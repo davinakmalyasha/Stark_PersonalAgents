@@ -1,0 +1,52 @@
+# Virtual environment
+venv/
+venv*/
+venv312/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment secrets
+.env
+
+# Runtime artifacts
+*.log
+*.db
+*.stackdump
+*_out.txt
+
+# Generated/output files
+*_generated.py
+*_generated
+Dockerfile*
+PromptFor*.txt
+*_Report.txt
+*Requirements.txt
+*TechnicalSpec.txt
+*DevOpsConfig.txt
+*QA_TestReport.txt
+*Analytics_Report.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime / tool state (never commit)
+.agent-memory/
+.agents/
+.claude/
+.codex/
+.deep_agents/
+conversation_history/
+skills/
+skills-lock.json
+*.lnk
+
+specs/
+design-references/

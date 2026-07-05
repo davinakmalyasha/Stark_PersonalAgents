@@ -36,3 +36,14 @@ PromptFor*.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime / tool state (never commit)
+.agent-memory/
+.agents/
+.claude/
+.codex/
+.deep_agents/
+conversation_history/
+skills/
+skills-lock.json
+*.lnk

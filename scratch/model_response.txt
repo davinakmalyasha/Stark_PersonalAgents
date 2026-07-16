@@ -1,1 +1,5 @@
-你好！👋 很高兴见到你！有什么我可以帮你的吗？无论是闲聊、学习、工作问题，还是任何其他需求，我都在这里等着你哦！😊
+CONTENT:
+Hello! How can I help you today?
+
+REASONING:
+We need answer hello. Need maybe respond greeting.

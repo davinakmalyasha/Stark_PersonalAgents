@@ -71,20 +71,20 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int, cache_hit_
     output_rate = 0.60       # per 1M tokens
     has_cache_hit_rate = False
     
-    if "deepseek-v4-flash" in model_lower or "deepseek-chat" in model_lower or "deepseek-v3" in model_lower:
+    if "deepseek-v4-flash" in model_lower or "deepseek-chat" in model_lower or "deepseek-v3" in model_lower or "deepseek-reasoner" in model_lower:
         input_rate = 0.14        # cache miss
-        cache_hit_rate = 0.014   # cache hit (90% discount)
-        output_rate = 0.28
+        cache_hit_rate = 0.0028  # cache hit ($0.0028 per 1M)
+        output_rate = 0.28       # output ($0.28 per 1M)
         has_cache_hit_rate = True
     elif "deepseek-v4-pro" in model_lower:
-        input_rate = 1.74        # cache miss
-        cache_hit_rate = 0.174   # cache hit (90% discount)
-        output_rate = 3.48
+        input_rate = 0.435       # cache miss ($0.435 per 1M)
+        cache_hit_rate = 0.003625 # cache hit ($0.003625 per 1M)
+        output_rate = 0.87       # output ($0.87 per 1M)
         has_cache_hit_rate = True
-    elif "deepseek-reasoner" in model_lower or "deepseek-r1" in model_lower:
-        input_rate = 0.55        # cache miss
-        cache_hit_rate = 0.14    # cache hit
-        output_rate = 2.19
+    elif "deepseek-r1" in model_lower:
+        input_rate = 0.55        # cache miss ($0.55 per 1M)
+        cache_hit_rate = 0.14    # cache hit ($0.14 per 1M)
+        output_rate = 2.19       # output ($2.19 per 1M)
         has_cache_hit_rate = True
     elif "gemini-1.5-flash" in model_lower:
         input_rate, output_rate = 0.075, 0.30

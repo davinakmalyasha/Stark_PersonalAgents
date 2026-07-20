@@ -42,35 +42,27 @@ def load_existing_specs(workspace_path: str = "") -> dict:
     }
 
 def load_supervisor_memory(workspace_path: str = "") -> dict:
-    """Loads the supervisor memory json file."""
-    ws_dir = workspace_path or WORKSPACE_DIR
-    memory_path = os.path.join(ws_dir, ".deep_agents", "workspace_memory.json")
-    if not os.path.isfile(memory_path) and ws_dir == WORKSPACE_DIR:
-        legacy_path = os.path.join(WORKSPACE_DIR, "workspace_memory.json")
-        if os.path.isfile(legacy_path):
-            memory_path = legacy_path
-            
-    memory = {}
-    if os.path.isfile(memory_path):
-        try:
-            with open(memory_path, "r", encoding="utf-8") as f:
-                memory = json.load(f)
-        except Exception:
-            pass
-    return memory
+    """DEPRECATED — memory is in .agent-memory/ now. Returns empty dict."""
+    return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Task Tracking — persistent task.json for agent continuity across runs
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _tasks_dir() -> str:
+    """Centralized tasks directory — never inside a project folder."""
+    d = os.path.join(WORKSPACE_DIR, ".deep_agents", "tasks")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def load_task_tracking(workspace_path: str = "", chat_id: str = "") -> dict | None:
-    """Load the task.json from .deep_agents/. Returns None if not found."""
+    """Load the task.json from central .deep_agents/tasks/. Returns None if not found."""
     if chat_id and not re.match(r'^[\w\-.]+$', chat_id):
         raise ValueError(f"Invalid chat_id: {chat_id}")
-    ws_dir = workspace_path or WORKSPACE_DIR
     filename = f"task_{chat_id}.json" if chat_id else TASK_FILE
-    task_path = os.path.join(ws_dir, ".deep_agents", filename)
+    task_path = os.path.join(_tasks_dir(), filename)
     if os.path.isfile(task_path):
         try:
             with open(task_path, "r", encoding="utf-8") as f:
@@ -120,26 +112,24 @@ def sync_planning_md_from_task_json(workspace_path: str, task_data: dict) -> Non
         print(f"Error syncing planning.md: {e}")
 
 def save_task_tracking(task_data: dict, workspace_path: str = "", chat_id: str = "") -> bool:
-    """Save task.json to .deep_agents/. Creates directory if needed."""
-    ws_dir = workspace_path or WORKSPACE_DIR
-    deep_agents_dir = os.path.join(ws_dir, ".deep_agents")
-    os.makedirs(deep_agents_dir, exist_ok=True)
+    """Save task.json to central .deep_agents/tasks/ (never inside project folders)."""
     cid = chat_id or task_data.get("chat_id", "")
     if cid and not re.match(r'^[\w\-.]+$', cid):
         raise ValueError(f"Invalid chat_id: {cid}")
     filename = f"task_{cid}.json" if cid else TASK_FILE
-    task_path = os.path.join(deep_agents_dir, filename)
+    task_path = os.path.join(_tasks_dir(), filename)
     try:
         task_data["updated_at"] = datetime.now().isoformat()
         with open(task_path, "w", encoding="utf-8") as f:
             json.dump(task_data, f, indent=2)
-            
-        # Programmatically sync planning.md on disk
+
+        # Programmatically sync planning.md on disk (still uses project path)
+        ws_dir = workspace_path or WORKSPACE_DIR
         try:
             sync_planning_md_from_task_json(ws_dir, task_data)
         except Exception as e:
             print(f"Error syncing planning.md in save_task_tracking: {e}")
-            
+
         return True
     except Exception as e:
         print(f"Error saving task tracking: {e}")

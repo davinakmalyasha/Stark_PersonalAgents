@@ -12,6 +12,10 @@ from datetime import datetime
 # Global registry: where workspace metadata is stored
 REGISTRY_PATH = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "workspaces.json")
 
+# Virtual workspace for general (non-folder) chats
+GENERAL_WORKSPACE_ID = "_general"
+GENERAL_CHAT_DIR = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "chats", GENERAL_WORKSPACE_ID)
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -38,6 +42,10 @@ def _save_registry(reg: dict) -> None:
 
 def _chat_dir(workspace_path: str) -> str:
     """Get the chat storage directory for a workspace."""
+    # General workspace uses central storage, not a folder path
+    if workspace_path == GENERAL_WORKSPACE_ID or workspace_path == '':
+        _ensure_dir(GENERAL_CHAT_DIR)
+        return GENERAL_CHAT_DIR
     workspace_path = os.path.normpath(os.path.abspath(workspace_path))
     
     # Try to find the workspace ID in the registry (case-insensitive for Windows)
@@ -47,12 +55,20 @@ def _chat_dir(workspace_path: str) -> str:
             ws_id = ws.get("id")
             central_dir = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "chats", ws_id)
             _ensure_dir(central_dir)
+            # Save the workspace path to a metadata file for orphan matching
+            path_file = os.path.join(central_dir, "workspace_path.txt")
+            if not os.path.isfile(path_file):
+                try:
+                    with open(path_file, "w", encoding="utf-8") as f:
+                        f.write(workspace_path)
+                except Exception:
+                    pass
             return central_dir
             
-    # Fallback to local workspace if not found in registry (e.g. during initialization)
-    local_dir = os.path.join(workspace_path, ".deep_agents", "chats")
-    _ensure_dir(local_dir)
-    return local_dir
+    # Fallback: use a central orphan directory instead of littering the project folder
+    fallback_dir = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "chats", "_unregistered")
+    _ensure_dir(fallback_dir)
+    return fallback_dir
 
 
 def _validate_chat_id(chat_id: str) -> None:
@@ -84,9 +100,19 @@ def _usage_path(workspace_path: str, chat_id: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def list_workspaces() -> list[dict]:
-    """Return all registered workspaces."""
+    """Return all registered workspaces, with General chat at the top."""
     reg = _load_registry()
-    workspaces = []
+    # Count general chats
+    general_chat_count = len(list_chats(GENERAL_WORKSPACE_ID))
+    workspaces = [{
+        "id": GENERAL_WORKSPACE_ID,
+        "name": "General",
+        "path": "",
+        "exists": True,
+        "chatCount": general_chat_count,
+        "addedAt": "",
+        "isGeneral": True,
+    }]
     for ws in reg.get("workspaces", []):
         ws_path = ws.get("path", "")
         exists = os.path.isdir(ws_path) if ws_path else False
@@ -103,19 +129,43 @@ def list_workspaces() -> list[dict]:
 
 
 def add_workspace(folder_path: str, name: str = "") -> dict:
-    """Register a new workspace folder."""
+    """Register a new workspace folder. Reuses old ID if the folder was previously registered."""
     folder_path = os.path.normpath(os.path.abspath(folder_path))
     if not os.path.isdir(folder_path):
         raise ValueError(f"Folder not found: {folder_path}")
 
     reg = _load_registry()
 
-    # Check if already registered
+    # Check if already registered (exact path match, case-insensitive)
     for ws in reg.get("workspaces", []):
         if os.path.normpath(ws.get("path", "")).lower() == folder_path.lower():
             return ws
 
+    # Check for orphaned chat directories from a previous registration of this
+    # folder. If we find one, reuse its workspace ID so old chats aren't lost.
     ws_id = f"ws-{uuid.uuid4().hex[:8]}"
+    central_chats_root = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "chats")
+    active_ids = {ws.get("id") for ws in reg.get("workspaces", [])}
+    if os.path.isdir(central_chats_root):
+        for dir_name in os.listdir(central_chats_root):
+            if not dir_name.startswith("ws-") or dir_name in active_ids:
+                continue
+            dir_path = os.path.join(central_chats_root, dir_name)
+            if not os.path.isdir(dir_path):
+                continue
+            
+            # Check workspace_path.txt if it exists
+            path_file = os.path.join(dir_path, "workspace_path.txt")
+            if os.path.isfile(path_file):
+                try:
+                    with open(path_file, "r", encoding="utf-8") as f:
+                        saved_path = f.read().strip()
+                    if os.path.normpath(saved_path).lower() == folder_path.lower():
+                        ws_id = dir_name
+                        break
+                except Exception:
+                    pass
+
     ws_name = name or os.path.basename(folder_path)
 
     entry = {
@@ -141,18 +191,35 @@ def add_workspace(folder_path: str, name: str = "") -> dict:
 
 
 def remove_workspace(workspace_id: str) -> bool:
-    """Remove a workspace from the registry (does not delete files)."""
+    """Remove a workspace from the registry and clean up its chat directory."""
+    import shutil
     reg = _load_registry()
     before = len(reg.get("workspaces", []))
     reg["workspaces"] = [w for w in reg.get("workspaces", []) if w.get("id") != workspace_id]
     if len(reg["workspaces"]) < before:
         _save_registry(reg)
+        # Clean up the central chat directory so orphaned folders don't accumulate
+        central_dir = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "chats", workspace_id)
+        if os.path.isdir(central_dir):
+            try:
+                shutil.rmtree(central_dir)
+            except Exception:
+                pass
         return True
     return False
 
 
 def get_workspace(workspace_id: str) -> dict | None:
     """Get a single workspace by ID."""
+    if workspace_id == GENERAL_WORKSPACE_ID:
+        return {
+            "id": GENERAL_WORKSPACE_ID,
+            "name": "General",
+            "path": "",
+            "exists": True,
+            "chatCount": len(list_chats(GENERAL_WORKSPACE_ID)),
+            "isGeneral": True,
+        }
     for ws in list_workspaces():
         if ws["id"] == workspace_id:
             return ws
@@ -349,6 +416,21 @@ def add_message(workspace_path: str, chat_id: str, role: str, content: str, meta
     return msg
 
 
+def get_chat_tasks(workspace_path: str, chat_id: str) -> list[dict]:
+    """Return persisted task definitions for a chat."""
+    chat = get_chat(workspace_path, chat_id, include_traces=False, include_usage=False)
+    return (chat or {}).get("tasks", [])
+
+
+def save_chat_tasks(workspace_path: str, chat_id: str, tasks: list[dict]) -> bool:
+    """Persist task definitions alongside the chat JSON."""
+    chat = get_chat(workspace_path, chat_id, include_traces=False, include_usage=False)
+    if chat is None:
+        return False
+    chat["tasks"] = tasks
+    return save_chat(workspace_path, chat_id, chat)
+
+
 def delete_chat(workspace_path: str, chat_id: str) -> bool:
     """Delete a chat JSON file and its trace/usage files."""
     fpath = _chat_path(workspace_path, chat_id)
@@ -383,6 +465,35 @@ def update_chat_title(workspace_path: str, chat_id: str, title: str) -> bool:
         return False
     chat["title"] = title
     return save_chat(workspace_path, chat_id, chat)
+
+
+def cleanup_orphaned_chat_dirs() -> int:
+    """Remove chat directories for workspaces no longer in the registry.
+
+    Called on server startup to prevent zombie directories from
+    accumulating after workspace deletions that didn't clean up.
+    Returns the number of directories removed.
+    """
+    import shutil
+    reg = _load_registry()
+    active_ids = {ws.get("id", "") for ws in reg.get("workspaces", [])}
+    central_chats_root = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "chats")
+    removed = 0
+    if os.path.isdir(central_chats_root):
+        for dir_name in os.listdir(central_chats_root):
+            if not dir_name.startswith("ws-"):
+                continue
+            if dir_name in active_ids:
+                continue  # Still registered — keep
+            dir_path = os.path.join(central_chats_root, dir_name)
+            if os.path.isdir(dir_path):
+                try:
+                    shutil.rmtree(dir_path)
+                    removed += 1
+                    print(f"[CLEANUP] Removed orphaned chat directory: {dir_name}")
+                except Exception as e:
+                    print(f"[CLEANUP] Failed to remove {dir_name}: {e}")
+    return removed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -463,8 +574,8 @@ def probe_environment(workspace_path: str) -> dict:
     return profile
 
 
-def init_default_workspace() -> dict:
-    """Ensure the default LangChain workspace is registered."""
+def init_default_workspace() -> dict | None:
+    """Ensure the default LangChain workspace is registered, but only if no workspaces exist."""
     default_path = r"d:\MyProject\LangChain"
     workspaces = list_workspaces()
     for ws in workspaces:
@@ -474,6 +585,11 @@ def init_default_workspace() -> dict:
             except Exception:
                 pass
             return ws
+
+    # If other workspaces are registered, do not recreate the default workspace.
+    if workspaces:
+        return None
+
     ws = add_workspace(default_path, "LangChain")
     try:
         probe_environment(default_path)
@@ -482,17 +598,32 @@ def init_default_workspace() -> dict:
     return ws
 
 
+def _resolve_workspace_id(workspace_path: str) -> str | None:
+    """Find workspace ID from its path."""
+    reg = _load_registry()
+    norm = os.path.normpath(workspace_path).lower() if workspace_path else ""
+    for ws in reg.get("workspaces", []):
+        if os.path.normpath(ws.get("path", "")).lower() == norm:
+            return ws.get("id")
+    return None
+
+
 def get_workspace_rules_and_profile(workspace_path: str) -> str:
     """
-    Loads global user_profile.json and local workspace rules.json
+    Loads global user_profile.json and central workspace rules.json
     and formats them as a clean prompt injection block.
     """
     import json
-    
+
     # Paths
     server_dir = r"d:\MyProject\LangChain"
     global_path = os.path.join(server_dir, ".deep_agents", "user_profile.json")
-    local_path = os.path.join(workspace_path, ".deep_agents", "rules.json") if workspace_path else None
+
+    # Rules stored centrally by workspace ID — never inside project folders
+    rules_path = None
+    ws_id = _resolve_workspace_id(workspace_path) if workspace_path else None
+    if ws_id:
+        rules_path = os.path.join(server_dir, ".deep_agents", "rules", f"{ws_id}.json")
 
     # Load global profile
     global_data = {}
@@ -503,11 +634,11 @@ def get_workspace_rules_and_profile(workspace_path: str) -> str:
         except Exception:
             pass
 
-    # Load local workspace rules
+    # Load central workspace rules
     local_data = {}
-    if local_path and os.path.isfile(local_path):
+    if rules_path and os.path.isfile(rules_path):
         try:
-            with open(local_path, "r", encoding="utf-8") as f:
+            with open(rules_path, "r", encoding="utf-8") as f:
                 local_data = json.load(f)
         except Exception:
             pass

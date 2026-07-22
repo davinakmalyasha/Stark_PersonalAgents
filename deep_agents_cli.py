@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from sync_manager import run_and_sync_graph
 from state_sync import shared_state
 
-load_dotenv()
+load_dotenv(override=True)
 
 def print_banner():
     print("=" * 65)

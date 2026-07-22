@@ -4,7 +4,7 @@ from sync_manager import shared_state, run_and_sync_graph
 from bot import bot
 from state_sync import safe_serialize_state, safe_update_state, safe_get_state
 
-load_dotenv()
+load_dotenv(override=True)
 
 def poll_state():
     state = safe_get_state()

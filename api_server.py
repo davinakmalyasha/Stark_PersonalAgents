@@ -3,27 +3,33 @@ FastAPI server — Bridges the React frontend with the LangGraph multi-agent pip
 Replaces the Gradio dashboard with SSE streaming endpoints.
 """
 import os
+import uuid
 import asyncio
 import json
 import threading
 import time
 import queue
 from typing import AsyncGenerator
+from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from sync_manager import run_and_sync_graph
-from state_sync import shared_state, safe_get_state, safe_update_state, safe_serialize_state, state_lock
+from state_sync import shared_state, safe_get_state, safe_update_state, safe_serialize_state, state_lock, reset_shared_state
 import workspace_manager as wm
 
-load_dotenv()
+load_dotenv(override=True)
 
 # Init default workspace on startup
 wm.init_default_workspace()
+# Clean up orphaned chat directories from previously deleted workspaces
+_orphans_removed = wm.cleanup_orphaned_chat_dirs()
+if _orphans_removed:
+    print(f"[STARTUP] Cleaned up {_orphans_removed} orphaned workspace chat directories")
 
 app = FastAPI(title="Deep Agents API", version="2.0")
 
@@ -43,9 +49,29 @@ class RunRequest(BaseModel):
     temperature: float = 0.7
     workspace_path: str = ""
     chat_id: str = ""
+    attachments: list[dict] = []
 
 class ChatRequest(BaseModel):
     prompt: str
+
+
+class TaskRequest(BaseModel):
+    prompt: str = ""
+    attachments: list[dict] = []
+    mode: str = "saved"
+    schedule: dict | None = None
+
+
+class TaskUpdateRequest(BaseModel):
+    status: str | None = None
+    prompt: str | None = None
+    attachments: list[dict] | None = None
+    mode: str | None = None
+    schedule: dict | None = None
+
+
+_task_scheduler_started = False
+_task_scheduler_lock = threading.Lock()
 
 
 # ── SSE Helpers ─────────────────────────────────────────────────────────────
@@ -61,6 +87,183 @@ def _format_sse(event: str, data: dict) -> str:
 async def get_state():
     """Return the current shared state as JSON."""
     return JSONResponse(content=json.loads(safe_serialize_state()))
+
+
+def _workspace_path_for_id(workspace_id: str) -> str:
+    if workspace_id == wm.GENERAL_WORKSPACE_ID:
+        return wm.GENERAL_WORKSPACE_ID
+    workspace = wm.get_workspace(workspace_id)
+    if not workspace:
+        raise ValueError("Workspace not found")
+    return workspace.get("path", "")
+
+
+def _task_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_task_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _next_recurring_time(current: datetime, recurrence: str) -> datetime | None:
+    if recurrence == "daily":
+        return current + timedelta(days=1)
+    if recurrence == "weekly":
+        return current + timedelta(days=7)
+    if recurrence == "monthly":
+        month = current.month % 12 + 1
+        year = current.year + (1 if current.month == 12 else 0)
+        day = min(current.day, 28)
+        return current.replace(year=year, month=month, day=day)
+    return None
+
+
+def _update_task(workspace_path: str, chat_id: str, task_id: str, **changes) -> dict | None:
+    tasks = wm.get_chat_tasks(workspace_path, chat_id)
+    for task in tasks:
+        if task.get("id") == task_id:
+            task.update(changes)
+            task["updatedAt"] = _task_now().isoformat()
+            wm.save_chat_tasks(workspace_path, chat_id, tasks)
+            return task
+    return None
+
+
+def _run_task_background(workspace_id: str, workspace_path: str, chat_id: str, task: dict) -> None:
+    task_id = task["id"]
+    _update_task(workspace_path, chat_id, task_id, status="running", lastRunAt=_task_now().isoformat())
+    try:
+        prompt = task.get("prompt", "")
+        attachments = task.get("attachments", [])
+        wm.add_message(workspace_path, chat_id, "user", prompt, {"attachments": attachments, "taskId": task_id} if attachments else {"taskId": task_id})
+        if workspace_path in ("", wm.GENERAL_WORKSPACE_ID):
+            from free_agent import run_freeagent_direct
+            for _ in run_freeagent_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
+                pass
+        else:
+            for _ in run_and_sync_graph(prompt, workspace_path=workspace_path, chat_id=chat_id):
+                pass
+        report = safe_get_state().get("outputs", {}).get("agent_report", "")
+        if report and chat_id:
+            wm.add_message(workspace_path, chat_id, "agent", report, {"taskId": task_id})
+        recurrence = (task.get("schedule") or {}).get("recurrence", "none")
+        current_next = _parse_task_time((task.get("schedule") or {}).get("nextRunAt")) or _task_now()
+        next_run = _next_recurring_time(current_next, recurrence)
+        if next_run:
+            schedule = {**(task.get("schedule") or {}), "nextRunAt": next_run.isoformat()}
+            _update_task(workspace_path, chat_id, task_id, status="scheduled", schedule=schedule)
+        else:
+            _update_task(workspace_path, chat_id, task_id, status="completed", completedAt=_task_now().isoformat())
+    except Exception as exc:
+        _update_task(workspace_path, chat_id, task_id, status="failed", error=str(exc))
+
+
+def _start_task_scheduler() -> None:
+    global _task_scheduler_started
+    with _task_scheduler_lock:
+        if _task_scheduler_started:
+            return
+        _task_scheduler_started = True
+
+    def loop() -> None:
+        while True:
+            try:
+                for workspace in wm.list_workspaces():
+                    workspace_id = workspace.get("id", "")
+                    workspace_path = _workspace_path_for_id(workspace_id)
+                    for chat in wm.list_chats(workspace_path):
+                        chat_id = chat.get("id", "")
+                        for task in wm.get_chat_tasks(workspace_path, chat_id):
+                            due = _parse_task_time((task.get("schedule") or {}).get("nextRunAt"))
+                            if task.get("status") == "scheduled" and due and due <= _task_now():
+                                threading.Thread(target=_run_task_background, args=(workspace_id, workspace_path, chat_id, task.copy()), daemon=True).start()
+            except Exception as exc:
+                print(f"[TASK SCHEDULER] {exc}")
+            time.sleep(15)
+
+    threading.Thread(target=loop, name="task-scheduler", daemon=True).start()
+
+
+@app.get("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks")
+async def list_tasks(workspace_id: str, chat_id: str):
+    try:
+        return JSONResponse(content=wm.get_chat_tasks(_workspace_path_for_id(workspace_id), chat_id))
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks")
+async def create_task(workspace_id: str, chat_id: str, req: TaskRequest):
+    try:
+        workspace_path = _workspace_path_for_id(workspace_id)
+        if not req.prompt.strip() and not req.attachments:
+            return JSONResponse(status_code=400, content={"error": "A prompt or attachment is required"})
+        now = _task_now()
+        schedule = req.schedule or {}
+        status = "scheduled" if req.mode == "scheduled" else "ready"
+        task = {"id": f"task-{uuid.uuid4().hex[:12]}", "workspaceId": workspace_id, "chatId": chat_id, "prompt": req.prompt, "attachments": req.attachments, "mode": req.mode, "status": status, "schedule": schedule, "createdAt": now.isoformat(), "updatedAt": now.isoformat()}
+        tasks = wm.get_chat_tasks(workspace_path, chat_id)
+        tasks.insert(0, task)
+        if not wm.save_chat_tasks(workspace_path, chat_id, tasks):
+            return JSONResponse(status_code=404, content={"error": "Chat not found"})
+        return JSONResponse(content=task)
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks/{task_id}/start")
+async def start_task(workspace_id: str, chat_id: str, task_id: str):
+    try:
+        workspace_path = _workspace_path_for_id(workspace_id)
+        task = next((item for item in wm.get_chat_tasks(workspace_path, chat_id) if item.get("id") == task_id), None)
+        if not task:
+            return JSONResponse(status_code=404, content={"error": "Task not found"})
+        updated = _update_task(workspace_path, chat_id, task_id, status="running", lastRunAt=_task_now().isoformat()) or {**task, "status": "running"}
+        return JSONResponse(content=updated)
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.patch("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks/{task_id}")
+async def update_task(workspace_id: str, chat_id: str, task_id: str, req: TaskUpdateRequest):
+    try:
+        workspace_path = _workspace_path_for_id(workspace_id)
+        if req.status is not None and req.status not in {"ready", "scheduled", "running", "completed", "failed"}:
+            return JSONResponse(status_code=400, content={"error": "Invalid task status"})
+        changes = req.model_dump(exclude_unset=True, exclude_none=True)
+        if "prompt" in changes and not str(changes["prompt"]).strip() and not changes.get("attachments"):
+            return JSONResponse(status_code=400, content={"error": "A prompt or attachment is required"})
+        if changes.get("mode") not in (None, "saved", "scheduled"):
+            return JSONResponse(status_code=400, content={"error": "Invalid task mode"})
+        if req.status == "completed":
+            changes["completedAt"] = _task_now().isoformat()
+        updated = _update_task(workspace_path, chat_id, task_id, **changes)
+        if not updated:
+            return JSONResponse(status_code=404, content={"error": "Task not found"})
+        return JSONResponse(content=updated)
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+
+@app.delete("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks/{task_id}")
+async def delete_task(workspace_id: str, chat_id: str, task_id: str):
+    try:
+        workspace_path = _workspace_path_for_id(workspace_id)
+        tasks = wm.get_chat_tasks(workspace_path, chat_id)
+        filtered = [task for task in tasks if task.get("id") != task_id]
+        if len(filtered) == len(tasks):
+            return JSONResponse(status_code=404, content={"error": "Task not found"})
+        wm.save_chat_tasks(workspace_path, chat_id, filtered)
+        return JSONResponse(content={"ok": True})
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
 
 
 def _save_chat_token_usage(workspace_path: str, chat_id: str):
@@ -94,48 +297,21 @@ def _save_chat_token_usage(workspace_path: str, chat_id: str):
         print(f"Error saving token stats for chat {chat_id}: {e}")
 
 
-# ── Simple chat keywords (costs nothing, no LLM call needed) ──
-_CHAT_KEYWORDS = {"hello", "hi", "hey", "thanks", "thank you", "good morning",
-                  "good afternoon", "how are you", "what's up", "bye", "goodbye"}
-
-def _is_obvious_chat(text: str) -> bool:
-    """Quick keyword check — true if it's clearly just a greeting/thanks, not a task."""
-    import re
-    text_lower = text.lower().strip()
-    words = text_lower.rstrip(".!?").split()
-    if len(words) > 6:
-        return False
-    
-    # Greetings & thanks keyword check with word boundaries to avoid substring matches
-    greetings = [
-        r"\bhello\b", r"\bhi\b", r"\bhey\b", r"\bthanks\b", r"\bthank\s+you\b",
-        r"\bgood\s+morning\b", r"\bgood\s+afternoon\b", r"\bhow\s+are\s+you\b",
-        r"\bwhat's\s+up\b", r"\bbye\b", r"\bgoodbye\b"
-    ]
-    has_greeting = any(re.search(pattern, text_lower) for pattern in greetings)
-    if not has_greeting:
-        return False
-
-    # Ensure it doesn't contain any task action words
-    actions = [
-        "build", "create", "make", "write", "code", "fix", "implement",
-        "add", "change", "modify", "delete", "remove", "refactor", "deploy",
-        "run", "test"
-    ]
-    has_action = any(re.search(rf"\b{act}\b", text_lower) for act in actions)
-    return not has_action
-
-
 @app.post("/api/run")
 async def run_pipeline(req: RunRequest, request: Request):
     """Run the agentic pipeline with SSE streaming of state updates.
     No Jarvis Router — goes directly to the main agent."""
-    from chat_memory_manager import add_chat_message, resolve_request_text
+    from workspace_manager import add_message as wm_add_message
+    from chat_memory_manager import resolve_request_text
+
+    # Reset shared state to clear stale data from previous run
+    reset_shared_state()
 
     # Clear previous failed models and reset current run token usage
     safe_update_state({
         "selected_model": req.model,
         "selected_temp": req.temperature,
+        "is_general": not req.workspace_path,
         "failed_models": [],
         "token_usage": {
             "total_input_tokens": 0,
@@ -147,34 +323,15 @@ async def run_pipeline(req: RunRequest, request: Request):
         }
     })
 
-    add_chat_message("user", req.prompt, workspace_path=req.workspace_path, chat_id=req.chat_id)
-    resolved = resolve_request_text(req.prompt, workspace_path=req.workspace_path, chat_id=req.chat_id)
-
-    # Quick chat check — no LLM call needed for greetings
-    if _is_obvious_chat(req.prompt):
-        _save_chat_token_usage(req.workspace_path, req.chat_id)
-        safe_update_state({
-            "active_node": "agent",
-            "next_agent": "",
-            "completed_nodes": [],
-            "thoughts": {"agent": "Ready and waiting for instructions."},
-            "client_request": resolved,
-            "outputs": {
-                "requirements": "", "tech_spec": "", "code": "",
-                "test_report": "", "devops_config": "", "analytics_report": "",
-                "gherkin": "", "mermaid": "",
-            },
-            "deep_agents_log": [],
-            "live_terminal_log": f"👤 User: {req.prompt}\n\n🤖 Assistant: Hi! Ready to help. What do you need?\n",
-        })
-
-        async def chat_stream() -> AsyncGenerator[str, None]:
-            if await request.is_disconnected():
-                return
-            yield _format_sse("state", json.loads(safe_serialize_state()))
-            yield _format_sse("done", {"status": "complete"})
-
-        return StreamingResponse(chat_stream(), media_type="text/event-stream")
+    attachment_note = ""
+    if req.attachments:
+        attachment_note = "\n\nAttached files for this request:\n" + "\n".join(
+            f"- {item.get('name', 'attachment')} ({item.get('path', item.get('url', 'uploaded file'))})"
+            for item in req.attachments
+        )
+    prompt_with_attachments = req.prompt + attachment_note
+    wm_add_message(req.workspace_path, req.chat_id, "user", req.prompt, {"attachments": req.attachments} if req.attachments else None)
+    resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
 
     # Go directly to the main agent
     async def build_stream() -> AsyncGenerator[str, None]:
@@ -189,12 +346,31 @@ async def run_pipeline(req: RunRequest, request: Request):
         def run_in_thread():
             nonlocal done, had_error
             try:
-                for state_snapshot in run_and_sync_graph(resolved, workspace_path=req.workspace_path, chat_id=req.chat_id, cancel_event=cancel_event):
-                    q.put(state_snapshot)
+                is_general = not req.workspace_path
+                if is_general:
+                    from free_agent import run_freeagent_direct
+                    image_paths = [item.get("path") for item in req.attachments
+                                   if item.get("isImage") and item.get("path")]
+                    for state_snapshot in run_freeagent_direct(resolved, chat_id=req.chat_id, images=image_paths or None):
+                        q.put(state_snapshot)
+                else:
+                    for state_snapshot in run_and_sync_graph(resolved, workspace_path=req.workspace_path, chat_id=req.chat_id, cancel_event=cancel_event):
+                        q.put(state_snapshot)
                 q.put(None)  # signal completion
             except Exception as e:
+                import traceback
                 had_error = True
-                q.put({"error": str(e)})
+                # Read the current shared state so the frontend sees the
+                # live_terminal_log with crash details (added by sync_manager).
+                # A bare {"error": ...} dict lacks live_terminal_log and
+                # would cause the frontend to show "Task complete." instead.
+                try:
+                    err_state = json.loads(safe_serialize_state())
+                except Exception:
+                    err_state = {}
+                err_state["error"] = str(e)
+                err_state["traceback"] = traceback.format_exc()
+                q.put(err_state)
                 q.put(None)
             finally:
                 done = True
@@ -228,6 +404,20 @@ async def run_pipeline(req: RunRequest, request: Request):
         # Save token usage for the chat
         _save_chat_token_usage(req.workspace_path, req.chat_id)
 
+        # The frontend persists one unified trace message containing the final
+        # answer and execution metadata. Do not save a second plain agent
+        # message here, otherwise every response appears twice in the chat.
+        agent_report = safe_get_state().get("outputs", {}).get("agent_report", "")
+
+        # Also save a session note to .agent-memory/ so the ORCHESTRATOR (not chat) remembers
+        try:
+            if agent_report and req.workspace_path:
+                from memory_manager import update_project_meta
+                snippet = agent_report[:500].replace("\n", " ")
+                update_project_meta(req.workspace_path, "Last Session", snippet)
+        except Exception as e:
+            print(f"[API] Error saving session memory: {e}")
+
         # Final state
         yield _format_sse("state", json.loads(safe_serialize_state()))
         yield _format_sse("done", {"status": "error" if had_error else "complete"})
@@ -255,7 +445,7 @@ async def reset_session():
         "project_path": "",
         "agents_plan": "",
         "deep_agents_log": [],
-        "live_terminal_log": "🧹 Session reset. Ready for a new request.\n",
+        "live_terminal_log": "[SESSION] Reset. Ready for a new request.\n",
         "token_usage": {
             "total_input_tokens": 0,
             "total_output_tokens": 0,
@@ -380,7 +570,7 @@ async def get_subagent_history_endpoint(workspace_id: str, chat_id: str, subagen
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
     
-    valid_subagents = {"Dev", "BA", "SA", "DevOps", "Refinement", "Analytics", "Critic", "Designer"}
+    valid_subagents = {"Dev", "BSA", "DevSecOps", "SDET", "FreeAgent", "Vision"}
     if subagent_name not in valid_subagents:
         return JSONResponse(content={"error": "Invalid subagent name"}, status_code=400)
     
@@ -431,6 +621,35 @@ async def add_message_endpoint(workspace_id: str, chat_id: str, req: Request):
     return JSONResponse(content=msg)
 
 
+@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/attachments")
+async def upload_chat_attachments(workspace_id: str, chat_id: str, files: list[UploadFile] = File(...)):
+    """Store chat attachments outside the workspace and return safe agent-readable paths."""
+    ws = wm.get_workspace(workspace_id)
+    if not ws or not wm.get_chat(ws["path"], chat_id):
+        return JSONResponse(content={"error": "Chat not found"}, status_code=404)
+    if len(files) > 8:
+        return JSONResponse(content={"error": "A maximum of 8 files can be uploaded"}, status_code=400)
+
+    upload_dir = os.path.join(os.path.dirname(__file__), ".deep_agents", "uploads", workspace_id, chat_id)
+    os.makedirs(upload_dir, exist_ok=True)
+    attachments = []
+    for item in files:
+        filename = os.path.basename(item.filename or "attachment")
+        contents = await item.read()
+        if len(contents) > 20 * 1024 * 1024:
+            return JSONResponse(content={"error": f"{filename} is larger than 20 MB"}, status_code=400)
+        stored_name = f"{uuid.uuid4().hex[:8]}-{filename}"
+        target = os.path.join(upload_dir, stored_name)
+        with open(target, "wb") as handle:
+            handle.write(contents)
+        mime = item.content_type or "application/octet-stream"
+        attachments.append({
+            "id": stored_name, "name": filename, "type": mime, "size": len(contents),
+            "path": target, "isImage": mime.startswith("image/"),
+        })
+    return JSONResponse(content={"attachments": attachments})
+
+
 @app.put("/api/workspaces/{workspace_id}/chats/{chat_id}/title")
 async def update_chat_title(workspace_id: str, chat_id: str, req: Request):
     ws = wm.get_workspace(workspace_id)
@@ -446,7 +665,41 @@ async def update_chat_title(workspace_id: str, chat_id: str, req: Request):
 # Settings & Rules API
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+@app.get("/api/settings/general-profile")
+async def get_general_profile():
+    """Get the General mode user profile (instructions + memory)."""
+    profile_path = r"d:\MyProject\LangChain\.deep_agents\general_profile.json"
+    default = {
+        "user_info": {"name": "", "birthday": "", "education": ""},
+        "instructions": "",
+        "memory": []
+    }
+    if os.path.isfile(profile_path):
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                return JSONResponse(content=json.load(f))
+        except Exception:
+            pass
+    return JSONResponse(content=default)
+
+
+@app.post("/api/settings/general-profile")
+async def save_general_profile(req: Request):
+    """Save the General mode user profile."""
+    profile_path = r"d:\MyProject\LangChain\.deep_agents\general_profile.json"
+    body = await req.json()
+    try:
+        os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(body, f, indent=2)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
 @app.get("/api/settings/profile")
+
 async def get_profile():
     profile_path = r"d:\MyProject\LangChain\.deep_agents\user_profile.json"
     default_profile = {
@@ -478,7 +731,7 @@ async def get_workspace_rules(workspace_id: str):
     ws = wm.get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(ws["path"], ".deep_agents", "rules.json")
+    rules_path = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "rules", f"{workspace_id}.json")
     default_rules = {
         "stack": {},
         "workspace_rules": []
@@ -496,7 +749,7 @@ async def save_workspace_rules(workspace_id: str, req: Request):
     ws = wm.get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(ws["path"], ".deep_agents", "rules.json")
+    rules_path = os.path.join(r"d:\MyProject\LangChain", ".deep_agents", "rules", f"{workspace_id}.json")
     body = await req.json()
     try:
         os.makedirs(os.path.dirname(rules_path), exist_ok=True)
@@ -525,6 +778,51 @@ def start_consolidation_daemon():
     threading.Thread(target=daemon_loop, daemon=True).start()
 
 
+# ── Voice transcription ────────────────────────────────────────────────────────
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Transcribe audio using Groq Whisper (free STT)."""
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY") or ""
+    if not GROQ_API_KEY:
+        # Fallback: try comma-separated env var
+        keys_str = os.getenv("GROQ_API_KEYS", "")
+        if keys_str:
+            GROQ_API_KEY = keys_str.split(",")[0].strip()
+    if not GROQ_API_KEY:
+        return {"error": "Groq API key not configured (set GROQ_API_KEY or GROQ_API_KEYS)"}, 400
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"error": "Empty audio file"}, 400
+
+    try:
+        import httpx
+        # Build multipart form for Groq Whisper
+        files = {
+            "file": (file.filename or "audio.webm", audio_bytes, file.content_type or "audio/webm"),
+            "model": (None, "whisper-large-v3-turbo"),
+        }
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                files=files,
+                headers=headers,
+            )
+        if resp.status_code != 200:
+            print(f"[Transcribe] Groq API error {resp.status_code}: {resp.text}")
+            return {"error": f"Groq API error: {resp.status_code}"}, 502
+        result = resp.json()
+        text = result.get("text", "").strip()
+        if not text:
+            return {"text": ""}, 200
+        return {"text": text}, 200
+    except Exception as e:
+        print(f"[Transcribe] Error: {e}")
+        return {"error": str(e)}, 500
+
+
 # ── Startup ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -532,6 +830,8 @@ if __name__ == "__main__":
     import sys
     
     reload_mode = "--reload" in sys.argv
+
+    _start_task_scheduler()
     
     # Start Telegram bot in background
     try:

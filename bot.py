@@ -5,10 +5,10 @@ Handles text/voice input, routes through Jarvis, and runs the agentic pipeline.
 import os
 import telebot
 from dotenv import load_dotenv
-from bot_helpers import transcribe_voice
+from bot_helpers import transcribe_voice, safe_send_message, safe_edit_message_text, WORKSPACE_DIR
 from bot_runner import handle_build_request
 
-load_dotenv()
+load_dotenv(override=True)
 
 token = os.getenv("TELEGRAM_BOT_TOKEN")
 if not token:
@@ -17,18 +17,32 @@ bot = telebot.TeleBot(token)
 
 @bot.message_handler(commands=["start", "help"])
 def welcome(msg: telebot.types.Message) -> None:
-    bot.reply_to(
-        msg,
-        "🏢 *Virtual IT Department*\n\n"
-        "I can help you build, deploy, and analyze software projects autonomously. Send me a command to get started:\n"
-        "• _\"Make a calculator app\"_ → Requirements + Design + Coder + QA\n"
-        "• _\"Deploy my project to Railway\"_ → DevOps Setup\n"
-        "• _\"Write requirements for a CRM\"_ → BA Specifications\n\n"
-        "Ready to generate documentation, establish project environments, and build functional systems.",
-        parse_mode="Markdown",
-    )
+    try:
+        bot.reply_to(
+            msg,
+            "🏢 *Virtual IT Department*\n\n"
+            "I can help you build, deploy, and analyze software projects autonomously. Send me a command to get started:\n"
+            "• _\"Make a calculator app\"_ → Requirements + Design + Coder + QA\n"
+            "• _\"Deploy my project to Railway\"_ → DevOps Setup\n"
+            "• _\"Write requirements for a CRM\"_ → BA Specifications\n\n"
+            "Ready to generate documentation, establish project environments, and build functional systems.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        try:
+            bot.reply_to(
+                msg,
+                "🏢 Virtual IT Department\n\n"
+                "I can help you build, deploy, and analyze software projects autonomously. Send me a command to get started:\n"
+                "• \"Make a calculator app\"\n"
+                "• \"Deploy my project to Railway\"\n"
+                "• \"Write requirements for a CRM\"\n\n"
+                "Ready to generate documentation, establish project environments, and build functional systems."
+            )
+        except Exception as e:
+            print(f"Error sending welcome message: {e}")
 
-_CHAT_KEYWORDS = {"hello", "hi", "hey", "thanks", "thank you", "good morning",
+_CHAT_KEYWORDS = {"hello", "hi", "hai", "yo", "halo", "helo", "hey", "thanks", "thank you", "good morning",
                   "good afternoon", "how are you", "what's up", "bye", "goodbye"}
 
 def _is_obvious_chat(text: str) -> bool:
@@ -40,7 +54,8 @@ def _is_obvious_chat(text: str) -> bool:
     
     # Greetings & thanks keyword check with word boundaries to avoid substring matches
     greetings = [
-        r"\bhello\b", r"\bhi\b", r"\bhey\b", r"\bthanks\b", r"\bthank\s+you\b",
+        r"\bhello\b", r"\bhi\b", r"\bhai\b", r"\byo\b", r"\bhalo\b", r"\bhelo\b",
+        r"\bhey\b", r"\bthanks\b", r"\bthank\s+you\b",
         r"\bgood\s+morning\b", r"\bgood\s+afternoon\b", r"\bhow\s+are\s+you\b",
         r"\bwhat's\s+up\b", r"\bbye\b", r"\bgoodbye\b"
     ]
@@ -63,12 +78,15 @@ def handle_request(msg: telebot.types.Message) -> None:
     status_msg = None
 
     if msg.content_type == "voice":
-        status_msg = bot.send_message(chat_id, "🎙️ Transcribing voice...")
+        status_msg = safe_send_message(bot, chat_id, "🎙️ Transcribing voice...")
+        if status_msg is None:
+            return
         req = transcribe_voice(bot, msg)
         if req.startswith("Error"):
-            bot.edit_message_text(f"❌ {req}", chat_id, status_msg.message_id)
+            safe_edit_message_text(bot, f"❌ {req}", chat_id, status_msg.message_id)
             return
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
             f"📝 Transcribed: \"{req}\"\n\n⏳ Processing...",
             chat_id, status_msg.message_id,
         )
@@ -76,7 +94,7 @@ def handle_request(msg: telebot.types.Message) -> None:
         req = msg.text
 
     from chat_memory_manager import add_chat_message, resolve_request_text
-    add_chat_message("user", req)
+    add_chat_message("user", req, workspace_path=WORKSPACE_DIR, chat_id=str(chat_id))
 
     # Clear failed models from previous requests
     try:
@@ -85,31 +103,25 @@ def handle_request(msg: telebot.types.Message) -> None:
     except Exception:
         pass
 
-    resolved_req = resolve_request_text(req)
+    resolved_req = resolve_request_text(req, workspace_path=WORKSPACE_DIR, chat_id=str(chat_id))
 
     # Quick chat check — no LLM call needed
     if _is_obvious_chat(req):
-        add_chat_message("jarvis", "Hi! Ready to help. What do you need?")
+        add_chat_message("jarvis", "Hi! Ready to help. What do you need?", workspace_path=WORKSPACE_DIR, chat_id=str(chat_id))
         reply = "Hi! Ready to help. What do you need?"
         if status_msg:
-            try:
-                bot.edit_message_text(reply, chat_id, status_msg.message_id)
-            except Exception:
-                bot.send_message(chat_id, reply)
+            safe_edit_message_text(bot, reply, chat_id, status_msg.message_id)
         else:
-            bot.send_message(chat_id, reply)
+            safe_send_message(bot, chat_id, reply)
         return
 
     # Go directly to the main agent
-    add_chat_message("jarvis", f"Initiating work: {resolved_req}")
+    add_chat_message("jarvis", f"Initiating work: {resolved_req}", workspace_path=WORKSPACE_DIR, chat_id=str(chat_id))
 
     if status_msg is None:
-        status_msg = bot.send_message(chat_id, "⏳ Processing your request...")
+        status_msg = safe_send_message(bot, chat_id, "⏳ Processing your request...")
     else:
-        try:
-            bot.edit_message_text("⏳ Processing your request...", chat_id, status_msg.message_id)
-        except Exception:
-            status_msg = bot.send_message(chat_id, "⏳ Processing your request...")
+        safe_edit_message_text(bot, "⏳ Processing your request...", chat_id, status_msg.message_id)
 
     handle_build_request(bot, resolved_req, chat_id, status_msg)
 

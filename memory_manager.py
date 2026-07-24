@@ -1,222 +1,441 @@
+"""
+Long-term project memory. Persistent across sessions.
+Auto-generates from codebase scan on first use.
+Orchestrator reads at session start, updates as it discovers new info.
+"""
 import os
 import json
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from memory_types import SupervisorMemoryUpdate
-from memory_io import load_memory, save_memory, apply_segment_update, load_global_lessons, save_global_lessons
+import re
+from datetime import datetime
 
-def is_valid_build_request(req: str) -> bool:
-    """Checks if a string looks like a real build request, rather than guidance, greetings, or chat."""
-    t = req.lower().strip().rstrip(".!?")
-    if not t:
-        return False
-    # Filter out greetings
-    greetings = {"hello", "hi", "hey", "what's up", "how are you", "operational and ready"}
-    if t in greetings or any(t.startswith(g) for g in ["hello", "hi ", "hey ", "hi, ", "hello, "]):
-        return False
-        
-    # Filter out simple continue/resume commands using similar logic
-    continue_words = {
-        "continue", "resume", "proceed", "go on", "go", "yes", "confirm", "approve",
-        "do it", "run it", "looks good", "yessss continueee", "go on continue",
-        "continue please", "please continue", "yesss continueee", "continueee"
-    }
-    if t in continue_words:
-        return False
-    words = t.split()
-    if len(words) <= 5 and any(w in words for w in ["continue", "resume", "proceed", "go"]):
-        return False
-    if any(phrase in t for phrase in ["continue from where", "resume from where", "continue where we left", "go on continue", "continue last"]):
+MEMORY_DIR = ".agent-memory"
+
+
+# ── Path helpers ─────────────────────────────────────────────────────────────
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _memory_path(workspace_path: str) -> str:
+    return os.path.join(workspace_path, MEMORY_DIR)
+
+
+def _project_file(workspace_path: str) -> str:
+    return os.path.join(_memory_path(workspace_path), "project.md")
+
+
+def _features_file(workspace_path: str) -> str:
+    return os.path.join(_memory_path(workspace_path), "features.md")
+# ── Auto-generation ──────────────────────────────────────────────────────────
+
+def auto_generate_memory(workspace_path: str) -> bool:
+    """Scan workspace and generate initial project.md + features.md.
+    Returns True if files were created, False if they already existed.
+    """
+    mem_dir = _memory_path(workspace_path)
+    _ensure_dir(mem_dir)
+
+    proj_file = _project_file(workspace_path)
+    feat_file = _features_file(workspace_path)
+
+    # Don't overwrite existing memory
+    if os.path.isfile(proj_file) or os.path.isfile(feat_file):
         return False
 
-    # Filter out pure guidance responses (like numbering answers or simple yes/no/confirmations)
-    if t in ("yes", "no", "y", "n", "ok", "okay", "sure", "sounds good", "go ahead", "do it"):
-        return False
-    # If it is numbering-only or list-only guidance without any active verbs
-    import re
-    if re.match(r"^\s*\d+[\.\)]", t):
-        action_keywords = {"build", "create", "make", "write", "code", "fix", "implement", "add", "change", "modify", "delete", "remove", "refactor", "install", "deploy", "run", "test", "debug"}
-        if not any(kw in t for kw in action_keywords):
-            return False
+    # Detect tech stack and project info
+    stack = _detect_tech_stack(workspace_path)
+    db = _detect_database(workspace_path)
+    frontend = _detect_frontend(workspace_path)
+    test_fw = _detect_test_framework(workspace_path)
+    arch = _detect_architecture(workspace_path)
+
+    # Write project.md
+    proj_lines = [
+        "# Project Overview",
+        f"**Auto-generated**: {datetime.now().strftime('%Y-%m-%d')}",
+        "",
+        "## Tech Stack",
+    ]
+    if stack:
+        for s in stack:
+            proj_lines.append(f"- {s}")
+    else:
+        proj_lines.append("- _Not detected_")
+    proj_lines.append("")
+
+    if frontend:
+        proj_lines.append("## Frontend")
+        for f in frontend:
+            proj_lines.append(f"- {f}")
+        proj_lines.append("")
+
+    if db:
+        proj_lines.append("## Database")
+        proj_lines.append(f"- {db}")
+        proj_lines.append("")
+
+    if test_fw:
+        proj_lines.append("## Testing")
+        proj_lines.append(f"- {test_fw}")
+        proj_lines.append("")
+
+    if arch:
+        proj_lines.append("## Architecture")
+        for a in arch[:5]:
+            proj_lines.append(f"- {a}")
+        proj_lines.append("")
+
+    # Project type
+    proj_lines.append("## Project Type")
+    has_python = any("Python" in s for s in stack)
+    has_node = any("Node.js" in s for s in stack)
+    has_ai = any("LangChain" in s or "LangGraph" in s for s in stack)
+    if has_ai:
+        proj_lines.append("- AI agent orchestration system")
+    if has_python:
+        proj_lines.append("- Python application")
+    if has_node:
+        proj_lines.append("- Node.js application")
+    if not has_python and not has_node and not has_ai:
+        proj_lines.append("- _Auto-detection pending_")
+    proj_lines.append("")
+
+    proj_lines.append("## Goals")
+    proj_lines.append("- _Auto-detected. Update as the project evolves._")
+    proj_lines.append("")
+
+    _write_file_safe(proj_file, "\n".join(proj_lines))
+
+    # Write features.md (starts as template — orchestrator populates)
+    feat_lines = [
+        "# Features",
+        f"**Auto-generated**: {datetime.now().strftime('%Y-%m-%d')}",
+        "",
+        "_Features are added here by the orchestrator as work is done._",
+        "",
+    ]
+    _write_file_safe(feat_file, "\n".join(feat_lines))
+
+    print(f"[MEMORY] Auto-generated at {mem_dir}")
     return True
 
-def clean_and_minify_memory(mem: dict) -> dict:
-    """Returns a copy of memory with environment_profile removed and empty keys pruned recursively."""
-    def clean(val):
-        if isinstance(val, dict):
-            cleaned = {k: clean(v) for k, v in val.items()}
-            return {k: v for k, v in cleaned.items() if v not in (None, {}, [], "")}
-        elif isinstance(val, list):
-            cleaned = [clean(x) for x in val]
-            return [x for x in cleaned if x not in (None, {}, [], "")]
-        return val
 
-    mem_copy = mem.copy()
-    if "environment_profile" in mem_copy:
-        del mem_copy["environment_profile"]
-    
-    if "past_requests" in mem_copy:
-        mem_copy["past_requests"] = mem_copy["past_requests"][-5:]
+# ── Tech detection ───────────────────────────────────────────────────────────
 
-    return clean(mem_copy)
-
-
-def refine_memory_milestone(client_request: str, requirements: str, tech_spec: str, log_text: str, project_path: str = "") -> None:
-    """Runs the Archivist Sub-Agent to extract facts from the run and update memory segments."""
-    mem = load_memory(project_path)
-
-    # Skip MemoryArchivist LLM call entirely for non-build / trivial requests to save resources
-    if not is_valid_build_request(client_request):
-        print(">> Memory: Done. (Skipped)")
-        return
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    compacted_logs = compact_logs(log_text)
-
-    sys_msg = (
-        "You are the Memory Archivist Agent for a Virtual IT Office.\n"
-        "Your task is to analyze the execution outputs (User request, requirements, specs, logs) "
-        "and extract key facts, preferences, blueprints, and QA bug fixes.\n\n"
-        "Organize updates into four Role-Based Access Control (RBAC) divisions:\n"
-        "1. global: General client profile, preferences, and name.\n"
-        "2. it_department: Software architecture, database schemas, codebase structures, and file locations.\n"
-        "3. design_department: Business rules, color themes, UI elements, specification metrics, and requirements version history.\n"
-        "4. security: Security standards, password formats, file permissions, and keys.\n\n"
-        "Additionally, extract new lessons learned. You MUST split lessons into two distinct categories:\n"
-        "- lessons_learned_updates: Workspace-level (local) lessons. These are project-specific, detailed code configurations, file pathways, database structures, or small workarounds that apply to this project specifically.\n"
-        "- global_lessons_learned_updates: Global-level lessons. These are universal runtime errors, OS-specific terminal issues (e.g. Windows paths, commands), language/tool bugs (like pytest module resolution), or architectural patterns that affect the global way of coding across all projects. Keep these rare and extremely high-impact.\n\n"
-        "All lessons must be compressed to a single, short, and dense line. Avoid conversational filler or long descriptions.\n\n"
-        "Guidelines:\n"
-        "- Do not create duplicate information. If information has changed (e.g. database type or folder path), "
-        "add the old key to 'deletions' and the new one to 'updates' to avoid conflicts.\n"
-        "- Integrate updates into pre-existing nested structures where possible (e.g., place frameworks/libraries under `technologies`, file structures under `file_blueprints`, styling details under `themes`, and layouts/components under `ui_flow_specs`), instead of cluttering each segment with flat root keys.\n"
-        "- Summarize the raw data into short, dense facts."
-    )
-
-    from workspace_manager import get_client_name
-    client_name = get_client_name()
-    active_path = project_path or r"d:\MyProject\LangChain"
-
-    user_msg = (
-        f"Client Name: {client_name}\n"
-        f"Active Project Path: {active_path}\n"
-        f"Current Memory Database:\n{json.dumps(clean_and_minify_memory(mem), separators=(',', ':'))}\n\n"
-        f"Client Request: \"{client_request}\"\n\n"
-        f"Generated Requirements:\n{requirements[:3000]}\n\n"
-        f"Generated Specs:\n{tech_spec[:3000]}\n\n"
-        f"Execution Logs:\n{compacted_logs}\n\n"
-        "Inspect the above and output the structured Memory Updates."
-    )
-
-    from llm import invoke_with_fallback
+def _read_file_lines(path: str) -> list[str]:
     try:
-        decision = invoke_with_fallback(
-            role="MemoryArchivist",
-            sys_inst=sys_msg,
-            prompt=user_msg,
-            schema=SupervisorMemoryUpdate,
-            temp=0.2
-        )
-    except Exception as e:
-        print(f"Memory Archivist LLM execution failed: {e}")
-        decision = None
+        with open(path, "r", encoding="utf-8") as f:
+            return f.readlines()
+    except Exception:
+        return []
 
-    if decision is None:
-        print("Memory Archivist: All LLM models exhausted. Memory refinement skipped.")
-        # Programmatic fallback: ensure the request is added to past_requests anyway!
-        clean_req = client_request.strip()
-        if clean_req and is_valid_build_request(clean_req):
-            past_reqs = mem.setdefault("past_requests", [])
-            if not past_reqs or past_reqs[-1] != clean_req:
-                past_reqs.append(clean_req)
-            save_memory(mem, project_path)
-        return
 
-    apply_segment_update(mem["global"], decision.global_segment)
-    apply_segment_update(mem["it_department"], decision.it_segment)
-    apply_segment_update(mem["design_department"], decision.design_segment)
-    apply_segment_update(mem["security"], decision.security_segment)
+def _detect_tech_stack(workspace_path: str) -> list[str]:
+    stack = []
 
-    # 1. Save Workspace lessons
-    if hasattr(decision, "lessons_learned_updates") and decision.lessons_learned_updates:
-        for lesson in decision.lessons_learned_updates:
-            lesson = lesson.strip()
-            if lesson and lesson not in mem.setdefault("lessons_learned", []):
-                mem["lessons_learned"].append(lesson)
-        if len(mem["lessons_learned"]) > 10:
-            mem["lessons_learned"] = mem["lessons_learned"][-10:]
+    # Python
+    req_file = os.path.join(workspace_path, "requirements.txt")
+    if os.path.isfile(req_file):
+        stack.append("Python")
+        content = _read_file_lines(req_file)
+        for line in content:
+            ll = line.lower()
+            if "fastapi" in ll and "FastAPI" not in stack:
+                stack.append("FastAPI")
+            if "flask" in ll and "Flask" not in stack:
+                stack.append("Flask")
+            if "django" in ll and "Django" not in stack:
+                stack.append("Django")
+            if "langchain" in ll and "LangChain" not in stack:
+                stack.append("LangChain")
+            if "langgraph" in ll and "LangGraph" not in stack:
+                stack.append("LangGraph")
+            if "pydantic" in ll and "Pydantic" not in stack:
+                stack.append("Pydantic")
+            if "sqlalchemy" in ll and "SQLAlchemy" not in stack:
+                stack.append("SQLAlchemy")
 
-    # 2. Save Global lessons (written to user_profile.json)
-    if hasattr(decision, "global_lessons_learned_updates") and decision.global_lessons_learned_updates:
-        g_lessons = load_global_lessons()
-        updated_g = False
-        for lesson in decision.global_lessons_learned_updates:
-            lesson = lesson.strip()
-            if lesson and lesson not in g_lessons:
-                g_lessons.append(lesson)
-                updated_g = True
-        if updated_g:
-            save_global_lessons(g_lessons)
+    # Node.js
+    pkg_file = os.path.join(workspace_path, "package.json")
+    if os.path.isfile(pkg_file):
+        stack.append("Node.js")
+        try:
+            with open(pkg_file, "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            for dep in deps:
+                dl = dep.lower()
+                if "typescript" in dl and "TypeScript" not in stack:
+                    stack.append("TypeScript")
+                if "tailwind" in dl and "Tailwind CSS" not in stack:
+                    stack.append("Tailwind CSS")
+        except Exception:
+            pass
 
-    if decision.new_request_to_add:
-        req = decision.new_request_to_add
-        if is_valid_build_request(req):
-            if req not in mem["past_requests"]:
-                mem["past_requests"].append(req)
+    # PHP
+    if os.path.isfile(os.path.join(workspace_path, "composer.json")):
+        stack.append("PHP")
+
+    # Go
+    if os.path.isfile(os.path.join(workspace_path, "go.mod")):
+        stack.append("Go")
+
+    # Rust
+    if os.path.isfile(os.path.join(workspace_path, "Cargo.toml")):
+        stack.append("Rust")
+
+    # Ruby
+    if os.path.isfile(os.path.join(workspace_path, "Gemfile")):
+        stack.append("Ruby")
+
+    return stack
+
+
+def _detect_database(workspace_path: str) -> str | None:
+    patterns = [
+        (r"sqlite|sqlite3", "SQLite"),
+        (r"postgresql|postgres|psycopg", "PostgreSQL"),
+        (r"mysql|mariadb|pymysql", "MySQL / MariaDB"),
+        (r"mongodb|pymongo|mongoose", "MongoDB"),
+        (r"redis", "Redis"),
+        (r"supabase|firebase", "Supabase / Firebase"),
+        (r"prisma", "Prisma ORM"),
+    ]
+    # Only check top-level files, not recursive (avoids node_modules, .git, venv etc.)
+    try:
+        for entry in os.listdir(workspace_path):
+            fpath = os.path.join(workspace_path, entry)
+            if os.path.isfile(fpath) and entry in (".env", ".env.example", "config.py", "database.php"):
+                content = open(fpath, encoding="utf-8").read().lower()
+                for pattern, db_name in patterns:
+                    if re.search(pattern, content):
+                        return db_name
+    except Exception:
+        pass
+    return None
+
+
+def _detect_frontend(workspace_path: str) -> list[str] | None:
+    frontend = []
+    pkg_file = os.path.join(workspace_path, "package.json")
+    if os.path.isfile(pkg_file):
+        try:
+            with open(pkg_file, "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            for dep in deps:
+                dl = dep.lower()
+                if "react" in dl and "React" not in frontend:
+                    frontend.append("React")
+                    if "next" in dl:
+                        frontend.append("Next.js")
+                if "vue" in dl and "Vue.js" not in frontend:
+                    frontend.append("Vue.js")
+                if "angular" in dl and "Angular" not in frontend:
+                    frontend.append("Angular")
+                if "svelte" in dl and "Svelte" not in frontend:
+                    frontend.append("Svelte")
+                if "vite" in dl and "Vite" not in frontend:
+                    frontend.append("Vite")
+                if "tailwind" in dl and "Tailwind CSS" not in frontend:
+                    frontend.append("Tailwind CSS")
+        except Exception:
+            pass
+
+    if os.path.isdir(os.path.join(workspace_path, "frontend")) and not frontend:
+        frontend.append("Frontend SPA")
+
+    return frontend if frontend else None
+
+
+def _detect_test_framework(workspace_path: str) -> str | None:
+    if os.path.isfile(os.path.join(workspace_path, "pytest.ini")):
+        return "pytest"
+    content = _read_file_lines(os.path.join(workspace_path, "pyproject.toml"))
+    if any("pytest" in line for line in content):
+        return "pytest"
+    pkg_file = os.path.join(workspace_path, "package.json")
+    if os.path.isfile(pkg_file):
+        try:
+            with open(pkg_file, "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            for dep in {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}:
+                dl = dep.lower()
+                if "jest" in dl:
+                    return "Jest"
+                if "vitest" in dl:
+                    return "Vitest"
+                if "playwright" in dl:
+                    return "Playwright"
+        except Exception:
+            pass
+    return None
+
+
+def _detect_architecture(workspace_path: str) -> list[str]:
+    arch = []
+    dirs = set()
+    try:
+        for entry in os.listdir(workspace_path):
+            if os.path.isdir(os.path.join(workspace_path, entry)):
+                dirs.add(entry.lower())
+    except Exception:
+        pass
+
+    if "src" in dirs:
+        arch.append("Source in `src/` directory")
+    if "frontend" in dirs or "client" in dirs:
+        arch.append("Separate frontend")
+    if "backend" in dirs or "api" in dirs:
+        arch.append("Separate backend")
+    if "routes" in dirs:
+        arch.append("Route-based API")
+    if "services" in dirs:
+        arch.append("Service layer")
+    if "agents" in dirs or ".deep_agents" in dirs:
+        arch.append("Multi-agent system")
+    if "tests" in dirs or "test" in dirs:
+        arch.append("Dedicated test directory")
+
+    return arch
+
+
+# ── Reading ──────────────────────────────────────────────────────────────────
+
+def load_project_memory(workspace_path: str) -> str:
+    """Read memory files and return formatted string for Zone 2 injection."""
+    mem_dir = _memory_path(workspace_path)
+    if not os.path.isdir(mem_dir):
+        return ""
+
+    parts = []
+    project = _read_file_safe(_project_file(workspace_path))
+    if project:
+        parts.append(project)
+
+    features = _read_file_safe(_features_file(workspace_path))
+    if features:
+        lines = features.strip().split("\n")
+        if len(lines) > 3:
+            parts.append(features)
+
+    if not parts:
+        return ""
+    return "\n\n---\n\n".join(parts)
+
+
+# ── Writing ──────────────────────────────────────────────────────────────────
+
+def update_feature(workspace_path: str, feature_name: str, description: str = "", file_refs: list[dict] | None = None) -> bool:
+    """Add or update a feature entry in features.md.
+    file_refs: [{"path": "file.py", "lines": "45-120", "purpose": "main logic"}, ...]
+    Description parameter is unused — only heading + file refs are written.
+    """
+    if file_refs is None:
+        file_refs = []
+    feat_file = _features_file(workspace_path)
+    _ensure_dir(_memory_path(workspace_path))
+
+    existing = _read_file_safe(feat_file)
+    lines = existing.split("\n") if existing else ["# Features", ""]
+
+    entry_lines = [""]
+    entry_lines.append(f"## {feature_name}")
+    for ref in file_refs:
+        path = ref.get("path", "")
+        lr = ref.get("lines", "")
+        purpose = ref.get("purpose", "")
+        if lr:
+            entry_lines.append(f"- `{path}:{lr}` — {purpose}")
+        else:
+            entry_lines.append(f"- `{path}` — {purpose}")
+    entry_lines.append("")
+
+    # Replace existing feature or append
+    heading = f"## {feature_name}"
+    if heading in lines:
+        start = lines.index(heading)
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if lines[i].startswith("## "):
+                end = i
+                break
+        lines = lines[:start] + entry_lines[1:] + lines[end:]
     else:
-        # Fallback to the client_request if the archivist skipped it
-        clean_req = client_request.strip()
-        if clean_req and is_valid_build_request(clean_req):
-            past_reqs = mem.setdefault("past_requests", [])
-            if not past_reqs or past_reqs[-1] != clean_req:
-                past_reqs.append(clean_req)
+        lines = lines + entry_lines[1:]
 
-    print(">> Memory: Done.")
-    save_memory(mem, project_path)
+    result = _write_file_safe(feat_file, "\n".join(lines))
+    if result:
+        print(f"[MEMORY] Updated feature: {feature_name}")
+    return result
 
-def compact_logs(log_text: str) -> str:
-    """Deterministic Python-based log compacter. Extracts key events and errors, eliminating LLM log compact calls."""
-    if not log_text:
-        return "(empty logs)"
-        
-    lines = log_text.splitlines()
-    cleaned = []
-    
-    # Track context around errors/tracebacks
-    keep_next_n = 0
-    
-    for line in lines:
-        line_str = line.strip()
-        if not line_str:
-            continue
-            
-        # Detect errors, tracebacks, exceptions
-        is_error_related = any(kw in line_str.lower() for kw in [
-            "traceback", "exception", "error", "fail", "stderr", "invalid syntax", "syntaxerror", "jsondecodeerror"
-        ])
-        
-        # Detect tool call notifications
-        is_tool_call = any(kw in line_str for kw in [
-            "[DEVELOPER] 🔧 Calling", "Calling run_command", "[OK]", "[WARNING]", "Tool '"
-        ])
-        
-        # Detect test statistics/outcomes
-        is_test_summary = any(kw in line_str.lower() for kw in [
-            "failed,", "passed,", "skipped in", "seconds ==="
-        ])
-        
-        if is_error_related or is_tool_call or is_test_summary:
-            cleaned.append(line)
-            # If it's a traceback start, keep the next 5 lines of context
-            if "traceback" in line_str.lower():
-                keep_next_n = 5
-        elif keep_next_n > 0:
-            cleaned.append(line)
-            keep_next_n -= 1
-            
-    # Join and limit size to prevent prompt bloating
-    output = "\n".join(cleaned)
-    if len(output) > 8000:
-        output = output[:4000] + "\n\n... [TRUNCATED LOG MIDDLE TO SAVE TOKENS] ...\n\n" + output[-4000:]
-        
-    return output
+
+_ALLOWED_PROJECT_SECTIONS = {
+    "Tech Stack", "Frontend", "Database", "Testing",
+    "Architecture", "Project Type", "Goals",
+}
+
+
+def update_project_meta(workspace_path: str, key: str, value: str) -> bool:
+    """Update a section in project.md. Only known sections allowed."""
+    if key not in _ALLOWED_PROJECT_SECTIONS:
+        print(f"[MEMORY] Ignored unknown section key: '{key}' — not in allowed list")
+        return False
+
+    proj_file = _project_file(workspace_path)
+    _ensure_dir(_memory_path(workspace_path))
+
+    existing = _read_file_safe(proj_file)
+    if not existing:
+        existing = "# Project Overview\n"
+    lines = existing.split("\n")
+
+    heading = f"## {key}"
+    new_section = [heading, value, ""]
+
+    if heading in lines:
+        start = lines.index(heading)
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if lines[i].startswith("## "):
+                end = i
+                break
+        lines = lines[:start] + new_section + lines[end:]
+    else:
+        lines = lines + [""] + new_section
+
+    result = _write_file_safe(proj_file, "\n".join(lines))
+    if result:
+        print(f"[MEMORY] Updated project.{key}")
+    return result
+
+
+# ── File helpers ─────────────────────────────────────────────────────────────
+
+def _read_file_safe(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _write_file_safe(path: str, content: str) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(f"[MEMORY] Error writing {path}: {e}")
+        return False
+
+
+# ── Convenience ──────────────────────────────────────────────────────────────
+
+def ensure_memory(workspace_path: str) -> str:
+    """Ensure memory exists (auto-generate if needed), return formatted content."""
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return ""
+    auto_generate_memory(workspace_path)
+    return load_project_memory(workspace_path)

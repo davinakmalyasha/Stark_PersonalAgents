@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 CHAT_MEMORY_PATH = r"d:\MyProject\LangChain\.deep_agents\chat_memory.json"
 

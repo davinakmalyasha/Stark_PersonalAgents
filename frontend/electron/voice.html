@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-app-region: drag;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.container {
+  background: rgba(15, 15, 18, 0.85);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  border-radius: 34px;
+  padding: 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5), 0 0 20px rgba(59,130,246,0.15);
+  -webkit-app-region: drag;
+  width: 260px;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: all 0.3s;
+}
+.dot.listening {
+  background: #ef4444;
+  box-shadow: 0 0 8px #ef4444;
+  animation: pulse 1s ease-in-out infinite;
+}
+.dot.idle {
+  background: #6b7280;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.1); }
+}
+.label {
+  color: #bfdbfe;
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.text {
+  color: #94a3b8;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+</style></head>
+<body>
+<div class="container">
+  <span id="dot" class="dot idle"></span>
+  <span id="label" class="label">Voice</span>
+  <span id="voice-text" class="text">Ctrl+G to toggle</span>
+</div>
+<script>
+  const dot = document.getElementById('dot');
+  const label = document.getElementById('label');
+  const text = document.getElementById('voice-text');
+</script>
+</body>
+</html>

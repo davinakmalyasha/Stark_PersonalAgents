@@ -1,10 +1,12 @@
-const { app, BrowserWindow, shell, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, dialog, ipcMain, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const { spawn } = require('child_process');
+const VOICE_HTML = path.join(__dirname, 'voice.html');
 
 let mainWindow;
+let voiceWindow;
 let apiProcess;
 
 const isDev = !app.isPackaged;
@@ -96,12 +98,79 @@ function createWindow() {
     return { action: 'deny' };
   });
 
+  // Grant microphone permission for voice mode
+  mainWindow.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
+    const allowed = ['media', 'microphone'];
+    callback(allowed.includes(permission));
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 }
 
-// ── IPC: Native folder picker ──
+// ── IPC: Voice floating window ──
+ipcMain.handle('voice-toggle', () => {
+  if (voiceWindow && !voiceWindow.isDestroyed()) {
+    voiceWindow.close();
+    voiceWindow = null;
+    return false;
+  }
+  const displays = screen.getAllDisplays();
+  const primary = displays.find(d => d.bounds.x === 0 && d.bounds.y === 0) || displays[0];
+  const wx = primary.bounds.x + primary.bounds.width - 300;
+  const wy = primary.bounds.y + 80;
+  voiceWindow = new BrowserWindow({
+    width: 280,
+    height: 68,
+    x: wx,
+    y: wy,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    focusable: false,
+    show: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  });
+  voiceWindow.loadFile(VOICE_HTML);
+  voiceWindow.on('closed', () => {
+    voiceWindow = null;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('voice-window-closed');
+    }
+  });
+  voiceWindow.showInactive();
+  return true;
+});
+
+ipcMain.on('voice-text', (_, text) => {
+  if (voiceWindow && !voiceWindow.isDestroyed()) {
+    const js = 'document.getElementById("voice-text").textContent = ' + JSON.stringify(text || '');
+    voiceWindow.webContents.executeJavaScript(js).catch(() => {});
+  }
+});
+
+ipcMain.on('voice-status', (_, status) => {
+  if (voiceWindow && !voiceWindow.isDestroyed()) {
+    if (status === 'listening') {
+      const js1 = 'document.getElementById("dot").className = "listening";';
+      const js2 = 'document.getElementById("label").textContent = "Listening...";';
+      voiceWindow.webContents.executeJavaScript(js1 + js2).catch(() => {});
+    } else {
+      const js1 = 'document.getElementById("dot").className = "idle";';
+      const js2 = 'document.getElementById("label").textContent = "Voice";';
+      voiceWindow.webContents.executeJavaScript(js1 + js2).catch(() => {});
+    }
+  }
+});
+
+// ── IPC: Native folder picker ──// ── IPC: Native folder picker ──
 ipcMain.handle('select-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
@@ -161,6 +230,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+  if (voiceWindow && !voiceWindow.isDestroyed()) voiceWindow.close();
   killApiProcess();
   if (process.platform !== 'darwin') app.quit();
 });

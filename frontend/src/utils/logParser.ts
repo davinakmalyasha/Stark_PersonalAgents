@@ -9,6 +9,7 @@ export interface TraceStep {
   toolName?: string;
   args?: string;
   isError?: boolean;
+  duration?: string;
 }
 
 export interface GroupedTraceStep {
@@ -18,6 +19,62 @@ export interface GroupedTraceStep {
   agent: string;
   steps: TraceStep[];
   isError?: boolean;
+}
+
+/** Max chars for tool output content — file contents can be huge; cap for the UI */
+const MAX_TOOL_CONTENT = 4000;
+
+export function normalizeAgentName(name: string): string {
+  const n = name.trim().toLowerCase();
+  if (n === 'developer' || n === 'dev') return 'Dev';
+  if (n === 'bsa' || n === 'ba' || n === 'business analyst' || n === 'businesssystemsanalyst') return 'BSA';
+  if (n === 'sdet' || n === 'qa' || n === 'critic' || n === 'evaluation') return 'SDET';
+  if (n === 'devsecops' || n === 'devops') return 'DevSecOps';
+  if (n === 'analytics') return 'Analytics';
+  if (n === 'designer' || n === 'ui/ux designer') return 'Designer';
+  if (n === 'supervisor' || n === 'orchestrator') return 'Supervisor';
+  return name;
+}
+
+/**
+ * Lines that should be silently skipped (not appended to any step's content).
+ * These are log-formatting / progress artefacts — the real tool data is captured
+ * by the "🔧 Calling" and "[TOOL OUTPUT]" lines.
+ */
+const SKIP_LINE_PATTERNS = [
+  // Developer action indicators (redundant with 🔧 Calling lines)
+  /^\[DEVELOPER\]\s+write\s/,          // "[DEVELOPER] write foo.ts (435B)"
+  /^\[DEVELOPER\]\s+read\s/,           // "[DEVELOPER] read foo.ts"
+  /^\[DEVELOPER\]\s+edit\s/,           // "[DEVELOPER] edit foo.ts"
+  /^\[DEVELOPER\]\s+run\s/,            // "[DEVELOPER] run npm test"
+  /^\[DEVELOPER\]\s+search\s/,         // "[DEVELOPER] search \"pattern\""
+  /^\[DEVELOPER\]\s+ls\s/,             // "[DEVELOPER] ls ."
+  /^\[DEVELOPER\]\s+delegate\s/,       // "[DEVELOPER] delegate BSA"
+  /^\[DEVELOPER\]\s+async\s/,          // "[DEVELOPER] async BSA"
+  /^\[DEVELOPER\]\s+=>\s/,             // "[DEVELOPER]   => foo.ts #1-10/20"
+  /^\[DEVELOPER\]\s+Response\s*\(/,    // "[DEVELOPER] Response (94 chars)"
+  /^\[DEVELOPER\]\s+âœ…\s+Agent finished/, // Agent finished status line
+  // Tool output metadata (real content is in the [TOOL OUTPUT] line)
+  /^\[FILE\]\s+/,                       // "[FILE] backend/src/foo.ts (lines 1-15 of 15)"
+  /^\[OK\]\s+/,                         // "[OK] Wrote backend/src/foo.ts (15 lines, 435 chars)"
+  // Iteration / progress markers
+  /^\[DEV\s+Iteration\s+\d+\/\d+\]/,   // "[DEV Iteration 10/50]"
+  /^\[Developer\]\s+Iter\s+\d+\/\d+:/, // "[Developer] Iter 10/50: write foo.ts"
+  /^\[ORCH\s+Iteration\s+\d+\/\d+\]/, // "[ORCH Iteration 10/20]"
+  // Separators & status
+  /^={10,}/,                            // "==============" separator lines
+];
+
+function isSkippableLine(line: string): boolean {
+  for (const pattern of SKIP_LINE_PATTERNS) {
+    if (pattern.test(line)) return true;
+  }
+  return false;
+}
+
+function truncateContent(content: string, maxLen: number): string {
+  if (content.length <= maxLen) return content;
+  return content.substring(0, maxLen) + `\n... (truncated ${content.length - maxLen} chars)`;
 }
 
 /** Parses the full raw live_terminal_log into steps and final response */
@@ -36,14 +93,14 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
     // Check for agent headers like "--- [BA AGENT] ---"
     const agentHeaderMatch = trimmed.match(/^---\s+\[(\w+)\s+AGENT\]\s+---$/i);
     if (agentHeaderMatch) {
-      activeAgent = agentHeaderMatch[1];
+      activeAgent = normalizeAgentName(agentHeaderMatch[1]);
       continue;
     }
 
     // Check for thoughts like "[DEVELOPER THOUGHTS] >> reasoning content"
     const thoughtMatch = trimmed.match(/^\[(\w+)\s+THOUGHTS\]\s+>>\s+(.*)$/i);
     if (thoughtMatch) {
-      activeAgent = thoughtMatch[1];
+      activeAgent = normalizeAgentName(thoughtMatch[1]);
       currentStep = {
         id: `step-${stepCounter++}`,
         type: 'thought',
@@ -56,34 +113,39 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
     }
 
     if (trimmed.startsWith('[THOUGHT]')) {
-      const match = trimmed.match(/^\[THOUGHT\]\s+\[([^\]]+)\]\s+(.*)$/);
+      const match = trimmed.match(/^\[THOUGHT(?:[:\s]+(\d+s?))?\]\s+\[([^\]]+)\]\s+(.*)$/);
       if (match) {
-        activeAgent = match[1];
+        const duration = match[1];
+        activeAgent = normalizeAgentName(match[2]);
         currentStep = {
           id: `step-${stepCounter++}`,
           type: 'thought',
           agent: activeAgent,
           title: `${activeAgent} Thought`,
-          content: match[2],
+          content: match[3],
+          duration,
         };
         steps.push(currentStep);
       }
-    } else if (trimmed.startsWith('🧠')) {
-      // Real-time developer status messages
-      const match = trimmed.match(/^🧠\s+(\w+):\s+(.*)$/);
+    } else if (trimmed.startsWith('[THINKING]')) {
+      // [THINKING] Agent: reasoning — real-time developer status messages
+      const match = trimmed.match(/^\[THINKING(?:[:\s]+(\d+s?))?\]\s+(\w+):\s+(.*)$/);
       if (match) {
-        activeAgent = match[1];
+        const duration = match[1];
+        activeAgent = normalizeAgentName(match[2]);
         currentStep = {
           id: `step-${stepCounter++}`,
           type: 'thought',
           agent: activeAgent,
           title: `${activeAgent} Thinking`,
-          content: match[2],
+          content: match[3],
+          duration,
         };
         steps.push(currentStep);
       }
-    } else if (trimmed.includes('🔧 Calling')) {
-      const match = trimmed.match(/🔧 Calling\s+(\w+)\((.*)\)/);
+    } else if (trimmed.startsWith('[TOOL_CALL]')) {
+      // [TOOL_CALL] tool_name(args)
+      const match = trimmed.match(/^\[TOOL_CALL\]\s+(\w+)\((.*)\)$/);
       if (match) {
         const tool = match[1];
         let args = match[2];
@@ -92,13 +154,14 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         // Try to parse as JSON for cleaner field extraction and specialized task titles
         try {
           const parsed = JSON.parse(args);
-          args = JSON.stringify(parsed);
           if ((tool === 'task' || tool === 'start_async_task') && parsed.name) {
+            parsed.name = normalizeAgentName(parsed.name);
             const subagentName = parsed.name;
-            displayTitle = tool === 'task' 
-              ? `Delegating to ${subagentName}` 
+            displayTitle = tool === 'task'
+              ? `Delegating to ${subagentName}`
               : `Spawning async ${subagentName}`;
           }
+          args = JSON.stringify(parsed);
         } catch {
           // Not valid JSON — keep raw args string but truncate if huge
           if (args.length > 500) args = args.substring(0, 500) + '...';
@@ -122,17 +185,18 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         const toolName = match[1];
         const resultPreview = match[2];
         if (currentStep && currentStep.toolName === toolName) {
-          currentStep.content = resultPreview;
+          currentStep.content = truncateContent(resultPreview, MAX_TOOL_CONTENT);
         }
       }
     } else if (
       trimmed.startsWith('[ORCH Iteration') ||
+      trimmed.startsWith('[ORCHESTRATOR]') ||
       trimmed.startsWith('[Orchestrator]') ||
-      trimmed.startsWith('🤖 Supervisor:')
+      trimmed.startsWith('[THINKING] Supervisor:')
     ) {
       currentStep = null;
-    } else if (trimmed.startsWith('🤖 Assistant:')) {
-      assistantResponse = trimmed.slice(13).trim();
+    } else if (trimmed.startsWith('[ASSISTANT]')) {
+      assistantResponse = trimmed.slice(12).trim();
       currentStep = null;
     } else if (trimmed.startsWith('[ORCHESTRATOR] Summary:')) {
       assistantResponse = trimmed.slice(23).trim();
@@ -140,15 +204,25 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
     } else if (trimmed.startsWith('[DEVELOPER] Summary:')) {
       assistantResponse = trimmed.slice(20).trim();
       currentStep = null;
-    } else if (trimmed.startsWith('🤖 Supervisor:')) {
+    } else if (trimmed.startsWith('[THINKING] Supervisor:')) {
       currentStep = null;
-    } else if (trimmed.startsWith('👤 User:') || trimmed.startsWith('🧹 Session')) {
+    } else if (trimmed.startsWith('[USER]') || trimmed.startsWith('[SESSION]')) {
       currentStep = null;
     } else {
+      // Catch-all: only append to assistantResponse, never to a step.
+      // Previously this appended everything to currentStep.content, which
+      // caused tool results / file contents / dev log lines to bleed into
+      // thought bubbles and create massive unreadable DOM nodes.
       if (assistantResponse !== null && currentStep === null) {
         assistantResponse += '\n' + trimmed;
-      } else if (currentStep) {
+      } else if (currentStep && !isSkippableLine(trimmed)) {
+        // Only append if it looks like actual content (not log metadata)
         currentStep.content += (currentStep.content ? '\n' : '') + trimmed;
+        // Cap tool output content (file contents can be enormous).
+        // Thought content is not capped — the UI has overflow scroll.
+        if (currentStep.type !== 'thought' && currentStep.content.length > MAX_TOOL_CONTENT) {
+          currentStep.content = truncateContent(currentStep.content, MAX_TOOL_CONTENT);
+        }
         if (currentStep.content.includes('[ERR]') || currentStep.content.includes('Error:')) {
           currentStep.isError = true;
         }
@@ -167,13 +241,29 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
 
   for (const step of steps) {
     if (step.type === 'tool') {
+      // Delegation calls must never be grouped as exploration — treat as standalone
+      const isDelegation = step.toolName === 'task' || step.toolName === 'start_async_task';
+      if (isDelegation) {
+        currentGroup = {
+          id: step.id,
+          type: 'system',
+          title: step.title,
+          agent: step.agent,
+          steps: [step],
+          isError: step.isError,
+        };
+        grouped.push(currentGroup);
+        currentGroup = null; // break any open group
+        continue;
+      }
+
       const isEdit = step.toolName === 'write_file' || step.toolName === 'edit_file';
       const expectedType = isEdit ? 'edit' : 'exploration';
 
       if (currentGroup && currentGroup.type === expectedType) {
         currentGroup.steps.push(step);
         if (step.isError) currentGroup.isError = true;
-        
+
         // Update title with count
         const count = currentGroup.steps.length;
         currentGroup.title = isEdit
@@ -205,4 +295,28 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
   }
 
   return grouped;
+}
+
+/**
+ * Orchestrator-only steps for the main chat.
+ *
+ * The main chat should only display orchestrator-level actions:
+ * delegation (task / start_async_task), supervisor thoughts, and
+ * final summaries. Subagent tool calls (read_file, write_file, run_command,
+ * search_code, etc.) belong in the canvas subagent drawer, not the main chat.
+ *
+ * Steps from the Supervisor/Orchestrator agent + any task delegation
+ * tool call are kept; everything else is stripped.
+ */
+export function filterOrchestratorSteps(steps: TraceStep[]): TraceStep[] {
+  return steps.filter((s) => {
+    // Always keep Supervisor / Orchestrator thoughts
+    if (s.agent === 'Supervisor' || s.agent === 'Orchestrator') return true;
+
+    // Keep delegation calls regardless of which agent issued them
+    if (s.toolName === 'task' || s.toolName === 'start_async_task') return true;
+
+    // Subagent internals — drop
+    return false;
+  });
 }

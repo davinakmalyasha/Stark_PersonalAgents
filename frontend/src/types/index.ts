@@ -25,6 +25,7 @@ export interface AgentOutputs {
   requirements: string;
   tech_spec: string;
   code: string;
+  agent_report?: string;
   test_report: string;
   devops_config: string;
   analytics_report: string;
@@ -46,6 +47,9 @@ export interface AppState {
   selected_model: string;
   selected_temp: number;
   token_usage: TokenUsage;
+  /** Present when the backend completed with a provider or pipeline error. */
+  error?: string;
+  traceback?: string;
 }
 
 export interface ModelOption {
@@ -63,6 +67,7 @@ export interface WorkspaceInfo {
   exists: boolean;
   chatCount: number;
   addedAt: string;
+  isGeneral?: boolean;
 }
 
 export interface ChatSummary {
@@ -93,6 +98,40 @@ export interface ChatMessage {
   duration?: string;
   isCollapsible?: boolean;
   metadata?: Record<string, unknown>;
+}
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  url?: string;
+  isImage: boolean;
+}
+
+export type TaskMode = 'immediate' | 'saved' | 'scheduled';
+export type TaskStatus = 'ready' | 'scheduled' | 'running' | 'completed' | 'failed';
+export type TaskRecurrence = 'none' | 'daily' | 'weekly' | 'monthly';
+
+export interface TaskSchedule {
+  nextRunAt?: string;
+  recurrence: TaskRecurrence;
+}
+
+export interface AgentTask {
+  id: string;
+  workspaceId: string;
+  chatId: string;
+  prompt: string;
+  attachments: ChatAttachment[];
+  mode: TaskMode;
+  status: TaskStatus;
+  schedule?: TaskSchedule;
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt?: string;
+  completedAt?: string;
+  error?: string;
 }
 
 export interface UserProfile {

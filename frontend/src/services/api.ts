@@ -1,6 +1,6 @@
 // ── Antigravity 2.0 API Client ──
 
-import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules } from '../types';
+import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules, ChatAttachment, AgentTask, TaskSchedule } from '../types';
 
 const API_BASE = '/api';
 
@@ -127,6 +127,58 @@ export async function addChatMessage(
   return res.json();
 }
 
+export async function uploadChatAttachments(workspaceId: string, chatId: string, files: File[]): Promise<ChatAttachment[]> {
+  const body = new FormData();
+  files.forEach((file) => body.append('files', file, file.name));
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/attachments`, {
+    method: 'POST', body,
+  });
+  if (!res.ok) throw new Error('Unable to upload attachment');
+  const data = await res.json();
+  return data.attachments ?? [];
+}
+
+export async function fetchTasks(workspaceId: string, chatId: string): Promise<AgentTask[]> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function createTask(workspaceId: string, chatId: string, payload: { prompt: string; attachments: ChatAttachment[]; mode: 'saved' | 'scheduled'; schedule?: TaskSchedule }): Promise<AgentTask> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error('Failed to create task');
+  return res.json();
+}
+
+export async function startTask(workspaceId: string, chatId: string, taskId: string): Promise<AgentTask> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}/start`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to start task');
+  return res.json();
+}
+
+export async function updateTaskStatus(workspaceId: string, chatId: string, taskId: string, status: AgentTask['status']): Promise<AgentTask> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }),
+  });
+  if (!res.ok) throw new Error('Failed to update task');
+  return res.json();
+}
+
+export async function updateTask(workspaceId: string, chatId: string, taskId: string, payload: Partial<Pick<AgentTask, 'prompt' | 'attachments' | 'mode' | 'schedule' | 'status'>>): Promise<AgentTask> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error('Failed to update task');
+  return res.json();
+}
+
+export async function deleteTask(workspaceId: string, chatId: string, taskId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error('Failed to delete task');
+}
+
 export async function updateChatTitle(workspaceId: string, chatId: string, title: string): Promise<void> {
   await fetch(
     `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/title`,
@@ -186,14 +238,29 @@ export function streamPipeline(
   onError: (err: string) => void,
   workspacePath: string = '',
   chatId: string = '',
+  attachments: ChatAttachment[] = [],
 ): AbortController {
   const controller = new AbortController();
   console.log('[streamPipeline] Starting fetch to /api/run, prompt:', prompt, 'model:', model);
 
+  // A failed state may be followed by a normal-looking `done` event. Keep
+  // completion and error mutually exclusive so failures cannot look successful.
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    onDone();
+  };
+  const fail = (message: string) => {
+    if (settled) return;
+    settled = true;
+    onError(message);
+  };
+
   fetch(`${API_BASE}/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, model, temperature, workspace_path: workspacePath, chat_id: chatId }),
+    body: JSON.stringify({ prompt, model, temperature, workspace_path: workspacePath, chat_id: chatId, attachments }),
     signal: controller.signal,
   })
     .then(async (res) => {
@@ -201,13 +268,13 @@ export function streamPipeline(
       if (!res.ok) {
         const txt = await res.text().catch(() => '');
         console.error('[streamPipeline] HTTP error:', res.status, txt);
-        onError(`HTTP ${res.status}: ${txt}`);
+        fail(`HTTP ${res.status}: ${txt}`);
         return;
       }
       const reader = res.body?.getReader();
       console.log('[streamPipeline] Reader obtained:', !!reader);
       if (!reader) {
-        onError('No response body');
+        fail('No response body');
         return;
       }
       const decoder = new TextDecoder();
@@ -222,16 +289,18 @@ export function streamPipeline(
             if (buffer.startsWith('data: ')) {
               try {
                 const parsed = JSON.parse(buffer.slice(6).trim());
-                onState(parsed as AppState);
+                if (parsed.error) fail(parsed.error);
+                else onState(parsed as AppState);
               } catch { /* skip */ }
             } else if (buffer.startsWith('event: done')) {
-              onDone();
+              finish();
             } else {
               // Fallback: treat as data if it starts with '{'
               try {
                 const parsed = JSON.parse(buffer.trim());
                 if (parsed.active_node) {
-                  onState(parsed as AppState);
+                  if (parsed.error) fail(parsed.error);
+                  else onState(parsed as AppState);
                 }
               } catch { /* skip */ }
             }
@@ -245,21 +314,26 @@ export function streamPipeline(
           if (line.startsWith('event: ')) {
             currentEvent = line.slice(7).trim();
             console.log('[streamPipeline] Event:', currentEvent);
-            if (currentEvent === 'done') {
-              onDone();
-            }
             continue;
           }
           if (line.startsWith('data: ')) {
-            // Skip data lines for 'done' events — they contain {"status":"complete"}, not AppState
-            if (currentEvent === 'done') {
-              console.log('[streamPipeline] Skipping done data line');
-              continue;
-            }
             try {
               const parsed = JSON.parse(line.slice(6).trim());
-              console.log('[streamPipeline] State received, active_node:', parsed.active_node);
-              onState(parsed as AppState);
+              if (currentEvent === 'done') {
+                console.log('[streamPipeline] Done payload:', parsed.status);
+                if (parsed.status === 'error') {
+                  fail(parsed.error || 'The agent pipeline failed. Check the backend logs for details.');
+                } else {
+                  finish();
+                }
+              } else if (parsed.error) {
+                console.error('[streamPipeline] Backend pipeline error:', parsed.error);
+                onState(parsed as AppState);
+                fail(parsed.error);
+              } else {
+                console.log('[streamPipeline] State received, active_node:', parsed.active_node);
+                onState(parsed as AppState);
+              }
               currentEvent = '';
             } catch {
               console.log('[streamPipeline] JSON parse error for line:', line);
@@ -271,12 +345,12 @@ export function streamPipeline(
         }
       }
       console.log('[streamPipeline] Calling onDone...');
-      onDone();
+      finish();
     })
     .catch((err) => {
       console.error('[streamPipeline] Fetch error:', err.name, err.message);
       if (err.name !== 'AbortError') {
-        onError(err.message ?? String(err));
+        fail(err.message ?? String(err));
       }
     });
 

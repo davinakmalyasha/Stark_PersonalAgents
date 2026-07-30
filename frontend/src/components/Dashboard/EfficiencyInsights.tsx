@@ -1,3 +1,4 @@
+import { TrendingUp, AlertTriangle, Lightbulb, CheckCircle2 } from 'lucide-react';
 import type { TokenUsage } from '../../types';
 
 interface EfficiencyInsightsProps {
@@ -48,44 +49,78 @@ export function EfficiencyInsights({ tokenUsage }: EfficiencyInsightsProps) {
   const costPercentage = totalCost > 0 ? (maxCost / totalCost) * 100 : 0;
 
   return (
-    <div className="p-3 rounded-lg border text-xs space-y-2.5"
-         style={{ backgroundColor: 'var(--bg-secondary)', borderColor: 'var(--border-color)' }}>
-      <div className="font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--accent)' }}>
-        <span>📊</span> Cost & Cache Efficiency Insights
+    <div 
+      className="text-xs flex flex-col"
+      style={{
+        padding: '20px',
+        borderRadius: '12px',
+        border: '1px solid rgba(255, 255, 255, 0.08)',
+        backgroundColor: 'rgba(255, 255, 255, 0.02)',
+        gap: '16px'
+      }}
+    >
+      <div className="font-bold uppercase tracking-wider flex items-center gap-2 text-indigo-400">
+        <TrendingUp size={16} /> Cost &amp; Cache Efficiency Insights
       </div>
-      <div className="space-y-2">
+      <div className="flex flex-col" style={{ gap: '14px' }}>
         {maxCost > 0 && (
-          <div className="flex gap-2 items-start">
-            <span className="text-amber-500">⚠️</span>
+          <div 
+            className="flex gap-2.5 items-start"
+            style={{
+              padding: '12px',
+              borderLeft: '3px solid #f59e0b',
+              backgroundColor: 'rgba(245, 158, 11, 0.04)',
+              borderRadius: '0 8px 8px 0'
+            }}
+          >
+            <AlertTriangle size={16} className="text-amber-500 flex-shrink-0" style={{ marginTop: '2px' }} />
             <div>
-              <span className="font-semibold">Primary Cost Driver: </span>
-              <span className="opacity-90">
-                The <strong className="capitalize text-zinc-100">{maxCostAgent}</strong> agent is responsible for{' '}
-                <strong className="text-amber-400">{costPercentage.toFixed(0)}%</strong> of the total run cost (${maxCost.toFixed(5)}).
-              </span>
+              <div className="font-bold text-amber-400 tracking-wide mb-0.5">Primary Cost Driver</div>
+              <p className="text-zinc-300 leading-relaxed">
+                The <strong className="capitalize text-zinc-100 font-semibold">{maxCostAgent}</strong> agent is responsible for{' '}
+                <strong className="text-amber-400 font-bold">{costPercentage.toFixed(0)}%</strong> of the total run cost (${maxCost.toFixed(5)}).
+              </p>
             </div>
           </div>
         )}
         {minRatioAgent && minRatio < 60 && (
-          <div className="flex gap-2 items-start">
-            <span className="text-blue-400">💡</span>
+          <div 
+            className="flex gap-2.5 items-start"
+            style={{
+              padding: '12px',
+              borderLeft: '3px solid #3b82f6',
+              backgroundColor: 'rgba(59, 130, 246, 0.04)',
+              borderRadius: '0 8px 8px 0'
+            }}
+          >
+            <Lightbulb size={16} className="text-blue-400 flex-shrink-0" style={{ marginTop: '2px' }} />
             <div>
-              <span className="font-semibold">Cache Miss Inefficiency: </span>
-              <span className="opacity-90">
-                <strong className="capitalize text-zinc-100">{minRatioAgent}</strong> has a low prompt cache hit rate of{' '}
-                <strong className="text-red-400">{minRatio.toFixed(1)}%</strong>.
+              <div className="font-bold text-blue-400 tracking-wide mb-0.5">Cache Miss Inefficiency</div>
+              <p className="text-zinc-300 leading-relaxed">
+                <strong className="capitalize text-zinc-100 font-semibold">{minRatioAgent}</strong> has a low prompt cache hit rate of{' '}
+                <strong className="text-red-400 font-bold">{minRatio.toFixed(1)}%</strong>.
                 {minRatioAgent === 'developer' && ' Use partial reads (`offset`/`limit`) or `view_signatures` first to reuse prompt prefixes.'}
                 {minRatioAgent === 'tester (qa)' && ' Traceback logs are too large. Log compactors/cleaners are critical.'}
-              </span>
+              </p>
             </div>
           </div>
         )}
         {(!minRatioAgent || minRatio >= 60) && maxCost > 0 && (
-          <div className="flex gap-2 items-start">
-            <span className="text-emerald-400">✓</span>
+          <div 
+            className="flex gap-2.5 items-start"
+            style={{
+              padding: '12px',
+              borderLeft: '3px solid #10b981',
+              backgroundColor: 'rgba(16, 185, 129, 0.04)',
+              borderRadius: '0 8px 8px 0'
+            }}
+          >
+            <CheckCircle2 size={16} className="text-emerald-400 flex-shrink-0" style={{ marginTop: '2px' }} />
             <div>
-              <span className="font-semibold text-emerald-400">Optimal Cache Performance:</span>{' '}
-              <span className="opacity-90">All agents are utilizing DeepSeek KV cache hits efficiently (&gt;60% hit ratio). Prefix reuse is working perfectly.</span>
+              <div className="font-bold text-emerald-400 tracking-wide mb-0.5">Optimal Cache Performance</div>
+              <p className="text-zinc-300 leading-relaxed">
+                All agents are utilizing DeepSeek KV cache hits efficiently (&gt;60% hit ratio). Prefix reuse is working perfectly.
+              </p>
             </div>
           </div>
         )}

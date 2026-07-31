@@ -1,13 +1,13 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
+import { Zap } from 'lucide-react';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
-import SettingsModal from './components/Layout/SettingsModal';
 import TokenStatsModal from './components/Layout/TokenStatsModal';
 import { usePipeline } from './hooks/usePipeline';
-import { fetchModels, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats } from './services/api';
-import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState } from './types';
-import { parseLogToSteps } from './utils/logParser';
+import { fetchModels, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus } from './services/api';
+import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment, AgentTask } from './types';
+import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
 
 const WELCOME_MESSAGES: ChatMessage[] = [
   {
@@ -27,25 +27,25 @@ export default function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceInfo | null>(null);
   const [activeChat, setActiveChat] = useState<ChatData | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isTokenStatsOpen, setIsTokenStatsOpen] = useState(false);
 
   const [model, setModel] = useState('Automatic Fallback');
   const [temperature] = useState(0.7);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
 
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
+  const activeTaskRef = useRef<string | null>(null);
 
+  // Init: fetch models + workspaces on mount
   useEffect(() => {
     fetchModels().then((m) => { if (m.length) setModels(m); }).catch(() => {});
-    
-    // Auto-select first workspace and chat on mount
     fetchWorkspaces().then(async (ws) => {
       if (ws.length > 0) {
-        // Find if there is a saved workspace or just use the first one
-        const initialWs = ws[0];
+        const general = ws.find((w) => w.isGeneral);
+        const initialWs = general || ws[0];
         setActiveWorkspace(initialWs);
         try {
           const chats = await fetchChats(initialWs.id);
@@ -55,7 +55,7 @@ export default function App() {
             setMessages(chat.messages.length > 0 ? chat.messages : [{
               id: `sys-${Date.now()}`,
               role: 'system',
-              content: `Chat ready in ${initialWs.name}. What would you like to build?`,
+              content: initialWs.isGeneral ? 'Connected. How can I help you?' : `Chat ready in ${initialWs.name}. What would you like to build?`,
               timestamp: new Date().toISOString(),
             }]);
           }
@@ -63,53 +63,26 @@ export default function App() {
           console.error('[App] Failed to auto-load chats:', err);
         }
       }
-    }).catch(() => {});
-
-    // Expose direct API test for debugging — call window.testApi() in DevTools console
-    (window as any).testApi = async (prompt = 'hello') => {
-      console.log('[testApi] Sending direct request to /api/run, prompt:', prompt);
-      try {
-        const res = await fetch('/api/run', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, model: 'Automatic Fallback', temperature: 0.7 }),
-        });
-        console.log('[testApi] Response status:', res.status);
-        const reader = res.body?.getReader();
-        if (!reader) { console.error('[testApi] No reader'); return; }
-        const decoder = new TextDecoder();
-        let buffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) { console.log('[testApi] Stream ended, buffer:', buffer); break; }
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const parsed = JSON.parse(line.slice(6));
-                console.log('[testApi] State:', parsed);
-              } catch (e) { console.log('[testApi] Parse error:', e); }
-            }
-            if (line.startsWith('event: done')) {
-              console.log('[testApi] DONE event');
-            }
-          }
-        }
-      } catch (err) {
-        console.error('[testApi] Fetch error:', err);
-      }
-    };
-    console.log('[VinCode] testApi() registered — call window.testApi() in console to test API directly');
+    }).catch(() => {})
+      .finally(() => {
+        setTimeout(() => setIsInitialLoading(false), 600);
+      });
   }, []);
 
-  // ── Handle pipeline completion persistence and synchronization ──
   useEffect(() => {
     if (isRunning) {
       wasRunning.current = true;
     } else if (wasRunning.current) {
       wasRunning.current = false;
+      // Backend/provider failures also end the stream, but they must not be
+      // persisted as completed runs or empty assistant traces.
+      if (state?.error) {
+        return;
+      }
+      if (activeTaskRef.current && activeWorkspace && activeChat) {
+        updateTaskStatus(activeWorkspace.id, activeChat.id, activeTaskRef.current, 'completed').catch(() => {});
+        activeTaskRef.current = null;
+      }
       if (activeWorkspace && activeChat) {
         console.log('[App] Pipeline run completed. Saving trace and final response...');
         setIsPersisting(true);
@@ -119,17 +92,25 @@ export default function App() {
             const log = state?.live_terminal_log;
             if (log) {
               const { steps, assistantResponse } = parseLogToSteps(log);
+              // General mode stores the final text in outputs rather than the
+              // terminal log. Use it as the same unified trace response.
+              const finalResponse = assistantResponse || state?.outputs?.agent_report || '';
               const duration = runStartTime.current
                 ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
                 : undefined;
-              
+
+              // Main chat only shows orchestrator-level actions (delegation,
+              // supervisor thoughts, final summary). Subagent tool calls
+              // belong in the canvas subagent drawer, not here.
+              const chatSteps = filterOrchestratorSteps(steps);
+
               // Save a single unified agent message with trace metadata
               await addChatMessage(
                 activeWorkspace.id,
                 activeChat.id,
                 'agent',
-                assistantResponse || 'Task complete.',
-                { isTrace: true, steps, duration }
+                finalResponse,
+                { isTrace: true, steps: chatSteps, duration }
               );
             }
             // Now re-fetch to sync messages and token stats
@@ -150,6 +131,10 @@ export default function App() {
 
   useEffect(() => {
     if (!error) return;
+    if (activeTaskRef.current && activeWorkspace && activeChat) {
+      updateTaskStatus(activeWorkspace.id, activeChat.id, activeTaskRef.current, 'failed').catch(() => {});
+      activeTaskRef.current = null;
+    }
     const errMsg: ChatMessage = { id: `error-${Date.now()}`, role: 'error', content: error, timestamp: new Date().toISOString() };
     setMessages((prev) => [...prev, errMsg]);
     if (activeWorkspace && activeChat) {
@@ -159,11 +144,11 @@ export default function App() {
 
   // ── Handlers ──
 
-  const handleSend = useCallback(async (prompt: string) => {
+  const handleSend = useCallback(async (prompt: string, files: File[] = []) => {
     console.log('[App.handleSend] called with prompt=%o activeWorkspace=%o activeChat=%o', prompt, activeWorkspace, activeChat);
     setNotification(null);
 
-    // Resolve workspace — auto-select first available if none is active
+    // Resolve workspace — auto-select General or first available
     let ws = activeWorkspace;
 
     if (!ws) {
@@ -172,10 +157,12 @@ export default function App() {
         const workspaces = await fetchWorkspaces();
         console.log('[App.handleSend] workspaces fetched:', workspaces);
         if (workspaces.length === 0) {
-          setNotification('No project folder yet. Add one from the sidebar — click the folder+ icon next to "Projects".');
+          setNotification('No chat available. Try restarting the server.');
           return;
         }
-        ws = workspaces[0];
+        // Prefer General workspace for non-folder chat
+        const general = workspaces.find((w) => w.isGeneral);
+        ws = general || workspaces[0];
         setActiveWorkspace(ws);
         console.log('[App.handleSend] auto-selected workspace:', ws);
       } catch (err) {
@@ -199,7 +186,9 @@ export default function App() {
           setMessages(chat.messages.length > 0 ? chat.messages : [{
             id: `sys-${Date.now()}`,
             role: 'system',
-            content: `Chat ready in ${ws.name}. What would you like to build?`,
+            content: ws.isGeneral
+              ? 'Connected. How can I help you?'
+              : `Chat ready in ${ws.name}. What would you like to build?`,
             timestamp: new Date().toISOString(),
           }]);
           console.log('[App.handleSend] loaded existing chat:', chat);
@@ -210,7 +199,9 @@ export default function App() {
           setMessages([{
             id: `sys-${Date.now()}`,
             role: 'system',
-            content: `Chat ready in ${ws.name}. What would you like to build?`,
+            content: ws.isGeneral
+              ? 'Connected. How can I help you?'
+              : `Chat ready in ${ws.name}. What would you like to build?`,
             timestamp: new Date().toISOString(),
           }]);
           console.log('[App.handleSend] created new chat:', chat);
@@ -224,18 +215,207 @@ export default function App() {
 
     // ── Send the message ──
     console.log('[App.handleSend] sending message, ws=%o chat=%o', ws, chat);
+    let attachments: ChatAttachment[] = [];
+    if (files.length) {
+      try {
+        attachments = await uploadChatAttachments(ws.id, chat.id, files);
+      } catch (err) {
+        console.error('[App] attachment upload failed:', err);
+        setNotification('Your files could not be uploaded. Please try again.');
+        return;
+      }
+    }
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
       content: prompt,
       timestamp: new Date().toISOString(),
+      metadata: attachments.length ? { attachments } : undefined,
     };
     setMessages((prev) => [...prev, userMsg]);
-    addChatMessage(ws.id, chat.id, 'user', prompt).catch(() => {});
+
+    // Auto-name if the chat title is 'New Conversation' or empty
+    if (chat && (chat.title === 'New Conversation' || !chat.title)) {
+      let cleanTitle = prompt.trim();
+      if (cleanTitle.startsWith('/')) {
+        // Remove slash commands (e.g. "/goal build app" -> "build app")
+        cleanTitle = cleanTitle.replace(/^\/\w+\s*/, '');
+      }
+      cleanTitle = cleanTitle.slice(0, 32).trim();
+      if (prompt.length > 32) cleanTitle += '...';
+      if (cleanTitle) {
+        updateChatTitle(ws.id, chat.id, cleanTitle).catch(console.error);
+        chat.title = cleanTitle;
+        setActiveChat({ ...chat });
+      }
+    }
+
     console.log('[App.handleSend] calling run...');
     runStartTime.current = Date.now();
-    run(prompt, model, temperature, ws.path, chat.id);
+    run(prompt, model, temperature, ws.path, chat.id, attachments);
   }, [run, model, temperature, activeWorkspace, activeChat]);
+
+  const handleRunTask = useCallback((task: AgentTask) => {
+    if (!activeWorkspace || !activeChat || isRunning) return false;
+    activeTaskRef.current = task.id;
+    const userMsg: ChatMessage = {
+      id: `task-${task.id}-${Date.now()}`,
+      role: 'user',
+      content: task.prompt,
+      timestamp: new Date().toISOString(),
+      metadata: { taskId: task.id, attachments: task.attachments },
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    runStartTime.current = Date.now();
+    run(task.prompt, model, temperature, activeWorkspace.path, activeChat.id, task.attachments);
+    return true;
+  }, [activeWorkspace, activeChat, isRunning, run, model, temperature]);
+  // ── Voice mode: round-based recording + Whisper ──
+  const [isVoiceMode, setIsVoiceMode] = useState(false);
+  const [voiceInputText, setVoiceInputText] = useState('');
+  const isVoiceRef = useRef(false);
+  const streamRef = useRef<MediaStream | null>(null);
+  const accumulatedRef = useRef('');
+
+  // Keep a ref to handleSend for use inside async callbacks
+  const handleSendRef = useRef(handleSend);
+  handleSendRef.current = handleSend;
+
+  const stopVoice = useCallback(() => {
+    isVoiceRef.current = false;
+    setIsVoiceMode(false);
+    setVoiceInputText('');
+    accumulatedRef.current = '';
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    const ag = (window as any).antigravity;
+    if (ag?.voiceToggle) ag.voiceToggle();
+    if (ag?.voiceStatus) ag.voiceStatus('idle');
+  }, []);
+
+  // Record one 2.5s chunk, transcribe it, then decide what to do next
+  const recordRound = useCallback(async () => {
+    if (!isVoiceRef.current || !streamRef.current) return;
+
+    const recorder = new MediaRecorder(streamRef.current, {
+      mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus' : 'audio/webm',
+    });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e: BlobEvent) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.start();
+
+    // Record for 2.5 seconds
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, 2500);
+      recorder.onstop = () => { clearTimeout(timer); resolve(undefined); };
+    });
+
+    if (recorder.state !== 'inactive') {
+      recorder.stop();
+      // Wait for remaining ondataavailable
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    // Restart round timer if still active
+    if (!isVoiceRef.current) return;
+
+    // Build blob and transcribe
+    const blob = new Blob(chunks, { type: 'audio/webm' });
+    if (blob.size < 500) {
+      // Empty/silent round → send accumulated text after ~2.5s of silence
+      const text = accumulatedRef.current.trim();
+      if (text && isVoiceRef.current) {
+        console.log('[Voice] Silence detected, sending:', text);
+        accumulatedRef.current = '';
+        setVoiceInputText('');
+        handleSendRef.current(text);
+      }
+      // Restart next round regardless
+      setTimeout(() => { if (isVoiceRef.current) recordRound(); }, 100);
+      return;
+    }
+
+    try {
+      const fd = new FormData();
+      fd.append('file', blob, 'round.webm');
+      const resp = await fetch('http://127.0.0.1:8003/api/transcribe', { method: 'POST', body: fd });
+      const data = await resp.json();
+      const t = (data.text || '').trim();
+      if (t) {
+        // Accumulate and show live in input
+        accumulatedRef.current = accumulatedRef.current
+          ? accumulatedRef.current + ' ' + t
+          : t;
+        console.log('[Voice] Live:', t, '| accumulated:', accumulatedRef.current);
+        setVoiceInputText(accumulatedRef.current);
+        const ag = (window as any).antigravity;
+        if (ag?.voiceText) ag.voiceText(accumulatedRef.current);
+      } else {
+        // Whisper returned empty → approximately 2.5s of silence
+        const text = accumulatedRef.current.trim();
+        if (text && isVoiceRef.current) {
+          console.log('[Voice] Silence round, sending:', text);
+          accumulatedRef.current = '';
+          setVoiceInputText('');
+          handleSendRef.current(text);
+        }
+      }
+    } catch (err) {
+      console.error('[Voice] Round failed:', err);
+    }
+
+    if (isVoiceRef.current) {
+      setTimeout(() => recordRound(), 100);
+    }
+  }, []);
+
+  const startVoice = useCallback(async () => {
+    if (!isVoiceRef.current) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!isVoiceRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
+      streamRef.current = stream;
+      accumulatedRef.current = '';
+      console.log('[Voice] Mic ready, starting rounds');
+      recordRound();
+    } catch (err: any) {
+      console.error('[Voice] getUserMedia error:', err);
+      setNotification('Microphone access denied: ' + (err.message || err));
+      stopVoice();
+    }
+  }, [recordRound, stopVoice]);
+
+  const toggleVoice = useCallback(() => {
+    if (isVoiceRef.current) {
+      stopVoice();
+    } else {
+      isVoiceRef.current = true;
+      setIsVoiceMode(true);
+      setVoiceInputText('');
+      accumulatedRef.current = '';
+      const ag = (window as any).antigravity;
+      if (ag?.voiceToggle) ag.voiceToggle();
+      if (ag?.voiceStatus) ag.voiceStatus('listening');
+      startVoice();
+    }
+  }, [startVoice, stopVoice]);
+
+  // Global Ctrl+G shortcut
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.ctrlKey && (e.key === 'g' || e.key === 'G')) { e.preventDefault(); toggleVoice(); }
+    };
+    window.addEventListener('keydown', handler);
+    const ag = (window as any).antigravity;
+    if (ag?.onVoiceWindowClosed) {
+      ag.onVoiceWindowClosed(() => { if (isVoiceRef.current) stopVoice(); });
+    }
+    return () => window.removeEventListener('keydown', handler);
+  }, [toggleVoice, stopVoice]);
+
 
   const handleSelectWorkspace = useCallback((ws: WorkspaceInfo) => {
     setActiveWorkspace(ws);
@@ -253,7 +433,9 @@ export default function App() {
       setMessages([{
         id: `sys-${Date.now()}`,
         role: 'system',
-        content: `Chat ready in ${ws.name}. What would you like to build?`,
+        content: ws.isGeneral
+          ? 'Connected. How can I help you?'
+          : `Chat ready in ${ws.name}. What would you like to build?`,
         timestamp: new Date().toISOString(),
       }]);
     }
@@ -261,6 +443,12 @@ export default function App() {
     // Sync project_path to the workspace folder
     fetch('/api/session/reset', { method: 'POST' }).catch(() => {});
   }, []);
+
+  const handleChatTitleUpdated = useCallback((chatId: string, newTitle: string) => {
+    if (activeChat && activeChat.id === chatId) {
+      setActiveChat((c) => c ? { ...c, title: newTitle } : null);
+    }
+  }, [activeChat]);
 
   const displayMessages = [...messages];
   if ((isRunning || isPersisting) && state?.live_terminal_log) {
@@ -276,9 +464,37 @@ export default function App() {
       content: assistantResponse || '',
       timestamp: new Date().toISOString(),
       duration: isRunning ? 'active' : (elapsed === 'active' ? 'completed' : elapsed),
-      metadata: { isTrace: true, steps, duration: elapsed === 'active' ? undefined : elapsed },
+      metadata: { isTrace: true, steps: filterOrchestratorSteps(steps), duration: elapsed === 'active' ? undefined : elapsed },
     });
   }
+
+  // TTS: speak only NEW agent responses (track by message ID, ignore history on chat switch)
+  const lastSpokenMsgId = useRef<string | null>(null);
+  const speakUtterance = useCallback((text: string) => {
+    const s = window.speechSynthesis;
+    if (!s) return;
+    s.cancel();
+    const u = new SpeechSynthesisUtterance(text.slice(0, 500));
+    u.rate = 1.0;
+    const v = s.getVoices().find(x => x.lang.startsWith('en'));
+    if (v) u.voice = v;
+    s.speak(u);
+  }, []);
+
+  // When pipeline completes → speak the last agent message (only if voice mode active)
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    if (isRunning) { wasRunningRef.current = true; return; }
+    if (wasRunningRef.current && isVoiceRef.current) {
+      wasRunningRef.current = false;
+      const agents = messages.filter(m => m.role === 'agent');
+      const last = agents[agents.length - 1];
+      if (last && last.content && last.id !== lastSpokenMsgId.current) {
+        lastSpokenMsgId.current = last.id;
+        speakUtterance(last.content);
+      }
+    }
+  }, [isRunning, messages, speakUtterance]);
 
   const combinedTokenUsage = {
     total_input_tokens: (activeChat?.token_usage?.total_input_tokens || 0) + (isRunning ? (state?.token_usage?.total_input_tokens || 0) : 0),
@@ -291,28 +507,61 @@ export default function App() {
       ...(isRunning ? (state?.token_usage?.calls || []) : [])
     ]
   };
+  const lastCall = combinedTokenUsage.calls[combinedTokenUsage.calls.length - 1];
+  const activeContextTokens = lastCall ? lastCall.input : 0;
+  const lastModelName = lastCall ? lastCall.model : (model || 'Automatic Fallback');
+
+  if (isInitialLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen w-screen bg-[#0c0c0e] text-zinc-300 font-sans select-none">
+        <div className="flex flex-col items-center gap-5 max-w-sm w-full px-8 py-10 rounded-2xl border border-zinc-900 bg-zinc-950/60 shadow-2xl relative overflow-hidden backdrop-blur-xl">
+          {/* Subtle top ambient glow */}
+          <div className="absolute -top-12 left-1/2 -translate-x-1/2 w-32 h-32 bg-indigo-500/10 rounded-full blur-2xl pointer-events-none" />
+          
+          <div className="relative flex items-center justify-center w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl">
+            <Zap size={28} className="text-indigo-400 animate-pulse" />
+            <div className="absolute inset-0 rounded-2xl border border-indigo-500/20 animate-ping opacity-25" style={{ animationDuration: '2s' }} />
+          </div>
+          
+          <div className="flex flex-col items-center gap-1.5 text-center">
+            <h1 className="text-[15px] font-bold text-zinc-100 tracking-wide">Initializing VinCode</h1>
+            <p className="text-[12px] text-zinc-500 font-mono">Loading workspaces and pipelines...</p>
+          </div>
+
+          {/* Simple animated loading bar */}
+          <div className="w-full h-1 bg-zinc-900 rounded-full overflow-hidden relative">
+            <div className="absolute top-0 bottom-0 left-0 w-1/2 h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full animate-pulse-slow" style={{
+              animation: 'loadingBar 1.5s infinite ease-in-out'
+            }} />
+          </div>
+        </div>
+        
+        {/* CSS Keyframes injected inline */}
+        <style dangerouslySetInnerHTML={{__html: `
+          @keyframes loadingBar {
+            0% { left: -50%; }
+            50% { left: 100%; }
+            100% { left: 100%; }
+          }
+        `}} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-screen w-screen bg-[#0c0c0e] text-zinc-100 overflow-hidden font-sans">
       <TitleBar
-        workspaceName={activeWorkspace?.name ?? null}
-        chatTitle={activeChat?.title ?? null}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        onOpenStats={() => setIsTokenStatsOpen(true)}
-        totalInput={combinedTokenUsage.total_input_tokens}
-        totalOutput={combinedTokenUsage.total_output_tokens}
-        totalCost={combinedTokenUsage.total_cost}
-        showPill={!!activeWorkspace && !!activeChat}
       />
-      <div className="flex flex-1 min-h-0" style={{ padding: '12px', gap: '12px', backgroundColor: '#0c0c0e' }}>
+      <div className="app-shell flex flex-1 min-h-0" style={{ backgroundColor: '#0c0c0e' }}>
         <Sidebar
           activeWorkspaceId={activeWorkspace?.id ?? null}
           activeChatId={activeChat?.id ?? null}
+          activeChatTitle={activeChat?.title}
           collapsed={sidebarCollapsed}
           onSelectWorkspace={handleSelectWorkspace}
           onSelectChat={handleSelectChat}
           onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
-          onOpenSettings={() => setIsSettingsOpen(true)}
+          onChatTitleUpdated={handleChatTitleUpdated}
         />
         <AgentCanvas
           messages={displayMessages}
@@ -325,22 +574,28 @@ export default function App() {
           hasActiveChat={!!activeWorkspace && !!activeChat}
           notification={notification}
           onSend={handleSend}
+          onRunTask={handleRunTask}
           onCancel={cancel}
           onModelChange={setModel}
           onClearNotification={() => setNotification(null)}
           workspaceId={activeWorkspace?.id ?? null}
           chatId={activeChat?.id ?? null}
+          isVoiceMode={isVoiceMode}
+          onToggleVoice={toggleVoice}
+          voiceInputText={voiceInputText}
+          onOpenStats={() => setIsTokenStatsOpen(true)}
+          totalCost={combinedTokenUsage.total_cost}
+          totalInput={combinedTokenUsage.total_input_tokens}
+          totalOutput={combinedTokenUsage.total_output_tokens}
+          totalCacheHitTokens={combinedTokenUsage.total_cache_hit_tokens}
+          activeContextTokens={activeContextTokens}
         />
       </div>
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-        activeWorkspace={activeWorkspace}
-      />
       <TokenStatsModal
         isOpen={isTokenStatsOpen}
         onClose={() => setIsTokenStatsOpen(false)}
         tokenUsage={combinedTokenUsage}
+        lastModelName={lastModelName}
       />
     </div>
   );

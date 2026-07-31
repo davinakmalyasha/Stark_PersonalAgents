@@ -1,25 +1,24 @@
 import { useState, useCallback } from 'react';
 import type { CanvasNode, CanvasEdge } from '../types/canvas.types';
 
-const CENTER_X = 1000;
-const CENTER_Y = 800;
+const CENTER_X = 1400;
+const CENTER_Y = 550;
 const RADIUS = 300;
+export const CANVAS_SIZE = { width: 2800, height: 1100 };
+export const CANVAS_LIMITS = { minZoom: 0.65, maxZoom: 1.6 };
 
-const CIRCLE_AGENTS = ['Dev', 'BA', 'SA', 'DevOps', 'Refinement', 'Analytics', 'Designer'];
+const CIRCLE_AGENTS = ['BSA', 'Dev', 'SDET', 'DevSecOps', 'FreeAgent'];
 
 const AGENT_LABELS: Record<string, string> = {
   Dev: 'Developer Subagent',
-  BA: 'Business Analyst Subagent',
-  SA: 'Software Analyst Subagent',
-  DevOps: 'DevOps Subagent',
-  Refinement: 'Refinement Subagent',
-  Analytics: 'Analytics Subagent',
-  Critic: 'Evaluation Subagent',
-  Designer: 'UI/UX Designer Subagent',
+  BSA: 'Business Analyst Subagent',
+  SDET: 'QA / SDET Subagent',
+  DevSecOps: 'DevSecOps Subagent',
+  FreeAgent: 'FreeAgent',
 };
 
 export function useCanvas() {
-  const [pan, setPan] = useState({ x: -500, y: -400 });
+  const [pan, setPan] = useState({ x: -900, y: -150 });
   const [zoom, setZoom] = useState(1);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
@@ -40,21 +39,11 @@ export function useCanvas() {
       });
     });
 
-    // Dev node is positioned directly to the right of Supervisor: Dev.angle = 0 => x = CENTER_X + RADIUS, y = CENTER_Y.
-    // Position Critic (Evaluation Subagent) right next to it:
-    nodes.push({
-      id: 'Critic',
-      label: AGENT_LABELS['Critic'],
-      type: 'subagent',
-      status: 'idle',
-      x: CENTER_X + RADIUS + 265,
-      y: CENTER_Y,
-    });
-
     return nodes;
   }, []);
 
   const getInitialEdges = useCallback((): CanvasEdge[] => {
+    // 1. Connect Supervisor to all subagents (Orchestration lines)
     const edges = CIRCLE_AGENTS.map((name) => ({
       id: `edge-Supervisor-${name}`,
       from: 'Supervisor',
@@ -62,23 +51,28 @@ export function useCanvas() {
       active: false,
     }));
 
-    // Connect Critic to Dev instead of Supervisor
-    edges.push({
-      id: 'edge-Dev-Critic',
-      from: 'Dev',
-      to: 'Critic',
-      active: false,
-    });
+    // 2. Connect subagents in a sequential workflow cycle representing the development lifecycle:
+    // BSA -> Dev -> SDET -> DevSecOps -> BSA
+    for (let i = 0; i < CIRCLE_AGENTS.length; i++) {
+      const fromAgent = CIRCLE_AGENTS[i];
+      const toAgent = CIRCLE_AGENTS[(i + 1) % CIRCLE_AGENTS.length];
+      edges.push({
+        id: `edge-flow-${fromAgent}-${toAgent}`,
+        from: fromAgent,
+        to: toAgent,
+        active: false,
+      });
+    }
 
     return edges;
   }, []);
 
   const handleZoom = useCallback((factor: number) => {
-    setZoom((z) => Math.max(0.3, Math.min(2.5, z * factor)));
+    setZoom((z) => Math.max(CANVAS_LIMITS.minZoom, Math.min(CANVAS_LIMITS.maxZoom, z * factor)));
   }, []);
 
   const handleReset = useCallback(() => {
-    setPan({ x: -500, y: -400 });
+    setPan({ x: -900, y: -150 });
     setZoom(1);
   }, []);
 

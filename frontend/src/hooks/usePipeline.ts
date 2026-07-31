@@ -1,9 +1,9 @@
 import { useState, useCallback, useRef } from 'react';
-import type { AppState } from '../types';
+import type { AppState, ChatAttachment } from '../types';
 import { streamPipeline } from '../services/api';
 
 interface UsePipelineReturn {
-  run: (prompt: string, model: string, temp: number, workspacePath?: string, chatId?: string) => void;
+  run: (prompt: string, model: string, temp: number, workspacePath?: string, chatId?: string, attachments?: ChatAttachment[]) => void;
   cancel: () => void;
   state: AppState | null;
   isRunning: boolean;
@@ -16,7 +16,7 @@ export function usePipeline(): UsePipelineReturn {
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const run = useCallback((prompt: string, model: string, temp: number, workspacePath = '', chatId = '') => {
+  const run = useCallback((prompt: string, model: string, temp: number, workspacePath = '', chatId = '', attachments: ChatAttachment[] = []) => {
     setIsRunning(true);
     setError(null);
     setState({
@@ -56,6 +56,7 @@ export function usePipeline(): UsePipelineReturn {
       (err) => { setError(err); setIsRunning(false); },
       workspacePath,
       chatId,
+      attachments,
     );
   }, []);
 

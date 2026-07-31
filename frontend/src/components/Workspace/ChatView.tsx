@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { X, Minimize2, Maximize2, MessageSquare } from 'lucide-react';
+import { X, Minimize2, Maximize2 } from 'lucide-react';
 import type { ChatMessage, AppState, ModelOption } from '../../types';
+import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
 import MessageStream from './MessageStream';
 
@@ -18,61 +19,59 @@ interface Props {
   onCancel: () => void;
   onModelChange: (model: string) => void;
   onClearNotification: () => void;
+  isVoiceMode?: boolean;
+  onToggleVoice: () => void;
+  voiceInputText?: string;
+  onOpenStats: () => void;
+  totalCost: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCacheHitTokens: number;
+  activeContextTokens: number;
+  traceSteps?: TraceStep[];
+  workspaceId: string | null;
+  chatId: string | null;
 }
 
 export default function ChatView({
   messages, isRunning,
-  selectedModel, models, hasActiveChat, notification,
-  onSend, onCancel, onModelChange, onClearNotification,
+  hasActiveChat, notification,
+  onSend, onCancel, onClearNotification,
+  isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId,
 }: Props) {
   const [minimized, setMinimized] = useState(false);
+  const [activeSubagent, setActiveSubagent] = useState<string | null>(null);
 
   return (
     <div 
-      className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 w-full max-w-[850px] flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/80 backdrop-blur-xl shadow-2xl transition-all duration-300"
+      className="absolute bottom-6 left-3 right-3 z-40 w-auto max-w-none flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/80 backdrop-blur-xl shadow-2xl transition-all duration-300"
       style={{
         backgroundColor: 'rgba(18, 18, 20, 0.85)',
         maxHeight: '80vh',
       }}
     >
-      {/* Header bar */}
-      <div 
-        className="flex items-center justify-between border-b border-zinc-800/60 bg-zinc-900/35 flex-shrink-0"
-        style={{ paddingLeft: '16px', paddingRight: '16px', paddingTop: '8px', paddingBottom: '8px' }}
+      {/* Floating minimize/expand button (icon only, proper bg color, bigger icon) */}
+      <button
+        onClick={() => setMinimized((m) => !m)}
+        className="absolute top-3.5 right-4 z-50 p-2 bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 hover:border-zinc-700/80 rounded-xl text-zinc-400 hover:text-zinc-100 transition-all cursor-pointer shadow-xl flex items-center justify-center"
+        title={minimized ? "Expand chat history" : "Collapse chat history"}
+        style={{
+          width: '32px',
+          height: '32px',
+        }}
       >
-        <div className="flex items-center gap-2">
-          <MessageSquare size={13} className="text-indigo-400" />
-          <span className="text-[11.5px] font-semibold text-zinc-400">
-            Supervisor Chat {minimized && `(${messages.length} messages)`}
-          </span>
-          {isRunning && (
-            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
-          )}
-        </div>
-        <button
-          onClick={() => setMinimized((m) => !m)}
-          className="p-1 hover:bg-zinc-850 rounded text-zinc-450 hover:text-zinc-200 transition-colors cursor-pointer flex items-center gap-1.5 text-[10px]"
-          title={minimized ? "Expand chat history" : "Collapse chat history"}
-        >
-          {minimized ? (
-            <>
-              <Maximize2 size={11} className="text-indigo-400" />
-              <span className="text-indigo-400 hover:text-indigo-300 font-semibold">Expand History</span>
-            </>
-          ) : (
-            <>
-              <Minimize2 size={11} />
-              <span>Collapse</span>
-            </>
-          )}
-        </button>
-      </div>
+        {minimized ? (
+          <Maximize2 size={16} className="text-indigo-400" />
+        ) : (
+          <Minimize2 size={16} />
+        )}
+      </button>
 
       {/* Collapsible Area */}
       <div 
-        className="flex-1 flex flex-col overflow-hidden transition-all duration-300 ease-in-out"
+        className="flex-1 flex flex-col overflow-y-auto transition-all duration-300 ease-in-out"
         style={{
-          maxHeight: minimized ? '0px' : '380px',
+          maxHeight: minimized ? '0px' : '480px',
           opacity: minimized ? 0 : 1,
         }}
       >
@@ -87,12 +86,21 @@ export default function ChatView({
         )}
 
         {/* Message stream */}
-        <MessageStream messages={messages} hasActiveChat={hasActiveChat} />
+        <MessageStream
+          messages={messages}
+          hasActiveChat={hasActiveChat}
+          onOpenSubagent={(name) => setActiveSubagent(name)}
+          activeSubagent={activeSubagent}
+          traceSteps={traceSteps}
+          workspaceId={workspaceId}
+          chatId={chatId}
+          onCloseSubagent={() => setActiveSubagent(null)}
+        />
       </div>
 
       {/* Always visible Bottom Prompt Dock */}
       <div className="border-t border-zinc-800/50 flex-shrink-0">
-        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} selectedModel={selectedModel} onModelChange={onModelChange} models={models} />
+        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} />
       </div>
     </div>
   );

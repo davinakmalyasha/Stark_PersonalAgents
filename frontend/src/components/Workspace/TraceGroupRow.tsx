@@ -1,32 +1,55 @@
-import { useState } from 'react';
-import type { GroupedTraceStep } from '../../utils/logParser';
+import { useEffect, useState } from 'react';
+import { ChevronRight, ChevronDown, BrainCircuit, FolderSearch, FilePenLine } from 'lucide-react';
+import type { GroupedTraceStep, TraceStep } from '../../utils/logParser';
 import TraceStepRow from './TraceStepRow';
 
 interface Props {
   group: GroupedTraceStep;
   isLastActive: boolean;
+  onOpenSubagent?: (name: string, task: string) => void;
+  activeSubagent?: string | null;
+  allTraceSteps?: TraceStep[];
+  workspaceId?: string | null;
+  chatId?: string | null;
+  onCloseSubagent?: () => void;
 }
 
-export default function TraceGroupRow({ group, isLastActive }: Props) {
-  const [expanded, setExpanded] = useState(group.type === 'thought' || isLastActive);
+export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, activeSubagent, allTraceSteps, workspaceId, chatId, onCloseSubagent }: Props) {
+  const [expanded, setExpanded] = useState(isLastActive);
+  const [activeSeconds, setActiveSeconds] = useState(0);
 
-  // Stable duration generator (matching Google/Antigravity style)
-  const getStableDuration = (text: string, type: string): string => {
-    let hash = 0;
-    for (let i = 0; i < text.length; i++) hash = text.charCodeAt(i) + ((hash << 5) - hash);
-    const absHash = Math.abs(hash);
-    return type === 'thought' ? ((absHash % 4) + 2) + 's' : ((absHash % 8) + 3) + 's';
-  };
+  useEffect(() => {
+    if (!isLastActive) return;
+    const startedAt = Date.now();
+    const tick = () => setActiveSeconds(Math.max(1, Math.round((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [group.id, isLastActive]);
 
   const getTitle = () => {
     if (isLastActive) {
-      if (group.type === 'thought') return 'Thinking...';
+      if (group.type === 'thought') {
+        const loggedDuration = group.steps[0]?.duration;
+        return `Thinking for ${loggedDuration || `${activeSeconds}s`}`;
+      }
       if (group.type === 'exploration') return 'Exploring files...';
       if (group.type === 'edit') return 'Editing files...';
       return group.title;
     }
-    const dur = getStableDuration(JSON.stringify(group.steps), group.type);
-    if (group.type === 'thought') return `Thought for ${dur}`;
+    if (group.type === 'thought') {
+      const firstStep = group.steps[0];
+      const thoughtDuration = (firstStep as any)?.duration;
+      if (thoughtDuration) {
+        const num = parseInt(thoughtDuration);
+        return isNaN(num) ? `Thought for ${thoughtDuration}` : `Thought for ${num}s`;
+      }
+      // Estimate duration based on reasoning content length if exact timing isn't logged (1s per ~15 words, min 1s)
+      const content = firstStep?.content || '';
+      const wordCount = content.trim().split(/\s+/).filter(Boolean).length;
+      const estimatedSecs = Math.max(1, Math.round(wordCount / 15));
+      return `Thought for ${estimatedSecs}s`;
+    }
     if (group.type === 'exploration' || group.type === 'edit') {
       const stepCount = group.steps.length;
       const searchCount = group.steps.filter(s => s.toolName === 'search_code').length;
@@ -42,9 +65,9 @@ export default function TraceGroupRow({ group, isLastActive }: Props) {
 
   if (!hasCollapsibleContent) {
     return (
-      <div className="pl-0 flex flex-col gap-1 text-[13px] text-zinc-400 font-sans leading-relaxed">
+      <div className="trace-system-row">
         {group.steps.map((s) => (
-          <TraceStepRow key={s.id} step={s} />
+          <TraceStepRow key={s.id} step={s} onOpenSubagent={onOpenSubagent} isActive={isLastActive} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} />
         ))}
       </div>
     );
@@ -52,34 +75,47 @@ export default function TraceGroupRow({ group, isLastActive }: Props) {
 
   const thoughtContent = group.steps[0]?.content || '';
   const lines = thoughtContent.split('\n').map(l => l.trim()).filter(Boolean);
-  const thoughtTitle = lines[0] || 'Thinking';
-  const thoughtBody = lines.slice(1).join('\n');
+
+  let thoughtTitle = '';
+  let thoughtBody = '';
+
+  if (lines.length > 1 && lines[0].length < 80) {
+    thoughtTitle = lines[0];
+    thoughtBody = lines.slice(1).join('\n');
+  } else {
+    thoughtBody = thoughtContent;
+  }
 
   return (
-    <div className="flex flex-col text-[13px] text-zinc-400 mb-1 animate-fade-in">
+    <div className={`trace-group trace-${group.type} ${isLastActive ? 'is-active' : ''}`}>
       {/* Header Row */}
-      <div 
+      <div
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1 py-0.5 w-fit cursor-pointer select-none text-zinc-500 font-medium hover:text-zinc-300 transition-colors"
+        style={{ marginBottom: expanded ? '8px' : '0px' }}
+        className="trace-group-header"
       >
+        <span className="trace-group-icon">{group.type === 'thought' ? <BrainCircuit size={13}/> : group.type === 'edit' ? <FilePenLine size={13}/> : <FolderSearch size={13}/>}</span>
         <span>{getTitle()}</span>
-        <span className="text-[10px] text-zinc-600 font-sans ml-1 select-none">
-          {expanded ? '▾' : '▸'}
-        </span>
+        {expanded
+          ? <ChevronDown size={14} className="text-zinc-500" />
+          : <ChevronRight size={14} className="text-zinc-500" />
+        }
       </div>
 
       {/* Expanded Content */}
       {expanded && (
-        <div className="mt-0.5 pl-3 ml-1.5 border-l border-zinc-800/50 flex flex-col gap-1 text-[13.5px] leading-relaxed">
+        <div className="trace-group-content">
           {group.type === 'thought' ? (
-            <div className="max-w-2xl leading-relaxed text-zinc-400 font-sans pr-4 py-0.5">
-              <div className="font-semibold text-zinc-200 mb-0.5">{thoughtTitle}</div>
-              {thoughtBody && <div className="text-[12.5px] text-zinc-400 font-normal whitespace-pre-wrap">{thoughtBody}</div>}
+            <div className="trace-thought-card">
+              {thoughtTitle && <div className="trace-thought-title">{thoughtTitle}</div>}
+              {thoughtBody && <div className="trace-thought-body">{thoughtBody}</div>}
             </div>
           ) : (
-            group.steps.map((s) => (
-              <TraceStepRow key={s.id} step={s} />
-            ))
+            <div className="trace-tool-stack">
+              {group.steps.map((s) => (
+                <TraceStepRow key={s.id} step={s} onOpenSubagent={onOpenSubagent} isActive={isLastActive} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} />
+              ))}
+            </div>
           )}
         </div>
       )}

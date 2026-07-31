@@ -1,389 +1,99 @@
-import { useState, useRef, useEffect } from 'react';
-import { Plus, Mic, ChevronDown, GitBranch, Send, Square } from 'lucide-react';
-import type { ModelOption } from '../../types';
+import { useEffect, useRef, useState } from 'react';
+import { ArrowUp, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 
 interface Props {
-  onSend: (message: string) => void;
+  onSend: (message: string, files: File[]) => void;
   onCancel?: () => void;
   isRunning: boolean;
-  selectedModel: string;
-  onModelChange: (model: string) => void;
-  models: ModelOption[];
+  isVoiceMode?: boolean;
+  onToggleVoice: () => void;
+  voiceInputText?: string;
+  onOpenStats: () => void;
+  totalCost: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCacheHitTokens: number;
+  activeContextTokens: number;
 }
 
-interface SlashCommand {
-  command: string;
-  description: string;
-  example: string;
-  hasArgs: boolean;
-}
+const MAX_FILES = 8;
+const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+const isImage = (file: File) => file.type.startsWith('image/');
 
-const SLASH_COMMANDS: SlashCommand[] = [
-  {
-    command: '/plan',
-    description: 'Analyze deeply and create an implementation plan in planning.md',
-    example: '/plan build a calculator web app',
-    hasArgs: true
-  },
-  {
-    command: '/help',
-    description: 'Show available systems, specialist agents, and workflows',
-    example: '/help',
-    hasArgs: false
-  },
-  {
-    command: '/start',
-    description: 'Reset or initialize workspace department resources',
-    example: '/start',
-    hasArgs: false
-  },
-  {
-    command: '/session-reset',
-    description: 'Clear the active agent session and log history',
-    example: '/session-reset',
-    hasArgs: false
-  }
-];
-
-export default function PromptDock({
-  onSend,
-  onCancel,
-  isRunning,
-  selectedModel,
-  onModelChange,
-  models,
-}: Props) {
+export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens }: Props) {
   const [value, setValue] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const [showModelPicker, setShowModelPicker] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0);
 
-  // Autocomplete States
-  const [activeCommandIndex, setActiveCommandIndex] = useState(0);
-  const [showCommands, setShowCommands] = useState(false);
-  const [filteredCommands, setFilteredCommands] = useState<SlashCommand[]>([]);
-
-  // Sync scroll between textarea and overlay
-  const handleScroll = () => {
-    if (textareaRef.current && overlayRef.current) {
-      overlayRef.current.scrollTop = textareaRef.current.scrollTop;
-      overlayRef.current.scrollLeft = textareaRef.current.scrollLeft;
-    }
-  };
-
-  // ── Auto-resize textarea ──
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
-    handleScroll();
+    el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
   }, [value]);
 
-  const checkAutocomplete = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    
-    const caretPos = el.selectionStart || 0;
-    const beforeCursor = value.slice(0, caretPos);
-    
-    // Match word starting with / at cursor position
-    const match = beforeCursor.match(/\/(\w*)$/);
-    if (match) {
-      const typed = match[1].toLowerCase();
-      const filtered = SLASH_COMMANDS.filter(cmd => 
-        cmd.command.toLowerCase().substring(1).startsWith(typed)
-      );
-      setFilteredCommands(filtered);
-      setShowCommands(filtered.length > 0);
-      setActiveCommandIndex(0);
-    } else {
-      setShowCommands(false);
-      setFilteredCommands([]);
-    }
-  };
-
-  // Run autocomplete check on value change
-  useEffect(() => {
-    checkAutocomplete();
-  }, [value]);
-
-  const selectCommand = (cmd: SlashCommand) => {
-    const el = textareaRef.current;
-    if (!el) return;
-    
-    const caretPos = el.selectionStart || 0;
-    const beforeCursor = value.slice(0, caretPos);
-    const lastSlashIndex = beforeCursor.lastIndexOf('/');
-    
-    if (lastSlashIndex !== -1) {
-      const start = value.slice(0, lastSlashIndex);
-      const end = value.slice(caretPos);
-      const replacement = cmd.command + (cmd.hasArgs ? ' ' : '');
-      const newValue = start + replacement + end;
-      setValue(newValue);
-      
-      // Reset cursor position to right after the inserted command
-      setTimeout(() => {
-        if (textareaRef.current) {
-          const newCaretPos = lastSlashIndex + replacement.length;
-          textareaRef.current.selectionStart = newCaretPos;
-          textareaRef.current.selectionEnd = newCaretPos;
-          textareaRef.current.focus();
-        }
-      }, 0);
-    }
-    setShowCommands(false);
-  };
-
-  const handleSend = () => {
-    const trimmed = value.trim();
-    console.log('[PromptDock] handleSend called, value=%o trimmed=%o isRunning=%o', value, trimmed, isRunning);
-    if (!trimmed) return;
-    console.log('[PromptDock] calling onSend with:', trimmed);
-    onSend(trimmed);
-    setValue('');
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (showCommands) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setActiveCommandIndex((prev) => (prev + 1) % filteredCommands.length);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setActiveCommandIndex((prev) => (prev - 1 + filteredCommands.length) % filteredCommands.length);
-        return;
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        selectCommand(filteredCommands[activeCommandIndex]);
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setShowCommands(false);
-        return;
-      }
-    }
-
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  // Syntax highlighting for commands in the textarea input
-  const highlightText = (text: string) => {
-    if (!text) return null;
-    const words = text.split(/(\s+)/);
-    return words.map((word, idx) => {
-      const cmd = SLASH_COMMANDS.find(c => c.command === word);
-      if (cmd) {
-        return (
-          <span key={idx} className="bg-blue-500/20 text-blue-400 border border-blue-500/30 px-1.5 py-0.5 rounded-md font-mono font-semibold">
-            {word}
-          </span>
-        );
-      }
-      return word;
+  useEffect(() => { if (isVoiceMode && voiceInputText !== undefined) setValue(voiceInputText); }, [voiceInputText, isVoiceMode]);
+  const addFiles = (incoming: FileList | File[]) => {
+    const selected = Array.from(incoming);
+    const valid = selected.filter((file) => file.size <= MAX_FILE_SIZE);
+    if (valid.length !== selected.length) setError('Files must be 20 MB or smaller.');
+    setFiles((current) => {
+      const next = [...current, ...valid.filter((file) => !current.some((item) => item.name === file.name && item.size === file.size))].slice(0, MAX_FILES);
+      if (next.length < current.length + valid.length) setError(`You can attach up to ${MAX_FILES} files at once.`);
+      return next;
     });
   };
 
-  // ── Find display name for selected model ──
-  const selectedModelName = models.find((m) => m.id === selectedModel)?.name ?? 'Claude Opus 4.6 (Thinking)';
+  const send = () => {
+    const text = value.trim();
+    if (!text && !files.length) return;
+    onSend(text, files);
+    setValue(''); setFiles([]); setError(null);
+  };
+  const cacheRate = totalInput ? (totalCacheHitTokens / totalInput) * 100 : 0;
+  const contextPercent = Math.min(100, (activeContextTokens / 1_000_000) * 100);
 
   return (
-    <div className="w-full flex-shrink-0" style={{ paddingLeft: '16px', paddingRight: '16px', paddingTop: '10px', paddingBottom: '12px' }}>
-      {/* Pill-shaped dock — centered, full width */}
+    <div className="w-full flex-shrink-0 px-4 pt-3 pb-4">
       <div
-        className="prompt-dock relative flex flex-col w-full bg-zinc-900 border border-zinc-850/80 rounded-xl transition-shadow"
-        style={{ padding: '12px 16px' }}
+        className={`prompt-dock premium-surface relative overflow-visible ${dragActive ? 'is-dragging' : ''} ${isVoiceMode ? 'is-listening' : ''}`}
+        onDragEnter={(event) => { event.preventDefault(); dragDepth.current += 1; setDragActive(true); }}
+        onDragLeave={(event) => { event.preventDefault(); dragDepth.current -= 1; if (dragDepth.current <= 0) { dragDepth.current = 0; setDragActive(false); } }}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => { event.preventDefault(); dragDepth.current = 0; setDragActive(false); addFiles(event.dataTransfer.files); }}
       >
-        {/* ── Autocomplete dropdown ── */}
-        {showCommands && (
-          <>
-            <div
-              className="fixed inset-0 z-40 cursor-default"
-              onClick={() => setShowCommands(false)}
-            />
-            <div className="absolute bottom-full left-0 right-0 mb-2.5 bg-zinc-900/95 backdrop-blur-md border border-zinc-800 rounded-xl shadow-2xl overflow-hidden z-50 flex flex-col max-h-60">
-              <div className="px-3 py-1.5 border-b border-zinc-800 text-[11px] text-zinc-500 font-semibold uppercase tracking-wider">
-                Available Actions
-              </div>
-              <div className="overflow-y-auto py-1">
-                {filteredCommands.map((cmd, idx) => (
-                  <button
-                    key={cmd.command}
-                    onClick={() => selectCommand(cmd)}
-                    className={`flex flex-col w-full px-3.5 py-2 text-left transition-colors border-l-2 ${
-                      idx === activeCommandIndex
-                        ? 'bg-blue-500/10 border-blue-500 text-zinc-100'
-                        : 'border-transparent text-zinc-300 hover:bg-zinc-800/50 hover:text-zinc-200'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between w-full">
-                      <span className="text-[14px] font-mono font-semibold text-blue-400">{cmd.command}</span>
-                      <span className="text-[11px] text-zinc-500 font-mono">{cmd.example}</span>
-                    </div>
-                    <span className="text-[12px] text-zinc-400 mt-0.5">{cmd.description}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </>
-        )}
+        <input ref={inputRef} type="file" multiple className="hidden" onChange={(event) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} />
+        {dragActive && <div className="drop-capture" aria-hidden="true"><div className="drop-orbit"><Plus size={24} /></div><strong>Drop to add to your message</strong><span>Images, documents, and code files up to 20 MB</span></div>}
 
-        {/* ── Text input area ── */}
-        <div className="relative w-full" style={{ minHeight: 38, maxHeight: 200 }}>
-          {/* Highlight Overlay */}
-          <div
-            ref={overlayRef}
-            className="absolute inset-0 pointer-events-none text-[14px] leading-relaxed text-zinc-100 whitespace-pre-wrap break-words overflow-hidden"
-            style={{ 
-              fontFamily: 'inherit',
-              paddingTop: '8px',
-              paddingBottom: '8px',
-              paddingLeft: '12px',
-              paddingRight: '12px'
-            }}
-          >
-            {highlightText(value)}
-            {!value && <span className="text-zinc-500">Ask anything, @ to mention, / for actions</span>}
-          </div>
-          {/* Textarea */}
-          <textarea
-            ref={textareaRef}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onKeyUp={checkAutocomplete}
-            onSelect={checkAutocomplete}
-            onClick={checkAutocomplete}
-            onScroll={handleScroll}
-            placeholder=""
-            rows={1}
-            className="w-full bg-transparent border-none outline-none resize-none text-[14px] text-transparent caret-zinc-100 leading-relaxed relative z-10"
-            style={{ 
-              minHeight: 38, 
-              maxHeight: 200,
-              paddingTop: '8px',
-              paddingBottom: '8px',
-              paddingLeft: '12px',
-              paddingRight: '12px'
-            }}
-          />
+        {files.length > 0 && <div className="attachment-deck" aria-label="Files ready to send">
+          {files.map((file) => <div className="attachment-card" key={`${file.name}-${file.size}`}>
+            {isImage(file) ? <div className="image-chip"><Image size={16} /></div> : <div className="file-chip"><FileText size={16} /></div>}
+            <div className="min-w-0 flex-1"><div className="truncate text-[12px] font-medium text-zinc-200">{file.name}</div><div className="text-[10px] text-zinc-500">{isImage(file) ? 'Image' : file.type.split('/').pop() || 'File'} · {formatSize(file.size)}</div></div>
+            <button type="button" onClick={() => setFiles((all) => all.filter((item) => item !== file))} className="remove-file" title={`Remove ${file.name}`}><X size={13} /></button>
+          </div>)}
+          <button type="button" className="attachment-add" onClick={() => inputRef.current?.click()} title="Add files"><Plus size={17} /></button>
+        </div>}
+
+        <div style={{ padding: '14px 18px 5px' }}>
+          <textarea ref={textareaRef} value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } }} rows={1}
+            placeholder={isVoiceMode ? 'Listening…' : files.length ? 'Add a note about these files…' : 'Ask anything'}
+            className="prompt-input" />
         </div>
-
-        {/* ── Bottom toolbar ── */}
-        <div 
-          className="flex items-center justify-between border-t border-zinc-800"
-          style={{ marginTop: '10px', paddingTop: '10px' }}
-        >
-          {/* Left side: Plus, Worktree, Model selector */}
+        {error && <div className="mx-4 mb-2 text-[11px] text-amber-300/90">{error}</div>}
+        <div className="prompt-toolbar">
           <div className="flex items-center gap-1">
-            {/* Plus / Attach */}
-            <button
-              className="p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors"
-              title="Add attachment"
-            >
-              <Plus size={16} />
-            </button>
-
-            {/* Worktree */}
-            <button
-              className="flex items-center gap-1 px-2 py-1 text-[12px] text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors"
-              title="Worktree"
-            >
-              <GitBranch size={13} />
-              <span>Worktree</span>
-            </button>
-
-            {/* Model selector dropdown */}
-            <div className="relative">
-              <button
-                onClick={() => setShowModelPicker((v) => !v)}
-                className="flex items-center gap-1 px-2 py-1 text-[12px] text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors"
-              >
-                <span className="truncate max-w-[160px]">{selectedModelName}</span>
-                <ChevronDown size={10} className="text-zinc-500 flex-shrink-0" />
-              </button>
-
-              {showModelPicker && (
-                <>
-                  {/* Backdrop */}
-                  <div
-                    className="fixed inset-0 z-40"
-                    onClick={() => setShowModelPicker(false)}
-                  />
-                  {/* Dropdown */}
-                  <div className="absolute bottom-full left-0 mb-1 z-50 w-64 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl overflow-hidden">
-                    <div className="py-1 max-h-64 overflow-y-auto">
-                      {models.map((m) => (
-                        <button
-                          key={m.id}
-                          onClick={() => { onModelChange(m.id); setShowModelPicker(false); }}
-                          className={`flex items-center gap-2 w-full px-3 py-2 text-[13px] text-left transition-colors ${
-                            m.id === selectedModel
-                              ? 'bg-blue-500/10 text-blue-400'
-                              : 'text-zinc-300 hover:bg-zinc-800'
-                          }`}
-                        >
-                          <span className="truncate">{m.name}</span>
-                          {m.provider && (
-                            <span className="text-[10px] text-zinc-600 flex-shrink-0 ml-auto">{m.provider}</span>
-                          )}
-                        </button>
-                      ))}
-                      {models.length === 0 && (
-                        <div className="px-3 py-2 text-[12px] text-zinc-600 italic">No models available</div>
-                      )}
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
+            <button type="button" onClick={() => inputRef.current?.click()} className="tool-button" title="Attach files"><Plus size={18} /></button>
           </div>
-
-          {/* Right side: Microphone */}
-          <button
-            className="p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition-colors"
-            title="Voice input"
-          >
-            <Mic size={16} />
-          </button>
-
-          {/* Send/Stop button */}
-          {(() => {
-            const showStop = isRunning && !value.trim();
-            const handleButtonClick = () => {
-              if (showStop) {
-                console.log('[PromptDock] Stop button clicked, calling onCancel...');
-                onCancel?.();
-              } else {
-                handleSend();
-              }
-            };
-
-            return (
-              <button
-                onClick={handleButtonClick}
-                disabled={!showStop && !value.trim()}
-                className={`p-1.5 rounded-lg transition-colors ${
-                  showStop
-                    ? 'text-red-500 hover:text-red-400 hover:bg-red-500/10'
-                    : value.trim()
-                      ? 'text-blue-400 hover:text-blue-300 hover:bg-blue-500/10'
-                      : 'text-zinc-600 cursor-not-allowed'
-                }`}
-                title={showStop ? 'Stop execution' : 'Send message'}
-              >
-                {showStop ? <Square size={16} className="fill-current" /> : <Send size={16} />}
-              </button>
-            );
-          })()}
+          <div className="flex items-center gap-2"><span className="hidden sm:block text-[10px] text-zinc-600">{files.length ? `${files.length} attachment${files.length > 1 ? 's' : ''}` : ''}</span>
+            <div className="usage-control"><button type="button" className="usage-orb" title="Usage" aria-label="Usage"><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100` }}/></svg><span>{Math.round(cacheRate)}</span></button><div className="usage-popover"><div className="usage-popover-title">Usage</div><div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div><div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div><div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div><div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div><button type="button" onClick={onOpenStats} className="usage-details">View details</button></div></div>
+            <button type="button" onClick={onToggleVoice} className={`prompt-voice-button ${isVoiceMode ? 'is-live' : ''}`} title={isVoiceMode ? 'Stop voice mode (Ctrl+G)' : 'Start voice mode (Ctrl+G)'}><AudioLines size={16}/><span className="voice-live-dot" /></button>
+            <button type="button" onClick={() => isRunning && !value.trim() && !files.length ? onCancel?.() : send()} disabled={!isRunning && !value.trim() && !files.length} className={`send-button ${isRunning && !value.trim() && !files.length ? 'stop' : ''}`} title={isRunning ? 'Stop execution' : 'Send message'}>{isRunning && !value.trim() && !files.length ? <Square size={14} fill="currentColor" /> : <ArrowUp size={16} strokeWidth={2.4} />}</button>
+          </div>
         </div>
       </div>
     </div>

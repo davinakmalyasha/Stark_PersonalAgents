@@ -1,9 +1,17 @@
-import { Copy, ThumbsUp, ThumbsDown, Share2, AlertTriangle, Wrench, Terminal, FileText, Search } from 'lucide-react';
-import type { ChatMessage } from '../../types';
+import { Copy, AlertTriangle, Wrench, Terminal, FileText, Search, Image } from 'lucide-react';
+import type { ChatAttachment, ChatMessage } from '../../types';
+import type { TraceStep } from '../../utils/logParser';
 import TraceAccordion from './TraceAccordion';
+import Markdown from './Markdown';
 
 interface Props {
   message: ChatMessage;
+  onOpenSubagent: (name: string, task: string) => void;
+  activeSubagent?: string | null;
+  traceSteps?: TraceStep[];
+  workspaceId?: string | null;
+  chatId?: string | null;
+  onCloseSubagent?: () => void;
 }
 
 /** Pick an icon for tool calls based on the tool name */
@@ -19,10 +27,10 @@ function toolIcon(content: string) {
 
 /** Check if a message content is a tool call */
 function isToolCall(content: string): boolean {
-  return content.startsWith('🔧 [');
+  return content.startsWith('[TOOL_CALL]');
 }
 
-export default function MessageBubble({ message }: Props) {
+export default function MessageBubble({ message, onOpenSubagent, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent }: Props) {
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -37,10 +45,15 @@ export default function MessageBubble({ message }: Props) {
       {isUser && (
         <div className="flex justify-end">
           <div 
-            className="max-w-[80%] text-[14px] text-zinc-100 leading-relaxed bg-zinc-800 border border-zinc-700/50"
+            className="max-w-[85%] text-[15.5px] text-zinc-100 leading-relaxed user-message-premium"
             style={{ padding: '10px 16px', borderRadius: '14px' }}
           >
-            {message.content}
+            {message.content && <Markdown content={message.content} />}
+            {Array.isArray(message.metadata?.attachments) && <div className="message-attachments">
+              {(message.metadata.attachments as ChatAttachment[]).map((file) => <div className="message-attachment" key={file.id}>
+                {file.isImage ? <Image size={14} /> : <FileText size={14} />}<span className="truncate">{file.name}</span>
+              </div>)}
+            </div>}
           </div>
         </div>
       )}
@@ -57,10 +70,10 @@ export default function MessageBubble({ message }: Props) {
             {toolIcon(message.content)}
           </div>
           <div className="min-w-0">
-            <span className="text-zinc-500 font-semibold text-[10px] uppercase tracking-wider">
+            <span className="text-zinc-500 font-bold text-[11px] uppercase tracking-wider">
               {message.agentName || 'Developer'}
             </span>
-            <div className="text-zinc-300 font-mono text-[11px] mt-0.5 leading-relaxed whitespace-pre-wrap break-all">
+            <div className="text-zinc-300 font-mono text-[12.5px] mt-0.5 leading-relaxed whitespace-pre-wrap break-all">
               {message.content}
             </div>
           </div>
@@ -71,59 +84,46 @@ export default function MessageBubble({ message }: Props) {
           AGENT MESSAGE — with status + actions
           ──────────────────────────────────── */}
       {isAgent && !isTool && (
-        <div>
+        <div className="agent-message-content">
           {/* Agent name label */}
           {message.agentName && (
-            <div className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-1.5">
+            <div className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">
               {message.agentName}
             </div>
           )}
-          
-          {/* Nested Collapsible Trace Accordion */}
-          {!!message.metadata?.isTrace && Array.isArray(message.metadata.steps) && 
-           (message.duration === 'active' || message.metadata.steps.length > 0) && (
-            <TraceAccordion 
-              steps={message.metadata.steps as any} 
+
+          {/* Trace status above the response so duration reads first */}
+          {!!message.metadata?.isTrace && Array.isArray(message.metadata.steps) && (
+            <div className="agent-message-trace">
+              <TraceAccordion
+              steps={message.metadata.steps as any}
               isActive={message.duration === 'active'}
               duration={message.metadata?.duration as string || message.duration}
-            />
+              onOpenSubagent={onOpenSubagent}
+              activeSubagent={activeSubagent}
+              allTraceSteps={traceSteps}
+              workspaceId={workspaceId}
+              chatId={chatId}
+              onCloseSubagent={onCloseSubagent}
+              />
+            </div>
           )}
 
           {/* Main response text content */}
           {message.content && message.content !== '(Execution Trace)' && (
-            <div className="text-[14px] text-zinc-200 leading-relaxed whitespace-pre-wrap">
-              {message.content}
+            <div className="agent-message-response text-[15.5px] text-zinc-200 leading-relaxed">
+              <Markdown content={message.content} />
             </div>
           )}
 
-
-
           {/* Inline action icons — right-aligned, revealed on hover */}
           <div className="flex items-center justify-end gap-0.5 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
-            <button
-              className="p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
-              title="Export / Share"
-            >
-              <Share2 size={13} />
-            </button>
             <button
               className="p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
               title="Copy to clipboard"
               onClick={() => navigator.clipboard?.writeText(message.content)}
             >
               <Copy size={13} />
-            </button>
-            <button
-              className="p-1.5 text-zinc-500 hover:text-green-400 hover:bg-zinc-800 rounded-md transition-colors"
-              title="Thumbs up"
-            >
-              <ThumbsUp size={13} />
-            </button>
-            <button
-              className="p-1.5 text-zinc-500 hover:text-red-400 hover:bg-zinc-800 rounded-md transition-colors"
-              title="Thumbs down"
-            >
-              <ThumbsDown size={13} />
             </button>
           </div>
         </div>
@@ -139,8 +139,8 @@ export default function MessageBubble({ message }: Props) {
         >
           <AlertTriangle size={14} className="text-red-400 flex-shrink-0 mt-0.5" />
           <div className="min-w-0">
-            <span className="text-[13px] font-semibold text-red-400">Error</span>
-            <p className="text-[13px] text-red-300/80 mt-0.5 leading-relaxed whitespace-pre-wrap">
+            <span className="text-[14.5px] font-semibold text-red-400">Error</span>
+            <p className="text-[14.5px] text-red-300/80 mt-0.5 leading-relaxed whitespace-pre-wrap">
               {message.content}
             </p>
           </div>
@@ -151,9 +151,9 @@ export default function MessageBubble({ message }: Props) {
           SYSTEM MESSAGE — low-contrast italic
           ──────────────────────────────────── */}
       {isSystem && (
-        <div className="flex items-center gap-2 text-[12px] text-zinc-500 italic px-1">
-          <div className="w-1 h-1 rounded-full bg-zinc-600 flex-shrink-0" />
-          {message.content}
+        <div className="system-message-note">
+          <span className="system-message-dot" />
+          <span>{message.content}</span>
         </div>
       )}
     </div>

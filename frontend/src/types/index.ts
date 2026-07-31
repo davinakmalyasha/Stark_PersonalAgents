@@ -67,6 +67,7 @@ export interface WorkspaceInfo {
   exists: boolean;
   chatCount: number;
   addedAt: string;
+  updatedAt?: string;
   isGeneral?: boolean;
 }
 

@@ -100,10 +100,10 @@ def _usage_path(workspace_path: str, chat_id: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def list_workspaces() -> list[dict]:
-    """Return all registered workspaces, with General chat at the top."""
+    """Return workspaces ordered by most recent chat activity."""
     reg = _load_registry()
-    # Count general chats
-    general_chat_count = len(list_chats(GENERAL_WORKSPACE_ID))
+    general_chats = list_chats(GENERAL_WORKSPACE_ID)
+    general_chat_count = len(general_chats)
     workspaces = [{
         "id": GENERAL_WORKSPACE_ID,
         "name": "General",
@@ -111,21 +111,29 @@ def list_workspaces() -> list[dict]:
         "exists": True,
         "chatCount": general_chat_count,
         "addedAt": "",
+        "updatedAt": max((chat.get("updatedAt", "") for chat in general_chats), default=""),
         "isGeneral": True,
     }]
+    projects = []
     for ws in reg.get("workspaces", []):
         ws_path = ws.get("path", "")
         exists = os.path.isdir(ws_path) if ws_path else False
-        chat_count = len(list_chats(ws_path)) if exists else 0
-        workspaces.append({
+        chats = list_chats(ws_path) if exists else []
+        latest_activity = max(
+            (chat.get("updatedAt", "") or chat.get("createdAt", "") for chat in chats),
+            default=ws.get("addedAt", ""),
+        )
+        projects.append({
             "id": ws.get("id", ""),
             "name": ws.get("name", os.path.basename(ws_path)),
             "path": ws_path,
             "exists": exists,
-            "chatCount": chat_count,
+            "chatCount": len(chats),
             "addedAt": ws.get("addedAt", ""),
+            "updatedAt": latest_activity,
         })
-    return workspaces
+    projects.sort(key=lambda project: project.get("updatedAt", ""), reverse=True)
+    return workspaces + projects
 
 
 def add_workspace(folder_path: str, name: str = "") -> dict:
@@ -255,6 +263,7 @@ def list_chats(workspace_path: str) -> list[dict]:
             })
         except Exception:
             pass
+    chats.sort(key=lambda chat: chat.get("updatedAt", "") or chat.get("createdAt", ""), reverse=True)
     return chats
 
 

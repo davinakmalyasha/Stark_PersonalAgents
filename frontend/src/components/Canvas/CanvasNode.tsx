@@ -1,4 +1,3 @@
-import { Terminal, FileText, Database, GitBranch, ShieldCheck, BarChart4, ShieldAlert, Palette, Crown, Circle } from 'lucide-react';
 import type { CanvasNode } from '../../types/canvas.types';
 import { statusConfig } from './canvasNode.styles';
 
@@ -6,97 +5,40 @@ interface Props {
   node: CanvasNode;
   steps: any[];
   isActive: boolean;
+  isVoiceMode: boolean;
   onClick: () => void;
 }
 
-const ICONS: Record<string, any> = {
-  Supervisor: Crown,
-  Dev: Terminal,
-  BA: FileText,
-  SA: Database,
-  DevOps: GitBranch,
-  Refinement: ShieldCheck,
-  Analytics: BarChart4,
-  Critic: ShieldAlert,
-  Designer: Palette,
-};
-
-export default function CanvasNode({ node, steps, isActive, onClick }: Props) {
-  const Icon = ICONS[node.id] || Circle;
+export default function CanvasNode({ node, steps, isActive, isVoiceMode, onClick }: Props) {
   const isSupervisor = node.id === 'Supervisor';
   const config = (statusConfig as any)[node.status] || statusConfig.idle;
-  
+  const voiceActive = isVoiceMode && node.id === 'FreeAgent';
   const agentSteps = steps.filter((s) => s.agent === node.id || (node.id === 'Supervisor' && s.agent === 'Supervisor'));
   const toolsCount = agentSteps.filter((s) => s.type === 'tool' || s.type === 'command').length;
   const thoughtsCount = agentSteps.filter((s) => s.type === 'thought').length;
 
   return (
-    <div
-      onClick={onClick}
-      className={`absolute w-[240px] h-[135px] flex flex-col rounded-2xl border backdrop-blur-xl cursor-pointer transition-all duration-300 select-none ${config.border} ${config.bg} ${config.glow} ${
-        isActive ? 'ring-2 ring-indigo-500 ring-offset-2 ring-offset-[#0c0c0e] scale-105' : 'hover:scale-[1.03] hover:-translate-y-0.5'
-      }`}
-      style={{
-        left: `${node.x - 120}px`,
-        top: `${node.y - 67.5}px`,
-        padding: '16px',
-      }}
-    >
-      <div className="flex items-center justify-between mb-2 flex-shrink-0">
+    <div onClick={onClick} className={`canvas-node absolute w-[238px] h-[116px] flex flex-col rounded-[12px] border backdrop-blur-xl cursor-pointer transition-all duration-300 select-none ${config.border} ${config.bg} ${config.glow} ${isActive ? 'ring-2 ring-indigo-300/70 ring-offset-2 ring-offset-[#101115] scale-[1.035]' : 'hover:scale-[1.02] hover:-translate-y-0.5'} ${voiceActive ? 'voice-active' : ''}`} style={{ left: `${node.x - 119}px`, top: `${node.y - 58}px`, padding: '14px' }}>
+      <div className="flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <div className={`p-1.5 rounded-lg flex items-center justify-center ${config.iconBg}`}>
-            <Icon size={14} />
+          <div className="min-w-0">
+            <span className="text-[13px] font-semibold text-zinc-100 truncate tracking-wide block">{node.label}</span>
+            <span className="text-[8px] uppercase tracking-[0.14em] text-zinc-500">{isSupervisor ? 'Orchestrator' : 'Subagent'}</span>
           </div>
-          <span className="text-[12px] font-bold text-zinc-150 truncate tracking-wide">
-            {node.label}
-          </span>
         </div>
         <div className="relative flex h-2 w-2 flex-shrink-0">
-          {node.status === 'working' && (
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-          )}
-          <span className={`relative inline-flex rounded-full h-2 w-2 ${config.dot}`}></span>
+          {node.status === 'working' && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75" />}
+          <span className={`relative inline-flex rounded-full h-2 w-2 ${config.dot}`} />
         </div>
       </div>
-
-      <div className="flex items-center mb-2.5 flex-shrink-0">
-        <span className={`px-2 py-0.5 text-[9px] font-bold font-mono uppercase rounded-md border ${config.badge}`}>
-          {node.status}
-        </span>
-      </div>
-
-      <div className="w-full border-t border-zinc-800/40 mb-2.5 flex-shrink-0" />
-
+      <div className="w-full border-t border-white/[0.07] mt-3 mb-2 flex-shrink-0" />
       <div className="flex-1 min-h-0 flex items-stretch">
-        <div className="flex-1 min-w-0 flex flex-col justify-center" style={{ paddingRight: '12px', borderRight: '1px solid rgba(63, 63, 70, 0.4)' }}>
-          <span className="text-[8px] uppercase tracking-wider text-zinc-500 mb-1 font-semibold block">Activity</span>
-          {node.lastStepText ? (
-            <div className="text-[9px] font-mono text-zinc-350 bg-zinc-900/45 px-1.5 py-1 rounded border border-zinc-800/30 truncate">
-              <span className="text-zinc-650 mr-1">▶</span>
-              {node.lastStepText}
-            </div>
-          ) : (
-            <span className="text-[9.5px] text-zinc-550 italic pl-0.5">
-              {isSupervisor ? 'Monitoring...' : 'Awaiting task...'}
-            </span>
-          )}
-        </div>
-
-        <div className="w-[88px] flex flex-col justify-center gap-0.5 text-[9px] font-mono text-zinc-450" style={{ paddingLeft: '16px' }}>
-          <div className="flex justify-between border-b border-zinc-800/20 pb-0.5">
-            <span>Thoughts</span>
-            <span className="font-semibold text-zinc-250">{thoughtsCount}</span>
-          </div>
-          <div className="flex justify-between border-b border-zinc-800/20 pb-0.5">
-            <span>Tools</span>
-            <span className="font-semibold text-zinc-250">{toolsCount}</span>
-          </div>
-          <div className="flex justify-between">
-            <span>Tokens</span>
-            <span className="font-semibold text-zinc-250">{node.tokenUsage || 0}</span>
-          </div>
+        <div className="flex-1 min-w-0 flex flex-col justify-center pr-3">
+          <div className="flex items-center gap-2 mb-1"><span className={`px-1.5 py-0.5 text-[8px] font-bold font-mono uppercase rounded border ${config.badge}`}>{node.status}</span><span className="text-[8px] uppercase tracking-[0.14em] text-zinc-600">Preview</span></div>
+          {node.lastStepText ? <div className="text-[9px] font-mono text-zinc-300 bg-white/[0.035] px-2 py-1 rounded-md border border-white/[0.06] truncate"><span className="text-zinc-500 mr-1">›</span>{node.lastStepText}</div> : <span className="text-[9px] text-zinc-500 italic pl-0.5">{isSupervisor ? 'Monitoring...' : 'Awaiting task...'}</span>}
         </div>
       </div>
+      <div className="flex items-center gap-3 mt-2 pt-2 border-t border-white/[0.06] text-[8px] font-mono text-zinc-500"><span>TH <b className="text-zinc-200 font-semibold">{thoughtsCount}</b></span><span>TL <b className="text-zinc-200 font-semibold">{toolsCount}</b></span><span>TK <b className="text-zinc-200 font-semibold">{node.tokenUsage || 0}</b></span></div>
     </div>
   );
 }

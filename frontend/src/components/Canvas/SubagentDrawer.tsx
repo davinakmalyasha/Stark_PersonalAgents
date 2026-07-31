@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { X, Wrench, Terminal, FileText } from 'lucide-react';
+import { X } from 'lucide-react';
 import type { ChatMessage } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
+import TraceStepRow from '../Workspace/TraceStepRow';
 
 interface Props {
   isOpen: boolean;
@@ -44,6 +45,8 @@ export default function SubagentDrawer({ isOpen, subagentName, status, taskDesc,
 
   if (!cachedAgent) return null;
 
+  const filteredSteps = cachedSteps.filter((s) => s.type !== 'thought');
+
   return (
     <div className={`absolute top-0 right-0 h-full w-[420px] bg-[#101012] border-l border-zinc-800 shadow-2xl flex flex-col z-50 transition-transform duration-300 ease-in-out ${
       isOpen ? 'translate-x-0' : 'translate-x-full'
@@ -60,22 +63,16 @@ export default function SubagentDrawer({ isOpen, subagentName, status, taskDesc,
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {cachedTask && (
-          <div className="bg-[#151518] p-3 rounded-lg border border-zinc-800/80">
-            <h4 className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1.5 font-bold">Task Description</h4>
-            <p className="text-[13px] text-zinc-300 whitespace-pre-wrap leading-relaxed">{cachedTask}</p>
+          <div className="text-[13px] text-zinc-300 whitespace-pre-wrap leading-relaxed">
+            {cachedTask}
           </div>
         )}
 
         <div className="space-y-2.5">
-          <h4 className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider font-bold">Internal execution log ({cachedSteps.length} steps)</h4>
-          <div className="space-y-1.5 pl-1.5 border-l border-zinc-850">
-            {cachedSteps.map((s, idx) => (
-              <div key={s.id || idx} className="text-[12px] flex items-start gap-2 text-zinc-450 py-0.5">
-                <span className="mt-0.5 text-zinc-650 flex-shrink-0">
-                  {s.type === 'tool' ? <Wrench size={12} /> : s.type === 'command' ? <Terminal size={12} /> : <FileText size={12} />}
-                </span>
-                <span className="font-mono text-zinc-300 truncate">{s.title || s.toolName}</span>
-              </div>
+          <h4 className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider">Internal execution log ({filteredSteps.length} steps)</h4>
+          <div className="space-y-1.5 pl-1 border-l border-zinc-800/60">
+            {filteredSteps.map((s, idx) => (
+              <TraceStepRow key={s.id || idx} step={s} />
             ))}
           </div>
         </div>
@@ -84,11 +81,11 @@ export default function SubagentDrawer({ isOpen, subagentName, status, taskDesc,
           <div className="text-center py-6 text-zinc-500 text-[12px]">Loading internal chat history...</div>
         ) : history.length > 0 ? (
           <div className="space-y-3 pt-2">
-            <h4 className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider font-bold">LLM Dialogue</h4>
+            <h4 className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider">LLM Dialogue</h4>
             <div className="space-y-3">
               {history.map((msg, i) => (
                 <div key={i} className={`p-2.5 rounded-lg text-[12.5px] border ${
-                  msg.role === 'user' ? 'bg-zinc-850/30 border-zinc-800 text-zinc-350' : 'bg-indigo-950/15 border-indigo-900/30 text-indigo-200'
+                  msg.role === 'user' ? 'bg-zinc-800/30 border-zinc-700 text-zinc-300' : 'bg-indigo-950/15 border-indigo-900/30 text-indigo-200'
                 }`}>
                   <span className="text-[10px] font-semibold block uppercase tracking-wider mb-1 text-zinc-500">{msg.role}</span>
                   <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>

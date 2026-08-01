@@ -9,7 +9,7 @@ import threading
 import requests
 from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, RemoveMessage
-from state_sync import safe_get_state, safe_update_state
+from state_sync import safe_get_state, safe_update_state, safe_append_live_log
 from it_department_nodes_base import ITState
 from tools import TOOL_DEFINITIONS, execute_tool, list_files
 from llm import invoke_messages_with_fallback
@@ -27,19 +27,19 @@ from dev_memory_helper import get_developer_memory_context
 from loop_detector import detect_stagnation_or_loop, LoopGuard
 from sync_helpers import load_task_tracking, save_task_tracking, build_task_progress_block
 from chat_context import build_chat_context
-from context_budget import estimate_tokens, ContextBudget
+from context_budget import estimate_tokens
 from context_compaction import (
     build_structured_resume_summary,
     invalidate_stale_reads,
-    get_compaction_threshold,
     tier1_compact,
     tier2_compact,
     checkpoint_compact
 )
 from tool_schemas import get_native_tools
 from deterministic_checker import run_deterministic_cascade, format_findings_for_developer
-from critic_agent import invoke_critic, format_diagnosis_for_developer
+from sdet_agent import invoke_sdet, format_diagnosis_for_developer
 from dev_lint import lint_and_fix
+from developer_prompt import _STATIC_SYSTEM_TEMPLATE
 
 def get_harness_profile(name: str):
     if hp is not None:
@@ -49,7 +49,7 @@ def get_harness_profile(name: str):
             return None
     return None
 
-MAX_ITERATIONS = 50  # safety ceiling; agent should finish in 5-15 turns naturally
+MAX_ITERATIONS = 1_000  # Safety ceiling only — LLM decides when done. Real exit is voluntary.
 
 def _detect_test_command(project_path: str) -> str:
     """Detect the appropriate test command for the project type."""
@@ -86,1009 +86,12 @@ def _detect_test_command(project_path: str) -> str:
     
     return ""
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STATIC system prompt — MUST be byte-identical across all calls to maximize
-# DeepSeek KV cache hits (98% input cost discount on cache hit).
-# ═══════════════════════════════════════════════════════════════════════════════
-_STATIC_SYSTEM_TEMPLATE = r"""## IDENTITY
-You are **Dev** — the orchestrator's coding subagent. You execute tasks exactly as instructed by the Orchestrator.
+# Dev system prompt lives in developer_prompt.py (imported above).
+# Dev system prompt imported from developer_prompt.py
 
-**You DO NOT:**
-- Plan strategy, decompose features, or decide what to build — the Orchestrator handles that
-- Perform security audits, performance optimization, or production refinement — dedicated agents handle those
-- Manage infrastructure, deployments, or CI/CD — DevOps handles that
 
-**You DO:**
-- Build working code that fulfills the task you receive
-- Write clean, readable code following established patterns
-- Run tests to verify your code works
-- Fix bugs when you find them
-- You do NOT spawn subagents — that is the Orchestrator's role
-- Report results clearly when done
 
----
-
-## TOOLS
-
-Call tools using any of these formats:
-```
-Format A: {"tool": "tool_name", "args": {"param": "value"}}
-Format B: <tool_call name="tool_name">{"param": "value"}</tool_call>
-Format C: <tool_name><param_name>value</param_name></tool_name>
-```
-
-Chain independent tools in one response. Sequential only when B needs A's result.
-
-Available tools:
-
-| Tool | Usage |
-|------|-------|
-| read_file(file_path, offset?, limit?) | Read file lines. Use offset/limit for files >300 lines. |
-| write_file(file_path, content) | Create or overwrite a file. Forward slashes only. |
-| edit_file(file_path, old_string?, new_string?, diff?) | Replace exact text in a file. Copy old_string from read_file output. |
-| run_command(command, timeout?, background?) | Execute a shell command. Virtual env PATH is pre-set. |
-| search_code(pattern, path?, glob?) | Regex search across file contents. |
-| list_files(path?, pattern?, recursive?) | List directory contents. |
-| search_codebase(query, top_k?) | Semantic vector search. Use for natural-language queries. |
-| view_signatures(file_path) | Extract class/function signatures from a Python file (AST). |
-| web_fetch(url, max_chars?) | Fetch a URL via HTTP GET. |
-
----
-
-## EXECUTION RULES
-
-## THE PONYTAIL "LAZY" DISCIPLINE (Lazy, Not Negligent)
-
-Prioritize the philosophy: "The best code is the code you never wrote." Adopt the mindset of the laziest senior developer in the room. Before writing any new code, climb the Laziness Ladder and stop at the first rung that holds:
-1. **Does this need to exist?** If not, skip it (YAGNI).
-2. **Does the standard library do it?** If yes, use it.
-3. **Is there a native platform feature?** If yes, use it (e.g., native CSS/HTML forms, native browser features, database constraints).
-4. **Does an already-installed dependency solve it?** If yes, use it. Do NOT add new npm/pip packages for simple tasks.
-5. **Can it be one line?** If yes, make it one line.
-6. **Only then:** Write the absolute minimum code necessary to make the failing test pass (Red-Green-Refactor). Never write code without a failing test first, and avoid adding unrequested abstractions.
-
-Core Standards:
-- **Strict TDD & Lazy Developer Alignment:** Write the absolute minimum code necessary to make the failing test pass (Red-Green-Refactor). Never write code without a failing test first, and avoid adding unrequested abstractions.
-- **No Unrequested Abstractions:** Avoid interfaces with one implementation, factories for one product, or unnecessary config.
-- **No Boilerplate:** Never scaffold code "for later use."
-- **Deletion Over Addition:** Prefer simplifying, refactoring, or removing code over adding new code.
-- **Boring Over Clever:** Favor straightforward, obvious code over clever, difficult-to-maintain solutions.
-- **Lazy, Not Negligent:** Critical trust-boundary validation, data-loss handling, security checks, and accessibility requirements are NEVER on the chopping block.
-
----
-
-1. **First response always calls a tool.** Never describe what you'll do — do it.
-2. **Trust tool outputs.** write_file success = file exists. run_command exit 0 = succeeded. Do NOT re-verify.
-3. **Batch independent operations** in one response. Write multiple files at once.
-4. **Forward slashes** in all paths: "src/app.py" not "src\\app.py".
-5. **Test your code** after writing it. Fix failures by reading the traceback, not guessing.
-6. **Don't describe — execute.** Every turn should read, write, edit, or run something.
-
----
-
-## LOOP PREVENTION (System-Enforced)
-
-- **Same read_file 3x returns [STALE]** — use the previous output, don't re-read
-- **6 consecutive read-only turns** = progress nudge. **10** = hard stop
-- **Same tool + same args 4x** = loop abort (read tools) or 5x (write/command tools)
-- **edit_file "old_string not found"** = re-read the exact lines from disk, then retry
-
----
-
----
-
-## REFLEXION SELF-VERIFICATION (Automatic)
-
-When you stop calling tools (output is plain text, not tool calls), the system automatically:
-
-1. Runs **deterministic_checker** (AST lint, syntax fixes, import cleanup) on all files you touched
-2. **Detects a test command** and runs it
-3. **If tests pass** — done, result is returned
-4. **If tests fail** — you get 2 rounds to read the traceback, fix the root cause, and retest
-5. **3rd failure** — Critic (deepseek-v4-pro + max thinking) diagnoses with structured output → you apply the targeted fix
-6. **Still failing after critic** — git rollback of your changes, report the failure honestly
-
-
-## BUILT-IN SKILLS
-
-### clean-code
-
-# Clean Code - Pragmatic AI Coding Standards
-> **CRITICAL SKILL** - Be **concise, direct, and solution-focused**.
-
-## Core Principles
-| Principle | Rule |
-|-----------|------|
-| **SRP** | Single Responsibility - each function/class does ONE thing |
-| **DRY** | Don't Repeat Yourself - extract duplicates, reuse |
-| **KISS** | Keep It Simple - simplest solution that works |
-| **YAGNI** | You Aren't Gonna Need It - don't build unused features |
-| **Boy Scout** | Leave code cleaner than you found it |
-
-## Naming Rules
-| Element | Convention |
-|---------|------------|
-| **Variables** | Reveal intent: `userCount` not `n` |
-| **Functions** | Verb + noun: `getUserById()` not `user()` |
-| **Booleans** | Question form: `isActive`, `hasPermission`, `canEdit` |
-| **Constants** | SCREAMING_SNAKE: `MAX_RETRY_COUNT` |
-
-**Rule:** If you need a comment to explain a name, rename it.
-
-## Function Rules
-| Rule | Description |
-|------|-------------|
-| **Small** | Max 20 lines, ideally 5-10 |
-| **One Thing** | Does one thing, does it well |
-| **One Level** | One level of abstraction per function |
-| **Few Args** | Max 3 arguments, prefer 0-2 |
-| **No Side Effects** | Don't mutate inputs unexpectedly |
-
-## Code Structure
-| Pattern | Apply |
-|---------|-------|
-| **Guard Clauses** | Early returns for edge cases |
-| **Flat > Nested** | Avoid deep nesting (max 2 levels) |
-| **Composition** | Small functions composed together |
-| **Colocation** | Keep related code close |
-
-## AI Coding Style
-| Situation | Action |
-|-----------|--------|
-| User asks for feature | Write it directly |
-| User reports bug | Fix it, don't explain |
-| No clear requirement | Ask, don't assume |
-
-## Anti-Patterns (DON'T)
-| ❌ Pattern | ✅ Fix |
-|-----------|-------|
-| Comment every line | Delete obvious comments |
-| Helper for one-liner | Inline the code |
-| Factory for 2 objects | Direct instantiation |
-| utils.ts with 1 function | Put code where used |
-| "First we import..." | Just write code |
-| Deep nesting | Guard clauses |
-| Magic numbers | Named constants |
-| God functions | Split by responsibility |
-
-## Before Editing ANY File (THINK FIRST!)
-| Question | Why |
-|----------|-----|
-| **What imports this file?** | They might break |
-| **What does this file import?** | Interface changes |
-| **What tests cover this?** | Tests might fail |
-| **Is this a shared component?** | Multiple places affected |
-
-> **Rule:** Edit the file + all dependent files in the SAME task.
-> **Never leave broken imports or missing updates.**
-
-## Self-Check Before Completing
-| Check | Question |
-|-------|----------|
-| **Goal met?** | Did I do exactly what user asked? |
-| **Files edited?** | Did I modify all necessary files? |
-| **Code works?** | Did I test/verify the change? |
-| **No errors?** | Lint and TypeScript pass? |
-| **Nothing forgotten?** | Any edge cases missed? |
-
-### api-design-principles
-
-Master REST and GraphQL API design principles to build intuitive, scalable, and maintainable APIs.
-
-## Instructions
-1. Define consumers, use cases, and constraints.
-2. Choose API style and model resources or types.
-3. Specify errors, versioning, pagination, and auth strategy.
-4. Validate with examples and review for consistency.
-
----
-
-### code-review-checklist
-
-# Code Review Checklist
-
-## Overview
-
-Provide a systematic checklist for conducting thorough code reviews. This skill helps reviewers ensure code quality, catch bugs, identify security issues, and maintain consistency across the codebase.
-
-## How It Works
-
-### Step 1: Understand the Context
-
-Before reviewing code, I'll help you understand:
-- What problem does this code solve?
-- What are the requirements?
-- What files were changed and why?
-- Are there related issues or tickets?
-- What's the testing strategy?
-
-### Step 2: Review Functionality
-
-Check if the code works correctly:
-- Does it solve the stated problem?
-- Are edge cases handled?
-- Is error handling appropriate?
-- Are there any logical errors?
-- Does it match the requirements?
-
-### Step 3: Review Code Quality
-
-Assess code maintainability:
-- Is the code readable and clear?
-- Are names descriptive?
-- Is it properly structured?
-- Are functions/methods focused?
-- Is there unnecessary complexity?
-
-### Step 4: Review Security
-
-Check for security issues:
-- Are inputs validated?
-- Is sensitive data protected?
-- Are there SQL injection risks?
-- Is authentication/authorization correct?
-- Are dependencies secure?
-
-### Step 5: Review Performance
-
-Look for performance issues:
-- Are there unnecessary loops?
-- Is database access optimized?
-- Are there memory leaks?
-- Is caching used appropriately?
-- Are there N+1 query problems?
-
-### Step 6: Review Tests
-
-Verify test coverage:
-- Are there tests for new code?
-- Do tests cover edge cases?
-- Are tests meaningful?
-- Do all tests pass?
-- Is test coverage adequate?
-
-## Examples
-
-### Example 1: Functionality Review Checklist
-
-`markdown
-## Functionality Review
-
-### Requirements
-- [ ] Code solves the stated problem
-- [ ] All acceptance criteria are met
-- [ ] Edge cases are handled
-- [ ] Error cases are handled
-- [ ] User input is validated
-
-### Logic
-- [ ] No logical errors or bugs
-- [ ] Conditions are correct (no off-by-one errors)
-- [ ] Loops terminate correctly
-- [ ] Recursion has proper base cases
-- [ ] State management is correct
-
-### Error Handling
-- [ ] Errors are caught appropriately
-- [ ] Error messages are clear and helpful
-- [ ] Errors don't expose sensitive information
-- [ ] Failed operations are rolled back
-- [ ] Logging is appropriate
-
-### Example Issues to Catch:
-
-**❌ Bad - Missing validation:**
-\`\`\`javascript
-function createUser(email, password) {
- // No validation!
- return db.users.create({ email, password });
-}
-\`\`\`
-
-**✅ Good - Proper validation:**
-\`\`\`javascript
-function createUser(email, password) {
- if (!email || !isValidEmail(email)) {
- throw new Error('Invalid email address');
- }
- if (!password || password.length < 8) {
- throw new Error('Password must be at least 8 characters');
- }
- return db.users.create({ email, password });
-}
-\`\`\`
-`
-
-### Example 2: Security Review Checklist
-
-`markdown
-## Security Review
-
-### Input Validation
-- [ ] All user inputs are validated
-- [ ] SQL injection is prevented (use parameterized queries)
-- [ ] XSS is prevented (escape output)
-- [ ] CSRF protection is in place
-- [ ] File uploads are validated (type, size, content)
-
-### Authentication & Authorization
-- [ ] Authentication is required where needed
-- [ ] Authorization checks are present
-- [ ] Passwords are hashed (never stored plain text)
-- [ ] Sessions are managed securely
-- [ ] Tokens expire appropriately
-
-### Data Protection
-- [ ] Sensitive data is encrypted
-- [ ] API keys are not hardcoded
-- [ ] Environment variables are used for secrets
-- [ ] Personal data follows privacy regulations
-- [ ] Database credentials are secure
-
-### Dependencies
-- [ ] No known vulnerable dependencies
-- [ ] Dependencies are up to date
-- [ ] Unnecessary dependencies are removed
-- [ ] Dependency versions are pinned
-
-### Example Issues to Catch:
-
-**❌ Bad - SQL injection risk:**
-\`\`\`javascript
-const query = \`SELECT * FROM users WHERE email = '\${email}'\`;
-db.query(query);
-\`\`\`
-
-**✅ Good - Parameterized query:**
-\`\`\`javascript
-const query = 'SELECT * FROM users WHERE email = $1';
-db.query(query, [email]);
-\`\`\`
-
-**❌ Bad - Hardcoded secret:**
-\`\`\`javascript
-const API_KEY = 'sk_live_abc123xyz';
-\`\`\`
-
-**✅ Good - Environment variable:**
-\`\`\`javascript
-const API_KEY = process.env.API_KEY;
-if (!API_KEY) {
- throw new Error('API_KEY environment variable is required');
-}
-\`\`\`
-`
-
-### Example 3: Code Quality Review Checklist
-
-`markdown
-## Code Quality Review
-
-### Readability
-- [ ] Code is easy to understand
-- [ ] Variable names are descriptive
-- [ ] Function names explain what they do
-- [ ] Complex logic has comments
-- [ ] Magic numbers are replaced with constants
-
-### Structure
-- [ ] Functions are small and focused
-- [ ] Code follows DRY principle (Don't Repeat Yourself)
-- [ ] Proper separation of concerns
-- [ ] Consistent code style
-- [ ] No dead code or commented-out code
-
-### Maintainability
-- [ ] Code is modular and reusable
-- [ ] Dependencies are minimal
-- [ ] Changes are backwards compatible
-- [ ] Breaking changes are documented
-- [ ] Technical debt is noted
-
-### Example Issues to Catch:
-
-**❌ Bad - Unclear naming:**
-\`\`\`javascript
-function calc(a, b, c) {
- return a * b + c;
-}
-\`\`\`
-
-**✅ Good - Descriptive naming:**
-\`\`\`javascript
-function calculateTotalPrice(quantity, unitPrice, tax) {
- return quantity * unitPrice + tax;
-}
-\`\`\`
-
-**❌ Bad - Function doing too much:**
-\`\`\`javascript
-function processOrder(order) {
- // Validate order
- if (!order.items) throw new Error('No items');
- 
- // Calculate total
- let total = 0;
- for (let item of order.items) {
- total += item.price * item.quantity;
- }
- 
- // Apply discount
- if (order.coupon) {
- total *= 0.9;
- }
- 
- // Process payment
- const payment = stripe.charge(total);
- 
- // Send email
- sendEmail(order.email, 'Order confirmed');
- 
- // Update inventory
- updateInventory(order.items);
- 
- return { orderId: order.id, total };
-}
-\`\`\`
-
-**✅ Good - Separated concerns:**
-\`\`\`javascript
-function processOrder(order) {
- validateOrder(order);
- const total = calculateOrderTotal(order);
- const payment = processPayment(total);
- sendOrderConfirmation(order.email);
- updateInventory(order.items);
- 
- return { orderId: order.id, total };
-}
-\`\`\`
-`
-
-## Best Practices
-
-### ✅ Do This
-
-- **Review Small Changes** - Smaller PRs are easier to review thoroughly
-- **Check Tests First** - Verify tests pass and cover new code
-- **Run the Code** - Test it locally when possible
-- **Ask Questions** - Don't assume, ask for clarification
-- **Be Constructive** - Suggest improvements, don't just criticize
-- **Focus on Important Issues** - Don't nitpick minor style issues
-- **Use Automated Tools** - Linters, formatters, security scanners
-- **Review Documentation** - Check if docs are updated
-- **Consider Performance** - Think about scale and efficiency
-- **Check for Regressions** - Ensure existing functionality still works
-
-### ❌ Don't Do This
-
-- **Don't Approve Without Reading** - Actually review the code
-- **Don't Be Vague** - Provide specific feedback with examples
-- **Don't Ignore Security** - Security issues are critical
-- **Don't Skip Tests** - Untested code will cause problems
-- **Don't Be Rude** - Be respectful and professional
-- **Don't Rubber Stamp** - Every review should add value
-- **Don't Review When Tired** - You'll miss important issues
-- **Don't Forget Context** - Understand the bigger picture
-
-## Complete Review Checklist
-
-### Pre-Review
-- [ ] Read the PR description and linked issues
-- [ ] Understand what problem is being solved
-- [ ] Check if tests pass in CI/CD
-- [ ] Pull the branch and run it locally
-
-### Functionality
-- [ ] Code solves the stated problem
-- [ ] Edge cases are handled
-- [ ] Error handling is appropriate
-- [ ] User input is validated
-- [ ] No logical errors
-
-### Security
-- [ ] No SQL injection vulnerabilities
-- [ ] No XSS vulnerabilities
-- [ ] Authentication/authorization is correct
-- [ ] Sensitive data is protected
-- [ ] No hardcoded secrets
-
-### Performance
-- [ ] No unnecessary database queries
-- [ ] No N+1 query problems
-- [ ] Efficient algorithms used
-- [ ] No memory leaks
-- [ ] Caching used appropriately
-
-### Code Quality
-- [ ] Code is readable and clear
-- [ ] Names are descriptive
-- [ ] Functions are focused and small
-- [ ] No code duplication
-- [ ] Follows project conventions
-
-### Tests
-- [ ] New code has tests
-- [ ] Tests cover edge cases
-- [ ] Tests are meaningful
-- [ ] All tests pass
-- [ ] Test coverage is adequate
-
-### Documentation
-- [ ] Code comments explain why, not what
-- [ ] API documentation is updated
-- [ ] README is updated if needed
-- [ ] Breaking changes are documented
-- [ ] Migration guide provided if needed
-
-### Git
-- [ ] Commit messages are clear
-- [ ] No merge conflicts
-- [ ] Branch is up to date with main
-- [ ] No unnecessary files committed
-- [ ] .gitignore is properly configured
-
-## Common Pitfalls
-
-### Problem: Missing Edge Cases
-**Symptoms:** Code works for happy path but fails on edge cases
-**Solution:** Ask "What if...?" questions
-- What if the input is null?
-- What if the array is empty?
-- What if the user is not authenticated?
-- What if the network request fails?
-
-### Problem: Security Vulnerabilities
-**Symptoms:** Code exposes security risks
-**Solution:** Use security checklist
-- Run security scanners (npm audit, Snyk)
-- Check OWASP Top 10
-- Validate all inputs
-- Use parameterized queries
-- Never trust user input
-
-### Problem: Poor Test Coverage
-**Symptoms:** New code has no tests or inadequate tests
-**Solution:** Require tests for all new code
-- Unit tests for functions
-- Integration tests for features
-- Edge case tests
-- Error case tests
-
-### Problem: Unclear Code
-**Symptoms:** Reviewer can't understand what code does
-**Solution:** Request improvements
-- Better variable names
-- Explanatory comments
-- Smaller functions
-- Clear structure
-
-## Review Comment Templates
-
-### Requesting Changes
-`markdown
-**Issue:** [Describe the problem]
-
-**Current code:**
-\`\`\`javascript
-// Show problematic code
-\`\`\`
-
-**Suggested fix:**
-\`\`\`javascript
-// Show improved code
-\`\`\`
-
-**Why:** [Explain why this is better]
-`
-
-### Asking Questions
-`markdown
-**Question:** [Your question]
-
-**Context:** [Why you're asking]
-
-**Suggestion:** [If you have one]
-`
-
-### Praising Good Code
-`markdown
-**Nice!** [What you liked]
-
-This is great because [explain why]
-`
-
-### react-performance
-
-# React & Next.js Performance Optimization
-
-Comprehensive performance rules for React and Next.js applications. Apply these systematically to eliminate bottlenecks.
-
-## Critical Priority (Fix These First)
-
-### Eliminate Waterfalls
-Waterfalls are the #1 performance killer. Each sequential await adds full round-trip latency.
-
-`typescript
-// ❌ WRONG: Sequential awaits — each waits for the previous to finish
-const user = await fetchUser()
-const posts = await fetchPosts()
-const comments = await fetchComments()
-
-// ✅ CORRECT: Parallel fetching — all start simultaneously
-const [user, posts, comments] = await Promise.all([
-  fetchUser(),
-  fetchPosts(),
-  fetchComments()
-])
-`
-
-### Defer Await Until Needed
-Move awaits into the branches where their data is actually used.
-
-`typescript
-// ❌ WRONG: Awaiting upfront even when data may not be needed
-async function getPageData(slug: string) {
-  const analytics = await fetchAnalytics(slug)
-  const page = await fetchPage(slug)
-  if (!page) return notFound()
-  return { page, analytics }
-}
-
-// ✅ CORRECT: Defer await until the data is consumed
-async function getPageData(slug: string) {
-  const analyticsPromise = fetchAnalytics(slug)
-  const page = await fetchPage(slug)
-  if (!page) return notFound()
-  return { page, analytics: await analyticsPromise }
-}
-`
-
-### Avoid Barrel Imports
-Barrel files (index.ts re-exports) prevent tree shaking and inflate bundle size.
-
-`typescript
-// ❌ WRONG: Loads entire icon library (~200KB)
-import { Check } from 'lucide-react'
-
-// ✅ CORRECT: Loads only the icon you need (~2KB)
-import Check from 'lucide-react/dist/esm/icons/check'
-
-// ❌ WRONG: Barrel import pulls all utils
-import { formatDate } from '@/utils'
-
-// ✅ CORRECT: Direct import
-import { formatDate } from '@/utils/date-formatting'
-`
-
-### Dynamic Imports for Heavy Components
-Lazy-load components that aren't needed on initial render.
-
-`typescript
-import dynamic from 'next/dynamic'
-
-// ❌ WRONG: Static import of heavy component
-import MonacoEditor from './monaco-editor'
-
-// ✅ CORRECT: Dynamic import with loading state
-const MonacoEditor = dynamic(
-  () => import('./monaco-editor'),
-  {
-    ssr: false,
-    loading: () => <EditorSkeleton />
-  }
-)
-`
-
-### Strategic Suspense Boundaries
-Stream content progressively — show layout shell while data loads.
-
-`typescript
-// ✅ CORRECT: Wrap slow data-fetching components in Suspense
-export default function DashboardPage() {
-  return (
-    <div className="dashboard-layout">
-      <Header />  {/* renders immediately */}
-      <Sidebar /> {/* renders immediately */}
-
-      <Suspense fallback={<ChartSkeleton />}>
-        <AnalyticsChart />  {/* streams when data ready */}
-      </Suspense>
-
-      <Suspense fallback={<TableSkeleton />}>
-        <DataTable />  {/* streams independently */}
-      </Suspense>
-    </div>
-  )
-}
-`
-
-## Re-render Prevention (High Priority)
-
-### Isolate Ticking State
-Move fast-changing state (timers, animations, real-time data) into child components so the parent never re-renders on each tick.
-
-`typescript
-// ❌ WRONG: Timer state in parent forces entire list to re-render
-function Dashboard() {
-  const [time, setTime] = useState(Date.now())
-  useEffect(() => {
-    const id = setInterval(() => setTime(Date.now()), 1000)
-    return () => clearInterval(id)
-  }, [])
-
-  return (
-    <div>
-      <Clock time={time} />
-      <ExpensiveList items={items} />  {/* re-renders every second! */}
-    </div>
-  )
-}
-
-// ✅ CORRECT: Timer state isolated in child
-function Dashboard() {
-  return (
-    <div>
-      <LiveClock />  {/* owns its own timer state */}
-      <ExpensiveList items={items} />  {/* never re-renders from clock */}
-    </div>
-  )
-}
-
-function LiveClock() {
-  const [time, setTime] = useState(Date.now())
-  useEffect(() => {
-    const id = setInterval(() => setTime(Date.now()), 1000)
-    return () => clearInterval(id)
-  }, [])
-  return <span>{new Date(time).toLocaleTimeString()}</span>
-}
-`
-
-### Memoization Rules
-
-`typescript
-// ✅ memo() — wrap leaf/row components ONLY when their props are stable
-export const MarketRow = React.memo<MarketRowProps>(({ market, onSelect }) => {
-  return <div onClick={() => onSelect(market.id)}>{market.name}</div>
-})
-
-// ✅ useCallback — stabilize handlers passed to memoized children
-const handleSelect = useCallback((id: string) => {
-  setSelectedId(id)
-}, [])
-
-// ✅ useMemo — cache expensive derived computations
-const sortedMarkets = useMemo(
-  () => markets.sort((a, b) => b.volume - a.volume),
-  [markets]
-)
-
-// ❌ WRONG: Memoizing with unstable props — WASTES CPU
-const Component = memo(({ data, onClick }) => { ... })
-// If onClick is a new arrow function every render, memo() does nothing
-`
-
-### Checklist
-- Virtualize lists > 50 items (react-window, @tanstack/react-virtual). Never render 1000+ DOM nodes.
-- Stable keys always. Never use array index as key when order can change.
-- Verify useEffect dependency arrays — effects that re-run on every render are bugs.
-- No derived computation in render body — precompute or compute inside useMemo.
-- Use useTransition for non-urgent state updates (search, filtering).
-
-## React Performance Diagnosis Workflow
-
-When a component is slow, follow this structured process:
-
-1. **Reproduce** or describe the slowdown precisely.
-2. **Identify triggers**: which state update, prop change, or effect causes the expensive render?
-3. **Isolate**: move fast-changing state into a child; keep heavy subtrees static.
-4. **Stabilize**: useCallback for handlers, useMemo for derived values.
-5. **Reduce work**: virtualize lists, defer off-screen content, code-split heavy modules.
-6. **Validate**: React DevTools Profiler → record interaction → Flamegraph → flag components rendering > 16ms → compare against pre-optimization baseline.
-
----
-
-### tdd-discipline
-
-# Test-Driven Development (TDD)
-
-Strict TDD discipline for all production code.
-
-## Iron Law
-
-**NO production code without a failing test first.**
-If you wrote code before writing a test for it, delete the code and start over with a test.
-
-## Red-Green-Refactor Cycle
-
-### 1. RED — Write a Failing Test
-Write ONE minimal test for ONE specific behavior. Run it. It MUST fail.
-If it passes without new code, the test is wrong or the behavior already exists.
-
-### 2. GREEN — Write Minimum Code
-Write the absolute minimum production code to make the test pass. Nothing more.
-No "while I'm here" additions. No future-proofing. Just make the red test green.
-
-### 3. REFACTOR — Clean Up
-Improve structure, remove duplication, clarify names — while keeping ALL tests green.
-If any test turns red during refactoring, you introduced a regression. Fix it immediately.
-
-## Anti-Patterns (BANNED)
-
-| Anti-Pattern | Why It's Bad | Fix |
-|-------------|-------------|-----|
-| **Implementation First** | Writing code before tests → tests become afterthoughts that test implementation, not behavior | Delete the code. Write the test first. |
-| **Horizontal TDD** | Writing 10 tests before implementing any → overwhelms, leads to speculative design | One test at a time. RED → GREEN → REFACTOR → next test. |
-| **Testing Internals** | Testing private methods, internal state, implementation details → brittle tests that break on refactors | Test PUBLIC behavior only. "Given input X, expect output Y." |
-| **Skipping Refactor** | Moving to next feature after GREEN → technical debt accumulates silently | ALWAYS refactor after GREEN. It's not optional. |
-| **Over-Mocking** | Mocking everything → tests pass but code is broken in production | Mock EXTERNAL dependencies only (APIs, DBs, file system). Never mock internal logic. |
-
-## Test Types & When to Use
-
-| Type | What It Tests | Speed | Quantity |
-|------|--------------|-------|----------|
-| **Unit** | Single function/class behavior in isolation | Fast (ms) | Many |
-| **Integration** | Module boundaries, API contracts, DB queries | Medium (s) | Moderate |
-| **E2E** | Critical user flows end-to-end | Slow (min) | Few — happy paths + critical failures only |
-
-## Rules
-
-- Every bug fix STARTS with a failing test that reproduces the bug. Then fix the bug. The test prevents regression.
-- Test names describe behavior: `"should reject expired tokens"`, NOT `"test1"` or `"testAuth"`.
-- Assertions must be meaningful. `"runs without throwing"` is NOT a valid test unless you're testing error handling.
-- Mock external dependencies (APIs, databases, file system). NEVER mock the code you're testing.
-- Tests must be deterministic. No flaky tests. No time-dependent tests without mocking time.
-- Arrange-Act-Assert structure for every test:
-
-`typescript
-// ✅ GOOD: Clear AAA structure
-test('should calculate total with tax', () => {
-  // Arrange
-  const items = [{ price: 100, quantity: 2 }]
-  const taxRate = 0.1
-
-  // Act
-  const total = calculateTotal(items, taxRate)
-
-  // Assert
-  expect(total).toBe(220)
-})
-`
-
----
-
-### error-handling-patterns
-
-# Error Handling Implementation Patterns
-
-Concrete patterns that translate error-handling principles into production code.
-
-## API Error Response Pattern (RFC 9457)
-
-Every error response from your API MUST follow this structure. Never return raw exception messages or stack traces.
-
-`typescript
-// ✅ Standardized error response
-interface ApiErrorResponse {
-  type: string          // Error category URI (e.g., "/errors/validation")
-  title: string         // Human-readable summary
-  status: number        // HTTP status code
-  detail: string        // Specific explanation for this occurrence
-  errors?: Array<{      // Field-level errors (for validation)
-    field: string
-    message: string
-    code: string
-  }>
-}
-
-// ✅ Example usage in API handler
-function handleError(error: unknown): ApiErrorResponse {
-  if (error instanceof ValidationError) {
-    return {
-      type: '/errors/validation',
-      title: 'Validation Failed',
-      status: 422,
-      detail: 'One or more fields contain invalid data.',
-      errors: error.fieldErrors.map(e => ({
-        field: e.path,
-        message: e.message,
-        code: e.code
-      }))
-    }
-  }
-
-  // Log full error internally, return sanitized response
-  logger.error('Unhandled error', { error, requestId })
-  return {
-    type: '/errors/internal',
-    title: 'Internal Server Error',
-    status: 500,
-    detail: 'An unexpected error occurred. Please try again.'
-    // NEVER include: stack trace, DB details, internal IDs
-  }
-}
-`
-
-## Result Pattern (For Business Logic)
-
-For expected failures (validation, business rules), return a Result type instead of throwing. Reserve exceptions for truly unexpected failures (network down, disk full, OOM).
-
-`typescript
-// ✅ Result type — explicit success/failure
-type Result<T, E = Error> =
-  | { success: true; data: T }
-  | { success: false; error: E }
-
-// ✅ Usage in service layer
-async function transferFunds(
-  fromId: string,
-  toId: string,
-  amount: number
-): Promise<Result<Transfer, TransferError>> {
-  const fromAccount = await accountRepo.findById(fromId)
-  if (!fromAccount) {
-    return { success: false, error: { code: 'ACCOUNT_NOT_FOUND', accountId: fromId } }
-  }
-
-  if (fromAccount.balance < amount) {
-    return { success: false, error: { code: 'INSUFFICIENT_FUNDS', available: fromAccount.balance } }
-  }
-
-  const transfer = await accountRepo.transfer(fromId, toId, amount)
-  return { success: true, data: transfer }
-}
-
-// ✅ Caller handles both cases explicitly
-const result = await transferFunds(from, to, amount)
-if (!result.success) {
-  return res.status(400).json(mapToApiError(result.error))
-}
-return res.status(200).json(result.data)
-`
-
-## Resilience Patterns
-
-### Circuit Breaker
-Prevent cascading failures by stopping calls to a failing downstream service.
-
-| State | Behavior |
-|-------|----------|
-| **CLOSED** (normal) | Requests pass through. Track failure count. |
-| **OPEN** (failing) | After N consecutive failures, reject ALL requests immediately. Return fallback. |
-| **HALF-OPEN** (testing) | After cooldown period, allow ONE test request through. If it succeeds → CLOSED. If it fails → OPEN. |
-
-Always implement a fallback for OPEN state: cached data, default values, or graceful degradation message.
-
-### Retry with Exponential Backoff + Jitter
-
-`typescript
-// ✅ CORRECT: Retry with backoff and jitter
-async function retryWithBackoff<T>(
-  fn: () => Promise<T>,
-  maxRetries: number = 3,
-  baseDelayMs: number = 1000
-): Promise<T> {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn()
-    } catch (error) {
-      if (attempt === maxRetries) throw error
-
-      // Exponential backoff + random jitter to prevent thundering herd
-      const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000
-      await new Promise(resolve => setTimeout(resolve, delay))
-    }
-  }
-  throw new Error('Unreachable')
-}
-- Strict timeout on ALL network calls. No unbounded waits. Default: 5s for APIs, 30s for uploads.
-- Idempotency keys for retried mutation requests. Never retry a POST/PUT without one.
-- Log every error with request ID, timestamp, and context. Never log sensitive data (passwords, tokens, PII).
-- Frontend: disable submit buttons during mutation to prevent double-submit. Re-enable on success OR failure.
-- Fail fast on unrecoverable errors. Don't retry 401 (auth), 403 (forbidden), or 404 (not found).
-"""
-
+# Dev system prompt lives in developer_prompt.py (imported above).
 
 def get_compact_file_list(project_path: str) -> str:
     """
@@ -1150,8 +153,8 @@ def _build_dynamic_context(task: str, project_path: str, context: str, is_fixing
 
     Returns:
         (stable_context, volatile_context)
-        - stable_context: Byte-identical per project_path — safe in SystemMessage (cached).
-        - volatile_context: Changes per task — must go at TAIL of HumanMessage (cache miss).
+        - stable_context: Byte-identical per project_path â€” safe in SystemMessage (cached).
+        - volatile_context: Changes per task â€” must go at TAIL of HumanMessage (cache miss).
 
     The Three-Zone Cache Architecture (Reasonix pattern):
       Zone 1 (Immutable Prefix): SystemMessage = base_prompt + tools + stable_context
@@ -1164,7 +167,7 @@ def _build_dynamic_context(task: str, project_path: str, context: str, is_fixing
     safe_path = project_path or "."
     wdir = project_path or "d:/MyProject/LangChain"
 
-    # ── STABLE: Byte-identical for a given project_path ──
+    # â”€â”€ STABLE: Byte-identical for a given project_path â”€â”€
     stable_parts = []
     stable_parts.append(f"## Working Directory\n{wdir}")
 
@@ -1178,7 +181,7 @@ def _build_dynamic_context(task: str, project_path: str, context: str, is_fixing
     except Exception as e:
         print(f"Error loading rules context for developer: {e}")
 
-    # ── VOLATILE: Changes per task — repo map extracts hot_files from task text ──
+    # â”€â”€ VOLATILE: Changes per task â€” repo map extracts hot_files from task text â”€â”€
     volatile_parts = []
 
     # Project structure (moved to volatile context to maximize Zone 1 KV cache hits since files can be added/deleted during execution)
@@ -1221,18 +224,18 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     """
     Build the system prompt with Three-Zone Cache Architecture.
 
-    Zone 1 (Immutable Prefix → SystemMessage):
+    Zone 1 (Immutable Prefix â†’ SystemMessage):
       base_prompt + tools_block + example + STABLE dynamic parts
       (working directory, project structure, workspace rules)
-      → 100% byte-identical per project_path → DEEPSEEK CACHE HIT
+      â†’ 100% byte-identical per project_path â†’ DEEPSEEK CACHE HIT
 
-    Zone 2 (Task-Specific Tail → HumanMessage):
+    Zone 2 (Task-Specific Tail â†’ HumanMessage):
       task + VOLATILE dynamic parts
       (repo map, memory context, skills context)
-      → Changes per task → cache miss (but only ~15-20% of total tokens)
+      â†’ Changes per task â†’ cache miss (but only ~15-20% of total tokens)
 
     Zone 3 (Append-Only Log):
-      Conversation turns — grows monotonically, prior turns cached.
+      Conversation turns â€” grows monotonically, prior turns cached.
 
     This pushes cache hit rate from ~60% to 85%+ across diverse eval tasks
     because the cache break point moves from mid-prompt to the very tail.
@@ -1243,12 +246,12 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
 
     base_prompt = profile.base_system_prompt if profile else _STATIC_SYSTEM_TEMPLATE
 
-    # Split dynamic context: stable → SystemMessage, volatile → HumanMessage tail
+    # Split dynamic context: stable â†’ SystemMessage, volatile â†’ HumanMessage tail
     stable_context, volatile_context = _build_dynamic_context(task, project_path, context, is_fixing)
 
-    # Zone 1: Immutable prefix — stable_context goes HERE (not in HumanMessage)
+    # Zone 1: Immutable prefix â€” stable_context goes HERE (not in HumanMessage)
     # so it participates in the DeepSeek prefix cache.
-    # NOTE: tools_block is NOT included — the COMPLETE TOOL REFERENCE section
+    # NOTE: tools_block is NOT included â€” the COMPLETE TOOL REFERENCE section
     # inside _STATIC_SYSTEM_TEMPLATE already documents every tool with params,
     # usage guides, trust rules, and STOP RULES. The compact 1-liner defs are
     # redundant and would waste ~200 tokens of cached Zone 1 space.
@@ -1312,9 +315,9 @@ def _log(msg: str) -> None:
         print(msg, flush=True)
     except Exception:
         pass
-    state = safe_get_state()
-    if "live_terminal_log" in state:
-        safe_update_state({"live_terminal_log": state["live_terminal_log"] + msg + "\n"})
+    # Appends under lock instead of snapshot+overwrite — the old pattern could
+    # drop lines appended by other threads between the read and the write.
+    safe_append_live_log(msg)
 
 def count_identical_calls_since_state_change(tool_call_log: list, tool_name: str, tool_args: dict) -> int:
     """
@@ -1395,7 +398,7 @@ def deserialize_messages(serialized_msgs: list[dict]) -> list:
 def developer_node(s: ITState) -> dict:
     """
     Tool-using Developer agent.
-    Loops: LLM decides tool → execute tool → feed result → repeat until done.
+    Loops: LLM decides tool â†’ execute tool â†’ feed result â†’ repeat until done.
 
     Uses proper LangChain message types for multi-turn conversations.
     """
@@ -1500,7 +503,7 @@ def developer_node(s: ITState) -> dict:
     err_count = s.get("error_count", 0)
     chat_id = s.get("chat_id", "")
 
-    # ── Loop-Breaker Git Rollback (#20) ──
+    # â”€â”€ Loop-Breaker Git Rollback (#20) â”€â”€
     if err_count > 1:
         try:
             safe_update_state({"thoughts": {"developer": "Loop detected. Rolling back workspace to last stable commit..."}})
@@ -1527,7 +530,7 @@ def developer_node(s: ITState) -> dict:
     )
     safe_update_state({"thoughts": {"developer": "Analyzing and executing..."}})
 
-    # ── Git Resumption Change Tracking (#15) ──
+    # â”€â”€ Git Resumption Change Tracking (#15) â”€â”€
     modified_files = []
     try:
         # Check status
@@ -1560,13 +563,13 @@ def developer_node(s: ITState) -> dict:
             "and inspect the error traceback details carefully before writing code.\n"
         )
 
-    # ── Load chat history from workspace chat file so the developer remembers the context ──
-    chat_history_str = build_chat_context(project_path, chat_id, max_messages=6, max_chars_per_msg=300)
+    # â”€â”€ Load chat history from workspace chat file so the developer remembers the context â”€â”€
+    chat_history_str = build_chat_context(project_path, chat_id, max_messages=30, max_chars_per_msg=3000)
 
     if chat_history_str:
         context += f"\n## Recent Chat History\nUse this to understand the context of the request and what has been completed or discussed:\n{chat_history_str}\n\n"
 
-    # ── Load task progress so the developer knows what was done vs remaining ──
+    # â”€â”€ Load task progress so the developer knows what was done vs remaining â”€â”€
     task_data = None
     task_step_info = ""
     try:
@@ -1581,7 +584,7 @@ def developer_node(s: ITState) -> dict:
                 task_step_info = "\n" + build_task_progress_block(task_data) + "\n"
     except Exception as e:
         print(f"[DEVELOPER] Error loading task context: {e}")
-    # ── END ──
+    # â”€â”€ END â”€â”€
 
     if task_step_info:
         context += task_step_info
@@ -1592,9 +595,9 @@ def developer_node(s: ITState) -> dict:
                    "web_fetch", "browser_navigate", "browser_extract",
                    "browser_screenshot", "browser_close"]
 
-    max_iters = 50
+    max_iters = MAX_ITERATIONS  # Use the module-level constant — 200 turns
 
-    # ── Load developer state if resuming from suspension ──
+    # â”€â”€ Load developer state if resuming from suspension â”€â”€
     developer_state = None
     try:
         task_data = load_task_tracking(project_path, chat_id)
@@ -1618,7 +621,7 @@ def developer_node(s: ITState) -> dict:
         task_human_content += f"\n\n{volatile_context}"
 
     if developer_state:
-        _log(f"[DEVELOPER] 🔄 Resuming from suspended execution state (iteration {developer_state['iteration']})...")
+        _log(f"[DEVELOPER] ðŸ”„ Resuming from suspended execution state (iteration {developer_state['iteration']})...")
         if developer_state.get("messages"):
             messages = deserialize_messages(developer_state["messages"])
         elif hasattr(s, "get") and s.get("messages") and len(s.get("messages")) > 0:
@@ -1649,7 +652,7 @@ def developer_node(s: ITState) -> dict:
             voluntary_compact_requested = False
             # Append the new task traceback / client request as a human message to the end of history
             messages.append(HumanMessage(content=task_human_content))
-            _log("[DEVELOPER] 🔄 Starting a new repair/implement cycle. Reset iteration budget and appended the new task description.")
+            _log("[DEVELOPER] ðŸ”„ Starting a new repair/implement cycle. Reset iteration budget and appended the new task description.")
 
         tool_call_log = developer_state["tool_call_log"]
         tracked_files_created = developer_state["tracked_files_created"]
@@ -1677,8 +680,8 @@ def developer_node(s: ITState) -> dict:
             appended_ids.append(summary_msg.id)
 
             messages = [messages[0], messages[1], summary_msg] + messages[-6:]
-            _log(f"[DEVELOPER] 🧹 Aggressive structured context compaction: reduced history from {len(developer_state['messages'])} to {len(messages)} messages.")
-            _log(f"[DEVELOPER] 🧹 Compacted summary details:\n{summary_content}")
+            _log(f"[DEVELOPER] ðŸ§¹ Aggressive structured context compaction: reduced history from {len(developer_state['messages'])} to {len(messages)} messages.")
+            _log(f"[DEVELOPER] ðŸ§¹ Compacted summary details:\n{summary_content}")
     else:
         # Zone 1 + Zone 2: SystemMessage (cached) + task+volatile (cache break)
         messages = [
@@ -1702,9 +705,43 @@ def developer_node(s: ITState) -> dict:
     self_verify_retries = 0
     reflexion_retries = 0
 
-    while iteration < max_iters:
+    while True:
         iteration += 1
-        _log(f"\n[DEV Iteration {iteration}/{max_iters}]")
+        _log(f"\n[DEV Iteration {iteration}]")
+
+        # ── Safety ceiling (should never be reached — LLM decides when done) ──
+        if iteration > max_iters:
+            _log(f"[DEVELOPER] Safety ceiling ({max_iters}) reached — saving checkpoint and forcing exit.")
+            safe_update_state({"thoughts": {"developer": f"Hit safety ceiling ({max_iters}). Saving work and exiting."}})
+            # Save checkpoint
+            try:
+                task_tracking_data = load_task_tracking(project_path, chat_id)
+                if task_tracking_data and task_tracking_data.get("steps"):
+                    steps_data = task_tracking_data["steps"]
+                    current_idx = task_tracking_data.get("current_step", 0)
+                    if current_idx < len(steps_data):
+                        steps_data[current_idx]["tool_calls"] = step_tool_calls
+                        steps_data[current_idx]["notes"] = f"Safety ceiling at iteration {max_iters}"
+                    artifacts = task_tracking_data.setdefault("artifacts", {})
+                    if tracked_files_created:
+                        existing = set(artifacts.get("files_created", []))
+                        existing.update(tracked_files_created)
+                        artifacts["files_created"] = list(existing)
+                    if tracked_files_modified:
+                        existing = set(artifacts.get("files_modified", []))
+                        existing.update(tracked_files_modified)
+                        artifacts["files_modified"] = list(existing)
+                    save_task_tracking(task_tracking_data, project_path, chat_id)
+            except Exception:
+                pass
+            return make_return({
+                "code": "Safety ceiling reached — partial work saved.",
+                "agent_report": _build_dev_report(last_response_text, False, []) if 'last_response_text' in dir() else "## Dev Summary\nStatus: CEILING\nWork was in progress when the safety iteration ceiling was reached.",
+                "test_report": "",
+                "project_path": project_path,
+                "code_updated": bool(tracked_files_created or tracked_files_modified),
+                "tech_spec_updated": False,
+            })
 
         # Invalidate stale read results to prevent temporal paradoxes
         messages = invalidate_stale_reads(messages)
@@ -1714,23 +751,15 @@ def developer_node(s: ITState) -> dict:
         rem_steps = (state_snap.get("remaining_steps") or 50) - 1
         safe_update_state({"remaining_steps": rem_steps})
         if rem_steps <= 0:
-            _log("[DEVELOPER] ⚠️ Out of remaining steps budget — forcing exit.")
+            _log("[DEVELOPER] âš ï¸ Out of remaining steps budget â€” forcing exit.")
             break
 
-        # ── Auto-compact: Claude Code style context management ──
+        # â”€â”€ Auto-compact: Claude Code style context management â”€â”€
         # When context grows too large, apply 3-Tier compaction strategy based on token budget
 
         # Three-zone: history starts at index 2 (after SystemMessage + Task HumanMessage)
         history_tokens = sum(estimate_tokens(m.content) for m in messages[2:]) if len(messages) > 2 else 0
         total_tokens = sum(estimate_tokens(m.content) for m in messages if hasattr(m, "content"))
-        budget = ContextBudget(
-            model_limit=1_000_000,
-            reserved_output=8000,
-            system_tokens=estimate_tokens(messages[0].content) if len(messages) > 0 else 0,
-            dynamic_tokens=estimate_tokens(messages[1].content) if len(messages) > 1 else 0,
-            history_tokens=history_tokens,
-        )
-
         # Check if the agent requested on-demand compaction via the compact_conversation tool
         voluntary_compact = False
         for msg in messages:
@@ -1738,8 +767,7 @@ def developer_node(s: ITState) -> dict:
                 voluntary_compact = True
                 break
 
-        # Pillar 111: Adaptive threshold — shallower runs tolerate more, deep loops compact earlier
-        compact_threshold = get_compaction_threshold(iteration) if iteration > 0 else 0.90
+        # Pillar 111: Adaptive threshold â€” shallower runs tolerate more, deep loops compact earlier
         keep_n = 12
 
         # 3-Tier Progressive Compaction Strategy
@@ -1753,11 +781,11 @@ def developer_node(s: ITState) -> dict:
                     tracked_files_modified,
                     keep_last_n=keep_n
                 )
-                _log(f"[DEVELOPER] Compacted history → {len(messages)} remain")
-        elif total_tokens > 500000 or budget.utilization > compact_threshold:
-            _log(f"[DEVELOPER] Auto-compact check: Tier 3 trigger (total_tokens={total_tokens}, utilization={budget.utilization:.0%} > {compact_threshold:.0%} threshold)")
+                _log(f"[DEVELOPER] Compacted history -> {len(messages)} remain")
+        elif total_tokens > 800000:
+            _log(f"[DEVELOPER] Auto-compact: Tier 3 trigger (tokens={total_tokens})")
             if len(messages) > keep_n + 2:
-                _log("[DEVELOPER] Checkpoint-Based Compaction (collapsing middle history to stable structured summary)")
+                _log("[DEVELOPER] Checkpoint-Based Compaction (collapsing middle history to structured summary)")
                 messages = checkpoint_compact(
                     messages,
                     tool_call_log,
@@ -1765,26 +793,26 @@ def developer_node(s: ITState) -> dict:
                     tracked_files_modified,
                     keep_last_n=keep_n
                 )
-                _log(f"[DEVELOPER] Compacted history → {len(messages)} remain")
-        elif total_tokens > 350000:
-            _log(f"[DEVELOPER] Auto-compact check: Tier 2 trigger (total_tokens={total_tokens} > 350K). Condensing intermediate tool results.")
+                _log(f"[DEVELOPER] Compacted history -> {len(messages)} remain")
+        elif total_tokens > 600000:
+            _log(f"[DEVELOPER] Auto-compact: Tier 2 trigger (tokens={total_tokens} > 600K)")
             if len(messages) > keep_n + 2:
                 messages = tier2_compact(messages, keep_last_n=keep_n)
-                _log(f"[DEVELOPER] Compacted history → {len(messages)} remain")
-        elif total_tokens > 200000:
-            _log(f"[DEVELOPER] Auto-compact check: Tier 1 trigger (total_tokens={total_tokens} > 200K). Compressing actions and deduplicating reads.")
+                _log(f"[DEVELOPER] Compacted history -> {len(messages)} remain")
+        elif total_tokens > 400000:
+            _log(f"[DEVELOPER] Auto-compact: Tier 1 trigger (tokens={total_tokens} > 400K)")
             if len(messages) > keep_n + 2:
                 messages = tier1_compact(messages, keep_last_n=keep_n)
-                _log(f"[DEVELOPER] Compacted history → {len(messages)} remain")
+                _log(f"[DEVELOPER] Compacted history -> {len(messages)} remain")
 
-        # ── Metacognitive Progress Audit ──
+        # Metacognitive Progress Audit â”€â”€
         # Check every 3 iterations starting at iteration 4 whether we are progressing.
         # Catches read-only spirals, indecisive exploration loops, and same-tool repetition.
         if iteration > 3 and iteration % 3 == 1:
             audit_result = _run_progress_audit(tool_call_log)
             if audit_result.startswith("STUCK:"):
                 stuck_reason = audit_result[6:].strip()
-                _log(f"[AUDITOR] ⚠️ Loop/stagnation detected: {stuck_reason}")
+                _log(f"[AUDITOR] âš ï¸ Loop/stagnation detected: {stuck_reason}")
                 auditor_msg_id = f"dev-auditor-{iteration}-{uuid.uuid4()}"
                 messages.append(HumanMessage(
                     content=f"[AUDITOR ALERT] You appear to be stuck or stagnating: {stuck_reason}. "
@@ -1794,28 +822,19 @@ def developer_node(s: ITState) -> dict:
                 ))
                 appended_ids.append(auditor_msg_id)
 
-        # Copy messages and append iteration limit warnings to nudge LLM if running out of turns
+        # Gentle progress nudges at very high iteration counts.
+        # The LLM decides when the task is done — these are just soft reminders
+        # that it's been working a long time. No pressure, no panic.
         run_messages = list(messages)
-        if iteration == max_iters:
+        if iteration >= 950:
             run_messages.append(HumanMessage(
-                content=f"WARNING: You are on iteration {iteration} of {max_iters} (the absolute final iteration). "
-                        "You are out of turns! You MUST NOT call any more tools. "
-                        "Write your final summary report / findings now in plain text."
-            ))
-        elif iteration == max_iters - 1:
-            run_messages.append(HumanMessage(
-                content=f"WARNING: You are on iteration {iteration} of {max_iters}. "
-                        "You are almost out of turns! Please wrap up your work, finish any necessary edits or reads, "
-                        "and prepare to write your final summary report in the next turn."
-            ))
-        elif iteration == max_iters - 2:
-            run_messages.append(HumanMessage(
-                content=f"WARNING: You are on iteration {iteration} of {max_iters}. "
-                        "You are almost out of turns! Please start wrapping up your work."
+                content=f"[GENTLE NUDGE] You've been working for {iteration} turns. "
+                        "If the task is complete, produce your exit summary. "
+                        "If there's genuinely more to do, continue — you're not out of time."
             ))
 
-        # ── Pillar 69: Cache disabled ──
-        response_text = None  # Initialize — will be set by LLM
+        # â”€â”€ Pillar 69: Cache disabled â”€â”€
+        response_text = None  # Initialize â€” will be set by LLM
 
         # Call LLM with proper multi-turn messages (unless cache hit)
         if not response_text:
@@ -1848,7 +867,7 @@ def developer_node(s: ITState) -> dict:
                 else:
                     where_tag = f"Iter {iteration}/{max_iters}"
 
-                # ── Native Function Calling ──
+                # â”€â”€ Native Function Calling â”€â”€
                 # Pass tool schemas via the API tools parameter so the model
                 # returns structured tool_calls instead of text we must parse.
                 llm_result = invoke_messages_with_fallback(
@@ -1870,7 +889,7 @@ def developer_node(s: ITState) -> dict:
                     native_tool_calls = []
                     reasoning_content = None
 
-                # ── Store successful code generation in cache ──
+                # â”€â”€ Store successful code generation in cache â”€â”€
                 if iteration == 1:
                     try:
                         set_cached_code(task, response_text)
@@ -1891,7 +910,7 @@ def developer_node(s: ITState) -> dict:
 
         # Handle empty response (only nudge if both text and native tool calls are empty)
         if (not response_text or not response_text.strip()) and not native_tool_calls:
-            _log("[DEVELOPER] ⚠️ Empty LLM response — retrying with explicit nudge")
+            _log("[DEVELOPER] âš ï¸ Empty LLM response â€” retrying with explicit nudge")
             ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
             human_msg_id = f"dev-human-{iteration}-{uuid.uuid4()}"
             messages.append(AIMessage(content="(empty response)", id=ai_msg_id))
@@ -1911,13 +930,13 @@ def developer_node(s: ITState) -> dict:
 
         # Log native reasoning_content if present
         if reasoning_content:
-            _log(f"🧠 Developer: {reasoning_content.strip()}")
+            _log(f"[THINKING] Developer: {reasoning_content.strip()}")
 
         # Extract and log thinking block if present
         thinking_match = re.search(r"<thinking>(.*?)</thinking>", response_text, flags=re.DOTALL)
         if thinking_match:
             thinking_content = thinking_match.group(1).strip()
-            _log(f"🧠 Developer: {thinking_content}")
+            _log(f"[THINKING] Developer: {thinking_content}")
 
         # Extract all tool calls (mix native and text parsed)
         tool_calls = []
@@ -1936,7 +955,7 @@ def developer_node(s: ITState) -> dict:
             tool_calls = parse_all_tool_calls(response_text)
 
         if not tool_calls:
-            # No tool call — agent is done
+            # No tool call â€” agent is done
             _log(f"[DEVELOPER] No tool call parsed from response (len={len(response_text)}). Preview: {repr(response_text[:300])}")
             planning_file = os.path.join(project_path or "d:/MyProject/LangChain", "planning.md")
             has_written_plan = (
@@ -1946,10 +965,10 @@ def developer_node(s: ITState) -> dict:
             )
             # Note: is_plan_req is always False (no mode detection). Plan nudging removed.
 
-            # ═══════════════════════════════════════════════════════════════════════
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             # reflexion_retries is a local variable
             if tracked_files_created or tracked_files_modified:
-                # ── Stage 2: Fast Deterministic Cascade ──
+                # â”€â”€ Stage 2: Fast Deterministic Cascade â”€â”€
                 all_tracked = list(set(tracked_files_created + tracked_files_modified))
                 _log(f"[REFLEXION] Stage 2: Running deterministic cascade on {len(all_tracked)} file(s)...")
 
@@ -1960,7 +979,7 @@ def developer_node(s: ITState) -> dict:
                     # If deterministic auto-fixes were applied, inject them as tool results
                     if stage2_result.auto_fixes_applied:
                         auto_fix_msg = "Auto-fixes applied:\n" + "\n".join(
-                            f"  ✓ {f}" for f in stage2_result.auto_fixes_applied
+                            f"  âœ“ {f}" for f in stage2_result.auto_fixes_applied
                         )
                         _log(f"[REFLEXION] {auto_fix_msg}")
 
@@ -1968,7 +987,7 @@ def developer_node(s: ITState) -> dict:
                     stage2_result = None
                     _log(f"[REFLEXION] Stage 2: deterministic_checker failed/unavailable: {e}")
 
-                # ── Run tests ──
+                # â”€â”€ Run tests â”€â”€
                 test_cmd = _detect_test_command(project_path)
                 if test_cmd and iteration < max_iters - 3:  # Reserve 3 turns for reflexion fix loop
                     _log(f"[REFLEXION] Running tests: '{test_cmd}'...")
@@ -1986,12 +1005,12 @@ def developer_node(s: ITState) -> dict:
                     )
 
                     if not test_failed:
-                        # ── Test PASSED — ship immediately ──
-                        _log("[REFLEXION] ✅ Tests PASSED — skipping Stage 3 Critic")
+                        # ── Test PASSED ──
+                        _log("[REFLEXION] ✅ Tests PASSED — skipping Stage 3 SDET")
                         reflexion_retries = 0  # Reset for next cycle
 
                     elif reflexion_retries >= 2:
-                        # ── Max 2 reflexion rounds — accept result or rollback ──
+                        # ── Max 2 reflexion rounds ──
                         _log(f"[REFLEXION] ⚠️ Reflexion rounds exhausted (max 2). "
                              f"Rolling back to last clean git state and exiting...")
                         reflexion_retries = 0
@@ -2003,11 +1022,11 @@ def developer_node(s: ITState) -> dict:
                             _log(f"[REFLEXION] ⚠️ Git rollback failed: {_e}")
 
                     else:
-                        # ── Stage 3: LLM Critic ──
+                        # ── Stage 3: LLM SDET ──
                         reflexion_retries += 1
-                        _log(f"[REFLEXION] ❌ Tests FAILED → Stage 3 Critic (round {reflexion_retries}/2)")
+                        _log(f"[REFLEXION] ❌ Tests FAILED → Stage 3 SDET (round {reflexion_retries}/2)")
 
-                        # Build Stage 2 findings string for the critic
+                        # Build Stage 2 findings string for the SDET
                         s2_findings = ""
                         s2_summary = "Stage 2 not run (module unavailable)."
                         if stage2_result is not None:
@@ -2017,25 +1036,28 @@ def developer_node(s: ITState) -> dict:
                             s2_summary = stage2_result.summary
 
                         try:
-                            diagnosis = invoke_critic(
+                            diagnosis = invoke_sdet(
                                 project_path=project_path,
                                 tracked_files=all_tracked,
                                 test_output=str(test_result),
                                 stage2_summary=s2_summary,
                                 stage2_findings=s2_findings,
                             )
-                            critic_msg = format_diagnosis_for_developer(diagnosis)
-                            _log(f"[REFLEXION] Stage 3 Critic: {diagnosis.summary}")
+                            report_path = getattr(diagnosis, '_report_path', '')
+                            sdet_msg = format_diagnosis_for_developer(diagnosis, report_path=report_path)
+                            _log(f"[REFLEXION] Stage 3 SDET: {diagnosis.summary}")
+                            if report_path:
+                                _log(f"[REFLEXION] SDET report saved: {report_path}")
 
                         except Exception as e:
                             diagnosis = None
-                            critic_msg = (
-                                f"[STAGE 3 — CRITIC UNAVAILABLE]\n\n"
-                                f"Tests failed but the Critic module is not available.\n"
+                            sdet_msg = (
+                                f"[STAGE 3 — SDET UNAVAILABLE]\n\n"
+                                f"Tests failed but the SDET module is not available.\n"
                                 f"Fallback: analyze the test output yourself and fix the root cause.\n\n"
                                 f"## Test Output\n```\n{str(test_result)[:3000]}\n```"
                             )
-                            _log(f"[REFLEXION] Stage 3: critic_agent failed/unavailable: {e}")
+                            _log(f"[REFLEXION] Stage 3: sdet_agent failed/unavailable: {e}")
 
                         # Score pre-fix state (count test failures as baseline)
                         pre_failures = len(re.findall(
@@ -2044,7 +1066,7 @@ def developer_node(s: ITState) -> dict:
 
                         # Feed structured diagnosis to developer and continue
                         ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
-                        human_msg_id = f"dev-critic-{iteration}-{uuid.uuid4()}"
+                        human_msg_id = f"dev-sdet-{iteration}-{uuid.uuid4()}"
                         additional_kwargs = {}
                         if reasoning_content:
                             additional_kwargs["reasoning_content"] = reasoning_content
@@ -2053,7 +1075,7 @@ def developer_node(s: ITState) -> dict:
                             additional_kwargs=additional_kwargs
                         ))
                         messages.append(HumanMessage(
-                            content=critic_msg,
+                            content=sdet_msg,
                             id=human_msg_id
                         ))
                         appended_ids.extend([ai_msg_id, human_msg_id])
@@ -2070,15 +1092,15 @@ def developer_node(s: ITState) -> dict:
 
                         continue  # Re-enter loop with structured diagnosis
                 else:
-                    _log("[REFLEXION] ⚠️ No test command detected — skipping verification")
+                    _log("[REFLEXION] âš ï¸ No test command detected â€” skipping verification")
 
             clean_response = _extract_text_response(response_text)
-            _log(f"\n[DEVELOPER] ✅ Agent finished after {iteration} iterations")
-            _log(f"🤖 Assistant: {clean_response}")
+            _log(f"\n[DEVELOPER] âœ… Agent finished after {iteration} iterations")
+            _log(f"ðŸ¤– Assistant: {clean_response}")
 
             is_error = clean_response.strip().upper().startswith("ERROR:") or clean_response.strip().upper().startswith("FAILED:")
 
-            # ── Post-Execution Verification: detect "described instead of did" ──
+            # â”€â”€ Post-Execution Verification: detect "described instead of did" â”€â”€
             # If the agent made zero tool calls and zero files were created, but the
             # response reads like a plan/intention (not an error), the agent hallucinated
             # that it did work without actually calling any tools.
@@ -2102,7 +1124,7 @@ def developer_node(s: ITState) -> dict:
             # Count how many times we've already nudged (max 2)
             _nudge_count = sum(1 for msg in messages if hasattr(msg, "content") and isinstance(msg.content, str) and "You described what you would do but did NOT actually call any tools" in msg.content)
             if no_tools_called and no_files_created and looks_like_description and _nudge_count < 2:
-                _log(f"[DEVELOPER] ❌ AGENT DESCRIBED INSTEAD OF DOING (nudge {_nudge_count + 1}/2) — injecting tool-use nudge and continuing loop")
+                _log(f"[DEVELOPER] âŒ AGENT DESCRIBED INSTEAD OF DOING (nudge {_nudge_count + 1}/2) â€” injecting tool-use nudge and continuing loop")
                 ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
                 human_msg_id = f"dev-human-{iteration}-{uuid.uuid4()}"
                 additional_kwargs = {}
@@ -2128,7 +1150,7 @@ def developer_node(s: ITState) -> dict:
                 appended_ids.extend([ai_msg_id, human_msg_id])
                 continue  # Re-enter the loop with the nudge
             elif no_tools_called and no_files_created and looks_like_description:
-                _log("[DEVELOPER] ❌ Agent persistently described instead of doing — aborting with error")
+                _log("[DEVELOPER] âŒ Agent persistently described instead of doing â€” aborting with error")
                 is_error = True
                 clean_response = "ERROR: Agent described the solution instead of executing. No tools were called."
 
@@ -2137,16 +1159,35 @@ def developer_node(s: ITState) -> dict:
             except Exception:
                 tool_log_val = str(tool_call_log)
 
+            # Validate exit summary — bare "Task complete." is useless to the
+            # orchestrator. The Dev prompt requires: Status, Files, Tests,
+            # Spec compliance, Coordination needed. If the LLM didn't produce
+            # a proper summary, synthesize one from tool_call_log.
+            if clean_response and len(clean_response.strip()) >= 60:
+                report = clean_response[:5000]
+            else:
+                files_created = [t for t in tool_call_log if t.get("tool") in ("write_file", "edit_file")]
+                report_lines = ["## Dev Summary"]
+                report_lines.append(f"Status: {'ERROR' if is_error else 'DONE'}")
+                if files_created:
+                    report_lines.append(f"Files: {len(files_created)} file(s) created/modified")
+                    for t in files_created[:15]:
+                        fp = t.get("args", {}).get("file_path", "?")
+                        report_lines.append(f"- {fp}")
+                if clean_response:
+                    report_lines.append(f"Notes: {clean_response[:500]}")
+                report = "\n".join(report_lines)
+
             safe_update_state({
                 "thoughts": {"developer": "Execution failed due to blocking error: " + clean_response[:100] if is_error else "Implementation complete."},
                 "developer_tool_log": tool_log_val,
                 "outputs": {
                     "code": f"// ERROR: {clean_response[:1000]}" if is_error else "Code successfully implemented.",
-                    "agent_report": clean_response[:5000] if clean_response else "Code implementation completed."
+                    "agent_report": report
                 }
             })
 
-            # ── Update task.json: mark current step completed/failed, advance ──
+            # â”€â”€ Update task.json: mark current step completed/failed, advance â”€â”€
             try:
                 task_tracking_data = load_task_tracking(project_path, chat_id)
                 if task_tracking_data and task_tracking_data.get("steps"):
@@ -2188,9 +1229,9 @@ def developer_node(s: ITState) -> dict:
                         save_task_tracking(task_tracking_data, project_path, chat_id)
             except Exception as e:
                 print(f"[DEVELOPER] Error updating task tracking: {e}")
-            # ── END ──
+            # â”€â”€ END â”€â”€
 
-            # ── Pillar 63/75/96: Local code quality check on all tracked files ──
+            # â”€â”€ Pillar 63/75/96: Local code quality check on all tracked files â”€â”€
             lint_summary_parts: list[str] = []
             if not is_error:
                 all_tracked = list(set(tracked_files_created + tracked_files_modified))
@@ -2207,18 +1248,18 @@ def developer_node(s: ITState) -> dict:
                                 if total_fixes > 0:
                                     with open(py_file, "w", encoding="utf-8") as lf:
                                         lf.write(lint_result["code"])
-                                    _log(f"[DEVELOPER] 🔧 dev_lint fixed {total_fixes} issue(s) in {os.path.basename(py_file)}: "
+                                    _log(f"[DEVELOPER] ðŸ”§ dev_lint fixed {total_fixes} issue(s) in {os.path.basename(py_file)}: "
                                          f"{'; '.join(lint_result['fast_fixes'] + lint_result['lint_fixes'])}")
                                     lint_summary_parts.append(f"{py_file}: {total_fixes} fix(es)")
                                 elif not lint_result["original_valid"] and lint_result["final_valid"]:
-                                    _log(f"[DEVELOPER] ✅ dev_lint resolved syntax error in {os.path.basename(py_file)}")
+                                    _log(f"[DEVELOPER] âœ… dev_lint resolved syntax error in {os.path.basename(py_file)}")
                                     with open(py_file, "w", encoding="utf-8") as lf:
                                         lf.write(lint_result["code"])
                                     lint_summary_parts.append(f"{py_file}: syntax fixed")
                             except Exception as le:
-                                _log(f"[DEVELOPER] ⚠️ dev_lint skipped {os.path.basename(py_file)}: {le}")
+                                _log(f"[DEVELOPER] âš ï¸ dev_lint skipped {os.path.basename(py_file)}: {le}")
                         if lint_summary_parts:
-                            _log(f"[DEVELOPER] 🎯 Local lint saved LLM correction turns on {len(lint_summary_parts)} file(s)")
+                            _log(f"[DEVELOPER] ðŸŽ¯ Local lint saved LLM correction turns on {len(lint_summary_parts)} file(s)")
                     except ImportError:
                         _log("[DEVELOPER] dev_lint module not available, skipping local code quality checks")
 
@@ -2231,13 +1272,42 @@ def developer_node(s: ITState) -> dict:
                     "code_updated": True,
                     "tech_spec_updated": False,
                 })
+            # Build exit report with validation -- bare "Completed." is useless
+            def _build_dev_report(raw: str, is_err: bool, lint_parts: list) -> str:
+                if raw and len(raw.strip()) >= 60:
+                    report = raw[:5000]
+                else:
+                    files_touched = list(set(
+                        t.get("args", {}).get("file_path", "")
+                        for t in tool_call_log
+                        if t.get("tool") in ("write_file", "edit_file")
+                        and t.get("args", {}).get("file_path")
+                    ))
+                    report = "## Dev Summary\n"
+                    report += f"Status: {'ERROR' if is_err else 'DONE'}\n"
+                    if files_touched:
+                        report += f"Files ({len(files_touched)}):\n"
+                        for fp in files_touched[:20]:
+                            report += f"- {fp}\n"
+                    if raw:
+                        report += f"\nNotes: {raw[:500]}"
+                if lint_parts:
+                    report += "\n\nLocal lint fixes:\n" + "\n".join(f"- {s}" for s in lint_parts)
+                return report
+
+            if is_error:
+                return make_return({
+                    "code": f"// ERROR: {clean_response[:1000]}",
+                    "agent_report": _build_dev_report(clean_response, True, []),
+                    "test_report": f"STATUS: FAIL\nDeveloper reported error: {clean_response[:300]}",
+                    "project_path": project_path,
+                    "code_updated": True,
+                    "tech_spec_updated": False,
+                })
             else:
-                agent_report_text = clean_response[:5000] if clean_response else "Completed."
-                if lint_summary_parts:
-                    agent_report_text += "\n\n🔧 Local lint fixes:\n" + "\n".join(f"- {s}" for s in lint_summary_parts)
                 return make_return({
                     "code": "Code successfully implemented.",
-                    "agent_report": agent_report_text,
+                    "agent_report": _build_dev_report(clean_response, False, lint_summary_parts),
                     "test_report": "",
                     "project_path": project_path,
                     "code_updated": True,
@@ -2255,7 +1325,7 @@ def developer_node(s: ITState) -> dict:
                 tool_args = {k: v for k, v in tool_call.items() if k not in ("tool", "args")}
 
             if tool_name not in valid_tools:
-                _log(f"[DEVELOPER] Unknown tool requested: {tool_name} — asking LLM to retry")
+                _log(f"[DEVELOPER] Unknown tool requested: {tool_name} â€” asking LLM to retry")
                 tool_result = f"TOOL ERROR: Unknown tool: {tool_name}. Available tools: {', '.join(valid_tools)}"
                 tool_outputs.append(f"[{tool_name}]:\n{tool_result}")
                 continue
@@ -2264,7 +1334,7 @@ def developer_node(s: ITState) -> dict:
             if tool_name in ("write_file", "edit_file", "apply_diff", "run_command"):
                 this_turn_has_write = True
 
-            # ── LoopGuard Pre-Execution Check ──
+            # â”€â”€ LoopGuard Pre-Execution Check â”€â”€
             guard_result = LoopGuard.check_pre_execute(tool_call_log, tool_name, tool_args)
             warning_msg = None
             if guard_result:
@@ -2280,7 +1350,7 @@ def developer_node(s: ITState) -> dict:
                     tool_outputs.append(f"[{tool_name}]:\n{tool_result}")
                     continue
                 elif guard_type == "ABORT":
-                    _log(f"[DEVELOPER] ⚠️ Loop detected for tool {tool_name} — aborting loop.")
+                    _log(f"[DEVELOPER] âš ï¸ Loop detected for tool {tool_name} â€” aborting loop.")
                     clean_response = f"ERROR: {guard_msg}"
                     safe_update_state({
                         "thoughts": {"developer": "Execution failed due to blocking loop."},
@@ -2314,12 +1384,12 @@ def developer_node(s: ITState) -> dict:
                         "tech_spec_updated": False,
                     })
 
-            # ── Same-Count warning/abort check ──
+            # â”€â”€ Same-Count warning/abort check â”€â”€
             same_count = count_identical_calls_since_state_change(tool_call_log, tool_name, tool_args)
             if same_count >= 2:
                 is_read_tool = tool_name in ("read_file", "search_code", "list_files", "search_codebase", "view_signatures")
                 if same_count >= 5:
-                    _log(f"[DEVELOPER] ⚠️ Loop detected for tool {tool_name} (called {same_count} times) — aborting loop.")
+                    _log(f"[DEVELOPER] âš ï¸ Loop detected for tool {tool_name} (called {same_count} times) â€” aborting loop.")
                     clean_response = f"ERROR: Loop detected. Called tool {tool_name} with same arguments {same_count} times without state change."
                     safe_update_state({
                         "thoughts": {"developer": "Execution failed due to blocking loop."},
@@ -2367,7 +1437,7 @@ def developer_node(s: ITState) -> dict:
                             "intervention (like system configuration or version mismatch), stop and output an 'ERROR: <description>' response."
                         )
 
-            # ── Stale-Read Detection ──
+            # â”€â”€ Stale-Read Detection â”€â”€
             # If the agent is re-reading the same file+offset a 3rd+ time,
             # return [STALE] to break re-read spirals (saves tokens + loops).
             # The count resets if the file was successfully modified in between.
@@ -2390,7 +1460,7 @@ def developer_node(s: ITState) -> dict:
                 if same_reads >= 2:  # This is the 3rd+ time
                     tool_result = (
                         f"[STALE] This file was already read {same_reads + 1} times with the same parameters. "
-                        f"Content has NOT changed. Do NOT re-read this file — use the previous output. "
+                        f"Content has NOT changed. Do NOT re-read this file â€” use the previous output. "
                         f"If you need different content, change offset/limit or read a different file."
                     )
                     tool_call_log.append({
@@ -2402,7 +1472,7 @@ def developer_node(s: ITState) -> dict:
                     tool_outputs.append(f"[{tool_name}]:\n{tool_result}")
                     continue
 
-            # ── Format tool log line: concise, shows file + detail ──
+            # â”€â”€ Format tool log line: concise, shows file + detail â”€â”€
             fpath = tool_args.get("file_path", tool_args.get("path", ""))
             fname = os.path.basename(fpath) if fpath else ""
             # Detect line range from read_file args
@@ -2439,7 +1509,7 @@ def developer_node(s: ITState) -> dict:
             safe_update_state({"thoughts": {"developer": f"Using {tool_name}..."}})
             _log(f"[DEVELOPER] {tool_label}")
             import json
-            _log(f"🔧 Calling {tool_name}({json.dumps(tool_args)})")
+            _log(f"[TOOL_CALL] {tool_name}({json.dumps(tool_args)})")
 
             try:
                 tool_result = execute_tool(tool_name, tool_args)
@@ -2451,7 +1521,7 @@ def developer_node(s: ITState) -> dict:
                 tool_result = f"Tool execution error: {e}"
                 _log(f"[TOOL OUTPUT] {tool_name}: {tool_result}")
 
-            # ── Build detail string for the where_tag (shown in next LLM invocation) ──
+            # â”€â”€ Build detail string for the where_tag (shown in next LLM invocation) â”€â”€
             tool_detail = ""
 
             # Enrich read_file with actual line range from result
@@ -2481,10 +1551,10 @@ def developer_node(s: ITState) -> dict:
             # Check for Sleep-and-Resume suspension trigger
             if tool_name == "run_command" and tool_args.get("background") is True and "[OK] Started background process" in str(tool_result):
                 if os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1":
-                    _log(f"[DEVELOPER] 💤 Background task started in evaluation mode. Sleeping 5 seconds for boot instead of suspending...")
+                    _log(f"[DEVELOPER] ðŸ’¤ Background task started in evaluation mode. Sleeping 5 seconds for boot instead of suspending...")
                     time.sleep(5)
                 else:
-                    _log(f"[DEVELOPER] 💤 Background task started. Suspending graph and starting automatic wake-up thread...")
+                    _log(f"[DEVELOPER] ðŸ’¤ Background task started. Suspending graph and starting automatic wake-up thread...")
                     
                     # Extract process name
                     process_name = tool_args.get("command", "").split()[0]
@@ -2561,7 +1631,7 @@ def developer_node(s: ITState) -> dict:
             # Format output for this tool
             tool_outputs.append(f"[{tool_name}]:\n{tool_result}")
 
-            # ── Early-stop on verified test success ──
+            # â”€â”€ Early-stop on verified test success â”€â”€
             if tool_name == "run_command" and "[OK] Exit 0" in str(tool_result):
                 result_lower = str(tool_result).lower()
                 if "passed" in result_lower or "ok" in result_lower:
@@ -2619,7 +1689,7 @@ def developer_node(s: ITState) -> dict:
 
         combined_tool_result = "\n\n".join(tool_outputs)
 
-        # ── Progress Gate: prevent read-only death spirals ──
+        # â”€â”€ Progress Gate: prevent read-only death spirals â”€â”€
         is_read_only_turn = not this_turn_has_write
         _consecutive_read_turns = consecutive_read_turns
         if is_read_only_turn:
@@ -2642,7 +1712,7 @@ def developer_node(s: ITState) -> dict:
                 "Either write your completion report NOW (no tools), or call write_file/edit_file immediately."
             )
 
-        # ── Cost Awareness ──
+        # â”€â”€ Cost Awareness â”€â”€
         cost_state = safe_get_state()
         tu = cost_state.get("token_usage", {})
         spent = tu.get("total_cost", 0)
@@ -2672,12 +1742,12 @@ def developer_node(s: ITState) -> dict:
             safe_update_state({"outputs": {"code": f"// Developer iteration {iteration}: {last_tool_name} completed"}})
 
     # Max iterations reached
-    _log(f"[DEVELOPER] ⚠️ Max iterations ({max_iters}) reached")
+    _log(f"[DEVELOPER] âš ï¸ Max iterations ({max_iters}) reached")
     safe_update_state({"thoughts": {"developer": f"Reached maximum iterations ({max_iters})."}})
 
-    # ── Goal Toggle Auto-Continue System ──
+    # â”€â”€ Goal Toggle Auto-Continue System â”€â”€
     if _is_auto_continue_enabled():
-        _log("[DEVELOPER] 🚀 Auto-Continue enabled. Triggering automatic wake-up and suspending graph...")
+        _log("[DEVELOPER] ðŸš€ Auto-Continue enabled. Triggering automatic wake-up and suspending graph...")
 
         try:
             task_data = load_task_tracking(project_path, chat_id)
@@ -2724,7 +1794,7 @@ def developer_node(s: ITState) -> dict:
         tool_log_val = str(tool_call_log)
     safe_update_state({"developer_tool_log": tool_log_val})
 
-    # ── Save partial task progress ──
+    # â”€â”€ Save partial task progress â”€â”€
     try:
         task_tracking_data = load_task_tracking(project_path, chat_id)
         if task_tracking_data and task_tracking_data.get("steps"):
@@ -2732,7 +1802,7 @@ def developer_node(s: ITState) -> dict:
             current_idx = task_tracking_data.get("current_step", 0)
             if current_idx < len(steps_data):
                 steps_data[current_idx]["tool_calls"] = step_tool_calls
-                steps_data[current_idx]["notes"] = f"Reached max iterations ({max_iters}) — will continue"
+                steps_data[current_idx]["notes"] = f"Reached max iterations ({max_iters}) â€” will continue"
                 # Save artifacts even on partial progress
                 artifacts = task_tracking_data.setdefault("artifacts", {})
                 if tracked_files_created:
@@ -2765,11 +1835,11 @@ def developer_node(s: ITState) -> dict:
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Parser & helper functions merged from dev_utils.py
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-"""Developer division utilities — shared helpers for developer subagents."""
+"""Developer division utilities â€” shared helpers for developer subagents."""
 import os
 import json
 
@@ -2795,7 +1865,7 @@ def build_other_summary(sections: dict, exclude_keys: list[str]) -> str:
 
 
 def read_files_for_manifest(project_path: str, manifest_entries: list[dict]) -> str:
-    """Reads ONLY files listed in the manifest — targeted context, not a token bomb."""
+    """Reads ONLY files listed in the manifest â€” targeted context, not a token bomb."""
     parts: list[str] = []
     for entry in manifest_entries:
         fp = os.path.join(project_path, entry["path"])
@@ -2834,33 +1904,8 @@ def detect_build_goal(project_path: str) -> str:
 
 
 def update_project_path_in_memory(project_path: str) -> None:
-    """Persists project path to workspace memory JSON without modifying request history."""
-    ws_dir = project_path or r"d:\MyProject\LangChain"
-    deep_agents_dir = os.path.join(ws_dir, ".deep_agents")
-    os.makedirs(deep_agents_dir, exist_ok=True)
-    mem_path = os.path.join(deep_agents_dir, "workspace_memory.json")
-    
-    # Fallback to legacy root path if it exists and project_path is default
-    if not os.path.isfile(mem_path) and ws_dir == r"d:\MyProject\LangChain":
-        legacy_path = os.path.join(r"d:\MyProject\LangChain", "workspace_memory.json")
-        if os.path.isfile(legacy_path):
-            mem_path = legacy_path
-
-    memory: dict = {}
-    if os.path.isfile(mem_path):
-        try:
-            with open(mem_path, "r", encoding="utf-8") as f:
-                memory = json.load(f)
-        except Exception:
-            pass
-    memory["project_path"] = project_path
-    if "global" in memory:
-        memory["global"]["project_path"] = project_path
-    try:
-        with open(mem_path, "w", encoding="utf-8") as f:
-            json.dump(memory, f, indent=4)
-    except Exception:
-        pass
+    """DEPRECATED — no longer persists to project folders. No-op."""
+    pass
 
 
 def scan_and_update_dependencies(project_path: str) -> None:
@@ -3114,7 +2159,7 @@ def _parse_xml_tool_call(text: str) -> list[dict]:
     import re
     results = []
 
-    # ── Format A: <function> wrapper ──
+    # â”€â”€ Format A: <function> wrapper â”€â”€
     # Matches <function>...<tool_name>NAME</tool_name>...<args>...<param>K</param><value>V</value>...</args>...</function>
     func_pattern = r'<function>\s*<tool_name>(.*?)</tool_name>\s*<args>(.*?)</args>\s*</function>'
     for m in re.finditer(func_pattern, text, re.DOTALL | re.IGNORECASE):
@@ -3138,7 +2183,7 @@ def _parse_xml_tool_call(text: str) -> list[dict]:
         if tool_name:
             results.append({"tool": tool_name, "args": args})
 
-    # ── Format B: Self-closing XML tags (common tool names) ──
+    # â”€â”€ Format B: Self-closing XML tags (common tool names) â”€â”€
     known_tools = [
         "read_file", "write_file", "edit_file", "run_command",
         "search_code", "list_files", "view_signatures", "write_planning_file",
@@ -3188,7 +2233,7 @@ def _parse_xml_tool_call(text: str) -> list[dict]:
             if args:
                 results.append({"tool": tool, "args": args})
 
-    # ── Format C: DSML (DeepSeek native tool calling) ──
+    # â”€â”€ Format C: DSML (DeepSeek native tool calling) â”€â”€
     # ||DSML||tool_calls>
     # ||DSML||invoke name="list_files">
     # ||DSML||parameter name="path" string="true">D:\path</||DSML||parameter>
@@ -3234,7 +2279,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
     import re
     results = []
 
-    # ── Format 1: ```tool JSON blocks (canonical) ──
+    # â”€â”€ Format 1: ```tool JSON blocks (canonical) â”€â”€
     pattern = r'```tool\s*\n(.*?)\n```'
     matches = re.findall(pattern, text, re.DOTALL)
     for raw_json in matches:
@@ -3243,7 +2288,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
         if parsed:
             results.append(parsed)
 
-    # ── Format 1b: JSON array of tools ──
+    # â”€â”€ Format 1b: JSON array of tools â”€â”€
     if not results:
         try:
             import json
@@ -3258,9 +2303,9 @@ def parse_all_tool_calls(text: str) -> list[dict]:
         except Exception:
             pass
 
-    # ── Format 2+3: XML and DSML (flash model native output) ──
+    # â”€â”€ Format 2+3: XML and DSML (flash model native output) â”€â”€
     xml_results = _parse_xml_tool_call(text)
-    # ── Format 4: <function_calls><invoke> (DeepSeek alternate native format) ──
+    # â”€â”€ Format 4: <function_calls><invoke> (DeepSeek alternate native format) â”€â”€
     # <function_calls>
     # <invoke name="read_file">
     # <parameter name="file_path">index.html</parameter>
@@ -3291,7 +2336,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
             if tool_name:
                 results.append({"tool": tool_name, "args": args})
 
-    # ── Format 5: <tool_call> (DeepSeek native function calling format) ──
+    # â”€â”€ Format 5: <tool_call> (DeepSeek native function calling format) â”€â”€
     # <tool_call name="list_files">
     # {"path": "D:/test", "recursive": true}
     # </tool_call>
@@ -3355,7 +2400,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
         if tool_name:
             results.append({"tool": tool_name, "args": args})
 
-    # ── Format 6: Anthropic-style tool_use ──
+    # â”€â”€ Format 6: Anthropic-style tool_use â”€â”€
     # <Tool-Name id="toolu_...">write_file</Tool-Name>
     # <Parameter name="file_path">/path/to/file</Parameter>
     # <Parameter name="content">file content here</Parameter>
@@ -3383,7 +2428,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
     for tool_name, args in anthro_tools.items():
         results.append({"tool": tool_name, "args": args})
 
-    # ── Format 7: <tool> JSON wrapper ──
+    # â”€â”€ Format 7: <tool> JSON wrapper â”€â”€
     # <tool>
     # {"tool": "list_files", "args": {"path": ".", "recursive": false}}
     # </tool>
@@ -3411,7 +2456,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
         except Exception:
             pass
 
-    # ── Normalize and Clean Up Formats ──
+    # â”€â”€ Normalize and Clean Up Formats â”€â”€
     for r in results:
         if not isinstance(r, dict):
             continue
@@ -3425,7 +2470,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
             if k not in ("tool", "args"):
                 r.pop(k, None)
 
-    # ── Deduplicate across all formats ──
+    # â”€â”€ Deduplicate across all formats â”€â”€
     def _make_hashable(obj):
         """Recursively convert dict values to hashable for dedup."""
         if isinstance(obj, dict):

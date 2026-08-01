@@ -11,7 +11,7 @@ import glob as globmod
 import threading
 import collections
 from typing import Optional, Any
-from state_sync import shared_state
+from state_sync import shared_state, safe_append_live_log
 from contextvars import ContextVar
 from deepagents.middleware.filesystem import FilesystemPermission, _check_fs_permission
 from subagent_swarm import load_subagent_history, save_subagent_history, clear_subagent_history
@@ -407,10 +407,7 @@ def _sanitize_path(path: str) -> str:
 def _log_tool(name: str, args: dict, result: str) -> None:
     """Log tool usage to shared state for the frontend."""
     preview = result[:300] + "..." if len(result) > 300 else result
-    shared_state.setdefault("live_terminal_log", "")
-    shared_state["live_terminal_log"] += (
-        f"\n[TOOL] [{name}] {_fmt_args(args)}\n{preview}\n"
-    )
+    safe_append_live_log(f"\n[TOOL] [{name}] {_fmt_args(args)}\n{preview}")
 
 
 def _fmt_args(args: dict) -> str:
@@ -1361,11 +1358,9 @@ class LocalShellBackend:
                     for line in proc.stdout:
                         info["logs"].append(line)
                         try:
-                            from state_sync import shared_state
-                            if "live_terminal_log" in shared_state:
-                                shared_state["live_terminal_log"] += f"[{name}] {line}"
-                                if len(shared_state["live_terminal_log"]) > 12000:
-                                    shared_state["live_terminal_log"] = shared_state["live_terminal_log"][-10000:]
+                            from state_sync import safe_append_live_log
+                            # `line` already carries its trailing newline
+                            safe_append_live_log(f"[{name}] {line}", newline=False)
                         except Exception:
                             pass
                             
@@ -1392,8 +1387,7 @@ class LocalShellBackend:
             except Exception as e:
                 return f"Error starting background process: {e}"
         else:
-            shared_state.setdefault("live_terminal_log", "")
-            shared_state["live_terminal_log"] += f"\n[Terminal] Run: {command}\n"
+            safe_append_live_log(f"\n[Terminal] Run: {command}")
             
             try:
                 proc = subprocess.Popen(
@@ -1428,9 +1422,8 @@ class LocalShellBackend:
                         try:
                             line = q.get_nowait()
                             out_lines.append(line)
-                            shared_state["live_terminal_log"] += line
-                            if len(shared_state["live_terminal_log"]) > 12000:
-                                shared_state["live_terminal_log"] = shared_state["live_terminal_log"][-10000:]
+                            # `line` already carries its trailing newline
+                            safe_append_live_log(line, newline=False)
                         except queue.Empty:
                             break
                     
@@ -1440,7 +1433,8 @@ class LocalShellBackend:
                             try:
                                 line = q.get_nowait()
                                 out_lines.append(line)
-                                shared_state["live_terminal_log"] += line
+                                # `line` already carries its trailing newline
+                                safe_append_live_log(line, newline=False)
                             except queue.Empty:
                                 break
                         break
@@ -1458,7 +1452,7 @@ class LocalShellBackend:
                         cleaned = _clean_terminal_output(output)
                         capped = auto_offload_result(cleaned, command)
                         result_str = f"Error: Command timed out after {timeout}ms: {command}\nPartial Output:\n{capped}\n[TIMEOUT]"
-                        shared_state["live_terminal_log"] += "\n[TIMEOUT]\n"
+                        safe_append_live_log("\n[TIMEOUT]")
                         _log_tool("run_command_timeout", {"command": command}, result_str[:500])
                         return result_str
                     
@@ -2233,81 +2227,74 @@ _DELEGATION_TOOLS = ["task", "start_async_task", "check_async_task", "list_async
 def _load_subagents():
     global _SUBAGENTS_REGISTRY
     try:
-        from ba_agent import _BA_SYSTEM_TEMPLATE
-        from sa_agent import _SA_SYSTEM_TEMPLATE
-        from devops_agent import _DEVOPS_SYSTEM_TEMPLATE
-        from refinement_agent import _REFINEMENT_SYSTEM_TEMPLATE
-        from analytics_agent import _ANALYTICS_SYSTEM_TEMPLATE
-        from critic_agent import _CRITIC_SYSTEM_TEMPLATE
-        from designer_agent import _DESIGNER_SYSTEM_TEMPLATE
-        from developer_agent import _STATIC_SYSTEM_TEMPLATE as _DEV_SYSTEM_TEMPLATE
+        from bsa_prompt import _STATIC_SYSTEM_TEMPLATE as _BSA_SYSTEM_TEMPLATE
+        from devops_prompt import _STATIC_SYSTEM_TEMPLATE as _DEVOPS_SYSTEM_TEMPLATE
+        from developer_prompt import _STATIC_SYSTEM_TEMPLATE as _DEV_SYSTEM_TEMPLATE
+        from sdet_prompt import _STATIC_SYSTEM_TEMPLATE as _SDET_SYSTEM_TEMPLATE
+        from free_agent_prompt import _FREE_AGENT_SYSTEM_TEMPLATE
 
         subs = [
             {
                 "name": "Dev",
-                "description": "Developer — write code, fix bugs, run tests, scaffold projects, implement features",
+                "description": "Developer — pure implementer: receives BSA specs, writes clean tested TDD code, handles errors",
                 "system_prompt": _DEV_SYSTEM_TEMPLATE,
                 "tools": [
                     "read_file", "write_file", "edit_file", "run_command",
-                    "search_code", "list_files", "view_signatures",
-                    "web_fetch", "browser_navigate", "browser_extract",
-                    "browser_screenshot", "browser_close",
+                    "search_code", "list_files",
                 ],
-                "model": "deepseek:v4-pro",
-            },
-            {
-                "name": "BA",
-                "description": "Business Analyst — gap analysis, BRD writing, Gherkin scenarios, Mermaid flow diagrams",
-                "system_prompt": _BA_SYSTEM_TEMPLATE,
-                "tools": ["read_file", "write_file", "search_code", "list_files"],
                 "model": "deepseek:v4-flash",
             },
             {
-                "name": "SA",
-                "description": "System Architect — DB schemas, API design, layering, resilience, design systems, sequence flows",
-                "system_prompt": _SA_SYSTEM_TEMPLATE,
-                "tools": ["read_file", "write_file", "search_code", "list_files", "view_signatures"],
+                "name": "BSA",
+                "description": "Business Systems Analyst — adaptive BA+SA: business analysis (BRD, Gherkin), systems architecture (schemas, API contracts, layered design), runs only the phases needed per task",
+                "system_prompt": _BSA_SYSTEM_TEMPLATE,
+                "tools": ["read_file", "write_file", "edit_file", "search_code",
+                          "list_files", "view_signatures", "search_codebase",
+                          "web_fetch", "run_command"],
                 "model": "deepseek:v4-flash",
+                "permissions": [
+                    {"operations": ["write_file", "edit_file"],
+                     "paths": [
+                         "/workspace/specs/**",
+                         "/workspace/docs/**",
+                         "/workspace/DECISION-*",
+                         "/workspace/SPEC-*",
+                         "/workspace/README*"
+                     ],
+                     "mode": "allow"}
+                ],
             },
             {
-                "name": "DevOps",
-                "description": "DevOps — git branches, PRs, Docker, GitHub Actions CI/CD, deployment configs, issue tracking",
+                "name": "DevSecOps",
+                "description": "DevSecOps — full-stack security + infrastructure + performance: Docker, K8s, Terraform, CI/CD, SAST/SCA, vulnerability scanning and fixing, secrets, observability, incident response",
                 "system_prompt": _DEVOPS_SYSTEM_TEMPLATE,
-                "tools": ["run_command", "write_file", "read_file", "list_files"],
-                "model": "deepseek:v4-flash",
-            },
-            {
-                "name": "Refinement",
-                "description": "Refinement — vulnerability scanning, dependency auditing, OWASP compliance, code security review",
-                "system_prompt": _REFINEMENT_SYSTEM_TEMPLATE,
-                "tools": ["read_file", "search_code", "run_command", "list_files"],
-                "model": "deepseek:v4-flash",
-            },
-            {
-                "name": "Analytics",
-                "description": "Analytics — deliverables audit, compliance check, KPI calculation, SDLC report compilation",
-                "system_prompt": _ANALYTICS_SYSTEM_TEMPLATE,
-                "tools": ["read_file", "search_code", "list_files", "write_file"],
-                "model": "deepseek:v4-flash",
-            },
-            {
-                "name": "Critic",
-                "description": "Code Critic — structured error diagnosis using deepseek-v4-pro + max thinking. Diagnoses test failures, tracebacks, and code issues",
-                "system_prompt": _CRITIC_SYSTEM_TEMPLATE,
-                "tools": ["read_file", "search_code", "list_files"],
+                "tools": ["run_command", "write_file", "read_file", "list_files",
+                          "github_create_repo", "github_create_issue",
+                          "github_create_pull_request", "github_list_issues"],
                 "model": "deepseek:v4-pro",
             },
             {
-                "name": "Designer",
-                "description": "UI/UX Designer — design systems, wireframes, components, 3D, animations, visual design",
-                "system_prompt": _DESIGNER_SYSTEM_TEMPLATE,
+                "name": "SDET",
+                "description": "Software Developer in Test — structured error diagnosis, verification, and dynamic testing (browser automation, API fuzzing, accessibility, security OWASP). Uses deepseek-v4-pro + max thinking.",
+                "system_prompt": _SDET_SYSTEM_TEMPLATE,
                 "tools": [
-                    "read_file", "write_file", "edit_file", "list_files", "search_code",
-                    "view_signatures", "run_command",
-                    "web_fetch", "browser_navigate", "browser_extract",
-                    "browser_screenshot", "browser_close",
+                    "read_file", "search_code", "list_files", "run_command",
+                    "browser_navigate", "browser_extract", "browser_screenshot", "browser_close",
+                    "browser_click", "browser_fill", "browser_type", "browser_press",
                 ],
                 "model": "deepseek:v4-pro",
+            },
+            {
+                "name": "FreeAgent",
+                "description": "FreeAgent — general-purpose free model agent (OpenRouter, Groq, Gemini, NVIDIA, Mistral, Cloudflare). Handles text chat, vision analysis, research, document creation, web browsing. Zero cost.",
+                "system_prompt": _FREE_AGENT_SYSTEM_TEMPLATE,
+                "tools": [
+                    "web_fetch", "web_search",
+                    "browser_navigate", "browser_extract", "browser_screenshot",
+                    "browser_click", "browser_fill", "browser_close",
+                    "create_docx", "create_xlsx", "read_pdf",
+                ],
+                "model": "free/free-agent",
             },
         ]
         for s in subs:
@@ -2316,15 +2303,27 @@ def _load_subagents():
 
         # Register explicit aliases for backward compatibility and tests
         aliases = {
-            "Security": "Refinement",
-            "BA-GapAnalyzer": "BA",
-            "BA-Gherkin": "BA",
-            "SA-Database": "SA",
-            "SA-API": "SA",
-            "DevOps-Pipeline-Docker": "DevOps",
-            "DevOps-Issues": "DevOps",
-            "Analytics-Auditor": "Analytics",
-            "Analytics-Compliance": "Analytics",
+            "BSA-Requirements": "BSA",
+            "BSA-Schema": "BSA",
+            "BSA-API": "BSA",
+            "BA-GapAnalyzer": "BSA",
+            "BA-Gherkin": "BSA",
+            "SA-Database": "BSA",
+            "SA-API": "BSA",
+            "DevSecOps-Pipeline-Docker": "DevSecOps",
+            "DevSecOps-Issues": "DevSecOps",
+            "DevOps-Pipeline-Docker": "DevSecOps",
+            "DevOps-Issues": "DevSecOps",
+            "CodeCritic": "SDET",
+            "Vision": "FreeAgent",
+            "BA": "BSA",
+            "SA": "BSA",
+            "DevOps": "DevSecOps",
+            "Refinement": "DevSecOps",
+            "Analytics": "BSA",
+            "Critic": "SDET",
+            "Designer": "BSA",
+            "Security": "DevSecOps",
         }
         for alias, base_name in aliases.items():
             if base_name in _SUBAGENTS_REGISTRY:
@@ -2393,7 +2392,19 @@ def task(name: str, task: str) -> str:
             "browser_navigate": "browser_navigate(url, wait_ms?) — Open URL in headless Chromium, returns snapshot with @ref selectors.",
             "browser_extract": "browser_extract(what?, selector?) — Extract text/html/value from current browser page.",
             "browser_screenshot": "browser_screenshot(path?) — Screenshot of current browser page.",
+            "browser_click": "browser_click(selector) — Click an element using CSS selector or snapshot @ref tag.",
+            "browser_fill": "browser_fill(selector, text) — Clear and fill an input element.",
+            "browser_type": "browser_type(selector, text) — Type text into an input element.",
+            "browser_press": "browser_press(key) — Press a keyboard key (e.g. 'Enter').",
             "browser_close": "browser_close() — Close browser session and free resources.",
+            "github_create_repo": "github_create_repo(name, private?, description?) — Create a GitHub repository.",
+            "github_create_issue": "github_create_issue(title, body?, repo?) — Create a GitHub issue.",
+            "github_create_pull_request": "github_create_pull_request(title, body?, base?, head?) — Create a GitHub PR.",
+            "github_list_issues": "github_list_issues(state?, limit?) — List GitHub issues.",
+            "create_docx": "create_docx(file_path, title?, content?) — Create a Word document (.docx).",
+            "create_xlsx": "create_xlsx(file_path, headers, rows) — Create an Excel spreadsheet (.xlsx).",
+            "read_pdf": "read_pdf(file_path, max_pages?, page_numbers?) — Read text from a PDF file.",
+            "web_search": "web_search(query) — Search the web for current information.",
         }
         tool_lines = [_COMPACT_DEFS.get(t, f"{t}() — Execute {t}") for t in tool_names if t in _COMPACT_DEFS]
         subagent_tools_str = "## Available Tools\n" + "\n".join(f"- {line}" for line in tool_lines)
@@ -2460,10 +2471,21 @@ def task(name: str, task: str) -> str:
             
             return res_dict.get("agent_report") or res_dict.get("code") or "Developer completed execution."
 
+        # Inject general profile for FreeAgent in General mode
+        resolved_task = task
+        if name == "FreeAgent" and shared_state.get("is_general", False):
+            try:
+                from free_agent import build_general_profile_prompt
+                prefix = build_general_profile_prompt()
+                if prefix:
+                    resolved_task = prefix + task
+            except Exception:
+                pass
+
         messages = load_subagent_history(chat_id, name)
         if not messages:
             messages.append(SystemMessage(content=full_sys_prompt))
-        messages.append(HumanMessage(content=task))
+        messages.append(HumanMessage(content=resolved_task))
 
         from llm import invoke_messages_with_fallback
 
@@ -2794,12 +2816,21 @@ def web_fetch(url: str, max_chars: int = 15000) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     try:
+        import ssl
         import urllib.request
+        # Python installations on Windows do not always use the same CA store
+        # as the browser. Prefer certifi's maintained CA bundle for research
+        # requests so valid public HTTPS sites are not rejected as untrusted.
+        try:
+            import certifi
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ssl_context = ssl.create_default_context()
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)",
             "Accept": "text/html,text/plain,*/*",
         })
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ssl_context) as resp:
             raw = resp.read()
             # Try UTF-8 first, fallback to detected charset
             content_type = resp.headers.get("Content-Type", "")
@@ -2918,10 +2949,215 @@ def browser_screenshot(path: str = "") -> str:
     return f"(screenshot result: {result})"
 
 
+def browser_click(selector: str) -> str:
+    """Click an element using CSS selector or snapshot @ref tag."""
+    return _browser_cmd(["click", selector], timeout_sec=15)
+
+
+def browser_fill(selector: str, text: str) -> str:
+    """Clear and fill an input element."""
+    return _browser_cmd(["fill", selector, text], timeout_sec=15)
+
+
+def browser_type(selector: str, text: str) -> str:
+    """Type text into an element (simulates keystrokes)."""
+    return _browser_cmd(["type", selector, text], timeout_sec=15)
+
+
+def browser_press(key: str) -> str:
+    """Press a keyboard key (e.g. 'Enter')."""
+    return _browser_cmd(["press", key], timeout_sec=10)
+
+
 def browser_close() -> str:
     """Close the browser daemon and free resources."""
     _browser_cmd(["close", "--all"], timeout_sec=10)
     return "Browser closed."
+
+
+# -- GitHub tools ------------------------------------------------------------
+
+def github_create_repo(name: str, private: bool = False, description: str = "") -> str:
+    """Create a GitHub repository using the gh CLI."""
+    import subprocess
+    try:
+        args = ["gh", "repo", "create", name, "--" + ("private" if private else "public")]
+        if description:
+            args += ["-d", description]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or f"Created repo: {name}"
+    except FileNotFoundError:
+        return "Error: gh CLI not installed. Run: winget install GitHub.cli"
+
+
+def github_create_issue(title: str, body: str = "", repo: str = "") -> str:
+    """Create a GitHub issue using the gh CLI."""
+    import subprocess
+    try:
+        args = ["gh", "issue", "create", "-t", title]
+        if body:
+            args += ["-b", body]
+        if repo:
+            args += ["-R", repo]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or f"Created issue: {title}"
+    except FileNotFoundError:
+        return "Error: gh CLI not installed."
+
+
+def github_create_pull_request(title: str, body: str = "", base: str = "master", head: str = "") -> str:
+    """Create a GitHub pull request using the gh CLI."""
+    import subprocess
+    try:
+        args = ["gh", "pr", "create", "-t", title, "-B", base]
+        if body:
+            args += ["-b", body]
+        if head:
+            args += ["-H", head]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or f"Created PR: {title}"
+    except FileNotFoundError:
+        return "Error: gh CLI not installed."
+
+
+def github_list_issues(state: str = "open", limit: int = 10) -> str:
+    """List GitHub issues using the gh CLI."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["gh", "issue", "list", "-s", state, "-L", str(limit)],
+            capture_output=True, text=True, timeout=30
+        )
+        return r.stdout.strip() or "No issues found."
+    except FileNotFoundError:
+        return "Error: gh CLI not installed."
+
+# -- PDF reader ---------------------------------------------------------------
+
+def read_pdf(file_path: str, max_pages: int = 20, page_numbers: str = "") -> str:
+    """Read text from a PDF file.
+
+    Args:
+        file_path: Path to the PDF file.
+        max_pages: Max pages to read (default 20). Use 0 for all.
+        page_numbers: Specific pages to read, e.g. '1-3,5,7-9' (overrides max_pages).
+    """
+    if not os.path.isfile(file_path):
+        return "Error: File not found: " + file_path
+    if not file_path.lower().endswith('.pdf'):
+        return "Error: Not a PDF file: " + file_path
+    try:
+        import fitz
+    except ImportError:
+        return "Error: pymupdf not installed. Run: pip install pymupdf"
+    try:
+        doc = fitz.open(file_path)
+        total = len(doc)
+        pages = []
+        if page_numbers:
+            import re
+            for part in page_numbers.split(','):
+                part = part.strip()
+                if '-' in part:
+                    a, b = part.split('-', 1)
+                    pages.extend(range(int(a.strip())-1, int(b.strip())))
+                else:
+                    pages.append(int(part)-1)
+        else:
+            max_p = max_pages if max_pages > 0 else total
+            pages = list(range(min(total, max_p)))
+        output = []
+        output.append("PDF: " + os.path.basename(file_path) + " (" + str(total) + " pages)")
+        for pnum in pages:
+            if pnum >= total:
+                break
+            page = doc[pnum]
+            text = page.get_text().strip()
+            if text:
+                output.append("--- Page " + str(pnum+1) + " ---")
+                # Truncate very long pages to 3000 chars
+                if len(text) > 3000:
+                    text = text[:1500] + "\n...[truncated]...\n" + text[-1500:]
+                output.append(text)
+        doc.close()
+        result = "\n".join(output)
+        if len(result) > 50000:
+            result = result[:25000] + "\n...[large PDF truncated]...\n" + result[-25000:]
+        return result if result.strip() else "(empty PDF)"
+    except Exception as e:
+        return "Error reading PDF: " + str(e)
+
+
+# -- Document creation & web search tools -----------------------------------
+
+def create_docx(file_path, title="", content=""):
+    """Create a Word document (.docx) with optional title and content."""
+    try:
+        from docx import Document
+    except ImportError:
+        return "Error: python-docx not installed. Run: pip install python-docx"
+    try:
+        doc = Document()
+        if title:
+            doc.add_heading(title, level=1)
+        for para in content.split(chr(10)):
+            para = para.strip()
+            if para:
+                doc.add_paragraph(para)
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        doc.save(file_path)
+        return "Created Word document: " + file_path
+    except Exception as e:
+        return "Error creating document: " + str(e)
+
+
+def create_xlsx(file_path, headers=None, rows=None):
+    """Create an Excel spreadsheet (.xlsx)."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return "Error: openpyxl not installed. Run: pip install openpyxl"
+    try:
+        wb = Workbook()
+        ws = wb.active
+        headers = headers or []
+        rows = rows or []
+        if headers:
+            ws.append(headers)
+        for row in rows:
+            ws.append(row if isinstance(row, list) else [row])
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        wb.save(file_path)
+        return "Created Excel: " + file_path + " (" + str(len(headers)) + " cols, " + str(len(rows)) + " rows)"
+    except Exception as e:
+        return "Error creating spreadsheet: " + str(e)
+
+
+def web_search(query, max_results=5):
+    """Search the web via DuckDuckGo."""
+    import urllib.parse
+    encoded = urllib.parse.quote(query)
+    url = "https://html.duckduckgo.com/html/?q=" + encoded
+    try:
+        result = web_fetch(url, max_chars=8000)
+        import re
+        snippets = re.findall(
+            r'<a[^>]*class="result__a"[^>]*>(.*?)</a>.*?'
+            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+            result, re.DOTALL
+        )
+        if snippets:
+            output = 'Web search: ' + chr(34) + query + chr(34)
+            for i, (title, snippet) in enumerate(snippets[:max_results], 1):
+                clean_title = re.sub(r'<[^>]+>', '', title).strip()
+                clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+                output += chr(10) + str(i) + '. ' + clean_title + chr(10) + '   ' + clean_snippet
+            return output
+        return "Search: " + chr(34) + query + chr(34) + chr(10) + result[:5000]
+    except Exception as e:
+        return "Search error: " + str(e)
+
+
 
 TOOL_MAP = {
     "read_file": read_file,
@@ -2948,7 +3184,19 @@ TOOL_MAP = {
     "browser_navigate": browser_navigate,
     "browser_extract": browser_extract,
     "browser_screenshot": browser_screenshot,
+    "browser_click": browser_click,
+    "browser_fill": browser_fill,
+    "browser_type": browser_type,
+    "browser_press": browser_press,
     "browser_close": browser_close,
+    "github_create_repo": github_create_repo,
+    "github_create_issue": github_create_issue,
+    "github_create_pull_request": github_create_pull_request,
+    "github_list_issues": github_list_issues,
+    "create_docx": create_docx,
+    "create_xlsx": create_xlsx,
+    "read_pdf": read_pdf,
+    "web_search": web_search,
 }
 
 

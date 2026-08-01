@@ -4,7 +4,7 @@ creates a new document, writes markdown-formatted content, saves as .docx, and c
 """
 import os
 import re
-from state_sync import shared_state
+from state_sync import shared_state, safe_append_live_log
 
 
 def append_inline_formatted(word_range, text: str):
@@ -37,9 +37,7 @@ def write_docx_with_word(filepath: str, title: str, body_text: str) -> bool:
     import pythoncom
 
     basename = os.path.basename(filepath)
-    shared_state["live_terminal_log"] += (
-        f"\n[Word Automation] Launching Microsoft Word to generate {basename}...\n"
-    )
+    safe_append_live_log(f"\n[Word Automation] Launching Microsoft Word to generate {basename}...")
     pythoncom.CoInitialize()
     word = None
     try:
@@ -185,15 +183,13 @@ def write_docx_with_word(filepath: str, title: str, body_text: str) -> bool:
         doc.SaveAs(abs_path, FileFormat=16)  # 16 = wdFormatDocumentDefault (.docx)
         doc.Close()
 
-        shared_state["live_terminal_log"] += (
-            f"[Word Automation] [OK] Successfully generated formatted Word document: {basename}\n"
-        )
+        safe_append_live_log(f"[Word Automation] [OK] Successfully generated formatted Word document: {basename}")
         return True
     except Exception as e:
         import traceback
         tb_str = traceback.format_exc()
-        err = f"[Word Automation] [ERROR] Failed to compile Word document: {e}\nTraceback:\n{tb_str}\n"
-        shared_state["live_terminal_log"] += err
+        err = f"[Word Automation] [ERROR] Failed to compile Word document: {e}\nTraceback:\n{tb_str}"
+        safe_append_live_log(err)
         print(err.encode('ascii', errors='replace').decode('ascii'))
         return False
     finally:

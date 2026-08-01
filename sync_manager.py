@@ -4,7 +4,7 @@ Just plumbing: load workspace context → run agent → stream output.
 """
 import os
 
-from state_sync import shared_state, safe_update_state, safe_get_state, state_lock
+from state_sync import shared_state, safe_update_state, safe_get_state, state_lock, safe_append_live_log
 
 
 def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: str = "", cancel_event=None):
@@ -40,20 +40,7 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         except Exception as e:
             print(f"[SYNC] Error appending task progress: {e}")
 
-    # Save request to memory
-    if project_path:
-        try:
-            from memory_io import load_memory, save_memory
-            mem = load_memory(project_path)
-            mem["project_path"] = project_path
-            clean_req = resolved_request.split("=== TASK PROGRESS")[0].strip()
-            if clean_req:
-                past_reqs = mem.setdefault("past_requests", [])
-                if not past_reqs or past_reqs[-1] != clean_req:
-                    past_reqs.append(clean_req)
-            save_memory(mem, project_path)
-        except Exception as e:
-            print(f"[SYNC] Error saving request to memory: {e}")
+
 
     # Load existing specs (requirements, tech_spec, etc.)
     specs = load_existing_specs(project_path)
@@ -84,6 +71,9 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         "deep_agents_log": [],
         "live_terminal_log": f"[>] User: {client_request}\n\n",
         "developer_tool_log": "",
+        "code_updated": False,
+        "requirements_updated": False,
+        "tech_spec_updated": False,
     })
     yield safe_get_state()
 
@@ -109,8 +99,8 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         "requirements", "tech_spec", "code", "agent_report", "test_report",
     ]
 
-    from orchestrator_agent import orchestrator_node
     try:
+        from orchestrator_agent import orchestrator_node
         res = orchestrator_node(init_state)
         if res:
             with state_lock:
@@ -125,6 +115,15 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
 
                 shared_state["failed_models"] = []
 
+                if "code_updated" in res:
+                    shared_state["code_updated"] = res["code_updated"]
+                if "requirements_updated" in res:
+                    shared_state["requirements_updated"] = res["requirements_updated"]
+                if "tech_spec_updated" in res:
+                    shared_state["tech_spec_updated"] = res["tech_spec_updated"]
+                if "error" in res and res["error"]:
+                    shared_state["error"] = res["error"]
+
                 nxt = res.get("next_agent", "")
                 if nxt:
                     shared_state["next_agent"] = nxt
@@ -136,7 +135,11 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
 
             yield safe_get_state()
     except Exception as e:
-        print(f"[SYNC] Error running orchestrator: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[SYNC] Error running orchestrator: {e}\n{tb}")
+        # Inject error into live_terminal_log so the frontend shows it
+        safe_append_live_log(f"\n[SYNC CRASH] {e}\n[ASSISTANT] ERROR: {e}")
         raise e
 
     # ── Pillar 17: Memory consolidation moved to background daemon ──

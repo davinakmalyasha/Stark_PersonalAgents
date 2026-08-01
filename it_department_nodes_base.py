@@ -8,7 +8,7 @@ Covers:
 import os
 import json
 from typing import TypedDict
-from state_sync import shared_state
+from state_sync import shared_state, safe_append_live_log
 
 # ── Pillar 118: Hierarchical Swarm Message Compression ──
 
@@ -186,7 +186,7 @@ def invoke_llm(role: str, system_instruction: str, prompt: str) -> str:
     """Invokes LLM with centralized fallback strategy.
     Streams output to shared_state live_terminal_log."""
     shared_state["thoughts"][role.lower()] = f"Spawning {role} Agent..."
-    shared_state["live_terminal_log"] += f"\n--- [{role.upper()} AGENT] ---\n"
+    safe_append_live_log(f"\n--- [{role.upper()} AGENT] ---")
     from llm import invoke_with_fallback
     return invoke_with_fallback(role, system_instruction, prompt)
 

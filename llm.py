@@ -9,25 +9,39 @@ from typing import Any, Optional, Type, TypeVar
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
-
-class BudgetExceededException(Exception):
-    """Exception raised when the cumulative token cost crosses the budget limit."""
-    pass
 from langchain_openai import ChatOpenAI
 from langchain_core.language_models.chat_models import BaseChatModel
 
-# Monkeypatch langchain_openai to preserve reasoning_content for DeepSeek prompt caching
+# Monkeypatch langchain_openai to preserve reasoning_content for DeepSeek prompt caching and response parsing
 try:
     import langchain_openai.chat_models.base as base_mod
-    orig_convert = base_mod._convert_message_to_dict
 
+    # 1. Outgoing messages (for prompt caching)
+    orig_convert = base_mod._convert_message_to_dict
     def patched_convert(message, *args, **kwargs):
         res_dict = orig_convert(message, *args, **kwargs)
         if hasattr(message, "additional_kwargs") and "reasoning_content" in message.additional_kwargs:
             res_dict["reasoning_content"] = message.additional_kwargs["reasoning_content"]
         return res_dict
-
     base_mod._convert_message_to_dict = patched_convert
+
+    # 2. Incoming messages (for parsing reasoning_content in non-streaming responses)
+    orig_convert_dict = base_mod._convert_dict_to_message
+    def patched_convert_dict(_dict, *args, **kwargs):
+        msg = orig_convert_dict(_dict, *args, **kwargs)
+        if isinstance(_dict, dict) and "reasoning_content" in _dict:
+            msg.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
+        return msg
+    base_mod._convert_dict_to_message = patched_convert_dict
+
+    # 3. Incoming streaming chunks (for parsing reasoning_content in streaming responses)
+    orig_convert_delta = base_mod._convert_delta_to_message_chunk
+    def patched_convert_delta(_dict, *args, **kwargs):
+        msg_chunk = orig_convert_delta(_dict, *args, **kwargs)
+        if isinstance(_dict, dict) and "reasoning_content" in _dict:
+            msg_chunk.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
+        return msg_chunk
+    base_mod._convert_delta_to_message_chunk = patched_convert_delta
 except Exception:
     pass
 
@@ -40,9 +54,9 @@ class StrWithMetadata(str):
         return obj
 
 from llm_stats import TokenUsageTracker, update_token_stats
-from rate_limiter import token_bucket_limit
+# rate_limiter removed — no artificial API throttling. The model decides pacing.
 
-load_dotenv()
+load_dotenv(override=True)
 T = TypeVar("T", bound=BaseModel)
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -60,15 +74,18 @@ def _is_off_peak() -> bool:
 
 
 def log_terminal(msg: str) -> None:
-    """Log to console and shared_state live_terminal_log."""
+    """Log to shared_state live_terminal_log. Console logging is best-effort."""
     try:
         print(msg, flush=True)
-    except UnicodeEncodeError:
-        print(msg.encode("ascii", errors="replace").decode(), flush=True)
+    except (UnicodeEncodeError, OSError):
+        try:
+            safe = msg.encode("ascii", errors="replace").decode()
+            print(safe, flush=True)
+        except OSError:
+            pass  # console is gone — log to shared_state only
     try:
-        from state_sync import shared_state
-        if "live_terminal_log" in shared_state:
-            shared_state["live_terminal_log"] += msg + "\n"
+        from state_sync import safe_append_live_log
+        safe_append_live_log(msg)
     except Exception:
         pass
 
@@ -122,35 +139,17 @@ def _extract_native_tool_calls(res) -> list[dict]:
 
 
 def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, response_format: Optional[dict] = None, tools: Optional[list[dict]] = None, reasoning_effort: Optional[str] = None, messages: Optional[list] = None) -> BaseChatModel:
-    """Create a DeepSeek ChatOpenAI client with role-based max_tokens and optional native tools."""
+    """Create a DeepSeek ChatOpenAI client with optional native tools."""
     key = os.getenv("DEEPSEEK_API_KEY", "")
     if not key or key.startswith("your_"):
         raise ValueError(
             "DEEPSEEK_API_KEY not set in .env. "
             "Get one at https://platform.deepseek.com/api_keys"
         )
-    MAX_TOKENS_BY_ROLE = {
-        "Supervisor": 800,
-        "SupervisorSummary": 1500,
-        "Developer": 8000,   # enough for full file writes
-        "DeveloperFixing": 8000,
-        "Orchestrator": 8000,  # max thinking needs room — reasoning + tool calls + summary
-        "default": 4000,
-    }
-    limit = MAX_TOKENS_BY_ROLE.get(role, MAX_TOKENS_BY_ROLE["default"]) if role else None
 
-    from state_sync import safe_get_state
-    state = safe_get_state()
-    remaining_steps = state.get("remaining_steps")
+    # No per-call max_tokens — the model decides how much to output.
+    # The context compaction system handles the window, the LLM handles pacing.
 
-    if remaining_steps is not None and remaining_steps < 5:
-        if role in ["Developer", "DeveloperFixing", "sa", "Coder"]:
-            cap = 1500
-        else:
-            cap = 400
-        limit = min(limit, cap) if limit is not None else cap
-
-    # Both v4-pro and v4-flash support temperature
     kwargs: dict[str, Any] = {
         "model": model,
         "api_key": key,
@@ -159,8 +158,6 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
         "max_retries": 1,
         "temperature": temp,
     }
-    if limit is not None:
-        kwargs["max_tokens"] = limit
     if response_format is not None:
         kwargs.setdefault("model_kwargs", {})["response_format"] = response_format
     if tools:
@@ -169,12 +166,9 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
 
     # Configure native thinking mode dynamically by role/model.
     # Only send thinking parameters if the model supports it or is a fallback model.
-    is_reasoning_model = any(x in model.lower() for x in ["r1", "pro", "o1", "o3", "reasoning", "thinking", "fallback", "automatic"])
+    is_reasoning_model = any(x in model.lower() for x in ["r1", "pro", "o1", "o3", "reasoning", "thinking", "fallback", "automatic", "flash"])
 
     if is_reasoning_model:
-        depth = len(messages) if messages else 0
-        is_first_turn = depth <= 3
-
         if reasoning_effort is not None:
             if reasoning_effort == "disabled":
                 kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -182,8 +176,6 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
                 kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
                 kwargs["reasoning_effort"] = reasoning_effort
         else:
-            is_pro = "pro" in model.lower()
-            is_flash = "flash" in model.lower()
             is_orchestrator = (
                 role in ["Developer", "DeveloperFixing"]
                 or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
@@ -193,45 +185,14 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
                 or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"]))
             )
 
-            if remaining_steps is not None and remaining_steps < 5:
-                if is_heavy:
-                    kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                    kwargs["reasoning_effort"] = "medium"
-                else:
-                    kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            if is_orchestrator:
+                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+                kwargs["reasoning_effort"] = "high"
+            elif is_heavy:
+                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+                kwargs["reasoning_effort"] = "high"
             else:
-                if is_orchestrator:
-                    if is_first_turn:
-                        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                        kwargs["reasoning_effort"] = "max"
-                    else:
-                        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                elif is_pro and is_heavy:
-                    if is_first_turn:
-                        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                        kwargs["reasoning_effort"] = "high"
-                    else:
-                        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                elif is_flash:
-                    kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                elif is_pro:
-                    if is_first_turn:
-                        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                        kwargs["reasoning_effort"] = "high"
-                    else:
-                        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                else:
-                    if role == "DeveloperFixing":
-                        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                        kwargs["reasoning_effort"] = "max"
-                    elif role == "Developer":
-                        if is_first_turn:
-                            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                            kwargs["reasoning_effort"] = "max"
-                        else:
-                            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                    else:
-                        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
     return ChatOpenAI(**kwargs)
 
@@ -362,7 +323,6 @@ def _handle_rate_limit(err_str: str, attempt: int) -> int:
     return min(wait, 30)  # cap at 30s
 
 
-@token_bucket_limit
 def invoke_with_fallback(
     role: str,
     sys_inst: str,
@@ -455,18 +415,18 @@ def invoke_with_fallback(
 
             # Log a smart summary instead of dumping the entire response
             try:
-                from state_sync import shared_state
-                if shared_state and "live_terminal_log" in shared_state and not schema:
+                from state_sync import safe_append_live_log
+                if not schema:
                     val_str = str(val)
                     # Extract tool calls for a concise summary
                     import re as _re
                     tools_called = _re.findall(r'"tool":\s*"(\w+)"', val_str)
                     if tools_called:
-                        shared_state["live_terminal_log"] += f"  → Tools: {', '.join(tools_called)}\n"
+                        safe_append_live_log(f"  → Tools: {', '.join(tools_called)}")
                     elif len(val_str) < 200:
-                        shared_state["live_terminal_log"] += val_str + "\n"
+                        safe_append_live_log(val_str)
                     else:
-                        shared_state["live_terminal_log"] += f"  → Response: {len(val_str)} chars\n"
+                        safe_append_live_log(f"  → Response: {len(val_str)} chars")
             except Exception:
                 pass
 
@@ -577,7 +537,6 @@ def _compact_prompt(text: str) -> str:
     return "\n".join(compacted_lines)
 
 
-@token_bucket_limit
 def invoke_messages_with_fallback(
     role: str,
     messages: list,
@@ -693,9 +652,11 @@ def invoke_messages_with_fallback(
                     return val
                 log_terminal(f"[{model}] Empty response, trying next...\n")
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
             err_str = str(e)
             errors_by_model[model] = err_str[:300]
-            log_terminal(f"[{model}] Failed: {err_str}\n")
+            log_terminal(f"[{model}] Failed: {err_str}\n{tb}\n")
 
             # Rate-limit retry
             if "429" in err_str or "rate" in err_str.lower():

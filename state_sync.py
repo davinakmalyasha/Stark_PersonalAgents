@@ -12,7 +12,7 @@ shared_state = {
     "next_agent": "",
     "completed_nodes": [],
     "thoughts": {
-        "supervisor": "", "developer": ""
+        "supervisor": "", "developer": "", "orchestrator": "", "agent": ""
     },
     "client_request": "",
     "outputs": {
@@ -89,10 +89,25 @@ def safe_serialize_state() -> str:
         return json.dumps(shared_state)
 
 
-def safe_append_live_log(msg: str) -> None:
-    """Safely appends a message to the live terminal log under lock without copying state."""
+# Cap for live_terminal_log — keeps the SSE snapshots and frontend re-parses bounded
+LIVE_LOG_CAP = 20000
+
+
+def safe_append_live_log(msg: str, newline: bool = True) -> None:
+    """Safely appends a message to the live terminal log under lock without copying state.
+
+    Bumps state_version so the SSE streamer in api_server.py emits intermediate
+    snapshots while a run is in progress (progressive thinking in the frontend).
+    ``newline=False`` appends the message verbatim — used for terminal output
+    lines that already carry their own trailing newline.
+    """
     with state_lock:
-        shared_state["live_terminal_log"] = shared_state["live_terminal_log"] + msg + "\n"
+        cur = shared_state.get("live_terminal_log", "")
+        text = msg + ("\n" if newline else "")
+        if LIVE_LOG_CAP and len(cur) + len(text) > LIVE_LOG_CAP:
+            keep = LIVE_LOG_CAP - len(text)
+            cur = cur[-keep:] if keep > 0 else ""
+        shared_state["live_terminal_log"] = cur + text
         shared_state["state_version"] += 1
 
 
@@ -103,7 +118,7 @@ def reset_shared_state():
         shared_state["active_node"] = ""
         shared_state["next_agent"] = ""
         shared_state["completed_nodes"] = []
-        shared_state["thoughts"] = {"supervisor": "", "developer": ""}
+        shared_state["thoughts"] = {"supervisor": "", "developer": "", "orchestrator": "", "agent": ""}
         shared_state["client_request"] = ""
         shared_state["outputs"] = {
             "requirements": "", "tech_spec": "", "code": "", "agent_report": "",

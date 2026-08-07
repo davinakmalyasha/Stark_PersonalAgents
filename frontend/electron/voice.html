@@ -1,0 +1,1298 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+* { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+body {
+  background: transparent;
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  --accent: #b6c2d4;
+  --accent-soft: rgba(182, 194, 212, 0.28);
+  --accent-bg: rgba(182, 194, 212, 0.1);
+}
+body.state-listening { --accent: #9fc1f0; --accent-soft: rgba(159, 193, 240, 0.3); --accent-bg: rgba(159, 193, 240, 0.1); }
+body.state-thinking { --accent: #c3b3e8; --accent-soft: rgba(195, 179, 232, 0.3); --accent-bg: rgba(195, 179, 232, 0.1); }
+body.state-speaking { --accent: #9be1e6; --accent-soft: rgba(155, 225, 230, 0.32); --accent-bg: rgba(155, 225, 230, 0.1); }
+body.state-muted   { --accent: #6b7686; --accent-soft: rgba(107, 118, 134, 0.25); --accent-bg: rgba(107, 118, 134, 0.08); }
+body.state-error   { --accent: #f2a0a0; --accent-soft: rgba(242, 160, 160, 0.35); --accent-bg: rgba(242, 160, 160, 0.12); }
+
+.container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(180deg, rgba(19, 19, 25, 0.9), rgba(9, 9, 13, 0.92));
+  backdrop-filter: blur(18px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  box-shadow: 0 12px 44px rgba(0, 0, 0, 0.55);
+  -webkit-app-region: drag;
+  transition: border-color 0.5s ease;
+  overflow: hidden;
+}
+.main-row { display: flex; align-items: center; gap: 10px; width: 100%; flex-shrink: 0; }
+.container::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 6%; right: 6%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.22), transparent);
+  pointer-events: none;
+}
+body.state-listening .container { border-color: rgba(159, 193, 240, 0.22); }
+body.state-thinking .container { border-color: rgba(195, 179, 232, 0.22); }
+body.state-speaking .container { border-color: rgba(155, 225, 230, 0.26); }
+body.state-error .container { border-color: rgba(242, 160, 160, 0.4); animation: errFade 0.9s ease 2; }
+@keyframes errFade { 50% { border-color: rgba(242, 160, 160, 0.7); } }
+
+/* soft idle sweep */
+.scan {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(180deg, transparent 0%, rgba(255, 255, 255, 0.025) 46%, rgba(255, 255, 255, 0.05) 50%, rgba(255, 255, 255, 0.025) 54%, transparent 100%);
+  transform: translateY(-110%);
+}
+body.state-idle .scan { opacity: 1; animation: scan 8s linear infinite 3s; }
+@keyframes scan {
+  0% { transform: translateY(-110%); }
+  45%, 60% { transform: translateY(110%); }
+  100% { transform: translateY(110%); }
+}
+
+button { -webkit-app-region: no-drag; cursor: pointer; border: none; outline: none; }
+
+/* ── Live bars toggle (voice-level equalizer) ── */
+.bars-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at 34% 30%, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.015) 55%, transparent 75%);
+  transition: transform 0.25s ease;
+}
+.bars-btn:hover { transform: scale(1.06); }
+.bars-btn:active { transform: scale(0.93); }
+
+/* soft halo behind the bars */
+.bars-btn::before {
+  content: '';
+  position: absolute;
+  inset: -9px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-soft), transparent 70%);
+  filter: blur(9px);
+  opacity: 0;
+  transition: opacity 0.6s ease;
+}
+body.state-listening .bars-btn::before,
+body.state-thinking .bars-btn::before,
+body.state-speaking .bars-btn::before { opacity: 0.65; }
+
+.bars {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3.5px;
+  height: 26px;
+}
+.bars i {
+  display: block;
+  width: 3.5px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-soft);
+  transition: height 0.12s linear, background 0.5s ease, opacity 0.5s ease;
+}
+body.state-muted .bars i { opacity: 0.35; }
+
+/* ripple rings — speaking / listening */
+.orb-ripple { position: absolute; inset: 0; border-radius: 50%; border: 1px solid var(--accent); opacity: 0; pointer-events: none; transition: border-color 0.5s ease; }
+body.state-speaking .orb-ripple { animation: rippleOut 2s ease-out infinite; }
+body.state-speaking .orb-ripple.r2 { animation-delay: 1s; }
+body.state-listening .orb-ripple { animation: rippleOut 2.8s ease-out infinite; }
+@keyframes rippleOut { 0% { transform: scale(1); opacity: 0.4; } 100% { transform: scale(1.9); opacity: 0; } }
+
+/* ── Info column ── */
+.info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.status-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.pip {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-soft);
+  transition: background 0.5s ease, box-shadow 0.5s ease;
+}
+.pip.listening { animation: pipPulse 1.2s ease-in-out infinite; }
+.pip.thinking { animation: pipPulse 1s ease-in-out infinite; }
+.pip.speaking { animation: pipPulse 0.7s ease-in-out infinite; }
+@keyframes pipPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.label {
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.label.swap { animation: labelSwap 0.3s ease; }
+@keyframes labelSwap { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+.ellipsis { display: inline-flex; gap: 2.5px; opacity: 0; transition: opacity 0.4s ease; }
+.ellipsis i { width: 3px; height: 3px; border-radius: 50%; background: var(--accent); animation: blink 1.3s ease-in-out infinite; transition: background 0.5s ease; }
+.ellipsis i:nth-child(2) { animation-delay: 0.2s; }
+.ellipsis i:nth-child(3) { animation-delay: 0.4s; }
+body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaking .ellipsis { opacity: 1; }
+@keyframes blink { 0%, 100% { opacity: 0.15; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-2px); } }
+
+/* activity hairline — L / T / A */
+.stages { display: flex; gap: 3px; margin-left: auto; align-items: center; flex-shrink: 0; }
+.stage {
+  width: 13px;
+  height: 2.5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.09);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+.stage.on { background: var(--accent); box-shadow: 0 0 6px var(--accent-soft); }
+
+.mid-row { display: flex; align-items: center; gap: 7px; min-width: 0; -webkit-app-region: no-drag; cursor: pointer; border-radius: 8px; padding: 2px 4px; margin: 0 -4px; transition: background 0.25s ease; }
+.mid-row:hover { background: rgba(255, 255, 255, 0.03); }
+
+#wave { width: 80px; height: 24px; flex-shrink: 0; opacity: 0.85; }
+#wave.fade-in { animation: waveIn 0.3s ease; }
+@keyframes waveIn { from { opacity: 0.25; transform: scale(0.97); } to { opacity: 0.85; transform: none; } }
+
+.text-wrap { flex: 1; min-width: 0; overflow: hidden; }
+.text {
+  display: inline-block;
+  color: #8b93a1;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.35;
+  max-width: 100%;
+  letter-spacing: 0.01em;
+}
+.text.marquee { text-overflow: clip; animation: marquee 10s linear infinite alternate; }
+.text-wrap:hover .text.marquee { animation-play-state: paused; }
+@keyframes marquee { from { transform: translateX(0); } to { transform: translateX(var(--tx, -120px)); } }
+
+.hint { color: #5b6472; font-size: 10px; white-space: nowrap; flex-shrink: 0; letter-spacing: 0.02em; }
+
+/* ── Action buttons ── */
+.btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #6b7280;
+  transition: all 0.2s ease;
+}
+.btn:hover { background: rgba(255, 255, 255, 0.09); color: #d1d5db; transform: translateY(-1px); }
+.btn:active { transform: scale(0.9); }
+.btn svg { width: 13px; height: 13px; }
+
+.send-btn {
+  background: var(--accent-bg);
+  border-color: var(--accent-soft);
+  color: var(--accent);
+  animation: sendIn 0.25s ease;
+}
+.send-btn:hover { background: var(--accent-bg); color: var(--accent); }
+@keyframes sendIn { from { transform: scale(0.5); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+.close-btn { width: 24px; height: 24px; font-size: 12px; line-height: 1; }
+
+.expand-btn svg { transition: transform 0.3s ease; }
+.expand-btn.expanded svg { transform: rotate(180deg); }
+.expand-btn.expanded { color: var(--accent); border-color: var(--accent-soft); }
+
+/* ── Live process feed (expanded view) ── */
+.feed-wrap {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  padding-top: 6px;
+}
+.feed-head { display: flex; justify-content: space-between; align-items: center; padding: 0 2px 4px; -webkit-app-region: no-drag; }
+.feed-live { font-size: 9px; font-weight: 700; letter-spacing: 0.12em; color: var(--accent); display: flex; gap: 5px; align-items: center; }
+.feed-live i { width: 5px; height: 5px; border-radius: 50%; background: #f87171; animation: blink 1s ease-in-out infinite; }
+.feed-status { font-size: 9.5px; color: #5b6472; letter-spacing: 0.04em; }
+.feed {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: #8b93a1;
+  -webkit-app-region: no-drag;
+}
+.feed-line { padding: 1px 2px; white-space: pre-wrap; word-break: break-word; }
+.feed-line.user { color: #e2e8f0; }
+.feed-line.thought { color: #c3b3e8; }
+.feed-line.agent { color: #9fc1f0; }
+.feed-line.tool { color: #9be1e6; }
+.feed-line.error { color: #f2a0a0; }
+.feed-line.meta { color: #6b7686; }
+.feed::-webkit-scrollbar { width: 4px; }
+.feed::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 2px; }
+
+/* Right-side vertical button stack */
+.side-col { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex-shrink: 0; }
+.side-row { display: flex; gap: 6px; align-items: center; }
+
+/* ── Voice menu ── */
+.voice-menu {
+  position: fixed;
+  right: 40px;
+  bottom: 6px;
+  background: rgba(15, 15, 20, 0.95);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  padding: 5px;
+  z-index: 50;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+  -webkit-app-region: no-drag;
+  max-height: 250px;
+  overflow-y: auto;
+}
+.voice-menu-head {
+  padding: 4px 9px 2px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #5b6472;
+}
+.voice-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 5px 9px;
+  border-radius: 7px;
+  font-size: 11px;
+  color: #9aa1ad;
+  background: transparent;
+  white-space: nowrap;
+}
+.voice-menu button:hover { background: var(--accent-bg); color: #e2e8f0; }
+.voice-menu button.active { color: var(--accent); }
+</style></head>
+<body>
+<div class="container">
+  <div class="main-row">
+    <div class="grip"><span></span><span></span><span></span></div>
+
+    <!-- Live bars: the voice toggle -->
+    <button id="mic-btn" class="bars-btn" title="Unmute">
+      <span class="orb-ripple"></span>
+      <span class="orb-ripple r2"></span>
+      <span class="bars" id="bars-icon"><i></i><i></i><i></i><i></i></span>
+    </button>
+
+    <div class="info">
+      <div class="status-row">
+        <span id="dot" class="pip idle"></span>
+        <span id="label" class="label">Voice</span>
+        <span class="ellipsis"><i></i><i></i><i></i></span>
+        <div class="stages" id="stages">
+          <span class="stage" data-s="listening" title="Listening"></span>
+          <span class="stage" data-s="thinking" title="Thinking"></span>
+          <span class="stage" data-s="speaking" title="Answering"></span>
+        </div>
+      </div>
+      <div class="mid-row" id="replay-area" title="Click to replay last answer">
+        <canvas id="wave" width="80" height="24"></canvas>
+        <div class="text-wrap">
+          <div id="voice-text" class="text">Ctrl+G to toggle</div>
+        </div>
+        <span id="hint" class="hint" style="display:none">· auto-sends</span>
+      </div>
+    </div>
+
+    <div class="side-col">
+      <div class="side-row">
+        <button id="send-btn" class="btn send-btn" title="Send now" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        </button>
+        <button id="close-btn" class="btn close-btn" title="Close overlay">✕</button>
+      </div>
+      <button id="voice-btn" class="btn" title="Change voice">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6 9H2v6h4l5 4V5Z"></path>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+        </svg>
+      </button>
+      <button id="expand-btn" class="btn expand-btn" title="Show live process">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="6 9 12 15 18 9"></polyline>
+        </svg>
+      </button>
+    </div>
+    <div id="voice-menu" class="voice-menu" style="display:none"></div>
+  </div>
+
+  <div class="feed-wrap" id="feed-wrap" style="display:none">
+    <div class="feed-head">
+      <span class="feed-live"><i></i>LIVE PROCESS</span>
+      <span id="feed-status" class="feed-status">idle</span>
+    </div>
+    <div id="feed" class="feed"></div>
+  </div>
+
+  <div class="scan"></div>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  const API = 'http://127.0.0.1:8000';
+  const $ = (id) => document.getElementById(id);
+  const dot = $('dot'), label = $('label'), textEl = $('voice-text');
+  const micBtn = $('mic-btn');
+  const closeBtn = $('close-btn');
+  const wave = $('wave'), wctx = wave.getContext('2d');
+  const hintEl = $('hint');
+  const sendBtn = $('send-btn');
+  const voiceBtn = $('voice-btn');
+  const voiceMenu = $('voice-menu');
+  const replayArea = $('replay-area');
+  const barsEl = $('bars-icon');
+  const barEls = barsEl ? barsEl.children : null;
+  const expandBtn = $('expand-btn');
+  const feedWrap = $('feed-wrap');
+  const feed = $('feed');
+  const feedStatus = $('feed-status');
+
+  const bridge = window.voiceBridge || null;
+  function send(type, payload) { if (bridge) bridge.sendEvent(Object.assign({ type: type }, payload || {})); }
+
+  const VOICES = [
+    { id: 'en-US-JennyNeural', name: 'Jenny · US · female', lang: 'en' },
+    { id: 'en-US-GuyNeural', name: 'Guy · US · male', lang: 'en' },
+    { id: 'en-US-AriaNeural', name: 'Aria · US · female', lang: 'en' },
+    { id: 'en-US-ChristopherNeural', name: 'Christopher · US · male', lang: 'en' },
+    { id: 'en-GB-SoniaNeural', name: 'Sonia · UK · female', lang: 'en' },
+    { id: 'en-GB-RyanNeural', name: 'Ryan · UK · male', lang: 'en' },
+    { id: 'en-AU-NatashaNeural', name: 'Natasha · AU · female', lang: 'en' },
+    { id: 'en-AU-WilliamNeural', name: 'William · AU · male', lang: 'en' },
+    { id: 'id-ID-GadisNeural', name: 'Gadis · ID · female', lang: 'id' },
+    { id: 'id-ID-ArdiNeural', name: 'Ardi · ID · male', lang: 'id' },
+  ];
+  let voice = localStorage.getItem('voice.voice') || 'en-US-JennyNeural';
+  let voiceId = localStorage.getItem('voice.idVoice') || 'id-ID-GadisNeural';
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Rough Indonesian vs English detection (Indonesian stopwords)
+  const ID_WORDS = [
+    'yang', 'di', 'ke', 'dari', 'dengan', 'untuk', 'saya', 'kamu', 'anda', 'ini', 'itu',
+    'ada', 'tidak', 'apa', 'mengapa', 'bagaimana', 'sudah', 'akan', 'bisa', 'aku', 'kami',
+    'mereka', 'kita', 'jangan', 'harus', 'mau', 'ingin', 'tolong', 'coba', 'pakai', 'buat',
+    'kalau', 'karena', 'tetapi', 'juga', 'saja', 'perlu', 'belum', 'ya', 'iya', 'kenapa',
+    'kapan', 'mana', 'yaitu', 'yakni', 'seperti', 'dalam', 'pada', 'oleh', 'atau', 'dan',
+    'agar', 'supaya', 'boleh', 'bantu', 'tentang', 'gimana', 'nggak', 'gak',
+  ];
+  function detectLanguage(text) {
+    const words = text.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(Boolean);
+    if (!words.length) return 'en';
+    let count = 0;
+    for (const w of words) if (ID_WORDS.indexOf(w) !== -1) count++;
+    return count / words.length > 0.12 ? 'id' : 'en';
+  }
+  function voiceForLanguage(lang) { return lang === 'id' ? voiceId : voice; }
+
+  let micOn = false;
+  let speaking = false;
+  let thinking = false;
+  let accumulated = '';
+  let lastReply = '';
+  let stream = null;
+  let audioCtx = null;
+  let analyser = null;
+  let freqBuf = null;
+  let roundTimer = null;
+  let roundRunning = false;
+  let abortRef = null;
+  let lastSpeechAt = 0;        // global: last time speech was heard (any round)
+  let lastLang = '';           // 'id' | 'en' — STT language hint
+  let sending = false;         // polish+send in flight guard
+  let roundHasSpeech = false;  // current round captured speech
+  let mutePendingSend = false; // hardware-mute pressed while a speech round runs
+  let chatId = localStorage.getItem('voice.chatId') || '';
+  let chatLock = null;
+  let maxLevelEver = 0;
+
+  const audio = new Audio();
+  audio.volume = 1.0;
+
+  // ── Status & live visuals ──
+  let waveMode = 'idle';
+  let animId = null;
+  const fakeBars = [];
+
+  function refreshMarquee() {
+    const wrap = textEl.parentElement;
+    const overflow = textEl.scrollWidth > wrap.clientWidth;
+    textEl.classList.toggle('marquee', overflow);
+    if (overflow) textEl.style.setProperty('--tx', -(textEl.scrollWidth - wrap.clientWidth) + 'px');
+  }
+
+  function startWave(mode) {
+    waveMode = mode;
+    if (mode === 'speaking') fakeBars.length = 0;
+    wave.classList.remove('fade-in');
+    void wave.offsetWidth;
+    wave.classList.add('fade-in');
+    if (!animId) drawWave();
+  }
+
+  // Live equalizer bars — heights follow the actual voice level
+  function updateBars() {
+    if (!barEls) return;
+    let heights;
+    if (waveMode === 'listening' && analyser && freqBuf) {
+      analyser.getByteFrequencyData(freqBuf);
+      heights = [0, 1, 2, 3].map((i) => {
+        const v = freqBuf[Math.floor((i / 4) * freqBuf.length * 0.6)] / 255;
+        return 5 + v * v * 19;
+      });
+    } else if (waveMode === 'thinking') {
+      const t = Date.now() / 190;
+      heights = [0, 1, 2, 3].map((i) => 5 + Math.abs(Math.sin(t + i * 1.1)) * 17);
+    } else if (waveMode === 'speaking') {
+      heights = [0, 1, 2, 3].map((i) => {
+        if (!fakeBars[20 + i]) fakeBars[20 + i] = 0.3;
+        fakeBars[20 + i] += (Math.random() - 0.5) * 0.5;
+        fakeBars[20 + i] = Math.min(1, Math.max(0.15, fakeBars[20 + i]));
+        fakeBars[20 + i] *= 0.9;
+        return 4 + fakeBars[20 + i] * 19;
+      });
+    } else {
+      heights = [9, 7, 8, 7];
+    }
+    for (let i = 0; i < barEls.length && i < 4; i++) {
+      barEls[i].style.height = heights[i].toFixed(1) + 'px';
+    }
+  }
+
+  function drawWave() {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    updateBars();
+    const W = wave.width, H = wave.height;
+    wctx.clearRect(0, 0, W, H);
+    const bars = 20;
+    const bw = W / bars;
+
+    const base = waveMode === 'listening' ? '159,193,240'
+      : waveMode === 'thinking' ? '195,179,232'
+      : waveMode === 'speaking' ? '155,225,230'
+      : '148,163,184';
+    const grad = wctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, 'rgba(' + base + ',0.2)');
+    grad.addColorStop(0.5, 'rgba(' + base + ',0.65)');
+    grad.addColorStop(1, 'rgba(' + base + ',0.2)');
+    wctx.fillStyle = grad;
+
+    const half = Math.ceil(bars / 2);
+    for (let i = 0; i < half; i++) {
+      let h = 0.06;
+      if (waveMode === 'listening' && analyser && freqBuf) {
+        analyser.getByteFrequencyData(freqBuf);
+        const v = freqBuf[Math.floor((i / half) * freqBuf.length * 0.55)] / 255;
+        h = Math.max(0.07, v * v);
+      } else if (waveMode === 'thinking') {
+        h = Math.max(0.09, Math.abs(Math.sin(Date.now() / 250 + i * 0.55)) * 0.9);
+      } else if (waveMode === 'speaking') {
+        if (!fakeBars[i]) fakeBars[i] = 0.12;
+        fakeBars[i] += (Math.random() - 0.5) * 0.55;
+        fakeBars[i] = Math.min(1, Math.max(0.07, fakeBars[i]));
+        fakeBars[i] *= 0.92;
+        h = fakeBars[i];
+      }
+      const bh = Math.max(3, h * (H - 4));
+      const x = i * bw + 1;
+      const w = Math.max(1.5, bw - 2.5);
+      wctx.beginPath();
+      wctx.roundRect(x, (H - bh) / 2, w, bh, 1.5);
+      wctx.fill();
+      if (i < bars / 2 - 1 || bars % 2 === 0) {
+        const xm = W - x - w;
+        wctx.beginPath();
+        wctx.roundRect(xm, (H - bh) / 2, w, bh, 1.5);
+        wctx.fill();
+      }
+    }
+    animId = requestAnimationFrame(drawWave);
+  }
+
+  function setStatus(s, extraText) {
+    const cls = s === 'listening' ? 'listening' : s === 'thinking' ? 'thinking' : s === 'speaking' ? 'speaking' : s === 'muted' ? 'muted' : s === 'error' ? 'error' : 'idle';
+    dot.className = 'pip ' + cls;
+    const map = { idle: 'Voice', muted: 'Muted', listening: 'Listening', thinking: 'Thinking', speaking: 'Answering', error: 'Error' };
+    label.textContent = map[s] || s;
+    label.classList.remove('swap');
+    void label.offsetWidth;
+    label.classList.add('swap');
+    if (extraText !== undefined) textEl.textContent = extraText;
+    document.body.className = 'state-' + cls;
+    micBtn.className = 'bars-btn' + (micOn ? ' on' : '');
+    const stageKey = { listening: 'listening', thinking: 'thinking', speaking: 'speaking' }[s];
+    document.querySelectorAll('.stage').forEach((el) => el.classList.toggle('on', el.dataset.s === stageKey));
+    startWave(s === 'muted' || s === 'idle' ? 'idle' : s);
+    if (extraText !== undefined) requestAnimationFrame(refreshMarquee);
+    send('status', { status: s, text: textEl.textContent });
+  }
+
+  function updateMicBtn() {
+    micBtn.classList.toggle('on', micOn);
+    micBtn.title = micOn ? 'Mute' : 'Unmute';
+  }
+
+  function showHint() { hintEl.style.display = ''; sendBtn.style.display = ''; }
+  function hideHint() { hintEl.style.display = 'none'; sendBtn.style.display = 'none'; }
+
+  // Parse STT JSON defensively (handles both {text} and legacy [{text}, status] shapes)
+  function extractTranscript(data) {
+    if (!data) return '';
+    if (typeof data.text === 'string') return data.text.trim();
+    if (Array.isArray(data) && data[0] && typeof data[0].text === 'string') return data[0].text.trim();
+    if (data.error) throw new Error(String(data.error));
+    return '';
+  }
+
+  // ── Recording rounds (extendable + silence-aware) ──
+  // Rounds record at 250ms timeslices. A round extends while speech keeps
+  // flowing (up to 8s), then leading/trailing-silence chunks are trimmed before
+  // STT so Whisper never sees long silences (kills "thank you" hallucinations).
+  // Auto-send waits for ~2.5s of true silence; the laptop mic-mute button
+  // triggers an instant send.
+  const LOUD_THRESHOLD = 0.045;
+  const ROUND_BASE_MS = 2000;
+  const ROUND_MAX_MS = 8000;
+  const TRAIL_END_MS = 700;   // speech stopped → end the round after this
+  const TAIL_KEEP_MS = 250;   // trailing audio kept in the STT blob
+  const SEND_SILENCE_MS = 2500;
+
+  // Whisper's classic silence/noise hallucinations — never send these
+  const HALLUCINATIONS = [
+    /^thank\s+you[\s.,!?]*$/i,
+    /^thank\s+you\s+(so|very)\s+much[\s.,!?]*$/i,
+    /^thanks[\s.,!?]*$/i,
+    /^thanks?\s+for\s+(watching|listening|your\s+time|the\s+video)[\s.,!?]*$/i,
+    /^thank\s+you\s+for\s+(watching|listening|your\s+time|the\s+video)[\s.,!?]*$/i,
+    /^you'?re\s+welcome[\s.,!?]*$/i,
+    /^you\s+are\s+welcome[\s.,!?]*$/i,
+    /^please\s+subscribe[\s.,!?]*$/i,
+    /^subscribe\s+to\s+my\s+channel[\s.,!?]*$/i,
+    /^(goodbye|bye|good\s+night|good\s+evening)[\s.,!?]*$/i,
+  ];
+  const GARBAGE_RE = /^(you|the|a|an|and|so|oh|um|uh|uhh|yeah|ok|okay|like|hmm|mhm|well|no)$/i;
+
+  function isGarbage(t) {
+    const s = (t || '').trim();
+    if (!s) return false;
+    if (/^[\s.,!?…·\-–—]+$/.test(s)) return true;
+    if (HALLUCINATIONS.some((re) => re.test(s))) return true;
+    if (GARBAGE_RE.test(s)) return true;
+    return false;
+  }
+
+  // Polish (free-LLM grammar fix) then send to the pipeline
+  async function sendText(raw) {
+    const text = (raw || '').trim();
+    if (!text || sending) return;
+    sending = true;
+    try {
+      setStatus('thinking');
+      textEl.textContent = 'Polishing…';
+      let final = text;
+      try {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 15000);
+        const resp = await fetch(API + '/api/cleanup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text.slice(0, 800) }),
+          signal: ac.signal,
+        });
+        clearTimeout(timer);
+        const data = await resp.json();
+        if (data && typeof data.text === 'string' && data.text.trim() && !data.error) {
+          final = data.text.trim();
+        }
+      } catch (e) {
+        console.error('[Voice] polish failed', e);
+      }
+      if (final !== text) {
+        textEl.textContent = final;
+        send('transcript', { text: final });
+      }
+      sendToPipeline(final);
+    } finally {
+      sending = false;
+    }
+  }
+
+  // Laptop hardware mute → instant send (your main workflow)
+  function onTrackMuted() {
+    if (!micOn) return;
+    if (roundHasSpeech) {
+      mutePendingSend = true; // send once the current round's speech is captured + transcribed
+      return;
+    }
+    const text = accumulated.trim();
+    if (text) {
+      accumulated = '';
+      hideHint();
+      sendText(text);
+    }
+  }
+
+  async function oneRound() {
+    if (!stream || !micOn) return;
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus' : 'audio/webm';
+    const recorder = new MediaRecorder(stream, { mimeType: mime });
+    const chunks = [];
+    const chunkTimes = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) { chunks.push(e.data); chunkTimes.push(Date.now()); }
+    };
+
+    const stopped = new Promise((resolve) => { recorder.onstop = () => resolve(); });
+    recorder.start(250);
+
+    let speechMs = 0;
+    let roundMax = 0;
+    let firstLoudAt = 0;
+    let lastLoudAt = 0;
+    roundHasSpeech = false;
+    const buf = analyser ? new Uint8Array(analyser.fftSize) : null;
+    const startedAt = Date.now();
+
+    const monitor = setInterval(() => {
+      if (!analyser || !buf) return;
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += Math.abs(buf[i] - 128) / 128;
+      const level = sum / buf.length;
+      roundMax = Math.max(roundMax, level);
+      const loud = level > LOUD_THRESHOLD;
+      if (loud) {
+        speechMs += 100;
+        const now = Date.now();
+        if (!firstLoudAt) firstLoudAt = now;
+        lastLoudAt = now;
+        lastSpeechAt = now;
+        roundHasSpeech = true;
+      }
+      const elapsed = Date.now() - startedAt;
+      const speechStopped = lastLoudAt && (Date.now() - lastLoudAt) >= TRAIL_END_MS;
+      if (elapsed >= ROUND_MAX_MS
+        || (elapsed >= ROUND_BASE_MS && speechStopped)
+        || (elapsed >= ROUND_BASE_MS && !roundHasSpeech)) {
+        clearInterval(monitor);
+        if (recorder.state !== 'inactive') recorder.stop();
+      }
+    }, 100);
+
+    await stopped;
+    await sleep(40);
+
+    maxLevelEver = Math.max(maxLevelEver, roundMax);
+    const blobFull = new Blob(chunks, { type: mime });
+    const loud = speechMs >= 300;
+    // Use RMS once the meter has proven alive; otherwise fall back to blob size.
+    const silent = (maxLevelEver > 0.05) ? !loud : blobFull.size < 4000;
+
+    if (speaking) {
+      // Barge-in: user talks while we answer → stop our voice and capture
+      // what they said (falls through to STT below)
+      if (loud) {
+        stopSpeaking();
+        setStatus('listening', accumulated || 'Listening');
+      } else {
+        return;
+      }
+    }
+
+    if (thinking) {
+      // Barge-in while the pipeline runs → cancel, then capture this utterance
+      if (loud) {
+        if (abortRef) { abortRef.abort(); abortRef = null; }
+        thinking = false;
+      } else {
+        return;
+      }
+    }
+
+    // Silence → auto-send only after real sustained quiet (hardware mute is instant)
+    if (silent) {
+      if (mutePendingSend) {
+        mutePendingSend = false;
+        const text = accumulated.trim();
+        if (text) { accumulated = ''; hideHint(); sendText(text); }
+        return;
+      }
+      const text = accumulated.trim();
+      if (text && (Date.now() - lastSpeechAt) >= SEND_SILENCE_MS) {
+        accumulated = '';
+        hideHint();
+        sendText(text);
+      }
+      return;
+    }
+
+    // Speech round → trim leading/trailing silence, then transcribe
+    let blob = blobFull;
+    try {
+      let firstIdx = 0;
+      if (firstLoudAt) {
+        for (let i = 0; i < chunkTimes.length; i++) {
+          if (chunkTimes[i] + 250 >= firstLoudAt) { firstIdx = Math.max(0, i - 1); break; }
+        }
+      }
+      const tailCut = lastLoudAt ? lastLoudAt + TAIL_KEEP_MS : Infinity;
+      const kept = [];
+      for (let i = firstIdx; i < chunkTimes.length; i++) {
+        if (chunkTimes[i] <= tailCut) kept.push(chunks[i]);
+      }
+      if (kept.length > 0) blob = new Blob(kept, { type: mime });
+    } catch (_e) { /* keep full blob on any error */ }
+
+    let t = '';
+    try {
+      const fd = new FormData();
+      fd.append('file', blob, 'round.webm');
+      // Bilingual prompt + language hint (short clips hallucinate on auto-detect)
+      fd.append('prompt', 'Transcribe Indonesian and English speech. Preserve technical terms, file names, and numbers.');
+      if (lastLang) fd.append('language', lastLang === 'id' ? 'id' : 'en');
+      const resp = await fetch(API + '/api/transcribe', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (data && data.error && !Array.isArray(data)) {
+        setStatus('error', String(data.error).slice(0, 80));
+        await sleep(1500);
+        if (micOn) setStatus('listening', accumulated || 'Listening');
+        return;
+      }
+      t = extractTranscript(data);
+    } catch (e) {
+      console.error('[Voice] STT failed', e);
+      setStatus('error', 'STT failed');
+      await sleep(1500);
+      if (micOn) setStatus('listening', accumulated || 'Listening');
+      return;
+    }
+    if (isGarbage(t)) t = '';
+    if (t) {
+      accumulated = accumulated ? accumulated + ' ' + t : t;
+      lastLang = detectLanguage(accumulated);
+      setStatus('listening', accumulated);
+      showHint();
+      send('transcript', { text: accumulated });
+    }
+
+    // Mute pressed during this speech round → send now that speech is captured
+    if (mutePendingSend) {
+      mutePendingSend = false;
+      const text = accumulated.trim();
+      if (text) { accumulated = ''; hideHint(); sendText(text); }
+    }
+  }
+
+  function loopRound() {
+    if (!micOn || roundRunning) return;
+    roundRunning = true;
+    oneRound()
+      .catch((e) => console.error('[Voice] round error', e))
+      .finally(() => {
+        roundRunning = false;
+        if (micOn) roundTimer = setTimeout(loopRound, 60);
+      });
+  }
+
+  // ── Chat resolution ──
+  // The main window tells us which chat is active (project or general), so
+  // live mode follows the open chat. Fallback: resolve the general workspace.
+  let voiceWsId = localStorage.getItem('voice.wsId') || '';
+  let voiceWsPath = localStorage.getItem('voice.wsPath');
+  let wsResolvedBy = ''; // 'ipc' | 'fallback' | ''
+
+  if (bridge && bridge.onSetChat) {
+    bridge.onSetChat((info) => {
+      if (info && info.chatId) {
+        voiceWsId = info.wsId || '';
+        voiceWsPath = (info.wsPath !== undefined && info.wsPath !== null) ? info.wsPath : '';
+        chatId = info.chatId;
+        chatLock = null;
+        wsResolvedBy = 'ipc';
+        localStorage.setItem('voice.wsId', voiceWsId);
+        localStorage.setItem('voice.wsPath', voiceWsPath);
+        localStorage.setItem('voice.chatId', chatId);
+      }
+    });
+  }
+
+  function ensureChat() {
+    if (chatLock) return chatLock;
+    chatLock = (async () => {
+      if (chatId && voiceWsId) return chatId;
+      // Fallback: resolve the general workspace's first chat
+      const wsRes = await fetch(API + '/api/workspaces');
+      const wsData = await wsRes.json();
+      const ws = (wsData.workspaces || []).find((w) => w.isGeneral) || (wsData.workspaces || [])[0];
+      if (!ws) throw new Error('No workspace available');
+      voiceWsId = ws.id;
+      voiceWsPath = ws.path || '';
+      wsResolvedBy = 'fallback';
+      localStorage.setItem('voice.wsId', voiceWsId);
+      localStorage.setItem('voice.wsPath', voiceWsPath);
+      const chatsRes = await fetch(API + '/api/workspaces/' + ws.id + '/chats');
+      const chatsData = await chatsRes.json();
+      if (chatsData.chats && chatsData.chats.length) {
+        chatId = chatsData.chats[0].id;
+      } else {
+        const createRes = await fetch(API + '/api/workspaces/' + ws.id + '/chats', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: 'Voice Chat' }),
+        });
+        chatId = (await createRes.json()).id;
+      }
+      localStorage.setItem('voice.chatId', chatId);
+      return chatId;
+    })();
+    return chatLock;
+  }
+
+  // Save the agent reply to the chat so it lands in history + memory context
+  async function persistReply(chat, reply) {
+    if (!voiceWsId || !chat || !reply) return;
+    try {
+      await fetch(API + '/api/workspaces/' + voiceWsId + '/chats/' + chat + '/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'agent', content: reply }),
+      });
+    } catch (e) {
+      console.error('[Voice] failed to persist reply', e);
+    }
+  }
+
+  function progressFromState(s) {
+    const th = s.thoughts || {};
+    const thought = th.developer || th.supervisor;
+    if (thought && thought.trim()) return thought.trim().slice(0, 90);
+    const log = s.live_terminal_log || '';
+    const lines = log.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (!lines.length) return '';
+    const last = lines[lines.length - 1].replace(/^\[[^\]]*\]\s*/, '').replace(/^\s*[═─=]*\s*$/, '').trim();
+    return (last || 'Working…').slice(0, 90);
+  }
+
+  // Pull the real failure reason from the run so the overlay shows something useful
+  function extractRunError(state, reason) {
+    const log = (state && state.live_terminal_log) || '';
+    const m = log.match(/Insufficient balance[^\n"]*/i)
+      || log.match(/All DeepSeek models exhausted[^\n"]*/i)
+      || log.match(/Error code: \d+[^\n"]*/i)
+      || log.match(/\[ORCHESTRATOR ERROR\][^\n"]*/i);
+    if (m) return m[0].slice(0, 90);
+    return (reason || 'Run failed').slice(0, 90);
+  }
+
+  // ── Live process feed (thinking / subagents / tools, like the main chat) ──
+  const FEED_MAX = 300;
+  let expanded = false;
+  let lastLogLen = 0;
+
+  function setExpanded(on) {
+    expanded = on;
+    expandBtn.classList.toggle('expanded', on);
+    feedWrap.style.display = on ? '' : 'none';
+    const w = on ? 400 : 356;
+    const h = on ? 344 : 124;
+    if (bridge && bridge.resize) bridge.resize(w, h);
+  }
+
+  function feedLine(text, kind) {
+    if (!feed) return;
+    const div = document.createElement('div');
+    div.className = 'feed-line ' + (kind || 'meta');
+    div.textContent = text;
+    feed.appendChild(div);
+    while (feed.children.length > FEED_MAX) feed.removeChild(feed.firstChild);
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  function classifyLine(line) {
+    const t = line.trim();
+    if (!t) return null;
+    if (/^\[>\]\s*User:|^You:/.test(t)) return 'user';
+    if (/^\[THOUGHT\]|^Thought:/.test(t)) return 'thought';
+    if (/^\[[^\]]*\]\s*$/.test(t)) return 'meta';
+    if (/ORCHESTRATOR|SUBAGENT|SUPERVISOR|Delegat|Delegating|task\(/i.test(t)) return 'agent';
+    if (/→|Tool:|\[TOOL|tool_|execute|run_command|write_file|edit_file|search/i.test(t)) return 'tool';
+    if (/error|failed|insufficient|traceback|exception/i.test(t)) return 'error';
+    if (/^[\s═─=·]+$/.test(t)) return null;
+    return 'meta';
+  }
+
+  function appendFeedFromState(state) {
+    const log = (state && state.live_terminal_log) || '';
+    if (!log || log.length <= lastLogLen) return;
+    const fresh = log.slice(lastLogLen);
+    lastLogLen = log.length;
+    fresh.split('\n').forEach((line) => {
+      const kind = classifyLine(line);
+      if (kind) feedLine(line, kind);
+    });
+  }
+
+  function feedMsg(text, kind) {
+    feedLine(text, kind || 'meta');
+    feedStatus.textContent = kind === 'error' ? 'error' : '…';
+  }
+
+  async function sendToPipeline(text) {
+    thinking = true;
+    setStatus('thinking');
+    lastLogLen = 0;
+    if (feed) { feed.innerHTML = ''; }
+    if (feedStatus) feedStatus.textContent = 'running';
+    feedMsg('You: ' + text, 'user');
+    let chat;
+    try {
+      chat = await ensureChat();
+    } catch (e) {
+      thinking = false;
+      setStatus('error', 'Backend unreachable');
+      send('pipeline-done', { workspaceId: voiceWsId, chatId: chatId, state: null, status: 'error', error: 'Backend unreachable' });
+      setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
+      return;
+    }
+    send('pipeline-start', { workspaceId: voiceWsId, chatId: chat, prompt: text });
+    abortRef = new AbortController();
+    let lastState = null;
+    let failed = false;
+    let failReason = '';
+    try {
+      const resp = await fetch(API + '/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: text, model: 'Automatic Fallback', temperature: 0.7, workspace_path: (voiceWsPath !== null && voiceWsPath !== undefined) ? voiceWsPath : '', chat_id: chat, attachments: [] }),
+        signal: abortRef.signal,
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const parsed = JSON.parse(line.slice(6).trim());
+            if (parsed.error) { failed = true; failReason = String(parsed.error); }
+            if (parsed.active_node || parsed.live_terminal_log) {
+              lastState = parsed;
+              send('pipeline-state', { workspaceId: voiceWsId, chatId: chat, state: parsed });
+              appendFeedFromState(parsed);
+              if (!failed) {
+                const prog = progressFromState(parsed);
+                if (prog) { textEl.textContent = prog; requestAnimationFrame(refreshMarquee); send('progress', { text: prog }); }
+              }
+            }
+          } catch (_e) { /* skip malformed lines */ }
+        }
+      }
+      thinking = false;
+      send('pipeline-done', {
+        workspaceId: voiceWsId,
+        chatId: chat,
+        state: lastState,
+        status: failed ? 'error' : 'complete',
+        error: failReason || undefined,
+      });
+      const reply = ((lastState && lastState.outputs && lastState.outputs.agent_report) || '').trim();
+      if (reply) {
+        if (feedStatus) feedStatus.textContent = 'answering';
+        feedMsg('Assistant: ' + reply.slice(0, 200), 'agent');
+        await persistReply(chat, reply);
+        await speak(reply);
+      } else if (failed) {
+        setStatus('error', extractRunError(lastState, failReason));
+        if (feedStatus) feedStatus.textContent = 'error';
+        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
+      } else {
+        setStatus('listening', 'Done');
+      }
+    } catch (e) {
+      thinking = false;
+      if (e.name === 'AbortError') {
+        setStatus('listening', accumulated || 'Listening');
+        if (feedStatus) feedStatus.textContent = 'stopped';
+        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'aborted' });
+      } else {
+        console.error('[Voice] run failed', e);
+        setStatus('error', 'Run failed');
+        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'error', error: String(e) });
+      }
+    } finally {
+      abortRef = null;
+    }
+  }
+
+  // ── Speech playback (TTS via backend edge-tts) ──
+  function cleanForTTS(t) {
+    return t
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\[(BUG|TODO|NOTE)[^\]]*\]/gi, ' ')
+      .replace(/[#*_>~|]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 800);
+  }
+
+  function stopSpeaking() {
+    speaking = false;
+    audio.pause();
+    if (audio.src) { URL.revokeObjectURL(audio.src); }
+    audio.removeAttribute('src');
+    audio.load();
+  }
+
+  async function speak(text) {
+    const clean = cleanForTTS(text);
+    if (!clean) return;
+    lastReply = clean;
+    speaking = true;
+    setStatus('speaking', clean.slice(0, 120) + (clean.length > 120 ? '…' : ''));
+    send('reply', { text: clean.slice(0, 500) });
+    const useVoice = voiceForLanguage(detectLanguage(clean));
+    try {
+      const resp = await fetch(API + '/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: clean, voice: useVoice }),
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      audio.src = url;
+      await audio.play();
+      await new Promise((res) => {
+        audio.onended = res;
+        audio.onpause = () => { if (!speaking) res(); };
+      });
+    } catch (e) {
+      console.error('[Voice] TTS failed', e);
+      setStatus('error', 'TTS failed');
+      setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
+    } finally {
+      speaking = false;
+      if (micOn) setStatus('listening', accumulated || 'Listening');
+    }
+  }
+
+  // Replay the last reply (click the transcript / waveform area)
+  function replayLast() {
+    if (lastReply && !speaking && !thinking) speak(lastReply);
+  }
+
+  // ── Voice menu + preview ──
+  function renderVoiceMenu() {
+    voiceMenu.innerHTML = '';
+    const sections = [
+      { label: 'English', lang: 'en' },
+      { label: 'Bahasa Indonesia', lang: 'id' },
+    ];
+    sections.forEach((sec) => {
+      const head = document.createElement('div');
+      head.className = 'voice-menu-head';
+      head.textContent = sec.label;
+      voiceMenu.appendChild(head);
+      VOICES.filter((v) => v.lang === sec.lang).forEach((v) => {
+        const b = document.createElement('button');
+        const active = v.id === voiceForLanguage(sec.lang);
+        b.textContent = v.name + (active ? '  ✓' : '');
+        b.className = active ? 'active' : '';
+        b.addEventListener('click', () => {
+          if (sec.lang === 'id') {
+            voiceId = v.id;
+            localStorage.setItem('voice.idVoice', voiceId);
+          } else {
+            voice = v.id;
+            localStorage.setItem('voice.voice', voice);
+          }
+          renderVoiceMenu();
+          voiceMenu.style.display = 'none';
+          const shortName = v.name.split('·')[0].trim();
+          if (!micOn && !thinking && !speaking) setStatus('idle', 'Voice: ' + shortName);
+          // A. Voice preview: instantly hear the selected voice
+          const sample = sec.lang === 'id'
+            ? 'Halo, saya ' + shortName + '. Ini suara saya.'
+            : 'Hi, I am ' + shortName + '. This is my voice.';
+          previewVoice(v.id, sample);
+        });
+        voiceMenu.appendChild(b);
+      });
+    });
+  }
+
+  function previewVoice(vId, sample) {
+    if (speaking) stopSpeaking();
+    const prevVol = audio.volume;
+    audio.volume = 0.55;
+    fetch(API + '/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: sample, voice: vId }),
+    })
+      .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        audio.src = url;
+        return audio.play().catch(() => {});
+      })
+      .catch((e) => console.error('[Voice] preview failed', e))
+      .finally(() => { audio.volume = prevVol; });
+  }
+
+  // ── Mic on/off ──
+  function startListening() {
+    if (micOn) return;
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((s) => {
+        stream = s;
+        audioCtx = new AudioContext();
+        audioCtx.resume().catch(() => {});
+        const src = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.75;
+        freqBuf = new Uint8Array(analyser.frequencyBinCount);
+        src.connect(analyser);
+        micOn = true;
+        localStorage.setItem('voice.micOn', '1');
+        accumulated = '';
+        maxLevelEver = 0;
+        lastSpeechAt = 0;
+        lastLang = '';
+        sending = false;
+        mutePendingSend = false;
+        hideHint();
+        updateMicBtn();
+        setStatus('listening', 'Listening');
+        send('mic', { mic: true });
+        // Laptop hardware mute button → instant send trigger
+        stream.getAudioTracks().forEach((track) => {
+          track.addEventListener('muted', onTrackMuted);
+        });
+        loopRound();
+      })
+      .catch((e) => {
+        console.error('[Voice] mic denied', e);
+        micOn = false;
+        localStorage.setItem('voice.micOn', '0');
+        updateMicBtn();
+        setStatus('error', 'Mic denied');
+        send('mic', { mic: false });
+      });
+  }
+
+  function stopListening() {
+    micOn = false;
+    localStorage.setItem('voice.micOn', '0');
+    clearTimeout(roundTimer);
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; analyser = null; freqBuf = null; }
+    stopSpeaking();
+    if (abortRef) { abortRef.abort(); abortRef = null; }
+    thinking = false;
+    mutePendingSend = false;
+    accumulated = '';
+    hideHint();
+    updateMicBtn();
+    setStatus('muted', '');
+    send('mic', { mic: false });
+  }
+
+  // Manual send: immediately submits whatever is currently accumulated
+  function sendNow() {
+    const text = accumulated.trim();
+    if (!text) return;
+    accumulated = '';
+    hideHint();
+    if (thinking && abortRef) { abortRef.abort(); abortRef = null; thinking = false; }
+    if (speaking) stopSpeaking();
+    sendText(text);
+  }
+
+  micBtn.addEventListener('click', () => { micOn ? stopListening() : startListening(); });
+  sendBtn.addEventListener('click', sendNow);
+  replayArea.addEventListener('click', replayLast);
+  closeBtn.addEventListener('click', () => { stopListening(); if (bridge) bridge.close(); else window.close(); });
+  expandBtn.addEventListener('click', () => setExpanded(!expanded));
+
+  // Voice menu open/close
+  voiceBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    renderVoiceMenu();
+    voiceMenu.style.display = voiceMenu.style.display === 'none' ? '' : 'none';
+  });
+  document.addEventListener('click', (e) => {
+    if (!voiceMenu.contains(e.target) && e.target !== voiceBtn) voiceMenu.style.display = 'none';
+  });
+
+  // Resume AudioContext on first interaction (needed if it started suspended)
+  window.addEventListener('pointerdown', () => { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+
+  // Init
+  updateMicBtn();
+  setStatus('idle', 'Ctrl+G to toggle');
+  if (localStorage.getItem('voice.micOn') === '1') {
+    setTimeout(startListening, 400);
+  }
+})();
+</script>
+</body>
+</html>

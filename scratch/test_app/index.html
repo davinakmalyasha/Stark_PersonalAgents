@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Buggy Login</title>
+<style>
+  body { font-family: Arial; max-width: 400px; margin: 50px auto; padding: 20px; }
+  input, button { display: block; width: 100%; margin: 8px 0; padding: 10px; box-sizing: border-box; }
+  button { background: #0066FF; color: white; border: none; cursor: pointer; }
+  .error { color: red; font-size: 14px; display: none; }
+  .success { color: green; display: none; }
+</style>
+</head>
+<body>
+
+<h1>Sign In</h1>
+
+<!-- BUG 1: No label tags linked to inputs (accessibility violation) -->
+<input type="text" id="email" placeholder="Email">
+<input type="password" id="password" placeholder="Password">
+
+<!-- BUG 2: Button doesn't disable during submit (double-submit vulnerable) -->
+<button onclick="handleLogin()" id="login-btn">Login</button>
+
+<!-- BUG 3: Error shown via innerHTML (XSS vulnerable) -->
+<div id="error-msg" class="error"></div>
+<div id="success-msg" class="success"></div>
+
+<script>
+  // BUG 4: Hardcoded credentials in client-side JS
+  // BUG 5: No CSRF protection
+  // BUG 6: Rate limiting handled client-side only (trivial bypass)
+  let attempts = 0;
+
+  function handleLogin() {
+    const email = document.getElementById('email').value;
+    const password = document.getElementById('password').value;
+
+    // BUG 7: No input validation — empty strings pass through
+    // BUG 8: SQL-injectable (would be if connected to backend)
+
+    attempts++;
+
+    if (email === 'admin@test.com' && password === 'admin123') {
+      // BUG 9: Stores sensitive token in localStorage (XSS-vulnerable)
+      localStorage.setItem('auth_token', 'eyJhbGciOiJIUzI1NiJ9.secret-token-' + Date.now());
+      document.getElementById('success-msg').style.display = 'block';
+      // BUG 10: XSS — renders user input directly as HTML
+      document.getElementById('success-msg').innerHTML = 'Welcome, <b>' + email + '</b>!';
+      return;
+    }
+
+    // BUG 11: Error uses innerHTML with user input (XSS)
+    document.getElementById('error-msg').style.display = 'block';
+    document.getElementById('error-msg').innerHTML = 'Invalid login for: <i>' + email + '</i>';
+  }
+
+  // BUG 12: Exposes internal functions to global scope (window)
+  // BUG 13: No focus management — focus ring removed
+  document.querySelectorAll('input, button').forEach(el => {
+    el.addEventListener('focus', () => { el.style.outline = 'none'; }); // WCAG fail
+  });
+</script>
+
+</body>
+</html>

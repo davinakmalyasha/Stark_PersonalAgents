@@ -50,3 +50,16 @@ skills-lock.json
 
 specs/
 design-references/
+
+# Eval run artifacts (never commit)
+scratch/eval_runs*/
+scratch/eval_*.log
+scratch/eval_*.err.log
+scratch/eval_pid.txt
+scratch/*.png
+scratch/*.txt
+scratch/*.json
+image.png
+scratch/*.jsonl
+scratch/measure_run_usage.json
+server_port.json

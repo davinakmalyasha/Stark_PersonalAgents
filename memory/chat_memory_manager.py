@@ -224,7 +224,7 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
         # Check if task.json exists in progress. If it does, we always resolve to executing the plan for this task,
         # since it is the active, incomplete task. This correctly handles mid-task pivots and resumes.
         try:
-            from sync_helpers import load_task_tracking
+            from sync.sync_helpers import load_task_tracking
             task_data = load_task_tracking(workspace_path, chat_id)
             if task_data and task_data.get("status") == "in_progress":
                 goal = task_data.get("user_request") or ""
@@ -263,7 +263,7 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
                             if any(pattern in content_stripped for pattern in meta_patterns):
                                 continue
                             # Skip if not a valid build request (greetings, guidance, etc.)
-                            from memory_manager import is_valid_build_request
+                            from memory.memory_manager import is_valid_build_request
                             if not is_valid_build_request(content):
                                 continue
                             
@@ -277,7 +277,7 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
                 print(f"Error extracting last request from chat history: {e}")
 
         # Fallback to scanning the supervisor memory file if chat history is empty/unavailable
-        from memory_io import load_memory
+        from memory.memory_io import load_memory
         mem = load_memory(workspace_path)
         past_requests = mem.get("past_requests", [])
         if past_requests:
@@ -296,7 +296,7 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
     contains_guidance_indicators = any(x in text_lower for x in ["sounds good", "yes", "no", "separate", "basic", "tailwind", "confirm", "proceed"])
     
     if has_numbering or is_option_select or ends_with_go or contains_guidance_indicators:
-        from memory_io import load_memory
+        from memory.memory_io import load_memory
         mem = load_memory(workspace_path)
         past_requests = mem.get("past_requests", [])
         if past_requests:

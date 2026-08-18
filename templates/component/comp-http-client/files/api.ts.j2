@@ -1,0 +1,91 @@
+export interface ApiError {
+  status: number;
+  message: string;
+  data?: unknown;
+}
+
+const TOKEN_KEY = "auth_token";
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export interface ApiOptions {
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  body?: unknown;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  auth?: boolean; // attach Bearer token from localStorage (see comp-login's useAuth)
+}
+
+/**
+ * Typed fetch wrapper: baseURL prefix, JSON bodies, timeout, error envelope,
+ * optional bearer auth. Returns parsed JSON or throws ApiError.
+ *
+ * Usage:
+ *   const data = await api("/users?page=2");
+ *   await api("/users", { method: "POST", body: { name: "Ada" }, auth: true });
+ */
+export async function api<T = unknown>(
+  path: string,
+  options: ApiOptions = {},
+  baseURL = "/api"
+): Promise<T> {
+  const { method = "GET", body, headers = {}, timeoutMs = 10000, auth = false } = options;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const finalHeaders: Record<string, string> = { ...headers };
+  if (body !== undefined) finalHeaders["Content-Type"] = "application/json";
+  if (auth) {
+    const token = getToken();
+    if (token) finalHeaders["Authorization"] = `Bearer ${token}`;
+  }
+
+  try {
+    const res = await fetch(`${baseURL}${path.startsWith("/") ? path : `/${path}`}`, {
+      method,
+      headers: finalHeaders,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    let data: unknown = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text; // non-JSON response (plain text/error page)
+      }
+    }
+
+    if (!res.ok) {
+      const detail =
+        (data as any)?.detail || (data as any)?.message || (data as any)?.error || text || `HTTP ${res.status}`;
+      throw { status: res.status, message: String(detail), data } as ApiError;
+    }
+    return data as T;
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      throw { status: 0, message: `Request timed out after ${timeoutMs}ms` } as ApiError;
+    }
+    if (err && typeof err === "object" && "status" in err) throw err;
+    throw { status: 0, message: err?.message || "Network error" } as ApiError;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Convenience helpers with sensible defaults. */
+export const http = {
+  get: <T = unknown>(path: string, opts?: ApiOptions) => api<T>(path, { ...opts, method: "GET" }),
+  post: <T = unknown>(path: string, body?: unknown, opts?: ApiOptions) =>
+    api<T>(path, { ...opts, method: "POST", body }),
+  put: <T = unknown>(path: string, body?: unknown, opts?: ApiOptions) =>
+    api<T>(path, { ...opts, method: "PUT", body }),
+  patch: <T = unknown>(path: string, body?: unknown, opts?: ApiOptions) =>
+    api<T>(path, { ...opts, method: "PATCH", body }),
+  del: <T = unknown>(path: string, opts?: ApiOptions) => api<T>(path, { ...opts, method: "DELETE" }),
+};

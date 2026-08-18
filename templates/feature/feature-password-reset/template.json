@@ -1,0 +1,21 @@
+{
+  "_comment": "LEVEL 3 (feature): email-based password reset — single-use hashed tokens with TTL, forgot + reset endpoints, anti-enumeration response, composes feature-email for delivery (log fallback).",
+  "name": "feature-password-reset",
+  "description": "Password reset flow: single-use hashed tokens (TTL), forgot + reset endpoints, emails via feature-email (log fallback).",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_admin'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix (routes: /api/auth/forgot-password, /api/auth/reset-password)"},
+    {"name": "token_ttl_minutes", "type": "string", "default": "30", "description": "Reset token lifetime in minutes"}
+  ],
+  "uses": [
+    {"template": "feature-email", "variables": {"app_name": "{{ app_name }}"}}
+  ],
+  "files": [
+    {"src": "models/reset_token.py.j2", "dest": "{{ app_name }}/models/reset_token.py"},
+    {"src": "services/reset_service.py.j2", "dest": "{{ app_name }}/services/reset_service.py"},
+    {"src": "routers/password_reset.py.j2", "dest": "{{ app_name }}/routers/password_reset.py"}
+  ],
+  "notes": "Requires feature-auth (User model, auth_service). After applying: 1) app.include_router(router), 2) make sure the model is imported (Base.metadata.create_all runs at app import), 3) set APP_BASE_URL for the reset link + SMTP_* env vars for delivery (see feature-email); in development the token logs to stdout instead. NOTE: the reset email sends to the username — if usernames are not emails, add an email column to the User model (feature-auth) and send there. Forgot-password always returns 202 to avoid user enumeration.",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "token_ttl_minutes": "30"}
+}

@@ -1,0 +1,94 @@
+import { useCallback, useEffect, useState } from "react";
+import { api } from "./api";
+
+interface Props {
+  fetchPath: string;            // data source, e.g. "/api/orders?page=1&page_size=10"
+  children: (data: any) => React.ReactNode;  // renders the loaded data
+  empty?: React.ReactNode;      // shown when the response is null/[]/{items:[]}
+  loadingFallback?: React.ReactNode;
+  refreshKey?: unknown;         // change to force a reload
+}
+
+const card: React.CSSProperties = {
+  border: "1px solid #e2e8f0",
+  borderRadius: 8,
+  background: "#fff",
+  padding: 20,
+};
+
+/**
+ * Standard data-page skeleton: fetch on mount, loading / error+retry / empty
+ * states, content slot. The most repeated new-file pattern in frontends.
+ * Usage:
+ *   <Page fetchPath="/api/orders?page=1&page_size=10" empty={<p>No orders yet</p>}>
+ *     {(orders) => orders.map((o) => <OrderCard key={o.id} order={o} />)}
+ *   </Page>
+ */
+export default function Page({
+  fetchPath,
+  children,
+  empty,
+  loadingFallback,
+  refreshKey,
+}: Props) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setData(await api(fetchPath));
+    } catch (err: any) {
+      setError(err?.message || "Failed to load");
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchPath]);
+
+  useEffect(() => {
+    load();
+  }, [load, refreshKey]);
+
+  const isEmpty =
+    data === null ||
+    data === undefined ||
+    (Array.isArray(data) && data.length === 0) ||
+    (data && Array.isArray(data.items) && data.items.length === 0);
+
+  if (loading) {
+    return (
+      <div style={{ ...card, textAlign: "center", color: "#64748b" }}>
+        {loadingFallback ?? "Loading\u2026"}
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ ...card, textAlign: "center", color: "#7f1d1d", background: "#fef2f2", borderColor: "#fecaca" }} role="alert">
+        <p style={{ margin: "0 0 12px", fontSize: 14 }}>{error}</p>
+        <button
+          onClick={load}
+          style={{
+            padding: "8px 16px", background: "#dc2626", color: "#fff", border: "none",
+            borderRadius: 6, cursor: "pointer",
+          }}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (isEmpty) {
+    return (
+      <div style={{ ...card, textAlign: "center", color: "#94a3b8" }}>
+        {empty ?? "No data"}
+      </div>
+    );
+  }
+
+  return <>{children(data)}</>;
+}

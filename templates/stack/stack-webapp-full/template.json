@@ -1,0 +1,23 @@
+{
+  "_comment": "LEVEL 5 (stack): stack-webapp + the whole frontend (scaffold + 5 UI components). Full-stack greenfield in ONE call — frontend is pre-wired to the backend via the /api proxy.",
+  "name": "stack-webapp-full",
+  "description": "Full-stack greenfield project: stack-webapp (backend + CI + deploy) + project-frontend + paginated table, charts, form, modal, toast. One call = entire product skeleton.",
+  "category": "stack",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Python package name, e.g. 'demo_web' (drives all nested packages)"},
+    {"name": "feature_name", "type": "string", "required": true, "description": "First CRUD entity, e.g. 'Product'"},
+    {"name": "model_fields", "type": "string", "default": "name:string,email:string", "description": "Fields for the first entity"},
+    {"name": "service_name", "type": "string", "default": "web", "description": "docker-compose service name"}
+  ],
+  "uses": [
+    "stack-webapp",
+    {"template": "project-frontend", "variables": {"project_name": "{{ project_name }}", "api_base": "/api"}},
+    {"template": "comp-paginated-table", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-charts", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-form", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-modal", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-toast", "variables": {"components_dir": "src/components"}}
+  ],
+  "notes": "Greenfield full-stack starter. IMPORTANT: feature_name must NOT be 'User' — the auth feature already owns models/user.py (use 'Product', 'Order', 'Invoice', ...). After applying: npm install in the root (frontend), set JWT_SECRET, register routers, build the real UI on top of the components. Vite dev proxy already points /api at the backend — front and back are pre-connected.",
+  "sample_vars": {"project_name": "demo_web", "feature_name": "Product", "model_fields": "name:string,price:float", "service_name": "web"}
+}

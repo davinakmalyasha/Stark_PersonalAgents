@@ -1,0 +1,54 @@
+"""RBAC: require_role dependency + admin user management + admin seeding."""
+from fastapi import Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from ..core.security import get_current_user
+from ..database import get_db
+
+
+def require_role(*roles: str):
+    """FastAPI dependency factory: 403 unless the token's role is in `roles`.
+
+    Usage:
+        @router.get("/admin/users", dependencies=[Depends(require_role("admin"))])
+    """
+    def checker(claims: dict = Depends(get_current_user)) -> dict:
+        if claims.get("role") not in roles:
+            raise HTTPException(status_code=403,
+                                detail="Insufficient permissions — admin required")
+        return claims
+    return checker
+
+
+def seed_admin(db: Session = None) -> None:
+    """Create the initial admin from ADMIN_USERNAME/ADMIN_PASSWORD env vars
+    when the users table is empty. Call once at app startup:
+        seed_admin()
+    """
+    if db is None:
+        from ..database import SessionLocal
+        with SessionLocal() as _db:
+            _seed_admin(_db)
+        return
+    _seed_admin(db)
+
+
+def _seed_admin(db: Session) -> None:
+    import os
+
+    from ..models.user import User
+
+    if db.query(User).first() is not None:
+        return
+    username = os.environ.get("ADMIN_USERNAME", "admin")
+    password = os.environ.get("ADMIN_PASSWORD", "")
+    if not password:
+        raise RuntimeError("ADMIN_PASSWORD is not set — set it in .env to seed the admin user")
+    from ..core.security import hash_password
+    from ..services.auth_service import get_by_username
+
+    if get_by_username(db, username) is None:
+        admin = User(username=username, password_hash=hash_password(password), role="admin")
+        db.add(admin)
+        db.commit()
+        print(f"[seed_admin] created default admin '{username}'")

@@ -1,0 +1,35 @@
+{
+  "_comment": "LEVEL 5 (stack): a complete chat/assistant app in ONE call — L3 features (auth, rate-limit, SSE streaming, notifications, uploads) + L4 components (layout, login, chat, markdown viewer, code block, page, dropzone) pre-wired, plus CI/gate/deploy. No new code: pure composition.",
+  "name": "stack-chat",
+  "description": "Complete chat/assistant app: FastAPI backend (JWT auth + rate limiting + SSE streaming + notifications + uploads) + React frontend (login, chat UI with markdown/code rendering). One call = full chat product skeleton.",
+  "category": "stack",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Python package name, e.g. 'demo_chat' (drives all nested packages)"},
+    {"name": "service_name", "type": "string", "default": "web", "description": "docker-compose service name"}
+  ],
+  "uses": [
+    "project-fastapi",
+    {"template": "feature-errors", "variables": {"app_name": "{{ project_name }}"}},
+    {"template": "feature-auth", "variables": {"app_name": "{{ project_name }}", "base_path": "/api"}},
+    {"template": "feature-rate-limit", "variables": {"app_name": "{{ project_name }}"}},
+    {"template": "feature-sse", "variables": {"app_name": "{{ project_name }}", "base_path": "/api", "stream_path": "/stream"}},
+    {"template": "feature-notifications", "variables": {"app_name": "{{ project_name }}", "base_path": "/api"}},
+    {"template": "feature-upload", "variables": {"app_name": "{{ project_name }}"}},
+    "github-ci-python",
+    "github-ci-security-python",
+    "docker-compose",
+    "nginx",
+    "project-frontend",
+    {"template": "comp-layout", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-login", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-http-client", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-chat", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-markdown-viewer", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-code-block", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-page", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-dropzone", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-error-boundary", "variables": {"components_dir": "src/components"}}
+  ],
+  "notes": "Chat product starter. Backend: set JWT_SECRET in .env, include ALL routers (auth, sse, notifications, upload) in {{ project_name }}/main.py, make sure models are imported, replace the SSE heartbeat TODO with your real event generator (queue -> yield 'data: {json}'). Frontend: npm install, wire the login flow, then: <Chat messages={msgs} onSend={async (t) => { const reply = await api('/api/chat', {method:'POST', body:{message:t}}); setMsgs([...msgs, {id:2, role:'assistant', content: reply.text}]); }} streamingText={partial} /> — render assistant bubbles with <MarkdownViewer text={...}/> instead of plain text for rich answers. SSE note: EventSource can't set headers — protect /api/stream with a short-lived query token. Rate limits: add dependencies=[Depends(rate_limit('10/minute', key=user_key))] to chat endpoints. CI, security gate, docker and nginx come pre-configured.",
+  "sample_vars": {"project_name": "demo_chat", "service_name": "web"}
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): code block — dark panel, language label, copy button, lightweight syntax highlighting (python/js/ts/bash, zero deps). Pairs comp-chat + comp-markdown-viewer. Uses [[ ]] delimiters.",
+  "name": "comp-code-block",
+  "description": "Code block: dark panel, language label, copy button, lightweight syntax highlighting (py/js/ts/bash). Zero deps.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "CodeBlock.tsx.j2", "dest": "[[components_dir]]/CodeBlock.tsx"}
+  ],
+  "notes": "Usage: <CodeBlock code={snippet} language='python' /> — render AI chat code answers (wrap in comp-chat bubbles or comp-markdown-viewer fenced blocks). Highlighting covers keywords/strings/comments for python/javascript/typescript/bash; other languages render plain. Copy uses the clipboard API.",
+  "sample_vars": {"components_dir": "src/components"}
+}

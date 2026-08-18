@@ -1,0 +1,14 @@
+{
+  "_comment": "LEVEL 4 (component): one cohesive module, bigger than a snippet, smaller than a feature. Import the helpers, wire once.",
+  "name": "comp-csv-exporter",
+  "description": "CSV exporter: stream any list-of-dicts to a file or string, encoding-safe, quoted fields. Import: from {{ utils_dir }}.csv_export import export_csv",
+  "category": "component",
+  "variables": [
+    {"name": "utils_dir", "type": "string", "default": "app/utils", "description": "Directory for the module"}
+  ],
+  "files": [
+    {"src": "csv_export.py.j2", "dest": "{{ utils_dir }}/csv_export.py"}
+  ],
+  "notes": "Usage: export_csv(rows, 'report.csv') or csv_text = to_csv_string(rows). Column order = first row's keys; missing keys become empty cells. UTF-8 with BOM so Excel opens it correctly.",
+  "sample_vars": {"utils_dir": "app/utils"}
+}

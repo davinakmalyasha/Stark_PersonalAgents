@@ -1,0 +1,174 @@
+import { ReactNode } from "react";
+
+export interface Feature {
+  title: string;
+  description: string;
+  icon?: ReactNode;
+}
+
+export interface LandingSection {
+  title?: string;
+  heading: string;
+  body: string;
+  image?: string;
+}
+
+interface Props {
+  brand: string;
+  heroTitle: string;
+  heroSubtitle: string;
+  ctaLabel: string;
+  ctaHref?: string;
+  features: Feature[];
+  sections?: LandingSection[];
+  footerText?: string;
+}
+
+const container: React.CSSProperties = {
+  maxWidth: 1080,
+  margin: "0 auto",
+  padding: "0 24px",
+};
+
+/**
+ * Marketing landing page shell: hero + CTA, features grid, content sections,
+ * footer. Self-contained (no sidebar — that's comp-layout's admin job).
+ *
+ * Usage:
+ *   <Landing brand="Acme" heroTitle="Ship faster" heroSubtitle="..." ctaLabel="Get started"
+ *           ctaHref="/signup" features={[{title:'Fast', description:'...'}]} />
+ */
+export default function Landing({
+  brand,
+  heroTitle,
+  heroSubtitle,
+  ctaLabel,
+  ctaHref = "#",
+  features,
+  sections = [],
+  footerText,
+}: Props) {
+  return (
+    <div style={{ fontFamily: "system-ui, sans-serif", color: "#0f172a", minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 24px",
+          height: 60,
+          borderBottom: "1px solid #e2e8f0",
+          background: "#fff",
+          position: "sticky",
+          top: 0,
+          zIndex: 10,
+        }}
+      >
+        <strong style={{ fontSize: 18 }}>{brand}</strong>
+        <a
+          href={ctaHref}
+          style={{
+            padding: "8px 18px",
+            background: "#2563eb",
+            color: "#fff",
+            borderRadius: 8,
+            textDecoration: "none",
+            fontSize: 14,
+          }}
+        >
+          {ctaLabel}
+        </a>
+      </header>
+
+      <main style={{ flex: 1 }}>
+        {/* Hero */}
+        <section style={{ textAlign: "center", padding: "96px 24px 72px", background: "linear-gradient(180deg, #eff6ff 0%, #fff 100%)" }}>
+          <h1 style={{ fontSize: 48, margin: "0 0 16px", letterSpacing: "-0.02em" }}>{heroTitle}</h1>
+          <p style={{ fontSize: 18, color: "#475569", maxWidth: 640, margin: "0 auto 32px", lineHeight: 1.6 }}>
+            {heroSubtitle}
+          </p>
+          <a
+            href={ctaHref}
+            style={{
+              display: "inline-block",
+              padding: "14px 32px",
+              background: "#2563eb",
+              color: "#fff",
+              borderRadius: 10,
+              textDecoration: "none",
+              fontSize: 16,
+              fontWeight: 600,
+            }}
+          >
+            {ctaLabel}
+          </a>
+        </section>
+
+        {/* Features */}
+        <section style={{ padding: "72px 24px" }}>
+          <div style={container}>
+            <h2 style={{ textAlign: "center", fontSize: 32, margin: "0 0 40px" }}>Why {brand}</h2>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 24 }}>
+              {features.map((f) => (
+                <div
+                  key={f.title}
+                  style={{
+                    border: "1px solid #e2e8f0",
+                    borderRadius: 12,
+                    padding: 24,
+                    background: "#fff",
+                    boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
+                  }}
+                >
+                  {f.icon && <div style={{ fontSize: 28, marginBottom: 12 }}>{f.icon}</div>}
+                  <h3 style={{ margin: "0 0 8px", fontSize: 18 }}>{f.title}</h3>
+                  <p style={{ margin: 0, fontSize: 14, color: "#475569", lineHeight: 1.6 }}>{f.description}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Content sections */}
+        {sections.map((s) => (
+          <section key={s.heading} style={{ padding: "64px 24px", background: "#f8fafc", borderTop: "1px solid #e2e8f0" }}>
+            <div style={{ ...container, display: "flex", gap: 48, alignItems: "center", flexWrap: "wrap" }}>
+              <div style={{ flex: 1, minWidth: 260 }}>
+                {s.title && <div style={{ fontSize: 13, color: "#2563eb", fontWeight: 600, textTransform: "uppercase", marginBottom: 8 }}>{s.title}</div>}
+                <h2 style={{ fontSize: 28, margin: "0 0 12px" }}>{s.heading}</h2>
+                <p style={{ margin: 0, fontSize: 15, color: "#475569", lineHeight: 1.7 }}>{s.body}</p>
+              </div>
+              {s.image && (
+                <img src={s.image} alt={s.heading} style={{ flex: 1, minWidth: 260, borderRadius: 12, maxWidth: 420 }} />
+              )}
+            </div>
+          </section>
+        ))}
+
+        {/* Final CTA */}
+        <section style={{ textAlign: "center", padding: "72px 24px" }}>
+          <h2 style={{ fontSize: 32, margin: "0 0 24px" }}>Ready to start?</h2>
+          <a
+            href={ctaHref}
+            style={{
+              display: "inline-block",
+              padding: "14px 32px",
+              background: "#2563eb",
+              color: "#fff",
+              borderRadius: 10,
+              textDecoration: "none",
+              fontSize: 16,
+              fontWeight: 600,
+            }}
+          >
+            {ctaLabel}
+          </a>
+        </section>
+      </main>
+
+      <footer style={{ padding: "24px", borderTop: "1px solid #e2e8f0", textAlign: "center", fontSize: 13, color: "#94a3b8" }}>
+        {footerText ?? `\u00A9 ${new Date().getFullYear()} ${brand}`}
+      </footer>
+    </div>
+  );
+}

@@ -1,0 +1,30 @@
+"""Typed application settings — single source of truth, loaded from env / .env."""
+import os
+from pathlib import Path
+from typing import List, Optional
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+load_dotenv(BASE_DIR / ".env")
+
+
+class Settings:
+    APP_NAME: str = "{{ app_title }}"
+    ENV: str = os.environ.get("APP_ENV", "development")
+    DEBUG: bool = ENV != "production"
+
+    DATABASE_URL: Optional[str] = os.environ.get("DATABASE_URL")
+    JWT_SECRET: Optional[str] = os.environ.get("JWT_SECRET")
+    CORS_ORIGINS: List[str] = [
+        o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()
+    ]
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENV == "production"
+
+
+settings = Settings()
+
+# TODO: add your settings fields here (third-party keys, feature flags, timeouts...).

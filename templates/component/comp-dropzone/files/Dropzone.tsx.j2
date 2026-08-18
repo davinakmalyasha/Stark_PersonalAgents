@@ -1,0 +1,135 @@
+import { useRef, useState } from "react";
+
+interface Props {
+  onUpload: (files: File[]) => Promise<void>;
+  accept?: string; // e.g. ".jpg,.png" or "image/*"
+  maxSizeMB?: number;
+  multiple?: boolean;
+  label?: string;
+}
+
+interface UploadItem {
+  id: string;
+  name: string;
+  status: "pending" | "uploading" | "done" | "error";
+  message?: string;
+}
+
+/**
+ * Drag-and-drop upload zone with click-to-browse, file validation and per-file
+ * status. Pairs with the backend feature-upload template.
+ * Usage: <Dropzone onUpload={async (files) => { await api('/upload', {method:'POST', body: formData}) }} />
+ */
+export default function Dropzone({
+  onUpload,
+  accept,
+  maxSizeMB = 10,
+  multiple = true,
+  label = "Drop files here or click to browse",
+}: Props) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [items, setItems] = useState<UploadItem[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const updateItem = (id: string, patch: Partial<UploadItem>) =>
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+
+  const handleFiles = async (fileList: FileList | File[]) => {
+    const files = Array.from(fileList);
+    if (!files.length) return;
+
+    const fresh: UploadItem[] = files.map((f) => ({ id: crypto.randomUUID(), name: f.name, status: "pending" }));
+    setItems((prev) => [...prev, ...fresh]);
+    setBusy(true);
+
+    for (const f of files) {
+      const id = fresh.find((it) => it.name === f.name)!.id;
+      updateItem(id, { status: "uploading" });
+      try {
+        if (maxSizeMB && f.size > maxSizeMB * 1024 * 1024) {
+          throw new Error(`File exceeds ${maxSizeMB}MB`);
+        }
+        await onUpload([f]);
+        updateItem(id, { status: "done" });
+      } catch (err: any) {
+        updateItem(id, { status: "error", message: err?.message || "Upload failed" });
+      }
+    }
+    setBusy(false);
+  };
+
+  const zoneStyle: React.CSSProperties = {
+    border: `2px dashed ${dragging ? "#2563eb" : "#cbd5e1"}`,
+    borderRadius: 8,
+    padding: 32,
+    textAlign: "center",
+    color: "#64748b",
+    background: dragging ? "#eff6ff" : "#f8fafc",
+    cursor: "pointer",
+    transition: "border-color 0.15s ease",
+  };
+
+  return (
+    <div>
+      <div
+        style={zoneStyle}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          handleFiles(e.dataTransfer.files);
+        }}
+        onClick={() => inputRef.current?.click()}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === "Enter" && inputRef.current?.click()}
+      >
+        {busy ? "Uploading\u2026" : label}
+        <input
+          ref={inputRef}
+          type="file"
+          accept={accept}
+          multiple={multiple}
+          hidden
+          onChange={(e) => {
+            if (e.target.files) handleFiles(e.target.files);
+            e.target.value = "";
+          }}
+        />
+      </div>
+      {items.length > 0 && (
+        <ul style={{ listStyle: "none", padding: 0, margin: "12px 0 0" }}>
+          {items.map((it) => (
+            <li
+              key={it.id}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                padding: "8px 12px",
+                marginBottom: 6,
+                border: "1px solid #e2e8f0",
+                borderRadius: 6,
+                fontSize: 13,
+                background: "#fff",
+              }}
+            >
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {it.name}
+              </span>
+              <span style={{ color: it.status === "error" ? "#dc2626" : "#64748b", whiteSpace: "nowrap" }}>
+                {it.status === "pending" ? "queued" : it.status === "uploading" ? "uploading\u2026"
+                  : it.status === "done" ? "\u2713 done" : it.message || "error"}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}

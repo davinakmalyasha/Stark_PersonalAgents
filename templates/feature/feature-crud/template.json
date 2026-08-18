@@ -1,0 +1,24 @@
+{
+  "_comment": "LEVEL 3 (feature): complete admin-ready CRUD vertical slice — model, schema, router, service, tests. List endpoint is paginated + searchable + sortable (?page=&page_size=&search=&sort=), status codes 201/200/204/404. package_dir must match the project package name (stack-webapp sets it automatically).",
+  "name": "feature-crud",
+  "description": "Admin-ready FastAPI CRUD: model, schema, router, service, tests. Paginated searchable list envelope (?page=&search=&sort=) + 201/204/404 codes.",
+  "category": "feature",
+  "variables": [
+    {"name": "feature_name", "type": "string", "required": true, "description": "Singular entity name, e.g. 'User'"},
+    {"name": "model_fields", "type": "string", "default": "name:string", "description": "Comma-separated 'field:type' pairs, e.g. 'name:string,email:string,age:int'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api'"},
+    {"name": "package_dir", "type": "string", "default": "app", "description": "Project package name (must match the scaffold's package, e.g. 'app' or 'my_api')"}
+  ],
+  "uses": [
+    {"template": "comp-search-filter", "variables": {"utils_dir": "{{ package_dir }}/core"}}
+  ],
+  "files": [
+    {"src": "model.py.j2", "dest": "{{ package_dir }}/models/{{ feature_name|lower }}.py"},
+    {"src": "schema.py.j2", "dest": "{{ package_dir }}/schemas/{{ feature_name|lower }}.py"},
+    {"src": "router.py.j2", "dest": "{{ package_dir }}/routers/{{ feature_name|lower }}.py"},
+    {"src": "service.py.j2", "dest": "{{ package_dir }}/services/{{ feature_name|lower }}_service.py"},
+    {"src": "test_api.py.j2", "dest": "tests/test_{{ feature_name|lower }}_api.py"}
+  ],
+  "notes": "After applying: 1) register the router in the app (app.include_router(router)), 2) make sure the model is imported so SQLAlchemy creates its table (Base.metadata.create_all runs at app import — the model uses the scaffold's shared Base), 3) adapt the db session import ({{ package_dir }}.database.get_db) to your project, 4) run the generated tests. The list endpoint's {items,total,page,page_size} envelope + ?search=&sort= match the frontend comp-crud-page admin template.",
+  "sample_vars": {"feature_name": "User", "model_fields": "name:string,email:string,age:int", "base_path": "/api", "package_dir": "app"}
+}

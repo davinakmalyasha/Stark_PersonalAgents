@@ -1,0 +1,62 @@
+import { useCallback, useEffect, useState } from "react";
+
+const TOKEN_KEY = "auth_token";
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setToken(token: string | null): void {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
+/**
+ * Auth hook: token persistence (localStorage) + login/logout + route guard.
+ * Usage:
+ *   const { token, isAuthenticated, login, logout } = useAuth();
+ *   <AuthGuard token={isAuthenticated}>{page}</AuthGuard>
+ */
+export function useAuth() {
+  const [token, setTokenState] = useState<string | null>(() => getToken());
+
+  const login = useCallback((next: string) => {
+    setToken(next);
+    setTokenState(next);
+  }, []);
+
+  const logout = useCallback(() => {
+    setToken(null);
+    setTokenState(null);
+  }, []);
+
+  return {
+    token,
+    isAuthenticated: Boolean(token),
+    login,
+    logout,
+  };
+}
+
+/** Route guard: renders children only when authenticated, else an optional login redirect message. */
+export function AuthGuard({ isAuthenticated, children }: { isAuthenticated: boolean; children: React.ReactNode }) {
+  if (!isAuthenticated) {
+    return (
+      <div style={{ padding: 40, textAlign: "center", color: "#64748b" }}>
+        Please sign in to continue.
+      </div>
+    );
+  }
+  return <>{children}</>;
+}
+
+/** Subscribe to token changes across components (fires on login/logout). */
+export function useTokenListener(onChange: (token: string | null) => void) {
+  useEffect(() => {
+    const listener = (e: StorageEvent) => {
+      if (e.key === TOKEN_KEY) onChange(e.newValue);
+    };
+    window.addEventListener("storage", listener);
+    return () => window.removeEventListener("storage", listener);
+  }, [onChange]);
+}

@@ -1,0 +1,19 @@
+"""Audit log model: records who did what, when."""
+from datetime import datetime
+
+from sqlalchemy import Column, DateTime, Integer, String, Text
+
+from ..database import Base
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, index=True, nullable=True)
+    actor_username = Column(String(100), nullable=True)
+    action = Column(String(50), index=True, nullable=False)   # create/update/delete/login/...
+    resource = Column(String(100), index=True, nullable=False)  # 'user', '{{ resource }}', ...
+    resource_id = Column(String(50), nullable=True)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)

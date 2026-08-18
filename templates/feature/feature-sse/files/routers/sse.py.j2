@@ -1,0 +1,44 @@
+"""SSE streaming endpoint — server-sent events for chat/progress/notifications."""
+import asyncio
+import json
+from typing import AsyncGenerator
+
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+
+router = APIRouter(tags=["sse"])
+
+
+async def event_stream() -> AsyncGenerator[str, None]:
+    """Yield SSE frames: `data: <json>\n\n`. Send a heartbeat every 15s so
+    proxies keep the connection open. Replace with real event sources."""
+    heartbeat = 0
+    while True:
+        try:
+            # TODO: pull the next event from your queue/generator here, e.g.
+            #   event = await your_queue.get()
+            #   yield f"data: {json.dumps({'type': 'message', 'data': event})}\n\n"
+            yield f"data: {json.dumps({'type': 'heartbeat', 'ts': heartbeat})}\n\n"
+            heartbeat += 1
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            break
+
+
+@router.get("{{ stream_path }}")
+async def sse(request: Request):
+    """Server-Sent Events stream. Client: new EventSource('{{ stream_path }}') —
+    note EventSource cannot set headers, so pass auth via a query token or cookie."""
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
+
+
+# TODO: register this router in the app: app.include_router(router)
+# TODO: protect the stream when needed (EventSource can't set headers — use a short-lived query token)

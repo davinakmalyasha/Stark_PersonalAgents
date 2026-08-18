@@ -1,0 +1,18 @@
+{
+  "_comment": "LEVEL 5 (stack): a complete marketing/landing website in ONE call — frontend only (project-frontend + comp-landing + comp-page + error boundary + http client), no backend. No new code: pure composition.",
+  "name": "stack-landing",
+  "description": "Complete marketing website: React landing page (hero, features, sections, footer) + data pages + error boundaries. Frontend-only greenfield in one call.",
+  "category": "stack",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Frontend project name, e.g. 'acme-site' (drives package.json and the Vite scaffold)"},
+    {"name": "api_base", "type": "string", "default": "/api", "description": "API base for the frontend's http client (empty = static site without API)"}
+  ],
+  "uses": [
+    {"template": "project-frontend", "variables": {"project_name": "{{ project_name }}", "api_base": "{{ api_base }}"}},
+    {"template": "comp-landing", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-page", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-error-boundary", "variables": {"components_dir": "src/components"}}
+  ],
+  "notes": "Marketing site starter. After applying: npm install, mount <Landing brand='YourBrand' heroTitle='...' heroSubtitle='...' ctaLabel='Get started' features={[...]} /> in App, add content pages with <Page fetchPath={...}> for data sections or plain sections for static content. TODO: add deploy config (vercel.json/render.yaml) or set up your hosting of choice; point the favicon/title in index.html.",
+  "sample_vars": {"project_name": "acme-site", "api_base": "/api"}
+}

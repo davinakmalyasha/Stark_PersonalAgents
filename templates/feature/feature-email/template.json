@@ -1,0 +1,13 @@
+{
+  "name": "feature-email",
+  "description": "Email sending via SMTP: connection, HTML + plain text templates, env-based config.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "default": "app", "description": "Package name, e.g. 'app'"}
+  ],
+  "files": [
+    {"src": "emailer.py.j2", "dest": "{{ app_name }}/services/emailer.py"}
+  ],
+  "notes": "After applying: set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/MAIL_FROM in .env, call send_email(subject, to, html). TODO markers show hardening points (retries, queueing).",
+  "sample_vars": {"app_name": "app"}
+}

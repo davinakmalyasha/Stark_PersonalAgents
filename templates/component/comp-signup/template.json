@@ -1,0 +1,19 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): signup form — username + password + confirm, posts to feature-auth's /auth/register, inline validation, 409 handling, auto-login hook. Composes comp-login (useAuth) + comp-http-client. Uses [[ ]] delimiters.",
+  "name": "comp-signup",
+  "description": "Signup form: username + password + confirm, register endpoint, validation, auto-login hook. Pairs feature-auth + comp-login.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "uses": [
+    {"template": "comp-login", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-http-client", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "SignupForm.tsx.j2", "dest": "[[components_dir]]/SignupForm.tsx"}
+  ],
+  "notes": "Backend contract: POST {apiBase}/auth/register {username,password} -> 201 {id,username,role,is_active,created_at}; 409 on duplicate username (feature-auth). Usage: <SignupForm apiBase='/api' onRegistered={(u,p) => { loginWith(u,p); }} /> — after register, call your login (e.g. post /auth/login) in onRegistered so the token flows into comp-http-client's auth. Wrap the whole auth flow (login/signup) in one parent that owns useAuth.",
+  "sample_vars": {"components_dir": "src/components"}
+}

@@ -1,0 +1,13 @@
+{
+  "name": "requirements",
+  "description": "Minimal requirements.txt with a commented structure and pinned-baseline style.",
+  "category": "routine",
+  "variables": [
+    {"name": "deps", "type": "string", "default": "fastapi\nuvicorn[standard]\npydantic\nsqlalchemy\npython-dotenv\npytest\nhttpx", "description": "Newline-separated top-level dependencies"}
+  ],
+  "files": [
+    {"src": "requirements.txt.j2", "dest": "requirements.txt"}
+  ],
+  "notes": "Pin versions for production (pip freeze). Keep top-level deps here; transitive deps stay implicit.",
+  "sample_vars": {"deps": "fastapi\nuvicorn[standard]\npydantic"}
+}

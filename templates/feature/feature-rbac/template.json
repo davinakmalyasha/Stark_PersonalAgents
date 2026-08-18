@@ -1,0 +1,20 @@
+{
+  "_comment": "LEVEL 3 (feature): RBAC + admin user management — role on User, require_role dependency, admin-only users router (list/search, set role, activate/deactivate, reset password), env-seeded first admin. Requires feature-auth (User model + role claim in tokens).",
+  "name": "feature-rbac",
+  "description": "RBAC + admin user management: require_role guard, users admin API (roles, activation, password reset), env-seeded first admin.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_admin' (must match feature-auth's)"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/admin/users...)"}
+  ],
+  "uses": [
+    {"template": "comp-search-filter", "variables": {"utils_dir": "{{ app_name }}/core"}}
+  ],
+  "files": [
+    {"src": "core/rbac.py.j2", "dest": "{{ app_name }}/core/rbac.py"},
+    {"src": "services/admin_service.py.j2", "dest": "{{ app_name }}/services/admin_service.py"},
+    {"src": "routers/admin.py.j2", "dest": "{{ app_name }}/routers/admin.py"}
+  ],
+  "notes": "Requires feature-auth: the User model carries the role column and login tokens carry the role claim. After applying: 1) app.include_router(router), 2) seed the first admin at startup (ADMIN_USERNAME/ADMIN_PASSWORD in .env — see TODO in the router), 3) protect admin-only resources with Depends(require_role('admin')). Frontend: manage users with comp-crud-page pointing at {base_path}/admin/users (role column uses comp-form's select field).",
+  "sample_vars": {"app_name": "app", "base_path": "/api"}
+}

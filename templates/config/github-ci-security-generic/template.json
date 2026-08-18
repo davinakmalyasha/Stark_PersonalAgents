@@ -1,0 +1,17 @@
+{
+  "_comment": "THE GATE — generic profile. For any language not otherwise profiled: osv-scanner SCA (all ecosystems), gitleaks, multi-language CodeQL, detected test command, zizmor. A repo is never ungated.",
+  "name": "github-ci-security-generic",
+  "description": "Universal fallback gate for any language: osv-scanner SCA, gitleaks secrets, multi-language CodeQL, detected test command, zizmor.",
+  "category": "config",
+  "variables": [
+    {"name": "gitleaks_version", "type": "string", "default": "8.30.1", "description": "Pinned gitleaks release"},
+    {"name": "zizmor_version", "type": "string", "default": "1.29.0", "description": "Pinned zizmor release"},
+    {"name": "osv_scanner_version", "type": "string", "default": "2.5.0", "description": "Pinned osv-scanner release"},
+    {"name": "codeql_on", "type": "string", "default": "true", "description": "Include the CodeQL job (analyzes whatever languages are present)"}
+  ],
+  "files": [
+    {"src": "security.yml.j2", "dest": ".github/workflows/security.yml"}
+  ],
+  "notes": "Contexts: sca, secrets, codeql, tests, zizmor. The tests job detects a runnable test command (npm test / go test / pytest); nothing detected = skipped. osv-scanner covers npm, PyPI, Go, Maven, Cargo, RubyGems, composer and more.",
+  "sample_vars": {"codeql_on": "true"}
+}

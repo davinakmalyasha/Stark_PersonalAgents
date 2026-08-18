@@ -1,0 +1,138 @@
+import { createElement, ReactNode } from "react";
+import CodeBlock from "./CodeBlock";
+
+interface Props {
+  text: string;
+}
+
+/** Escape HTML so raw text never becomes markup — output is always React nodes. */
+function esc(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function inline(text: string, keyPrefix: string): ReactNode[] {
+  // code spans
+  const parts = esc(text).split(/(`[^`]+`)/g);
+  return parts.map((part, i) =>
+    part.startsWith("`") && part.endsWith("`") ? (
+      <code
+        key={`${keyPrefix}-c${i}`}
+        style={{
+          background: "#f1f5f9",
+          padding: "1px 5px",
+          borderRadius: 4,
+          fontSize: "0.9em",
+          fontFamily: "ui-monospace, monospace",
+        }}
+      >
+        {part.slice(1, -1)}
+      </code>
+    ) : (
+      <span key={`${keyPrefix}-t${i}`} dangerouslySetInnerHTML={{ __html: part }} />
+    )
+  );
+}
+
+/**
+ * Minimal safe markdown renderer: headings, bold/italic, links, unordered/ordered
+ * lists, inline + fenced code blocks (via comp-code-block). Output is escaped
+ * text parsed into React nodes — no raw HTML injection. Upgrade path: swap the
+ * body for react-markdown if richer syntax is needed.
+ *
+ * Usage: <MarkdownViewer text={assistantReply} />
+ */
+export default function MarkdownViewer({ text }: Props) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const nodes: ReactNode[] = [];
+  let listType: "ul" | "ol" | null = null;
+  let listItems: string[] = [];
+  let fenceLang = "";
+  let fenceLines: string[] = [];
+  let key = 0;
+
+  const flushList = () => {
+    if (listType && listItems.length) {
+      const Tag = listType;
+      nodes.push(
+        <Tag key={`l${key++}`}>
+          {listItems.map((item, i) => (
+            <li key={i}>{inline(item, `li${key}-${i}`)}</li>
+          ))}
+        </Tag>
+      );
+      listItems = [];
+    }
+    listType = null;
+  };
+
+  const flushFence = () => {
+    if (fenceLines.length) {
+      nodes.push(<CodeBlock key={`f${key++}`} code={fenceLines.join("\n")} language={fenceLang || undefined} />);
+      fenceLines = [];
+      fenceLang = "";
+    }
+  };
+
+  for (const line of lines) {
+    // fenced code
+    if (line.trim().startsWith("```")) {
+      flushList();
+      flushFence();
+      fenceLang = line.trim().slice(3).trim();
+      continue;
+    }
+    if (fenceLines.length > 0 || fenceLang !== "") {
+      fenceLines.push(line);
+      continue;
+    }
+    const t = line.trim();
+    if (!t) {
+      flushList();
+      continue;
+    }
+    const h = t.match(/^(#{1,4})\s+(.*)$/);
+    if (h) {
+      flushList();
+      const level = h[1].length;
+      nodes.push(createElement(`h${level}` as any, { key: `h${key++}` }, inline(h[2], `h${key}`)));
+      continue;
+    }
+    if (/^[-*]\s+/.test(t)) {
+      flushFence();
+      if (listType !== "ul") {
+        flushList();
+        listType = "ul";
+      }
+      listItems.push(t.replace(/^[-*]\s+/, ""));
+      continue;
+    }
+    if (/^\d+[.)]\s+/.test(t)) {
+      flushFence();
+      if (listType !== "ol") {
+        flushList();
+        listType = "ol";
+      }
+      listItems.push(t.replace(/^\d+[.)]\s+/, ""));
+      continue;
+    }
+    flushList();
+    flushFence();
+    // paragraph: bold **x**, italic *x*, links [t](u)
+    let html = esc(t)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+    nodes.push(
+      <p key={`p${key++}`} style={{ margin: "0 0 8px" }}>
+        <span dangerouslySetInnerHTML={{ __html: html }} />
+      </p>
+    );
+  }
+  flushList();
+  flushFence();
+
+  return <div style={{ fontSize: 14, lineHeight: 1.6 }}>{nodes}</div>;
+}

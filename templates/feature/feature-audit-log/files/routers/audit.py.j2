@@ -1,0 +1,68 @@
+"""Admin audit trail endpoint: GET {{ base_path }}/admin/audit (admin-only, paginated)."""
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from ..core.security import get_current_user
+from ..database import get_db
+from ..models.audit_log import AuditLog
+from ..services.audit_service import list_audit
+
+router = APIRouter(prefix="{{ base_path }}/admin", tags=["admin"])
+
+
+class AuditEntry(BaseModel):
+    id: int
+    actor_id: int | None
+    actor_username: str | None
+    action: str
+    resource: str
+    resource_id: str | None
+    detail: str | None
+    created_at: str
+
+
+class AuditListResponse(BaseModel):
+    items: list[AuditEntry]
+    total: int
+    page: int
+    page_size: int
+
+
+def _admin_only(claims: dict = Depends(get_current_user)) -> dict:
+    """Admin guard (self-contained — feature-rbac's require_role is the richer version)."""
+    if claims.get("role") != "admin":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Insufficient permissions — admin required")
+    return claims
+
+
+@router.get("/audit", response_model=AuditListResponse)
+def audit(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+          actor: str = "", resource: str = "", action: str = "",
+          db: Session = Depends(get_db), _: dict = Depends(_admin_only)):
+    """Paginated audit log: ?page=&page_size=&actor=&resource=&action=."""
+    items, total = list_audit(db, page=page, page_size=page_size,
+                              actor=actor, resource=resource, action=action)
+    return {
+        "items": [
+            {
+                "id": it.id,
+                "actor_id": it.actor_id,
+                "actor_username": it.actor_username,
+                "action": it.action,
+                "resource": it.resource,
+                "resource_id": it.resource_id,
+                "detail": it.detail,
+                "created_at": it.created_at.isoformat(),
+            }
+            for it in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+# TODO: register this router in the app: app.include_router(router)
+# TODO: call log_action(db, claims, "create", "user", id, ...) from mutation endpoints

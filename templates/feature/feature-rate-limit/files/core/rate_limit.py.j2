@@ -1,0 +1,79 @@
+"""In-memory token-bucket rate limiter as a FastAPI dependency.
+
+Usage:
+    @router.get("/search", dependencies=[Depends(rate_limit("5/minute"))])
+    def search(): ...
+
+    # per-user limit (claims from feature-auth):
+    @router.post("/chat", dependencies=[Depends(rate_limit("10/minute", key=user_key))])
+    def chat(claims: dict = Depends(get_current_user)): ...
+
+Rate strings: "<count>/<second|minute|hour>". In-memory — resets on restart;
+for multi-worker/redis use a shared store (swap the _BUCKETS dict).
+"""
+import threading
+import time
+from typing import Callable, Optional
+
+from fastapi import HTTPException, Request
+
+_BUCKETS: dict = {}
+_LOCK = threading.Lock()
+
+
+def _parse_rate(rate: str) -> tuple[float, float]:
+    """'5/minute' -> (5, 60.0)  (capacity, refill_seconds)."""
+    count_s, unit = rate.strip().lower().split("/")
+    count = float(count_s)
+    seconds = {"second": 1.0, "minute": 60.0, "hour": 3600.0}.get(unit)
+    if seconds is None:
+        raise ValueError(f"invalid rate unit '{unit}' (use second|minute|hour)")
+    return count, seconds
+
+
+def _bucket(key: str, capacity: float, refill_seconds: float) -> tuple[float, float]:
+    """Token bucket: returns (allow, tokens_after). Thread-safe via global lock."""
+    now = time.monotonic()
+    with _LOCK:
+        tokens, last = _BUCKETS.get(key, (capacity, now))
+        tokens = min(capacity, tokens + (now - last) / refill_seconds)
+        if tokens >= 1.0:
+            tokens -= 1.0
+            _BUCKETS[key] = (tokens, now)
+            return True, tokens
+        _BUCKETS[key] = (tokens, now)
+        return False, tokens
+
+
+def rate_limit(rate: str, key: Optional[Callable[[Request], str]] = None):
+    """Dependency factory. Default key: client IP. Custom key: pass a callable
+    that returns a stable string (e.g. user_key for per-user limits)."""
+    capacity, refill_seconds = _parse_rate(rate)
+
+    def default_key(request: Request) -> str:
+        return request.client.host if request.client else "unknown"
+
+    def limiter(request: Request):
+        k = (key or default_key)(request)
+        allowed, _tokens = _bucket(f"{rate}:{k}", capacity, refill_seconds)
+        if not allowed:
+            raise HTTPException(status_code=429,
+                                detail=f"Rate limit exceeded ({rate})",
+                                headers={"Retry-After": str(int(refill_seconds))})
+
+    return limiter
+
+
+def user_key(request: Request) -> str:
+    """Per-user key — pair with feature-auth's get_current_user dependency.
+
+    Note: the limiter runs BEFORE get_current_user in dependency order, so pull
+    the token from the Authorization header directly:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth.split(" ", 1)[1][:32]  # stable prefix is enough for bucketing
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1][:32]
+    return request.client.host if request.client else "unknown"

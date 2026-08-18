@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): chat UI — message bubbles, streaming assistant text, input + send, auto-scroll. Controlled component (messages live in the parent); pair with feature-sse or any chat API. Uses [[ ]] delimiters.",
+  "name": "comp-chat",
+  "description": "Chat UI: message bubbles, streaming assistant text, input + send, auto-scroll. Controlled — pair with feature-sse or any chat API.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Chat.tsx.j2", "dest": "[[components_dir]]/Chat.tsx"}
+  ],
+  "notes": "Usage: <Chat messages={msgs} onSend={async (t) => { const reply = await api('/api/chat', {method:'POST', body:{message:t}}); setMsgs([...msgs, {id:2, role:'assistant', content: reply.text}]); }} streamingText={partialReply} title='Support chat' />. Controlled: the parent owns the message array; pass streamingText while an SSE/stream reply is in progress (feature-sse). Auto-scrolls on new messages. Wrap in a fixed-height container.",
+  "sample_vars": {"components_dir": "src/components"}
+}

@@ -1,0 +1,18 @@
+{
+  "_comment": "LEVEL 3 (feature): bulk CSV import for an entity — multipart upload, header-row validation, per-row error reporting, partial import (valid rows inserted, bad rows reported). Completes the admin import/export pair with feature-export.",
+  "name": "feature-import",
+  "description": "Bulk CSV import endpoint: multipart upload, header validation, per-row errors, partial import (valid rows inserted).",
+  "category": "feature",
+  "variables": [
+    {"name": "resource_name", "type": "string", "required": true, "description": "Singular entity name, e.g. 'Product' (must match feature-crud's)"},
+    {"name": "model_fields", "type": "string", "default": "name:string", "description": "Comma-separated 'field:type' pairs — type-aware parsing (int/float/bool/string)"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix (route: /api/{resource}s/import)"},
+    {"name": "package_dir", "type": "string", "default": "app", "description": "Project package name (must match feature-crud's)"}
+  ],
+  "files": [
+    {"src": "services/import_service.py.j2", "dest": "{{ package_dir }}/services/import_service.py"},
+    {"src": "routers/import.py.j2", "dest": "{{ package_dir }}/routers/import.py"}
+  ],
+  "notes": "Pairs with feature-export (import/export round-trip: the export's CSV columns are the import's header). Frontend: send with comp-http-client — const fd = new FormData(); fd.append('file', csvFile); await api('/api/{{ resource_name|lower }}s/import', {method:'POST', body: fd}); (comp-http-client skips JSON encoding for FormData). Response: {created, errors:[{row,message}], total_rows}. TODO: register the router; add admin/auth protection when needed.",
+  "sample_vars": {"resource_name": "Product", "model_fields": "name:string,price:float", "base_path": "/api", "package_dir": "app"}
+}

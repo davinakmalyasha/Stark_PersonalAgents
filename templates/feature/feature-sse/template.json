@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 3 (feature): SSE streaming endpoint — server-sent events for chat/progress/notifications, with heartbeat + nginx buffering off. Frontend pairing documented in notes.",
+  "name": "feature-sse",
+  "description": "SSE streaming endpoint: server-sent events with heartbeat (chat/progress/notifications). Client via EventSource.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix"},
+    {"name": "stream_path", "type": "string", "default": "/stream", "description": "Stream path under base_path, e.g. '/stream' -> /api/stream"}
+  ],
+  "files": [
+    {"src": "routers/sse.py.j2", "dest": "{{ app_name }}/routers/sse.py"}
+  ],
+  "notes": "After applying: 1) app.include_router(router), 2) replace the heartbeat TODO with your real event source (queue/generator), 3) frontend: const es = new EventSource('/api/stream'); es.onmessage = (e) => { const ev = JSON.parse(e.data); }; — EventSource cannot set Authorization headers, so protect the stream with a short-lived query token or cookie if needed. Pairs with comp-chat (streamingText prop).",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "stream_path": "/stream"}
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component): threaded in-process task queue with retry + dead-letter handling.",
+  "name": "comp-queue-worker",
+  "description": "Task queue worker: threaded executor, retry with backoff, dead-letter on final failure. Import: from {{ utils_dir }}.queue_worker import TaskQueue",
+  "category": "component",
+  "variables": [
+    {"name": "utils_dir", "type": "string", "default": "app/utils", "description": "Directory for the module"},
+    {"name": "default_workers", "type": "string", "default": "4", "description": "Default worker thread count"}
+  ],
+  "files": [
+    {"src": "queue_worker.py.j2", "dest": "{{ utils_dir }}/queue_worker.py"}
+  ],
+  "notes": "Usage: q = TaskQueue(); q.submit(fn, arg=1); q.wait() to drain. Retries (default 3) with backoff; final failures go to on_dead callback. In-process only — swap to Celery/RQ when you outgrow one process.",
+  "sample_vars": {"utils_dir": "app/utils"}
+}

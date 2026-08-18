@@ -1,0 +1,305 @@
+import { useCallback, useEffect, useState } from "react";
+import PaginatedTable, { Column } from "./PaginatedTable";
+import { Modal } from "./Modal";
+import AppForm, { Field } from "./Form";
+import { useToast } from "./Toast";
+import { api, getToken } from "./api";
+
+export type { Field };
+
+interface ListResponse<T> {
+  items: T[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+type ModalState = { mode: "create" } | { mode: "edit"; item: any } | null;
+
+interface Props {
+  resource: string;                 // e.g. "User" — used in titles and toasts
+  apiPath: string;                  // e.g. "/users" — list + create + item ops
+  columns: Column[];                // table columns (see comp-paginated-table)
+  fields: Field[];                  // form fields for create/edit (see comp-form)
+  pageSize?: number;
+  selectable?: boolean;             // show checkboxes + bulk delete
+  searchPlaceholder?: string;
+  exportPath?: string;              // e.g. "/users/export" — CSV export (feature-export)
+}
+
+const btn: React.CSSProperties = {
+  padding: "8px 14px",
+  borderRadius: 6,
+  border: "none",
+  cursor: "pointer",
+  fontSize: 14,
+};
+const btnPrimary: React.CSSProperties = { ...btn, background: "#2563eb", color: "#fff" };
+const btnDanger: React.CSSProperties = { ...btn, background: "#dc2626", color: "#fff" };
+const btnGhost: React.CSSProperties = {
+  ...btn, background: "#e2e8f0", color: "#0f172a",
+};
+
+/**
+ * Complete admin CRUD page: search, pagination, sorting, create/edit modal
+ * form, delete confirm, bulk delete, toasts, loading/empty/error states.
+ * Backend contract (see feature-crud): GET ?page=&page_size=&search=&sort=
+ * -> {items,total,page,page_size}; POST 201; PUT 200; DELETE 204.
+ */
+export default function CrudPage({
+  resource,
+  apiPath,
+  columns,
+  fields,
+  pageSize = 20,
+  selectable = false,
+  searchPlaceholder = "Search\u2026",
+  exportPath,
+}: Props) {
+  const { toast } = useToast();
+  const [items, setItems] = useState<any[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [searchInput, setSearchInput] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [modal, setModal] = useState<ModalState>(null);
+  const [deleting, setDeleting] = useState<any | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+
+  // Debounced search -> resets to page 1.
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      setSearchTerm(searchInput);
+      setPage(1);
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [searchInput]);
+
+  const load = useCallback(async (pageNum: number, term: string, sortBy: { key: string; dir: "asc" | "desc" } | null) => {
+    setLoading(true);
+    setError("");
+    try {
+      const params = new URLSearchParams({ page: String(pageNum), page_size: String(pageSize) });
+      if (term) params.set("search", term);
+      if (sortBy) params.set("sort", `${sortBy.key}:${sortBy.dir}`);
+      const data = await api<ListResponse<any>>(`${apiPath}?${params.toString()}`);
+      setItems(data.items);
+      setTotal(data.total);
+      setPage(data.page);
+      setSelected(new Set());
+    } catch (err: any) {
+      setError(err?.message || "Failed to load data");
+    } finally {
+      setLoading(false);
+    }
+  }, [apiPath, pageSize]);
+
+  useEffect(() => {
+    load(page, searchTerm, sort);
+  }, [load, page, searchTerm, sort]);
+
+  const refresh = () => load(page, searchTerm, sort);
+
+  const handleSubmit = async (values: Record<string, any>) => {
+    setBusy(true);
+    try {
+      if (modal?.mode === "edit") {
+        await api(`${apiPath}/${modal.item.id}`, { method: "PUT", body: values });
+        toast.success(`${resource} updated`);
+      } else {
+        await api(apiPath, { method: "POST", body: values });
+        toast.success(`${resource} created`);
+      }
+      setModal(null);
+      refresh();
+    } catch (err: any) {
+      toast.error(err?.message || "Save failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleting) return;
+    setBusy(true);
+    try {
+      await api(`${apiPath}/${deleting.id}`, { method: "DELETE" });
+      toast.success(`${resource} deleted`);
+      setDeleting(null);
+      refresh();
+    } catch (err: any) {
+      toast.error(err?.message || "Delete failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const bulkDelete = async () => {
+    setBusy(true);
+    try {
+      await Promise.all([...selected].map((id) => api(`${apiPath}/${id}`, { method: "DELETE" })));
+      toast.success(`Deleted ${selected.size} ${resource.toLowerCase()}s`);
+      refresh();
+    } catch (err: any) {
+      toast.error(err?.message || "Bulk delete failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportCsv = async () => {
+    if (!exportPath) return;
+    setBusy(true);
+    try {
+      const params = new URLSearchParams();
+      if (searchTerm) params.set("search", searchTerm);
+      if (sort) params.set("sort", `${sort.key}:${sort.dir}`);
+      const token = getToken();
+      const res = await fetch(`${exportPath}?${params.toString()}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`Export failed (${res.status})`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${resource.toLowerCase()}s.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Export started");
+    } catch (err: any) {
+      toast.error(err?.message || "Export failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleSelect = (id: number) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const toggleSelectAll = (ids: number[]) =>
+    setSelected((prev) =>
+      ids.every((id) => prev.has(id)) ? new Set() : new Set(ids)
+    );
+
+  // Form fields prefilled from the row being edited.
+  const editFields: Field[] =
+    modal?.mode === "edit"
+      ? fields.map((f) => ({ ...f, defaultValue: modal.item[f.name] ?? f.defaultValue }))
+      : fields;
+
+  const selectCol: Column = {
+    key: "__select__",
+    label: (
+      <input
+        type="checkbox"
+        checked={items.length > 0 && items.every((r) => selected.has(r.id))}
+        onChange={() => toggleSelectAll(items.map((r) => r.id))}
+      />
+    ),
+    render: (row) => (
+      <input type="checkbox" checked={selected.has(row.id)} onChange={() => toggleSelect(row.id)} />
+    ),
+  };
+
+  const actionsCol: Column = {
+    key: "__actions__",
+    label: "Actions",
+    render: (row) => (
+      <div style={{ display: "flex", gap: 8 }}>
+        <button style={btnGhost} onClick={() => setModal({ mode: "edit", item: row })}>
+          Edit
+        </button>
+        <button style={btnGhost} onClick={() => setDeleting(row)}>
+          <span style={{ color: "#dc2626" }}>Delete</span>
+        </button>
+      </div>
+    ),
+  };
+
+  const tableColumns = [...(selectable ? [selectCol] : []), ...columns, actionsCol];
+
+  return (
+    <div style={{ fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+        <input
+          style={{
+            flex: 1, minWidth: 200, padding: "8px 12px", borderRadius: 6,
+            border: "1px solid #cbd5e1", fontSize: 14,
+          }}
+          placeholder={searchPlaceholder}
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+        />
+        {selectable && selected.size > 0 && (
+          <button style={btnDanger} onClick={bulkDelete} disabled={busy}>
+            Delete {selected.size} selected
+          </button>
+        )}
+        {exportPath && (
+          <button style={btnGhost} onClick={exportCsv} disabled={busy}>
+            Export CSV
+          </button>
+        )}
+        <button style={btnPrimary} onClick={() => setModal({ mode: "create" })}>
+          New {resource}
+        </button>
+      </div>
+
+      {error && (
+        <div
+          role="alert"
+          style={{
+            padding: "10px 14px", marginBottom: 12, borderRadius: 6,
+            background: "#fef2f2", border: "1px solid #fecaca", color: "#7f1d1d", fontSize: 13,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      <PaginatedTable
+        columns={tableColumns}
+        rows={items}
+        total={total}
+        page={page}
+        pageSize={pageSize}
+        loading={loading}
+        onPageChange={setPage}
+        onSort={(key, dir) => setSort({ key, dir })}
+      />
+
+      <Modal
+        open={modal !== null}
+        onClose={() => setModal(null)}
+        title={modal?.mode === "edit" ? `Edit ${resource}` : `New ${resource}`}
+      >
+        <AppForm fields={editFields} onSubmit={handleSubmit} loading={busy}
+                 submitLabel={modal?.mode === "edit" ? "Save changes" : `Create ${resource}`} />
+      </Modal>
+
+      <Modal open={deleting !== null} onClose={() => setDeleting(null)} title={`Delete ${resource}`}>
+        <p style={{ margin: "0 0 16px", fontSize: 14 }}>
+          Delete <strong>{deleting?.name ?? `#${deleting?.id ?? ""}`}</strong>? This cannot be undone.
+        </p>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button style={btnGhost} onClick={() => setDeleting(null)} disabled={busy}>
+            Cancel
+          </button>
+          <button style={btnDanger} onClick={confirmDelete} disabled={busy}>
+            Delete
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}

@@ -1,0 +1,22 @@
+{
+  "_comment": "LEVEL 3 (feature): CSV export endpoint for an entity — composes comp-csv-exporter (to_csv_string) + comp-search-filter (search/sort parity with the list endpoint).",
+  "name": "feature-export",
+  "description": "CSV export endpoint: GET /{resource}s/export?search=&sort= streams every matching row (composes the csv exporter).",
+  "category": "feature",
+  "variables": [
+    {"name": "resource_name", "type": "string", "required": true, "description": "Singular entity name, e.g. 'User' (must match the feature-crud resource)"},
+    {"name": "model_fields", "type": "string", "default": "name:string", "description": "Comma-separated 'field:type' pairs — string fields become searchable, same as feature-crud"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix (the endpoint mounts at {base_path}/{resource}s/export)"},
+    {"name": "package_dir", "type": "string", "default": "app", "description": "Project package name (must match feature-crud's)"}
+  ],
+  "uses": [
+    {"template": "comp-csv-exporter", "variables": {"utils_dir": "{{ package_dir }}/core"}},
+    {"template": "comp-search-filter", "variables": {"utils_dir": "{{ package_dir }}/core"}}
+  ],
+  "files": [
+    {"src": "services/export_service.py.j2", "dest": "{{ package_dir }}/services/export_service.py"},
+    {"src": "routers/export.py.j2", "dest": "{{ package_dir }}/routers/export.py"}
+  ],
+  "notes": "Pairs with feature-crud: same search/sort semantics, exports ALL matching rows (no pagination). Frontend: comp-crud-page's Export button calls this endpoint (exportPath prop). TODO: register the router; add auth/admin protection via require_role when needed.",
+  "sample_vars": {"resource_name": "User", "model_fields": "name:string,email:string,age:int", "base_path": "/api", "package_dir": "app"}
+}

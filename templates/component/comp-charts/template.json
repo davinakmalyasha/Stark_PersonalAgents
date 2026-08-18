@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): recharts wrappers — one data prop, consistent sizing. Requires recharts: npm install recharts.",
+  "name": "comp-charts",
+  "description": "Recharts wrappers: LineChart, BarChart, PieChart with one data prop. Requires: npm install recharts.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Charts.tsx.j2", "dest": "[[components_dir]]/Charts.tsx"}
+  ],
+  "notes": "Usage: <LineChart data={[{month, sales}]} xKey=\"month\" yKeys={['sales']} />. Consistent 16:9 sizing, tooltip + legend included. Install recharts first.",
+  "sample_vars": {"components_dir": "src/components"}
+}

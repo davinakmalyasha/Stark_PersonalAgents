@@ -1,0 +1,38 @@
+{
+  "_comment": "LEVEL 5 (stack): a COMPLETE admin product in ONE call — L3 features (auth, RBAC + admin user management, admin-ready CRUD, CSV export, audit trail, uploads, email) + L4 components (layout, login, http-client, full admin CRUD page, dashboard, settings, dropzone) pre-wired, plus CI/gate/deploy. No new code: pure composition.",
+  "name": "stack-admin",
+  "description": "Complete admin product: FastAPI backend (JWT auth + RBAC roles + admin user management + admin-ready CRUD + CSV export + audit log + uploads) and React frontend (layout, login, dashboard, full admin CRUD page, settings). One call = full admin app.",
+  "category": "stack",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Python package name, e.g. 'demo_admin' (drives all nested packages)"},
+    {"name": "feature_name", "type": "string", "required": true, "description": "First CRUD entity managed by the admin page, e.g. 'Product'"},
+    {"name": "model_fields", "type": "string", "default": "name:string,email:string", "description": "Fields for the first entity"},
+    {"name": "service_name", "type": "string", "default": "web", "description": "docker-compose service name"}
+  ],
+  "uses": [
+    "project-fastapi",
+    {"template": "feature-errors", "variables": {"app_name": "{{ project_name }}"}},
+    {"template": "feature-auth", "variables": {"app_name": "{{ project_name }}", "base_path": "/api"}},
+    {"template": "feature-rbac", "variables": {"app_name": "{{ project_name }}", "base_path": "/api"}},
+    {"template": "feature-crud", "variables": {"package_dir": "{{ project_name }}", "feature_name": "{{ feature_name }}", "model_fields": "{{ model_fields }}", "base_path": "/api"}},
+    {"template": "feature-export", "variables": {"package_dir": "{{ project_name }}", "resource_name": "{{ feature_name }}", "model_fields": "{{ model_fields }}", "base_path": "/api"}},
+    {"template": "feature-audit-log", "variables": {"app_name": "{{ project_name }}", "base_path": "/api"}},
+    {"template": "feature-upload", "variables": {"app_name": "{{ project_name }}"}},
+    {"template": "feature-email", "variables": {"app_name": "{{ project_name }}"}},
+    "github-ci-python",
+    "github-ci-security-python",
+    "docker-compose",
+    "nginx",
+    "project-frontend",
+    {"template": "comp-layout", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-login", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-http-client", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-crud-page", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-dashboard", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-settings", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-dropzone", "variables": {"components_dir": "src/components"}},
+    {"template": "comp-error-boundary", "variables": {"components_dir": "src/components"}}
+  ],
+  "notes": "Complete admin starter. IMPORTANT: feature_name must NOT be 'User' — the auth feature already owns models/user.py (use 'Product', 'Order', 'Invoice', ...). Backend: set JWT_SECRET + ADMIN_USERNAME/ADMIN_PASSWORD in .env, include ALL routers (auth, admin, {{ feature_name|lower }}, export, audit, upload) in {{ project_name }}/main.py, make sure every model is imported (Base.metadata.create_all runs at app import), seed the first admin at startup (from {{ project_name }}.core.rbac import seed_admin; seed_admin()). Frontend: npm install (react-hook-form, recharts), wrap the app in <ToastProvider> + <ErrorBoundary>, mount: login -> <Layout nav=[...]><Dashboard cards=[{label:'{{ feature_name }}s', fetchPath:'/api/{{ feature_name|lower }}s'}] /> <CrudPage resource='{{ feature_name }}' apiPath='/api/{{ feature_name|lower }}s' exportPath='/api/{{ feature_name|lower }}s/export' .../> <SettingsPage/></Layout>. Manage users via CrudPage at /api/admin/users (role field uses the select field type). CI, security gate, docker and nginx come pre-configured.",
+  "sample_vars": {"project_name": "demo_admin", "feature_name": "Product", "model_fields": "name:string,price:float", "service_name": "web"}
+}

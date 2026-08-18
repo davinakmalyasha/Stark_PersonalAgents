@@ -1,0 +1,20 @@
+"""Webhook event record: source, payload, signature, idempotency, processing state."""
+from datetime import datetime
+
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+
+from ..database import Base
+
+
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String(100), index=True, nullable=False)
+    event_type = Column(String(100), index=True, nullable=True)
+    idempotency_key = Column(String(200), index=True, nullable=True)
+    payload = Column(Text, nullable=False)
+    signature = Column(String(200), nullable=True)
+    processed = Column(Boolean, default=False, nullable=False)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)

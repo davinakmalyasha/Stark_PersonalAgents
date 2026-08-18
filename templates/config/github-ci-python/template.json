@@ -1,0 +1,15 @@
+{
+  "name": "github-ci-python",
+  "description": "GitHub Actions CI for Python: syntax check + pytest on every push/PR. Universal config.",
+  "category": "config",
+  "variables": [
+    {"name": "python_version", "type": "string", "default": "3.12", "description": "Python version for the runner"},
+    {"name": "pytest_path", "type": "string", "default": "tests", "description": "Where pytest collects tests from"},
+    {"name": "install_cmd", "type": "string", "default": "pip install -r requirements.txt pytest", "description": "Dependency install command"}
+  ],
+  "files": [
+    {"src": "ci.yml.j2", "dest": ".github/workflows/ci.yml"}
+  ],
+  "notes": "Two jobs: 'syntax' py_compiles every .py file (fails in ~20s on broken files), 'pytest' installs deps and runs the suite. Add pip cache for speed if the install is heavy.",
+  "sample_vars": {"python_version": "3.12", "pytest_path": "tests", "install_cmd": "pip install -r requirements.txt pytest"}
+}

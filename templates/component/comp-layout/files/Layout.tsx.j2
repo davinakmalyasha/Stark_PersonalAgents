@@ -1,0 +1,127 @@
+import { useState } from "react";
+
+export interface NavItem {
+  key: string;
+  label: string;
+  href?: string;
+  icon?: React.ReactNode;
+  onClick?: () => void;
+}
+
+interface Props {
+  title: string;
+  nav: NavItem[];
+  activeKey?: string;
+  children: React.ReactNode;
+  headerRight?: React.ReactNode;
+  footer?: React.ReactNode;
+  sidebarWidth?: number;
+}
+
+/**
+ * App layout shell: sticky header, collapsible sidebar, content outlet, footer.
+ * Usage: <Layout title="My App" nav={[{key:'home', label:'Home'}]} activeKey="home">
+ *           <YourPage />
+ *         </Layout>
+ */
+export default function Layout({
+  title,
+  nav,
+  activeKey,
+  children,
+  headerRight,
+  footer,
+  sidebarWidth = 220,
+}: Props) {
+  const [collapsed, setCollapsed] = useState(false);
+
+  const sidebarStyle: React.CSSProperties = {
+    width: collapsed ? 56 : sidebarWidth,
+    background: "#1e293b",
+    color: "#e2e8f0",
+    display: "flex",
+    flexDirection: "column",
+    transition: "width 0.2s ease",
+    overflow: "hidden",
+  };
+
+  const linkStyle = (active: boolean): React.CSSProperties => ({
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "10px 14px",
+    color: active ? "#fff" : "#94a3b8",
+    background: active ? "#334155" : "transparent",
+    textDecoration: "none",
+    fontSize: 14,
+    whiteSpace: "nowrap",
+  });
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh", fontFamily: "system-ui, sans-serif" }}>
+      <aside style={sidebarStyle}>
+        <div style={{ padding: "12px 14px", fontWeight: 700, whiteSpace: "nowrap" }}>
+          {collapsed ? title[0]?.toUpperCase() : title}
+        </div>
+        <nav style={{ flex: 1 }}>
+          {nav.map((item) => (
+            <a
+              key={item.key}
+              href={item.href}
+              onClick={(e) => {
+                if (item.onClick) {
+                  e.preventDefault();
+                  item.onClick();
+                }
+              }}
+              style={linkStyle(item.key === activeKey)}
+              title={collapsed ? item.label : undefined}
+            >
+              {item.icon}
+              {!collapsed && item.label}
+            </a>
+          ))}
+        </nav>
+        <button
+          onClick={() => setCollapsed((c) => !c)}
+          style={{
+            margin: 8,
+            padding: "8px 12px",
+            background: "#334155",
+            color: "#e2e8f0",
+            border: "none",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          {collapsed ? ">" : "<"}
+        </button>
+      </aside>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <header
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "0 20px",
+            height: 56,
+            borderBottom: "1px solid #e2e8f0",
+            background: "#fff",
+            position: "sticky",
+            top: 0,
+            zIndex: 10,
+          }}
+        >
+          <h1 style={{ fontSize: 18, margin: 0 }}>{title}</h1>
+          {headerRight}
+        </header>
+        <main style={{ flex: 1, padding: 24, background: "#f8fafc" }}>{children}</main>
+        {footer && (
+          <footer style={{ padding: "12px 20px", borderTop: "1px solid #e2e8f0", fontSize: 13, color: "#64748b" }}>
+            {footer}
+          </footer>
+        )}
+      </div>
+    </div>
+  );
+}

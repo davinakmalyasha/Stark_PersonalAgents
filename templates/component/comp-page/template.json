@@ -1,0 +1,18 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): the standard data-page skeleton — fetch on mount, loading / error+retry / empty states, content slot. The most repeated new-file pattern in every frontend; apply it instead of hand-writing the state machine. Composes comp-http-client. Uses [[ ]] delimiters.",
+  "name": "comp-page",
+  "description": "Data-page skeleton: fetch on mount, loading / error+retry / empty states, content slot. The most repeated new-file pattern in frontends.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "uses": [
+    {"template": "comp-http-client", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Page.tsx.j2", "dest": "[[components_dir]]/Page.tsx"}
+  ],
+  "notes": "Usage: <Page fetchPath='/api/orders?page=1&page_size=10' empty={<p>No orders yet</p>}>{(orders) => orders.map((o) => <OrderCard key={o.id} order={o}/>)}</Page>. Handles list envelopes ({items:[...]}) and bare arrays. Pass refreshKey to force a reload after mutations. Wrap in ErrorBoundary for crash safety.",
+  "sample_vars": {"components_dir": "src/components"}
+}

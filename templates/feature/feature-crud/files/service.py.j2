@@ -1,0 +1,54 @@
+"""Service layer for {{ feature_name }} CRUD."""
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from ..core.filters import apply_filters, build_filters
+from ..models.{{ feature_name|lower }} import {{ feature_name }}
+
+# String columns that ?search= matches against (int/float/bool columns excluded).
+_SEARCH_FIELDS = [{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}{% if parts|length < 2 or parts[1] not in ('int', 'integer', 'float', 'double', 'bool', 'boolean') %}"{{ parts[0] }}",{% endif %}{% endfor %}]
+
+
+def create_{{ feature_name|lower }}(db: Session, data) -> {{ feature_name }}:
+    item = {{ feature_name }}(**data.model_dump(exclude_none=True))
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def list_{{ feature_name|lower }}(db: Session, page: int = 1, page_size: int = 20,
+                                 search: str = "", sort: str = "") -> tuple[list[{{ feature_name }}], int]:
+    """Paginated list with ?search= and ?sort=field:dir (see comp-search-filter)."""
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    query = db.query({{ feature_name }})
+    if search or sort:
+        query = apply_filters(query, build_filters({"search": search, "sort": sort}),
+                              search_fields=_SEARCH_FIELDS)
+    total = query.count()
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+    return items, total
+
+
+def get_{{ feature_name|lower }}(db: Session, item_id: int) -> {{ feature_name }} | None:
+    return db.get({{ feature_name }}, item_id)
+
+
+def update_{{ feature_name|lower }}(db: Session, item_id: int, data) -> {{ feature_name }}:
+    item = get_{{ feature_name|lower }}(db, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="{{ feature_name }} not found")
+    for key, value in data.model_dump(exclude_none=True).items():
+        setattr(item, key, value)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def delete_{{ feature_name|lower }}(db: Session, item_id: int) -> None:
+    item = get_{{ feature_name|lower }}(db, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="{{ feature_name }} not found")
+    db.delete(item)
+    db.commit()

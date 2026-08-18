@@ -1,0 +1,21 @@
+{
+  "_comment": "LEVEL 3 (feature): complete JWT auth vertical slice — user model, register/login/refresh/me endpoints, schemas, service, password hashing. package_dir must match the project package name (stack-webapp sets it automatically).",
+  "name": "feature-auth",
+  "description": "Complete backend auth: user model + register/login/refresh/me endpoints, JWT, password hashing. Wire once with include_router.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api' (drives all nested imports)"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/auth/register, /api/auth/login, /api/auth/me)"},
+    {"name": "secret_env", "type": "string", "default": "JWT_SECRET", "description": "Env var holding the JWT signing secret"},
+    {"name": "expire_days", "type": "string", "default": "7", "description": "Access token expiry in days"}
+  ],
+  "files": [
+    {"src": "core/security.py.j2", "dest": "{{ app_name }}/core/security.py"},
+    {"src": "models/user.py.j2", "dest": "{{ app_name }}/models/user.py"},
+    {"src": "schemas/auth.py.j2", "dest": "{{ app_name }}/schemas/auth.py"},
+    {"src": "services/auth_service.py.j2", "dest": "{{ app_name }}/services/auth_service.py"},
+    {"src": "routers/auth.py.j2", "dest": "{{ app_name }}/routers/auth.py"}
+  ],
+  "notes": "After applying: 1) set JWT_SECRET in .env, 2) app.include_router(router) in main.py, 3) make sure the User model is imported so SQLAlchemy creates the table (Base.metadata.create_all runs at app import), 4) protect routes with Depends(get_current_user). Login returns {access_token, token_type, expires_in} and the token carries the user's role claim — matches the frontend comp-login template and the feature-rbac require_role dependency. Refresh: POST /api/auth/refresh with a refresh-typed token. Password hashing uses stdlib pbkdf2 — no extra deps.",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "secret_env": "JWT_SECRET", "expire_days": "7"}
+}

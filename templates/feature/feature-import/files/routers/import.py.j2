@@ -1,0 +1,20 @@
+"""Import endpoint: POST {{ base_path }}/{{ resource_name|lower }}s/import (multipart CSV)."""
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..services.import_service import import_csv_rows
+
+router = APIRouter(tags=["import"])
+
+
+@router.post("/{{ resource_name|lower }}s/import")
+def import_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Bulk-create {{ resource_name }}s from an uploaded CSV (UTF-8, header row)."""
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are accepted")
+    return import_csv_rows(db, file)
+
+
+# TODO: register this router in the app: app.include_router(router)
+# TODO: protect with auth when needed (e.g. dependencies=[Depends(require_role('admin'))])

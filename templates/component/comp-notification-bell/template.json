@@ -1,0 +1,18 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): notification bell — unread badge (polled), dropdown inbox, mark-read / mark-all-read. Pairs with the backend feature-notifications template. Composes comp-http-client. Uses [[ ]] delimiters.",
+  "name": "comp-notification-bell",
+  "description": "Notification bell: unread badge (polled), dropdown inbox, mark-read / mark-all-read. Pairs feature-notifications.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "uses": [
+    {"template": "comp-http-client", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "NotificationBell.tsx.j2", "dest": "[[components_dir]]/NotificationBell.tsx"}
+  ],
+  "notes": "Usage: <NotificationBell basePath='/api/notifications' /> — place in the Layout header (headerRight slot). Polls the unread count every 30s (pollMs prop). Backend contract: GET /api/notifications/unread-count -> {unread}, GET /api/notifications?page=&page_size= -> {items,total,page,page_size,unread}, POST /{id}/read, POST /read-all (see feature-notifications). Requires auth (Bearer token from comp-login's useAuth).",
+  "sample_vars": {"components_dir": "src/components"}
+}

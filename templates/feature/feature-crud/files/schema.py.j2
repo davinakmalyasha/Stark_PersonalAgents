@@ -1,0 +1,29 @@
+"""Pydantic schemas for {{ feature_name }}."""
+from pydantic import BaseModel, ConfigDict
+
+
+class {{ feature_name }}Base(BaseModel):
+{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}
+    {{ parts[0] }}: {% if parts|length > 1 and parts[1] in ('int', 'integer') %}int{% elif parts|length > 1 and parts[1] in ('float', 'double') %}float{% elif parts|length > 1 and parts[1] in ('bool', 'boolean') %}bool{% else %}str{% endif %} = None
+{% endfor %}
+
+
+class {{ feature_name }}Create({{ feature_name }}Base):
+    pass
+
+
+class {{ feature_name }}Update({{ feature_name }}Base):
+    pass
+
+
+class {{ feature_name }}Read({{ feature_name }}Base):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+
+
+class {{ feature_name }}ListResponse(BaseModel):
+    """Paginated list envelope — matches the admin page (comp-crud-page)."""
+    items: list[{{ feature_name }}Read]
+    total: int
+    page: int
+    page_size: int

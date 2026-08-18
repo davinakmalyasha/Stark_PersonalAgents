@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): app layout shell — header + collapsible sidebar + content outlet + footer. Uses [[ ]] delimiters so it never collides with JS/HTML template syntax.",
+  "name": "comp-layout",
+  "description": "App layout shell: sticky header, collapsible sidebar, content outlet, footer. Place in src/components/.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Layout.tsx.j2", "dest": "[[components_dir]]/Layout.tsx"}
+  ],
+  "notes": "Usage: <Layout title='My App' nav={[{key:'home',label:'Home',href:'/'}]} activeKey='home' headerRight={<button>}>{page}</Layout>. Self-contained, no extra deps. Pair with comp-login for the auth gate.",
+  "sample_vars": {"components_dir": "src/components"}
+}

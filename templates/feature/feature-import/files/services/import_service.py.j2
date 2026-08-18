@@ -1,0 +1,55 @@
+"""Bulk CSV import for {{ resource_name }}: parse -> validate -> bulk create."""
+import csv
+import io
+from typing import Any, Optional
+
+from fastapi import HTTPException, UploadFile
+from sqlalchemy.orm import Session
+
+from ..models.{{ resource_name|lower }} import {{ resource_name }}
+
+_STRING_FIELDS = [{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}{% if parts|length < 2 or parts[1] not in ('int', 'integer', 'float', 'double', 'bool', 'boolean') %}"{{ parts[0] }}",{% endif %}{% endfor %}]
+_INT_FIELDS = [{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}{% if parts|length > 1 and parts[1] in ('int', 'integer') %}"{{ parts[0] }}",{% endif %}{% endfor %}]
+_FLOAT_FIELDS = [{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}{% if parts|length > 1 and parts[1] in ('float', 'double') %}"{{ parts[0] }}",{% endif %}{% endfor %}]
+_BOOL_FIELDS = [{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}{% if parts|length > 1 and parts[1] in ('bool', 'boolean') %}"{{ parts[0] }}",{% endif %}{% endfor %}]
+
+
+def _parse_value(field: str, raw: str) -> Any:
+    raw = raw.strip()
+    if field in _INT_FIELDS:
+        return int(raw) if raw else None
+    if field in _FLOAT_FIELDS:
+        return float(raw) if raw else None
+    if field in _BOOL_FIELDS:
+        return raw.lower() in ("1", "true", "yes", "on")
+    return raw if raw else None
+
+
+def import_csv_rows(db: Session, file: UploadFile, required_fields: Optional[list[str]] = None) -> dict:
+    """Parse the uploaded CSV, validate, and bulk-create rows.
+
+    Returns {"created": n, "errors": [{"row": i, "message": "..."}]} — rows with
+    errors are skipped, valid rows are still inserted (partial import).
+    """
+    required = required_fields or _STRING_FIELDS[:1] or ["{{ resource_name|lower }}_name"]
+    try:
+        raw = io.StringIO(file.file.read().decode("utf-8-sig"))
+        reader = csv.DictReader(raw)
+        headers = [h.strip() for h in (reader.fieldnames or [])]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
+
+    created, errors = 0, []
+    for i, row in enumerate(reader, start=2):  # row 1 = header
+        data = {k.strip(): _parse_value(k.strip(), v) for k, v in row.items()}
+        missing = [f for f in required if not data.get(f)]
+        if missing:
+            errors.append({"row": i, "message": f"missing required column(s): {', '.join(missing)}"})
+            continue
+        try:
+            db.add({{ resource_name }}(**{k: v for k, v in data.items() if v is not None}))
+            created += 1
+        except Exception as e:
+            errors.append({"row": i, "message": str(e)[:200]})
+    db.commit()
+    return {"created": created, "errors": errors, "total_rows": i - 1 if i > 1 else 0}

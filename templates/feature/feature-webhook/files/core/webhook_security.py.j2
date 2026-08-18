@@ -1,0 +1,25 @@
+"""Webhook security: HMAC-SHA256 signature helpers (body-bound, constant-time)."""
+import hashlib
+import hmac
+import os
+
+
+def _secret() -> bytes:
+    secret = os.environ.get("{{ secret_env }}", "")
+    if not secret:
+        raise RuntimeError("{{ secret_env }} is not set — add it to .env")
+    return secret.encode()
+
+
+def expected_digest(timestamp: str, body: bytes) -> str:
+    """Sender computes hmac_sha256(secret, f'{timestamp}.{raw_body}') — hex."""
+    message = f"{timestamp}.".encode() + body
+    return hmac.new(_secret(), message, hashlib.sha256).hexdigest()
+
+
+def verify_hmac(timestamp: str, body: bytes, signature: str) -> bool:
+    """True when `signature` (format 'sha256=<hex>') matches, constant-time."""
+    if not signature.startswith("sha256="):
+        return False
+    provided = signature.split("=", 1)[1]
+    return hmac.compare_digest(provided, expected_digest(timestamp, body))

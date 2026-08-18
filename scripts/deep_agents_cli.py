@@ -1,8 +1,14 @@
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 import sys
 import time
 from dotenv import load_dotenv
-from sync_manager import run_and_sync_graph
-from state_sync import shared_state
+from sync.sync_manager import run_and_sync_graph
+from sync.state_sync import shared_state
 
 load_dotenv(override=True)
 

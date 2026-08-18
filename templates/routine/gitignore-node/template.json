@@ -1,0 +1,11 @@
+{
+  "name": "gitignore-node",
+  "description": "Universal Node.js .gitignore: node_modules, builds, env, logs.",
+  "category": "routine",
+  "variables": [],
+  "files": [
+    {"src": "gitignore.j2", "dest": ".gitignore"}
+  ],
+  "notes": "Works standalone or merged into an existing .gitignore. Never remove the env section.",
+  "sample_vars": {}
+}

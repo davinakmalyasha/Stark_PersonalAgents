@@ -1,0 +1,79 @@
+import { useEffect, useState } from "react";
+import { api } from "./api";
+
+interface CardDef {
+  label: string;          // e.g. "Users"
+  fetchPath: string;      // e.g. "/api/users" — reads total from the list envelope
+  valueKey?: string;      // fallback: read this key from the response instead of "total"
+  accent?: string;        // card accent color
+}
+
+interface Props {
+  cards: CardDef[];
+  charts?: React.ReactNode;   // grid of charts — pass LineChartView/BarChartView/PieChartView from Charts.tsx
+}
+
+const cardStyle: React.CSSProperties = {
+  border: "1px solid #e2e8f0",
+  borderRadius: 8,
+  background: "#fff",
+  padding: "16px 20px",
+  boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
+};
+
+/**
+ * Admin dashboard home: KPI cards (totals from the CRUD list envelope —
+ * GET ?page=1&page_size=1 returns {total,...}) + a charts grid.
+ * Usage:
+ *   <Dashboard cards={[{label:'Users', fetchPath:'/api/users'}, {label:'Orders', fetchPath:'/api/orders'}]}
+ *              charts={<><LineChartView data={...} xKey="day" yKeys={['count']} /></>} />
+ */
+export default function Dashboard({ cards, charts }: Props) {
+  const [values, setValues] = useState<Record<string, string | number>>({});
+  const [errors, setErrors] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    let alive = true;
+    cards.forEach(async (card) => {
+      try {
+        const data = await api<any>(`${card.fetchPath}?page=1&page_size=1`);
+        if (!alive) return;
+        const value = card.valueKey ? data?.[card.valueKey] : data?.total;
+        setValues((prev) => ({ ...prev, [card.label]: value ?? "\u2014" }));
+      } catch {
+        if (alive) setErrors((prev) => ({ ...prev, [card.label]: true }));
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [cards]);
+
+  return (
+    <div style={{ fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 16 }}>
+        {cards.map((card) => (
+          <div key={card.label} style={{ ...cardStyle, borderTop: `3px solid ${card.accent ?? "#2563eb"}` }}>
+            <div style={{ fontSize: 13, color: "#64748b" }}>{card.label}</div>
+            <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4 }}>
+              {errors[card.label] ? "\u2014" : values[card.label] ?? "\u2026"}
+            </div>
+          </div>
+        ))}
+      </div>
+      {charts && (
+        <div style={{ marginTop: 24 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(420px, 1fr))",
+              gap: 16,
+            }}
+          >
+            {charts}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

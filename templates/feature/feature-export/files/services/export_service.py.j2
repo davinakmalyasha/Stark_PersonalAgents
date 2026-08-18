@@ -1,0 +1,24 @@
+"""CSV export for {{ resource_name }} — streams every matching row as CSV."""
+import io
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from ..core.csv_export import to_csv_string
+from ..core.filters import apply_filters, build_filters
+from ..models.{{ resource_name|lower }} import {{ resource_name }}
+
+_SEARCH_FIELDS = [{% for f in model_fields.split(',') if model_fields %}{% set parts = f.strip().split(':') %}{% if parts|length < 2 or parts[1] not in ('int', 'integer', 'float', 'double', 'bool', 'boolean') %}"{{ parts[0] }}",{% endif %}{% endfor %}]
+
+
+def export_{{ resource_name|lower }}_rows(db: Session, search: str = "", sort: str = "") -> str:
+    """All rows matching ?search=&sort= as CSV text (UTF-8 BOM for Excel)."""
+    query = db.query({{ resource_name }})
+    if search or sort:
+        query = apply_filters(query, build_filters({"search": search, "sort": sort}),
+                              search_fields=_SEARCH_FIELDS)
+    rows = query.all()
+    if not rows:
+        return to_csv_string([])
+    dicts = [row.__dict__ for row in rows]
+    return to_csv_string(dicts)

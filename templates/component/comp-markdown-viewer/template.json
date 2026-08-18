@@ -1,0 +1,18 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): safe minimal markdown renderer — headings, bold/italic, links, lists, inline + fenced code (via comp-code-block). Escaped React nodes, no dangerouslySetInnerHTML for raw text, zero deps. Composes comp-code-block. Uses [[ ]] delimiters.",
+  "name": "comp-markdown-viewer",
+  "description": "Safe markdown renderer: headings, bold/italic, links, lists, inline + fenced code blocks. Zero deps, escaped output.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "uses": [
+    {"template": "comp-code-block", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "MarkdownViewer.tsx.j2", "dest": "[[components_dir]]/MarkdownViewer.tsx"}
+  ],
+  "notes": "Usage: <MarkdownViewer text={assistantReply} /> — render AI chat answers, docs, READMEs. Fenced code blocks render via comp-code-block (copy + highlighting). Upgrade: swap the body for react-markdown if richer syntax (tables, footnotes) is needed.",
+  "sample_vars": {"components_dir": "src/components"}
+}

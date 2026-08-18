@@ -1,0 +1,14 @@
+{
+  "_comment": "LEVEL 3 (feature): in-memory token-bucket rate limiter as a FastAPI dependency — subtle concurrency logic that is safer to copy than to generate. No extra deps.",
+  "name": "feature-rate-limit",
+  "description": "Token-bucket rate limiter: FastAPI dependency factory (per-IP or per-user), 429 + Retry-After. No extra deps.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api'"}
+  ],
+  "files": [
+    {"src": "core/rate_limit.py.j2", "dest": "{{ app_name }}/core/rate_limit.py"}
+  ],
+  "notes": "Usage: dependencies=[Depends(rate_limit('5/minute'))] on a route, or rate_limit('10/minute', key=user_key) for per-user limits (see user_key — it reads the Bearer token directly so it works before get_current_user runs). In-memory bucket: resets on restart; swap _BUCKETS for a redis-backed store in multi-worker deployments. Returns HTTP 429 with Retry-After.",
+  "sample_vars": {"app_name": "app"}
+}

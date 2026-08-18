@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): typed fetch wrapper — baseURL, timeout, error envelope, bearer auth. Pairs with util-api-response's {ok/error} envelope. Uses [[ ]] delimiters.",
+  "name": "comp-http-client",
+  "description": "Typed fetch wrapper: JSON bodies, timeout, ApiError envelope, optional bearer auth. Place in src/lib or src/services.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/lib", "description": "Frontend lib directory (src/lib for helpers, or src/services)"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "api.ts.j2", "dest": "[[components_dir]]/api.ts"}
+  ],
+  "notes": "Usage: await api('/users?page=2'); await api('/users', {method:'POST', body:{name:'Ada'}, auth:true}); Throws ApiError {status,message}. The auth flag reads the Bearer token from localStorage key 'auth_token' (set by comp-login's useAuth — it lives in the same src/components dir when comp-login is applied). TODO: align baseURL default '/api' with your backend proxy.",
+  "sample_vars": {"components_dir": "src/lib"}
+}

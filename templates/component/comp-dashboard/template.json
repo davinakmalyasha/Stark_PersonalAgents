@@ -1,0 +1,19 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): admin dashboard home — KPI cards (totals read from the CRUD list envelope, no extra backend) + a charts grid reusing comp-charts. Uses [[ ]] delimiters.",
+  "name": "comp-dashboard",
+  "description": "Admin dashboard home: KPI cards (totals from list envelopes) + charts grid (composes comp-charts).",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "uses": [
+    {"template": "comp-charts", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-http-client", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Dashboard.tsx.j2", "dest": "[[components_dir]]/Dashboard.tsx"}
+  ],
+  "notes": "Usage: <Dashboard cards={[{label:'Users', fetchPath:'/api/users'}, {label:'Orders', fetchPath:'/api/orders', accent:'#10b981'}]} charts={<><LineChartView data={trend} xKey='day' yKeys={['count']}/></>} />. KPI cards read {total} from the feature-crud list envelope (GET ?page=1&page_size=1) — no stats backend needed. Charts come from Charts.tsx (requires recharts: npm install recharts — see comp-charts).",
+  "sample_vars": {"components_dir": "src/components"}
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): marketing landing page shell — hero + CTA, features grid, content sections, footer. Content-driven, zero deps. Used by stack-landing. Uses [[ ]] delimiters.",
+  "name": "comp-landing",
+  "description": "Marketing landing page: hero + CTA, features grid, content sections, footer. Content-driven, zero deps.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Landing.tsx.j2", "dest": "[[components_dir]]/Landing.tsx"}
+  ],
+  "notes": "Usage: <Landing brand='Acme' heroTitle='Ship faster' heroSubtitle='The fastest way to X' ctaLabel='Get started' ctaHref='/signup' features={[{title:'Fast', description:'...', icon:'⚡'}]} sections={[{title:'How it works', heading:'Step 1', body:'...', image:'/img.png'}]} />. Pairs with stack-landing; customize colors by editing the inline styles.",
+  "sample_vars": {"components_dir": "src/components"}
+}

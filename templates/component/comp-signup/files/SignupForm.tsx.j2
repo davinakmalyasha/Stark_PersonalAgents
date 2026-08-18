@@ -1,0 +1,130 @@
+import { useState } from "react";
+import { api } from "./api";
+
+interface Props {
+  apiBase: string;                // e.g. "/api"
+  onRegistered: (username: string, password: string) => void; // call auth.login here
+  onError?: (message: string) => void;
+}
+
+const inputStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "10px 12px",
+  marginBottom: 12,
+  border: "1px solid #cbd5e1",
+  borderRadius: 6,
+  fontSize: 14,
+};
+
+/**
+ * Signup form: posts {username, password} to {apiBase}/auth/register (feature-auth),
+ * then calls onRegistered(username, password) so the parent can auto-login
+ * (auth.login from comp-login's useAuth).
+ *
+ * Usage: <SignupForm apiBase="/api" onRegistered={(u, p) => { auth.login(tokenFromLogin); }} />
+ */
+export default function SignupForm({ apiBase, onRegistered, onError }: Props) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    if (username.trim().length < 3) {
+      setError("Username must be at least 3 characters");
+      return;
+    }
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters");
+      return;
+    }
+    if (password !== confirm) {
+      setError("Passwords do not match");
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await api<any>(`${apiBase}/auth/register`, {
+        method: "POST",
+        body: { username: username.trim(), password },
+      });
+      onRegistered(username.trim(), password);
+      void res;
+    } catch (err: any) {
+      const msg = err?.status === 409 ? "That username is already taken" : err?.message || "Signup failed";
+      setError(msg);
+      onError?.(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={submit}
+      style={{
+        width: 320,
+        margin: "80px auto",
+        padding: 24,
+        border: "1px solid #e2e8f0",
+        borderRadius: 8,
+        background: "#fff",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
+      }}
+    >
+      <h2 style={{ margin: "0 0 16px", fontSize: 18 }}>Create account</h2>
+      <input
+        style={inputStyle}
+        placeholder="Username"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        autoComplete="username"
+        minLength={3}
+        required
+      />
+      <input
+        style={inputStyle}
+        type="password"
+        placeholder="Password (min 8 chars)"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        autoComplete="new-password"
+        minLength={8}
+        required
+      />
+      <input
+        style={inputStyle}
+        type="password"
+        placeholder="Confirm password"
+        value={confirm}
+        onChange={(e) => setConfirm(e.target.value)}
+        autoComplete="new-password"
+        required
+      />
+      {error && (
+        <p style={{ color: "#dc2626", fontSize: 13, margin: "0 0 12px" }} role="alert">
+          {error}
+        </p>
+      )}
+      <button
+        type="submit"
+        disabled={loading}
+        style={{
+          width: "100%",
+          padding: "10px 12px",
+          background: "#2563eb",
+          color: "#fff",
+          border: "none",
+          borderRadius: 6,
+          fontSize: 14,
+          cursor: loading ? "wait" : "pointer",
+        }}
+      >
+        {loading ? "Creating account\u2026" : "Sign up"}
+      </button>
+    </form>
+  );
+}

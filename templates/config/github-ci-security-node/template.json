@@ -1,0 +1,21 @@
+{
+  "_comment": "THE GATE — node profile. Covers plain node, Next.js, Vite/React, Express (same four jobs: quality, coverage, bundle, perf-smoke). npm audit SCA, gitleaks, ESLint+prettier+tsc, c8 coverage, bundle budget, main-import perf, semgrep, trivy, codeql-js, zizmor.",
+  "name": "github-ci-security-node",
+  "description": "Enterprise-grade node/Next.js gate: npm audit SCA, gitleaks secrets, ESLint+prettier+tsc quality, c8 coverage threshold, bundle-size budget, perf-smoke, Semgrep, Trivy, CodeQL-js, zizmor.",
+  "category": "config",
+  "variables": [
+    {"name": "node_version", "type": "string", "default": "22", "description": "Node major version"},
+    {"name": "gitleaks_version", "type": "string", "default": "8.30.1", "description": "Pinned gitleaks release"},
+    {"name": "zizmor_version", "type": "string", "default": "1.29.0", "description": "Pinned zizmor release"},
+    {"name": "trivy_version", "type": "string", "default": "0.73.0", "description": "Pinned trivy release"},
+    {"name": "codeql_on", "type": "string", "default": "true", "description": "Include the CodeQL job"},
+    {"name": "coverage_threshold", "type": "string", "default": "80", "description": "c8 line coverage threshold"},
+    {"name": "bundle_budget_kb", "type": "string", "default": "500", "description": "Largest emitted asset budget (KB)"},
+    {"name": "perf_import_budget_ms", "type": "string", "default": "5000", "description": "Main-entry import budget (ms)"}
+  ],
+  "files": [
+    {"src": "security.yml.j2", "dest": ".github/workflows/security.yml"}
+  ],
+  "notes": "Contexts: sca, secrets, quality, coverage, bundle, perf-smoke, semgrep, container, codeql, zizmor. Next.js projects: 'npm run lint' runs next lint, 'npm run build' runs next build, tsc --noEmit type-checks — no profile change needed. All jobs graceful-skip when the dependency/config is absent.",
+  "sample_vars": {"node_version": "22", "codeql_on": "true", "coverage_threshold": "80", "bundle_budget_kb": "500"}
+}

@@ -1,0 +1,73 @@
+import { Component, ErrorInfo, ReactNode } from "react";
+
+interface Props {
+  children: ReactNode;
+  fallback?: ReactNode;
+  onError?: (error: Error, info: ErrorInfo) => void;
+}
+
+interface State {
+  error: Error | null;
+}
+
+/**
+ * React Error Boundary with a retry button. Wrap any subtree that must never
+ * crash the whole app (async-loaded pages, third-party widgets).
+ *
+ * Usage:
+ *   <ErrorBoundary onError={(e) => console.error(e)}>
+ *     <Dashboard />
+ *   </ErrorBoundary>
+ */
+export default class ErrorBoundary extends Component<Props, State> {
+  state: State = { error: null };
+
+  static getDerivedStateFromError(error: Error): State {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    this.props.onError?.(error, info);
+  }
+
+  private reset = () => this.setState({ error: null });
+
+  render() {
+    if (this.state.error) {
+      if (this.props.fallback) return this.props.fallback;
+      return (
+        <div
+          role="alert"
+          style={{
+            margin: 24,
+            padding: 24,
+            border: "1px solid #fecaca",
+            borderRadius: 8,
+            background: "#fef2f2",
+            color: "#7f1d1d",
+            fontFamily: "system-ui, sans-serif",
+          }}
+        >
+          <h3 style={{ margin: "0 0 8px", fontSize: 16 }}>Something went wrong</h3>
+          <p style={{ margin: "0 0 12px", fontSize: 13, overflowWrap: "anywhere" }}>
+            {this.state.error.message}
+          </p>
+          <button
+            onClick={this.reset}
+            style={{
+              padding: "8px 16px",
+              background: "#dc2626",
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              cursor: "pointer",
+            }}
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}

@@ -1,0 +1,41 @@
+"""Webhook receiver: HMAC-verified, idempotent, recorded inbound events."""
+import json
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from sqlalchemy.orm import Session
+
+from ..core.webhook_security import verify_hmac
+from ..database import get_db
+from ..services.webhook_service import dispatch, record_event
+
+router = APIRouter(prefix="{{ base_path }}/webhooks", tags=["webhooks"])
+
+
+@router.post("/{source}", status_code=200)
+async def receive(
+    source: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    x_webhook_signature: str = Header(default=""),
+    x_webhook_timestamp: str = Header(default=""),
+    x_idempotency_key: str = Header(default=""),
+):
+    """Receive + verify + record a webhook event. Replays (same idempotency key)
+    return 200 without re-running the handler. 401 on bad signature."""
+    raw = await request.body()
+    if not verify_hmac(x_webhook_timestamp, raw, x_webhook_signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = raw.decode("utf-8", "replace")
+
+    event = record_event(db, source, json.dumps(payload), x_webhook_signature,
+                         idempotency_key=x_idempotency_key)
+    dispatch(db, event)
+    return {"received": True, "id": event.id}
+
+
+# TODO: register this router in the app: app.include_router(router)
+# TODO: set {{ secret_env }} in .env — senders sign bodies as sha256=hex(hmac(secret, f'{timestamp}.{body}'))

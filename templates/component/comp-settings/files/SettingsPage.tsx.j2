@@ -1,0 +1,137 @@
+import { useCallback, useEffect, useState } from "react";
+import { useAuth } from "./useAuth";
+import { api } from "./api";
+
+interface Props {
+  mePath?: string;            // GET profile, e.g. "/api/auth/me"
+  changePasswordPath?: string; // POST {old_password,new_password}, e.g. "/api/auth/change-password"
+  onLogout?: () => void;      // default: auth.logout() from comp-login's useAuth
+}
+
+const inputStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "10px 12px",
+  border: "1px solid #cbd5e1",
+  borderRadius: 6,
+  fontSize: 14,
+  marginBottom: 12,
+};
+const labelStyle: React.CSSProperties = {
+  display: "block",
+  fontSize: 13,
+  color: "#475569",
+  marginBottom: 4,
+};
+const card: React.CSSProperties = {
+  border: "1px solid #e2e8f0",
+  borderRadius: 8,
+  background: "#fff",
+  padding: 20,
+  maxWidth: 480,
+};
+
+/**
+ * Settings page: account info (from the auth /me endpoint), change password,
+ * and logout. Pair with comp-login's useAuth and feature-auth's /me.
+ */
+export default function SettingsPage({
+  mePath = "/api/auth/me",
+  changePasswordPath = "/api/auth/change-password",
+  onLogout,
+}: Props) {
+  const auth = useAuth();
+  const logout = onLogout ?? auth.logout;
+
+  const [profile, setProfile] = useState<{ username: string; role: string } | null>(null);
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    api<any>(mePath, { auth: true })
+      .then((data) => setProfile({ username: data.username, role: data.role }))
+      .catch((err: any) => setError(err?.message || "Could not load profile"));
+  }, [mePath]);
+
+  const changePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      await api(changePasswordPath, {
+        method: "POST",
+        body: { old_password: oldPassword, new_password: newPassword },
+        auth: true,
+      });
+      setOldPassword("");
+      setNewPassword("");
+      setMessage("Password updated");
+    } catch (err: any) {
+      setError(err?.message || "Password change failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ fontFamily: "system-ui, sans-serif", display: "grid", gap: 16 }}>
+      <div style={card}>
+        <h3 style={{ margin: "0 0 12px", fontSize: 16 }}>Account</h3>
+        <label style={labelStyle}>Username</label>
+        <input style={inputStyle} value={profile?.username ?? ""} disabled />
+        <label style={labelStyle}>Role</label>
+        <input style={inputStyle} value={profile?.role ?? ""} disabled />
+      </div>
+
+      {changePasswordPath && (
+        <form style={card} onSubmit={changePassword}>
+          <h3 style={{ margin: "0 0 12px", fontSize: 16 }}>Change password</h3>
+          <label style={labelStyle}>Current password</label>
+          <input
+            style={inputStyle}
+            type="password"
+            value={oldPassword}
+            onChange={(e) => setOldPassword(e.target.value)}
+            required
+          />
+          <label style={labelStyle}>New password (min 8 chars)</label>
+          <input
+            style={inputStyle}
+            type="password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            minLength={8}
+            required
+          />
+          {message && <p style={{ color: "#16a34a", fontSize: 13, margin: "0 0 8px" }}>{message}</p>}
+          {error && <p style={{ color: "#dc2626", fontSize: 13, margin: "0 0 8px" }} role="alert">{error}</p>}
+          <button
+            type="submit"
+            disabled={busy}
+            style={{
+              padding: "10px 14px", background: "#2563eb", color: "#fff",
+              border: "none", borderRadius: 6, fontSize: 14, cursor: "pointer",
+            }}
+          >
+            {busy ? "Saving\u2026" : "Update password"}
+          </button>
+        </form>
+      )}
+
+      <div style={card}>
+        <button
+          onClick={logout}
+          style={{
+            padding: "10px 14px", background: "#dc2626", color: "#fff",
+            border: "none", borderRadius: 6, fontSize: 14, cursor: "pointer",
+          }}
+        >
+          Log out
+        </button>
+      </div>
+    </div>
+  );
+}

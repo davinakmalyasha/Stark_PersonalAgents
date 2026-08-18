@@ -1,0 +1,17 @@
+{
+  "name": "readme",
+  "description": "README skeleton: what/why/how, setup, run, test, project structure.",
+  "category": "routine",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Project name"},
+    {"name": "description", "type": "string", "default": "One-line description", "description": "What the project does"},
+    {"name": "run_cmd", "type": "string", "default": "python main.py", "description": "Command to run the app"},
+    {"name": "install_cmd", "type": "string", "default": "pip install -r requirements.txt", "description": "Command to install deps"},
+    {"name": "test_cmd", "type": "string", "default": "pytest", "description": "Command to run tests"}
+  ],
+  "files": [
+    {"src": "README.md.j2", "dest": "README.md"}
+  ],
+  "notes": "Fill the structure section from the real repo layout. This is also the file agents read first — keep it accurate.",
+  "sample_vars": {"project_name": "my-api", "description": "FastAPI backend for X", "run_cmd": "uvicorn app.main:app", "install_cmd": "pip install -r requirements.txt", "test_cmd": "pytest"}
+}

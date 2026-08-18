@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): React Error Boundary with retry UI — prevents a crashed subtree from killing the whole app. Uses [[ ]] delimiters.",
+  "name": "comp-error-boundary",
+  "description": "React Error Boundary with retry button + optional onError hook. Wrap risky subtrees so one crash never kills the app.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "ErrorBoundary.tsx.j2", "dest": "[[components_dir]]/ErrorBoundary.tsx"}
+  ],
+  "notes": "Usage: <ErrorBoundary onError={(e)=>console.error(e)}><Dashboard/></ErrorBoundary>. Retry resets the boundary state and re-renders children. Wrap async-loaded pages, charts, and third-party widgets.",
+  "sample_vars": {"components_dir": "src/components"}
+}

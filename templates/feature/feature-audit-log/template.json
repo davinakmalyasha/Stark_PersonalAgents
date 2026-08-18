@@ -1,0 +1,18 @@
+{
+  "_comment": "LEVEL 3 (feature): audit trail — AuditLog model + log_action helper + admin-only paginated /admin/audit endpoint. Self-contained (its own admin guard), no cross-feature imports.",
+  "name": "feature-audit-log",
+  "description": "Audit trail: AuditLog model, log_action helper, admin-only paginated GET /admin/audit (filter by actor/resource/action).",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_admin'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix (route: /api/admin/audit)"},
+    {"name": "resource", "type": "string", "default": "user", "description": "Default resource label used in the model comment (any string, cosmetic)"}
+  ],
+  "files": [
+    {"src": "models/audit_log.py.j2", "dest": "{{ app_name }}/models/audit_log.py"},
+    {"src": "services/audit_service.py.j2", "dest": "{{ app_name }}/services/audit_service.py"},
+    {"src": "routers/audit.py.j2", "dest": "{{ app_name }}/routers/audit.py"}
+  ],
+  "notes": "After applying: 1) app.include_router(router), 2) make sure the AuditLog model is imported so SQLAlchemy creates the table, 3) call log_action(db, claims, 'create', 'user', item.id, ...) inside mutation endpoints (the claims dict comes from get_current_user). The guard checks claims['role'] == 'admin' (feature-auth tokens carry the role claim). Frontend: admin table via comp-crud-page at {base_path}/admin/audit.",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "resource": "user"}
+}

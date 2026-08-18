@@ -1,0 +1,19 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): settings page — account info from /auth/me, change-password form, logout. Composes comp-login (useAuth) + comp-http-client. Uses [[ ]] delimiters.",
+  "name": "comp-settings",
+  "description": "Settings page: account info (from /auth/me), change-password form, logout. Pairs comp-login + feature-auth.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "uses": [
+    {"template": "comp-login", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-http-client", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "SettingsPage.tsx.j2", "dest": "[[components_dir]]/SettingsPage.tsx"}
+  ],
+  "notes": "Usage: <SettingsPage /> (defaults: GET /api/auth/me, POST /api/auth/change-password). TODO: implement the change-password endpoint if the backend doesn't have one (feature-auth has login/refresh/me — a change-password route is a small addition) or pass changePasswordPath=null to hide it. Logout clears the token via comp-login's useAuth.",
+  "sample_vars": {"components_dir": "src/components"}
+}

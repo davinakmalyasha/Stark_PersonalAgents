@@ -1,0 +1,44 @@
+"""Webhook service: idempotent record + dispatch hook."""
+import json
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from ..models.webhook_event import WebhookEvent
+
+
+def record_event(db: Session, source: str, payload_text: str, signature: str,
+                 idempotency_key: str = "") -> WebhookEvent:
+    """Store the event. Returns the existing record when the idempotency key was
+    already seen (replay protection) — the caller returns 200 without re-running."""
+    if idempotency_key:
+        existing = db.query(WebhookEvent).filter(
+            WebhookEvent.idempotency_key == idempotency_key).first()
+        if existing:
+            return existing
+    event = WebhookEvent(
+        source=source,
+        idempotency_key=idempotency_key or None,
+        payload=payload_text,
+        signature=signature,
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def dispatch(db: Session, event: WebhookEvent) -> None:
+    """Route the event to a handler. TODO: implement per-source handlers, e.g.
+        if event.event_type == 'payment.succeeded':
+            handle_payment_succeeded(json.loads(event.payload))
+    """
+    try:
+        json.loads(event.payload)  # payload sanity check
+        # TODO: dispatch to your handlers here; mark processed on success.
+        event.processed = True
+        db.commit()
+    except Exception as e:
+        event.error = str(e)[:2000]
+        db.commit()
+        raise HTTPException(status_code=500, detail="Webhook handler failed")

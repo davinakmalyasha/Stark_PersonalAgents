@@ -1,0 +1,111 @@
+import { useState } from "react";
+
+interface Props {
+  apiBase: string;
+  onLogin: (token: string) => void;
+  onError?: (message: string) => void;
+  redirectPath?: string;
+}
+
+/**
+ * Login form: posts {username, password} to `{apiBase}/auth/login`,
+ * expects {"access_token": "..."} (or {"token": "..."}), calls onLogin(token).
+ * Pair with useAuth from the same folder to store the token and guard routes.
+ */
+export default function LoginForm({ apiBase, onLogin, onError }: Props) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const res = await fetch(`${apiBase}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.detail || body?.message || `Login failed (${res.status})`);
+      }
+      const data = await res.json();
+      const token = data.access_token || data.token;
+      if (!token) throw new Error("Response has no access_token");
+      onLogin(token);
+    } catch (err: any) {
+      const msg = err.message || "Login failed";
+      setError(msg);
+      onError?.(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    padding: "10px 12px",
+    marginBottom: 12,
+    border: "1px solid #cbd5e1",
+    borderRadius: 6,
+    fontSize: 14,
+  };
+
+  return (
+    <form
+      onSubmit={submit}
+      style={{
+        width: 320,
+        margin: "80px auto",
+        padding: 24,
+        border: "1px solid #e2e8f0",
+        borderRadius: 8,
+        background: "#fff",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
+      }}
+    >
+      <h2 style={{ margin: "0 0 16px", fontSize: 18 }}>Sign in</h2>
+      <input
+        style={inputStyle}
+        placeholder="Username"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        autoComplete="username"
+        required
+      />
+      <input
+        style={inputStyle}
+        type="password"
+        placeholder="Password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        autoComplete="current-password"
+        required
+      />
+      {error && (
+        <p style={{ color: "#dc2626", fontSize: 13, margin: "0 0 12px" }} role="alert">
+          {error}
+        </p>
+      )}
+      <button
+        type="submit"
+        disabled={loading}
+        style={{
+          width: "100%",
+          padding: "10px 12px",
+          background: "#2563eb",
+          color: "#fff",
+          border: "none",
+          borderRadius: 6,
+          fontSize: 14,
+          cursor: loading ? "wait" : "pointer",
+        }}
+      >
+        {loading ? "Signing in\u2026" : "Sign in"}
+      </button>
+    </form>
+  );
+}

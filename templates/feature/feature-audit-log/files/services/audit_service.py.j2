@@ -1,0 +1,42 @@
+"""Audit service: write + paginated admin listing."""
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
+from ..models.audit_log import AuditLog
+
+
+def log_action(db: Session, actor: dict, action: str, resource: str,
+               resource_id: str = "", detail: str = "") -> AuditLog:
+    """Record one audit entry. actor = the token claims dict from get_current_user."""
+    entry = AuditLog(
+        actor_id=int(actor["sub"]) if actor and actor.get("sub") else None,
+        actor_username=(actor or {}).get("username", ""),
+        action=action,
+        resource=resource,
+        resource_id=str(resource_id) if resource_id is not None else "",
+        detail=detail[:2000],
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def list_audit(db: Session, page: int = 1, page_size: int = 20,
+               actor: str = "", resource: str = "",
+               action: str = "") -> tuple[list[AuditLog], int]:
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    query = db.query(AuditLog)
+    if actor:
+        query = query.filter(AuditLog.actor_username.ilike(f"%{actor}%"))
+    if resource:
+        query = query.filter(AuditLog.resource == resource)
+    if action:
+        query = query.filter(AuditLog.action == action)
+    total = query.count()
+    items = query.order_by(AuditLog.created_at.desc()).\
+        offset((page - 1) * page_size).limit(page_size).all()
+    return items, total

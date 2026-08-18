@@ -1,0 +1,19 @@
+{
+  "_comment": "LEVEL 3 (feature): inbound webhook receiver — HMAC-SHA256 body-bound signature verification, idempotency-key replay protection, event recording + handler dispatch hook.",
+  "name": "feature-webhook",
+  "description": "Inbound webhook receiver: HMAC-SHA256 body verification, idempotency-key replay protection, recorded events with handler dispatch.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix (route: /api/webhooks/{source})"},
+    {"name": "secret_env", "type": "string", "default": "WEBHOOK_SECRET", "description": "Env var holding the shared HMAC secret"}
+  ],
+  "files": [
+    {"src": "core/webhook_security.py.j2", "dest": "{{ app_name }}/core/webhook_security.py"},
+    {"src": "models/webhook_event.py.j2", "dest": "{{ app_name }}/models/webhook_event.py"},
+    {"src": "services/webhook_service.py.j2", "dest": "{{ app_name }}/services/webhook_service.py"},
+    {"src": "routers/webhooks.py.j2", "dest": "{{ app_name }}/routers/webhooks.py"}
+  ],
+  "notes": "After applying: 1) app.include_router(router), 2) set WEBHOOK_SECRET in .env, 3) make sure the model is imported (Base.metadata.create_all runs at app import), 4) implement per-source handlers in webhook_service.dispatch (TODO). Sender contract: POST {base_path}/webhooks/{source} with headers X-Webhook-Timestamp, X-Webhook-Signature: sha256=hex(hmac_sha256(secret, '{timestamp}.{raw_body}')), and optionally X-Idempotency-Key for replay protection. Returns 401 on bad signature, 200 with {received:true,id}.",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "secret_env": "WEBHOOK_SECRET"}
+}

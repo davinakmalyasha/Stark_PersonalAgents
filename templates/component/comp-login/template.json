@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): login form + auth hook (token storage, logout, route guard). Pairs with the backend feature-auth template. Uses [[ ]] delimiters.",
+  "name": "comp-login",
+  "description": "Login form + useAuth hook: token storage, logout, AuthGuard route guard. Pairs with feature-auth backend.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "LoginForm.tsx.j2", "dest": "[[components_dir]]/LoginForm.tsx"},
+    {"src": "useAuth.ts.j2", "dest": "[[components_dir]]/useAuth.ts"}
+  ],
+  "notes": "Expects POST {apiBase}/auth/login -> {access_token}. Wire: const auth = useAuth(); {auth.isAuthenticated ? <App/> : <LoginForm apiBase='/api' onLogin={auth.login}/>}. Wrap protected routes with <AuthGuard isAuthenticated={auth.isAuthenticated}>. TODO: align the endpoint path/token field with feature-auth's actual route.",
+  "sample_vars": {"components_dir": "src/components"}
+}

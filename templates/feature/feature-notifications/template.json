@@ -1,0 +1,17 @@
+{
+  "_comment": "LEVEL 3 (feature): in-app notifications — Notification model + current-user inbox (paginated), unread count, read / read-all. Other features call create_notification().",
+  "name": "feature-notifications",
+  "description": "In-app notifications: model, inbox endpoint (paginated), unread count, read / read-all. Other features call create_notification().",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_admin'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix (routes: /api/notifications...)"}
+  ],
+  "files": [
+    {"src": "models/notification.py.j2", "dest": "{{ app_name }}/models/notification.py"},
+    {"src": "services/notification_service.py.j2", "dest": "{{ app_name }}/services/notification_service.py"},
+    {"src": "routers/notifications.py.j2", "dest": "{{ app_name }}/routers/notifications.py"}
+  ],
+  "notes": "After applying: 1) app.include_router(router), 2) make sure the model is imported (Base.metadata.create_all runs at app import), 3) call create_notification(db, user_id, title, body) from other features (e.g. after a long job). Requires feature-auth's get_current_user. Frontend: poll GET /api/notifications/unread-count for the badge, list via GET /api/notifications.",
+  "sample_vars": {"app_name": "app", "base_path": "/api"}
+}

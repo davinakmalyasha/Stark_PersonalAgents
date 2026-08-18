@@ -1,0 +1,15 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): drag-and-drop upload zone with validation + per-file status. Pairs with the backend feature-upload template. Uses [[ ]] delimiters.",
+  "name": "comp-dropzone",
+  "description": "Drag-and-drop upload zone: click-to-browse, size/type validation, per-file status. Pairs with feature-upload backend.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory"}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "Dropzone.tsx.j2", "dest": "[[components_dir]]/Dropzone.tsx"}
+  ],
+  "notes": "Usage: <Dropzone onUpload={async (files) => { const fd = new FormData(); fd.append('file', files[0]); await api('/upload', {method:'POST', body: fd}); }} accept='.jpg,.png' maxSizeMB={5} />. TODO: adapt the endpoint to feature-upload's route and multipart field name.",
+  "sample_vars": {"components_dir": "src/components"}
+}

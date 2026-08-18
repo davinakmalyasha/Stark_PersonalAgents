@@ -1,0 +1,27 @@
+"""Export endpoint: GET {{ base_path }}/{{ resource_name|lower }}s/export?search=&sort= → CSV stream."""
+import io
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..services.export_service import export_{{ resource_name|lower }}_rows
+
+router = APIRouter(tags=["export"])
+
+
+@router.get("/{{ resource_name|lower }}s/export")
+def export_csv(search: str = "", sort: str = "", db: Session = Depends(get_db)):
+    """CSV export of the {{ resource_name }} table honoring the current filters."""
+    csv_text = export_{{ resource_name|lower }}_rows(db, search=search, sort=sort)
+    filename = "{{ resource_name|lower }}s.csv"
+    return StreamingResponse(
+        io.StringIO(csv_text),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# TODO: register this router in the app: app.include_router(router)
+# TODO: protect with auth when needed (e.g. dependencies=[Depends(require_role('admin'))])

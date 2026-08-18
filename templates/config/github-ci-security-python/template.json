@@ -1,0 +1,21 @@
+{
+  "_comment": "THE GATE — python profile. Security + performance + bug detection on every push: SAST, SCA, secrets, quality (lint+format+type), coverage, perf-smoke, semgrep, container, codeql, zizmor. Action SHAs are pinned; every job has explicit permissions. Installed by github_apply_gate / github_init_project.",
+  "name": "github-ci-security-python",
+  "description": "Enterprise-grade python gate: Bandit SAST, pip-audit SCA, gitleaks secrets, Ruff S+B + format + mypy, coverage threshold, perf-smoke, Semgrep, Trivy, CodeQL, zizmor. All jobs SHA-pinned, graceful-skip when a dependency is absent.",
+  "category": "config",
+  "variables": [
+    {"name": "python_version", "type": "string", "default": "3.12", "description": "Python version for scan jobs"},
+    {"name": "gitleaks_version", "type": "string", "default": "8.30.1", "description": "Pinned gitleaks release (asset names are versioned — never /latest)"},
+    {"name": "zizmor_version", "type": "string", "default": "1.29.0", "description": "Pinned zizmor release (workflow self-audit)"},
+    {"name": "trivy_version", "type": "string", "default": "0.73.0", "description": "Pinned trivy release (container/fs scan)"},
+    {"name": "codeql_on", "type": "string", "default": "true", "description": "true/false — include the CodeQL job (free on public repos)"},
+    {"name": "coverage_threshold", "type": "string", "default": "80", "description": "Minimum line coverage enforced on detected packages (enterprise standard)"},
+    {"name": "pytest_path", "type": "string", "default": "tests", "description": "Where pytest collects tests"},
+    {"name": "perf_test_path", "type": "string", "default": "tests/test_perf_smoke.py", "description": "Perf-smoke test file path"}
+  ],
+  "files": [
+    {"src": "security.yml.j2", "dest": ".github/workflows/security.yml"}
+  ],
+  "notes": "Job names are the branch-protection contexts: sast, sca, secrets, quality, coverage, perf-smoke, semgrep, container, codeql, zizmor. Coverage enforces only when a real importable package exists (never on CI boilerplate). Perf budgets are universal defaults — tune tests/test_perf_smoke.py after first green. Graceful-skip philosophy everywhere: a fresh repo stays green.",
+  "sample_vars": {"python_version": "3.12", "codeql_on": "true", "coverage_threshold": "80"}
+}

@@ -1,0 +1,22 @@
+{
+  "_comment": "LEVEL 4 (component, frontend): the complete admin CRUD page — search, pagination, sorting, create/edit modal, delete confirm, bulk delete, toasts. Composes the sibling L4 components via uses (table, form, modal, toast, http-client all land in the same components_dir). Uses [[ ]] delimiters.",
+  "name": "comp-crud-page",
+  "description": "Complete admin CRUD page: search, pagination, sorting, create/edit modal, delete confirm, bulk delete. Wires table+form+modal+toast together.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "Frontend components directory (all composed siblings land here too)"}
+  ],
+  "uses": [
+    {"template": "comp-paginated-table", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-form", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-modal", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-toast", "variables": {"components_dir": "[[ components_dir ]]"}},
+    {"template": "comp-http-client", "variables": {"components_dir": "[[ components_dir ]]"}}
+  ],
+  "delimiters": ["[[", "]]", "<%", "%>"],
+  "files": [
+    {"src": "CrudPage.tsx.j2", "dest": "[[components_dir]]/CrudPage.tsx"}
+  ],
+  "notes": "Backend contract (see feature-crud): GET {apiPath}?page=&page_size=&search=&sort=field:dir -> {items,total,page,page_size}; POST 201; PUT 200; DELETE 204. Usage: <CrudPage resource='User' apiPath='/api/users' columns={[{key:'name',label:'Name',sortable:true}]} fields={[{name:'name',label:'Name',rules:{required:'Name is required'}},{name:'role',label:'Role',type:'select',options:[{value:'user',label:'User'},{value:'admin',label:'Admin'}]}]} selectable exportPath='/api/users/export' />. Wrap the app in <ToastProvider> (comp-toast). Requires react-hook-form (npm install react-hook-form) — see comp-form. The Export button calls the feature-export endpoint honoring current search/sort. Wrap in ErrorBoundary for crash safety.",
+  "sample_vars": {"components_dir": "src/components"}
+}

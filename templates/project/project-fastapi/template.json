@@ -1,0 +1,20 @@
+{
+  "name": "project-fastapi",
+  "description": "Full FastAPI project scaffold: app entry, config, database session, requirements, gitignore, README. One call = new project.",
+  "category": "project",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Project/package name (snake_case), e.g. 'my_api'"},
+    {"name": "description", "type": "string", "default": "FastAPI service", "description": "One-line description"},
+    {"name": "database", "type": "string", "default": "sqlite:///./app.db", "description": "DATABASE_URL default"}
+  ],
+  "files": [
+    {"src": "main.py.j2", "dest": "{{ project_name }}/main.py"},
+    {"src": "config.py.j2", "dest": "{{ project_name }}/config.py"},
+    {"src": "database.py.j2", "dest": "{{ project_name }}/database.py"},
+    {"src": "requirements.txt.j2", "dest": "requirements.txt"},
+    {"src": "gitignore.j2", "dest": ".gitignore"},
+    {"src": "README.md.j2", "dest": "README.md"}
+  ],
+  "notes": "After applying: pip install -r requirements.txt && uvicorn {{ project_name }}.main:app --reload. Then add features with feature-crud / feature-auth templates. Health endpoint at /health powers docker compose checks.",
+  "sample_vars": {"project_name": "my_api", "description": "FastAPI service", "database": "sqlite:///./app.db"}
+}

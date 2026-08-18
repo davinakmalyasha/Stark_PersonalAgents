@@ -1,0 +1,138 @@
+import { useState } from "react";
+
+interface Props {
+  code: string;
+  language?: string;
+}
+
+const KEYWORDS: Record<string, RegExp> = {
+  python: /\b(def|class|import|from|return|if|elif|else|for|while|try|except|with|as|None|True|False|async|await|lambda|raise)\b/g,
+  javascript: /\b(function|const|let|var|return|if|else|for|while|try|catch|async|await|import|export|default|new|class|this|null|undefined|true|false)\b/g,
+  typescript: /\b(function|const|let|var|return|if|else|for|while|try|catch|async|await|import|export|default|new|class|this|null|undefined|true|false|interface|type|enum|implements|extends)\b/g,
+  bash: /\b(if|then|else|fi|for|do|done|while|echo|export|cd|npm|pip|python|node|git)\b/g,
+};
+
+const STRING = /("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|`([^`\\]|\\.)*`)/g;
+const COMMENT: Record<string, RegExp> = {
+  python: /#.*$/gm,
+  javascript: /\/\/.*$/gm,
+  typescript: /\/\/.*$/gm,
+  bash: /#.*$/gm,
+};
+
+function highlight(code: string, language?: string): React.ReactNode[] {
+  const lang = (language || "").toLowerCase();
+  const kw = KEYWORDS[lang] ? new RegExp(KEYWORDS[lang].source, "g") : null;
+  const comment = COMMENT[lang] ? new RegExp(COMMENT[lang].source, "g") : null;
+
+  const tokens: { text: string; cls: string }[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  const next = (until: number) => {
+    if (until > last) {
+      const segment = code.slice(last, until);
+      // split segment into keyword / plain
+      let segLast = 0;
+      if (kw) {
+        kw.lastIndex = 0;
+        while ((m = kw.exec(segment)) !== null) {
+          if (m.index > segLast) tokens.push({ text: segment.slice(segLast, m.index), cls: "" });
+          tokens.push({ text: m[0], cls: "kw" });
+          segLast = m.index + m[0].length;
+        }
+      }
+      if (segLast < segment.length) tokens.push({ text: segment.slice(segLast), cls: "" });
+    }
+  };
+
+  const scan = (regex: RegExp | null, cls: string) => {
+    if (!regex) return;
+    regex.lastIndex = 0;
+    while ((m = regex.exec(code)) !== null) {
+      if (m.index > last) {
+        next(m.index);
+      }
+      tokens.push({ text: m[0], cls });
+      last = m.index + m[0].length;
+    }
+  };
+
+  scan(comment, "comment");
+  scan(STRING, "string");
+  next(code.length);
+
+  return tokens.map((t, i) =>
+    t.cls === "kw" ? (
+      <span key={i} style={{ color: "#c678dd" }}>{t.text}</span>
+    ) : t.cls === "string" ? (
+      <span key={i} style={{ color: "#98c379" }}>{t.text}</span>
+    ) : t.cls === "comment" ? (
+      <span key={i} style={{ color: "#7f848e", fontStyle: "italic" }}>{t.text}</span>
+    ) : (
+      <span key={i}>{t.text}</span>
+    )
+  );
+}
+
+/**
+ * Code block: dark panel, language label, copy button, lightweight syntax
+ * highlighting (python/js/ts/bash). Pairs with comp-chat + comp-markdown-viewer.
+ * Usage: <CodeBlock code="print('hi')" language="python" />
+ */
+export default function CodeBlock({ code, language }: Props) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+
+  return (
+    <div
+      style={{
+        background: "#0f172a",
+        color: "#e2e8f0",
+        borderRadius: 8,
+        overflow: "hidden",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontSize: 13,
+        lineHeight: 1.6,
+        margin: "8px 0",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "6px 12px",
+          background: "#1e293b",
+          fontSize: 12,
+          color: "#94a3b8",
+        }}
+      >
+        <span>{language || "code"}</span>
+        <button
+          onClick={copy}
+          style={{
+            background: "none",
+            border: "none",
+            color: copied ? "#4ade80" : "#94a3b8",
+            cursor: "pointer",
+            fontSize: 12,
+          }}
+        >
+          {copied ? "\u2713 copied" : "copy"}
+        </button>
+      </div>
+      <pre style={{ margin: 0, padding: 12, overflowX: "auto" }}>
+        <code>{highlight(code, language)}</code>
+      </pre>
+    </div>
+  );
+}

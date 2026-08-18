@@ -1,0 +1,17 @@
+{
+  "name": "docker-compose",
+  "description": "docker-compose baseline: web + postgres + volume + healthcheck. Universal starting point.",
+  "category": "config",
+  "variables": [
+    {"name": "service_name", "type": "string", "required": true, "description": "Web service name, e.g. 'web'"},
+    {"name": "image", "type": "string", "default": "", "description": "Image name (leave empty to build from Dockerfile)"},
+    {"name": "port", "type": "string", "default": "8000", "description": "Host port to map"},
+    {"name": "db_name", "type": "string", "default": "appdb", "description": "Postgres database name"},
+    {"name": "db_user", "type": "string", "default": "appuser", "description": "Postgres user"}
+  ],
+  "files": [
+    {"src": "docker-compose.yml.j2", "dest": "docker-compose.yml"}
+  ],
+  "notes": "Run: docker compose up --build. Extend services (redis, worker...) freely. DB credentials via ${DB_PASSWORD:?} — always from env, never hardcoded.",
+  "sample_vars": {"service_name": "web", "image": "", "port": "8000", "db_name": "appdb", "db_user": "appuser"}
+}

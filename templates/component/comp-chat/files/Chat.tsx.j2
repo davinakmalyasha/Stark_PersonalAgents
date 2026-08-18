@@ -1,0 +1,120 @@
+import { useEffect, useRef, useState } from "react";
+
+export interface ChatMessage {
+  id: string | number;
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+interface Props {
+  messages: ChatMessage[];
+  onSend: (text: string) => void | Promise<void>;
+  streamingText?: string;   // partial assistant text while a stream is running
+  disabled?: boolean;
+  placeholder?: string;
+  title?: string;
+}
+
+const bubble = (role: ChatMessage["role"]): React.CSSProperties => ({
+  maxWidth: "72%",
+  padding: "10px 14px",
+  borderRadius: 12,
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  fontSize: 14,
+  lineHeight: 1.5,
+  background: role === "user" ? "#2563eb" : role === "system" ? "#e2e8f0" : "#f1f5f9",
+  color: role === "user" ? "#fff" : "#0f172a",
+  alignSelf: role === "user" ? "flex-end" : "flex-start",
+  borderBottomRightRadius: role === "user" ? 4 : 12,
+  borderBottomLeftRadius: role === "user" ? 12 : 4,
+});
+
+/**
+ * Chat UI: message bubbles, streaming assistant text, input + send, auto-scroll.
+ * Controlled — messages live in the parent (pair with feature-sse / a chat API).
+ * Usage: <Chat messages={msgs} onSend={(t)=>send(t)} streamingText={partial} />
+ */
+export default function Chat({
+  messages,
+  onSend,
+  streamingText,
+  disabled = false,
+  placeholder = "Type a message\u2026",
+  title,
+}: Props) {
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, streamingText]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || sending) return;
+    setInput("");
+    setSending(true);
+    try {
+      await onSend(text);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 320, fontFamily: "system-ui, sans-serif" }}>
+      {title && (
+        <div style={{ padding: "10px 16px", borderBottom: "1px solid #e2e8f0", fontWeight: 600, fontSize: 14 }}>
+          {title}
+        </div>
+      )}
+      <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+        {messages.length === 0 && (
+          <div style={{ color: "#94a3b8", fontSize: 13, textAlign: "center", marginTop: 24 }}>
+            No messages yet — say hello!
+          </div>
+        )}
+        {messages.map((m) => (
+          <div key={m.id} style={bubble(m.role)}>
+            {m.content}
+          </div>
+        ))}
+        {streamingText !== undefined && streamingText !== "" && (
+          <div style={{ ...bubble("assistant"), opacity: 0.8 }}>
+            {streamingText}
+            <span style={{ opacity: 0.5 }}>\u2588</span>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+      <form
+        onSubmit={submit}
+        style={{ display: "flex", gap: 8, padding: 12, borderTop: "1px solid #e2e8f0" }}
+      >
+        <input
+          style={{
+            flex: 1, padding: "10px 12px", border: "1px solid #cbd5e1", borderRadius: 8,
+            fontSize: 14,
+          }}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder={placeholder}
+          disabled={disabled || sending}
+        />
+        <button
+          type="submit"
+          disabled={disabled || sending || !input.trim()}
+          style={{
+            padding: "10px 18px", background: "#2563eb", color: "#fff", border: "none",
+            borderRadius: 8, fontSize: 14, cursor: "pointer",
+          }}
+        >
+          {sending ? "Sending\u2026" : "Send"}
+        </button>
+      </form>
+    </div>
+  );
+}

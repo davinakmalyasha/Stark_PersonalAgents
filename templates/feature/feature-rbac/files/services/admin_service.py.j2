@@ -1,0 +1,58 @@
+"""Admin user management service: list, roles, activation, password resets."""
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from ..core.filters import apply_filters, build_filters
+from ..core.security import hash_password
+from ..models.user import User
+from ..schemas.auth import UserRead
+
+_SEARCH_FIELDS = ["username"]
+_ALLOWED_ROLES = ("admin", "user")
+
+
+def list_users(db: Session, page: int = 1, page_size: int = 20,
+               search: str = "", sort: str = "") -> tuple[list[User], int]:
+    """Paginated admin user list: ?page=&page_size=&search=&sort=username:asc."""
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    query = db.query(User)
+    if search or sort:
+        query = apply_filters(query, build_filters({"search": search, "sort": sort}),
+                              search_fields=_SEARCH_FIELDS)
+    total = query.count()
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+    return items, total
+
+
+def set_user_role(db: Session, user_id: int, role: str) -> User:
+    if role not in _ALLOWED_ROLES:
+        raise HTTPException(status_code=400,
+                            detail=f"role must be one of: {', '.join(_ALLOWED_ROLES)}")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.role = role
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def set_user_active(db: Session, user_id: int, is_active: bool) -> User:
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_active = is_active
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def reset_password(db: Session, user_id: int, new_password: str) -> None:
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.password_hash = hash_password(new_password)
+    db.commit()

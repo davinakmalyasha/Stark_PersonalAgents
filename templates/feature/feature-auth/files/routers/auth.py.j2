@@ -1,0 +1,68 @@
+"""Auth endpoints: register, login, refresh, me."""
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from ..core.security import create_token, decode_token, get_current_user
+from ..database import get_db
+from ..schemas.auth import (
+    LoginRequest,
+    RefreshRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserRead,
+)
+from ..services import auth_service
+
+router = APIRouter(prefix="{{ base_path }}/auth", tags=["auth"])
+
+
+@router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def register(data: RegisterRequest, db: Session = Depends(get_db)):
+    try:
+        return auth_service.register_user(db, data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    user = auth_service.authenticate(db, data.username, data.password)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid username or password")
+    return {
+        "access_token": create_token(user.id, claims={"typ": "access", "username": user.username,
+                                                      "role": user.role}),
+        "expires_in": int("{{ expire_days }}") * 86400,
+    }
+
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh(data: RefreshRequest, db: Session = Depends(get_db)):
+    try:
+        claims = decode_token(data.refresh_token)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    if claims.get("typ") != "refresh":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Not a refresh token")
+    user = auth_service.get_user_by_id(db, int(claims["sub"]))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="User no longer active")
+    return {
+        "access_token": create_token(user.id, claims={"typ": "access", "username": user.username,
+                                                      "role": user.role}),
+        "expires_in": int("{{ expire_days }}") * 86400,
+    }
+
+
+@router.get("/me", response_model=UserRead)
+def me(claims: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    user = auth_service.get_user_by_id(db, int(claims["sub"]))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return user
+
+
+# TODO: register this router in the app: app.include_router(router)

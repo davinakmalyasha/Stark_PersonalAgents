@@ -1,0 +1,61 @@
+"""Admin-only user management endpoints: list/search users, roles, activation, reset."""
+from fastapi import APIRouter, Depends, Query, status
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from ..core.rbac import require_role
+from ..database import get_db
+from ..schemas.auth import UserRead
+from ..services import admin_service
+
+router = APIRouter(prefix="{{ base_path }}/admin", tags=["admin"],
+                   dependencies=[Depends(require_role("admin"))])
+
+
+class UserListResponse(BaseModel):
+    items: list[UserRead]
+    total: int
+    page: int
+    page_size: int
+
+
+class UserRoleUpdate(BaseModel):
+    role: str
+
+
+class UserActiveUpdate(BaseModel):
+    is_active: bool
+
+
+class PasswordReset(BaseModel):
+    new_password: str
+
+
+@router.get("/users", response_model=UserListResponse)
+def list_all(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+             search: str = "", sort: str = "", db: Session = Depends(get_db)):
+    """Paginated user list: ?page=&page_size=&search=&sort=username:asc|desc."""
+    items, total = admin_service.list_users(db, page=page, page_size=page_size,
+                                            search=search, sort=sort)
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.put("/users/{user_id}/role", response_model=UserRead)
+def update_role(user_id: int, data: UserRoleUpdate, db: Session = Depends(get_db)):
+    return admin_service.set_user_role(db, user_id, data.role)
+
+
+@router.put("/users/{user_id}/active", response_model=UserRead)
+def update_active(user_id: int, data: UserActiveUpdate, db: Session = Depends(get_db)):
+    return admin_service.set_user_active(db, user_id, data.is_active)
+
+
+@router.post("/users/{user_id}/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+def reset(user_id: int, data: PasswordReset, db: Session = Depends(get_db)):
+    admin_service.reset_password(db, user_id, data.new_password)
+
+
+# TODO: register this router in the app: app.include_router(router)
+# TODO: seed the first admin at startup: from {{ app_name }}.core.rbac import seed_admin;
+#       with {{ app_name }}.database.SessionLocal() as db: seed_admin(db)
+#       (creates ADMIN_USERNAME/ADMIN_PASSWORD from .env when the users table is empty)

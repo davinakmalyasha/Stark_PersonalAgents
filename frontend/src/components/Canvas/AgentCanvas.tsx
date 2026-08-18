@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
-import { useCanvas } from '../../hooks/useCanvas';
+import { useEffect, useRef, useState } from 'react';
 import { useCanvasAgentState } from '../../hooks/useCanvasAgentState';
 import CanvasWorkspace from './CanvasWorkspace';
+import SubagentDrawer from './SubagentDrawer';
 import ChatView from '../Workspace/ChatView';
 import type { AppState, ChatMessage, ModelOption } from '../../types';
 import type { AgentTask } from '../../types';
@@ -28,6 +28,8 @@ interface Props {
   onToggleVoice: () => void;
   voiceInputText?: string;
   onOpenStats: () => void;
+  onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
+  onRetry?: (prompt: string) => void;
   totalCost: number;
   totalInput: number;
   totalOutput: number;
@@ -36,29 +38,39 @@ interface Props {
 }
 
 export default function AgentCanvas(props: Props) {
-  const { pan, setPan, zoom, setZoom, selectedNodeId, setSelectedNodeId, getInitialNodes, getInitialEdges } = useCanvas();
-  const { steps, nodes, edges, activeAgent } = useCanvasAgentState({
+  const { steps, agents } = useCanvasAgentState({
     isRunning: props.isRunning,
     liveLog: props.state?.live_terminal_log,
-    getInitialNodes,
-    getInitialEdges,
     tokenUsage: props.state?.token_usage,
   });
 
-  // Whether the user has manually dismissed the popover mid-run
-  const [popoverDismissed, setPopoverDismissed] = useState(false);
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<AgentTask | null>(null);
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
 
+  // Track when the current run started so running cards show a live elapsed clock.
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const prevRunningRef = useRef(false);
   useEffect(() => {
-    if (!props.workspaceId || !props.chatId) { setTasks([]); return; }
+    if (props.isRunning && !prevRunningRef.current) setRunStartedAt(Date.now());
+    prevRunningRef.current = props.isRunning;
+  }, [props.isRunning]);
+
+  const chatKey = props.workspaceId && props.chatId ? `${props.workspaceId}:${props.chatId}` : '';
+  const [loadedChatKey, setLoadedChatKey] = useState('');
+  useEffect(() => {
+    if (!chatKey) return;
     let cancelled = false;
-    const refresh = () => fetchTasks(props.workspaceId!, props.chatId!).then((next) => { if (!cancelled) setTasks(next); }).catch(() => {});
+    const refresh = () => fetchTasks(props.workspaceId!, props.chatId!)
+      .then((next) => { if (!cancelled) { setTasks(next); setLoadedChatKey(chatKey); } })
+      .catch(() => {});
     refresh();
     const timer = window.setInterval(refresh, 5000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [props.workspaceId, props.chatId]);
+  }, [chatKey]);
+
+  const visibleTasks = chatKey && loadedChatKey === chatKey ? tasks : [];
 
   const refreshTasks = () => {
     if (props.workspaceId && props.chatId) fetchTasks(props.workspaceId, props.chatId).then(setTasks).catch(() => {});
@@ -79,69 +91,55 @@ export default function AgentCanvas(props: Props) {
   const handleDeleteTask = (task: AgentTask) => {
     if (props.workspaceId && props.chatId) deleteTask(props.workspaceId, props.chatId, task.id).then(refreshTasks).catch(() => {});
   };
-  // Reset dismissal whenever a new agent becomes active
-  const prevAgentRef = { current: activeAgent };
-  if (prevAgentRef.current !== activeAgent) {
-    setPopoverDismissed(false);
-  }
 
-  // The floating popover only appears when a non-Supervisor agent is actively working
-  const isSubagentWorking = props.isRunning && !!activeAgent && activeAgent !== 'Supervisor';
-  const activeAgentNode = isSubagentWorking && !popoverDismissed
-    ? (nodes.find((n) => n.id === activeAgent) ?? null)
-    : null;
+  const handleStatusChange = (task: AgentTask, status: AgentTask['status']) => {
+    if (!props.workspaceId || !props.chatId) return;
+    const prev = task.status;
+    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status } : item));
+    updateTaskStatus(props.workspaceId, props.chatId, task.id, status)
+      .then((updated) => setTasks((current) => current.map((item) => item.id === updated.id ? updated : item)))
+      .catch(() => setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: prev } : item)));
+  };
 
-  const activeAgentSteps = activeAgentNode
-    ? steps.filter((s) => s.agent === activeAgent)
-    : [];
-
-  // Pull the task description from the delegation call for the active agent
-  const activeAgentTask = steps
-    .filter((s) => s.toolName === 'task' || s.toolName === 'start_async_task')
-    .map((s) => {
-      try {
-        const parsed = JSON.parse(s.args || '{}');
-        if (parsed.name === activeAgent) return parsed.task as string;
-      } catch {}
-      return null;
-    })
-    .filter(Boolean)[0] ?? '';
+  const selectedAgentMeta = selectedAgent ? agents.find((a) => a.id === selectedAgent) ?? null : null;
+  const selectedAgentSteps = selectedAgent ? steps.filter((s) => s.agent === selectedAgent) : [];
 
   return (
     <div className="relative flex flex-1 min-w-0 h-full overflow-hidden border-l border-zinc-800/80 bg-[#0a0a0c]">
       <CanvasWorkspace
-        nodes={nodes}
-        edges={edges}
-        pan={pan}
-        zoom={zoom}
-        steps={steps}
-        selectedId={selectedNodeId}
-        setPan={setPan}
-        setZoom={setZoom}
-        onSelectNode={setSelectedNodeId}
-        activeAgentNode={activeAgentNode}
-        activeAgentSteps={activeAgentSteps}
-        activeAgentTask={activeAgentTask}
+        tasks={visibleTasks}
+        agents={agents}
         isRunning={props.isRunning}
-        onClosePopover={() => setPopoverDismissed(true)}
-        isVoiceMode={props.isVoiceMode}
-        activeAgent={activeAgentNode}
-        tasks={tasks}
-        taskModalOpen={taskModalOpen}
+        runStartedAt={runStartedAt}
+        selectedAgent={selectedAgent}
+        onSelectAgent={setSelectedAgent}
+        onStartTask={handleStartTask}
+        onEditTask={(task) => { setEditingTask(task); setTaskModalOpen(true); }}
+        onDeleteTask={handleDeleteTask}
+        onStatusChange={handleStatusChange}
         onOpenTaskModal={() => { setEditingTask(null); setTaskModalOpen(true); }}
+        taskModalOpen={taskModalOpen}
+        editingTask={editingTask}
         onCloseTaskModal={() => { setEditingTask(null); setTaskModalOpen(false); }}
         onTaskCreated={(task) => setTasks((current) => [task, ...current])}
-        editingTask={editingTask}
-        onEditTask={(task) => { setEditingTask(task); setTaskModalOpen(true); }}
         onTaskUpdated={(updated) => { setTasks((current) => current.map((item) => item.id === updated.id ? updated : item)); setEditingTask(null); }}
-        onStartTask={handleStartTask}
-        onDeleteTask={handleDeleteTask}
         onStartNow={(prompt, files) => props.onSend(prompt, files)}
         workspaceId={props.workspaceId}
         chatId={props.chatId}
       />
 
       <ChatView {...props} traceSteps={steps} />
+
+      <SubagentDrawer
+        isOpen={Boolean(selectedAgent)}
+        subagentName={selectedAgent}
+        status={selectedAgentMeta?.status ?? 'idle'}
+        taskDesc={selectedAgentMeta?.task ?? ''}
+        steps={selectedAgentSteps}
+        workspaceId={props.workspaceId}
+        chatId={props.chatId}
+        onClose={() => setSelectedAgent(null)}
+      />
     </div>
   );
 }

@@ -1,15 +1,20 @@
 import { useMemo } from 'react';
-import type { CanvasNode, CanvasEdge } from '../types/canvas.types';
 import type { TokenUsage } from '../types';
+import type { BoardAgent, BoardAgentStatus } from '../types/board.types';
 import { parseLogToSteps } from '../utils/logParser';
 
 interface Input {
   isRunning: boolean;
   liveLog: string | undefined;
-  getInitialNodes: () => CanvasNode[];
-  getInitialEdges: () => CanvasEdge[];
   tokenUsage?: TokenUsage | null;
 }
+
+const AGENT_ROSTER: { id: string; label: string; role: BoardAgent['role'] }[] = [
+  { id: 'Supervisor', label: 'Supervisor', role: 'Orchestrator' },
+  { id: 'Dev', label: 'Developer Subagent', role: 'Subagent' },
+  { id: 'FreeAgent', label: 'FreeAgent', role: 'Subagent' },
+  { id: 'Vision', label: 'Vision Agent', role: 'Subagent' },
+];
 
 /** Map node ids to the agent names used in token call records */
 function normalizeTokenAgent(nodeId: string): string[] {
@@ -17,17 +22,32 @@ function normalizeTokenAgent(nodeId: string): string[] {
   switch (lower) {
     case 'supervisor': return ['supervisor', 'orchestrator', 'director'];
     case 'dev': return ['dev', 'developer', 'coder'];
-    case 'bsa': return ['bsa', 'business analyst', 'ba'];
     case 'sdet': return ['sdet', 'tester', 'qa'];
     case 'devsecops': return ['devsecops', 'devops'];
     case 'analytics': return ['analytics', 'data'];
     case 'freeagent': return ['freeagent', 'free agent'];
+    case 'vision': return ['vision', 'visual'];
     case 'designer': return ['designer', 'ui/ux'];
     default: return [lower];
   }
 }
 
-export function useCanvasAgentState({ isRunning, liveLog, getInitialNodes, getInitialEdges, tokenUsage }: Input) {
+/** Pull the task description from the delegation call targeting the given agent. */
+function getAgentTask(steps: ReturnType<typeof parseLogToSteps>['steps'], agentId: string): string {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const s = steps[i];
+    if (s.toolName !== 'task' && s.toolName !== 'start_async_task') continue;
+    try {
+      const parsed = JSON.parse(s.args || '{}');
+      if (parsed.name === agentId && typeof parsed.task === 'string') return parsed.task;
+    } catch {
+      // Not a delegation step we can read.
+    }
+  }
+  return '';
+}
+
+export function useCanvasAgentState({ isRunning, liveLog, tokenUsage }: Input) {
   const steps = useMemo(() => {
     if (!liveLog) return [];
     return parseLogToSteps(liveLog).steps;
@@ -41,22 +61,22 @@ export function useCanvasAgentState({ isRunning, liveLog, getInitialNodes, getIn
       try {
         const parsed = JSON.parse(lastStep.args || '{}');
         if (parsed.name) return parsed.name;
-      } catch {}
+      } catch {
+        // Malformed delegation args — fall through to the agent field.
+      }
     }
     return lastStep.agent || 'Supervisor';
   }, [isRunning, steps]);
 
-  /** Per-node token totals derived from API call records */
+  /** Per-agent token totals derived from API call records */
   const nodeTokens = useMemo(() => {
     const totals: Record<string, number> = {};
     if (!tokenUsage?.calls) return totals;
     for (const call of tokenUsage.calls) {
       const agentLower = call.agent.toLowerCase();
-      // Match call to a node id via the name map
-      const nodeIds = ['Supervisor', 'Dev', 'BSA', 'SDET', 'DevSecOps', 'FreeAgent'];
-      for (const nid of nodeIds) {
-        if (normalizeTokenAgent(nid).some(k => agentLower.includes(k))) {
-          totals[nid] = (totals[nid] || 0) + (call.input || 0) + (call.output || 0);
+      for (const def of AGENT_ROSTER) {
+        if (normalizeTokenAgent(def.id).some((key) => agentLower.includes(key))) {
+          totals[def.id] = (totals[def.id] || 0) + (call.input || 0) + (call.output || 0);
           break;
         }
       }
@@ -64,35 +84,28 @@ export function useCanvasAgentState({ isRunning, liveLog, getInitialNodes, getIn
     return totals;
   }, [tokenUsage]);
 
-  const nodes = useMemo(() => {
-    const base = getInitialNodes();
-    return base.map((node) => {
-      let status: 'idle' | 'working' | 'completed' | 'failed' = 'idle';
-      if (node.id === 'Supervisor') {
-        status = isRunning && activeAgent === 'Supervisor' ? 'working' : isRunning ? 'idle' : 'completed';
-      } else {
-        if (activeAgent === node.id) {
-          status = 'working';
-        } else if (steps.some((s) => s.agent === node.id)) {
-          status = 'completed';
-        }
+  const agents = useMemo<BoardAgent[]>(() => {
+    return AGENT_ROSTER.map((def) => {
+      const agentSteps = steps.filter((s) => s.agent === def.id);
+      let status: BoardAgentStatus = 'idle';
+      if (isRunning && activeAgent === def.id) {
+        status = 'working';
+      } else if (agentSteps.length > 0) {
+        status = 'completed';
       }
 
-      const agentSteps = steps.filter((s) => s.agent === node.id || (node.id === 'Supervisor' && s.agent === 'Supervisor'));
-      const lastStep = agentSteps[agentSteps.length - 1];
-      const lastStepText = lastStep ? (lastStep.title || lastStep.toolName) : undefined;
-
-      return { ...node, status, lastStepText, tokenUsage: nodeTokens[node.id] || 0 };
+      return {
+        ...def,
+        status,
+        task: getAgentTask(steps, def.id),
+        steps: agentSteps.length,
+        thoughts: agentSteps.filter((s) => s.type === 'thought').length,
+        tools: agentSteps.filter((s) => s.type === 'tool' || s.type === 'command').length,
+        tokens: nodeTokens[def.id] || 0,
+        isActive: isRunning && activeAgent === def.id,
+      };
     });
-  }, [getInitialNodes, isRunning, activeAgent, steps, nodeTokens]);
+  }, [isRunning, activeAgent, steps, nodeTokens]);
 
-  const edges = useMemo(() => {
-    const base = getInitialEdges();
-    return base.map((edge) => ({
-      ...edge,
-      active: isRunning && activeAgent === edge.to,
-    }));
-  }, [getInitialEdges, isRunning, activeAgent]);
-
-  return { steps, activeAgent, nodes, edges };
+  return { steps, activeAgent, agents };
 }

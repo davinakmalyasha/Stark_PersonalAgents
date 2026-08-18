@@ -3,7 +3,7 @@ import json
 import glob
 import re
 import gzip
-from memory_io import load_memory, save_memory
+from memory.memory_io import load_memory, save_memory
 from llm import invoke_with_fallback
 from pydantic import BaseModel, Field
 
@@ -90,7 +90,7 @@ def _write_project_memory(workspace, lessons, requests, techs):
         # stores evidence-backed lessons (hidden-test-verified diffs).
         # features.md entry via the standard writer (merged, not overwritten)
         try:
-            from memory_manager import update_feature
+            from memory.memory_manager import update_feature
             from datetime import datetime
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             summary = "; ".join(lessons[:3]) if lessons else "session consolidated"

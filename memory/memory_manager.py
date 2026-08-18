@@ -59,7 +59,7 @@ def refresh_code_map(workspace_path: str) -> bool:
     """Update the `## Code Map` section inside features.md — APPEND-ONLY.
 
     The map is the byte-stable source of truth injected into the cached
-    system messages of Dev/SDET/DevSecOps. Existing file blocks are NEVER
+    system messages of Dev. Existing file blocks are NEVER
     rewritten or removed (that would shift every later byte and break the
     prefix cache) — only brand-new files get appended at the BOTTOM, behind
     a `[added: <utc>]` marker. Edited/deleted files keep their old block
@@ -69,7 +69,7 @@ def refresh_code_map(workspace_path: str) -> bool:
         return False
     _ensure_dir(_memory_path(workspace_path))
     try:
-        from repo_map_generator import RepoMapGenerator
+        from memory.repo_map_generator import RepoMapGenerator
         generator = RepoMapGenerator(workspace_path)
         code_map = generator.generate_map()
     except Exception as e:
@@ -586,7 +586,7 @@ def _strip_code_map_section(features_md: str) -> str:
     """Remove the Code Map section from features.md content.
 
     Used by load_project_memory: the orchestrator dispatches tasks, it does
-    NOT navigate code — the map is injected (cached) into Dev/SDET/DevSecOps
+    NOT navigate code — the map is injected (cached) into Dev
     system messages instead, and would be dead weight here.
     """
     if CODE_MAP_START in features_md and CODE_MAP_END in features_md:
@@ -708,6 +708,54 @@ def update_project_meta(workspace_path: str, key: str, value: str) -> bool:
     return update_feature(workspace_path, key, str(value)[:400])
 
 
+# ── Lessons journal (lessons.md) ─────────────────────────────────────────────
+
+def _lessons_file(workspace_path: str) -> str:
+    return os.path.join(_memory_path(workspace_path), "lessons.md")
+
+
+def append_lesson(workspace_path: str, status: str, title: str, body: str, max_entries: int = 20) -> bool:
+    """Append a failure/blocker lesson to lessons.md (deduped, bounded).
+
+    status: BLOCKED / FAILED / SAVED (SAVED = agent-initiated via save_memory).
+    Dedup: identical (title + body head) entries are skipped — a recurring
+    failure must not stack duplicate lessons.
+    Keeps the newest max_entries, oldest dropped.
+    """
+    if not workspace_path:
+        return False
+    try:
+        _ensure_dir(_memory_path(workspace_path))
+        fpath = _lessons_file(workspace_path)
+        from datetime import datetime
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        import hashlib
+        dedup_key = hashlib.sha256(f"{title}|{body[:300]}".encode("utf-8", "replace")).hexdigest()[:12]
+
+        existing = _read_file_safe(fpath) or "# Lessons\n"
+        if dedup_key in existing:
+            return True  # already recorded — skip duplicates
+
+        entry = (
+            f"\n## {stamp} [{status}] {title[:120]}\n"
+            f"<!-- lesson-id: {dedup_key} -->\n"
+            f"{body.strip()[:600]}\n"
+        )
+        updated = existing + entry
+
+        # Bound the journal to the newest max_entries (drop oldest blocks)
+        blocks = [b for b in updated.split("## ") if b.strip()]
+        if len(blocks) > max_entries + 1:  # +1 for the "# Lessons" header
+            updated = "# Lessons" + "".join(f"\n## {b}" for b in blocks[-max_entries:])
+
+        if _write_file_safe(fpath, updated):
+            print(f"[MEMORY] Lesson appended: [{status}] {title[:60]}")
+            return True
+    except Exception as e:
+        print(f"[MEMORY] Lesson append failed: {e}")
+    return False
+
+
 # ── File helpers ─────────────────────────────────────────────────────────────
 
 def _read_file_safe(path: str) -> str | None:
@@ -739,3 +787,16 @@ def ensure_memory(workspace_path: str) -> str:
     refresh_code_map(workspace_path)  # keep the symbol index fresh each session
     refresh_project_identity(workspace_path)  # rare append-only reality drift
     return load_project_memory(workspace_path)
+
+
+def is_valid_build_request(text: str) -> bool:
+    """Determine whether user input is an actionable build/task request."""
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if len(stripped) < 3:
+        return False
+    greetings = {"hi", "hello", "hey", "hola", "halo", "test", "ping", "p"}
+    if stripped.lower() in greetings:
+        return False
+    return True

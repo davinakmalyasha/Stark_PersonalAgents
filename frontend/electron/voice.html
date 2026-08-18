@@ -16,6 +16,7 @@ body {
 }
 body.state-listening { --accent: #9fc1f0; --accent-soft: rgba(159, 193, 240, 0.3); --accent-bg: rgba(159, 193, 240, 0.1); }
 body.state-thinking { --accent: #c3b3e8; --accent-soft: rgba(195, 179, 232, 0.3); --accent-bg: rgba(195, 179, 232, 0.1); }
+body.state-processing { --accent: #b18be8; --accent-soft: rgba(177, 139, 232, 0.34); --accent-bg: rgba(177, 139, 232, 0.12); }
 body.state-speaking { --accent: #9be1e6; --accent-soft: rgba(155, 225, 230, 0.32); --accent-bg: rgba(155, 225, 230, 0.1); }
 body.state-muted   { --accent: #6b7686; --accent-soft: rgba(107, 118, 134, 0.25); --accent-bg: rgba(107, 118, 134, 0.08); }
 body.state-error   { --accent: #f2a0a0; --accent-soft: rgba(242, 160, 160, 0.35); --accent-bg: rgba(242, 160, 160, 0.12); }
@@ -24,32 +25,32 @@ body.state-error   { --accent: #f2a0a0; --accent-soft: rgba(242, 160, 160, 0.35)
   position: relative;
   width: 100%;
   height: 100%;
-  background: linear-gradient(180deg, rgba(19, 19, 25, 0.9), rgba(9, 9, 13, 0.92));
-  backdrop-filter: blur(18px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 16px;
-  padding: 8px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 12px;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 6px;
-  box-shadow: 0 12px 44px rgba(0, 0, 0, 0.55);
+  gap: 4px;
+  box-shadow: none;
   -webkit-app-region: drag;
-  transition: border-color 0.5s ease;
+  transition: border-color 0.5s ease, border-radius 0.25s ease;
   overflow: hidden;
 }
-.main-row { display: flex; align-items: center; gap: 10px; width: 100%; flex-shrink: 0; }
+.main-row { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: 100%; height: 100%; flex-shrink: 0; }
 .container::before {
   content: '';
   position: absolute;
   top: 0; left: 6%; right: 6%;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.22), transparent);
+  display: none;
   pointer-events: none;
 }
-body.state-listening .container { border-color: rgba(159, 193, 240, 0.22); }
-body.state-thinking .container { border-color: rgba(195, 179, 232, 0.22); }
-body.state-speaking .container { border-color: rgba(155, 225, 230, 0.26); }
+body.state-listening .container,
+body.state-thinking .container,
+body.state-processing .container,
+body.state-speaking .container { border-color: transparent; }
 body.state-error .container { border-color: rgba(242, 160, 160, 0.4); animation: errFade 0.9s ease 2; }
 @keyframes errFade { 50% { border-color: rgba(242, 160, 160, 0.7); } }
 
@@ -73,15 +74,17 @@ button { -webkit-app-region: no-drag; cursor: pointer; border: none; outline: no
 
 /* ── Live bars toggle (voice-level equalizer) ── */
 .bars-btn {
-  width: 52px;
-  height: 52px;
+  width: 54px;
+  height: 54px;
   border-radius: 50%;
   position: relative;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: radial-gradient(circle at 34% 30%, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.015) 55%, transparent 75%);
+  background: #ffffff;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.2);
   transition: transform 0.25s ease;
 }
 .bars-btn:hover { transform: scale(1.06); }
@@ -95,11 +98,12 @@ button { -webkit-app-region: no-drag; cursor: pointer; border: none; outline: no
   border-radius: 50%;
   background: radial-gradient(circle, var(--accent-soft), transparent 70%);
   filter: blur(9px);
-  opacity: 0;
+  display: none;
   transition: opacity 0.6s ease;
 }
 body.state-listening .bars-btn::before,
 body.state-thinking .bars-btn::before,
+body.state-processing .bars-btn::before,
 body.state-speaking .bars-btn::before { opacity: 0.65; }
 
 .bars {
@@ -114,8 +118,8 @@ body.state-speaking .bars-btn::before { opacity: 0.65; }
   width: 3.5px;
   height: 8px;
   border-radius: 2px;
-  background: var(--accent);
-  box-shadow: 0 0 6px var(--accent-soft);
+  background: #0f172a;
+  box-shadow: none;
   transition: height 0.12s linear, background 0.5s ease, opacity 0.5s ease;
 }
 body.state-muted .bars i { opacity: 0.35; }
@@ -141,11 +145,12 @@ body.state-listening .orb-ripple { animation: rippleOut 2.8s ease-out infinite; 
 }
 .pip.listening { animation: pipPulse 1.2s ease-in-out infinite; }
 .pip.thinking { animation: pipPulse 1s ease-in-out infinite; }
+.pip.processing { animation: pipPulse 0.8s ease-in-out infinite; }
 .pip.speaking { animation: pipPulse 0.7s ease-in-out infinite; }
 @keyframes pipPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 .label {
-  color: #cbd5e1;
+  color: #334155;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.09em;
@@ -159,7 +164,7 @@ body.state-listening .orb-ripple { animation: rippleOut 2.8s ease-out infinite; 
 .ellipsis i { width: 3px; height: 3px; border-radius: 50%; background: var(--accent); animation: blink 1.3s ease-in-out infinite; transition: background 0.5s ease; }
 .ellipsis i:nth-child(2) { animation-delay: 0.2s; }
 .ellipsis i:nth-child(3) { animation-delay: 0.4s; }
-body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaking .ellipsis { opacity: 1; }
+body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-processing .ellipsis, body.state-speaking .ellipsis { opacity: 1; }
 @keyframes blink { 0%, 100% { opacity: 0.15; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-2px); } }
 
 /* activity hairline — L / T / A */
@@ -173,46 +178,46 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
 }
 .stage.on { background: var(--accent); box-shadow: 0 0 6px var(--accent-soft); }
 
-.mid-row { display: flex; align-items: center; gap: 7px; min-width: 0; -webkit-app-region: no-drag; cursor: pointer; border-radius: 8px; padding: 2px 4px; margin: 0 -4px; transition: background 0.25s ease; }
+.mid-row { display: flex; align-items: center; justify-content: center; gap: 4px; width: 100%; min-width: 0; -webkit-app-region: no-drag; cursor: pointer; border-radius: 8px; padding: 2px 4px; margin: 0 -4px; transition: background 0.25s ease; }
 .mid-row:hover { background: rgba(255, 255, 255, 0.03); }
 
-#wave { width: 80px; height: 24px; flex-shrink: 0; opacity: 0.85; }
+#wave { width: 48px; height: 20px; flex-shrink: 0; opacity: 0.85; }
 #wave.fade-in { animation: waveIn 0.3s ease; }
 @keyframes waveIn { from { opacity: 0.25; transform: scale(0.97); } to { opacity: 0.85; transform: none; } }
 
 .text-wrap { flex: 1; min-width: 0; overflow: hidden; }
 .text {
   display: inline-block;
-  color: #8b93a1;
-  font-size: 11px;
+  color: #64748b;
+  font-size: 10px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   line-height: 1.35;
-  max-width: 100%;
+  max-width: 86px;
   letter-spacing: 0.01em;
 }
 .text.marquee { text-overflow: clip; animation: marquee 10s linear infinite alternate; }
 .text-wrap:hover .text.marquee { animation-play-state: paused; }
 @keyframes marquee { from { transform: translateX(0); } to { transform: translateX(var(--tx, -120px)); } }
 
-.hint { color: #5b6472; font-size: 10px; white-space: nowrap; flex-shrink: 0; letter-spacing: 0.02em; }
+.hint { display: none; color: #64748b; font-size: 10px; white-space: nowrap; flex-shrink: 0; letter-spacing: 0.02em; }
 
 /* ── Action buttons ── */
 .btn {
-  width: 28px;
-  height: 28px;
+  width: 25px;
+  height: 25px;
   border-radius: 50%;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #6b7280;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  color: #64748b;
   transition: all 0.2s ease;
 }
-.btn:hover { background: rgba(255, 255, 255, 0.09); color: #d1d5db; transform: translateY(-1px); }
+.btn:hover { background: #e2e8f0; color: #334155; transform: translateY(-1px); }
 .btn:active { transform: scale(0.9); }
 .btn svg { width: 13px; height: 13px; }
 
@@ -266,8 +271,8 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
 .feed::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 2px; }
 
 /* Right-side vertical button stack */
-.side-col { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex-shrink: 0; }
-.side-row { display: flex; gap: 6px; align-items: center; }
+.side-col { display: flex; flex-direction: row; gap: 4px; align-items: center; justify-content: center; width: 100%; flex-shrink: 0; }
+.side-row { display: contents; }
 
 /* ── Voice menu ── */
 .voice-menu {
@@ -306,9 +311,200 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
 }
 .voice-menu button:hover { background: var(--accent-bg); color: #e2e8f0; }
 .voice-menu button.active { color: var(--accent); }
+
+/* The live process feed needs the original wide layout when expanded. */
+body.is-expanded .container {
+  border-radius: 16px;
+  padding: 8px 10px;
+  gap: 6px;
+}
+body.is-expanded .main-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: initial;
+  gap: 10px;
+  width: 100%;
+  height: auto;
+}
+body.is-expanded .bars-btn { width: 52px; height: 52px; }
+body.is-expanded .info { flex: 1; width: auto; align-items: initial; }
+body.is-expanded .status-row { justify-content: initial; }
+body.is-expanded .mid-row { justify-content: initial; width: auto; gap: 7px; }
+body.is-expanded #wave { width: 80px; height: 24px; }
+body.is-expanded .text { max-width: 100%; font-size: 11px; }
+body.is-expanded .hint { display: inline; }
+body.is-expanded .side-col { flex-direction: column; gap: 6px; align-items: flex-end; width: auto; }
+body.is-expanded .side-row { display: flex; gap: 6px; align-items: center; }
+body.is-expanded .btn { width: 28px; height: 28px; }
+body.is-expanded .feed-wrap { border-top-color: #e2e8f0; }
+body.is-expanded .feed { color: #64748b; }
+body.is-expanded .feed-line.user { color: #334155; }
+body.is-expanded .feed-line.thought { color: #7c3aed; }
+body.is-expanded .feed-line.agent { color: #2563eb; }
+body.is-expanded .feed-line.tool { color: #0f766e; }
+
+/* ── Compact orb ── */
+.menu-toggle {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 4;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2.5px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.16);
+  color: #64748b;
+  transition: transform 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+.menu-toggle:hover { transform: scale(1.08); background: #f8fafc; color: #1e293b; }
+.menu-toggle:active { transform: scale(0.94); }
+.menu-toggle i { display: block; width: 9px; height: 1.5px; border-radius: 2px; background: currentColor; }
+.menu-toggle.active { background: #f1f5f9; color: #334155; }
+
+body:not(.is-menu-open):not(.is-expanded) .container {
+  padding: 0;
+  border-radius: 0;
+}
+body:not(.is-menu-open):not(.is-expanded) .main-row {
+  flex-direction: row;
+  height: 100%;
+  justify-content: center;
+}
+body:not(.is-menu-open):not(.is-expanded) .info,
+body:not(.is-menu-open):not(.is-expanded) .side-col { display: none; }
+body:not(.is-menu-open):not(.is-expanded) .bars-btn { width: 52px; height: 52px; }
+
+/* ── Compact utility panel ── */
+body.is-menu-open .container {
+  border-radius: 24px;
+  padding: 12px 13px;
+}
+body.is-menu-open .main-row {
+  flex-direction: row;
+  height: auto;
+  justify-content: initial;
+  gap: 9px;
+}
+body.is-menu-open .bars-btn { width: 48px; height: 48px; }
+body.is-menu-open .info { display: flex; flex: 1; width: auto; }
+body.is-menu-open .status-row { justify-content: initial; }
+body.is-menu-open .mid-row { justify-content: initial; width: auto; gap: 5px; }
+body.is-menu-open #wave { width: 48px; height: 20px; }
+body.is-menu-open .text { max-width: 88px; }
+body.is-menu-open .side-col { display: flex; flex-direction: row; width: auto; gap: 4px; }
+body.is-menu-open .side-row { display: contents; }
+body.is-menu-open .btn { width: 25px; height: 25px; }
+
+/* ── Hamburger menu: menu-only surface, never the old overlay layout ── */
+.menu-panel {
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 28px 8px 8px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 18px;
+  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.2);
+  -webkit-app-region: drag;
+}
+body.is-menu-open .container {
+  padding: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+body.is-menu-open .main-row {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: flex-end;
+  width: 100%;
+  height: 100%;
+  padding-top: 15px;
+  padding-right: 8px;
+  position: relative;
+  z-index: 3;
+}
+body.is-menu-open .info,
+body.is-menu-open .side-col { display: none; }
+body.is-menu-open .bars-btn { width: 54px; height: 54px; }
+body.is-menu-open .menu-panel {
+  display: flex;
+  position: absolute;
+  top: 6px;
+  left: 0;
+  width: 210px;
+  height: calc(100% - 12px);
+  padding: 10px;
+  z-index: 5;
+  animation: menuSeparate 1.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes menuSeparate {
+  from { opacity: 0; transform: translateX(14px) scale(0.96); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+body.is-menu-closing .menu-panel {
+  animation: menuCollapse 1.2s cubic-bezier(0.4, 0, 0.2, 1) both;
+  pointer-events: none;
+}
+@keyframes menuCollapse {
+  from { opacity: 1; transform: translateX(0) scale(1); }
+  to { opacity: 0; transform: translateX(14px) scale(0.96); }
+}
+body.is-menu-open .menu-toggle { top: 6px; right: 1px; }
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 9px;
+  background: transparent;
+  color: #1e293b;
+  font: 500 12px/1 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  letter-spacing: 0.01em;
+  text-align: left;
+  -webkit-app-region: no-drag;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.menu-item:hover { background: #f1f5f9; color: #0f172a; }
+.menu-item:active { background: #e2e8f0; }
+.menu-item b { color: #94a3b8; font-size: 18px; font-weight: 400; line-height: 0.7; }
+body.is-menu-open .voice-menu {
+  right: 8px;
+  bottom: 8px;
+  background: #ffffff;
+  border-color: #e2e8f0;
+  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.2);
+}
+body.is-menu-open .voice-menu-head { color: #64748b; }
+body.is-menu-open .voice-menu button { color: #334155; }
+body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a; }
 </style></head>
 <body>
 <div class="container">
+  <button id="menu-btn" class="menu-toggle" title="Open voice controls" aria-label="Open voice controls" aria-expanded="false">
+    <i></i><i></i><i></i>
+  </button>
+  <div id="menu-panel" class="menu-panel" aria-hidden="true">
+    <button id="menu-close" class="menu-item" type="button">
+      <span>Close Overlay</span><b>×</b>
+    </button>
+    <button id="menu-voice" class="menu-item" type="button">
+      <span>Change Voice</span><b>›</b>
+    </button>
+    <button id="menu-detail" class="menu-item" type="button">
+      <span>Detail</span><b>›</b>
+    </button>
+  </div>
   <div class="main-row">
     <div class="grip"><span></span><span></span><span></span></div>
 
@@ -362,8 +558,8 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
         </svg>
       </button>
     </div>
-    <div id="voice-menu" class="voice-menu" style="display:none"></div>
   </div>
+  <div id="voice-menu" class="voice-menu" style="display:none"></div>
 
   <div class="feed-wrap" id="feed-wrap" style="display:none">
     <div class="feed-head">
@@ -383,6 +579,11 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   const $ = (id) => document.getElementById(id);
   const dot = $('dot'), label = $('label'), textEl = $('voice-text');
   const micBtn = $('mic-btn');
+  const menuBtn = $('menu-btn');
+  const menuPanel = $('menu-panel');
+  const menuClose = $('menu-close');
+  const menuVoice = $('menu-voice');
+  const menuDetail = $('menu-detail');
   const closeBtn = $('close-btn');
   const wave = $('wave'), wctx = wave.getContext('2d');
   const hintEl = $('hint');
@@ -401,16 +602,9 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   function send(type, payload) { if (bridge) bridge.sendEvent(Object.assign({ type: type }, payload || {})); }
 
   const VOICES = [
-    { id: 'en-US-JennyNeural', name: 'Jenny · US · female', lang: 'en' },
-    { id: 'en-US-GuyNeural', name: 'Guy · US · male', lang: 'en' },
-    { id: 'en-US-AriaNeural', name: 'Aria · US · female', lang: 'en' },
-    { id: 'en-US-ChristopherNeural', name: 'Christopher · US · male', lang: 'en' },
-    { id: 'en-GB-SoniaNeural', name: 'Sonia · UK · female', lang: 'en' },
-    { id: 'en-GB-RyanNeural', name: 'Ryan · UK · male', lang: 'en' },
-    { id: 'en-AU-NatashaNeural', name: 'Natasha · AU · female', lang: 'en' },
-    { id: 'en-AU-WilliamNeural', name: 'William · AU · male', lang: 'en' },
-    { id: 'id-ID-GadisNeural', name: 'Gadis · ID · female', lang: 'id' },
-    { id: 'id-ID-ArdiNeural', name: 'Ardi · ID · male', lang: 'id' },
+    { id: 'jarvis', name: 'JARVIS — cloned', lang: 'en' },
+    { id: 'am_michael', name: 'Michael — male', lang: 'en' },
+    { id: 'af_heart', name: 'Heart — female', lang: 'en' },
   ];
   let voice = localStorage.getItem('voice.voice') || 'en-US-JennyNeural';
   let voiceId = localStorage.getItem('voice.idVoice') || 'id-ID-GadisNeural';
@@ -443,6 +637,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   let audioCtx = null;
   let analyser = null;
   let freqBuf = null;
+  let levelBuf = null;
   let roundTimer = null;
   let roundRunning = false;
   let abortRef = null;
@@ -453,7 +648,6 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   let mutePendingSend = false; // hardware-mute pressed while a speech round runs
   let chatId = localStorage.getItem('voice.chatId') || '';
   let chatLock = null;
-  let maxLevelEver = 0;
 
   const audio = new Audio();
   audio.volume = 1.0;
@@ -471,7 +665,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   }
 
   function startWave(mode) {
-    waveMode = mode;
+    waveMode = mode === 'processing' ? 'thinking' : mode;
     if (mode === 'speaking') fakeBars.length = 0;
     wave.classList.remove('fade-in');
     void wave.offsetWidth;
@@ -485,9 +679,23 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     let heights;
     if (waveMode === 'listening' && analyser && freqBuf) {
       analyser.getByteFrequencyData(freqBuf);
+      let rms = 0;
+      if (levelBuf) {
+        analyser.getByteTimeDomainData(levelBuf);
+        for (let i = 0; i < levelBuf.length; i++) {
+          const sample = (levelBuf[i] - 128) / 128;
+          rms += sample * sample;
+        }
+        rms = Math.sqrt(rms / levelBuf.length);
+      }
+      // Use real microphone energy as the main driver. The frequency bins
+      // only add a little variation between bars, so quiet input stays quiet
+      // and a louder voice visibly lifts the whole group.
+      const loudness = Math.min(1, rms * 9);
       heights = [0, 1, 2, 3].map((i) => {
         const v = freqBuf[Math.floor((i / 4) * freqBuf.length * 0.6)] / 255;
-        return 5 + v * v * 19;
+        const variation = 0.58 + v * 0.42;
+        return 4 + loudness * variation * 21;
       });
     } else if (waveMode === 'thinking') {
       const t = Date.now() / 190;
@@ -559,9 +767,9 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   }
 
   function setStatus(s, extraText) {
-    const cls = s === 'listening' ? 'listening' : s === 'thinking' ? 'thinking' : s === 'speaking' ? 'speaking' : s === 'muted' ? 'muted' : s === 'error' ? 'error' : 'idle';
+    const cls = s === 'listening' ? 'listening' : s === 'thinking' ? 'thinking' : s === 'processing' ? 'processing' : s === 'speaking' ? 'speaking' : s === 'muted' ? 'muted' : s === 'error' ? 'error' : 'idle';
     dot.className = 'pip ' + cls;
-    const map = { idle: 'Voice', muted: 'Muted', listening: 'Listening', thinking: 'Thinking', speaking: 'Answering', error: 'Error' };
+    const map = { idle: 'Voice', muted: 'Muted', listening: 'Listening', thinking: 'Thinking', processing: 'Preparing voice', speaking: 'Answering', error: 'Error' };
     label.textContent = map[s] || s;
     label.classList.remove('swap');
     void label.offsetWidth;
@@ -569,7 +777,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     if (extraText !== undefined) textEl.textContent = extraText;
     document.body.className = 'state-' + cls;
     micBtn.className = 'bars-btn' + (micOn ? ' on' : '');
-    const stageKey = { listening: 'listening', thinking: 'thinking', speaking: 'speaking' }[s];
+    const stageKey = { listening: 'listening', thinking: 'thinking', processing: 'thinking', speaking: 'speaking' }[s];
     document.querySelectorAll('.stage').forEach((el) => el.classList.toggle('on', el.dataset.s === stageKey));
     startWave(s === 'muted' || s === 'idle' ? 'idle' : s);
     if (extraText !== undefined) requestAnimationFrame(refreshMarquee);
@@ -593,18 +801,11 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     return '';
   }
 
-  // ── Recording rounds (extendable + silence-aware) ──
-  // Rounds record at 250ms timeslices. A round extends while speech keeps
-  // flowing (up to 8s), then leading/trailing-silence chunks are trimmed before
-  // STT so Whisper never sees long silences (kills "thank you" hallucinations).
-  // Auto-send waits for ~2.5s of true silence; the laptop mic-mute button
-  // triggers an instant send.
-  const LOUD_THRESHOLD = 0.045;
-  const ROUND_BASE_MS = 2000;
-  const ROUND_MAX_MS = 8000;
-  const TRAIL_END_MS = 700;   // speech stopped → end the round after this
-  const TAIL_KEEP_MS = 250;   // trailing audio kept in the STT blob
-  const SEND_SILENCE_MS = 2500;
+  // ── Capture config (mirrors scratch/pure_moonshine_test.py) ──
+  const SEND_SILENCE_MS = 2500;  // quiet for this long → end the round + transcribe
+  const MAX_ROUND_MS = 30000;    // hard cap for continuous talking
+  const MIN_ROUND_MS = 800;      // ignore sub-second blips
+  const SOUND_LEVEL = 0.01;      // anything above this counts as "sound"
 
   // Whisper's classic silence/noise hallucinations — never send these
   const HALLUCINATIONS = [
@@ -681,49 +882,90 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     }
   }
 
+  // ── Capture: getUserMedia + MediaRecorder ───────────────────────────────
+  // The SAME capture method other apps use (and the one that provably hears
+  // this machine's user). The FULL recording goes to /api/transcribe, which
+  // calls Moonshine with the exact code path of scratch/pure_moonshine_test.py
+  // (transcribe_without_streaming). No trimming, no gates, no hints.
+  let recorder = null;
+  let recChunks = [];
+
+  function startRound() {
+    if (!micOn || roundRunning) return;
+    roundRunning = true;
+    oneRound()
+      .catch((e) => console.error('[Voice] round error', e))
+      .finally(() => {
+        roundRunning = false;
+        if (micOn) roundTimer = setTimeout(startRound, 60);
+      });
+  }
+
+  function endRecorder() {
+    if (recorder && recorder.state !== 'inactive') {
+      try { recorder.stop(); } catch (_e) { /* already stopped */ }
+    }
+  }
+
+  async function transcribeBlob(blob) {
+    try {
+      const fd = new FormData();
+      fd.append('file', blob, 'round.webm');
+      const resp = await fetch(API + '/api/transcribe', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (!resp.ok || (data && data.error)) {
+        // Empty transcript (422) = no speech heard — ignore silently
+        if (resp.status !== 422) {
+          setStatus('error', String((data && data.error) || ('HTTP ' + resp.status)).slice(0, 400));
+          await sleep(1500);
+        }
+        return '';
+      }
+      return extractTranscript(data);
+    } catch (e) {
+      console.error('[Voice] STT failed', e);
+      return '';
+    }
+  }
+
   async function oneRound() {
     if (!stream || !micOn) return;
     const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus' : 'audio/webm';
-    const recorder = new MediaRecorder(stream, { mimeType: mime });
-    const chunks = [];
-    const chunkTimes = [];
+    recorder = new MediaRecorder(stream, { mimeType: mime });
+    recChunks = [];
     recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) { chunks.push(e.data); chunkTimes.push(Date.now()); }
+      if (e.data && e.data.size > 0) recChunks.push(e.data);
     };
-
-    const stopped = new Promise((resolve) => { recorder.onstop = () => resolve(); });
+    const stopped = new Promise((res) => { recorder.onstop = () => res(); });
     recorder.start(250);
 
-    let speechMs = 0;
-    let roundMax = 0;
-    let firstLoudAt = 0;
-    let lastLoudAt = 0;
-    roundHasSpeech = false;
     const buf = analyser ? new Uint8Array(analyser.fftSize) : null;
+    roundHasSpeech = false;
+    let lastSoundAt = Date.now();
     const startedAt = Date.now();
 
     const monitor = setInterval(() => {
-      if (!analyser || !buf) return;
-      analyser.getByteTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += Math.abs(buf[i] - 128) / 128;
-      const level = sum / buf.length;
-      roundMax = Math.max(roundMax, level);
-      const loud = level > LOUD_THRESHOLD;
-      if (loud) {
-        speechMs += 100;
-        const now = Date.now();
-        if (!firstLoudAt) firstLoudAt = now;
-        lastLoudAt = now;
-        lastSpeechAt = now;
+      let level = 0;
+      if (analyser && buf) {
+        analyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += Math.abs(buf[i] - 128) / 128;
+        level = sum / buf.length;
+      }
+      if (level > SOUND_LEVEL) {
+        lastSoundAt = Date.now();
+        lastSpeechAt = Date.now();
         roundHasSpeech = true;
+        // Barge-in: user talks while we answer → stop our voice and capture
+        if (speaking) {
+          stopSpeaking();
+          setStatus('listening', accumulated || 'Listening');
+        }
       }
       const elapsed = Date.now() - startedAt;
-      const speechStopped = lastLoudAt && (Date.now() - lastLoudAt) >= TRAIL_END_MS;
-      if (elapsed >= ROUND_MAX_MS
-        || (elapsed >= ROUND_BASE_MS && speechStopped)
-        || (elapsed >= ROUND_BASE_MS && !roundHasSpeech)) {
+      // End the round after 2.5s of quiet, or after the hard cap
+      if (elapsed >= MAX_ROUND_MS || (elapsed >= MIN_ROUND_MS && Date.now() - lastSoundAt >= SEND_SILENCE_MS)) {
         clearInterval(monitor);
         if (recorder.state !== 'inactive') recorder.stop();
       }
@@ -732,116 +974,50 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     await stopped;
     await sleep(40);
 
-    maxLevelEver = Math.max(maxLevelEver, roundMax);
-    const blobFull = new Blob(chunks, { type: mime });
-    const loud = speechMs >= 300;
-    // Use RMS once the meter has proven alive; otherwise fall back to blob size.
-    const silent = (maxLevelEver > 0.05) ? !loud : blobFull.size < 4000;
+    recorder = null;
+    // Pure silence — nothing to transcribe
+    if (!roundHasSpeech || recChunks.length === 0) return;
 
-    if (speaking) {
-      // Barge-in: user talks while we answer → stop our voice and capture
-      // what they said (falls through to STT below)
-      if (loud) {
-        stopSpeaking();
-        setStatus('listening', accumulated || 'Listening');
-      } else {
-        return;
-      }
-    }
-
-    if (thinking) {
-      // Barge-in while the pipeline runs → cancel, then capture this utterance
-      if (loud) {
-        if (abortRef) { abortRef.abort(); abortRef = null; }
-        thinking = false;
-      } else {
-        return;
-      }
-    }
-
-    // Silence → auto-send only after real sustained quiet (hardware mute is instant)
-    if (silent) {
-      if (mutePendingSend) {
-        mutePendingSend = false;
-        const text = accumulated.trim();
-        if (text) { accumulated = ''; hideHint(); sendText(text); }
-        return;
-      }
-      const text = accumulated.trim();
-      if (text && (Date.now() - lastSpeechAt) >= SEND_SILENCE_MS) {
-        accumulated = '';
-        hideHint();
-        sendText(text);
-      }
-      return;
-    }
-
-    // Speech round → trim leading/trailing silence, then transcribe
-    let blob = blobFull;
-    try {
-      let firstIdx = 0;
-      if (firstLoudAt) {
-        for (let i = 0; i < chunkTimes.length; i++) {
-          if (chunkTimes[i] + 250 >= firstLoudAt) { firstIdx = Math.max(0, i - 1); break; }
-        }
-      }
-      const tailCut = lastLoudAt ? lastLoudAt + TAIL_KEEP_MS : Infinity;
-      const kept = [];
-      for (let i = firstIdx; i < chunkTimes.length; i++) {
-        if (chunkTimes[i] <= tailCut) kept.push(chunks[i]);
-      }
-      if (kept.length > 0) blob = new Blob(kept, { type: mime });
-    } catch (_e) { /* keep full blob on any error */ }
-
-    let t = '';
-    try {
-      const fd = new FormData();
-      fd.append('file', blob, 'round.webm');
-      // Bilingual prompt + language hint (short clips hallucinate on auto-detect)
-      fd.append('prompt', 'Transcribe Indonesian and English speech. Preserve technical terms, file names, and numbers.');
-      if (lastLang) fd.append('language', lastLang === 'id' ? 'id' : 'en');
-      const resp = await fetch(API + '/api/transcribe', { method: 'POST', body: fd });
-      const data = await resp.json();
-      if (data && data.error && !Array.isArray(data)) {
-        setStatus('error', String(data.error).slice(0, 80));
-        await sleep(1500);
-        if (micOn) setStatus('listening', accumulated || 'Listening');
-        return;
-      }
-      t = extractTranscript(data);
-    } catch (e) {
-      console.error('[Voice] STT failed', e);
-      setStatus('error', 'STT failed');
-      await sleep(1500);
-      if (micOn) setStatus('listening', accumulated || 'Listening');
-      return;
-    }
+    // PURE: send the FULL recording — the first chunk always carries the
+    // WebM header; the server uses the pure Moonshine call (loudnorm + retry)
+    const blob = new Blob(recChunks, { type: mime });
+    recChunks = [];
+    let t = await transcribeBlob(blob);
     if (isGarbage(t)) t = '';
     if (t) {
-      accumulated = accumulated ? accumulated + ' ' + t : t;
+      // Barge-in only after STT confirms actual speech. A noisy recording
+      // can still produce a 422/empty transcript; cancelling the active run
+      // for that case leaves live mode listening without ever answering.
+      if (thinking) {
+        if (abortRef) { abortRef.abort(); abortRef = null; }
+        thinking = false;
+      }
+      accumulated = t;
       lastLang = detectLanguage(accumulated);
       setStatus('listening', accumulated);
       showHint();
       send('transcript', { text: accumulated });
     }
 
-    // Mute pressed during this speech round → send now that speech is captured
+    // Mute pressed during this speech round → send now
     if (mutePendingSend) {
       mutePendingSend = false;
       const text = accumulated.trim();
       if (text) { accumulated = ''; hideHint(); sendText(text); }
+      return;
     }
-  }
 
-  function loopRound() {
-    if (!micOn || roundRunning) return;
-    roundRunning = true;
-    oneRound()
-      .catch((e) => console.error('[Voice] round error', e))
-      .finally(() => {
-        roundRunning = false;
-        if (micOn) roundTimer = setTimeout(loopRound, 60);
-      });
+    // Hands-free auto-send after the round settles
+    const pending = accumulated.trim();
+    if (pending && !sending && !thinking) {
+      await sleep(400);
+      const text2 = accumulated.trim();
+      if (text2 && !sending && !thinking) {
+        accumulated = '';
+        hideHint();
+        sendText(text2);
+      }
+    }
   }
 
   // ── Chat resolution ──
@@ -869,8 +1045,16 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   function ensureChat() {
     if (chatLock) return chatLock;
     chatLock = (async () => {
-      if (chatId && voiceWsId) return chatId;
-      // Fallback: resolve the general workspace's first chat
+      // 1) Known chat (IPC-synced or stored) — but VERIFY it still exists.
+      //    Stale chat ids silently drop messages on the backend.
+      if (chatId && voiceWsId) {
+        try {
+          const check = await fetch(API + '/api/workspaces/' + encodeURIComponent(voiceWsId) + '/chats/' + encodeURIComponent(chatId));
+          if (check.ok) return chatId;
+        } catch (_e) { /* fall through */ }
+      }
+      // 2) Fresh resolution: General workspace + its first chat (what the
+      //    house shows). Creates 'Voice Chat' when there are none.
       const wsRes = await fetch(API + '/api/workspaces');
       const wsData = await wsRes.json();
       const ws = (wsData.workspaces || []).find((w) => w.isGeneral) || (wsData.workspaces || [])[0];
@@ -937,15 +1121,71 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   // ── Live process feed (thinking / subagents / tools, like the main chat) ──
   const FEED_MAX = 300;
   let expanded = false;
+  let menuOpen = false;
+  let menuClosing = false;
+  let menuClosingTimer = null;
   let lastLogLen = 0;
+
+  function resizeOverlay() {
+    const menuVisible = menuOpen || menuClosing;
+    const w = expanded ? 400 : menuVisible ? 286 : 84;
+    const h = expanded ? 344 : menuVisible ? 140 : 84;
+    if (bridge && bridge.resize) bridge.resize(w, h);
+  }
+
+  function finishMenuClose() {
+    if (menuOpen) return;
+    menuClosing = false;
+    document.body.classList.remove('is-menu-open', 'is-menu-closing');
+    menuPanel.setAttribute('aria-hidden', 'true');
+    resizeOverlay();
+  }
+
+  function setMenuOpen(on) {
+    if (on) {
+      clearTimeout(menuClosingTimer);
+      menuClosingTimer = null;
+      menuOpen = true;
+      menuClosing = false;
+      expanded = false;
+      expandBtn.classList.remove('expanded');
+      feedWrap.style.display = 'none';
+      document.body.classList.remove('is-expanded');
+      document.body.classList.add('is-menu-open');
+      document.body.classList.remove('is-menu-closing');
+      menuPanel.setAttribute('aria-hidden', 'false');
+    } else {
+      if (!menuOpen && !menuClosing) return;
+      menuOpen = false;
+      menuClosing = true;
+      document.body.classList.add('is-menu-open', 'is-menu-closing');
+      menuPanel.setAttribute('aria-hidden', 'false');
+      clearTimeout(menuClosingTimer);
+      menuClosingTimer = setTimeout(finishMenuClose, 1220);
+    }
+    menuBtn.classList.toggle('active', on);
+    menuBtn.setAttribute('aria-expanded', String(on));
+    menuBtn.title = on ? 'Close voice controls' : 'Open voice controls';
+    resizeOverlay();
+  }
 
   function setExpanded(on) {
     expanded = on;
+    if (on) {
+      clearTimeout(menuClosingTimer);
+      menuClosingTimer = null;
+      menuOpen = false;
+      menuClosing = false;
+      menuBtn.classList.remove('active');
+      menuBtn.setAttribute('aria-expanded', 'false');
+      menuBtn.title = 'Open voice controls';
+      document.body.classList.remove('is-menu-open', 'is-menu-closing');
+      menuPanel.setAttribute('aria-hidden', 'true');
+    }
     expandBtn.classList.toggle('expanded', on);
+    document.body.classList.toggle('is-expanded', on);
     feedWrap.style.display = on ? '' : 'none';
-    const w = on ? 400 : 356;
-    const h = on ? 344 : 124;
-    if (bridge && bridge.resize) bridge.resize(w, h);
+    resizeOverlay();
   }
 
   function feedLine(text, kind) {
@@ -1055,14 +1295,21 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
       if (reply) {
         if (feedStatus) feedStatus.textContent = 'answering';
         feedMsg('Assistant: ' + reply.slice(0, 200), 'agent');
+        setStatus('processing', 'Preparing voice…');
         await persistReply(chat, reply);
         await speak(reply);
       } else if (failed) {
         setStatus('error', extractRunError(lastState, failReason));
         if (feedStatus) feedStatus.textContent = 'error';
         setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
+      } else if (lastState) {
+        setStatus('error', 'No reply received — check api_out.log');
+        if (feedStatus) feedStatus.textContent = 'error';
+        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
       } else {
-        setStatus('listening', 'Done');
+        setStatus('error', 'Run returned nothing — check api_out.log');
+        if (feedStatus) feedStatus.textContent = 'error';
+        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
       }
     } catch (e) {
       thinking = false;
@@ -1105,20 +1352,23 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     if (!clean) return;
     lastReply = clean;
     speaking = true;
-    setStatus('speaking', clean.slice(0, 120) + (clean.length > 120 ? '…' : ''));
+    setStatus('processing', 'Preparing voice…');
     send('reply', { text: clean.slice(0, 500) });
     const useVoice = voiceForLanguage(detectLanguage(clean));
+    // Don't transcribe our own voice: pause the recorder while speaking
+    if (recorder && recorder.state === 'recording') { try { recorder.pause(); } catch (_e) {} }
     try {
       const resp = await fetch(API + '/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: clean, voice: useVoice }),
+        body: JSON.stringify({ text: clean, voice: useVoice, engine: 'kokoro' }),
       });
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       audio.src = url;
       await audio.play();
+      setStatus('speaking', clean.slice(0, 120) + (clean.length > 120 ? '…' : ''));
       await new Promise((res) => {
         audio.onended = res;
         audio.onpause = () => { if (!speaking) res(); };
@@ -1129,6 +1379,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
       setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
     } finally {
       speaking = false;
+      if (recorder && recorder.state === 'paused') { try { recorder.resume(); } catch (_e) {} }
       if (micOn) setStatus('listening', accumulated || 'Listening');
     }
   }
@@ -1142,8 +1393,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   function renderVoiceMenu() {
     voiceMenu.innerHTML = '';
     const sections = [
-      { label: 'English', lang: 'en' },
-      { label: 'Bahasa Indonesia', lang: 'id' },
+      { label: 'Voices', lang: 'en' },
     ];
     sections.forEach((sec) => {
       const head = document.createElement('div');
@@ -1185,7 +1435,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     fetch(API + '/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: sample, voice: vId }),
+      body: JSON.stringify({ text: sample, voice: vId, engine: 'kokoro' }),
     })
       .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
       .then((blob) => {
@@ -1210,11 +1460,11 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
         analyser.fftSize = 2048;
         analyser.smoothingTimeConstant = 0.75;
         freqBuf = new Uint8Array(analyser.frequencyBinCount);
+        levelBuf = new Uint8Array(analyser.fftSize);
         src.connect(analyser);
         micOn = true;
         localStorage.setItem('voice.micOn', '1');
         accumulated = '';
-        maxLevelEver = 0;
         lastSpeechAt = 0;
         lastLang = '';
         sending = false;
@@ -1227,7 +1477,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
         stream.getAudioTracks().forEach((track) => {
           track.addEventListener('muted', onTrackMuted);
         });
-        loopRound();
+        startRound();
       })
       .catch((e) => {
         console.error('[Voice] mic denied', e);
@@ -1243,8 +1493,9 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     micOn = false;
     localStorage.setItem('voice.micOn', '0');
     clearTimeout(roundTimer);
+    endRecorder();
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
-    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; analyser = null; freqBuf = null; }
+    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; analyser = null; freqBuf = null; levelBuf = null; }
     stopSpeaking();
     if (abortRef) { abortRef.abort(); abortRef = null; }
     thinking = false;
@@ -1268,6 +1519,14 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   }
 
   micBtn.addEventListener('click', () => { micOn ? stopListening() : startListening(); });
+  menuBtn.addEventListener('click', (e) => { e.stopPropagation(); setMenuOpen(!menuOpen); });
+  menuClose.addEventListener('click', () => { stopListening(); if (bridge) bridge.close(); else window.close(); });
+  menuVoice.addEventListener('click', (e) => {
+    e.stopPropagation();
+    renderVoiceMenu();
+    voiceMenu.style.display = voiceMenu.style.display === 'none' ? '' : 'none';
+  });
+  menuDetail.addEventListener('click', () => { setMenuOpen(false); setExpanded(true); });
   sendBtn.addEventListener('click', sendNow);
   replayArea.addEventListener('click', replayLast);
   closeBtn.addEventListener('click', () => { stopListening(); if (bridge) bridge.close(); else window.close(); });
@@ -1280,7 +1539,7 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
     voiceMenu.style.display = voiceMenu.style.display === 'none' ? '' : 'none';
   });
   document.addEventListener('click', (e) => {
-    if (!voiceMenu.contains(e.target) && e.target !== voiceBtn) voiceMenu.style.display = 'none';
+    if (!voiceMenu.contains(e.target) && e.target !== voiceBtn && e.target !== menuVoice) voiceMenu.style.display = 'none';
   });
 
   // Resume AudioContext on first interaction (needed if it started suspended)
@@ -1289,6 +1548,9 @@ body.state-listening .ellipsis, body.state-thinking .ellipsis, body.state-speaki
   // Init
   updateMicBtn();
   setStatus('idle', 'Ctrl+G to toggle');
+  // Normalize the native window after the HTML first paints so the initial
+  // orb is the same compact size as it is after closing the menu.
+  resizeOverlay();
   if (localStorage.getItem('voice.micOn') === '1') {
     setTimeout(startListening, 400);
   }

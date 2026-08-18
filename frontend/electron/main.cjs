@@ -2,6 +2,7 @@ const { app, BrowserWindow, shell, dialog, ipcMain, screen, Tray, Menu, globalSh
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const { exec } = require('child_process');
 const { spawn } = require('child_process');
 const VOICE_HTML = path.join(__dirname, 'voice.html');
 
@@ -22,6 +23,24 @@ function sendToMain(channel, payload) {
   }
 }
 
+function killPort(port) {
+  // Kill whatever holds the port so the API server can always bind fresh.
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve();
+    exec(`netstat -ano | findstr ":${port}" | findstr "LISTENING"`, (err, stdout) => {
+      if (!stdout) return resolve();
+      for (const line of stdout.trim().split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && /^\d+$/.test(pid) && Number(pid) !== process.pid) {
+          try { process.kill(Number(pid)); console.log(`[API] killed stale server PID ${pid}`); } catch (_e) { /* gone */ }
+        }
+      }
+      resolve();
+    });
+  });
+}
+
 function startApiServer() {
   const venv312Python = path.join(__dirname, '..', '..', 'venv312', 'Scripts', 'python.exe');
   const venvPython = path.join(__dirname, '..', '..', 'venv', 'Scripts', 'python.exe');
@@ -34,27 +53,38 @@ function startApiServer() {
   }
   const apiPath = path.join(__dirname, '..', '..', 'api_server.py');
 
-  const args = [apiPath];
-  if (isDev) {
-    args.push('--reload');
-  }
+  killPort(8000).then(() => {
+    const args = [apiPath];
+    if (isDev) {
+      args.push('--reload');
+    }
 
-  apiProcess = spawn(pythonCmd, args, {
-    cwd: path.join(__dirname, '..', '..'),
-    env: { ...process.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+    apiProcess = spawn(pythonCmd, args, {
+      cwd: path.join(__dirname, '..', '..'),
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-  apiProcess.stdout.on('data', (data) => {
-    console.log(`[API] ${data.toString().trim()}`);
-  });
+    apiProcess.stdout.on('data', (data) => {
+      console.log(`[API] ${data.toString().trim()}`);
+    });
 
-  apiProcess.stderr.on('data', (data) => {
-    console.error(`[API err] ${data.toString().trim()}`);
-  });
+    apiProcess.stderr.on('data', (data) => {
+      console.error(`[API err] ${data.toString().trim()}`);
+    });
 
-  apiProcess.on('error', (err) => {
-    console.error('Failed to start API server:', err.message);
+    apiProcess.on('error', (err) => {
+      console.error('Failed to start API server:', err.message);
+    });
+
+    // Self-heal: restart the API server if it dies while the app is open.
+    apiProcess.on('exit', (code) => {
+      console.error(`[API] server exited (${code})`);
+      if (mainWindow && !mainWindow.isDestroyed() && !isQuitting) {
+        console.log('[API] restarting in 3s...');
+        setTimeout(() => startApiServer(), 3000);
+      }
+    });
   });
 }
 
@@ -127,11 +157,11 @@ function openVoiceWindow() {
   if (voiceWindow && !voiceWindow.isDestroyed()) return;
   const displays = screen.getAllDisplays();
   const primary = displays.find(d => d.bounds.x === 0 && d.bounds.y === 0) || displays[0];
-  const wx = primary.bounds.x + primary.bounds.width - 372;
+  const wx = primary.bounds.x + primary.bounds.width - 96;
   const wy = primary.bounds.y + 96;
   voiceWindow = new BrowserWindow({
-    width: 356,
-    height: 124,
+    width: 84,
+    height: 84,
     x: wx,
     y: wy,
     frame: false,
@@ -187,15 +217,18 @@ ipcMain.on('voice-set-chat', (_event, payload) => {
   }
 });
 
-// Overlay → resize itself (compact pill ↔ expanded process feed)
+// Overlay → resize itself (compact circle ↔ expanded process feed)
 ipcMain.on('voice-resize', (_event, w, h) => {
   if (voiceWindow && !voiceWindow.isDestroyed()) {
-    const disp = screen.getDisplayMatching(voiceWindow.getBounds());
     const bounds = voiceWindow.getBounds();
+    const nextWidth = Math.round(w);
+    // Resize around the current right edge so the mic stays in place while
+    // the controls extend beside it. Dragging still determines the edge.
+    const x = bounds.x - (nextWidth - bounds.width);
     voiceWindow.setBounds({
-      x: disp.workArea.x + disp.workArea.width - Math.round(w),
+      x,
       y: bounds.y,
-      width: Math.round(w),
+      width: nextWidth,
       height: Math.round(h),
     });
   }

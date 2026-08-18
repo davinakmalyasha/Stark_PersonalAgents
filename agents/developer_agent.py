@@ -9,10 +9,10 @@ import threading
 import requests
 from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, RemoveMessage
-from state_sync import safe_get_state, safe_update_state, safe_append_live_log
-from it_department_nodes_base import ITState
-from tools import TOOL_DEFINITIONS, execute_tool, list_files
-from llm import invoke_messages_with_fallback
+from sync.state_sync import safe_get_state, safe_update_state, safe_append_live_log
+from agents.it_department_nodes_base import ITState
+from tools import TOOL_DEFINITIONS, execute_tool
+from llm import invoke_messages_with_fallback, invoke_messages_with_fallback_stream
 from deepagents import HarnessProfile, register_harness_profile
 
 try:
@@ -22,12 +22,12 @@ except Exception:
 
 # Local helper imports moved to top level
 from workspace_manager import get_workspace_rules_and_profile
-from dev_memory_helper import get_developer_memory_context
-from loop_detector import detect_stagnation_or_loop, LoopGuard
-from sync_helpers import load_task_tracking, save_task_tracking, build_task_progress_block
-from chat_context import build_chat_context
-from context_budget import estimate_tokens
-from context_compaction import (
+from memory.dev_memory_helper import get_developer_memory_context
+from llm.loop_detector import detect_stagnation_or_loop, LoopGuard
+from sync.sync_helpers import load_task_tracking, save_task_tracking, build_task_progress_block
+from memory.chat_context import build_chat_context
+from memory.context_budget import estimate_tokens
+from memory.context_compaction import (
     build_structured_resume_summary,
     invalidate_stale_reads,
     tier1_compact,
@@ -35,10 +35,16 @@ from context_compaction import (
     checkpoint_compact,
     prune_stale_tool_outputs
 )
-from tool_schemas import get_native_tools
-from deterministic_checker import run_deterministic_cascade
-from dev_lint import lint_and_fix
-from developer_prompt import _STATIC_SYSTEM_TEMPLATE
+try:
+    from dev_lint import lint_and_fix
+except ImportError:
+    try:
+        from Testing_Log.Testing.dev_lint import lint_and_fix
+    except ImportError:
+        lint_and_fix = None
+
+from tools import get_native_tools
+from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
 
 def get_harness_profile(name: str):
     if hp is not None:
@@ -52,9 +58,9 @@ MAX_ITERATIONS = 1_000  # Safety ceiling only — LLM decides when done. Real ex
 
 # Tools that belong to the DISCOVERY phase: the turn AFTER a successful
 # search/list/read is still exploring, so it gets a tight reasoning budget
-# (BSA_REASONING_DISCOVERY + BSA_REASONING_DISCOVERY_BUDGET) instead of none.
+# (REASONING_DISCOVERY + REASONING_DISCOVERY_BUDGET) instead of none.
 _DISCOVERY_TOOLS = frozenset({
-    "search_codebase", "search_code", "list_files", "read_file", "view_signatures",
+    "search_code", "read_file",
 })
 
 
@@ -112,7 +118,8 @@ def get_compact_file_list(project_path: str) -> str:
         "node_modules", "venv", ".venv", ".git", "__pycache__", 
         ".claude", ".deep_agents", "vendor", "dist", "build", 
         ".next", ".vscode", ".idea", ".pytest_cache", ".mypy_cache",
-        ".tox", "htmlcov", "venv312", "scratch", ".antigravity"
+        ".tox", "htmlcov", "venv312", "scratch", ".antigravity",
+        ".agent-cache",  # tool-output sidecar offloads — not project source
     }
     
     file_list = []
@@ -231,7 +238,7 @@ def _build_dynamic_context(task: str, project_path: str, context: str, is_fixing
     because the cache break point moves from mid-context to the very end.
     """
     safe_path = project_path or "."
-    wdir = project_path or (os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)))
+    wdir = project_path or (os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)))
 
     # ── STABLE: Byte-identical for a given project_path ──
     # NOTE: `## Working Directory` is deliberately NOT here — it contains the
@@ -249,13 +256,24 @@ def _build_dynamic_context(task: str, project_path: str, context: str, is_fixing
     except Exception as e:
         print(f"Error loading rules context for developer: {e}")
 
+    # Template map — compact catalog of the harness template library (Zone 1).
+    # Byte-identical per templates/ state (harness-global, not per-project), so
+    # it cache-hits with the rest of the prefix. Live details via template_list().
+    try:
+        from tools import build_template_map
+        template_map = build_template_map()
+        if template_map:
+            stable_parts.append(template_map)
+    except Exception as e:
+        print(f"Error loading template map: {e}")
+
     # Cached repository map — LAST stable section (append-only tail growth).
     # Byte-identical per project_path, so it cache-hits after the first call;
     # new-file appends only ever touch the map's bottom (prefix stays cached).
     # Never injected here fresh: `load_cached_code_map` is read-only; the map
     # is generated/persisted by refresh_code_map (eval attempt / session start).
     try:
-        from memory_manager import load_cached_code_map
+        from memory.memory_manager import load_cached_code_map
         cached_map = load_cached_code_map(safe_path)
         if cached_map:
             stable_parts.append(f"## Repository Map (cached, append-only)\n{cached_map}")
@@ -267,7 +285,7 @@ def _build_dynamic_context(task: str, project_path: str, context: str, is_fixing
     # tail keeps those appends cache-clean (map appends shift only this tiny
     # section — negligible re-miss).
     try:
-        from memory_manager import load_cached_project_identity
+        from memory.memory_manager import load_cached_project_identity
         project_card = load_cached_project_identity(safe_path)
         if project_card:
             stable_parts.append(f"## Project Overview\n{project_card}")
@@ -409,7 +427,7 @@ def looks_like_tool_call(text: str) -> bool:
 
 def _is_auto_continue_enabled() -> bool:
     """Checks if the auto_continue setting is enabled in the user profile settings."""
-    harness_root = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
     profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
     try:
         if os.path.isfile(profile_path):
@@ -461,7 +479,7 @@ def count_identical_calls_since_state_change(tool_call_log: list, tool_name: str
             continue
             
         # Break on state-changing file tools (edits or writes)
-        if item_tool in ("write_file", "edit_file", "apply_diff"):
+        if item_tool in ("edit_file",):
             break
             
         # Break on a different command execution (since different commands indicate progress/change)
@@ -623,7 +641,7 @@ def developer_node(s: ITState) -> dict:
     requirements = s.get("requirements", "")
     test_report = s.get("test_report", "")
     is_fixing = bool(test_report)
-    project_path = s.get("project_path", "") or (os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)))
+    project_path = s.get("project_path", "") or (os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)))
     err_count = s.get("error_count", 0)
     chat_id = s.get("chat_id", "")
 
@@ -713,15 +731,14 @@ def developer_node(s: ITState) -> dict:
     if task_step_info:
         context += task_step_info
 
-    valid_tools = ["read_file", "view_signatures", "write_file", "edit_file", "run_command",
-                   "search_code", "list_files", "compact_conversation",
-                   "query_history", "search_codebase",
-                   "web_fetch", "browser_navigate", "browser_extract",
-                   "browser_screenshot", "browser_close", "revert_last_change"]
+    valid_tools = ["read_file", "edit_file", "run_command",
+                   "search_code",
+                   "browser_navigate", "browser_extract",
+                   "browser_screenshot", "browser_close"]
 
-    # Configurable iteration ceiling — BSA_DEV_MAX_ITERS lets the eval harness
+    # Configurable iteration ceiling — DEV_MAX_ITERS lets the eval harness
     # cap a single Dev run (default 1000 = safety-only, LLM exits voluntarily).
-    max_iters = int(os.environ.get("BSA_DEV_MAX_ITERS", str(MAX_ITERATIONS)))
+    max_iters = int(os.environ.get("DEV_MAX_ITERS", str(MAX_ITERATIONS)))
 
     # â”€â”€ Load developer state if resuming from suspension â”€â”€
     developer_state = None
@@ -899,19 +916,14 @@ def developer_node(s: ITState) -> dict:
         # Three-zone: history starts at index 2 (after SystemMessage + Task HumanMessage)
         history_tokens = sum(estimate_tokens(m.content) for m in messages[2:]) if len(messages) > 2 else 0
         total_tokens = sum(estimate_tokens(m.content) for m in messages if hasattr(m, "content"))
-        # Check if the agent requested on-demand compaction via the compact_conversation tool
         voluntary_compact = False
-        for msg in messages:
-            if hasattr(msg, "content") and "compact_conversation" in str(msg.content):
-                voluntary_compact = True
-                break
 
         # Pillar 111: Adaptive threshold â€” shallower runs tolerate more, deep loops compact earlier
         keep_n = 12
         # B5: token-budgeted tail (opencode select() pattern) instead of fixed count.
-        # B6: incremental tier-0 prune runs before the full tiers. Both gated by BSA_COMPACT_V2.
-        compact_v2 = os.environ.get("BSA_COMPACT_V2", "1") == "1"
-        tail_budget = int(os.environ.get("BSA_TAIL_BUDGET_TOKENS", "100000")) if compact_v2 else None
+        # B6: incremental tier-0 prune runs before the full tiers. Both gated by COMPACT_V2.
+        compact_v2 = os.environ.get("COMPACT_V2", "1") == "1"
+        tail_budget = int(os.environ.get("TAIL_BUDGET_TOKENS", "100000")) if compact_v2 else None
 
         # Tier-0: cheap incremental prune before any full-tier rewrite
         if compact_v2 and total_tokens > 600000:
@@ -1010,8 +1022,6 @@ def developer_node(s: ITState) -> dict:
 
                 if last_tool == "read_file" and fname:
                     where_tag = f"Iter {iteration}/{max_iters}: read {fname} {last_detail}".strip()
-                elif last_tool == "write_file" and fname:
-                    where_tag = f"Iter {iteration}/{max_iters}: write {fname}"
                 elif last_tool == "edit_file" and fname:
                     where_tag = f"Iter {iteration}/{max_iters}: edit {fname} {last_detail}".strip()
                 elif last_tool == "run_command":
@@ -1046,16 +1056,16 @@ def developer_node(s: ITState) -> dict:
                 # discovery rung cost that miss while producing ~0 reasoning.
                 # Trouble signals flip the NEXT turn back to "high" (cheap: the
                 # high-config request is already cached from iter-1).
-                # Knobs: BSA_REASONING_ITER1 (planning depth, "high"),
-                #        BSA_REASONING_ROUTINE (routine depth, "disabled"),
-                #        BSA_FLIP_ON_TEST_ONLY=1 (default) → flip to high only
+                # Knobs: REASONING_ITER1 (planning depth, "high"),
+                #        REASONING_ROUTINE (routine depth, "disabled"),
+                #        FLIP_ON_TEST_ONLY=1 (default) → flip to high only
                 #        on real TEST failures; tool errors don't flip. With
                 #        Dev self-verification off there are no mid-session
                 #        test failures → the session is config-stable
                 #        (iter-1 high, everything else disabled, zero flips).
-                iter1_effort = os.environ.get("BSA_REASONING_ITER1", "high")
-                routine_effort = os.environ.get("BSA_REASONING_ROUTINE", "disabled")
-                flip_on_test_only = os.environ.get("BSA_FLIP_ON_TEST_ONLY", "1") == "1"
+                iter1_effort = os.environ.get("REASONING_ITER1", "high")
+                routine_effort = os.environ.get("REASONING_ROUTINE", "disabled")
+                flip_on_test_only = os.environ.get("FLIP_ON_TEST_ONLY", "1") == "1"
                 think_hard = (
                     iteration <= 1
                     or reflexion_retries > 0
@@ -1069,7 +1079,7 @@ def developer_node(s: ITState) -> dict:
                     reasoning_effort = routine_effort
                     reasoning_budget = None
 
-                llm_result = invoke_messages_with_fallback(
+                llm_result = invoke_messages_with_fallback_stream(
                     role="Developer",
                     messages=run_messages,
                     tools=get_native_tools(),
@@ -1182,99 +1192,12 @@ def developer_node(s: ITState) -> dict:
 
             # No tool call â€” agent is done
             _log(f"[DEVELOPER] No tool call parsed from response (len={len(response_text)}). Preview: {repr(response_text[:300])}")
-            planning_file = os.path.join(project_path or (os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))), "planning.md")
+            planning_file = os.path.join(project_path or (os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))), "planning.md")
             has_written_plan = (
-                any(item.get("tool") == "write_file" and "planning.md" in str(item.get("args", {}).get("file_path", "")) for item in tool_call_log) or
+                any(item.get("tool") == "edit_file" and "planning.md" in str(item.get("args", {}).get("file_path", "")) for item in tool_call_log) or
                 (os.path.isfile(planning_file) and os.path.getsize(planning_file) > 10)
             )
             # Note: is_plan_req is always False (no mode detection). Plan nudging removed.
-
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-            # reflexion_retries is a local variable
-            # BSA_DEV_SELF_VERIFY=1 restores the old Dev self-verification
-            # (deterministic cascade + test run + one bounded fix round).
-            # Default OFF: Dev is implement-only — the harness verifies
-            # automatically after the session and SDET fixes failures.
-            dev_self_verify = os.environ.get("BSA_DEV_SELF_VERIFY", "0") == "1"
-            if dev_self_verify and (tracked_files_created or tracked_files_modified):
-                # â”€â”€ Stage 2: Fast Deterministic Cascade â”€â”€
-                all_tracked = list(set(tracked_files_created + tracked_files_modified))
-                _log(f"[REFLEXION] Stage 2: Running deterministic cascade on {len(all_tracked)} file(s)...")
-
-                try:
-                    stage2_result = run_deterministic_cascade(all_tracked, project_path)
-                    _log(f"[REFLEXION] Stage 2: {stage2_result.summary}")
-
-                    # If deterministic auto-fixes were applied, inject them as tool results
-                    if stage2_result.auto_fixes_applied:
-                        auto_fix_msg = "Auto-fixes applied:\n" + "\n".join(
-                            f"  âœ“ {f}" for f in stage2_result.auto_fixes_applied
-                        )
-                        _log(f"[REFLEXION] {auto_fix_msg}")
-
-                except Exception as e:
-                    stage2_result = None
-                    _log(f"[REFLEXION] Stage 2: deterministic_checker failed/unavailable: {e}")
-
-                # â”€â”€ Run tests â”€â”€
-                test_cmd = _detect_test_command(project_path)
-                if test_cmd and iteration < max_iters - 3:  # Reserve 3 turns for reflexion fix loop
-                    _log(f"[REFLEXION] Running tests: '{test_cmd}'...")
-                    try:
-                        test_result = execute_tool("run_command", {"command": test_cmd, "timeout": 30000})
-                    except Exception as e:
-                        test_result = f"Test execution error: {e}"
-
-                    test_failed = (
-                        "STATUS: FAIL" in str(test_result)
-                        or (
-                            "exit code:" in str(test_result).lower()
-                            and "exit code: 0" not in str(test_result).lower()
-                        )
-                    )
-
-                    if not test_failed:
-                        # ── Test PASSED ──
-                        _log("[REFLEXION] ✅ Tests PASSED")
-                        reflexion_retries = 0  # Reset for next cycle
-
-                    else:
-                        # ── Test FAILED → honest report (NO in-session SDET) ──
-                        # The Developer NEVER spawns SDET — that is the harness's
-                        # job. One bounded re-entry lets Dev fix its own code or
-                        # write an honest report; the harness verify gate (hidden
-                        # test in eval, adaptive verify in the app) is the
-                        # authority and fires SDET-FIX outside this session.
-                        reflexion_retries += 1
-                        _log(f"[REFLEXION] ❌ Tests FAILED (round {reflexion_retries}) — no SDET spawn; "
-                             f"reporting honestly")
-                        if reflexion_retries <= 1 and iteration < max_iters - 3:
-                            test_tail = str(test_result)[-1500:] if test_result else ""
-                            ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
-                            human_msg_id = f"dev-verify-{iteration}-{uuid.uuid4()}"
-                            additional_kwargs = {}
-                            if reasoning_content and tool_calls:
-                                additional_kwargs["reasoning_content"] = reasoning_content
-                            messages.append(AIMessage(
-                                content=response_text, id=ai_msg_id,
-                                additional_kwargs=additional_kwargs
-                            ))
-                            messages.append(HumanMessage(
-                                content=(
-                                    "[VERIFY] Your verification run failed:\n"
-                                    f"```\n{test_tail}\n```\n"
-                                    "Do NOT claim success. Either fix the root cause now with "
-                                    "minimal edits, or finish with an honest report quoting this "
-                                    "failure in your Verification section. This is your ONE chance — "
-                                    "the harness verifies independently after you finish."
-                                ),
-                                id=human_msg_id
-                            ))
-                            appended_ids.extend([ai_msg_id, human_msg_id])
-                            continue  # one bounded re-entry, then honest exit
-                        _log("[REFLEXION] Exiting with honest failure report — harness gate takes over fixing.")
-                else:
-                    _log("[REFLEXION] âš ï¸ No test command detected â€” skipping verification")
 
             clean_response = _extract_text_response(response_text)
             _log(f"\n[DEVELOPER] âœ… Agent finished after {iteration} iterations")
@@ -1361,9 +1284,9 @@ def developer_node(s: ITState) -> dict:
                         "Zero files were created. You MUST use tools to make progress.\n\n"
                         "Call tools using ONE of these formats:\n\n"
                         "Format A:\n```tool\n"
-                        '{"tool": "write_file", "args": {"file_path": "output.txt", "content": "..."}}\n'
+                        '{"tool": "edit_file", "args": {"file_path": "output.txt", "new_string": "..."}}\n'
                         "```\n\n"
-                        "Format B:\n<tool_call name=\"write_file\">\n"
+                        "Format B:\n<tool_call name=\"edit_file\">\n"
                         '{"file_path": "output.txt", "content": "..."}\n'
                         "</tool_call>\n\n"
                         "DO NOT just describe what you would do. Actually call the tools NOW. "
@@ -1390,7 +1313,7 @@ def developer_node(s: ITState) -> dict:
             if clean_response and len(clean_response.strip()) >= 60:
                 report = clean_response[:1000]
             else:
-                files_created = [t for t in tool_call_log if t.get("tool") in ("write_file", "edit_file")]
+                files_created = [t for t in tool_call_log if t.get("tool") in ("edit_file",)]
                 report_lines = ["## Dev Summary"]
                 report_lines.append(f"Status: {'ERROR' if is_error else 'DONE'}")
                 if files_created:
@@ -1502,7 +1425,7 @@ def developer_node(s: ITState) -> dict:
                 files_touched = sorted(set(
                     t.get("args", {}).get("file_path", "")
                     for t in tool_call_log
-                    if t.get("tool") in ("write_file", "edit_file")
+                    if t.get("tool") in ("edit_file",)
                     and t.get("args", {}).get("file_path")
                 ))
                 notes = (raw or "").strip()
@@ -1582,7 +1505,7 @@ def developer_node(s: ITState) -> dict:
                 continue
 
             # Track write/edit/run for progress detection
-            if tool_name in ("write_file", "edit_file", "apply_diff", "run_command"):
+            if tool_name in ("edit_file", "run_command"):
                 this_turn_has_write = True
 
             # â”€â”€ LoopGuard Pre-Execution Check â”€â”€
@@ -1638,7 +1561,7 @@ def developer_node(s: ITState) -> dict:
             # â”€â”€ Same-Count warning/abort check â”€â”€
             same_count = count_identical_calls_since_state_change(tool_call_log, tool_name, tool_args)
             if same_count >= 2:
-                is_read_tool = tool_name in ("read_file", "search_code", "list_files", "search_codebase", "view_signatures")
+                is_read_tool = tool_name in ("read_file", "search_code")
                 if same_count >= 5:
                     _log(f"[DEVELOPER] âš ï¸ Loop detected for tool {tool_name} (called {same_count} times) â€” aborting loop.")
                     clean_response = f"ERROR: Loop detected. Called tool {tool_name} with same arguments {same_count} times without state change."
@@ -1699,7 +1622,7 @@ def developer_node(s: ITState) -> dict:
                 same_reads = 0
                 for item in reversed(tool_call_log[-20:]):
                     # Reset check if there was a successful write/edit on the same file
-                    if item.get("tool") in ("write_file", "edit_file") and item.get("args", {}).get("file_path") == target_file:
+                    if item.get("tool") in ("edit_file",) and item.get("args", {}).get("file_path") == target_file:
                         res_preview = str(item.get("result_preview", ""))
                         if not res_preview.startswith("Error") and not res_preview.startswith("TOOL ERROR"):
                             break
@@ -1736,9 +1659,6 @@ def developer_node(s: ITState) -> dict:
                     tool_label += f" @{read_offset}"
                 if read_limit:
                     tool_label += f"+{read_limit}"
-            elif tool_name == "write_file":
-                content_len = len(str(tool_args.get("content", "")))
-                tool_label = f"write {fname or fpath} ({content_len}B)"
             elif tool_name == "edit_file":
                 tool_label = f"edit {fname or fpath}"
             elif tool_name == "run_command":
@@ -1747,9 +1667,6 @@ def developer_node(s: ITState) -> dict:
             elif tool_name == "search_code":
                 pat = str(tool_args.get("pattern", ""))[:60]
                 tool_label = f"search \"{pat}\""
-            elif tool_name == "list_files":
-                lp = str(tool_args.get("path", "."))[:50]
-                tool_label = f"ls {lp}"
             elif tool_name == "task":
                 tool_label = f"delegate {str(tool_args.get('name', ''))[:40]}"
             elif tool_name == "start_async_task":
@@ -1792,7 +1709,7 @@ def developer_node(s: ITState) -> dict:
             elif tool_name == "edit_file":
                 if res_str.startswith("Error") or "no match" in res_str.lower():
                     last_tool_failed = True
-            elif tool_name in ("read_file", "search_code", "list_files", "view_signatures", "search_codebase"):
+            elif tool_name in ("read_file", "search_code"):
                 if res_str.startswith("Error"):
                     last_tool_failed = True
             elif res_str.startswith("Tool execution error") or res_str.startswith("Error:"):
@@ -1891,19 +1808,13 @@ def developer_node(s: ITState) -> dict:
             if warning_msg:
                 tool_result = str(tool_result) + warning_msg
 
-            if tool_name == "compact_conversation":
-                voluntary_compact_requested = True
 
             if warning_msg:
                 tool_result = str(tool_result) + warning_msg
 
             # Track artifacts for task.json
             step_tool_calls += 1
-            if tool_name in ("write_file",):
-                fpath = tool_args.get("file_path", "")
-                if fpath and fpath not in tracked_files_created:
-                    tracked_files_created.append(fpath)
-            elif tool_name == "edit_file":
+            if tool_name == "edit_file":
                 fpath = tool_args.get("file_path", "")
                 if fpath and fpath not in tracked_files_modified:
                     tracked_files_modified.append(fpath)
@@ -1982,7 +1893,7 @@ def developer_node(s: ITState) -> dict:
             combined_tool_result += (
                 "\n\n[PROGRESS GATE] You have spent 6 turns investigating without making any changes. "
                 "You MUST now either: (a) make a targeted change — read ONLY the exact lines you will "
-                "edit, then write_file/edit_file, or (b) output your completion report if the task is done. "
+                "edit, then edit_file, or (b) output your completion report if the task is done. "
                 "Do NOT keep scanning files or running broad searches."
             )
         elif _consecutive_read_turns >= 10:
@@ -2323,6 +2234,27 @@ def _parse_tool_call(text: str) -> dict | None:
     if not text:
         return None
 
+    _NUMERIC_CAST_KEYS = {"offset", "limit", "timeout", "max_chars", "top_k", "wait_ms"}
+    _BOOL_CAST_KEYS = {"recursive", "background"}
+
+    def cast_arg_types(args: dict) -> dict:
+        """Eager type normalization: '"offset": "100"' → 100, '"recursive": "true"' → True.
+        Only known numeric/bool keys are cast — string payloads (content, diff, etc.)
+        are never touched, so a bad cast can't silently corrupt real data."""
+        if not isinstance(args, dict):
+            return args
+        for k, v in list(args.items()):
+            if k in _NUMERIC_CAST_KEYS and isinstance(v, str) and v.strip().lstrip("-").isdigit():
+                try:
+                    args[k] = int(v.strip())
+                except (ValueError, TypeError):
+                    pass
+            elif k in _BOOL_CAST_KEYS and isinstance(v, str):
+                v_low = v.strip().lower()
+                if v_low in ("true", "false"):
+                    args[k] = v_low == "true"
+        return args
+
     def repair_json_newlines(s: str) -> str:
         in_string = False
         escape = False
@@ -2371,6 +2303,13 @@ def _parse_tool_call(text: str) -> dict | None:
         # Repair common array-quote bracket hallucination: replace `" "]"` or `" ]"` with `"]"`
         raw_rep = re.sub(r'"\s*"\]"', '"]', raw_clean)
         res = try_parse(raw_rep)
+        if res is not None:
+            return res
+
+        # Repair trailing commas before } or ] (the classic flash-model slip):
+        # {"tool": "read_file", "args": {"file_path": "a.py",},}
+        raw_tc = re.sub(r",\s*([}\]])", r"\1", raw_clean)
+        res = try_parse(raw_tc)
         if res is not None:
             return res
 
@@ -2429,6 +2368,7 @@ def _parse_tool_call(text: str) -> dict | None:
         raw_json = match.group(1).strip()
         parsed = robust_json_parse(raw_json)
         if parsed is not None:
+            parsed["args"] = cast_arg_types(parsed.get("args") or {})
             return parsed
 
     return None
@@ -2472,9 +2412,8 @@ def _parse_xml_tool_call(text: str) -> list[dict]:
 
     # â”€â”€ Format B: Self-closing XML tags (common tool names) â”€â”€
     known_tools = [
-        "read_file", "write_file", "edit_file", "run_command",
-        "search_code", "list_files", "view_signatures",
-        "query_history", "compact_conversation",
+        "read_file", "edit_file", "run_command",
+        "search_code",
         "task", "start_async_task", "check_async_task", "list_async_tasks",
     ]
     for tool in known_tools:
@@ -2522,7 +2461,7 @@ def _parse_xml_tool_call(text: str) -> list[dict]:
 
     # â”€â”€ Format C: DSML (DeepSeek native tool calling) â”€â”€
     # ||DSML||tool_calls>
-    # ||DSML||invoke name="list_files">
+    # (list_files removed from the tool surface — use search_code or run_command("dir"))
     # ||DSML||parameter name="path" string="true">D:\path</||DSML||parameter>
     # </||DSML||invoke>
     # </||DSML||tool_calls>
@@ -2624,7 +2563,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
                 results.append({"tool": tool_name, "args": args})
 
     # â”€â”€ Format 5: <tool_call> (DeepSeek native function calling format) â”€â”€
-    # <tool_call name="list_files">
+    # (list_files removed — use search_code)
     # {"path": "D:/test", "recursive": true}
     # </tool_call>
     tc_pattern = r'<tool_call\s+name="(\w+)"\s*>(.*?)</tool_call>'
@@ -2688,7 +2627,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
             results.append({"tool": tool_name, "args": args})
 
     # â”€â”€ Format 6: Anthropic-style tool_use â”€â”€
-    # <Tool-Name id="toolu_...">write_file</Tool-Name>
+    # <Tool-Name id="toolu_...">edit_file</Tool-Name>
     # <Parameter name="file_path">/path/to/file</Parameter>
     # <Parameter name="content">file content here</Parameter>
     anthro_tools = {}
@@ -2717,7 +2656,7 @@ def parse_all_tool_calls(text: str) -> list[dict]:
 
     # â”€â”€ Format 7: <tool> JSON wrapper â”€â”€
     # <tool>
-    # {"tool": "list_files", "args": {"path": ".", "recursive": false}}
+    # (list_files removed — use search_code)
     # </tool>
     tool_xml_matches = re.finditer(r'<tool>\s*(.*?)\s*</tool>', text, re.DOTALL | re.IGNORECASE)
     for m in tool_xml_matches:

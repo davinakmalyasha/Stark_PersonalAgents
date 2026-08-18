@@ -446,7 +446,7 @@ class RepoMapGenerator:
         }
         
         supported_exts = {".py", ".php", ".ts", ".tsx", ".js", ".jsx", ".dart"}
-        max_files = int(os.environ.get("BSA_MAP_MAX_FILES", "300"))
+        max_files = int(os.environ.get("MAP_MAX_FILES", "300"))
         
         # 1. Walk directory and group file paths
         files_to_process: List[str] = []

@@ -47,7 +47,7 @@ def _get_model():
         # Default the fastembed cache to D: — the model is ~1.3GB and C: is often
         # too full. Respect an explicit FASTEMBED_CACHE_PATH if the operator set one.
         if not os.environ.get("FASTEMBED_CACHE_PATH"):
-            harness_root = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+            harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
             os.environ["FASTEMBED_CACHE_PATH"] = os.path.join(harness_root, ".deep_agents", "fastembed_cache")
         _model = TextEmbedding(model_name="BAAI/bge-large-en-v1.5")
         return _model
@@ -117,7 +117,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 # ── Vector Store (in-SQLite, mmap-backed) ───────────────────────────────────
 
-_VECTOR_DB_PATH = os.path.join(os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "vectors.db")
+_VECTOR_DB_PATH = os.path.join(os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "vectors.db")
 _VECTOR_CONN: Optional[sqlite3.Connection] = None
 _MMAP_SIZE = 268435456  # 256MB — Pillar 87
 

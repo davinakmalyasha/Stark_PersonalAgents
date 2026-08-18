@@ -53,6 +53,23 @@ export interface AgentOutputs {
   mermaid: string;
 }
 
+export interface ProjectRef {
+  name: string;
+  workspace_id: string;
+  chat_id: string;
+  path: string;
+  full_reply: string;
+}
+
+/** P10: live token delta frame from the backend SSE stream. */
+export interface StreamDelta {
+  kind: 'text' | 'reasoning' | 'usage' | 'end';
+  text: string;
+  agent?: string;
+  model?: string;
+  ts?: number;
+}
+
 export interface AppState {
   active_node: string;
   next_agent: string;
@@ -68,6 +85,10 @@ export interface AppState {
   selected_temp: number;
   token_usage: TokenUsage;
   artifacts?: RunArtifacts;
+  /** P9: set when this run routed straight to a project's Dev agent. */
+  project_ref?: ProjectRef | null;
+  /** P9: set when this run created a new project workspace. */
+  workspace_created?: boolean;
   /** Present when the backend completed with a provider or pipeline error. */
   error?: string;
   traceback?: string;

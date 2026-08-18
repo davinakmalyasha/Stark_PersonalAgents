@@ -7,10 +7,22 @@ declare global {
       selectFolder: () => Promise<string | null>;
       /** Toggle the floating voice overlay window (Electron). */
       voiceToggle?: () => Promise<boolean>;
-      /** Subscribe to voice session events from the overlay. */
-      onVoiceSessionEvent?: (cb: (ev: { type: string; text?: string }) => void) => void;
-      /** Fired when the voice overlay window closes. */
-      onVoiceWindowClosed?: (cb: () => void) => void;
+      /** Subscribe to voice session events from the overlay.
+       *  Returns an unsubscribe function (and off*() clears all). */
+      onVoiceSessionEvent?: (cb: (ev: {
+        type: string;
+        text?: string;
+        workspaceId?: string;
+        chatId?: string;
+        state?: unknown;
+      }) => void) => (() => void) | void;
+      /** Fired when the voice overlay window closes.
+       *  Returns an unsubscribe function (and off*() clears all). */
+      onVoiceWindowClosed?: (cb: () => void) => (() => void) | void;
+      /** Remove all voice session event listeners. */
+      offVoiceSessionEvent?: () => void;
+      /** Remove all voice window-closed listeners. */
+      offVoiceWindowClosed?: () => void;
       /** Tell the overlay which chat is currently active (so live mode
        *  follows the open chat instead of a fixed one). */
       setVoiceChat?: (payload: { wsId: string; wsPath: string; chatId: string }) => void;

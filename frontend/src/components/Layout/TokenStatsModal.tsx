@@ -16,7 +16,7 @@ export default function TokenStatsModal({ isOpen, onClose, tokenUsage, lastModel
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 animate-fade-in">
       {/* Modal Card */}
       <div 
-        className="w-[calc(100vw-220px)] max-w-[1280px] border bg-zinc-950 flex flex-col overflow-hidden"
+        className="modal-panel-enter w-[calc(100vw-220px)] max-w-[1280px] border bg-zinc-950 flex flex-col overflow-hidden"
         style={{ 
           borderColor: 'var(--border-color)',
           borderRadius: '16px',

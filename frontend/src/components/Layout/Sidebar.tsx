@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { MessageSquare, Plus, Trash2, Pencil, MoreHorizontal, ChevronDown, ChevronRight } from 'lucide-react';
+import { MessageSquare, Plus, Trash2, Pencil, MoreHorizontal, ChevronDown } from 'lucide-react';
 import { PanelLeftClose, FolderPlus } from 'lucide-react';
 import { fetchWorkspaces, addWorkspace, removeWorkspace, fetchChats, createChat, deleteChat, fetchChat, updateChatTitle } from '../../services/api';
 import type { WorkspaceInfo, ChatSummary, ChatData } from '../../types';
@@ -16,11 +16,14 @@ interface Props {
   onSelectChat: (ws: WorkspaceInfo, chat: ChatData) => void;
   onToggleCollapse: () => void;
   onChatTitleUpdated?: (chatId: string, newTitle: string) => void;
+  /** P9: bump to re-fetch workspaces (e.g. a project was created mid-run). */
+  refreshSignal?: number;
 }
 
 export default function Sidebar({
   activeWorkspaceId, activeChatId, activeChatTitle, collapsed,
   onSelectWorkspace, onSelectChat, onToggleCollapse, onChatTitleUpdated,
+  refreshSignal = 0,
 }: Props) {
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [expandedWs, setExpandedWs] = useState<Set<string>>(new Set());
@@ -94,6 +97,11 @@ export default function Sidebar({
   useEffect(() => {
     loadWorkspaces();
   }, [loadWorkspaces]);
+
+  // P9: re-fetch when a run created a new project workspace.
+  useEffect(() => {
+    if (refreshSignal > 0) loadWorkspaces();
+  }, [refreshSignal, loadWorkspaces]);
 
   const toggleWs = useCallback(async (ws: WorkspaceInfo) => {
     setExpandedWs((prev) => {
@@ -205,7 +213,7 @@ export default function Sidebar({
           {/* ── General Chat Section (always expanded) ── */}
           <div className="group flex items-center justify-between" style={{ padding: '18px 14px 8px' }}>
             <button onClick={() => setChatsOpen((open) => !open)} className="flex items-center gap-1 text-[11px] font-bold text-zinc-500 uppercase tracking-widest hover:text-zinc-300 transition-colors" title={chatsOpen ? 'Collapse chats' : 'Expand chats'}>
-              <span>Chats</span>{chatsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              <span>Chats</span><ChevronDown size={14} className={`transition-transform duration-200 ${chatsOpen ? '' : '-rotate-90'}`} />
             </button>
             <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity"><button onClick={() => generalWs && handleCreateChat(generalWs)} className="p-1 text-zinc-500 hover:text-zinc-200" title="New chat"><Plus size={15}/></button><button onClick={onToggleCollapse} className="p-1 text-zinc-500 hover:text-zinc-200" title="Close Sidebar"><PanelLeftClose size={15}/></button></div>
           </div>
@@ -252,7 +260,7 @@ export default function Sidebar({
           {/* ── Projects Section ── */}
           <div className="project-heading group flex items-center justify-between mb-2" style={{ padding: '0 14px' }}>
             <button onClick={() => setProjectsOpen((open) => !open)} className="flex items-center gap-1 text-[11px] font-bold text-zinc-500 uppercase tracking-widest hover:text-zinc-300 transition-colors" title={projectsOpen ? 'Collapse projects' : 'Expand projects'}>
-              <span>Projects</span>{projectsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              <span>Projects</span><ChevronDown size={14} className={`transition-transform duration-200 ${projectsOpen ? '' : '-rotate-90'}`} />
             </button>
             <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity"><button className="p-1 text-zinc-500 hover:text-zinc-200" title="Project actions"><MoreHorizontal size={15}/></button><button onClick={handleAddWorkspace} className="p-1 text-zinc-500 hover:text-zinc-200" title="Create project"><Plus size={15}/></button></div>
           </div>

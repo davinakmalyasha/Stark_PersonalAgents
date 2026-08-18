@@ -1,6 +1,6 @@
 // ── Antigravity 2.0 API Client ──
 
-import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules, ChatAttachment, AgentTask, TaskSchedule } from '../types';
+import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules, ChatAttachment, AgentTask, TaskSchedule, StreamDelta } from '../types';
 
 const API_BASE = '/api';
 
@@ -257,9 +257,74 @@ export async function saveWorkspaceRules(workspaceId: string, rules: WorkspaceRu
 
 /**
  * Stream the agentic pipeline via SSE.
- * Calls onState for every state update, onDone when finished, onError on failure.
+ * Calls onState for every state update, onDelta for live token deltas,
+ * onDone when finished, onError on failure.
  * Returns an AbortController to cancel mid-run.
  */
+export interface AskOption { label: string; description?: string }
+export interface AskQuestion {
+  id: string;
+  question: string;
+  detail?: string;
+  header?: string;
+  multiSelect?: boolean;
+  options?: (string | AskOption)[];
+  intent?: { kind: string; approve?: string };
+}
+export interface AskBatch { batch_id: string; questions: AskQuestion[]; created: number }
+export interface AskAnswer { id: string; selected: string[]; custom: string }
+
+/** P10/P2: fetch pending ask_user batches (agents block while unanswered). */
+export async function fetchPendingQuestions(): Promise<AskBatch[]> {
+  try {
+    const res = await fetch(`${API_BASE}/ask/pending`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.batches) ? data.batches : [];
+  } catch {
+    return [];
+  }
+}
+
+/** P10/P2: resolve a pending ask_user batch with the human's answers. */
+export async function submitAskAnswers(batchId: string, answers: AskAnswer[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/ask/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_id: batchId, answers }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export interface WorkspaceFileEntry { type: 'dir' | 'file'; path: string; name: string; size?: number }
+
+/** P10/Tier-3: list a workspace folder tree. */
+export async function fetchWorkspaceFiles(workspaceId: string): Promise<WorkspaceFileEntry[]> {
+  try {
+    const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/files`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.files) ? data.files : [];
+  } catch {
+    return [];
+  }
+}
+
+/** P10/Tier-3: read a file's content from the workspace. */
+export async function fetchWorkspaceFile(workspaceId: string, path: string): Promise<{ path: string; content: string; truncated: boolean } | null> {
+  try {
+    const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/file?path=${encodeURIComponent(path)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 export function streamPipeline(
   prompt: string,
   model: string,
@@ -270,6 +335,7 @@ export function streamPipeline(
   workspacePath: string = '',
   chatId: string = '',
   attachments: ChatAttachment[] = [],
+  onDelta?: (delta: StreamDelta) => void,
 ): AbortController {
   const controller = new AbortController();
   console.log('[streamPipeline] Starting fetch to /api/run, prompt:', prompt, 'model:', model);
@@ -350,7 +416,13 @@ export function streamPipeline(
           if (line.startsWith('data: ')) {
             try {
               const parsed = JSON.parse(line.slice(6).trim());
-              if (currentEvent === 'done') {
+              if (currentEvent === 'delta') {
+                // P10: live token deltas (text / reasoning / end)
+                if (onDelta) onDelta(parsed as StreamDelta);
+                else if (parsed.kind === 'end' || parsed.text) {
+                  // fallback (no listener): ignore deltas
+                }
+              } else if (currentEvent === 'done') {
                 console.log('[streamPipeline] Done payload:', parsed.status);
                 if (parsed.status === 'error') {
                   fail(parsed.error || 'The agent pipeline failed. Check the backend logs for details.');

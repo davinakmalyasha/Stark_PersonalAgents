@@ -1,9 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap } from 'lucide-react';
+import { X, FolderGit2 } from 'lucide-react';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
 import TokenStatsModal from './components/Layout/TokenStatsModal';
+import QuestionModal from './components/Workspace/QuestionModal';
+import FileExplorer from './components/Workspace/FileExplorer';
 import { usePipeline } from './hooks/usePipeline';
 import { fetchModels, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus } from './services/api';
 import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment, AgentTask } from './types';
@@ -19,7 +21,7 @@ const WELCOME_MESSAGES: ChatMessage[] = [
 ];
 
 export default function App() {
-  const { run, cancel, state: pipeState, isRunning, error } = usePipeline();
+  const { run, cancel, state: pipeState, isRunning, error, streaming } = usePipeline();
   const state: AppState | null = pipeState;
 
   const [messages, setMessages] = useState<ChatMessage[]>(WELCOME_MESSAGES);
@@ -40,7 +42,9 @@ export default function App() {
   const [temperature] = useState(0.7);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [showFiles, setShowFiles] = useState(false);
 
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
@@ -70,10 +74,7 @@ export default function App() {
           console.error('[App] Failed to auto-load chats:', err);
         }
       }
-    }).catch(() => {})
-      .finally(() => {
-        setTimeout(() => setIsInitialLoading(false), 600);
-      });
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -117,13 +118,17 @@ export default function App() {
                 activeChat.id,
                 'agent',
                 finalResponse,
-                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts }
+                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined }
               );
             }
             // Now re-fetch to sync messages and token stats
             const updatedChat = await fetchChat(activeWorkspace.id, activeChat.id);
             setActiveChat(updatedChat);
             setMessages(updatedChat.messages);
+            // P9: a new project workspace was created this run → refresh sidebar
+            if (state?.workspace_created) {
+              setSidebarRefreshTick((t) => t + 1);
+            }
           } catch (err) {
             console.error('[App] Failed to complete run persistence:', err);
           } finally {
@@ -134,7 +139,7 @@ export default function App() {
         saveAndRefresh();
       }
     }
-  }, [isRunning, activeWorkspace, activeChat, state?.live_terminal_log]);
+  }, [isRunning, activeWorkspace, activeChat, state?.live_terminal_log, state?.project_ref, state?.workspace_created, state?.token_usage]);
 
   useEffect(() => {
     if (!error) return;
@@ -318,9 +323,9 @@ export default function App() {
 
   // Instant refresh when the overlay finishes a reply
   useEffect(() => {
-    const ag = (window as any).antigravity;
+    const ag = window.antigravity;
     if (!ag) return;
-    ag.onVoiceSessionEvent?.((ev: any) => {
+    const offSession = ag.onVoiceSessionEvent?.((ev) => {
       if (ev?.type && ev.type !== 'idle' && ev.type !== 'closed') {
         setIsVoiceMode(true);
       } else {
@@ -355,10 +360,14 @@ export default function App() {
         setVoiceLiveRun(null);
       }
     });
-    ag.onVoiceWindowClosed?.(() => {
+    const offClosed = ag.onVoiceWindowClosed?.(() => {
       setIsVoiceMode(false);
       setVoiceLiveRun(null);
     });
+    return () => {
+      offSession?.();
+      offClosed?.();
+    };
   }, [refreshActiveChat, syncVoiceChat]);
 
   // Lightweight polling fallback (covers runs finished while window was hidden)
@@ -366,6 +375,22 @@ export default function App() {
     const id = setInterval(refreshActiveChat, 4000);
     return () => clearInterval(id);
   }, [refreshActiveChat]);
+
+  // ── Keyboard shortcuts: Esc cancels a running pipeline, "?" opens help ──
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const typing = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+      if (e.key === 'Escape' && isRunning && !typing) {
+        cancel();
+      } else if (e.key === '?' && !isRunning && !typing) {
+        e.preventDefault();
+        setShowShortcuts((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isRunning, cancel]);
 
   const handleSelectWorkspace = useCallback((ws: WorkspaceInfo) => {
     setActiveWorkspace(ws);
@@ -400,6 +425,25 @@ export default function App() {
     }
   }, [activeChat]);
 
+  // P9: "Open in <project>" — jump from a routed reply card to the project's
+  // own chat (where the full Dev reply lives).
+  const handleOpenProject = useCallback((ref: { workspace_id: string; chat_id: string }) => {
+    fetchWorkspaces().then(async (wsList) => {
+      const ws = wsList.find((w) => w.id === ref.workspace_id);
+      if (!ws) return;
+      const chat = await fetchChat(ws.id, ref.chat_id);
+      setActiveWorkspace(ws);
+      setActiveChat(chat);
+      setMessages(chat.messages.length > 0 ? chat.messages : [{
+        id: `sys-${Date.now()}`,
+        role: 'system',
+        content: `Chat ready in ${ws.name}.`,
+        timestamp: new Date().toISOString(),
+      }]);
+      fetch('/api/session/reset', { method: 'POST' }).catch(() => {});
+    }).catch(() => {});
+  }, []);
+
   const voiceTraceMatchesActiveChat = !!voiceLiveRun
     && (!voiceLiveRun.workspaceId || voiceLiveRun.workspaceId === activeWorkspace?.id)
     && (!voiceLiveRun.chatId || voiceLiveRun.chatId === activeChat?.id);
@@ -414,14 +458,27 @@ export default function App() {
       ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
       : 'active';
 
+    // P10: live token streaming — show the generated text as it arrives, with
+    // a caret; the final [ASSISTANT] line takes over when the run completes.
+    const streamText = streaming.active && streaming.text ? streaming.text : '';
+    const liveContent = streamText || assistantResponse || '';
     displayMessages.push({
       id: 'live-agent-run',
       role: 'agent',
-      agentName: 'Assistant',
-      content: assistantResponse || '',
+      agentName: streaming.active && streaming.agent ? streaming.agent : 'Assistant',
+      content: liveContent,
       timestamp: new Date().toISOString(),
       duration: isRunning ? 'active' : (elapsed === 'active' ? 'completed' : elapsed),
-      metadata: { isTrace: true, steps: filterOrchestratorSteps(steps), duration: elapsed === 'active' ? undefined : elapsed, artifacts: state?.artifacts },
+      metadata: {
+        isTrace: true,
+        steps: filterOrchestratorSteps(steps),
+        duration: elapsed === 'active' ? undefined : elapsed,
+        artifacts: state?.artifacts,
+        project_ref: state?.project_ref ?? undefined,
+        isStreaming: isRunning && streaming.active,
+        streamingReasoning: streaming.active ? streaming.reasoning : '',
+        streamRate: isRunning ? streaming.rate : 0,
+      },
     });
   }
   if (showVoiceTrace && voiceLiveRun?.state) {
@@ -463,43 +520,6 @@ export default function App() {
   const activeContextTokens = lastCall ? lastCall.input : 0;
   const lastModelName = lastCall ? lastCall.model : (model || 'Automatic Fallback');
 
-  if (isInitialLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-screen w-screen bg-[#0c0c0e] text-zinc-300 font-sans select-none">
-        <div className="flex flex-col items-center gap-5 max-w-sm w-full px-8 py-10 rounded-2xl border border-zinc-900 bg-zinc-950/60 shadow-2xl relative overflow-hidden backdrop-blur-xl">
-          {/* Subtle top ambient glow */}
-          <div className="absolute -top-12 left-1/2 -translate-x-1/2 w-32 h-32 bg-indigo-500/10 rounded-full blur-2xl pointer-events-none" />
-          
-          <div className="relative flex items-center justify-center w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl">
-            <Zap size={28} className="text-indigo-400 animate-pulse" />
-            <div className="absolute inset-0 rounded-2xl border border-indigo-500/20 animate-ping opacity-25" style={{ animationDuration: '2s' }} />
-          </div>
-          
-          <div className="flex flex-col items-center gap-1.5 text-center">
-            <h1 className="text-[15px] font-bold text-zinc-100 tracking-wide">Initializing VinCode</h1>
-            <p className="text-[12px] text-zinc-500 font-mono">Loading workspaces and pipelines...</p>
-          </div>
-
-          {/* Simple animated loading bar */}
-          <div className="w-full h-1 bg-zinc-900 rounded-full overflow-hidden relative">
-            <div className="absolute top-0 bottom-0 left-0 w-1/2 h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full animate-pulse-slow" style={{
-              animation: 'loadingBar 1.5s infinite ease-in-out'
-            }} />
-          </div>
-        </div>
-        
-        {/* CSS Keyframes injected inline */}
-        <style dangerouslySetInnerHTML={{__html: `
-          @keyframes loadingBar {
-            0% { left: -50%; }
-            50% { left: 100%; }
-            100% { left: 100%; }
-          }
-        `}} />
-      </div>
-    );
-  }
-
   return (
     <div className="flex flex-col h-screen w-screen bg-[#0c0c0e] text-zinc-100 overflow-hidden font-sans">
       <TitleBar
@@ -514,6 +534,7 @@ export default function App() {
           onSelectChat={handleSelectChat}
           onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
           onChatTitleUpdated={handleChatTitleUpdated}
+          refreshSignal={sidebarRefreshTick}
         />
         <AgentCanvas
           messages={displayMessages}
@@ -536,6 +557,8 @@ export default function App() {
           onToggleVoice={toggleVoice}
           voiceInputText={voiceInputText}
           onOpenStats={() => setIsTokenStatsOpen(true)}
+          onOpenProject={handleOpenProject}
+          onRetry={handleSend}
           totalCost={combinedTokenUsage.total_cost}
           totalInput={combinedTokenUsage.total_input_tokens}
           totalOutput={combinedTokenUsage.total_output_tokens}
@@ -549,6 +572,44 @@ export default function App() {
         tokenUsage={combinedTokenUsage}
         lastModelName={lastModelName}
       />
+      {showShortcuts && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowShortcuts(false)}>          <div className="modal-panel-enter w-full max-w-sm rounded-2xl border border-zinc-800 bg-[#141417] shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-800">
+              <span className="text-[13px] font-bold text-zinc-100">Keyboard shortcuts</span>
+              <button type="button" onClick={() => setShowShortcuts(false)} className="p-1 text-zinc-500 hover:text-zinc-300" aria-label="Close"><X size={15} /></button>
+            </div>
+            <div className="px-5 py-4 space-y-2.5 text-[12.5px]">
+              {[
+                ['Enter', 'Send message'],
+                ['Shift + Enter', 'New line'],
+                ['Ctrl + G', 'Toggle voice mode'],
+                ['Esc', 'Stop the running agent'],
+                ['?', 'Show this help'],
+                ['Ctrl + Enter', 'Send (when typing)'],
+              ].map(([key, desc]) => (
+                <div key={key} className="flex items-center justify-between gap-4">
+                  <span className="text-zinc-400">{desc}</span>
+                  <kbd className="px-2 py-0.5 rounded bg-zinc-800 border border-zinc-700 text-[11px] font-mono text-zinc-300">{key}</kbd>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      <QuestionModal visible={isRunning || isPersisting} />
+
+      {/* P10/Tier-3: file explorer toggle + panel */}
+      <button
+        type="button"
+        onClick={() => setShowFiles((v) => !v)}
+        className="fixed right-2 top-1/2 -translate-y-1/2 z-[85] flex flex-col items-center gap-1 px-1.5 py-3 rounded-xl bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shadow-xl"
+        title={showFiles ? 'Close files' : 'Browse project files'}
+        style={{ writingMode: 'vertical-rl' }}
+      >
+        <FolderGit2 size={15} className={showFiles ? 'text-indigo-400' : ''} />
+        <span className="text-[9.5px] font-bold tracking-widest uppercase">Files</span>
+      </button>
+      {showFiles && <FileExplorer workspaceId={activeWorkspace?.id ?? null} onClose={() => setShowFiles(false)} />}
     </div>
   );
 }

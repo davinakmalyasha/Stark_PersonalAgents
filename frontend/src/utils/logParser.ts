@@ -27,9 +27,6 @@ const MAX_TOOL_CONTENT = 4000;
 export function normalizeAgentName(name: string): string {
   const n = name.trim().toLowerCase();
   if (n === 'developer' || n === 'dev') return 'Dev';
-  if (n === 'bsa' || n === 'ba' || n === 'business analyst' || n === 'businesssystemsanalyst') return 'BSA';
-  if (n === 'sdet' || n === 'qa' || n === 'critic' || n === 'evaluation') return 'SDET';
-  if (n === 'devsecops' || n === 'devops') return 'DevSecOps';
   if (n === 'analytics') return 'Analytics';
   if (n === 'designer' || n === 'ui/ux designer') return 'Designer';
   if (n === 'supervisor' || n === 'orchestrator') return 'Supervisor';
@@ -49,8 +46,8 @@ const SKIP_LINE_PATTERNS = [
   /^\[DEVELOPER\]\s+run\s/,            // "[DEVELOPER] run npm test"
   /^\[DEVELOPER\]\s+search\s/,         // "[DEVELOPER] search \"pattern\""
   /^\[DEVELOPER\]\s+ls\s/,             // "[DEVELOPER] ls ."
-  /^\[DEVELOPER\]\s+delegate\s/,       // "[DEVELOPER] delegate BSA"
-  /^\[DEVELOPER\]\s+async\s/,          // "[DEVELOPER] async BSA"
+  /^\[DEVELOPER\]\s+delegate\s/,       // "[DEVELOPER] delegate Dev"
+  /^\[DEVELOPER\]\s+async\s/,          // "[DEVELOPER] async Dev"
   /^\[DEVELOPER\]\s+=>\s/,             // "[DEVELOPER]   => foo.ts #1-10/20"
   /^\[DEVELOPER\]\s+Response\s*\(/,    // "[DEVELOPER] Response (94 chars)"
   /^\[DEVELOPER\]\s+âœ…\s+Agent finished/, // Agent finished status line

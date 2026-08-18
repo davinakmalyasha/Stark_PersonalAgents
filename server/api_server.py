@@ -1,8 +1,51 @@
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+_DESKTOP = os.path.join(_ROOT, "Desktop")
+if _DESKTOP not in sys.path:
+    sys.path.insert(0, _DESKTOP)
+_VOICE = os.path.join(_ROOT, "Voice")
+if _VOICE not in sys.path:
+    sys.path.insert(0, _VOICE)
 """
 FastAPI server — Bridges the React frontend with the LangGraph multi-agent pipeline.
 Replaces the Gradio dashboard with SSE streaming endpoints.
 """
 import os
+import sys
+
+# ── Interpreter guard ─────────────────────────────────────────────────────
+# The voice engine (Moonshine + Kokoro) only exists in venv312. No matter how
+# this file is launched (`python api_server.py`, a .bat, Electron, ...) we
+# re-exec ourselves with venv312 so the local ASR/TTS always work.
+def _ensure_venv312() -> None:
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        venv_py = os.path.join(here, "venv312", "Scripts", "python.exe")
+        if not os.path.exists(venv_py):
+            print("[api_server] WARNING: venv312 not found — voice engines (Moonshine/Kokoro) unavailable")
+            return
+        venv_dir = os.path.normpath(os.path.dirname(venv_py)).lower()
+        if not os.path.normpath(sys.prefix).lower().startswith(os.path.dirname(venv_dir)):
+            print(f"[api_server] Re-executing with {venv_py} (current: {sys.executable})")
+            os.execv(venv_py, [venv_py] + sys.argv)
+    except Exception as e:
+        print(f"[api_server] Interpreter guard failed ({e}) — continuing")
+
+_ensure_venv312()
+
+# ── Voice module path (audio_engine, voice_services moved to Voice/) ──────────
+_VOICE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Voice")
+if _VOICE_DIR not in sys.path:
+    sys.path.insert(0, _VOICE_DIR)
+
+_DESKTOP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Desktop")
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
+
 import uuid
 import asyncio
 import json
@@ -10,8 +53,8 @@ import threading
 import time
 import queue
 import hashlib
-import sys
 import re
+import tempfile
 from typing import AsyncGenerator
 from datetime import datetime, timezone, timedelta
 
@@ -21,8 +64,8 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from sync_manager import run_and_sync_graph
-from state_sync import shared_state, safe_get_state, safe_update_state, safe_serialize_state, state_lock, reset_shared_state
+from sync.sync_manager import run_and_sync_graph
+from sync.state_sync import shared_state, safe_get_state, safe_update_state, safe_serialize_state, state_lock, reset_shared_state
 import workspace_manager as wm
 
 load_dotenv(override=True)
@@ -42,6 +85,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/health")
+async def health():
+    """Engine status — quick check that Moonshine + Kokoro are loadable."""
+    asr_ok = False
+    tts_ok = False
+    asr_detail = "ok"
+    tts_detail = "ok"
+    try:
+        import audio_engine
+        asr_ok = audio_engine.asr_available()
+        if not asr_ok:
+            asr_detail = "model files missing (run the moonshine download)"
+    except Exception as e:
+        asr_detail = f"unavailable: {e}"
+    try:
+        import kokoro  # noqa: F401
+        tts_ok = True
+    except Exception as e:
+        tts_detail = f"unavailable: {e}"
+    return JSONResponse(content={
+        "interpreter": sys.executable,
+        "asr": {"ok": asr_ok, "detail": asr_detail},
+        "tts": {"ok": tts_ok, "detail": tts_detail},
+    })
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -68,6 +137,7 @@ class TaskRequest(BaseModel):
 class TTSRequest(BaseModel):
     text: str
     voice: str = "en-US-JennyNeural"
+    engine: str = "auto"  # auto | edge | kokoro
 
 
 class CleanupRequest(BaseModel):
@@ -215,7 +285,7 @@ def _collect_run_artifacts(project_path: str, context: dict) -> dict:
     # Supplement Git's status delta with the task tracker. This catches edits
     # to files that were already dirty before the run.
     try:
-        from sync_helpers import load_task_tracking
+        from sync.sync_helpers import load_task_tracking
         task_data = load_task_tracking(project_path, safe_get_state().get("chat_id", "")) or {}
         artifacts = task_data.get("artifacts", {})
         for group in ("files_created", "files_modified", "files_deleted"):
@@ -245,7 +315,7 @@ def _collect_run_artifacts(project_path: str, context: dict) -> dict:
 
     tests_passing = False
     try:
-        from sync_helpers import load_task_tracking
+        from sync.sync_helpers import load_task_tracking
         task_data = load_task_tracking(project_path, safe_get_state().get("chat_id", "")) or {}
         tests_passing = bool((task_data.get("artifacts", {}) or {}).get("tests_passing"))
     except Exception:
@@ -390,7 +460,7 @@ def _run_task_background(workspace_id: str, workspace_path: str, chat_id: str, t
         attachments = task.get("attachments", [])
         wm.add_message(workspace_path, chat_id, "user", prompt, {"attachments": attachments, "taskId": task_id} if attachments else {"taskId": task_id})
         if workspace_path in ("", wm.GENERAL_WORKSPACE_ID):
-            from free_agent import run_freeagent_direct
+            from agents.free_agent import run_freeagent_direct
             for _ in run_freeagent_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
                 pass
         else:
@@ -398,10 +468,6 @@ def _run_task_background(workspace_id: str, workspace_path: str, chat_id: str, t
             for _ in run_graph_with_verify(prompt, workspace_path=workspace_path, chat_id=chat_id):
                 pass
         report = safe_get_state().get("outputs", {}).get("agent_report", "")
-        vstatus = safe_get_state().get("outputs", {}).get("verify_status")
-        if vstatus:
-            note = "✅ Verification passed." if vstatus == "PASS" else f"⚠️ Verification: {vstatus}."
-            report = (report or "") + f"\n\n{note}"
         if report and chat_id:
             wm.add_message(workspace_path, chat_id, "agent", report, {"taskId": task_id})
         recurrence = (task.get("schedule") or {}).get("recurrence", "none")
@@ -553,7 +619,7 @@ async def run_pipeline(req: RunRequest, request: Request):
     """Run the agentic pipeline with SSE streaming of state updates.
     No Jarvis Router — goes directly to the main agent."""
     from workspace_manager import add_message as wm_add_message
-    from chat_memory_manager import resolve_request_text
+    from memory.chat_memory_manager import resolve_request_text
 
     # Reset shared state to clear stale data from previous run
     reset_shared_state()
@@ -585,6 +651,13 @@ async def run_pipeline(req: RunRequest, request: Request):
     resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
     run_context = _capture_run_context(req.workspace_path, req.chat_id)
 
+    # P9: baseline workspace ids so the final snapshot can flag newly created
+    # projects (orchestrator create_project tool) for the sidebar refresh.
+    try:
+        _workspace_ids_before_run = {w.get("id") for w in wm.list_workspaces()}
+    except Exception:
+        _workspace_ids_before_run = set()
+
     # Go directly to the main agent
     async def build_stream() -> AsyncGenerator[str, None]:
         """Stream state updates from the LangGraph pipeline via SSE.
@@ -598,9 +671,30 @@ async def run_pipeline(req: RunRequest, request: Request):
         def run_in_thread():
             nonlocal done, had_error
             try:
+                # ── P9: direct-to-Dev routing — messages bound for an existing
+                # project's Dev agent skip the orchestrator entirely. This runs
+                # before the general/workspace split so cross-project routing
+                # works from the General chat too. New project creation is
+                # decided by the orchestrator LLM (create_project tool), never
+                # hardcoded here.
+                # NOTE: when the message comes FROM a project chat we fall
+                # through to run_graph_with_verify — it routes the same way and
+                # still runs the verification gate after the Dev turn.
+                try:
+                    if not req.workspace_path:
+                        from agents.project_router import route_request, stream_direct
+                        route_kind, project = route_request(resolved, "", req.chat_id)
+                        if route_kind == "project_dev" and project:
+                            for state_snapshot in stream_direct(project, resolved, "", req.chat_id):
+                                q.put(state_snapshot)
+                            q.put(None)  # signal completion
+                            return
+                except Exception as e:
+                    print(f"[API] Project routing error (falling back to pipeline): {e}")
+
                 is_general = not req.workspace_path
                 if is_general:
-                    from free_agent import run_freeagent_direct
+                    from agents.free_agent import run_freeagent_direct
                     image_paths = [item.get("path") for item in req.attachments
                                    if item.get("isImage") and item.get("path")]
                     for state_snapshot in run_freeagent_direct(resolved, chat_id=req.chat_id, images=image_paths or None):
@@ -633,10 +727,27 @@ async def run_pipeline(req: RunRequest, request: Request):
         thread.start()
 
         last_ver = 0
+        last_bus_drain = 0.0
         while not done or not q.empty():
             if await request.is_disconnected():
                 cancel_event.set()  # Signal the graph thread to stop
                 break
+
+            # ── P10: forward live token deltas from the StreamBus (text /
+            # reasoning / end) as SSE `delta` frames ──
+            try:
+                from stream_bus import drain as _bus_drain, cleanup as _bus_cleanup
+                deltas = _bus_drain(req.chat_id)
+                if deltas:
+                    for d in deltas:
+                        yield _format_sse("delta", d)
+                now = time.time()
+                if now - last_bus_drain > 60:
+                    last_bus_drain = now
+                    _bus_cleanup()
+            except Exception:
+                pass
+
             try:
                 item = q.get(timeout=0.05)
                 if item is None:
@@ -665,7 +776,7 @@ async def run_pipeline(req: RunRequest, request: Request):
         # Also save a session note to .agent-memory/ so the ORCHESTRATOR (not chat) remembers
         try:
             if agent_report and req.workspace_path:
-                from memory_manager import update_project_meta
+                from memory.memory_manager import update_project_meta
                 snippet = agent_report[:500].replace("\n", " ")
                 update_project_meta(req.workspace_path, "Last Session", snippet)
         except Exception as e:
@@ -674,10 +785,149 @@ async def run_pipeline(req: RunRequest, request: Request):
         # Final state, including the files changed during this run.
         final_state = json.loads(safe_serialize_state())
         final_state["artifacts"] = _collect_run_artifacts(req.workspace_path, run_context)
+
+        # P9: tell the frontend a new project workspace appeared this run
+        # (created via the orchestrator's create_project tool) so the sidebar
+        # can refresh without a manual reload.
+        try:
+            new_ids = {w.get("id") for w in wm.list_workspaces()} - _workspace_ids_before_run
+            if new_ids:
+                final_state["workspace_created"] = True
+                final_state["created_workspace_ids"] = sorted(new_ids)
+        except Exception:
+            pass
+
         yield _format_sse("state", final_state)
         yield _format_sse("done", {"status": "error" if had_error else "complete"})
 
     return StreamingResponse(build_stream(), media_type="text/event-stream")
+
+
+class InboxRequest(BaseModel):
+    chat_id: str = ""
+    message: str = ""
+
+
+@app.post("/api/steer")
+async def api_steer(req: InboxRequest):
+    """Queue a steering message: delivered after the current step's tool calls."""
+    from inbox import steer, pending_counts
+    ok = steer(req.chat_id, req.message)
+    return {"ok": ok, "pending": pending_counts(req.chat_id)}
+
+
+@app.post("/api/followup")
+async def api_followup(req: InboxRequest):
+    """Queue a follow-up message: delivered only after the agent is idle."""
+    from inbox import follow_up, pending_counts
+    ok = follow_up(req.chat_id, req.message)
+    return {"ok": ok, "pending": pending_counts(req.chat_id)}
+
+
+@app.post("/api/abort")
+async def api_abort(req: InboxRequest):
+    """Abort the current run; queued steering/follow-up are preserved."""
+    from inbox import abort, pending_counts
+    abort(req.chat_id, keep_inbox=True)
+    return {"ok": True, "pending": pending_counts(req.chat_id)}
+
+
+@app.get("/api/inbox")
+async def api_inbox(chat_id: str = ""):
+    from inbox import pending_counts
+    return pending_counts(chat_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Workspace file explorer (P10/Tier-3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FILE_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "venv", "venv312", ".venv",
+    "__pycache__", ".pytest_cache", ".ruff_cache", ".agent-memory",
+    ".deep_agents", "dist", "build", ".next", "target", "release",
+}
+_FILE_MAX_SIZE = 5 * 1024 * 1024  # skip files larger than 5 MB in listings
+
+
+@app.get("/api/workspaces/{workspace_id}/files")
+async def list_workspace_files(workspace_id: str, max_depth: int = 8):
+    """Flat listing of a workspace folder tree (dirs then files, depth-capped)."""
+    ws = wm.get_workspace(workspace_id)
+    if not ws or not ws.get("path") or not os.path.isdir(ws["path"]):
+        return JSONResponse(content={"files": [], "error": "Workspace folder not found"}, status_code=404)
+    root = ws["path"]
+    out = []
+
+    def walk(d: str, depth: int, prefix: str) -> None:
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(os.listdir(d), key=str.lower)
+        except Exception:
+            return
+        for name in entries:
+            if name in _FILE_SKIP_DIRS:
+                continue
+            full = os.path.join(d, name)
+            rel = os.path.join(prefix, name) if prefix else name
+            try:
+                if os.path.isdir(full):
+                    out.append({"type": "dir", "path": rel, "name": name})
+                    walk(full, depth + 1, rel)
+                else:
+                    size = os.path.getsize(full)
+                    if size > _FILE_MAX_SIZE:
+                        continue
+                    out.append({"type": "file", "path": rel, "name": name, "size": size})
+            except Exception:
+                continue
+
+    walk(root, 0, "")
+    return {"files": out, "root": root}
+
+
+@app.get("/api/workspaces/{workspace_id}/file")
+async def get_workspace_file(workspace_id: str, path: str = ""):
+    """Read a file from the workspace (path-traversal safe, 200 KB cap)."""
+    ws = wm.get_workspace(workspace_id)
+    if not ws or not ws.get("path"):
+        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
+    root = os.path.realpath(ws["path"])
+    target = os.path.realpath(os.path.join(root, path))
+    if target != root and not target.startswith(root + os.sep):
+        return JSONResponse(content={"error": "Path escapes the workspace"}, status_code=400)
+    if not os.path.isfile(target):
+        return JSONResponse(content={"error": "File not found"}, status_code=404)
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(200_000)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return {"path": path, "content": content, "truncated": len(content) >= 200_000}
+
+
+class AskAnswerRequest(BaseModel):
+    batch_id: str
+    answers: list[dict] = []
+
+
+@app.get("/api/ask/pending")
+async def api_ask_pending():
+    """Unanswered ask_user batches (frontend polls while an agent blocks)."""
+    from user_questions import pending_batches
+    return {"batches": pending_batches()}
+
+
+@app.post("/api/ask/answer")
+async def api_ask_answer(req: AskAnswerRequest):
+    """Resolve one pending ask_user batch with the human's answers."""
+    from user_questions import resolve_batch
+    ok = resolve_batch(req.batch_id, req.answers)
+    if not ok:
+        return JSONResponse(content={"ok": False, "error": "unknown batch"}, status_code=404)
+    return {"ok": True}
+
 
 
 @app.post("/api/session/reset")
@@ -717,7 +967,7 @@ async def reset_session():
 async def get_history():
     """Return recent prompt history."""
     try:
-        from chat_memory_manager import load_chat_memory
+        from memory.chat_memory_manager import load_chat_memory
         mem = load_chat_memory()
         messages = mem.get("current_day_messages", [])
         user_prompts = [m["text"] for m in messages if m.get("sender") == "user"]
@@ -854,11 +1104,11 @@ async def get_subagent_history_endpoint(workspace_id: str, chat_id: str, subagen
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
     
-    valid_subagents = {"Dev", "BSA", "DevSecOps", "SDET", "FreeAgent", "Vision"}
+    valid_subagents = {"Dev", "FreeAgent", "Vision"}
     if subagent_name not in valid_subagents:
         return JSONResponse(content={"error": "Invalid subagent name"}, status_code=400)
     
-    from subagent_swarm import load_subagent_history
+    from agents.subagent_swarm import load_subagent_history
     try:
         messages = load_subagent_history(chat_id, subagent_name)
         serialized = []
@@ -953,7 +1203,7 @@ async def update_chat_title(workspace_id: str, chat_id: str, req: Request):
 @app.get("/api/settings/general-profile")
 async def get_general_profile():
     """Get the General mode user profile (instructions + memory)."""
-    harness_root = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)); profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
+    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)); profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
     default = {
         "user_info": {"name": "", "birthday": "", "education": ""},
         "instructions": "",
@@ -971,7 +1221,7 @@ async def get_general_profile():
 @app.post("/api/settings/general-profile")
 async def save_general_profile(req: Request):
     """Save the General mode user profile."""
-    harness_root = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)); profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
+    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)); profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
     body = await req.json()
     try:
         os.makedirs(os.path.dirname(profile_path), exist_ok=True)
@@ -985,7 +1235,7 @@ async def save_general_profile(req: Request):
 @app.get("/api/settings/profile")
 
 async def get_profile():
-    harness_root = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
     profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
     default_profile = {
         "user_info": {"name": "Davin Akmal Yasha"},
@@ -1001,7 +1251,7 @@ async def get_profile():
 
 @app.post("/api/settings/profile")
 async def save_profile(req: Request):
-    harness_root = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
     profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
     body = await req.json()
     try:
@@ -1017,7 +1267,7 @@ async def get_workspace_rules(workspace_id: str):
     ws = wm.get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "rules", f"{workspace_id}.json")
+    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "rules", f"{workspace_id}.json")
     default_rules = {
         "stack": {},
         "workspace_rules": []
@@ -1035,7 +1285,7 @@ async def save_workspace_rules(workspace_id: str, req: Request):
     ws = wm.get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "rules", f"{workspace_id}.json")
+    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "rules", f"{workspace_id}.json")
     body = await req.json()
     try:
         os.makedirs(os.path.dirname(rules_path), exist_ok=True)
@@ -1049,7 +1299,7 @@ async def save_workspace_rules(workspace_id: str, req: Request):
 def start_consolidation_daemon():
     """Starts a periodic background daemon thread for memory consolidation."""
     import time
-    from memory_consolidation_daemon import consolidate_memories
+    from memory.memory_consolidation_daemon import consolidate_memories
     
     def daemon_loop():
         print("[DAEMON] Background memory consolidation daemon started.")
@@ -1066,48 +1316,112 @@ def start_consolidation_daemon():
 
 # ── Voice transcription ────────────────────────────────────────────────────────
 
+@app.post("/api/voice/start")
+async def voice_start():
+    """Start server-side mic capture (sounddevice, 16kHz raw — the pure Moonshine path)."""
+    try:
+        import audio_engine
+        ok = await asyncio.to_thread(audio_engine.start_capture)
+        return JSONResponse(content={"active": ok})
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": f"Capture unavailable: {e}"})
+
+
+@app.get("/api/voice/status")
+async def voice_status():
+    try:
+        import audio_engine
+        return JSONResponse(content={"active": audio_engine.capture_active()})
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+
+@app.post("/api/voice/stop")
+async def voice_stop(request: Request):
+    """Stop capture and return the final transcript (official streaming flush).
+
+    Body: {"discard": true} stops without transcribing (mic turned off).
+    """
+    discard = False
+    try:
+        body = await request.json()
+        discard = bool(body.get("discard"))
+    except Exception:
+        pass
+    try:
+        import audio_engine
+        text = (await asyncio.to_thread(audio_engine.stop_capture, discard) or "").strip()
+        if discard:
+            return JSONResponse(content={"text": "", "engine": "moonshine", "discarded": True})
+        if not text:
+            return JSONResponse(status_code=422, content={"error": "Moonshine could not transcribe the audio (empty result)"})
+        return JSONResponse(content={"text": text, "engine": "moonshine"})
+    except Exception as e:
+        import traceback
+        print(f"[Voice] stop/transcribe failed: {e}")
+        traceback.print_exc()
+        return JSONResponse(status_code=503, content={"error": f"Moonshine ASR unavailable: {e}"})
+
+
+@app.post("/api/voice/mute")
+async def voice_mute(request: Request):
+    """Mute the capture while Stark speaks (prevents self-transcription)."""
+    muted = False
+    try:
+        body = await request.json()
+        muted = bool(body.get("muted"))
+    except Exception:
+        pass
+    try:
+        import audio_engine
+        await asyncio.to_thread(audio_engine.set_capture_muted, muted)
+        return JSONResponse(content={"muted": muted})
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+
+@app.post("/api/voice/peek")
+async def voice_peek():
+    """Latest rolling transcript + live mic level (no model call)."""
+    try:
+        import audio_engine
+        text = audio_engine.live_text()
+        return JSONResponse(content={"text": text, "level": audio_engine.live_peak(), "active": audio_engine.capture_active()})
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+
 @app.post("/api/transcribe")
 async def transcribe_audio(file: UploadFile = File(...), language: str = Form("")):
-    """Transcribe audio using Groq Whisper (free STT)."""
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY") or ""
-    if not GROQ_API_KEY:
-        # Fallback: try comma-separated env var
-        keys_str = os.getenv("GROQ_API_KEYS", "")
-        if keys_str:
-            GROQ_API_KEY = keys_str.split(",")[0].strip()
-    if not GROQ_API_KEY:
-        return JSONResponse(status_code=400, content={"error": "Groq API key not configured (set GROQ_API_KEY or GROQ_API_KEYS)"})
-
+    """Transcribe audio with the on-device Moonshine engine (free, CPU)."""
     audio_bytes = await file.read()
     if not audio_bytes:
         return JSONResponse(status_code=400, content={"error": "Empty audio file"})
 
+    tmp_path = None
     try:
-        import httpx
-        # Build multipart form for Groq Whisper
-        files = {
-            "file": (file.filename or "audio.webm", audio_bytes, file.content_type or "audio/webm"),
-            "model": (None, "whisper-large-v3-turbo"),
-        }
-        lang = (language or "").strip().lower()
-        if lang:
-            files["language"] = (None, lang)
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                files=files,
-                headers=headers,
-            )
-        if resp.status_code != 200:
-            print(f"[Transcribe] Groq API error {resp.status_code}: {resp.text}")
-            return JSONResponse(status_code=502, content={"error": f"Groq API error: {resp.status_code}"})
-        result = resp.json()
-        text = result.get("text", "").strip()
-        return JSONResponse(content={"text": text})
+        import audio_engine
+        tmp_path = os.path.join(tempfile.gettempdir(), f"stt_{uuid.uuid4().hex}.webm")
+        with open(tmp_path, "wb") as f:
+            f.write(audio_bytes)
+        print(f"[Transcribe] received {len(audio_bytes)} bytes ({file.filename or 'round.webm'})")
+        text = (await asyncio.to_thread(audio_engine.transcribe_file, tmp_path) or "").strip()
+        if not text:
+            print("[Transcribe] empty transcript from Moonshine")
+            return JSONResponse(status_code=422, content={"error": "Moonshine could not transcribe the audio (empty result)"})
+        print(f"[Transcribe] OK: '{text[:100]}'")
+        return JSONResponse(content={"text": text, "engine": "moonshine"})
     except Exception as e:
-        print(f"[Transcribe] Error: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        import traceback
+        print(f"[Transcribe] Local ASR unavailable: {e}")
+        traceback.print_exc()
+        return JSONResponse(status_code=503, content={"error": f"Moonshine ASR unavailable: {e}"})
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _is_clean_polish(text: str) -> bool:
@@ -1151,7 +1465,7 @@ async def cleanup_text(req: CleanupRequest):
     if len(text) > 800:
         return JSONResponse(content={"text": text})
     try:
-        import free_agent
+        from agents import free_agent
         prompt = (
             "You are a grammar corrector. Fix the grammar, spelling, and punctuation "
             "of the voice transcript below. Keep the exact meaning, wording, language "
@@ -1171,74 +1485,20 @@ async def cleanup_text(req: CleanupRequest):
 
 
 # ── TTS helpers ──────────────────────────────────────────────────────────────
-
-_TTS_CMD = None
-
-
-def _tts_candidates() -> list[list[str]]:
-    """Candidate commands to synthesize speech (first working one is cached)."""
-    import shutil
-
-    if _TTS_CMD:
-        return [_TTS_CMD]
-    out: list[list[str]] = []
-    # 1) edge_tts module in the running interpreter (no PATH dependency)
-    try:
-        import edge_tts  # noqa: F401
-        out.append([sys.executable, "-m", "edge_tts"])
-    except ImportError:
-        pass
-    # 2) edge-tts CLI on PATH
-    exe = shutil.which("edge-tts")
-    if exe:
-        out.append([exe])
-    # 3) project virtualenvs (desktop mode runs venv312)
-    for py in (
-        os.path.join(os.path.dirname(__file__), "venv312", "Scripts", "python.exe"),
-        os.path.join(os.path.dirname(__file__), "venv", "Scripts", "python.exe"),
-    ):
-        if os.path.exists(py):
-            out.append([py, "-m", "edge_tts"])
-    return out
-
-
-async def _run_edge_tts(voice: str, text: str, out_path: str) -> tuple[bool, str | None]:
-    global _TTS_CMD
-    last_err: str | None = None
-    for cmd in _tts_candidates():
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, "--voice", voice, "--text", text, "--write-media", out_path,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
-            except asyncio.TimeoutError:
-                proc.kill()
-                last_err = f"timeout after 90s ({cmd[0]})"
-                continue
-            if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                _TTS_CMD = cmd
-                return True, None
-            last_err = f"rc={proc.returncode} ({cmd[0]}): {stderr.decode(errors='replace')[:200]}"
-        except FileNotFoundError:
-            last_err = f"executable not found ({cmd[0]})"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e} ({cmd[0]})"
-    return False, last_err
+# (edge-tts removed — voice now runs on the on-device Kokoro engine only)
 
 
 @app.post("/api/tts")
 async def tts(req: TTSRequest):
-    """Synthesize speech with edge-tts (Microsoft Neural voices, free).
+    """Synthesize speech with the on-device Kokoro engine (free, CPU).
 
-    Returns an audio/mpeg stream. Generates once per (voice, text) pair and
-    caches the mp3 so repeated replies are instant.
+    Returns an audio/wav stream. Generated once per (voice, text) pair and
+    cached so repeated replies are instant.
     """
     text = (req.text or "").strip()
     if not text:
         return JSONResponse(status_code=400, content={"error": "Empty text"})
-    voice = req.voice or "en-US-JennyNeural"
+    voice = req.voice or "am_michael"
 
     cache_dir = os.path.join(os.path.dirname(__file__), ".deep_agents", "tts_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -1253,14 +1513,18 @@ async def tts(req: TTSRequest):
     except Exception:
         pass
 
-    key = hashlib.md5((voice + "\x00" + text).encode("utf-8")).hexdigest()[:20]
-    out_path = os.path.join(cache_dir, f"{key}.mp3")
-    if not os.path.exists(out_path):
-        ok, err = await _run_edge_tts(voice, text, out_path)
-        if not ok:
-            print(f"[TTS] Generation failed: {err}")
-            return JSONResponse(status_code=502, content={"error": f"TTS generation failed: {err}"})
-    return FileResponse(out_path, media_type="audio/mpeg")
+    try:
+        import audio_engine
+        tts_key = (voice + '\x00' + text).encode('utf-8')
+        out_path = os.path.join(cache_dir, f"kokoro_{hashlib.md5(tts_key).hexdigest()[:20]}.wav")
+        if not os.path.exists(out_path):
+            ok = await asyncio.to_thread(audio_engine.synthesize_tts, text, out_path, voice)
+            if not ok or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                return JSONResponse(status_code=502, content={"error": "Kokoro TTS generation failed"})
+        return FileResponse(out_path, media_type="audio/wav")
+    except Exception as e:
+        print(f"[TTS] Kokoro engine unavailable: {e}")
+        return JSONResponse(status_code=503, content={"error": f"Kokoro TTS unavailable: {e}"})
 
 
 # ── Startup ─────────────────────────────────────────────────────────────────
@@ -1272,6 +1536,21 @@ if __name__ == "__main__":
     reload_mode = "--reload" in sys.argv
 
     _start_task_scheduler()
+
+    # Warm the embedding model in the background (the first semantic search
+    # would otherwise stall the agent loop for seconds-minutes loading ONNX).
+    def _warm_embeddings() -> None:
+        try:
+            from tools import _embedding_model_available
+            if not _embedding_model_available():
+                return
+            from memory.embedding_service import embed
+            embed("warmup")
+            print("[API] Embedding model warmed.")
+        except Exception as e:
+            print(f"[API] Embedding warm-up skipped: {e}")
+
+    threading.Thread(target=_warm_embeddings, daemon=True).start()
     
     # Start Telegram bot in background
     try:

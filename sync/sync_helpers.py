@@ -3,7 +3,7 @@ import json
 import re
 from datetime import datetime
 
-WORKSPACE_DIR = os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
 TASK_FILE = "task.json"
 
 def load_existing_specs(workspace_path: str = "") -> dict:

@@ -4,16 +4,28 @@ Just plumbing: load workspace context → run agent → stream output.
 """
 import os
 
-from state_sync import shared_state, safe_update_state, safe_get_state, state_lock, safe_append_live_log
+from sync.state_sync import shared_state, safe_update_state, safe_get_state, state_lock, safe_append_live_log
 
 
 def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: str = "", cancel_event=None):
     """Runs the agentic graph and yields shared_state after each step.
     The caller already resolves "continue" etc. — we just load context and run."""
-    from sync_helpers import (
+    from sync.sync_helpers import (
         load_existing_specs,
         load_task_tracking, build_task_progress_block,
     )
+
+    # ── P9: direct-to-Dev routing — messages bound for an existing project's
+    # Dev agent never touch the orchestrator (zero relay tokens). New project
+    # creation is NOT decided here — that stays with the orchestrator LLM.
+    try:
+        from agents.project_router import route_request, stream_direct
+        route_kind, project = route_request(client_request, workspace_path, chat_id)
+        if route_kind == "project_dev" and project:
+            yield from stream_direct(project, client_request, workspace_path, chat_id)
+            return
+    except Exception as e:
+        print(f"[SYNC] Project routing error (falling back to orchestrator): {e}")
 
     # Project path comes from the caller (workspace) — the legacy supervisor-memory
     # loader was removed (it always returned {}).
@@ -103,7 +115,7 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
     ]
 
     try:
-        from orchestrator_agent import orchestrator_node
+        from agents.orchestrator_agent import orchestrator_node
         res = orchestrator_node(init_state)
         if res:
             with state_lock:
@@ -158,7 +170,7 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
 
     # Clear the lazy hydration store to prevent unbounded memory growth across runs
     try:
-        from context_compaction import clear_lazy_store
+        from memory.context_compaction import clear_lazy_store
         clear_lazy_store()
     except Exception:
         pass

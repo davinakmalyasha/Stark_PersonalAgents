@@ -25,19 +25,19 @@ def _detect_read_stagnation(log: List[Dict[str, Any]]) -> Optional[str]:
         return None
 
     # Tier 4: scan-then-open (check first — it's the most actionable)
-    scans = ("search_code", "search_codebase", "list_files")
-    opens = ("read_file", "view_signatures")
+    scans = ("search_code",)
+    opens = ("read_file",)
     consecutive_reads = 0
     for entry in reversed(log):
         tool = entry.get("tool", "")
-        if tool in ("write_file", "edit_file", "apply_diff", "run_command"):
+        if tool in ("edit_file", "run_command"):
             break
         if tool in opens:
             consecutive_reads += 1
         elif tool in scans and consecutive_reads >= 3:
             return (
                 f"Scan-then-open: searched/listed then opened {consecutive_reads} files with no write between. "
-                "Rank the candidates and read ONLY the top 1-2 (use view_signatures first), "
+                "Rank the candidates and read ONLY the top 1-2, "
                 "then write — do not open every search hit."
             )
         elif tool in scans:
@@ -48,9 +48,9 @@ def _detect_read_stagnation(log: List[Dict[str, Any]]) -> Optional[str]:
     read_targets = set()
     for entry in reversed(log):
         tool = entry.get("tool", "")
-        if tool in ("write_file", "edit_file", "apply_diff", "run_command"):
+        if tool in ("edit_file", "run_command"):
             break
-        if tool in ("read_file", "search_code", "list_files", "view_signatures"):
+        if tool in ("read_file", "search_code"):
             reads += 1
             read_targets.add((tool, _clean_args(entry.get("args"))))
     if reads >= 4 and len(read_targets) <= 2:
@@ -59,8 +59,8 @@ def _detect_read_stagnation(log: List[Dict[str, Any]]) -> Optional[str]:
         return f"Stuck in read-only loop: {reads} consecutive reads/searches across {len(read_targets)} targets with zero writes/edits."
 
     # Tier 3: overall indecision — too many reads vs writes across whole log
-    total_reads = sum(1 for e in log if e.get("tool") in ("read_file", "search_code", "list_files", "view_signatures"))
-    total_writes = sum(1 for e in log if e.get("tool") in ("write_file", "edit_file", "apply_diff", "run_command"))
+    total_reads = sum(1 for e in log if e.get("tool") in ("read_file", "search_code"))
+    total_writes = sum(1 for e in log if e.get("tool") in ("edit_file", "run_command"))
     total_actions = total_reads + total_writes
     if total_actions >= 10 and total_reads > total_writes * 5:
         return f"Indecisive: {total_reads} reads vs {total_writes} writes ({total_actions} calls) — ratio > 5:1."
@@ -143,7 +143,7 @@ class LoopGuard:
             same_reads = 0
             for item in reversed(tool_call_log[-20:]):
                 # Reset check if there was a successful write/edit on the same file
-                if item.get("tool") in ("write_file", "edit_file") and item.get("args", {}).get("file_path") == target_file:
+                if item.get("tool") in ("edit_file",) and item.get("args", {}).get("file_path") == target_file:
                     res_preview = str(item.get("result_preview", ""))
                     if not res_preview.startswith("Error") and not res_preview.startswith("TOOL ERROR"):
                         break
@@ -168,12 +168,12 @@ class LoopGuard:
             if item_tool == tool_name and _clean_args(item_args) == canonical_args:
                 same_count += 1
                 continue
-            if item_tool in ("write_file", "edit_file", "apply_diff"):
+            if item_tool in ("edit_file",):
                 break
             if item_tool == "run_command":
                 break
 
-        is_read_tool = tool_name in ("read_file", "list_files", "search_code")
+        is_read_tool = tool_name in ("read_file", "search_code")
         abort_limit = 4 if is_read_tool else 5
         if same_count >= abort_limit:
             return (

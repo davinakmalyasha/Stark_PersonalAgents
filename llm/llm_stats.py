@@ -116,7 +116,7 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int, cache_hit_
 
 def update_token_stats(role: str, model_used: str, input_tokens: int, output_tokens: int, cache_hit_tokens: int = 0, where: Optional[str] = None, reasoning_chars: Optional[int] = None, reasoning_effort: Optional[str] = None, reasoning_budget: Optional[int] = None) -> None:
     try:
-        from state_sync import safe_update_state, safe_get_state
+        from sync.state_sync import safe_update_state, safe_get_state
         state = safe_get_state()
         usage = state.get("token_usage", {
             "total_input_tokens": 0, "total_output_tokens": 0,

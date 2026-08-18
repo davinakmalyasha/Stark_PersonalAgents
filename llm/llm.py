@@ -45,7 +45,7 @@ try:
 except Exception:
     pass
 
-from llm_config import TASK_CATEGORIES, get_task_category
+from llm.llm_config import TASK_CATEGORIES, get_task_category
 
 class StrWithMetadata(str):
     def __new__(cls, value, reasoning=None):
@@ -53,7 +53,7 @@ class StrWithMetadata(str):
         obj.reasoning_content = reasoning
         return obj
 
-from llm_stats import TokenUsageTracker, update_token_stats
+from llm.llm_stats import TokenUsageTracker, update_token_stats
 # rate_limiter removed — no artificial API throttling. The model decides pacing.
 
 load_dotenv(override=True)
@@ -86,7 +86,7 @@ def log_terminal(msg: str) -> None:
         except OSError:
             pass  # console is gone — log to shared_state only
     try:
-        from state_sync import safe_append_live_log
+        from sync.state_sync import safe_append_live_log
         safe_append_live_log(msg)
     except Exception:
         pass
@@ -177,7 +177,7 @@ def _resolve_llm_provider() -> dict:
     """
     provider = ""
     try:
-        from state_sync import safe_get_state
+        from sync.state_sync import safe_get_state
         provider = (safe_get_state().get("llm_provider") or "").strip().lower()
     except Exception:
         pass
@@ -282,7 +282,7 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
 def _clear_failed_models() -> None:
     """Clear the failed models set so each new request starts fresh."""
     try:
-        from state_sync import safe_update_state
+        from sync.state_sync import safe_update_state
         safe_update_state({"failed_models": []})
     except Exception:
         pass
@@ -476,13 +476,13 @@ def _handle_rate_limit(err_str: str, attempt: int) -> int:
 
 
 def _log_cache_debug(messages, tracker, role: str, model: str) -> None:
-    """CF3: BSA_CACHE_DEBUG=1 → log a payload-content hash + cache tokens per call.
+    """CF3: CACHE_DEBUG=1 → log a payload-content hash + cache tokens per call.
 
     DeepSeek prefix caching is a byte-prefix match. If cache_hit stays 0 across
     repeated calls with identical prefixes, a silent invalidator is at work —
     compare payload_sha between two requests to find the changing bytes.
     """
-    if os.environ.get("BSA_CACHE_DEBUG", "0") != "1":
+    if os.environ.get("CACHE_DEBUG", "0") != "1":
         return
     try:
         import hashlib
@@ -520,7 +520,7 @@ def invoke_with_fallback(
     selected_temp = temp
 
     try:
-        from state_sync import safe_get_state
+        from sync.state_sync import safe_get_state
         state = safe_get_state()
         selected_temp = state.get("selected_temp", temp)
     except Exception:
@@ -593,7 +593,7 @@ def invoke_with_fallback(
 
             # Log a smart summary instead of dumping the entire response
             try:
-                from state_sync import safe_append_live_log
+                from sync.state_sync import safe_append_live_log
                 if not schema:
                     val_str = str(val)
                     # Extract tool calls for a concise summary
@@ -754,24 +754,19 @@ def strip_thinking_from_messages(messages: list, strip: bool = True) -> list:
     return out
 
 
-def invoke_messages_with_fallback(
+def _prepare_llm_call(
     role: str,
     messages: list,
-    temp: float = 0.7,
-    where: Optional[str] = None,
-    schema: Optional[Any] = None,
-    tools: Optional[list[dict]] = None,
-    reasoning_effort: Optional[str] = None,
-    reasoning_budget: Optional[int] = None,
-    model: Optional[str] = None,
-) -> Any:
-    """
-    Invoke LLM with multi-turn messages and optional native function calling.
-    Returns (content_text, tool_calls) tuple when tools are provided,
-    or just content_text string when tools=None (legacy mode).
-    """
-    
-
+    temp: float,
+    schema: Optional[Any],
+    tools: Optional[list[dict]],
+    reasoning_effort: Optional[str],
+    reasoning_budget: Optional[int],
+    model: Optional[str],
+) -> tuple:
+    """Shared prep for invoke + streaming variants: model queue, temperature,
+    thinking-strip trimming, schema guideline. Returns (queue, trimmed_messages,
+    selected_temp)."""
     category = get_task_category(role)
     queue = TASK_CATEGORIES[category].copy()
     if model:
@@ -782,13 +777,11 @@ def invoke_messages_with_fallback(
     selected_temp = temp
 
     try:
-        from state_sync import safe_get_state
+        from sync.state_sync import safe_get_state
         state = safe_get_state()
         selected_temp = state.get("selected_temp", temp)
     except Exception:
         pass
-
-    errors_by_model: dict[str, str] = {}
 
     trimmed_messages = []
     # Thinking Block Stripping (Claude Code style): reasoning from PREVIOUS turns is
@@ -796,9 +789,9 @@ def invoke_messages_with_fallback(
     # completion, and only re-sends those tokens as cache-miss input. DeepSeek docs:
     # reasoning does not need to participate in context concatenation. Tool calls are
     # preserved (required for native function-calling round trips). Applied uniformly
-    # from turn 1 so the provider's prefix cache stays consistent. BSA_STRIP_THINKING=0
+    # from turn 1 so the provider's prefix cache stays consistent. STRIP_THINKING=0
     # restores the old echo behavior for A/B comparison.
-    strip_thinking = os.environ.get("BSA_STRIP_THINKING", "1").lower() not in ("0", "false", "no", "off")
+    strip_thinking = os.environ.get("STRIP_THINKING", "1").lower() not in ("0", "false", "no", "off")
     if strip_thinking:
         messages = strip_thinking_from_messages(messages)
     for msg in messages:
@@ -806,7 +799,7 @@ def invoke_messages_with_fallback(
             content = trim_prompt(msg.content)
             if type(msg).__name__ == "SystemMessage":
                 content = _compact_prompt(content)
-            
+
             # Recreate preserving all fields like id, name, tool_calls, additional_kwargs
             kwargs = {}
             for field in ["id", "name", "tool_calls", "additional_kwargs", "tool_call_id"]:
@@ -832,7 +825,7 @@ def invoke_messages_with_fallback(
             schema_json = json.dumps(schema.model_json_schema())
         else:
             schema_json = str(schema)
-        
+
         guideline = f"\n\nCRITICAL: You MUST respond with a JSON object matching this schema:\n{schema_json}"
         if trimmed_messages:
             last_msg = trimmed_messages[-1]
@@ -842,6 +835,259 @@ def invoke_messages_with_fallback(
                     if hasattr(last_msg, field):
                         kwargs[field] = getattr(last_msg, field)
                 trimmed_messages[-1] = type(last_msg)(content=str(last_msg.content) + guideline, **kwargs)
+
+    return queue, trimmed_messages, selected_temp
+
+
+def _stream_emit(chat_id: str, kind: str, text: str, agent: str = "", model: str = "") -> None:
+    """Push a delta to the shared StreamBus (best-effort)."""
+    if not text:
+        return
+    try:
+        from stream_bus import emit as _bus_emit
+        _bus_emit(chat_id, kind, text, agent=agent, model=model)
+    except Exception:
+        pass
+
+
+def invoke_messages_with_fallback_stream(
+    role: str,
+    messages: list,
+    temp: float = 0.7,
+    where: Optional[str] = None,
+    schema: Optional[Any] = None,
+    tools: Optional[list[dict]] = None,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+    model: Optional[str] = None,
+) -> Any:
+    """Streaming variant of invoke_messages_with_fallback.
+
+    Emits text/reasoning deltas into the shared StreamBus (chat-scoped) so the
+    API server can forward them as SSE ``delta`` frames — the frontend shows the
+    reply as it is generated (P10). Returns the EXACT same result shape as the
+    non-streaming variant; if streaming fails for any reason, this falls back to
+    the non-streaming path for that call (zero behavior change when disabled).
+    """
+    try:
+        from stream_bus import enabled as _stream_bus_enabled
+        if not _stream_bus_enabled():
+            return invoke_messages_with_fallback(
+                role, messages, temp=temp, where=where, schema=schema, tools=tools,
+                reasoning_effort=reasoning_effort, reasoning_budget=reasoning_budget, model=model,
+            )
+    except Exception:
+        return invoke_messages_with_fallback(
+            role, messages, temp=temp, where=where, schema=schema, tools=tools,
+            reasoning_effort=reasoning_effort, reasoning_budget=reasoning_budget, model=model,
+        )
+
+    queue, trimmed_messages, selected_temp = _prepare_llm_call(
+        role, messages, temp, schema, tools, reasoning_effort, reasoning_budget, model
+    )
+    errors_by_model: dict[str, str] = {}
+    chat_id = ""
+    try:
+        from sync.state_sync import shared_state
+        chat_id = str(shared_state.get("chat_id") or "")
+    except Exception:
+        pass
+
+    def _emit(kind: str, text: str) -> None:
+        _stream_emit(chat_id, kind, text, agent=role, model="")
+
+    def _build_native_tool_calls(chunks: list[dict]) -> list[dict]:
+        out = []
+        for tc in chunks:
+            name = tc.get("name") or ""
+            args_str = tc.get("args") or "{}"
+            cid = tc.get("id") or ""
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except Exception:
+                args = {}
+            if name:
+                out.append({"tool": name, "args": args, "id": cid})
+        return out
+
+    def _stream_once(m: str, response_format: Optional[dict]):
+        """One streaming attempt; returns (text, reasoning, tool_chunks, tracker)."""
+        llm = _get_deepseek_client(
+            m, selected_temp, role,
+            response_format=response_format,
+            tools=tools, reasoning_effort=reasoning_effort,
+            reasoning_budget=reasoning_budget, messages=trimmed_messages,
+        )
+        try:
+            # Ask the provider to include usage in the final streamed chunk.
+            llm.stream_usage = True
+        except Exception as _usage_e:
+            # stream_usage unsupported on this client — usage falls back to
+            # the token tracker callbacks.
+            print(f"[llm] stream_usage not supported ({_usage_e}) — using callback usage.")
+        tracker = TokenUsageTracker()
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_chunks: list[dict] = []
+        _throttle.acquire()
+        try:
+            for chunk in llm.stream(trimmed_messages, config={"callbacks": [tracker]}):
+                delta = getattr(chunk, "content", None)
+                if isinstance(delta, list):
+                    delta = "".join(
+                        str(p.get("text", p)) if isinstance(p, dict) else str(p)
+                        for p in delta
+                    )
+                if delta:
+                    text_parts.append(delta)
+                    _emit("text", delta)
+                reasoning = getattr(chunk, "additional_kwargs", {}).get("reasoning_content") if hasattr(chunk, "additional_kwargs") else None
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    _emit("reasoning", reasoning)
+                for tc in (getattr(chunk, "tool_call_chunks", None) or []):
+                    idx = tc.get("index", len(tool_chunks))
+                    while len(tool_chunks) <= idx:
+                        tool_chunks.append({"name": "", "args": "", "id": ""})
+                    if tc.get("name"):
+                        tool_chunks[idx]["name"] += tc["name"]
+                    if tc.get("id"):
+                        tool_chunks[idx]["id"] += tc["id"]
+                    if tc.get("args"):
+                        tool_chunks[idx]["args"] += tc["args"]
+        finally:
+            _throttle.release()
+        text = "".join(text_parts)
+        reasoning = "".join(reasoning_parts) or None
+        if not text and reasoning:
+            text = reasoning
+        return text, reasoning, tool_chunks, tracker
+
+    for item in queue:
+        m = item["model"]
+        try:
+            off_peak = " [Off-Peak Discount Active]" if _is_off_peak() else ""
+            if role != "MemoryArchivist":
+                action = where[:120].replace('\n', ' ').strip() if where else "processing..."
+                log_terminal(f"[{role}] {action}")
+            response_format = {"type": "json_object"} if schema is not None else None
+            text, reasoning, tool_chunks, tracker = _stream_once(m, response_format)
+
+            input_tok = tracker.input_tokens or 0
+            output_tok = tracker.output_tokens or 0
+            cache_hit = tracker.cache_hit_tokens or 0
+            update_token_stats(
+                role, m, input_tok, output_tok, cache_hit, where,
+                reasoning_chars=len(reasoning) if reasoning else 0,
+                reasoning_effort=reasoning_effort,
+                reasoning_budget=reasoning_budget,
+            )
+            _log_cache_debug(trimmed_messages, tracker, role, m)
+            _emit("end", "\n")
+
+            native_tool_calls = _build_native_tool_calls(tool_chunks)
+            if tools is not None:
+                if native_tool_calls:
+                    return (text or "", native_tool_calls, reasoning)
+                elif text:
+                    return (text, [], reasoning)  # Text response, no tool calls — agent is done
+                else:
+                    log_terminal(f"[{m}] Empty response, trying next...\n")
+            else:
+                if text:
+                    if schema is not None:
+                        text = _parse_schema_response(text, schema)
+                    else:
+                        text = StrWithMetadata(text, reasoning=reasoning)
+                    return text
+                log_terminal(f"[{m}] Empty response, trying next...\n")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            err_str = str(e)
+            errors_by_model[m] = err_str[:300]
+            log_terminal(f"[{m}] Failed: {err_str}\n{tb}\n")
+
+            # Rate-limit / transient server error retry (same policy as non-streaming)
+            if _is_retryable_http_error(err_str):
+                _throttle.trigger_cooldown(30)
+                for attempt in range(3):
+                    wait = _handle_rate_limit(err_str, attempt)
+                    log_terminal(
+                        f"[{m}] Transient error, retrying (attempt {attempt+1}/3) — waiting {wait}s...\n"
+                    )
+                    time.sleep(wait)
+                    try:
+                        response_format = {"type": "json_object"} if schema is not None else None
+                        text, reasoning, tool_chunks, tracker = _stream_once(m, response_format)
+                        input_tok = tracker.input_tokens or 0
+                        output_tok = tracker.output_tokens or 0
+                        cache_hit = tracker.cache_hit_tokens or 0
+                        update_token_stats(
+                            role, m, input_tok, output_tok, cache_hit, where,
+                            reasoning_chars=len(reasoning) if reasoning else 0,
+                            reasoning_effort=reasoning_effort,
+                            reasoning_budget=reasoning_budget,
+                        )
+                        _log_cache_debug(trimmed_messages, tracker, role, m)
+                        _emit("end", "\n")
+                        native_tool_calls = _build_native_tool_calls(tool_chunks)
+                        if tools is not None:
+                            if native_tool_calls:
+                                return (text or "", native_tool_calls, reasoning)
+                            elif text:
+                                return (text, [], reasoning)
+                        elif text:
+                            if schema is not None:
+                                text = _parse_schema_response(text, schema)
+                            else:
+                                text = StrWithMetadata(text, reasoning=reasoning)
+                            return text
+                    except Exception as retry_e:
+                        err_str = str(retry_e)
+                        errors_by_model[m] = f"Rate-limit retry {attempt+1} failed: {err_str[:200]}"
+                        log_terminal(f"[{m}] Retry {attempt+1} failed: {retry_e}\n")
+                        if not _is_retryable_http_error(err_str):
+                            break
+
+            # P10: streaming failed (non-transient) — fall back to the plain
+            # non-streaming path for THIS call. If the API is genuinely down,
+            # the fallback raises the same exhaustion error.
+            log_terminal(f"[{m}] Streaming failed ({err_str[:120]}) — falling back to non-streaming.")
+            return invoke_messages_with_fallback(
+                role, messages, temp=temp, where=where, schema=schema, tools=tools,
+                reasoning_effort=reasoning_effort, reasoning_budget=reasoning_budget, model=model,
+            )
+
+    detail = "; ".join(f"{m}: {e}" for m, e in errors_by_model.items())
+    raise RuntimeError(
+        f"All DeepSeek models exhausted for role '{role}'. "
+        f"Errors: {detail}. "
+        "Check your DEEPSEEK_API_KEY and account balance at https://platform.deepseek.com."
+    )
+
+
+def invoke_messages_with_fallback(
+    role: str,
+    messages: list,
+    temp: float = 0.7,
+    where: Optional[str] = None,
+    schema: Optional[Any] = None,
+    tools: Optional[list[dict]] = None,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+    model: Optional[str] = None,
+) -> Any:
+    """
+    Invoke LLM with multi-turn messages and optional native function calling.
+    Returns (content_text, tool_calls) tuple when tools are provided,
+    or just content_text string when tools=None (legacy mode).
+    """
+
+    queue, trimmed_messages, selected_temp = _prepare_llm_call(
+        role, messages, temp, schema, tools, reasoning_effort, reasoning_budget, model
+    )
+    errors_by_model: dict[str, str] = {}
 
     for item in queue:
         model = item["model"]

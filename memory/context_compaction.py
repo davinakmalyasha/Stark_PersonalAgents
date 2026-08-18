@@ -14,7 +14,7 @@ import os
 import re
 import uuid
 from langchain_core.messages import HumanMessage, AIMessage
-from context_budget import estimate_tokens
+from memory.context_budget import estimate_tokens
 
 
 def _get_active_ws():
@@ -48,6 +48,127 @@ def truncation_note(orig_len: int, cap: int) -> str:
         "To retrieve specific content, use search_code / grep with a narrow pattern, "
         "or read_file with offset+limit. Do not re-dump whole files or outputs.]"
     )
+
+
+# ── Tool-Result Sidecar Offloading ──
+# Tier-0 upgrades destructive stubbing to RETRIEVABLE offloading: raw output is
+# saved to <ws>/.agent-cache/<run-id>/ and the in-context message becomes a
+# lightweight pointer (read_file can fetch it back on demand). Zero LLM calls;
+# nothing is lost — only moved to disk. SIDECAR_OFFLOAD=0 restores the old
+# destructive stub behavior for A/B comparison.
+
+_SIDECAR_SUBDIR = ".agent-cache"
+_SIDECAR_MAX_AGE_HOURS = 48
+
+def _get_sidecar_run_id() -> str:
+    """Per-process run id for the sidecar subdir (one dir per harness process)."""
+    run_id = getattr(_get_sidecar_run_id, "_run_id", None)
+    if run_id is None:
+        run_id = os.environ.get("RUN_ID") or uuid.uuid4().hex[:8]
+        _get_sidecar_run_id._run_id = run_id
+    return run_id
+
+
+def _offload_to_sidecar(ws: str, content: str, msg_key: str, tool_label: str) -> str | None:
+    """
+    Write raw tool output to the workspace sidecar cache.
+    Returns the workspace-relative sidecar path, or None on any failure
+    (caller falls back to the destructive stub — offloading is best-effort).
+    """
+    try:
+        run_id = _get_sidecar_run_id()
+        sidecar_dir = os.path.join(ws, _SIDECAR_SUBDIR, run_id)
+        os.makedirs(sidecar_dir, exist_ok=True)
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(msg_key))[:80] or "tool"
+        fname = f"tool_{tool_label}_{safe_key}.log"
+        fpath = os.path.join(sidecar_dir, fname)
+        with open(fpath, "w", encoding="utf-8", errors="replace") as f:
+            f.write(content)
+        return os.path.join(_SIDECAR_SUBDIR, run_id, fname).replace("\\", "/")
+    except Exception:
+        return None
+
+
+def _cleanup_old_sidecars(ws: str) -> None:
+    """Best-effort: drop sidecar files older than _SIDECAR_MAX_AGE_HOURS."""
+    try:
+        root = os.path.join(ws, _SIDECAR_SUBDIR)
+        if not os.path.isdir(root):
+            return
+        import time as _time
+        cutoff = _time.time() - _SIDECAR_MAX_AGE_HOURS * 3600
+        for dirpath, _, files in os.walk(root):
+            for fn in files:
+                if not fn.startswith("tool_"):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    if os.path.getmtime(fp) < cutoff:
+                        os.remove(fp)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+# ── Git-Anchored Context Compression ──
+# When tier-2 condenses many write/edit messages, the working tree itself is the
+# authoritative state. If the workspace is a git repo, collapse all intermediate
+# edit payloads into ONE <accumulated_changes> block (git diff --stat + truncated
+# diff) — byte-exact, zero LLM calls. Non-git workspaces keep the old one-liner
+# path untouched. GIT_DIFF_BLOCK=0 disables it.
+
+_GIT_STAT_MAX_CHARS = 1200
+_GIT_DIFF_MAX_CHARS = 2600
+
+def _git_changes_block(ws: str) -> str | None:
+    """Best-effort <accumulated_changes> block from the working tree, or None."""
+    if os.environ.get("GIT_DIFF_BLOCK", "1") != "1":
+        return None
+    if not ws or not os.path.isdir(ws):
+        return None
+    try:
+        import subprocess
+        def _run(cmd: list[str], timeout: int = 10) -> str:
+            try:
+                r = subprocess.run(
+                    ["git", "-C", ws] + cmd,
+                    capture_output=True, text=True, timeout=timeout,
+                    shell=False, errors="replace",
+                )
+                return r.stdout.strip() if r.returncode == 0 else ""
+            except Exception:
+                return ""
+
+        if _run(["rev-parse", "--is-inside-work-tree"]) != "true":
+            return None  # not a git repo — keep the one-liner fallback
+        # Scope to the workspace subtree: a task dir nested inside a larger repo
+        # must only ever report ITS OWN changes, not the parent repo's diff.
+        stat = _run(["diff", "--stat", "--", "."])
+        if not stat:
+            return None  # clean tree — nothing to report
+        stat = stat[:_GIT_STAT_MAX_CHARS]
+
+        diff = _run(["diff", "-U1", "--", "."])
+        if diff:
+            if len(diff) > _GIT_DIFF_MAX_CHARS:
+                head, tail = diff[:1600], diff[-1000:]
+                diff = f"{head}\n... [{len(diff):,} chars of diff omitted] ...\n{tail}"
+        else:
+            diff = ""
+
+        lines = [stat]
+        if diff:
+            lines.append(diff)
+        return (
+            "<accumulated_changes>\n"
+            + "\n".join(lines)
+            + "\n</accumulated_changes>\n"
+            "[All file edits above are saved on disk; content is the current working tree. "
+            "Do not re-apply them. Re-read only the exact lines you still need.]"
+        )
+    except Exception:
+        return None
 
 
 # ── Tail selection (B5): keep the last N TURNS up to a token budget ──
@@ -130,6 +251,10 @@ def prune_stale_tool_outputs(
     without an LLM call or a full history rebuild. Keeps recent turns intact,
     never touches error-signal messages or file reads.
 
+    Raw output is offloaded to a workspace sidecar (<ws>/.agent-cache/<run-id>/)
+    before stubbing — retrievable via read_file — so nothing is lost
+    (SIDECAR_OFFLOAD=0 restores the old destructive stub).
+
     Returns (new_messages, pruned_chars).
     """
     if len(messages) < 8:
@@ -181,16 +306,32 @@ def prune_stale_tool_outputs(
     if total_pruned < min_prune_chars or not prunable:
         return messages, 0
 
+    sidecar_on = os.environ.get("SIDECAR_OFFLOAD", "1") == "1"
+    if sidecar_on:
+        _cleanup_old_sidecars(_get_active_ws())
+
     result = list(messages)
     for idx, n in prunable:
         msg = result[idx]
         content = msg.content if hasattr(msg, "content") else str(msg)
         head_match = _TOOL_RESULT_HEAD.match(content)
         tool_label = head_match.group(1) if head_match else "tool"
-        stub = content[:_PRUNE_STUB_KEEP]
-        stub = re.sub(r"^\[[^\]]+\]\s*", "", stub)  # avoid double tool label in the stub
+        sidecar_rel = None
+        if sidecar_on:
+            # Offload the full output first; the stub then points at it.
+            msg_key = getattr(msg, "id", None) or f"m{idx}"
+            sidecar_rel = _offload_to_sidecar(_get_active_ws(), content, msg_key, tool_label)
+        if sidecar_rel:
+            stub = (
+                f"[{tool_label}] output offloaded to sidecar: {sidecar_rel} "
+                f"({n:,} chars). Use read_file to inspect if needed."
+            )
+        else:
+            stub = content[:_PRUNE_STUB_KEEP]
+            stub = re.sub(r"^\[[^\]]+\]\s*", "", stub)  # avoid double tool label in the stub
+            stub = f"[{tool_label}] output pruned ({n:,} chars) — was:\n{stub}"
         result[idx] = HumanMessage(
-            content=f"[{tool_label}] output pruned ({n:,} chars) — was:\n{stub}",
+            content=stub,
             id=getattr(msg, "id", None),
             additional_kwargs=getattr(msg, "additional_kwargs", {}),
         )
@@ -268,7 +409,7 @@ def invalidate_stale_reads(messages: list) -> list:
             content = msg.content if hasattr(msg, "content") else str(msg)
             tool_calls = []
             try:
-                from developer_agent import parse_all_tool_calls
+                from agents.developer_agent import parse_all_tool_calls
                 tool_calls = parse_all_tool_calls(content) if content else []
             except Exception:
                 pass
@@ -276,7 +417,7 @@ def invalidate_stale_reads(messages: list) -> list:
             for tc in tool_calls:
                 tool_name = tc.get("tool", "")
                 if tool_name in (
-                    "write_file", "edit_file", "apply_diff",
+                    "edit_file",
                     "batch_edit", "write_to_file", "replace_file_content",
                     "multi_replace_file_content"
                 ):
@@ -303,7 +444,7 @@ def invalidate_stale_reads(messages: list) -> list:
             if name_match:
                 tool_name = name_match.group(1) or name_match.group(2)
 
-            write_tools = {"write_file", "edit_file", "apply_diff", "batch_edit", "write_to_file", "replace_file_content", "multi_replace_file_content"}
+            write_tools = {"edit_file", "batch_edit", "write_to_file", "replace_file_content", "multi_replace_file_content"}
             if (tool_name in write_tools):
                 is_write_edit_result = True
 
@@ -443,6 +584,8 @@ def tier2_compact(messages: list, keep_last_n: int = 8, tail_budget_tokens: int 
     Tier 2 (Medium Compaction):
       - Runs Tier 1 compaction first (strip thinking, dedup reads, truncate >40K).
       - For successful write/edit tool outputs: condense to one line with file path.
+      - When many edits were condensed AND the workspace is a git repo, they are
+        replaced by a single <accumulated_changes> block (git diff --stat + diff).
       - For large run_command outputs (>40K): truncate, keep small ones intact.
       - File reads are NEVER compacted — the model needs the content.
 
@@ -459,8 +602,41 @@ def tier2_compact(messages: list, keep_last_n: int = 8, tail_budget_tokens: int 
         protected = set(range(len(messages) - keep_last_n, len(messages)))
 
     compacted = []
+    action_count = 0
+    git_block = None
+    git_inserted = False
+    action_tools = {
+        "edit_file", "batch_edit",
+        "write_to_file", "replace_file_content",
+        "multi_replace_file_content",
+    }
+    # First pass: count condenseable write/edit messages in the old region so the
+    # git-anchored block (when present) can replace them wholesale.
     for i, msg in enumerate(messages):
         if i in header_indices or i in protected:
+            continue
+        if not isinstance(msg, HumanMessage):
+            continue
+        content = str(msg.content) if hasattr(msg, "content") else str(msg)
+        if any(e in content.lower() for e in _ERROR_SIGNALS):
+            continue
+        name_match = re.search(r"Tool '([^']+)'|\[([a-zA-Z0-9_-]+)\]", content[:200])
+        tool_name = name_match.group(1) or name_match.group(2) if name_match else ""
+        if tool_name in action_tools:
+            action_count += 1
+
+    git_block = None
+    if action_count >= 3:
+        try:
+            git_block = _git_changes_block(_get_active_ws())
+        except Exception:
+            git_block = None
+
+    for i, msg in enumerate(messages):
+        if i in header_indices or i in protected:
+            if git_block is not None and not git_inserted and i >= 2:
+                compacted.append(HumanMessage(content=git_block))
+                git_inserted = True
             compacted.append(msg)
             continue
 
@@ -482,12 +658,11 @@ def tier2_compact(messages: list, keep_last_n: int = 8, tail_budget_tokens: int 
             # Write/edit actions — can condense since content is on disk.
             # Checked BEFORE the [FILE] guard: edit results often embed "[FILE]",
             # but the tool name is authoritative (an edit result is not a read).
-            action_tools = {
-                "write_file", "edit_file", "apply_diff", "batch_edit",
-                "write_to_file", "replace_file_content",
-                "multi_replace_file_content",
-            }
             if tool_name in action_tools:
+                if git_block is not None:
+                    # The accumulated_changes block carries the full state —
+                    # individual edit payloads are dropped entirely.
+                    continue
                 # Extract file path from the output
                 fp = None
                 for ptn in [r"\[FILE\]\s+(\S+)", r"wrote\s+(\S+)", r"edited\s+(\S+)", r"file_path['\"]?\s*[:=]\s*['\"]?([^\s,;)'\"]+)", r"path['\"]?\s*[:=]\s*['\"]?([^\s,;)'\"]+)"]:
@@ -552,36 +727,6 @@ def tier2_compact(messages: list, keep_last_n: int = 8, tail_budget_tokens: int 
     return compacted
 
 
-# ── Anchor Pivoting ──
-
-def pivot_anchor_to_stable_checkpoint(messages: list, plan_checkpoint_idx: int) -> list:
-    """
-    Drop intermediate messages between start and the stable plan checkpoint,
-    keeping only system + dynamic context + plan checkpoint + a compact summary.
-    Called when transitioning from planning to execution phases.
-    """
-    if plan_checkpoint_idx <= 3 or plan_checkpoint_idx >= len(messages):
-        return messages
-
-    dropped = messages[3:plan_checkpoint_idx]
-    dropped_summary_parts = []
-    for m in dropped:
-        c = m.content if hasattr(m, "content") else str(m)
-        dropped_summary_parts.append(c[:200])
-
-    summary_text = (
-        f"[ANCHOR PIVOT] Planning phase completed. "
-        f"{len(dropped)} intermediate messages compacted.\n"
-        f"Summary of planning activity:\n" +
-        "\n".join(f"- {s}" for s in dropped_summary_parts[:5]) +
-        (f"\n... and {len(dropped_summary_parts) - 5} more" if len(dropped_summary_parts) > 5 else "")
-    )
-
-    return [messages[0], messages[1], messages[2],
-            HumanMessage(content=summary_text),
-            messages[plan_checkpoint_idx]] + messages[plan_checkpoint_idx + 1:]
-
-
 # ── Checkpoint Compaction (Nuclear) ──
 
 def build_structured_resume_summary(tool_call_log: list, created: list, modified: list) -> str:
@@ -605,6 +750,57 @@ def build_structured_resume_summary(tool_call_log: list, created: list, modified
     return "\n".join(sections)
 
 
+def _build_semantic_resume_summary(messages: list, header_end: int, tail_start: int) -> str | None:
+    """B2: one cheap flash call summarizing the DROPPED region semantically.
+
+    The structural summary (file lists + tool counts) preserves WHAT changed;
+    this preserves WHY — decisions, failures, open items. Best-effort: any
+    error falls back to the structural summary (caller keeps it).
+    Gated by T3_LLM_SUMMARY (default 1) and a min dropped-size floor
+    (T3_LLM_SUMMARY_MIN_CHARS, default 150K) so small compactions never
+    pay for a call.
+    """
+    if os.environ.get("T3_LLM_SUMMARY", "1") != "1":
+        return None
+    try:
+        dropped = messages[header_end:tail_start]
+        dropped_chars = sum(len(str(getattr(m, "content", ""))) for m in dropped)
+        min_chars = int(os.environ.get("T3_LLM_SUMMARY_MIN_CHARS", "150000"))
+        if dropped_chars < min_chars:
+            return None
+
+        # Compact transcript sample: last ~12 dropped messages, ~300 chars each
+        sample = []
+        for m in dropped[-12:]:
+            c = str(getattr(m, "content", ""))
+            c = re.sub(r"\s+", " ", c)[:300]
+            label = "AI" if isinstance(m, AIMessage) else "tool-result"
+            sample.append(f"[{label}] {c}")
+        transcript = "\n".join(sample)
+
+        from llm import invoke_with_fallback
+        summary = invoke_with_fallback(
+            role="MemoryArchivist",
+            sys_inst=(
+                "You are a context-compaction summarizer. From the agent work "
+                "transcript below, write a tight 5-8 line summary capturing: "
+                "what was accomplished, what FAILED or is BLOCKED (with the "
+                "exact error/failure), decisions made and why, and what remains "
+                "to do next. Output ONLY the summary text — no headers, no "
+                "markdown, no preamble."
+            ),
+            prompt=f"Transcript of agent work (older history, being compacted):\n\n{transcript}",
+            temp=0.3,
+            where="context compaction summary",
+        )
+        s = str(summary).strip()
+        if len(s) >= 40:
+            return s
+    except Exception:
+        pass
+    return None
+
+
 def checkpoint_compact(
     messages: list,
     tool_call_log: list,
@@ -621,6 +817,8 @@ def checkpoint_compact(
 
     The resume summary is CHAINED: any prior compaction summary found in the
     dropped region is folded into the new summary instead of being lost (M3).
+    A semantic LLM summary of the dropped region (B2) is prepended when the
+    dropped region is large — best-effort, structural fallback on any failure.
 
     This is the heavy compaction for when we're approaching the context limit.
     Unlike [TOOL OK] approach, the resume summary preserves dense factual
@@ -640,6 +838,16 @@ def checkpoint_compact(
 
     header_end = 2
     summary_msg_content = build_structured_resume_summary(tool_call_log, created, modified)
+
+    # B2: semantic LLM summary of the dropped region, prepended when available
+    semantic = _build_semantic_resume_summary(messages, header_end, tail_start)
+    if semantic:
+        summary_msg_content = (
+            "SEMANTIC SESSION SUMMARY (what happened and why):\n"
+            f"{semantic}\n\n"
+            "STRUCTURAL STATE (files + tool activity):\n"
+            f"{summary_msg_content}"
+        )
 
     # M3: chain prior compaction summaries from the dropped region
     prior_summaries = []
@@ -675,3 +883,233 @@ def checkpoint_compact(
     compacted.append(summary_msg)
     compacted.extend(messages[tail_start:])
     return compacted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pi-style session-log compaction (P3): summary entry + retainedTail checkpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _entry_char_size(entry) -> int:
+    """Rough char size of a session entry for cut-point math."""
+    try:
+        from session_log import CompactionEntry, BranchSummaryEntry, MessageEntry, message_text
+        if isinstance(entry, MessageEntry):
+            total = len(message_text(entry.content))
+            if isinstance(entry.content, list):
+                for block in entry.content:
+                    if getattr(block, "type", "") == "toolCall":
+                        total += len(str(block.arguments))
+            return total
+        if isinstance(entry, CompactionEntry):
+            return len(entry.summary)
+        if isinstance(entry, BranchSummaryEntry):
+            return len(entry.summary)
+        return 0
+    except Exception:
+        return 0
+
+
+def _entries_chars(entries: list) -> int:
+    return sum(_entry_char_size(e) for e in entries)
+
+
+def _log_cut_valid(entry) -> bool:
+    """Cut points must be user/assistant messages — never a tool result
+    (it must stay with its tool call)."""
+    try:
+        from session_log import MessageEntry
+        return isinstance(entry, MessageEntry) and entry.role in ("user", "assistant")
+    except Exception:
+        return False
+
+
+def find_log_cut_point(entries: list, keep_recent_chars: int) -> tuple[int, int]:
+    """Walk backwards from the newest entry accumulating char size; cut at the
+    first valid user/assistant boundary that fits the budget. Returns
+    (cut_index, accumulated_chars); entries[:cut] are summarized."""
+    if not entries:
+        return 0, 0
+    acc = 0
+    for i in range(len(entries) - 1, -1, -1):
+        acc += _entry_char_size(entries[i])
+        if acc >= keep_recent_chars:
+            j = i
+            while j >= 0 and not _log_cut_valid(entries[j]):
+                j -= 1
+            return max(j, 0), acc
+    return 0, acc
+
+
+def serialize_entries(entries: list, tool_result_cap: int = 2000) -> str:
+    """Serialize session entries to plain text for summarization (Pi-style).
+
+    The flat [User]/[Assistant]/[Tool result] framing keeps the summarizer from
+    treating the transcript as a conversation to continue.
+    """
+    from session_log import (CompactionEntry, BranchSummaryEntry, MessageEntry,
+                             message_text)
+    lines = []
+    for e in entries:
+        try:
+            if isinstance(e, CompactionEntry):
+                lines.append(f"[Context summary]: {e.summary[:2000]}")
+            elif isinstance(e, BranchSummaryEntry):
+                lines.append(f"[Branch summary]: {e.summary[:2000]}")
+            elif isinstance(e, MessageEntry):
+                if e.role == "user":
+                    lines.append(f"[User]: {message_text(e.content)[:4000]}")
+                elif e.role == "assistant":
+                    thinking = ""
+                    calls = []
+                    text = ""
+                    if isinstance(e.content, list):
+                        for block in e.content:
+                            bt = getattr(block, "type", "")
+                            if bt == "thinking":
+                                thinking = block.thinking
+                            elif bt == "toolCall":
+                                calls.append(f"{block.name}({block.arguments})")
+                            elif bt == "text":
+                                text = block.text
+                    else:
+                        text = str(e.content)
+                    if thinking:
+                        lines.append(f"[Assistant thinking]: {thinking[:1500]}")
+                    if calls:
+                        lines.append(f"[Assistant tool calls]: {'; '.join(calls)[:1500]}")
+                    if text:
+                        lines.append(f"[Assistant]: {text[:4000]}")
+                elif e.role == "toolResult":
+                    t = message_text(e.content)
+                    if len(t) > tool_result_cap:
+                        t = f"{t[:tool_result_cap]}... [{len(t)} chars truncated]"
+                    lines.append(f"[Tool result]: {t}")
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+
+def extract_log_file_ops(entries: list) -> tuple[list, list]:
+    """Cumulative read/modified file tracking from toolCall blocks."""
+    from session_log import MessageEntry
+    read_files: list[str] = []
+    modified_files: list[str] = []
+    seen_r, seen_m = set(), set()
+
+    def _add(dst, seen, path):
+        if path and path not in seen:
+            seen.add(path)
+            dst.append(path)
+
+    for e in entries:
+        if not isinstance(e, MessageEntry) or not isinstance(e.content, list):
+            continue
+        for block in e.content:
+            bt = getattr(block, "type", "")
+            if bt != "toolCall":
+                continue
+            args = block.arguments or {}
+            path = str(args.get("file_path") or args.get("path") or "")
+            if not path:
+                continue
+            if block.name in ("read_file", "ls"):
+                _add(read_files, seen_r, path)
+            elif block.name in ("edit_file", "revert_last_change", "apply_patch"):
+                _add(modified_files, seen_m, path)
+    return read_files, modified_files
+
+
+_LOG_SUMMARY_SYSTEM = (
+    "You are a context-compaction summarizer. From the agent work transcript "
+    "below, produce a summary in this exact structure:\n"
+    "## Goal\nWhat the user is trying to accomplish\n"
+    "## Constraints & Preferences\n- requirements mentioned\n"
+    "## Progress\n### Done\n- completed items\n### In Progress\n- current work\n"
+    "### Blocked\n- issues with exact errors\n"
+    "## Key Decisions\n- **decision**: rationale\n"
+    "## Next Steps\n1. what should happen next\n"
+    "## Critical Context\n- data needed to continue\n"
+    "Include a <read-files> and <modified-files> block at the end. "
+    "Output ONLY the summary."
+)
+
+
+def _summarize_entries(entries: list, previous_summaries: list) -> str | None:
+    """One flash call summarizing the dropped region (best-effort)."""
+    if os.environ.get("LOG_LLM_SUMMARY", "1") != "1":
+        return None
+    try:
+        transcript = serialize_entries(entries)
+        if len(transcript) < 2000:
+            return None
+        prev = ""
+        if previous_summaries:
+            prev = "PREVIOUS SUMMARIES (fold into context):\n" + \
+                "\n---\n".join(s[:1500] for s in previous_summaries[-2:]) + "\n\n"
+        from llm import invoke_with_fallback
+        summary = invoke_with_fallback(
+            role="MemoryArchivist",
+            sys_inst=_LOG_SUMMARY_SYSTEM,
+            prompt=f"{prev}Transcript of agent work (older history, being compacted):\n\n{transcript}",
+            temp=0.3,
+            where="session log compaction summary",
+        )
+        s = str(summary).strip()
+        return s if len(s) >= 40 else None
+    except Exception:
+        return None
+
+
+def compact_session_log(session_mgr, keep_recent_chars: int | None = None) -> str | None:
+    """Pi-style compaction on a session log (P3).
+
+    Finds a safe cut point (never at a tool result), summarizes the dropped
+    region, and appends a ``compaction`` entry whose ``retainedTail`` is a
+    self-contained checkpoint: ``build_context_entries()`` then rebuilds
+    context without walking the older entries. Returns the summary, or None
+    when nothing was compacted.
+    """
+    if os.environ.get("LOG_COMPACT", "1") != "1":
+        return None
+    if keep_recent_chars is None:
+        keep_recent_chars = int(os.environ.get("LOG_KEEP_RECENT_CHARS", "80000"))
+    try:
+        from session_log import CompactionEntry, MessageEntry
+        entries = session_mgr.build_context_entries()
+        if len(entries) < 8:
+            return None
+        cut, acc = find_log_cut_point(entries, keep_recent_chars)
+        if cut <= 0:
+            return None  # log fits the budget — nothing to compact
+
+        to_summarize = entries[:cut]
+        retained = entries[cut:]
+        read_files, modified_files = extract_log_file_ops(entries)
+        previous_summaries = [e.summary for e in entries if isinstance(e, CompactionEntry)]
+
+        summary = _summarize_entries(to_summarize, previous_summaries)
+        if not summary:
+            files = []
+            if modified_files:
+                files.append("Modified: " + ", ".join(modified_files[:20]))
+            if read_files:
+                files.append("Read: " + ", ".join(read_files[:20]))
+            summary = (
+                "## Progress\n### Done\n- session progress compacted at checkpoint\n"
+                + ("## Critical Context\n" + "\n".join(f"- {f}" for f in files) if files else "")
+            )
+
+        retained_tail = [e for e in retained if isinstance(e, MessageEntry)]
+        first_kept = retained[0].id if retained else None
+        tokens_before = _entries_chars(to_summarize) // 3  # ~3.5 chars/token
+        session_mgr.append_compaction(
+            summary,
+            first_kept_entry_id=first_kept,
+            retained_tail=retained_tail,
+            tokens_before=tokens_before,
+            read_files=read_files,
+            modified_files=modified_files,
+        )
+        return summary
+    except Exception:
+        return None

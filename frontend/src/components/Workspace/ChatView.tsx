@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { X, Minimize2, Maximize2 } from 'lucide-react';
+import { X, Minimize2, Maximize2, Search, Download } from 'lucide-react';
 import type { ChatMessage, AppState, ModelOption } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
@@ -31,16 +31,45 @@ interface Props {
   traceSteps?: TraceStep[];
   workspaceId: string | null;
   chatId: string | null;
+  onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
+  onRetry?: (prompt: string) => void;
 }
 
 export default function ChatView({
   messages, isRunning,
   hasActiveChat, notification,
   onSend, onCancel, onClearNotification,
-  isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId,
+  isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
+  selectedModel, models, onModelChange, onRetry,
 }: Props) {
   const [minimized, setMinimized] = useState(false);
   const [activeSubagent, setActiveSubagent] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showSearch, setShowSearch] = useState(false);
+
+  // P10/Tier-3: client-side chat search — only show matching messages.
+  const visibleMessages = searchQuery.trim()
+    ? messages.filter((m) => (m.content || '').toLowerCase().includes(searchQuery.trim().toLowerCase()))
+    : messages;
+
+  // P10/Tier-3: export the chat as Markdown (blob download).
+  const exportChat = () => {
+    const lines: string[] = [];
+    for (const m of messages) {
+      if (!m.content) continue;
+      if (m.role === 'user') lines.push(`**You:**\n\n${m.content}\n`);
+      else if (m.role === 'agent') lines.push(`**Assistant${m.agentName ? ` (${m.agentName})` : ''}:**\n\n${m.content}\n`);
+      else if (m.role === 'system') lines.push(`> ${m.content}\n`);
+      else if (m.role === 'error') lines.push(`**Error:**\n\n${m.content}\n`);
+    }
+    const blob = new Blob([lines.join('\n---\n\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chat-${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div 
@@ -67,6 +96,37 @@ export default function ChatView({
         )}
       </button>
 
+      {/* Chat toolbar: search + export (right of the minimize button) */}
+      <div className="absolute top-3.5 right-[52px] z-50 flex items-center gap-1.5">
+        <button
+          onClick={() => { setShowSearch((v) => !v); setSearchQuery(''); }}
+          className="pressable p-2 bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 hover:border-zinc-700/80 rounded-xl text-zinc-400 hover:text-zinc-100 transition-all cursor-pointer shadow-xl flex items-center justify-center"
+          title={showSearch ? 'Close search' : 'Search in chat'}
+          style={{ width: '32px', height: '32px' }}
+        >
+          <Search size={14} />
+        </button>
+        <button
+          onClick={exportChat}
+          className="pressable p-2 bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 hover:border-zinc-700/80 rounded-xl text-zinc-400 hover:text-zinc-100 transition-all cursor-pointer shadow-xl flex items-center justify-center"
+          title="Export chat as Markdown"
+          style={{ width: '32px', height: '32px' }}
+        >
+          <Download size={14} />
+        </button>
+      </div>
+      {showSearch && (
+        <div className="absolute top-3.5 left-3 right-[100px] z-50">
+          <input
+            autoFocus
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search messages…"
+            className="w-full px-3 py-1.5 rounded-xl bg-zinc-900/95 border border-zinc-800/80 text-[12.5px] text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-indigo-500/50"
+          />
+        </div>
+      )}
+
       {/* Collapsible Area */}
       <div 
         className="flex-1 flex flex-col overflow-y-auto transition-all duration-300 ease-in-out"
@@ -87,7 +147,7 @@ export default function ChatView({
 
         {/* Message stream */}
         <MessageStream
-          messages={messages}
+          messages={visibleMessages}
           hasActiveChat={hasActiveChat}
           onOpenSubagent={(name) => setActiveSubagent(name)}
           activeSubagent={activeSubagent}
@@ -95,12 +155,14 @@ export default function ChatView({
           workspaceId={workspaceId}
           chatId={chatId}
           onCloseSubagent={() => setActiveSubagent(null)}
+          onOpenProject={onOpenProject}
+          onRetry={onRetry}
         />
       </div>
 
       {/* Always visible Bottom Prompt Dock */}
       <div className="border-t border-zinc-800/50 flex-shrink-0">
-        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} />
+        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} />
       </div>
     </div>
   );

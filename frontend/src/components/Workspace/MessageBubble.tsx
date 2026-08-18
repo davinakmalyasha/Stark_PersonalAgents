@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { Copy, AlertTriangle, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X } from 'lucide-react';
-import type { ArtifactFile, ChatAttachment, ChatMessage, RunArtifacts } from '../../types';
+import { Copy, AlertTriangle, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink, Loader2 } from 'lucide-react';
+import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import { undoRun } from '../../services/api';
 import TraceAccordion from './TraceAccordion';
 import Markdown from './Markdown';
+import DiffView from './DiffView';
 
 interface Props {
   message: ChatMessage;
@@ -14,6 +15,8 @@ interface Props {
   workspaceId?: string | null;
   chatId?: string | null;
   onCloseSubagent?: () => void;
+  onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
+  onRetry?: () => void;
 }
 
 /** Pick an icon for tool calls based on the tool name */
@@ -89,22 +92,110 @@ function ArtifactSummary({ artifacts }: { artifacts: RunArtifacts }) {
       {reviewOpen && <div className="artifact-review-backdrop" onClick={() => setReviewOpen(false)}>
         <div className="artifact-review-modal" onClick={(event) => event.stopPropagation()}>
           <div className="artifact-review-header"><div><span>RUN REVIEW</span><h3>Edited {files.length} files</h3></div><button type="button" onClick={() => setReviewOpen(false)} aria-label="Close review"><X size={17} /></button></div>
-          <div className="artifact-review-body">{files.map((file) => <section key={`review-${file.path}`}><div className="artifact-review-file"><span>{statusIcon(file.status)}{file.path}</span><span><b className="artifact-total-add">+{file.additions}</b> <b className="artifact-total-delete">-{file.deletions}</b></span></div><pre>{file.diff || 'No text diff available for this file.'}</pre></section>)}</div>
+          <div className="artifact-review-body">{files.map((file) => <section key={`review-${file.path}`}><div className="artifact-review-file"><span>{statusIcon(file.status)}{file.path}</span><span><b className="artifact-total-add">+{file.additions}</b> <b className="artifact-total-delete">-{file.deletions}</b></span></div><DiffView diff={file.diff || ''} filename={file.path} /></section>)}</div>
         </div>
       </div>}
     </div>
   );
 }
 
-export default function MessageBubble({ message, onOpenSubagent, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent }: Props) {
+/** P9: compact card for replies that were routed straight to another
+ * project's Dev agent (full reply lives in that project's chat). */
+function RoutedProjectCard({ projectRef, onOpenProject }: { projectRef: ProjectRef; onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const fullReply = projectRef.full_reply || '';
+  const preview = fullReply.length > 220 ? fullReply.slice(0, 220).trimEnd() + '…' : fullReply;
+
+  return (
+    <div className="routed-card rounded-xl border border-indigo-500/20 bg-indigo-500/[0.04] overflow-hidden">
+      <div className="flex items-center gap-2.5 px-3.5 py-2.5 border-b border-indigo-500/10">
+        <FolderGit2 size={15} className="text-indigo-400 flex-shrink-0" />
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-bold text-zinc-200 truncate">Project {projectRef.name} · Dev reply</div>
+          <div className="text-[10.5px] text-zinc-500">Routed directly to the project's Dev agent</div>
+        </div>
+        {onOpenProject && (
+          <button
+            type="button"
+            className="pressable flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-indigo-200 text-[11px] font-semibold transition-colors cursor-pointer flex-shrink-0"
+            onClick={() => onOpenProject({ workspace_id: projectRef.workspace_id, chat_id: projectRef.chat_id })}
+          >
+            <ExternalLink size={12} /> Open in {projectRef.name}
+          </button>
+        )}
+      </div>
+      <div className="px-3.5 py-2.5">
+        {expanded ? (
+          <div className="text-[14px] text-zinc-300 leading-relaxed">
+            <Markdown content={fullReply} />
+          </div>
+        ) : (
+          <p className="text-[13.5px] text-zinc-400 leading-relaxed whitespace-pre-wrap">{preview}</p>
+        )}
+        <button
+          type="button"
+          className="pressable flex items-center gap-1 mt-2 text-[11.5px] font-semibold text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <ChevronDown size={13} className={expanded ? 'rotate-180 transition-transform' : 'transition-transform'} />
+          {expanded ? 'Hide details' : 'Show details'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** P10: live reasoning/thinking block — fills as DeepSeek streams reasoning
+ * tokens; collapses to a one-line summary after the run finishes. */
+function StreamingThinking({ reasoning, rate, active }: { reasoning: string; rate: number; active: boolean }) {
+  const [open, setOpen] = useState(true);
+  const [userToggled, setUserToggled] = useState(false);
+  const isOpen = userToggled ? open : active;
+
+  return (
+    <div className="rounded-lg border border-amber-500/15 bg-amber-500/[0.03] overflow-hidden mb-2">
+      <button
+        type="button"
+        onClick={() => { setUserToggled(true); setOpen((v) => !v); }}
+        className="w-full flex items-center gap-2 px-3 py-2 text-left cursor-pointer"
+      >
+        <span className="relative flex h-2 w-2 flex-shrink-0">
+          {active && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-60" />}
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
+        </span>
+        <span className="text-[11.5px] font-bold text-amber-300/90 uppercase tracking-wider flex-1">
+          {active ? 'Thinking…' : `Thought for ${reasoning.length > 0 ? `${Math.round(reasoning.length / 4)} tokens` : 'a moment'}`}
+        </span>
+        {active && rate > 0 && <span className="text-[10.5px] text-amber-200/60 font-mono">{rate} tok/s</span>}
+        <ChevronDown size={13} className={`text-amber-400/70 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+      </button>
+      {isOpen && (
+        <div className="thinking-collapse is-open">
+          <div>
+            <div className={`px-3.5 pb-3 text-[13px] text-amber-100/70 leading-relaxed whitespace-pre-wrap font-mono max-h-[240px] overflow-y-auto ${active ? 'thinking-live-fade' : ''}`}>
+              {reasoning || '…'}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function MessageBubble({ message, onOpenSubagent, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
   const isSystem = message.role === 'system';
   const isTool = isAgent && isToolCall(message.content);
+  const showAgentName = !!message.agentName;
+  const streamingActive = !!message.metadata?.isStreaming;
+  const streamingReasoning = (message.metadata?.streamingReasoning as string | undefined) || '';
+  const streamRate = (message.metadata?.streamRate as number | undefined) || 0;
+  const usageMeta = message.metadata?.usage as { total_input_tokens?: number; total_output_tokens?: number; total_cost?: number } | undefined;
 
   return (
-    <div className="animate-fade-in group" style={{ marginBottom: '24px' }}>
+    <div className={`group ${isUser ? 'msg-user-enter' : isAgent ? 'msg-agent-enter' : 'animate-fade-in'}`} style={{ marginBottom: '24px' }}>
       {/* ────────────────────────────────────
           USER MESSAGE — simple text display
           ──────────────────────────────────── */}
@@ -152,33 +243,86 @@ export default function MessageBubble({ message, onOpenSubagent, activeSubagent,
       {isAgent && !isTool && (
         <div className="agent-message-content">
           {/* Agent name label */}
-          {message.agentName && (
+          {showAgentName && (
             <div className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">
               {message.agentName}
             </div>
           )}
 
+          {/* P10: live token streaming — thinking block + generating badge */}
+          {streamingActive && (
+            <>
+              {!!streamingReasoning && (
+                <StreamingThinking
+                  reasoning={streamingReasoning}
+                  rate={streamRate}
+                  active={message.duration === 'active'}
+                />
+              )}
+              {!streamingReasoning && !message.content && (
+                <div className="flex items-center gap-2 text-[11.5px] text-zinc-500 mb-2">
+                  <Loader2 size={12} className="animate-spin text-indigo-400" />
+                  Generating…
+                  {streamRate > 0 && (
+                    <span className="font-mono text-zinc-600">{streamRate} tok/s</span>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
           {/* Trace status above the response so duration reads first */}
-          {!!message.metadata?.isTrace && Array.isArray(message.metadata.steps) && (
-            <div className="agent-message-trace">
-              <TraceAccordion
-              steps={message.metadata.steps as TraceStep[]}
-              isActive={message.duration === 'active'}
-              duration={message.metadata?.duration as string || message.duration}
-              onOpenSubagent={onOpenSubagent}
-              activeSubagent={activeSubagent}
-              allTraceSteps={traceSteps}
-              workspaceId={workspaceId}
-              chatId={chatId}
-              onCloseSubagent={onCloseSubagent}
+              {!!message.metadata?.isTrace && Array.isArray(message.metadata.steps) && (
+                <div className="agent-message-trace">
+                  <TraceAccordion
+                  steps={message.metadata.steps as TraceStep[]}
+                  isActive={message.duration === 'active'}
+                  duration={message.metadata?.duration as string || message.duration}
+                  onOpenSubagent={onOpenSubagent}
+                  activeSubagent={activeSubagent}
+                  allTraceSteps={traceSteps}
+                  workspaceId={workspaceId}
+                  chatId={chatId}
+                  onCloseSubagent={onCloseSubagent}
+                  />
+                </div>
+              )}
+
+          {/* P9: routed-to-project replies render as a compact card (the full
+              reply lives in the project's own chat). */}
+          {!!message.metadata?.project_ref && (
+            <div className="mb-2">
+              <RoutedProjectCard
+                projectRef={message.metadata.project_ref as ProjectRef}
+                onOpenProject={onOpenProject}
               />
             </div>
           )}
 
           {/* Main response text content */}
-          {message.content && message.content !== '(Execution Trace)' && (
+          {message.content && message.content !== '(Execution Trace)' && !message.metadata?.project_ref && (
             <div className="agent-message-response text-[15.5px] text-zinc-200 leading-relaxed">
-              <Markdown content={message.content} />
+              {streamingActive ? (
+                // P10: while tokens are streaming, render plain text — parsing
+                // Markdown (tables + syntax highlighting) on every delta is
+                // wasteful; the persisted message renders full Markdown.
+                <span className="whitespace-pre-wrap break-words">{message.content}</span>
+              ) : (
+                <Markdown content={message.content} />
+              )}
+              {streamingActive && message.duration === 'active' && (
+                <span className="stream-caret" aria-hidden="true">▍</span>
+              )}
+            </div>
+          )}
+
+          {/* P10: per-message usage chip (tokens + cost for this run) */}
+          {!!usageMeta && !streamingActive && (
+            <div className="flex items-center gap-3 mt-2 text-[10.5px] font-mono text-zinc-600">
+              <span title="Input tokens">↑{((usageMeta.total_input_tokens) || 0).toLocaleString()}</span>
+              <span title="Output tokens">↓{((usageMeta.total_output_tokens) || 0).toLocaleString()}</span>
+              <span title="Cost">${((usageMeta.total_cost) || 0).toFixed(5)}</span>
+              {message.duration && <span title="Duration">{message.duration}</span>}
             </div>
           )}
 
@@ -188,8 +332,17 @@ export default function MessageBubble({ message, onOpenSubagent, activeSubagent,
 
           {/* Inline action icons — right-aligned, revealed on hover */}
           <div className="flex items-center justify-end gap-0.5 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+            {onRetry && !streamingActive && (
+              <button
+                className="pressable p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
+                title="Retry — re-run the last request"
+                onClick={() => onRetry()}
+              >
+                <RotateCcw size={13} />
+              </button>
+            )}
             <button
-              className="p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
+              className="pressable p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
               title="Copy to clipboard"
               onClick={() => navigator.clipboard?.writeText(message.content)}
             >

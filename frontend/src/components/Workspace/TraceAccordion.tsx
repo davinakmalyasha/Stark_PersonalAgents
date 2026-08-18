@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Loader2, Sparkles } from 'lucide-react';
+import { ChevronDown, Loader2, Sparkles } from 'lucide-react';
 import ExecutionTrace from './ExecutionTrace';
 import type { TraceStep } from '../../utils/logParser';
 
@@ -39,10 +39,7 @@ export default function TraceAccordion({ steps, isActive, duration, onOpenSubage
         className="trace-complete-header"
       >
         <span>{durationText}</span>
-        {isOpen
-          ? <ChevronDown size={14} className="text-zinc-500" />
-          : <ChevronRight size={14} className="text-zinc-500" />
-        }
+        <ChevronDown size={14} className={`text-zinc-500 transition-transform duration-200 ${isOpen ? '' : '-rotate-90'}`} />
       </div>
 
       <div className={`trace-collapsible ${isOpen ? 'is-open' : ''}`}><div><ExecutionTrace steps={steps} isActive={false} onOpenSubagent={onOpenSubagent} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} /></div></div>

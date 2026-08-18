@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import { fetchProvider, setProvider } from '../../services/api';
+import type { ModelOption } from '../../types';
 
 interface Props {
   onSend: (message: string, files: File[]) => void;
@@ -15,6 +16,9 @@ interface Props {
   totalOutput: number;
   totalCacheHitTokens: number;
   activeContextTokens: number;
+  selectedModel?: string;
+  models?: ModelOption[];
+  onModelChange?: (model: string) => void;
 }
 
 const MAX_FILES = 8;
@@ -22,7 +26,7 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 const isImage = (file: File) => file.type.startsWith('image/');
 
-export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens }: Props) {
+export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange }: Props) {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [dragActive, setDragActive] = useState(false);
@@ -94,7 +98,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
         </div>}
 
         <div style={{ padding: '14px 18px 5px' }}>
-          <textarea ref={textareaRef} value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } }} rows={1}
+          <textarea ref={textareaRef} value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && (event.shiftKey === false || (event.ctrlKey || event.metaKey))) { event.preventDefault(); send(); } }} rows={1}
             placeholder={isVoiceMode ? 'Listening…' : files.length ? 'Add a note about these files…' : 'Ask anything'}
             className="prompt-input" />
         </div>
@@ -112,11 +116,25 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
               <option value="deepseek">DeepSeek API</option>
               <option value="opencode">OpenCode Zen</option>
             </select>
+            {models.length > 0 && onModelChange && (
+              <select
+                value={selectedModel || 'Automatic Fallback'}
+                onChange={(e) => onModelChange(e.target.value)}
+                className="provider-select"
+                title="Model"
+                aria-label="Model"
+              >
+                <option value="Automatic Fallback">Automatic Fallback</option>
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name}</option>
+                ))}
+              </select>
+            )}
           </div>
           <div className="flex items-center gap-2"><span className="hidden sm:block text-[10px] text-zinc-600">{files.length ? `${files.length} attachment${files.length > 1 ? 's' : ''}` : ''}</span>
             <div className="usage-control"><button type="button" className="usage-orb" title="Usage" aria-label="Usage"><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100` }}/></svg><span>{Math.round(cacheRate)}</span></button><div className="usage-popover"><div className="usage-popover-title">Usage</div><div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div><div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div><div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div><div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div><button type="button" onClick={onOpenStats} className="usage-details">View details</button></div></div>
             <button type="button" onClick={onToggleVoice} className={`prompt-voice-button ${isVoiceMode ? 'is-live' : ''}`} title={isVoiceMode ? 'Stop voice mode (Ctrl+G)' : 'Start voice mode (Ctrl+G)'}><AudioLines size={16}/><span className="voice-live-dot" /></button>
-            <button type="button" onClick={() => isRunning && !value.trim() && !files.length ? onCancel?.() : send()} disabled={!isRunning && !value.trim() && !files.length} className={`send-button ${isRunning && !value.trim() && !files.length ? 'stop' : ''}`} title={isRunning ? 'Stop execution' : 'Send message'}>{isRunning && !value.trim() && !files.length ? <Square size={14} fill="currentColor" /> : <ArrowUp size={16} strokeWidth={2.4} />}</button>
+            <button type="button" onClick={() => isRunning && !value.trim() && !files.length ? onCancel?.() : send()} disabled={!isRunning && !value.trim() && !files.length} className={`pressable send-button ${isRunning && !value.trim() && !files.length ? 'stop' : ''}`} title={isRunning ? 'Stop execution' : 'Send message'}>{isRunning && !value.trim() && !files.length ? <Square size={14} fill="currentColor" /> : <ArrowUp size={16} strokeWidth={2.4} />}</button>
           </div>
         </div>
       </div>

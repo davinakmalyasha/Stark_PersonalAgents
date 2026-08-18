@@ -1,9 +1,14 @@
 import React, { useState } from 'react';
-import { Copy, Check } from 'lucide-react';
+import { Copy, Check, Circle, CheckCircle2 } from 'lucide-react';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import oneDark from 'react-syntax-highlighter/dist/esm/styles/prism/one-dark';
 
 interface Props {
   content: string;
 }
+
+/** Code blocks larger than this skip syntax highlighting (perf guard). */
+const MAX_HIGHLIGHT_CHARS = 40000;
 
 /** Copy button for code blocks */
 function CodeCopyButton({ text }: { text: string }) {
@@ -34,12 +39,13 @@ export default function Markdown({ content }: Props) {
   let codeBlockLines: string[] = [];
   let codeBlockLang = '';
 
-  /** Inline renderer: links, images, bold, inline code */
+  /** Inline renderer: links, images, bold, inline code, strikethrough */
   const renderInline = (text: string) => {
     const parts: React.ReactNode[] = [];
-    // We walk the string with a unified regex that matches links, images, bold, and inline code.
-    // Order: images first (most specific), then links, then bold/code.
-    const regex = /(!\[([^\]]*)\]\(([^)]+)\))|(\[([^\]]+)\]\(([^)]+)\))|(\*\*|`)(.*?)\7/g;
+    // We walk the string with a unified regex that matches links, images, bold,
+    // inline code, and strikethrough. Order: images first (most specific), then
+    // links, then bold/code/strikethrough.
+    const regex = /(!\[([^\]]*)\]\(([^)]+)\))|(\[([^\]]+)\]\(([^)]+)\))|(\*\*|`|~~)(.*?)\7/g;
     let lastIdx = 0;
     let match;
     while ((match = regex.exec(text)) !== null) {
@@ -53,8 +59,10 @@ export default function Markdown({ content }: Props) {
             key={match.index}
             src={match[3]}
             alt={match[2]}
-            className="max-w-full rounded-lg my-2 border border-zinc-700"
+            loading="lazy"
+            className="md-img-fade max-w-full rounded-lg my-2 border border-zinc-700"
             style={{ maxHeight: '320px' }}
+            onLoad={(e) => e.currentTarget.classList.add('is-loaded')}
           />
         );
       } else if (match[4]) {
@@ -75,6 +83,8 @@ export default function Markdown({ content }: Props) {
         const val = match[8];
         if (type === '**') {
           parts.push(<strong key={match.index} className="font-semibold text-zinc-50">{val}</strong>);
+        } else if (type === '~~') {
+          parts.push(<del key={match.index} className="text-zinc-500 line-through">{val}</del>);
         } else if (type === '`') {
           parts.push(<code key={match.index} className="bg-zinc-800/80 px-1.5 py-0.5 rounded text-[13.5px] font-mono text-indigo-300 border border-zinc-700/50">{val}</code>);
         }
@@ -204,6 +214,7 @@ export default function Markdown({ content }: Props) {
       flushAll(i);
       if (inCodeBlock) {
         const codeText = codeBlockLines.join('\n');
+        const highlight = codeBlockLang && codeText.length <= MAX_HIGHLIGHT_CHARS;
         blocks.push(
           <div
             key={`code-${i}`}
@@ -215,11 +226,30 @@ export default function Markdown({ content }: Props) {
                 {codeBlockLang}
               </div>
             )}
-            <pre className={`p-4 bg-zinc-950 border border-zinc-800/60 text-zinc-400 font-mono text-[13.5px] overflow-x-auto leading-relaxed shadow-sm max-w-full ${
-              codeBlockLang ? 'rounded-b-xl rounded-tr-xl' : 'rounded-xl'
-            }`}>
-              <code>{codeText}</code>
-            </pre>
+            {highlight ? (
+              <div className={`border border-zinc-800/60 overflow-x-auto text-[13.5px] leading-relaxed ${codeBlockLang ? 'rounded-b-xl rounded-tr-xl' : 'rounded-xl'}`}>
+                <SyntaxHighlighter
+                  language={codeBlockLang}
+                  style={oneDark}
+                  customStyle={{
+                    margin: 0,
+                    padding: '16px',
+                    background: '#09090b',
+                    fontSize: '13.5px',
+                    lineHeight: '1.6',
+                  }}
+                  codeTagProps={{ style: { fontFamily: "'JetBrains Mono', ui-monospace, monospace" } }}
+                >
+                  {codeText}
+                </SyntaxHighlighter>
+              </div>
+            ) : (
+              <pre className={`p-4 bg-zinc-950 border border-zinc-800/60 text-zinc-400 font-mono text-[13.5px] overflow-x-auto leading-relaxed shadow-sm max-w-full ${
+                codeBlockLang ? 'rounded-b-xl rounded-tr-xl' : 'rounded-xl'
+              }`}>
+                <code>{codeText}</code>
+              </pre>
+            )}
             <CodeCopyButton text={codeText} />
           </div>
         );
@@ -301,16 +331,37 @@ export default function Markdown({ content }: Props) {
       continue;
     }
 
+    // ── Task list items (- [ ] / - [x]) ──
+    const taskMatch = trimmed.match(/^[-*]\s+\[([ xX])\]\s+(.*)$/);
+    if (taskMatch) {
+      flushBlockquote(i);
+      flushTable(i);
+      const checked = taskMatch[1].toLowerCase() === 'x';
+      const depth = Math.min(4, Math.floor((line.length - line.trimStart().length) / 2));
+      blocks.push(
+        <div key={i} className="flex items-start gap-2.5 text-zinc-200 leading-[1.85] text-[15.5px] my-2 ml-5" style={{ marginTop: '4px', marginBottom: '4px', marginLeft: 20 + depth * 18 }}>
+          {checked ? (
+            <CheckCircle2 size={15} className="text-emerald-400 flex-shrink-0 mt-[7px]" />
+          ) : (
+            <Circle size={15} className="text-zinc-600 flex-shrink-0 mt-[7px]" />
+          )}
+          <span className={`flex-1 ${checked ? 'text-zinc-500 line-through' : ''}`}>{renderInline(taskMatch[2])}</span>
+        </div>
+      );
+      continue;
+    }
+
     // ── Unordered list ──
     if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
       const text = trimmed.substring(2);
+      const depth = Math.min(4, Math.floor((line.length - line.trimStart().length) / 2));
       blocks.push(
         <div
           key={i}
-          className="flex gap-2.5 text-zinc-200 leading-[1.85] text-[15.5px] my-2.5 ml-5"
-          style={{ marginTop: '6px', marginBottom: '6px' }}
+          className="flex gap-2.5 text-zinc-200 leading-[1.85] text-[15.5px]"
+          style={{ marginTop: '6px', marginBottom: '6px', marginLeft: 20 + depth * 18 }}
         >
-          <span className="text-zinc-500 font-bold select-none">•</span>
+          <span className="text-zinc-500 font-bold select-none" style={{ color: depth > 0 ? '#a78bfa' : undefined }}>{depth > 0 ? '◦' : '•'}</span>
           <span className="flex-1">{renderInline(text)}</span>
         </div>
       );

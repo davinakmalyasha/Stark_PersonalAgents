@@ -52,7 +52,7 @@ def save_to_gen5_log(role: str, model_used: str, input_tokens: int,
     (Supervisor, Developer, Tester) to be lost when save_task_result_incremental
     overwrote the shared JSON file.
     """
-    from llm_stats import calculate_cost
+    from llm.llm_stats import calculate_cost
 
     calls_path = _calls_log_path()
     os.makedirs(os.path.dirname(calls_path), exist_ok=True)

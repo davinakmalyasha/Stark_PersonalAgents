@@ -2,12 +2,20 @@ import os
 import time
 import threading
 import glob
-from state_sync import shared_state, safe_get_state
-from sync_manager import run_and_sync_graph
+import sys
+
+# ── Path setup: add project root so state_sync / sync_manager are importable ──
+_HERE = os.path.dirname(os.path.abspath(__file__))   # Telegram/
+_ROOT = os.path.dirname(_HERE)                       # project root
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from sync.state_sync import shared_state, safe_get_state
+from sync.sync_manager import run_and_sync_graph
 from bot_helpers import safe_send_message, safe_edit_message_text
 
 # Workspaces root — env-overridable, defaults to the repo's parent directory
-WORKSPACE_DIR = os.environ.get("BSA_WORKSPACE_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKSPACE_DIR = os.environ.get("WORKSPACE_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def format_telegram_status(s: dict) -> str:
     """Formats shared_state into a simple, clean Telegram status message."""
@@ -65,8 +73,8 @@ def send_deliverables(bot, chat_id: int, msg_id: int, req: str) -> None:
 
 def handle_build_request(bot, req: str, chat_id: int, status_msg) -> None:
     """Runs the full agentic pipeline and sends live status updates."""
-    from memory_manager import is_valid_build_request
-    from chat_memory_manager import add_chat_message
+    from memory.memory_manager import is_valid_build_request
+    from memory.chat_memory_manager import add_chat_message
 
     if status_msg is None:
         status_msg = safe_send_message(bot, chat_id, "⏳ Starting the execution pipeline...")
@@ -99,10 +107,6 @@ def handle_build_request(bot, req: str, chat_id: int, status_msg) -> None:
     # Retrieve and send agent_report
     state = safe_get_state()
     agent_report = state.get("outputs", {}).get("agent_report", "")
-    verify_status = state.get("outputs", {}).get("verify_status")
-    if verify_status:
-        note = "✅ Verification passed." if verify_status == "PASS" else f"⚠️ Verification: {verify_status}."
-        agent_report = (agent_report or "") + f"\n\n{note}"
 
     # Only send deliverables if it is a valid build request and files were actually updated/created
     was_updated = (

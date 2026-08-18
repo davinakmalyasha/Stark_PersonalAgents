@@ -3,6 +3,16 @@ Telegram Bot — Entry point for the Virtual IT Department.
 Handles text/voice input and runs the agentic pipeline (orchestrator + subagents).
 """
 import os
+import sys
+
+# ── Path setup: root (for .env, state_sync etc.) + Telegram/ (siblings) ───────
+_HERE = os.path.dirname(os.path.abspath(__file__))   # Telegram/
+_ROOT = os.path.dirname(_HERE)                       # project root
+for _p in [_ROOT, _HERE]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import threading
 import telebot
 from dotenv import load_dotenv
 from bot_helpers import transcribe_voice, safe_send_message, safe_edit_message_text, WORKSPACE_DIR
@@ -15,6 +25,31 @@ if not token:
     raise ValueError("TELEGRAM_BOT_TOKEN not set in .env")
 bot = telebot.TeleBot(token)
 
+# ── P5: ask_user answers arrive through Telegram inline keyboards ──
+try:
+    from user_questions import register_provider, telegram_provider
+    register_provider("telegram", telegram_provider(bot))
+except Exception as e:
+    print(f"[BOT] Telegram question provider unavailable: {e}")
+
+# ── Inbox (P2): per-chat run tracking so a message during a run steers
+# instead of spawning a concurrent second run ──
+_active_runs: set[int] = set()
+_active_runs_lock = threading.Lock()
+
+
+def _is_run_active(chat_id: int) -> bool:
+    with _active_runs_lock:
+        return chat_id in _active_runs
+
+
+def _mark_run(chat_id: int, active: bool) -> None:
+    with _active_runs_lock:
+        if active:
+            _active_runs.add(chat_id)
+        else:
+            _active_runs.discard(chat_id)
+
 @bot.message_handler(commands=["start", "help"])
 def welcome(msg: telebot.types.Message) -> None:
     try:
@@ -22,9 +57,9 @@ def welcome(msg: telebot.types.Message) -> None:
             msg,
             "🏢 *Virtual IT Department*\n\n"
             "I can help you build, deploy, and analyze software projects autonomously. Send me a command to get started:\n"
-            "• _\"Make a calculator app\"_ → BSA spec → Dev implementation → SDET QA\n"
-            "• _\"Harden my deployment / set up CI/CD\"_ → DevSecOps\n"
-            "• _\"Write requirements for a CRM\"_ → BSA analysis\n"
+            "• _\"Make a calculator app\"_ → spec & plan → Dev implementation → CI gate verification\n"
+            "• _\"Harden my deployment / set up CI/CD\"_ → Dev + the CI security gate\n"
+            "• _\"Write requirements for a CRM\"_ → requirements analysis\n"
             "• _\"Quick question or research\"_ → FreeAgent (zero cost)\n\n"
             "Ready to generate documentation, establish project environments, and build functional systems.",
             parse_mode="Markdown",
@@ -95,12 +130,28 @@ def handle_request(msg: telebot.types.Message) -> None:
     else:
         req = msg.text
 
-    from chat_memory_manager import add_chat_message, resolve_request_text
+    # ── Inbox (P2): while a run is in progress, text steers; /cancel aborts ──
+    if msg.content_type == "text":
+        low = (req or "").strip().lower()
+        if low in ("/cancel", "/stop", "/abort"):
+            from inbox import abort
+            abort(str(chat_id), keep_inbox=True)
+            safe_send_message(bot, chat_id, "⏹️ Cancelling the current run...")
+            return
+        if _is_run_active(chat_id):
+            from inbox import steer
+            steer(str(chat_id), req)
+            safe_send_message(bot, chat_id,
+                              "📨 Queued as a steering message — the agent will see it at its next step. "
+                              "Send /cancel to abort the run.")
+            return
+
+    from memory.chat_memory_manager import add_chat_message, resolve_request_text
     add_chat_message("user", req, workspace_path=WORKSPACE_DIR, chat_id=str(chat_id))
 
     # Clear failed models from previous requests
     try:
-        from state_sync import safe_update_state
+        from sync.state_sync import safe_update_state
         safe_update_state({"failed_models": []})
     except Exception:
         pass
@@ -125,7 +176,11 @@ def handle_request(msg: telebot.types.Message) -> None:
     else:
         safe_edit_message_text(bot, "⏳ Processing your request...", chat_id, status_msg.message_id)
 
-    handle_build_request(bot, resolved_req, chat_id, status_msg)
+    _mark_run(chat_id, True)
+    try:
+        handle_build_request(bot, resolved_req, chat_id, status_msg)
+    finally:
+        _mark_run(chat_id, False)
 
 if __name__ == "__main__":
     print("[BOT] Telegram bot is running...")

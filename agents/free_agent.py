@@ -1357,13 +1357,13 @@ def run_freeagent_direct(prompt, chat_id="", images=None):
     Used for General mode chat. Yields state dicts (same format as run_and_sync_graph).
     """
     import time, json as _json, re, traceback
-    from state_sync import shared_state, safe_update_state, safe_serialize_state
+    from sync.state_sync import shared_state, safe_update_state, safe_serialize_state
 
     profile = build_general_profile_prompt()
     tools_desc = (
         "You have these tools available:\n"
-        "- web_search(query) - Search the web\n"
-        "- web_fetch(url) - Fetch a URL\n"
+        "- run_command(command) - Full POSIX bash (curl for research)\n"
+        "- run_command(command) - Full POSIX bash (curl for research)\n"
         "- browser_navigate(url) - Open a webpage\n"
         "- browser_extract(what?, selector?) - Get page content\n"
         "- browser_screenshot(path?) - Take a screenshot\n"
@@ -1380,7 +1380,7 @@ def run_freeagent_direct(prompt, chat_id="", images=None):
     chat_history = ""
     if chat_id:
         try:
-            from chat_context import build_chat_context
+            from memory.chat_context import build_chat_context
             chat_history = build_chat_context("_general", chat_id, max_messages=30, max_chars_per_msg=3000, exclude_traces=True)
         except Exception:
             pass
@@ -1407,7 +1407,23 @@ def run_freeagent_direct(prompt, chat_id="", images=None):
             last_msg = conversation[-1]["content"]
             # Only the first turn contains the user's visual context. Follow-up
             # tool turns are text-only, so we do not repeatedly re-upload files.
-            response = agent.chat(task=last_msg, images=images if iteration == 0 else None)
+            # P10: prefer token streaming (live deltas to the StreamBus); fall
+            # back to a plain chat call if the provider stream fails.
+            response = ""
+            _emit_chat = chat_id or str(shared_state.get("chat_id") or "")
+            try:
+                for _tok in agent.stream(task=last_msg, images=images if iteration == 0 else None):
+                    response += _tok
+                    try:
+                        from stream_bus import emit as _bus_emit
+                        _bus_emit(_emit_chat, "text", _tok, agent="FreeAgent")
+                    except Exception as _bus_err:
+                        print(f"[FreeAgent] bus emit skipped: {_bus_err}")
+            except Exception as _stream_err:
+                print(f"[FreeAgent] stream failed, falling back to chat: {_stream_err}")
+                response = agent.chat(task=last_msg, images=images if iteration == 0 else None)
+            if not response:
+                response = agent.chat(task=last_msg, images=images if iteration == 0 else None)
 
             tool_calls = []
             for match in re.finditer(r'```tool\n(.*?)\n```', response, re.DOTALL):

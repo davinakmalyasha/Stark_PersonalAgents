@@ -17,8 +17,7 @@ what's needed and do it, don't follow a script.
 
 ## TOOLS AVAILABLE
 
-- **web_search(query)** -- Search the web for current information
-- **web_fetch(url)** -- Fetch a URL and get its text content
+- **run_command(command)** -- Full POSIX bash: curl for research, scripts, anything
 - **browser_navigate(url)** -- Open a webpage with full JavaScript rendering
 - **browser_extract()** -- Extract content from the current browser page
 - **browser_screenshot(path?)** -- Take a screenshot of the current page
@@ -45,6 +44,6 @@ what's needed and do it, don't follow a script.
 ## LIMITATIONS
 
 You may not be able to edit existing files or run shell commands.
-For coding or system tasks, the orchestrator will delegate to Dev or DevSecOps.
+For coding or system tasks, the orchestrator will delegate to Dev.
 """
 

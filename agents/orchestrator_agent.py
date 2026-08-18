@@ -18,18 +18,29 @@ import re
 import json
 import uuid
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from state_sync import shared_state, safe_append_live_log
-from it_department_nodes_base import ITState
+from sync.state_sync import shared_state, safe_append_live_log
+from agents.it_department_nodes_base import ITState
 from tools import execute_tool, TOOL_DEFINITIONS
-from llm import invoke_messages_with_fallback
-from developer_agent import _parse_tool_call, parse_all_tool_calls
-from context_budget import estimate_tokens
-from context_compaction import (
+from llm import invoke_messages_with_fallback, invoke_messages_with_fallback_stream
+from agents.developer_agent import _parse_tool_call, parse_all_tool_calls
+from memory.context_budget import estimate_tokens
+from memory.context_compaction import (
     tier1_compact,
     tier2_compact,
     checkpoint_compact,
     prune_stale_tool_outputs
 )
+from inbox import drain_steering, drain_follow_up, consume_abort, render_delivery
+
+
+def _orch_session_log(chat_id: str, project_path: str):
+    """Get-or-create the Pi-style session JSONL for this chat (best-effort)."""
+    try:
+        from session_log import get_session
+        ws = project_path or os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+        return get_session(chat_id or "default", ws)
+    except Exception:
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -51,7 +62,7 @@ Before your first action each turn:
 5. **When it returns**: TRUST its outcome, run `update_feature()` / `update_project_meta()` to record progress, and give the user a concise report.
 
 **YOU NEVER RE-DELEGATE AND YOU NEVER DOUBLE-DELEGATE.**
-- The harness runs its OWN independent verification after the subagent completes and auto-triggers SDET-FIX on failure. You do NOT re-delegate on failures and you do NOT spawn SDET to "double-check" Dev's work.
+- The harness runs its OWN independent verification after the subagent completes; gate failures route back to Dev as repair turns (with the gate report + task journal). You do NOT re-delegate on failures and you do NOT spawn a second agent to "double-check" Dev's work.
 - A returned subagent is FINAL. If it reports failure, include that honestly in your report — the next step belongs to the harness gate or the user.
 
 That's it. Your only job: understand → classify → delegate ONE subagent → report.
@@ -80,20 +91,31 @@ That's it. Your only job: understand → classify → delegate ONE subagent → 
 
 | Request domain | Subagent | What It Does |
 |----------|-------|--------------|
-| **Bug-fix / error / wrong behavior / "tests failing" / verify / reproduce** | **SDET** | The harness's FIXER. Diagnoses the failing verification, finds the root cause, FIXES the code directly with the full Developer toolset, and re-runs verification until it passes — one careful pass, never gives up. Reports DONE only when verified. Does NOT handle security auditing or performance profiling — DevSecOps owns those. |
-| **Coding / implementation / feature / new code** | **Dev** | Pure implementer. Writes clean code, runs a syntax self-check, then STOPS — the harness verifies automatically (project tests, smoke, gate) and SDET fixes any failures. Never delegates to other agents. Does NOT design architecture, review security, or optimize performance. |
+| **Bug-fix / error / wrong behavior / "tests failing" / verify / reproduce** | **Dev** | Dev OWNS the full loop: diagnoses the failure (local tests or the CI gate report via gh api through run_command), finds the root cause, FIXES the code, writes/updates tests, and re-runs verification until it passes. Reports DONE only when verified. Does NOT audit security or performance — the CI security gate owns those. |
+| **Coding / implementation / feature / new code** | **Dev** | Writes clean code WITH tests (features touching API/db/validation MUST ship tests), runs a syntax self-check, then STOPS — the CI gate verifies automatically and failures route back to Dev (repair turn) until green. Never delegates to other agents. Does NOT design architecture, review security, or optimize performance. |
 | **General chat / research / quick question / vision** | **FreeAgent** | General-purpose free model agent (OpenRouter, Groq, Google AI Studio, Mistral, NVIDIA NIM, Cloudflare, Z.ai, OpenCode Zen, Kilo & Cline) — text chat, image analysis, quick research, lightweight tasks. Zero cost. |
-| **Security / infrastructure / performance** — ONLY when the request EXPLICITLY asks | **DevSecOps** | Full-stack security + infrastructure + performance. Finds and fixes issues directly. |
+| **New project creation** ("make a new project called X…", "set up a project") | **You** — call `create_project(name, concept)` | Creates the folder under D:\\MyProject, registers the workspace + a chat, and assigns a durable Dev agent that starts on the concept immediately. Do NOT delegate to a subagent; do NOT call this for work on an existing project. |
+| **Security / infrastructure / performance** — ONLY when the request EXPLICITLY asks | **Dev** | Security & performance are enforced by the CI gate (Bandit, pip-audit, gitleaks, Ruff, perf-smoke, CodeQL) on every push with branch protection blocking merges until green. For explicit security/infra requests: Dev implements, pushes, reads the gate report via gh api through run_command, and fixes until the gate passes. |
 
 *(future domains plug in as new registry entries + one row here.)*
 
 ## DELEGATION RULES
 
-- **ONE request → ONE subagent.** Pick the single best fit and delegate ONLY it. Bug-fix-classified requests go to SDET ONLY; implementation goes to Dev ONLY; they are NOT additive. Do NOT spawn Dev AND SDET for the same work item — that is duplication, not decomposition, and it wastes the team's budget.
+- **ONE request → ONE subagent.** Pick the single best fit and delegate ONLY it. Every coding/bug/verify request goes to Dev — there is no separate fixer agent. Do NOT spawn Dev AND anything else for the same work item — that is duplication and wastes the team's budget.
 - **Multi-spawn is reserved for genuinely large, multi-domain requests** where the work items are clearly separable (backend + frontend + infrastructure, or a feature + an explicit security review). Each distinct work item gets exactly one subagent, each delegated ONCE.
-- **NEVER re-delegate a subtask that already returned.** No retries, no "try again" handoffs. Failures flow to the harness verification gate, never to another delegation from you.
-- For HIGH-RISK change (data schema/migrations, auth/security boundaries, payment/finance logic, large multi-file blast radius), prefer **SDET** (it fixes + verifies) over Dev.
-- SDET's handoff is a one-line `DONE | FILES | NOTE` — do not expect a long report. Dev's handoff is the standard AGENT HANDOFF REPORT.
+- **NEVER re-delegate a subtask that already returned.** No retries, no "try again" handoffs. Failures flow to the harness verification gate, and gate failures route back to Dev as repair turns (with the gate report + task journal as context).
+- For HIGH-RISK change (data schema/migrations, auth/security boundaries, payment/finance logic, large multi-file blast radius), instruct Dev to verify more aggressively (run the tests, check the gate).
+- Dev's handoff is the standard AGENT HANDOFF REPORT — expect a compact report, and tell Dev to write its task journal (.agent-memory/task-journal-<taskid>.md) so repair turns start with full intent.
+
+## PROJECT-AWARE ROUTING (P9)
+
+Projects registered in this harness each have a DURABLE Dev agent (a continuable child). Follow these rules exactly:
+
+- **Existing project → continue its Dev agent.** Coding, bug-fix, or follow-up work for a project that exists: call `find_project_dev(name)` → then `send_message(child_id, message)`. The project's Dev resumes its OWN durable session — full context, zero re-spawning. NEVER use `task("Dev")` for a project that already has a Dev agent.
+- **New project → create it with `create_project(name, concept)`.** The tool makes the folder, workspace, chat, and a fresh durable Dev agent in one call. Only call it when the user genuinely asks for a NEW project.
+- **No Dev agent yet for an existing folder?** `find_project_dev` returns NOT FOUND → then create the project with `create_project(name, concept)` to assign its Dev agent.
+- **Multiple new projects** ("two projects: A and B") → call `create_project` once per project (they can run in the same turn).
+- The harness pre-router already sends most in-project and name-mention messages straight to the project's Dev agent before you ever see them; when you DO see project work, it was ambiguous enough to need your call — make it with the tools above.
 
 ## REPORTING (concise, Claude-Code style)
 
@@ -108,17 +130,29 @@ Rules: ≤15 lines total. No raw dumps, no repeated context, no "Here is the sum
 
 ## COST AWARENESS
 
-- **Dev** is the implementation workhorse (cheap flash). **SDET** is the fixer for bug-fix/verify requests (cheap flash + max thinking on diagnosis). **FreeAgent** is $0 for general work. **DevSecOps** is for security/infra only when asked. The harness verifies Dev's output automatically; SDET fixes what it catches.
+- **Dev** is the workhorse (cheap flash): implementation, bug-fix, verify, and gate-repair all route to it; its adaptive reasoning ladder (iter-1 high, routine disabled, trouble → high) handles deep diagnosis. **FreeAgent** is $0 for general work. The CI gate (github-ci-security) verifies every push and routes failures back to Dev as repair turns.
 - One well-written delegation prompt is cheaper than two vague ones — invest clarity upfront.
 - Parallel async tasks (`start_async_task`) reduce wall-clock time but not token cost. Use when SPEED matters more than cost.
 
 ## WEB RESEARCH
 
-You and your subagents have `web_fetch(url)` for fast HTTP GET research. Browser tools (`browser_navigate`, `browser_extract`, `browser_screenshot`) are available to Dev, SDET and FreeAgent for JavaScript-heavy pages — delegate JS-rendering research to one of them.
+Research goes through your subagents: FreeAgent has run_command (curl) + browser tools (zero cost); Dev has browser tools for JS-heavy pages. Delegate research to the right one — you do not fetch directly.
 
 ## SUBAGENT DEPTH
 
 The system enforces a maximum nesting depth of 3 (orchestrator → subagent → sub-subagent). Subagents are terminal nodes — they do NOT spawn subagents. Only you delegate. You do not need to manage sub-subagents.
+
+## CONTINUABLE SUBAGENTS (P6)
+
+For long-running or iterative work, you can start a continuable subagent and keep talking to it across turns:
+
+- `start_async_task` with a general-purpose agent creates a **continuable child** when the delegation returns a child id; otherwise it is one-shot.
+- `list_agents()` — see your continuable children and their status (running / idle).
+- `send_message(child_id, message)` — deliver a follow-up turn; an idle child resumes from its durable session, a running child queues the message.
+- `interrupt_agent(child_id)` — ask a running child to stop at its next step.
+- Children can `report()` back to you (wakes you via a follow-up) — treat reports as progress updates and respond or continue as needed.
+
+Use continuable children when the work spans several user requests or when you need to steer an ongoing effort. Prefer one-shot `task()` for single delegations.
 
 """
 
@@ -192,7 +226,7 @@ def _private_requery(messages: list, failed_content: str, malformed: list) -> tu
 def _log_requery_classification(reason: str) -> None:
     """B8: log the error-taxonomy classification + handler policy for requery failures."""
     try:
-        from agent_errors import classify_tool_error, handler_policy
+        from agents.agent_errors import classify_tool_error, handler_policy
         err_cls = classify_tool_error(reason)
         _log(f"[ORCHESTRATOR] Requery failed ({reason}) — taxonomy: {err_cls.__name__}, policy: {handler_policy(err_cls)}")
     except Exception:
@@ -242,7 +276,7 @@ def orchestrator_node(s: ITState) -> dict:
 
 def _orchestrator_loop(s: ITState) -> dict:
     client_req = s.get("client_request", "")
-    project_path = s.get("project_path", "") or os.environ.get("BSA_HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    project_path = s.get("project_path", "") or os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
     chat_id = s.get("chat_id", "")
 
     shared_state["thoughts"]["orchestrator"] = "Analyzing request..."
@@ -250,9 +284,20 @@ def _orchestrator_loop(s: ITState) -> dict:
     # ── Tools the orchestrator is allowed to use ──
     valid_tools = [
         "task", "start_async_task", "check_async_task", "list_async_tasks",
-        "web_fetch",
         "update_feature", "update_project_meta",
+        "ask_user",
+        "send_message", "list_agents", "interrupt_agent",
+        "create_project", "find_project_dev",
     ]
+
+    # ── P4: registry scope — one visibility for the orchestrator ──
+    _scope_token = None
+    try:
+        from tools import active_tool_scope, get_registry
+        get_registry().restrict_scope("Orchestrator", allow=valid_tools)
+        _scope_token = active_tool_scope.set("Orchestrator")
+    except Exception:
+        pass
 
     # ── Zone 1: Frozen system prompt (never changes → cached) ──
     static_system = _build_orchestrator_prompt()
@@ -306,7 +351,7 @@ def _orchestrator_loop(s: ITState) -> dict:
                     except Exception as e:
                         _log(f"[ORCHESTRATOR] General profile load error: {e}")
             else:
-                from memory_manager import ensure_memory
+                from memory.memory_manager import ensure_memory
                 memory_content = ensure_memory(project_path)
                 if memory_content:
                     task_message += f"## PROJECT MEMORY\n{memory_content}\n\n"
@@ -317,7 +362,7 @@ def _orchestrator_loop(s: ITState) -> dict:
     chat_history_str = ""
     if project_path and chat_id:
         try:
-            from chat_context import build_chat_context
+            from memory.chat_context import build_chat_context
             # General mode: load from _general workspace, not the default project path
             ctx_path = "_general" if shared_state.get("is_general", False) else project_path
             chat_history_str = build_chat_context(
@@ -335,6 +380,14 @@ def _orchestrator_loop(s: ITState) -> dict:
         HumanMessage(content=task_message),
     ]
 
+    # ── Session log (P1): record this run's user turn, best-effort ──
+    orch_sess = _orch_session_log(chat_id, project_path)
+    if orch_sess is not None:
+        try:
+            orch_sess.append_message("user", client_req, source="user")
+        except Exception:
+            pass
+
     content = ""  # Initialize --- set during loop
     existing_ids = {m.id for m in messages if getattr(m, "id", None)}
     iteration = 0
@@ -344,13 +397,19 @@ def _orchestrator_loop(s: ITState) -> dict:
     escalation_counts: dict[str, int] = {}  # delegations per task key
     escalated_keys: set[str] = set()
     _hard_stop_key: str | None = None  # set when a task key is re-delegated / ceiling hit
-    _session_delegations = 0  # total delegations this session (rail: BSA_ORCH_MAX_DELEGATIONS)
+    _session_delegations = 0  # total delegations this session (rail: ORCH_MAX_DELEGATIONS)
 
     _log(f"\n{'='*60}\n[ORCHESTRATOR] Starting delegation loop\n{'='*60}")
 
     while True:
         iteration += 1
         _log(f"\n[ORCH Iteration {iteration}]")
+
+        # ── Inbox (P2): a user abort takes effect at the next step boundary ──
+        if consume_abort(chat_id):
+            safe_append_live_log("\n[CANCELLED] Run cancelled by user request.")
+            _log("[ORCHESTRATOR] Aborted by user request.")
+            break
 
         # ── Safety ceiling (should never be reached — LLM decides when done) ──
         if iteration > MAX_ITERATIONS:
@@ -403,9 +462,9 @@ def _orchestrator_loop(s: ITState) -> dict:
                 # Calculate budget utilization
                 static_prompt_len = len(static_system)
                 keep_n = 12
-                # B5/B6: token-budgeted tail + incremental tier-0 prune (BSA_COMPACT_V2)
-                compact_v2 = os.environ.get("BSA_COMPACT_V2", "1") == "1"
-                tail_budget = int(os.environ.get("BSA_TAIL_BUDGET_TOKENS", "100000")) if compact_v2 else None
+                # B5/B6: token-budgeted tail + incremental tier-0 prune (COMPACT_V2)
+                compact_v2 = os.environ.get("COMPACT_V2", "1") == "1"
+                tail_budget = int(os.environ.get("TAIL_BUDGET_TOKENS", "100000")) if compact_v2 else None
 
                 # Tier-0: cheap incremental prune before any full-tier rewrite
                 if compact_v2 and total_tokens > 600_000:
@@ -437,6 +496,16 @@ def _orchestrator_loop(s: ITState) -> dict:
                         messages = tier2_compact(messages, keep_last_n=keep_n, tail_budget_tokens=tail_budget)
                         _log(f"[ORCHESTRATOR] Compacted -> {len(messages)} messages remain")
                         orch_think = True
+                    # P3: Pi-style session-log checkpoint (summary entry +
+                    # retainedTail), best-effort and zero impact on the loop
+                    if orch_sess is not None:
+                        try:
+                            from memory.context_compaction import compact_session_log
+                            _log_summary = compact_session_log(orch_sess)
+                            if _log_summary:
+                                _log(f"[ORCHESTRATOR] Session log checkpointed ({len(_log_summary)} chars summary)")
+                        except Exception as e:
+                            _log(f"[ORCHESTRATOR] Session log compaction error (non-fatal): {e}")
                 elif total_tokens > 400_000:
                     _log(f"[ORCHESTRATOR] Compaction Tier 1 (tokens={total_tokens})")
                     if len(messages) > keep_n + 2:
@@ -457,17 +526,17 @@ def _orchestrator_loop(s: ITState) -> dict:
             # subagent report, malformed tool call, compaction, no-progress
             # audit) flips THIS turn back to high for diagnosis; the flag is
             # consumed (one high turn, then back to routine).
-            # Knobs: BSA_REASONING_ITER1 (first-call depth, default "disabled"),
-            #        BSA_REASONING_ORCH_ROUTINE (routine depth, default "disabled").
+            # Knobs: REASONING_ITER1 (first-call depth, default "disabled"),
+            #        REASONING_ORCH_ROUTINE (routine depth, default "disabled").
             if orch_think:
                 orch_effort = "high"
                 orch_think = False
             elif iteration <= 1:
-                orch_effort = os.environ.get("BSA_ORCH_REASONING_ITER1",
-                                             os.environ.get("BSA_REASONING_ITER1", "disabled"))
+                orch_effort = os.environ.get("ORCH_REASONING_ITER1",
+                                             os.environ.get("REASONING_ITER1", "disabled"))
             else:
-                orch_effort = os.environ.get("BSA_REASONING_ORCH_ROUTINE", "disabled")
-            response = invoke_messages_with_fallback(
+                orch_effort = os.environ.get("REASONING_ORCH_ROUTINE", "disabled")
+            response = invoke_messages_with_fallback_stream(
                 role="Orchestrator",
                 messages=list(messages),
                 temp=0.2,
@@ -504,6 +573,11 @@ def _orchestrator_loop(s: ITState) -> dict:
             # (DeepSeek docs) and does not need to participate in concatenation,
             # so do NOT carry it forward as new cache-miss input.
             messages.append(AIMessage(content=content))
+            if orch_sess is not None:
+                try:
+                    orch_sess.append_assistant(content, stop_reason="stop")
+                except Exception:
+                    pass
             clean_response = _extract_text_response(content)
 
             # ── Validate exit ──
@@ -521,6 +595,16 @@ def _orchestrator_loop(s: ITState) -> dict:
                     id=f"orch-exit-nudge-{iteration}-{uuid.uuid4()}"
                 ))
                 continue  # Back to LLM loop for corrected summary
+
+            # ── Inbox (P2): follow-up work queued while running → keep going ──
+            follow_msgs = drain_follow_up(chat_id)
+            if follow_msgs and iteration < MAX_ITERATIONS:
+                _log(f"[ORCHESTRATOR] Follow-up queued ({len(follow_msgs)}) — continuing")
+                messages.append(HumanMessage(
+                    content=render_delivery("FOLLOW-UP", follow_msgs),
+                    id=f"orch-followup-{iteration}-{uuid.uuid4()}",
+                ))
+                continue
 
             _log(f"\n[ORCHESTRATOR] Agent finished after {iteration} iterations")
             _log(f"[ASSISTANT] {clean_response}")
@@ -561,6 +645,17 @@ def _orchestrator_loop(s: ITState) -> dict:
                 ))
                 continue
 
+        # ── Session log (P1): record the step's assistant message ──
+        # Placed after the requery guard so a failed turn (A2) is never logged.
+        if orch_sess is not None:
+            try:
+                blocks = [{"type": "text", "text": content}]
+                if reasoning_content:
+                    blocks.insert(0, {"type": "thinking", "thinking": reasoning_content})
+                orch_sess.append_assistant(blocks, stop_reason="toolUse" if tool_calls else "stop")
+            except Exception:
+                pass
+
         # ── Merged final turn (F2) ──
         # The model may emit its final report AND memory tools (update_feature /
         # update_project_meta) in ONE response. Execute those tools, then use the
@@ -574,14 +669,35 @@ def _orchestrator_loop(s: ITState) -> dict:
         if (memory_tools and not has_non_memory and len(final_report.strip()) >= 40
                 and ("## Summary" in final_report or "SUMMARY:" in final_report.upper())):
             _log(f"[ORCHESTRATOR] Merged final turn: {len(memory_tools)} memory tool(s) + summary in one response")
+            if orch_sess is not None:
+                try:
+                    orch_sess.append_assistant(content, stop_reason="toolUse")
+                except Exception:
+                    pass
             merged_results = []
             for tc in memory_tools:
                 try:
                     mres = execute_tool(tc["tool"], tc.get("args", {}))
                     merged_results.append(f"[{tc['tool']}] {str(mres)[:300]}")
                     tool_call_log.append({"tool": tc["tool"], "args": tc.get("args", {}), "iteration": iteration})
+                    if orch_sess is not None:
+                        try:
+                            orch_sess.append_tool_result(
+                                str(mres), tool_call_id=f"orch-mem-{iteration}-{tc['tool']}",
+                                tool_name=tc["tool"],
+                            )
+                        except Exception:
+                            pass
                 except Exception as e:
                     merged_results.append(f"[{tc['tool']}] ERROR: {str(e)[:200]}")
+                    if orch_sess is not None:
+                        try:
+                            orch_sess.append_tool_result(
+                                str(e), tool_call_id=f"orch-mem-{iteration}-{tc['tool']}",
+                                tool_name=tc["tool"], is_error=True,
+                            )
+                        except Exception:
+                            pass
             messages.append(AIMessage(content=content))
             messages.append(HumanMessage(content="Tool results:\n" + "\n".join(merged_results)))
             clean_response = final_report
@@ -623,8 +739,18 @@ def _orchestrator_loop(s: ITState) -> dict:
                     orig_len = len(result_str)
                     result_str = result_str[:2000] + "\n... (truncated middle) ...\n" + result_str[-2000:]
                     try:
-                        from context_compaction import truncation_note
+                        from memory.context_compaction import truncation_note
                         result_str += truncation_note(orig_len, 4000)
+                    except Exception:
+                        pass
+
+                # Session log (P1): record the tool result, best-effort
+                if orch_sess is not None:
+                    try:
+                        orch_sess.append_tool_result(
+                            result_str, tool_call_id=f"orch-{iteration}-{tool_name}",
+                            tool_name=tool_name,
+                        )
                     except Exception:
                         pass
 
@@ -643,7 +769,7 @@ def _orchestrator_loop(s: ITState) -> dict:
                         escalated_keys.add(_task_key)
                         _hard_stop_key = _task_key
                         _log(f"[ORCHESTRATOR] HARD STOP: re-delegation blocked for {_task_key[:80]}")
-                    if _session_delegations > int(os.environ.get("BSA_ORCH_MAX_DELEGATIONS", "4")):
+                    if _session_delegations > int(os.environ.get("ORCH_MAX_DELEGATIONS", "4")):
                         _hard_stop_key = _hard_stop_key or "session ceiling"
                         _log(f"[ORCHESTRATOR] HARD STOP: delegation ceiling ({_session_delegations}) reached")
                     low = result_str.lower()
@@ -659,6 +785,14 @@ def _orchestrator_loop(s: ITState) -> dict:
                 tool_call_log.append({"tool": tool_name, "args": args, "iteration": iteration})
             except Exception as e:
                 tool_results.append(f"[{tool_name}] ERROR: {str(e)[:300]}")
+                if orch_sess is not None:
+                    try:
+                        orch_sess.append_tool_result(
+                            str(e)[:300], tool_call_id=f"orch-{iteration}-{tool_name}",
+                            tool_name=tool_name, is_error=True,
+                        )
+                    except Exception:
+                        pass
                 orch_think = True  # tool blew up — next turn must diagnose
 
         # ── Feed results back ──
@@ -697,8 +831,24 @@ def _orchestrator_loop(s: ITState) -> dict:
                     id=f"orch-audit-{iteration}-{uuid.uuid4()}"
                 ))
 
+        # ── Inbox (P2): steering lands at the next step boundary (after this
+        # step's tool calls) — the model sees it on the next iteration ──
+        steer_msgs = drain_steering(chat_id)
+        if steer_msgs:
+            _log(f"[ORCHESTRATOR] Steering queued ({len(steer_msgs)}) — injecting")
+            messages.append(HumanMessage(
+                content=render_delivery("STEERING", steer_msgs),
+                id=f"orch-steer-{iteration}-{uuid.uuid4()}",
+            ))
+
     # ── Return ──
-    from state_sync import safe_get_state
+    if _scope_token is not None:
+        try:
+            from tools import active_tool_scope
+            active_tool_scope.reset(_scope_token)
+        except Exception:
+            pass
+    from sync.state_sync import safe_get_state
     new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
     final_report = _extract_text_response(content) if content else ""
     final_error = ""
@@ -712,10 +862,36 @@ def _orchestrator_loop(s: ITState) -> dict:
     # update_feature — this is what makes project memory actually accumulate.
     try:
         if final_report and project_path and os.path.isdir(project_path):
-            from memory_manager import update_feature
+            from memory.memory_manager import update_feature
             from datetime import datetime
             _stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             update_feature(project_path, f"Session {_stamp}", final_report[:400])
+    except Exception:
+        pass
+
+    # ── Lessons journal: auto-record subagent BLOCKED/FAILED handoffs ──
+    # The Dev handoff reports classify their own failures
+    # ("### AGENT HANDOFF REPORT [BLOCKED]" + Primary Exception + Error Trail).
+    # Harvest those into .agent-memory/lessons.md (deduped) so future tasks
+    # start knowing the repo's known blockers instead of re-discovering them.
+    try:
+        if project_path and os.path.isdir(project_path):
+            from memory.memory_manager import append_lesson
+            import re as _re
+            for m in reversed(messages):
+                content = str(getattr(m, "content", ""))
+                if "AGENT HANDOFF REPORT" not in content:
+                    continue
+                status_m = _re.search(r"\[(BLOCKED|FAILED|DONE)\]", content)
+                if not status_m or status_m.group(1) == "DONE":
+                    continue
+                status = status_m.group(1)
+                exc_m = _re.search(r"\*\*Primary Exception:\*\*\s*`([^`]+)`", content)
+                loc_m = _re.search(r"\*\*Failure Locus & Context\*\*", content)
+                title = exc_m.group(1) if exc_m else "unclassified failure"
+                body = content[content.index("#### 1. ERROR CLASSIFICATION"):][:900] if "#### 1. ERROR CLASSIFICATION" in content else content[:400]
+                append_lesson(project_path, status, title, body)
+                break  # one lesson per session — the LAST handoff
     except Exception:
         pass
 

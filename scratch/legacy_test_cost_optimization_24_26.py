@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import os
 from langgraph.types import Command
-from it_department_nodes_base import ITState
+from agents.it_department_nodes_base import ITState
 from it_department_graph import budget_guard_node
 from sa_agent import sa_node
 from ba_agent import ba_node
@@ -32,7 +32,7 @@ class TestCostOptimization24to26(unittest.TestCase):
             remaining_steps=40
         )
         
-        from state_sync import shared_state
+        from sync.state_sync import shared_state
         shared_state["token_usage"]["total_cost"] = 0.45
         os.environ["DEEP_AGENTS_BUDGET_CAP"] = "1.00"
         
@@ -63,7 +63,7 @@ class TestCostOptimization24to26(unittest.TestCase):
             remaining_steps=40
         )
         
-        from state_sync import shared_state
+        from sync.state_sync import shared_state
         shared_state["token_usage"]["total_cost"] = 1.25
         os.environ["DEEP_AGENTS_BUDGET_CAP"] = "1.00"
         

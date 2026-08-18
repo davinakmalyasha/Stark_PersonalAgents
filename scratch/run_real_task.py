@@ -52,7 +52,7 @@ def main():
         _make_app(tmp)
         print(f"[DRIVER] task={task[:80]!r} workspace={tmp}", flush=True)
 
-        from sync_manager import run_and_sync_graph
+        from sync.sync_manager import run_and_sync_graph
 
         step = 0
         for state in run_and_sync_graph(task, workspace_path=tmp, chat_id="measure-run"):
@@ -61,7 +61,7 @@ def main():
             if step == 1 or step % 5 == 0:
                 print(f"[DRIVER] step {step}: {active}", flush=True)
 
-        from state_sync import safe_get_state
+        from sync.state_sync import safe_get_state
         usage = safe_get_state().get("token_usage", {})
         with open(_OUT, "w", encoding="utf-8") as f:
             json.dump(usage, f, indent=1, default=str)

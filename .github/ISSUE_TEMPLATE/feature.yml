@@ -1,0 +1,36 @@
+name: Feature request
+description: Request a new feature — structured for agent implementation
+title: "feature: "
+labels: ["feature"]
+body:
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose
+      description: What problem does this solve, for whom?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Testable statements. Use GIVEN/WHEN/THEN. These become the tests.
+      placeholder: |
+        - GIVEN ... WHEN ... THEN ...
+        - GIVEN ... WHEN ... THEN ...
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope / out of scope
+      description: Boundaries so the agent does not over-build.
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Implementation notes
+      description: Templates to use (feature-crud, project-fastapi...), files likely touched, constraints.
+    validations:
+      required: false

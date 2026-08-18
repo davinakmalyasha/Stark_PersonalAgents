@@ -6,7 +6,7 @@ PROJECT_ROOT = r"D:\MyProject\LangChain"
 sys.path.append(PROJECT_ROOT)
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from context_compaction import tier1_compact, tier2_compact, checkpoint_compact, invalidate_stale_reads
+from memory.context_compaction import tier1_compact, tier2_compact, checkpoint_compact, invalidate_stale_reads
 
 class TestCompactionAlgorithms(unittest.TestCase):
     def test_tier1_and_tier2_compaction(self):

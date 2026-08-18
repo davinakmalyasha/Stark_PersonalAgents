@@ -10,8 +10,8 @@ from datetime import datetime
 sys.path.insert(0, r'D:\MyProject\LangChain')
 os.environ['DEEP_AGENTS_BUDGET_CAP'] = '5.00'
 
-from sync_manager import run_and_sync_graph
-from state_sync import safe_get_state, reset_shared_state
+from sync.sync_manager import run_and_sync_graph
+from sync.state_sync import safe_get_state, reset_shared_state
 
 SANDBOX = r'D:\MyProject\GauntletSandbox'
 

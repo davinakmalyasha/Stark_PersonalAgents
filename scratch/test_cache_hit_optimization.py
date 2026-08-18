@@ -8,7 +8,7 @@ PROJECT_ROOT = r"D:\MyProject\LangChain"
 sys.path.append(PROJECT_ROOT)
 
 from langchain_core.messages import HumanMessage, AIMessage
-from context_compaction import compact_successful_tools
+from memory.context_compaction import compact_successful_tools
 from tools import LocalShellBackend
 
 class TestCacheHitOptimization(unittest.TestCase):

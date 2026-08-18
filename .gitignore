@@ -51,7 +51,7 @@ skills-lock.json
 specs/
 design-references/
 
-# Eval run artifacts (never commit)
+# Eval run artifacts & temporary test caches (never commit)
 scratch/eval_runs*/
 scratch/eval_*.log
 scratch/eval_*.err.log
@@ -59,7 +59,13 @@ scratch/eval_pid.txt
 scratch/*.png
 scratch/*.txt
 scratch/*.json
-image.png
 scratch/*.jsonl
+scratch/*.wav
 scratch/measure_run_usage.json
+scratch/pip_cache/
+scratch/pkg_cache/
+scratch/swe_repo_cache/
+scratch/swe_gen9/
+scratch/tmp*/
+image.png
 server_port.json

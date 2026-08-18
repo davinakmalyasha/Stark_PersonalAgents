@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a bug for an agent to fix
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Exact symptom, not a guess at the cause.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run ...
+        2. Do ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output / logs
+      description: Paste the exact error message and stack trace (trim secrets).
+    validations:
+      required: false
+  - type: input
+    id: files
+    attributes:
+      label: Files likely involved
+      description: Paths you suspect, e.g. memory_manager.py

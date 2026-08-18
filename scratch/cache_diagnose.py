@@ -27,7 +27,7 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from state_sync import reset_shared_state, safe_update_state
+from sync.state_sync import reset_shared_state, safe_update_state
 try:
     reset_shared_state()
 except Exception:
@@ -35,7 +35,7 @@ except Exception:
 
 from llm import invoke_messages_with_fallback
 from langchain_core.messages import SystemMessage, HumanMessage
-from tool_schemas import get_native_tools
+from tools_pkg import get_native_tools
 
 import tiktoken
 _ENC = tiktoken.encoding_for_model("gpt-4o")
@@ -59,7 +59,7 @@ def make_project(tag: str, files: dict):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content)
-    from memory_manager import refresh_code_map, ensure_project_identity
+    from memory.memory_manager import refresh_code_map, ensure_project_identity
     refresh_code_map(tmp)
     ensure_project_identity(tmp, name=f"diag_{tag}", description="diagnostic fixture",
                             purpose="measure cache behavior", status="stable")
@@ -68,7 +68,7 @@ def make_project(tag: str, files: dict):
 
 
 def build(tag, task_text, tools):
-    from developer_agent import _build_system_prompt
+    from agents.developer_agent import _build_system_prompt
     S, V = _build_system_prompt(task_text, tag)
     H = f"{task_text}\n\n{V}"
     return [SystemMessage(content=S), HumanMessage(content=H)], S, H
@@ -81,7 +81,7 @@ class Recorder:
     def call(self, label, msgs, effort, tools):
         invoke_messages_with_fallback(role="Developer", messages=list(msgs), temp=0.2,
                                       reasoning_effort=effort, tools=tools, where=label)
-        from state_sync import shared_state
+        from sync.state_sync import shared_state
         c = shared_state["token_usage"]["calls"][-1]
         m_tok = msg_tokens(msgs)
         t_tok = max(0, c["input"] - m_tok)

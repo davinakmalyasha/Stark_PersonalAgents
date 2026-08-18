@@ -16,7 +16,7 @@ assert TASK_CATEGORIES['orchestrator'][0]['model'] == 'deepseek-v4-flash'
 print('[OK] Orchestrator uses flash-first')
 
 # 3. XML parser
-from developer_agent import _parse_xml_tool_call, parse_all_tool_calls
+from agents.developer_agent import _parse_xml_tool_call, parse_all_tool_calls
 
 # Format A: <function> wrapper
 r = _parse_xml_tool_call('<function><tool_name>read_file</tool_name><args><param>file_path</param><value>/test</value></args></function>')
@@ -45,7 +45,7 @@ assert len(parse_all_tool_calls('<read_file file_path="test.html" />')) == 1
 print('[OK] parse_all_tool_calls covers all 3 formats')
 
 # 5. state reset works
-from state_sync import reset_shared_state, safe_get_state, shared_state
+from sync.state_sync import reset_shared_state, safe_get_state, shared_state
 shared_state['token_usage']['total_cost'] = 999
 reset_shared_state()
 assert safe_get_state()['token_usage']['total_cost'] == 0

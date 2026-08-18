@@ -92,7 +92,7 @@ export const pct = (n: number): number => n / 100;
 def call(label, static, vol):
     from llm import invoke_messages_with_fallback
     from langchain_core.messages import SystemMessage, HumanMessage
-    from state_sync import shared_state
+    from sync.state_sync import shared_state
     invoke_messages_with_fallback(
         role="Developer",
         messages=[SystemMessage(content=static), HumanMessage(content=vol)],
@@ -106,7 +106,7 @@ def call(label, static, vol):
 
 
 def main():
-    from state_sync import reset_shared_state
+    from sync.state_sync import reset_shared_state
     try:
         reset_shared_state()
     except Exception:
@@ -117,14 +117,14 @@ def main():
         shutil.rmtree(tmp)
     make_project(tmp)
 
-    from memory_manager import refresh_code_map, load_cached_code_map
+    from memory.memory_manager import refresh_code_map, load_cached_code_map
     print("refresh_code_map:", refresh_code_map(tmp))
     cm = load_cached_code_map(tmp)
     print("cached map:", len(cm), "chars |", cm.splitlines()[0] if cm else "(none)")
     print("map content:")
     print(cm)
 
-    from developer_agent import _build_system_prompt
+    from agents.developer_agent import _build_system_prompt
     t1 = "Fix the payment flow in src/payment.py and add card validation."
     t2 = "Refactor the cart total calculation in src/cart.ts."
     t3 = "Add a retry wrapper around checkout in src/checkout.js."
@@ -163,7 +163,7 @@ def main():
     print(f"D (delta cached now): hit={d.get('cache_hits')}/{d.get('input')} "
           f"= {100.0 * d.get('cache_hits', 0) / max(1, d.get('input', 1)):.1f}% — "
           f"grown system hits fully")
-    from state_sync import shared_state
+    from sync.state_sync import shared_state
     print(f"total cost of this test: ${shared_state.get('token_usage', {}).get('total_cost', 0):.4f}")
 
 

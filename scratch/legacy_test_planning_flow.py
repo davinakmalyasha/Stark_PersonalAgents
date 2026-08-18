@@ -5,9 +5,9 @@ sys.path.append(r'd:\MyProject\LangChain')
 from dotenv import load_dotenv
 load_dotenv()
 
-from chat_memory_manager import resolve_request_text
+from memory.chat_memory_manager import resolve_request_text
 from supervisor_agent import supervisor_node
-from state_sync import shared_state
+from sync.state_sync import shared_state
 
 def test_flow():
     project_path = r"D:\MyProject\TestProjectForAgent"

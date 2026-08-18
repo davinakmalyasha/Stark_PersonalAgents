@@ -1060,6 +1060,22 @@ try:
 except ImportError:
     _USER_PROMPTS = {}
 
+# ── gen9-real: 18 real-world bug tasks (SWE-bench methodology) ──
+# Frozen repo snapshots at real base commits; hidden tests = the upstream fix
+# commit's own tests. setup(d) handles snapshot copy + venv/node_modules
+# junctions + per-task budget override, so the existing runner flow is reused.
+try:
+    from gen9_real_tasks import build_tasks as _build_gen9_tasks
+    GEN9_TASKS = _build_gen9_tasks({})
+    TASKS = TASKS + GEN9_TASKS
+    TASKS_BY_ID = {t["id"]: t for t in TASKS}
+    print(f"[eval] gen9-real suite registered: {len(GEN9_TASKS)} tasks "
+          f"({sorted(set(t['category'] for t in GEN9_TASKS))})", flush=True)
+except Exception as _gen9_err:
+    import traceback
+    traceback.print_exc()
+    print(f"[eval] WARNING: gen9-real suite NOT loaded ({_gen9_err})", flush=True)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Single-task runner
@@ -1331,7 +1347,14 @@ def _prompt_for(task):
 
 def run_single(task_id, keep=False):
     task = TASKS_BY_ID[task_id]
-    tmp = tempfile.mkdtemp(prefix=f"eval_{task_id}_")
+    # Task workspaces must NEVER land on the OS temp drive (C:) — big repos and
+    # long runs would eat the C partition. BSA_EVAL_TMP defaults to D:.
+    _eval_tmp_root = os.environ.get("BSA_EVAL_TMP", os.path.join(PROJECT_ROOT, "scratch", "eval_tmp"))
+    try:
+        os.makedirs(_eval_tmp_root, exist_ok=True)
+    except Exception:
+        _eval_tmp_root = tempfile.gettempdir()
+    tmp = tempfile.mkdtemp(prefix=f"eval_{task_id}_", dir=_eval_tmp_root)
     # Unique chat_id per run → stale task-tracking state can never leak into this run.
     run_seed = uuid.uuid4().hex[:6]
     _purge_stale_eval_tasks(task_id)
@@ -1348,7 +1371,7 @@ def run_single(task_id, keep=False):
         # eval task workspace IS a built project) — then frozen; the card
         # adapts only via rare append-only [updated:] drift corrections.
         try:
-            from memory_manager import ensure_project_identity
+            from memory.memory_manager import ensure_project_identity
             _first_line = (task["prompt"].strip().splitlines() or [""])[0][:160]
             ensure_project_identity(
                 tmp,
@@ -1373,7 +1396,7 @@ def run_single(task_id, keep=False):
         #    is an infrastructure failure, not an agent failure. It retries with a FRESH
         #    chat context WITHOUT consuming a repair round. If every attempt is hollow,
         #    the task is reported as status="error" (infra), not "fail" (agent).
-        from sync_manager import run_and_sync_graph
+        from sync.sync_manager import run_and_sync_graph
         max_repairs = int(os.environ.get("BSA_MAX_REPAIRS", "2"))
         max_hollow = int(os.environ.get("BSA_MAX_HOLLOW_RETRIES", "2"))
         hollow_cost_max = float(os.environ.get("BSA_HOLLOW_COST_MAX", "0.003"))
@@ -1389,7 +1412,7 @@ def run_single(task_id, keep=False):
 
         def _usage_now():
             try:
-                from state_sync import safe_get_state
+                from sync.state_sync import safe_get_state
                 u = safe_get_state().get("token_usage", {}) or {}
                 return float(u.get("total_cost", 0) or 0), len(u.get("calls", []) or [])
             except Exception:
@@ -1407,7 +1430,7 @@ def run_single(task_id, keep=False):
             # Keep the memory code map in sync with the current on-disk code so
             # Dev's PROJECT MEMORY symbol index never goes stale between attempts.
             try:
-                from memory_manager import refresh_code_map
+                from memory.memory_manager import refresh_code_map
                 refresh_code_map(tmp)
             except Exception:
                 pass
@@ -1439,13 +1462,18 @@ def run_single(task_id, keep=False):
                 and os.environ.get("BSA_REPAIR_DIRECT_SDET", "1") != "0"
             )
             if sdet_repair:
-                # SDET-FIX repair path: the harness hands the hidden-test
-                # failure to the SDET subagent (full Dev toolset), never to
-                # Dev and never via the orchestrator. SDET reproduces, fixes
-                # and verifies internally; the hidden test re-runs below and
-                # remains the only gate.
-                from verify_helper import run_sdet_fix
-                from state_sync import safe_update_state, shared_state
+                # DEV repair path: the harness hands the hidden-test failure
+                # to the Dev subagent (full toolset), never via the
+                # orchestrator. Dev reproduces, fixes and verifies internally;
+                # the hidden test re-runs below and remains the only gate.
+                try:
+                    from verify_helper import run_dev_repair
+                except ImportError:
+                    print("[eval] verify_helper.run_dev_repair removed — repair path disabled", flush=True)
+                    run_dev_repair = None
+                from sync.state_sync import safe_update_state, shared_state
+                if run_dev_repair is None:
+                    break
                 try:
                     safe_update_state({"project_path": tmp, "chat_id": chat_id,
                                        "client_request": run_task})
@@ -1473,7 +1501,7 @@ def run_single(task_id, keep=False):
                     if prior_status and prior_diff:
                         prior_diff = ("## WORKSPACE STATE (git status --porcelain=v2)\n"
                                       + prior_status + "\n\n" + prior_diff)
-                    handoff = run_sdet_fix(
+                    handoff = run_dev_repair(
                         goal=goal,
                         failure_detail=detail,
                         test_output=fail_log or detail,
@@ -1497,8 +1525,8 @@ def run_single(task_id, keep=False):
                 # Fallback (BSA_REPAIR_DIRECT_SDET=0): the repair prompt IS the
                 # plan (failure detail + prior attempt state). Bypass the
                 # orchestrator's replan/ceremony turns and feed it to Dev.
-                from developer_agent import developer_node
-                from state_sync import safe_update_state, shared_state
+                from agents.developer_agent import developer_node
+                from sync.state_sync import safe_update_state, shared_state
                 try:
                     safe_update_state({"project_path": tmp, "chat_id": chat_id,
                                        "client_request": run_task})
@@ -1589,7 +1617,7 @@ def run_single(task_id, keep=False):
                         fix_diff = "\n".join(fix_parts)[:600]
                         if fix_diff:
                             try:
-                                from memory_manager import _detect_stack_summary
+                                from memory.memory_manager import _detect_stack_summary
                                 _stack = _detect_stack_summary(tmp)
                             except Exception:
                                 _stack = ""
@@ -1625,7 +1653,7 @@ def run_single(task_id, keep=False):
                 except Exception:
                     pass
                 try:
-                    from state_sync import shared_state, state_lock
+                    from sync.state_sync import shared_state, state_lock
                     with state_lock:
                         shared_state["failed_models"] = []
                 except Exception:
@@ -1654,7 +1682,7 @@ def run_single(task_id, keep=False):
             _emit("repair", id=task_id, round=repairs, reason=(detail or "")[:200])
             print(f"[eval] {task_id} attempt {attempts} FAILED — repairing ({repairs}/{max_repairs})", flush=True)
 
-        from state_sync import safe_get_state
+        from sync.state_sync import safe_get_state
         usage = safe_get_state().get("token_usage", {})
         calls = usage.get("calls", [])
         after = _snapshot(tmp)

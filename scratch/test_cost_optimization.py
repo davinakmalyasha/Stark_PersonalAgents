@@ -27,7 +27,7 @@ class TestCostOptimization(unittest.TestCase):
         self.assertIn("- Do not collapse this code block:", compacted)
 
     def test_store_based_caching_and_invalidation(self):
-        from state_sync import active_store
+        from sync.state_sync import active_store
         mock_store = InMemoryStore()
         token = active_store.set(mock_store)
         try:

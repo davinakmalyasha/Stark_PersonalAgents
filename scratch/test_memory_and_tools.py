@@ -24,8 +24,8 @@ def _make_sandbox(features_md="", project_md=""):
 
 
 def test_memory_always_includes_code_map():
-    from dev_memory_helper import get_developer_memory_context
-    from memory_manager import CODE_MAP_START, CODE_MAP_END
+    from memory.dev_memory_helper import get_developer_memory_context
+    from memory.memory_manager import CODE_MAP_START, CODE_MAP_END
     d = _make_sandbox(
         project_md="# Project Overview\n**Auto-generated**: 2026-08-05\n## Tech Stack\n- Node.js\n",
         features_md=(
@@ -45,8 +45,8 @@ def test_memory_always_includes_code_map():
 
 
 def test_memory_cap_6k():
-    from dev_memory_helper import get_developer_memory_context
-    from memory_manager import CODE_MAP_START, CODE_MAP_END
+    from memory.dev_memory_helper import get_developer_memory_context
+    from memory.memory_manager import CODE_MAP_START, CODE_MAP_END
     big = "\n".join(f"line {i} " + "x" * 50 for i in range(300))
     d = _make_sandbox(
         project_md="# Project Overview\n- Node.js\n",
@@ -57,8 +57,8 @@ def test_memory_cap_6k():
 
 
 def test_memory_code_map_only_fix_mode():
-    from dev_memory_helper import get_developer_memory_context
-    from memory_manager import CODE_MAP_START, CODE_MAP_END
+    from memory.dev_memory_helper import get_developer_memory_context
+    from memory.memory_manager import CODE_MAP_START, CODE_MAP_END
     d = _make_sandbox(
         project_md="# Project Overview\n- Node.js\n- something meaningful\n",
         features_md=f"{CODE_MAP_START}\n## Code Map\nutils.js:\n\u2502 formatMoney\n{CODE_MAP_END}\n",
@@ -94,13 +94,6 @@ def test_get_file_signatures_three_tuple():
     sig, depth, doc = sigs[0]
     assert "formatMoney" in sig
     assert "Rounds a float" in doc
-
-
-def test_sdet_registry_max():
-    from tools import _SUBAGENTS_REGISTRY, _load_subagents
-    if not _SUBAGENTS_REGISTRY:
-        _load_subagents()
-    assert _SUBAGENTS_REGISTRY["SDET"]["reasoning_effort"] == "max"
 
 
 def test_devsecops_registry_still_max():

@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import os
-from state_sync import shared_state
+from sync.state_sync import shared_state
 from llm import _get_deepseek_client
 from tools import task
 

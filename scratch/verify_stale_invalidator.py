@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.messages import HumanMessage, AIMessage
-from context_compaction import invalidate_stale_reads
+from memory.context_compaction import invalidate_stale_reads
 
 def test_stale_reads():
     messages = [

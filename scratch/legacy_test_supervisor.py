@@ -5,7 +5,7 @@ sys.path.append(r'd:\MyProject\LangChain')
 from dotenv import load_dotenv
 load_dotenv()
 
-from state_sync import shared_state, safe_get_state
+from sync.state_sync import shared_state, safe_get_state
 from supervisor_agent import supervisor_node
 
 # Set up test state

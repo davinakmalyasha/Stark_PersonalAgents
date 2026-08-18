@@ -10,8 +10,8 @@ sys.path.insert(0, r"D:\MyProject\LangChain")
 import langchain_openai.chat_models.base as base_mod
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from llm import invoke_messages_with_fallback
-from developer_agent import developer_node
-from it_department_nodes_base import ITState
+from agents.developer_agent import developer_node
+from agents.it_department_nodes_base import ITState
 
 class TestReasoningPreservation(unittest.TestCase):
     
@@ -141,7 +141,7 @@ class TestReasoningPreservation(unittest.TestCase):
     @patch("developer_agent.load_task_tracking")
     @patch("developer_agent._detect_test_command")
     def test_remaining_steps_decrement_and_cap(self, mock_detect, mock_load, mock_save, mock_execute, mock_invoke):
-        from state_sync import shared_state, safe_update_state
+        from sync.state_sync import shared_state, safe_update_state
         mock_detect.return_value = ""
         mock_execute.return_value = "[OK] Done"
         mock_load.return_value = None

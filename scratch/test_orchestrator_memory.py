@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 from langchain_core.messages import HumanMessage
 
 import workspace_manager as wm
-from orchestrator_agent import orchestrator_node
+from agents.orchestrator_agent import orchestrator_node
 
 class TestOrchestratorMemory(unittest.TestCase):
     def setUp(self):

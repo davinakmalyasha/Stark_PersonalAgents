@@ -7,7 +7,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from state_sync import safe_append_live_log, safe_serialize_state, reset_shared_state
+from sync.state_sync import safe_append_live_log, safe_serialize_state, reset_shared_state
 
 reset_shared_state()
 

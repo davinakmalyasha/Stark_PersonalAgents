@@ -7,7 +7,7 @@ class TestDeepAgentsIntegration(unittest.TestCase):
     
     def test_harness_profile_registration(self):
         # Test registered developer HarnessProfile
-        from developer_agent import get_harness_profile
+        from agents.developer_agent import get_harness_profile
         try:
             profile = get_harness_profile("developer")
             self.assertIsNotNone(profile)

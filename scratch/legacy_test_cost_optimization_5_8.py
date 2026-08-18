@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import patch, MagicMock
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, RemoveMessage
-from it_department_nodes_base import merge_active_tasks, ITState
-from developer_agent import developer_node
+from agents.it_department_nodes_base import merge_active_tasks, ITState
+from agents.developer_agent import developer_node
 
 class TestCostOptimization5to8(unittest.TestCase):
     def test_merge_active_tasks_reducer(self):

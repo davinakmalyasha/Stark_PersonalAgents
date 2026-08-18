@@ -12,8 +12,8 @@ for f in os.listdir(sandbox):
         elif os.path.isdir(path) and f != '.deep_agents': shutil.rmtree(path)
     except: pass
 
-from sync_manager import run_and_sync_graph
-from state_sync import safe_get_state
+from sync.sync_manager import run_and_sync_graph
+from sync.state_sync import safe_get_state
 
 task = 'Create a file called hello.py with a function greet() that returns hello world. Also create test_hello.py that imports and tests it.'
 print('Task:', task[:80])

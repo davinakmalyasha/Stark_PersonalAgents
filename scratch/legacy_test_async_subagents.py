@@ -3,7 +3,7 @@ import os
 import time
 import threading
 from unittest.mock import patch, MagicMock
-from it_department_nodes_base import ITState
+from agents.it_department_nodes_base import ITState
 from tester_agent import tester_node, _BACKGROUND_TASKS, _tasks_lock
 from supervisor_agent import supervisor_node
 

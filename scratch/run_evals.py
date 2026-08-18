@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import graph-related modules
-from sync_manager import run_and_sync_graph
-from state_sync import safe_update_state, safe_get_state
+from sync.sync_manager import run_and_sync_graph
+from sync.state_sync import safe_update_state, safe_get_state
 
 # ==========================================
 # 1. Task Definitions

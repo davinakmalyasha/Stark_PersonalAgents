@@ -6,7 +6,7 @@ def main():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(base_dir)
     try:
-        from devops_prompt import _STATIC_SYSTEM_TEMPLATE
+        from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
         enc = tiktoken.get_encoding("cl100k_base")
         tokens = enc.encode(_STATIC_SYSTEM_TEMPLATE)
         print(f"Token count: {len(tokens)}")

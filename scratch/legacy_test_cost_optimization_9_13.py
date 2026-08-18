@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 from compact_exchange import list_to_compact, compact_to_list
 from ba_subagents import GapAnalysisResponse, GapAnalyzerSubAgent
-from it_department_nodes_base import vfs_state_wrapper, ITState
+from agents.it_department_nodes_base import vfs_state_wrapper, ITState
 from it_department_graph import supervisor_command_node, developer_command_node, tester_command_node
 from sa_agent import sa_node
 from analytics_agent import analytics_node

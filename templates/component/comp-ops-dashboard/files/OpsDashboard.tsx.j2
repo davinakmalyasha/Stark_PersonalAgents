@@ -1,0 +1,41 @@
+import { useEffect, useState } from "react";
+
+type OpsStats = { error_rate: number; p95_ms: number; rate_limited: number };
+
+export default function OpsDashboard({ apiBase = "{{ base_path }}" }: { apiBase?: string }) {
+  const [stats, setStats] = useState<OpsStats | null>(null);
+
+  useEffect(() => {
+    fetch(`${apiBase}/admin/ops-stats`, {
+      headers: { Authorization: `Bearer ${localStorage.getItem("auth_token") || ""}` },
+    })
+      .then((r) => r.json())
+      .then(setStats)
+      .catch(() => {});
+  }, [apiBase]);
+
+  if (!stats) return <p>Loading ops stats...</p>;
+
+  return (
+    <div className="ops-dashboard">
+      <div className="kpi-grid">
+        <div className="kpi-card">
+          <h3>Error rate</h3>
+          <p>{(stats.error_rate * 100).toFixed(2)}%</p>
+        </div>
+        <div className="kpi-card">
+          <h3>p95 latency</h3>
+          <p>{stats.p95_ms} ms</p>
+        </div>
+        <div className="kpi-card">
+          <h3>Rate limited</h3>
+          <p>{stats.rate_limited}</p>
+        </div>
+      </div>
+      {/* TODO: add charts via comp-charts: <LineChart data={...} /> for latency over time */}
+    </div>
+  );
+}
+
+// TODO: backend should aggregate from feature-observability logs + feature-rate-limit counters.
+// Extend comp-dashboard pattern but ops-focused (error/p95/rate-limit).

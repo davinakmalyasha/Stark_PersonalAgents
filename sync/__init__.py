@@ -29,7 +29,10 @@ from .state_sync import (
 from .sync_helpers import (
     load_task_tracking,
     save_task_tracking,
-    build_task_progress_block,
+    plan_state,
+    load_plan,
+    save_plan,
+    build_plan_progress_block,
 )
 from .sync_manager import (
     run_and_sync_graph,
@@ -45,6 +48,9 @@ __all__ = [
     "reset_shared_state",
     "load_task_tracking",
     "save_task_tracking",
-    "build_task_progress_block",
+    "plan_state",
+    "load_plan",
+    "save_plan",
+    "build_plan_progress_block",
     "run_and_sync_graph",
 ]

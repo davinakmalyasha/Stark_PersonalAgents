@@ -296,17 +296,20 @@ def github_dispatch_workflow(repo: str, workflow: str, ref: str = "main") -> str
     return f"Dispatched workflow {workflow} on {repo} @ {ref}."
 
 _GATE_CHECKS = {
-    "python": ["sast", "sca", "secrets", "quality", "coverage", "perf-smoke",
-               "semgrep", "container", "codeql", "zizmor"],
-    "node": ["sca", "secrets", "quality", "coverage", "bundle", "perf-smoke",
-             "semgrep", "container", "codeql", "zizmor"],
-    "go": ["sca", "secrets", "tests", "codeql", "zizmor"],
-    "php": ["sca", "secrets", "tests", "codeql", "zizmor"],
-    "generic": ["sca", "secrets", "tests", "codeql", "zizmor"],
+    "python": ["sast", "sca", "dependency-review", "secrets", "quality",
+               "coverage", "perf-smoke", "semgrep", "container", "codeql", "zizmor"],
+    "node": ["sca", "dependency-review", "secrets", "quality", "coverage", "bundle",
+             "perf-smoke", "semgrep", "container", "codeql", "zizmor"],
+    "go": ["sca", "dependency-review", "secrets", "tests", "codeql", "zizmor"],
+    "php": ["sca", "dependency-review", "secrets", "tests", "codeql", "zizmor"],
+    "generic": ["sca", "dependency-review", "secrets", "tests", "codeql", "zizmor"],
 }
 
+# Two-tier gate: the security workflow IS the merged CI+gate (runs on
+# push/PR/workflow_dispatch); release-heavy.yml (nightly/tags) is seeded by the
+# same template and never blocks branch protection.
 _GATE_PROFILE_TEMPLATES = {
-    "python": {"security": "github-ci-security-python", "ci": "github-ci-python",
+    "python": {"security": "github-ci-security-python", "ci": None,
                "gitignore": "gitignore-python", "perf": None, "requirements": True},
     "node": {"security": "github-ci-security-node", "ci": None,
              "gitignore": "gitignore-node", "perf": None, "requirements": False},
@@ -498,8 +501,9 @@ def github_apply_gate(repo: str, stack: str = "auto", codeql_on: bool = True,
     gate: 'ask' (default — confirms with the user for new AND existing repos),
     'yes' (apply without asking), 'no' (skip).
     stack: 'auto' (detect) | python | node | go | php | generic.
-    NO templates are applied here — templates are only used when a task
-    actually needs them.
+    The gate renders its own ci.yml/security.yml from templates/config/
+    github-ci-* into a temp dir and pushes them via the Contents API
+    (skip-if-exists) — local template apply is NOT required.
     """
     created_prefix = ""
     if create:

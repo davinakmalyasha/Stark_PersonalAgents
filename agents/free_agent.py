@@ -2,7 +2,7 @@
 free_agent.py --- Multi-provider free LLM agent.
 
 Single file that routes across 10 free providers:
-  OpenRouter, Groq, Google AI Studio, Mistral AI, NVIDIA NIM, Cloudflare, Z.ai (GLM), OpenCode Zen, Kilo Gateway, Cline
+  OpenRouter, Groq, Google AI Studio, Mistral AI, NVIDIA NIM, Cloudflare, Z.ai (GLM), OpenCode, Kilo Gateway, Cline
 
 Zero cost. Supports text, vision, coding, reasoning, and audio.
 
@@ -204,7 +204,7 @@ PROVIDER_CONFIGS = {
         },
     },
     "opencode": {
-        "name": "OpenCode Zen",
+        "name": "OpenCode",
         "base_url": "https://opencode.ai/zen/v1",
         "auth": "Bearer",
         "env_key": "OPENCODE_API_KEYS",
@@ -388,7 +388,7 @@ MODEL_CATALOG = [
     {"id": "GLM-4.6V-Flash", "provider": "zhipu", "name": "GLM 4.6V Flash",
      "capabilities": ["text", "vision"], "context": 131072, "priority": 3},
 
-    # ── OpenCode Zen (free tier) ──
+    # ── OpenCode (free tier) ──
     {"id": "deepseek-v4-flash-free", "provider": "opencode", "name": "DeepSeek V4 Flash (free)",
      "capabilities": ["text", "coding"], "context": 200000, "priority": 1},
     {"id": "big-pickle", "provider": "opencode", "name": "Big Pickle (stealth / DS V4)",
@@ -492,6 +492,32 @@ class FreeAgentError(Exception):
 
 class AllProvidersExhaustedError(FreeAgentError):
     """All providers failed for this request."""
+
+
+class ContextWindowExceededError(FreeAgentError):
+    """A provider rejected a request because its real context is too small."""
+
+
+def _is_context_window_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    markers = (
+        "context length", "context window", "maximum context", "max context",
+        "too many tokens", "prompt is too long", "request too large",
+        "token limit", "input token",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _sleep_with_abort(seconds: float, abort_check=None) -> None:
+    """Back off without making a retry-until-success request uncancellable."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if callable(abort_check) and abort_check():
+            raise AllProvidersExhaustedError("Free-agent request cancelled.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
 
 
 class RateLimitTracker:
@@ -636,7 +662,13 @@ class ProviderClient:
         system_prompt: Optional[str] = None,
         images: Optional[list[str]] = None,
         image_urls: Optional[list[str]] = None,
+        messages: Optional[list[dict]] = None,
     ) -> list[dict]:
+        if messages is not None:
+            # Native tool turns must preserve the exact assistant/tool message
+            # sequence.  Do not collapse it back into a prompt string.
+            return [dict(message) for message in messages]
+
         msgs = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
@@ -669,6 +701,9 @@ class ProviderClient:
         system_prompt: Optional[str] = None,
         images: Optional[list[str]] = None,
         image_urls: Optional[list[str]] = None,
+        messages: Optional[list[dict]] = None,
+        tools: Optional[list[dict]] = None,
+        tool_choice=None,
         **overrides,
     ) -> dict:
         model = overrides.pop("model", self.default_model)
@@ -681,10 +716,16 @@ class ProviderClient:
 
         body: dict = {
             "model": model,
-            "messages": self._build_messages(prompt, system_prompt, images, image_urls),
+            "messages": self._build_messages(
+                prompt, system_prompt, images, image_urls, messages
+            ),
             "stream": stream,
             **params,
         }
+        if tools is not None:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
         return body
 
     # ── HTTP ─────────────────────────────────────────────────────
@@ -716,10 +757,55 @@ class ProviderClient:
             raise FreeAgentError(f"{self.name} request failed or timed out: {exc}", provider=self.name, status=0) from exc
 
     def _parse_reply(self, body: dict) -> str:
-        choice = body.get("choices", [{}])[0]
+        choices = body.get("choices") or [{}]
+        choice = choices[0] if isinstance(choices, list) else {}
         msg = choice.get("message", {})
         content = msg.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
         return content.strip() if content else ""
+
+    @staticmethod
+    def _parse_tool_calls(body: dict) -> list[dict]:
+        """Normalize OpenAI-compatible native function calls.
+
+        The model-facing protocol is the provider's structured ``tool_calls``
+        field.  Invalid argument payloads are ignored as malformed calls rather
+        than reinterpreted as text instructions.
+        """
+        choices = body.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            return []
+        message = choices[0].get("message") or {}
+        raw_calls = message.get("tool_calls") or []
+        if not isinstance(raw_calls, list):
+            return []
+
+        calls = []
+        for index, call in enumerate(raw_calls):
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            raw_args = function.get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args or "{}")
+                except json.JSONDecodeError:
+                    continue
+            if not isinstance(raw_args, dict):
+                continue
+            calls.append({
+                "id": str(call.get("id") or f"call_{index + 1}"),
+                "name": name,
+                "args": raw_args,
+            })
+        return calls
 
     def _parse_model_used(self, body: dict) -> str:
         return body.get("model", self.default_model)
@@ -732,11 +818,26 @@ class ProviderClient:
         resp = self._post(body)
         return self._parse_reply(resp)
 
-    def chat_with_info(self, prompt: str, **overrides) -> dict:
-        """Text-only chat with metadata."""
-        raw = self._post(self._build_body(prompt, stream=False, **overrides))
+    def chat_with_info(
+        self,
+        prompt: str = "",
+        messages: Optional[list[dict]] = None,
+        tools: Optional[list[dict]] = None,
+        tool_choice=None,
+        **overrides,
+    ) -> dict:
+        """Chat with metadata and optional native tool calls."""
+        raw = self._post(self._build_body(
+            prompt,
+            stream=False,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            **overrides,
+        ))
         return {
             "reply": self._parse_reply(raw),
+            "tool_calls": self._parse_tool_calls(raw),
             "model": self._parse_model_used(raw),
             "provider": self.name,
             "usage": raw.get("usage", {}),
@@ -838,24 +939,31 @@ def _detect_capability(prompt: str, images=None, image_urls=None) -> str:
     return "text"
 
 
-def _get_models_for_capability(capability: str) -> list[dict]:
-    """Get all models that support a capability, sorted by provider priority."""
-    cap_priority = {"text": 0, "vision": 1, "coding": 2, "reasoning": 3, "audio": 4}
-    cap_idx = cap_priority.get(capability, 0)
-
+def _get_models_for_capability(
+    capability: str,
+    min_context_tokens: int | None = None,
+    prefer_context: bool = False,
+) -> list[dict]:
+    """Get eligible models, optionally preferring the largest context first."""
     matches = []
     for model in MODEL_CATALOG:
         if capability in model.get("capabilities", []):
+            context = int(model.get("context", 0) or 0)
+            if min_context_tokens is not None and context < int(min_context_tokens):
+                continue
             provider = model["provider"]
             pcfg = PROVIDER_CONFIGS.get(provider, {})
             prov_priority = pcfg.get("priority", {}).get(capability, 99)
 
             # Combined score: provider priority + model priority
             score = prov_priority * 100 + model.get("priority", 99)
-            matches.append((score, prov_priority, model))
+            matches.append((score, prov_priority, context, model))
 
-    matches.sort(key=lambda x: x[0])
-    return [m[2] for m in matches]
+    if prefer_context:
+        matches.sort(key=lambda x: (-x[2], x[0], x[1], x[3].get("priority", 99)))
+    else:
+        matches.sort(key=lambda x: (x[0], x[1], x[3].get("priority", 99)))
+    return [m[3] for m in matches]
 
 
 class FreeAgent:
@@ -886,7 +994,7 @@ class FreeAgent:
                 "  MISTRAL_API_KEY, NVIDIA_API_KEY, CLOUDFLARE_API_TOKEN\n"
                 "  (+ CLOUDFLARE_ACCOUNT_ID for Cloudflare)\n"
                 "  ZAI_API_KEY for Z.ai (GLM)\n"
-                "  or OPENCODE_API_KEY for OpenCode Zen\n"
+                "  or OPENCODE_API_KEY for OpenCode\n"
                 "  or CLINE_API_KEY for Cline (usage-billing)\n"
                 "Note: Kilo Gateway works without any API key."
             )
@@ -899,6 +1007,8 @@ class FreeAgent:
         preferred_provider: Optional[str] = None,
         images: Optional[list[str]] = None,
         image_urls: Optional[list[str]] = None,
+        min_context_tokens: int | None = None,
+        prefer_context: bool = False,
     ) -> list[tuple[ProviderClient, str]]:
         """Build an ordered list of (client, model_id) to try.
 
@@ -909,7 +1019,11 @@ class FreeAgent:
         if actual_capability != "text":
             capability = actual_capability
 
-        models = _get_models_for_capability(capability)
+        models = _get_models_for_capability(
+            capability,
+            min_context_tokens=min_context_tokens,
+            prefer_context=prefer_context,
+        )
 
         # Build route list
         route_list = []
@@ -937,6 +1051,18 @@ class FreeAgent:
 
         return deduped
 
+    def available_model_contexts(self, capability: str = "text") -> list[int]:
+        """Return context capacities for models backed by configured providers."""
+        configured = set(self.providers)
+        capacities = {
+            int(model.get("context", 0) or 0)
+            for model in MODEL_CATALOG
+            if model.get("provider") in configured
+            and capability in model.get("capabilities", [])
+            and int(model.get("context", 0) or 0) > 0
+        }
+        return sorted(capacities, reverse=True)
+
     def _get_shortest_cooldown(self) -> float:
         """Find the shortest cooldown time among all rate-limited providers."""
         now = time.time()
@@ -958,31 +1084,81 @@ class FreeAgent:
     ) -> str:
         """Send a request to the best available provider.
 
-        Falls back through providers on failure. When all providers
-        are exhausted, loops back to the first and retries indefinitely
-        (up to 100 cycles).
+        Falls back through providers on failure. Normal requests retain the
+        bounded retry policy. Dedicated compaction requests can opt into
+        ``retry_forever`` and context-aware routing without changing normal
+        Developer/FreeAgent behavior.
         """
+        min_context_tokens = overrides.pop("min_context_tokens", None)
+        prefer_context = bool(overrides.pop("prefer_context", False))
+        retry_forever = bool(overrides.pop("retry_forever", False))
+        context_sensitive = bool(overrides.pop("context_sensitive", False))
+        abort_check = overrides.pop("abort_check", None)
+        native_messages = overrides.pop("messages", None)
+        native_tools = overrides.pop("tools", None)
+        native_tool_choice = overrides.pop("tool_choice", None)
+        return_info = bool(overrides.pop("_return_info", False))
         max_loops = MAX_PROVIDER_RETRY_CYCLES
-        for loop in range(max_loops):
-            routes = self._route(capability, preferred_provider, images, image_urls)
+        loop = 0
+        last_error: Optional[Exception] = None
+
+        # A context-aware request must fail over to chunking when no
+        # configured model can fit the requested payload. Without this guard,
+        # ``retry_forever`` would wait forever for a model that cannot exist.
+        if min_context_tokens is not None:
+            actual_capability = _detect_capability("", images, image_urls)
+            if actual_capability == "text":
+                actual_capability = capability
+            fitting_models = [
+                model for model in MODEL_CATALOG
+                if model.get("provider") in self.providers
+                and actual_capability in model.get("capabilities", [])
+                and int(model.get("context", 0) or 0) >= int(min_context_tokens)
+            ]
+            if not fitting_models:
+                raise ContextWindowExceededError(
+                    f"No configured {actual_capability} model fits {int(min_context_tokens):,} tokens."
+                )
+
+        while retry_forever or loop < max_loops:
+            if callable(abort_check) and abort_check():
+                raise AllProvidersExhaustedError("Free-agent request cancelled.")
+
+            routes = self._route(
+                capability,
+                preferred_provider,
+                images,
+                image_urls,
+                min_context_tokens=min_context_tokens,
+                prefer_context=prefer_context,
+            )
 
             # All providers rate-limited — wait and loop back
             if not routes:
-                if loop >= max_loops - 1:
+                if not retry_forever and loop >= max_loops - 1:
                     raise AllProvidersExhaustedError(
-                        "All providers exhausted after 100 retry cycles."
-                    )
-                wait = self._get_shortest_cooldown()
-                time.sleep(wait)
+                        f"No eligible providers after {max_loops} retry cycles."
+                    ) from last_error
+                wait = self._get_shortest_cooldown() if not min_context_tokens else min(60.0, 5.0 * (2 ** min(loop, 4)))
+                _sleep_with_abort(wait, abort_check)
+                loop += 1
                 continue
 
-            last_error: Optional[Exception] = None
+            context_error: Optional[Exception] = None
             for client, model_id in routes:
                 try:
                     overrides["model"] = model_id
                     has_media = (images and len(images) > 0) or (image_urls and len(image_urls) > 0)
 
-                    if has_media:
+                    if return_info or native_messages is not None or native_tools is not None:
+                        result = client.chat_with_info(
+                            task,
+                            messages=native_messages,
+                            tools=native_tools,
+                            tool_choice=native_tool_choice,
+                            **overrides,
+                        )
+                    elif has_media:
                         result = client.chat_multimodal(
                             task, images=images, image_urls=image_urls, **overrides
                         )
@@ -990,11 +1166,26 @@ class FreeAgent:
                         result = client.chat(task, **overrides)
 
                     client.rate_limiter.record_request()
+                    if return_info:
+                        result_text = str(result.get("reply", "") if isinstance(result, dict) else result or "")
+                        has_tool_calls = bool(result.get("tool_calls")) if isinstance(result, dict) else False
+                    else:
+                        result_text = str(result or "")
+                        has_tool_calls = False
+                    if retry_forever and not result_text.strip() and not has_tool_calls:
+                        last_error = FreeAgentError(
+                            "provider returned an empty response",
+                            provider=client.name,
+                        )
+                        continue
                     self._last_provider = client.name
                     return result
 
                 except FreeAgentError as e:
                     last_error = e
+                    if context_sensitive and _is_context_window_error(e):
+                        context_error = e
+                        continue
                     if e.status == 401:
                         # Auth error — skip this provider entirely
                         continue
@@ -1007,17 +1198,47 @@ class FreeAgent:
                         continue
                 except Exception as e:
                     last_error = e
+                    if context_sensitive and _is_context_window_error(e):
+                        context_error = e
+                        continue
                     continue
 
+            if context_sensitive and context_error is not None:
+                # Do not retry an impossible full request forever. The
+                # compactor catches this and switches to chronological chunks.
+                raise ContextWindowExceededError(
+                    str(context_error),
+                    provider=getattr(context_error, "provider", ""),
+                    status=getattr(context_error, "status", 0),
+                ) from context_error
+
             # All providers in this round failed — wait, then loop back to start
-            if loop < max_loops - 1:
+            if retry_forever or loop < max_loops - 1:
                 wait = self._get_shortest_cooldown()
-                time.sleep(wait)
+                _sleep_with_abort(wait, abort_check)
+                loop += 1
                 continue
 
         raise AllProvidersExhaustedError(
             f"All providers failed after {max_loops} retry cycles. Last error: {last_error}"
         ) from last_error
+
+    def chat_with_info(
+        self,
+        messages: list[dict],
+        capability: str = "text",
+        preferred_provider: Optional[str] = None,
+        **overrides,
+    ) -> dict:
+        """Send an exact native-message conversation and return tool metadata."""
+        return self.chat(
+            "",
+            capability=capability,
+            preferred_provider=preferred_provider,
+            messages=messages,
+            _return_info=True,
+            **overrides,
+        )
 
     def stream(
         self,
@@ -1030,7 +1251,7 @@ class FreeAgent:
     ):
         """Stream a response from the best available provider.
 
-        Loops back through providers indefinitely when exhausted.
+        Tries the configured provider routes within the bounded retry policy.
         """
         max_loops = MAX_PROVIDER_RETRY_CYCLES
         for loop in range(max_loops):
@@ -1038,7 +1259,9 @@ class FreeAgent:
 
             if not routes:
                 if loop >= max_loops - 1:
-                    raise AllProvidersExhaustedError("No available providers for streaming after 100 retries.")
+                    raise AllProvidersExhaustedError(
+                        f"No available providers for streaming after {max_loops} retry cycles."
+                    )
                 time.sleep(self._get_shortest_cooldown())
                 continue
 
@@ -1197,7 +1420,7 @@ def _check_versions(args=None):
 
     OpenRouter/Kilo expose dated model IDs -> authoritative.
     Cline's chat response reports the real upstream build in the model field.
-    OpenCode Zen / NVIDIA NIM expose no version info -> unverifiable.
+    OpenCode / NVIDIA NIM expose no version info -> unverifiable.
     """
     import datetime
     import urllib.error
@@ -1278,8 +1501,8 @@ def _check_versions(args=None):
         except Exception as e:
             print(f"  live probe failed: {e}")
 
-    # OpenCode Zen / NVIDIA NIM: no version info exposed
-    print("\n-- OpenCode Zen --")
+    # OpenCode / NVIDIA NIM: no version info exposed
+    print("\n-- OpenCode --")
     print("  'deepseek-v4-flash-free' - unverifiable via API (no build date exposed); Zen refreshes in place")
     print("\n-- NVIDIA NIM --")
     print("  'deepseek-ai/deepseek-v4-flash' - unverifiable via API (no build date exposed); NIM refreshes in place")
@@ -1321,61 +1544,27 @@ def _cli_chat(args):
 #  General Profile Helper
 # ----------------------------------------------------------------------
 
-def build_general_profile_prompt() -> str:
-    """Build a prompt prefix from general_profile.json for General mode.
-    Returns empty string if profile doesnt exist or has no content.
-    """
-    gp_path = r"d:\MyProject\LangChain\.deep_agents\general_profile.json"
-    if not os.path.isfile(gp_path):
-        return ""
-    try:
-        with open(gp_path, "r", encoding="utf-8") as f:
-            gp = json.load(f)
-        lines = []
-        user = gp.get("user_info", {})
-        for key, label in [("name", "User"), ("birthday", "Birthday"), ("education", "Education")]:
-            val = user.get(key, "")
-            if val:
-                lines.append(label + ": " + val)
-        inst = gp.get("instructions", "")
-        if inst:
-            lines.append("Preferences: " + inst)
-        mem = gp.get("memory", [])
-        for m in mem:
-            lines.append("Reminder: " + m)
-        if not lines:
-            return ""
-        return "\n".join(lines) + "\n\n---\n\n"
-    except Exception:
-        return ""
-
-
-
-
 def run_freeagent_direct(prompt, chat_id="", images=None):
-    """Run FreeAgent directly with a tool loop, skipping the orchestrator.
-    Used for General mode chat. Yields state dicts (same format as run_and_sync_graph).
-    """
-    import time, json as _json, re, traceback
-    from sync.state_sync import shared_state, safe_update_state, safe_serialize_state
+    """Run General-mode FreeAgent with native tools and an exact transcript.
 
-    profile = build_general_profile_prompt()
-    tools_desc = (
-        "You have these tools available:\n"
-        "- run_command(command) - Full POSIX bash (curl for research)\n"
-        "- run_command(command) - Full POSIX bash (curl for research)\n"
-        "- browser_navigate(url) - Open a webpage\n"
-        "- browser_extract(what?, selector?) - Get page content\n"
-        "- browser_screenshot(path?) - Take a screenshot\n"
-        "- browser_click(selector) - Click an element\n"
-        "- browser_fill(selector, text) - Fill an input\n"
-        "- create_docx(file_path, title?, content?) - Create Word doc\n"
-        "- create_xlsx(file_path, headers, rows) - Create Excel\n"
-        "- read_pdf(file_path) - Read a PDF\n\n"
-        "When you need to use a tool, output:\n"
-        "```tool\n{\"tool\": \"tool_name\", \"args\": {\"param\": \"value\"}}\n```\n"
-        "Then wait for the result and continue."
-    )
+    This path is intentionally terminal: it does not delegate to the
+    orchestrator and it does not translate model output through a text tool
+    protocol. Providers receive the same structured assistant/tool messages
+    that they returned, so each tool result is attached to its call id.
+    """
+    import json as _json, traceback
+    from sync.state_sync import shared_state, safe_update_state, safe_serialize_state
+    from agents.free_agent_prompt import _FREE_AGENT_SYSTEM_TEMPLATE
+    from tools import execute_tool_detailed, get_registry
+    from tools._schemas import get_native_tools
+
+    native_tools = get_native_tools("free_agent")
+    allowed_tool_names = {
+        item["function"]["name"]
+        for item in native_tools
+        if isinstance(item, dict) and isinstance(item.get("function"), dict)
+    }
+    get_registry().restrict_scope("FreeAgent", allow=sorted(allowed_tool_names))
 
     chat_history = ""
     if chat_id:
@@ -1385,54 +1574,65 @@ def run_freeagent_direct(prompt, chat_id="", images=None):
         except Exception:
             pass
 
-    system_note = "You are FreeAgent, a general-purpose assistant. Be concise and helpful."
-    parts = []
-    if profile:
-        parts.append(profile)
-    parts.append(system_note)
-    parts.append(tools_desc)
+    parts = [_FREE_AGENT_SYSTEM_TEMPLATE]
     if chat_history:
         parts.append("## Chat History\n" + chat_history)
-    parts.append("## User\n" + prompt)
-    full_prompt = "\n\n".join(parts)
+    system_prompt = "\n\n".join(parts)
 
     safe_update_state({"live_terminal_log": "[FreeAgent] Processing...\n", "outputs": {}})
     yield _json.loads(safe_serialize_state())
 
     try:
         agent = FreeAgent()
-        conversation = [{"role": "system", "content": full_prompt}]
+        user_content = prompt
+        if images:
+            content_parts: list[dict] = [{"type": "text", "text": prompt}]
+            for image_path in images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": ProviderClient._image_to_data_uri(image_path)},
+                })
+            user_content = content_parts
 
-        for iteration in range(10):
-            last_msg = conversation[-1]["content"]
-            # Only the first turn contains the user's visual context. Follow-up
-            # tool turns are text-only, so we do not repeatedly re-upload files.
-            # P10: prefer token streaming (live deltas to the StreamBus); fall
-            # back to a plain chat call if the provider stream fails.
-            response = ""
-            _emit_chat = chat_id or str(shared_state.get("chat_id") or "")
+        conversation = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        emit_chat = chat_id or str(shared_state.get("chat_id") or "")
+
+        def _is_aborted() -> bool:
+            if not emit_chat:
+                return False
             try:
-                for _tok in agent.stream(task=last_msg, images=images if iteration == 0 else None):
-                    response += _tok
-                    try:
-                        from stream_bus import emit as _bus_emit
-                        _bus_emit(_emit_chat, "text", _tok, agent="FreeAgent")
-                    except Exception as _bus_err:
-                        print(f"[FreeAgent] bus emit skipped: {_bus_err}")
-            except Exception as _stream_err:
-                print(f"[FreeAgent] stream failed, falling back to chat: {_stream_err}")
-                response = agent.chat(task=last_msg, images=images if iteration == 0 else None)
-            if not response:
-                response = agent.chat(task=last_msg, images=images if iteration == 0 else None)
+                from inbox import consume_abort
+                return bool(consume_abort(emit_chat))
+            except Exception:
+                return False
 
-            tool_calls = []
-            for match in re.finditer(r'```tool\n(.*?)\n```', response, re.DOTALL):
+        while True:
+            if _is_aborted():
+                safe_update_state({
+                    "live_terminal_log": "[FreeAgent] Cancelled\n",
+                    "outputs": {"agent_report": "Cancelled by user."},
+                })
+                yield _json.loads(safe_serialize_state())
+                return
+
+            info = agent.chat_with_info(
+                messages=conversation,
+                tools=native_tools,
+                capability="vision" if images else "text",
+                abort_check=_is_aborted,
+            )
+            response = str(info.get("reply", "") or "")
+            tool_calls = list(info.get("tool_calls") or [])
+
+            if response and emit_chat:
                 try:
-                    tc = _json.loads(match.group(1))
-                    if "tool" in tc:
-                        tool_calls.append(tc)
-                except _json.JSONDecodeError:
-                    continue
+                    from stream_bus import emit as _bus_emit
+                    _bus_emit(emit_chat, "text", response, agent="FreeAgent")
+                except Exception as _bus_err:
+                    print(f"[FreeAgent] bus emit skipped: {_bus_err}")
 
             if not tool_calls:
                 safe_update_state({
@@ -1442,24 +1642,41 @@ def run_freeagent_direct(prompt, chat_id="", images=None):
                 yield _json.loads(safe_serialize_state())
                 return
 
-            for tc in tool_calls:
-                tool_name = tc.get("tool", "")
-                args = tc.get("args", {})
+            conversation.append({
+                "role": "assistant",
+                "content": response or "",
+                "tool_calls": [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": _json.dumps(call["args"], separators=(",", ":")),
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
+
+            for call in tool_calls:
+                tool_name = call["name"]
+                args = call["args"]
                 safe_update_state({"live_terminal_log": "[FreeAgent] Using " + tool_name + "...\n"})
                 yield _json.loads(safe_serialize_state())
                 try:
-                    from tools import execute_tool
-                    result = execute_tool(tool_name, args)
+                    if tool_name not in allowed_tool_names:
+                        result = f"[BLOCKED] Tool '{tool_name}' is not available to FreeAgent."
+                    else:
+                        execution = execute_tool_detailed(tool_name, args, scope="FreeAgent")
+                        result = execution.content
                 except Exception as e:
                     result = "Error: " + str(e)
-                conversation.append({"role": "assistant", "content": response})
-                conversation.append({"role": "user", "content": "Tool " + tool_name + " returned:\n" + str(result)[:5000]})
-
-        safe_update_state({
-            "live_terminal_log": "[FreeAgent] Max iterations reached\n",
-            "outputs": {"agent_report": "I reached the maximum number of tool iterations."},
-        })
-        yield _json.loads(safe_serialize_state())
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": tool_name,
+                    "content": str(result),
+                })
 
     except Exception as e:
         safe_update_state({

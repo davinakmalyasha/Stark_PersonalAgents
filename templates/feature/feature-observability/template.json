@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 3 (feature): observability — structured JSON logging + filterable log viewer API. Pairs with comp-log-viewer. Stack-prod uses: feature-observability.",
+  "name": "feature-observability",
+  "description": "Structured observability: JSON-line logging with request-id + filterable GET /admin/logs. Pairs with log viewer UI.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/admin/logs)"}
+  ],
+  "files": [
+    {"src": "core/logging.py.j2", "dest": "{{ app_name }}/core/logging.py"},
+    {"src": "routers/ops_logs.py.j2", "dest": "{{ app_name }}/routers/ops_logs.py"}
+  ],
+  "notes": "After applying: 1) call setup_logging() in main.py lifespan, 2) use log_structured() in middleware, 3) app.include_router(router) for logs, 4) frontend comp-log-viewer consumes GET {{ base_path }}/admin/logs.",
+  "sample_vars": {"app_name": "app", "base_path": "/api"}
+}

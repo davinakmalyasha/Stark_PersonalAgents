@@ -1,6 +1,6 @@
 """
 Memory Package
-Provides unified memory management, chat memory, context compaction, daemons, and embedding services.
+Provides unified memory management, chat memory, context compaction, and embedding services.
 """
 import os
 import sys
@@ -17,22 +17,14 @@ _VOICE = os.path.join(_ROOT, "Voice")
 if os.path.isdir(_VOICE) and _VOICE not in sys.path:
     sys.path.insert(0, _VOICE)
 
-from .memory_io import (
-    load_memory,
-    save_memory,
-)
 from .memory_manager import (
-    ensure_memory,
-    update_project_meta,
     load_cached_code_map,
     load_cached_project_identity,
     refresh_code_map,
+    refresh_code_map_context,
+    ensure_project_cache,
     ensure_project_identity,
-    update_feature,
-    append_lesson,
     is_valid_build_request,
-    CODE_MAP_START,
-    CODE_MAP_END,
 )
 from .chat_memory_manager import (
     load_chat_memory,
@@ -43,26 +35,21 @@ from .chat_memory_manager import (
     summarize_previous_day,
     is_continue_command,
 )
-from .memory_consolidation_daemon import (
-    consolidate_memories,
-)
-from .dev_memory_helper import (
-    get_developer_memory_context,
-)
 from .chat_context import (
     build_chat_context,
 )
 from .context_budget import (
     estimate_tokens,
+    estimate_message_tokens,
+    estimate_messages,
 )
 from .context_compaction import (
-    tier1_compact,
-    tier2_compact,
+    CompactionPolicy,
+    get_compaction_policy,
+    compact_history,
     checkpoint_compact,
-    prune_stale_tool_outputs,
+    CheckpointCompactionError,
     build_structured_resume_summary,
-    invalidate_stale_reads,
-    compact_session_log,
     truncation_note,
     strip_thinking,
 )
@@ -87,19 +74,13 @@ from .embedding_service import (
 )
 
 __all__ = [
-    "load_memory",
-    "save_memory",
-    "ensure_memory",
-    "update_project_meta",
     "load_cached_code_map",
     "load_cached_project_identity",
     "refresh_code_map",
+    "refresh_code_map_context",
+    "ensure_project_cache",
     "ensure_project_identity",
-    "update_feature",
-    "append_lesson",
     "is_valid_build_request",
-    "CODE_MAP_START",
-    "CODE_MAP_END",
     "load_chat_memory",
     "save_chat_memory",
     "add_chat_message",
@@ -107,17 +88,16 @@ __all__ = [
     "summarize_session_chunk",
     "summarize_previous_day",
     "is_continue_command",
-    "consolidate_memories",
-    "get_developer_memory_context",
     "build_chat_context",
     "estimate_tokens",
-    "tier1_compact",
-    "tier2_compact",
+    "estimate_message_tokens",
+    "estimate_messages",
+    "CompactionPolicy",
+    "get_compaction_policy",
+    "compact_history",
     "checkpoint_compact",
-    "prune_stale_tool_outputs",
+    "CheckpointCompactionError",
     "build_structured_resume_summary",
-    "invalidate_stale_reads",
-    "compact_session_log",
     "truncation_note",
     "strip_thinking",
     "embed",

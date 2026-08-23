@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 4 (component): ops dashboard — error rate, p95, rate-limit KPIs. Pairs with observability. Stack-prod uses: comp-ops-dashboard.",
+  "name": "comp-ops-dashboard",
+  "description": "Ops dashboard: error rate, p95 latency, rate-limited KPIs. Pairs with observability.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "React components directory"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix"}
+  ],
+  "files": [
+    {"src": "OpsDashboard.tsx.j2", "dest": "[[ components_dir ]]/OpsDashboard.tsx"}
+  ],
+  "notes": "After applying: extend comp-dashboard pattern but ops-focused. Backend should aggregate from observability logs + rate-limit counters. Stack-prod will include this.",
+  "sample_vars": {"components_dir": "src/components", "base_path": "/api"},
+  "delimiters": ["[[", "]]", "<%", "%>"]
+}

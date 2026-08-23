@@ -3,6 +3,7 @@ import { X, Minimize2, Maximize2, Search, Download } from 'lucide-react';
 import type { ChatMessage, AppState, ModelOption } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
+import PlanDock from './PlanDock';
 import MessageStream from './MessageStream';
 
 interface Props {
@@ -40,7 +41,7 @@ export default function ChatView({
   hasActiveChat, notification,
   onSend, onCancel, onClearNotification,
   isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
-  selectedModel, models, onModelChange, onRetry,
+  selectedModel, models, onModelChange, onRetry, state,
 }: Props) {
   const [minimized, setMinimized] = useState(false);
   const [activeSubagent, setActiveSubagent] = useState<string | null>(null);
@@ -162,6 +163,7 @@ export default function ChatView({
 
       {/* Always visible Bottom Prompt Dock */}
       <div className="border-t border-zinc-800/50 flex-shrink-0">
+        <PlanDock plan={state?.plan} />
         <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} />
       </div>
     </div>

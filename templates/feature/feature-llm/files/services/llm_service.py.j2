@@ -1,0 +1,65 @@
+"""LLM chat service: prompt assembly + per-user token usage tracking."""
+from datetime import datetime
+
+from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy.orm import Session
+
+from ..core.llm_client import complete, stream_chat
+from ..database import Base
+
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+class LLMUsage(Base):
+    """One row per completion call — cheap analytics for /usage."""
+    __tablename__ = "llm_usage"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    model = Column(String(80), default="{{ llm_model }}", nullable=False)
+    prompt_chars = Column(Integer, default=0, nullable=False)
+    completion_chars = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # TODO: store provider-reported usage tokens if your gateway returns them.
+
+
+def build_messages(history: list[dict], user_text: str) -> list[dict]:
+    """history: [{"role": "user"|"assistant", "content": str}, ...] (oldest first)."""
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs.extend(history[-20:])  # bound context
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+
+def chat(db: Session, user_id: int, history: list[dict], user_text: str) -> tuple[str, int]:
+    """Blocking completion. Returns (text, prompt_chars)."""
+    messages = build_messages(history, user_text)
+    text = complete(messages)
+    db.add(LLMUsage(user_id=user_id, prompt_chars=sum(len(m["content"]) for m in messages),
+                    completion_chars=len(text)))
+    db.commit()
+    return text, sum(len(m["content"]) for m in messages)
+
+
+def chat_stream(db: Session, user_id: int, history: list[dict], user_text: str):
+    """Generator for SSE endpoints — records usage after the stream drains."""
+    messages = build_messages(history, user_text)
+    prompt_chars = sum(len(m["content"]) for m in messages)
+    collected = []
+
+    def _gen():
+        full = []
+        try:
+            for delta in stream_chat(messages):
+                full.append(delta)
+                yield delta
+        finally:
+            db.add(LLMUsage(user_id=user_id, prompt_chars=prompt_chars,
+                            completion_chars=sum(len(d) for d in full)))
+            db.commit()
+
+    return _gen()
+
+
+# TODO: add per-user daily quotas (count LLMUsage rows) before chat().

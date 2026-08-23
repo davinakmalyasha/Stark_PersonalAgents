@@ -1,0 +1,25 @@
+"""Ops log viewer API — filterable JSON lines for {{ app_name }}."""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from ..core.security import get_current_user
+from ..database import get_db
+
+router = APIRouter(prefix="{{ base_path }}/admin/logs", tags=["ops"])
+
+
+@router.get("")
+def list_logs(
+    level: str = Query(default=""),
+    q: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=500),
+    claims: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # TODO: require_role("admin") from feature-rbac
+    # Stub: in production, tail the JSON log file or query Loki/ELK.
+    # This stub returns in-memory recent logs (replace with file tail).
+    return {"level": level, "q": q, "logs": [], "note": "Wire to core/logging.py JSON file tail or Loki query here."}
+
+
+# TODO: register router in main.py: app.include_router(router)

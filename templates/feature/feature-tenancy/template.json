@@ -1,0 +1,17 @@
+{
+  "_comment": "LEVEL 3 (feature): multi-tenancy — tenants + memberships + request-scoped tenant resolution and a scoped() query helper. Row-level scoping (tenant_id column), pairs with feature-auth.",
+  "name": "feature-tenancy",
+  "description": "Multi-tenant foundation: Tenant model + memberships, X-Tenant-Slug resolution dependency, require_role guard, and scoped(query, tenant_id) helper for row-level isolation.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api' (drives all nested imports)"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/tenants)"}
+  ],
+  "files": [
+    {"src": "models/tenant.py.j2", "dest": "{{ app_name }}/models/tenant.py"},
+    {"src": "core/tenancy.py.j2", "dest": "{{ app_name }}/core/tenancy.py"},
+    {"src": "routers/tenants.py.j2", "dest": "{{ app_name }}/routers/tenants.py"}
+  ],
+  "notes": "After applying: 1) import models.tenant in main.py so tables are created, 2) add tenant_id Integer FK column to every business model you want isolated, then wrap queries with tenancy.scoped(stmt, tenant.id), 3) resolve the active tenant per request via Depends(get_current_tenant) (X-Tenant-Slug header or the user's single membership), 4) owner-only routes use Depends(require_role('admin')). Requires feature-auth for get_current_user/users table.",
+  "sample_vars": {"app_name": "app", "base_path": "/api"}
+}

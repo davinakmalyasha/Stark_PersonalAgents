@@ -1,0 +1,20 @@
+{
+  "_comment": "LEVEL 3 (feature): search infra — Meilisearch/Typesense client + indexing + query. Composes with feature-crud/comp-search-filter for full-stack search. Stack-saas future: feature-search-infra will be in stack-saas uses[].",
+  "name": "feature-search-infra",
+  "description": "Full-text search infra: Meilisearch/Typesense HTTP client, index + search with ranking, health endpoint. Pairs with comp-search-filter for SQL fallback.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/search)"},
+    {"name": "search_provider", "type": "string", "default": "meilisearch", "description": "Search provider: meilisearch or typesense"},
+    {"name": "search_url", "type": "string", "default": "http://localhost:7700", "description": "Search engine URL"},
+    {"name": "search_index", "type": "string", "default": "items", "description": "Default index/collection name"}
+  ],
+  "files": [
+    {"src": "core/search_config.py.j2", "dest": "{{ app_name }}/core/search_config.py"},
+    {"src": "services/search_service.py.j2", "dest": "{{ app_name }}/services/search_service.py"},
+    {"src": "routers/search.py.j2", "dest": "{{ app_name }}/routers/search.py"}
+  ],
+  "notes": "After applying: 1) set SEARCH_URL + SEARCH_API_KEY in .env, 2) app.include_router(router) in main.py, 3) create index on first index_document call. For stack-saas: this will be composed via uses[] in stack-saas. Requires httpx. Composes with comp-search-filter for list filtering fallback.",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "search_provider": "meilisearch", "search_url": "http://localhost:7700", "search_index": "items"}
+}

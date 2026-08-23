@@ -3,20 +3,19 @@ import sys
 import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from loop_detector import LoopGuard
+from llm.loop_detector import LoopGuard
 
 class TestLoopDetectorOptimization(unittest.TestCase):
-    def test_stale_read_detection(self):
-        # 1. Reading the same file multiple times without edit
+    def test_exact_repeat_is_advisory(self):
+        # Repeated calls receive a warning; the controller never skips or aborts.
         log = [
             {"tool": "read_file", "args": {"file_path": "a.py"}, "result_preview": "some content"},
             {"tool": "read_file", "args": {"file_path": "a.py"}, "result_preview": "some content"},
         ]
-        # Third read of same file with same offset/limit
         res = LoopGuard.check_pre_execute(log, "read_file", {"file_path": "a.py"})
         self.assertIsNotNone(res)
-        self.assertEqual(res[0], "STALE")
-        self.assertIn("already read 3 times", res[1])
+        self.assertEqual(res[0], "WARNING")
+        self.assertIn("exact call #3", res[1])
 
     def test_reset_on_edit(self):
         # 2. Writing/editing resets stale check
@@ -31,29 +30,23 @@ class TestLoopDetectorOptimization(unittest.TestCase):
     def assertNullOrNone(self, val):
         self.assertTrue(val is None)
 
-    def test_identical_calls_count_warning_and_abort(self):
-        # 3. Warning at 3 same calls, abort at 4 (list_files reads)
+    def test_identical_calls_warn_without_abort(self):
+        # The first warning is emitted on the third exact consecutive call.
         log = [
             {"tool": "list_files", "args": {"path": "."}},
             {"tool": "list_files", "args": {"path": "."}},
         ]
-        # 3rd call
-        res = LoopGuard.check_pre_execute(log, "list_files", {"path": "."})
-        self.assertNullOrNone(res) # same_count is 2 (less than warning threshold of 3)
-
-        # Append 3rd call
-        log.append({"tool": "list_files", "args": {"path": "."}})
-        # 4th call (same_count is 3)
         res = LoopGuard.check_pre_execute(log, "list_files", {"path": "."})
         self.assertIsNotNone(res)
         self.assertEqual(res[0], "WARNING")
 
-        # Append 4th call
         log.append({"tool": "list_files", "args": {"path": "."}})
-        # 5th call (same_count is 4)
         res = LoopGuard.check_pre_execute(log, "list_files", {"path": "."})
-        self.assertIsNotNone(res)
-        self.assertEqual(res[0], "ABORT")
+        self.assertIsNone(res)
+
+        log.append({"tool": "list_files", "args": {"path": "."}})
+        res = LoopGuard.check_pre_execute(log, "list_files", {"path": "."})
+        self.assertIsNone(res)
 
 if __name__ == '__main__':
     unittest.main()

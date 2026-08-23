@@ -1,0 +1,27 @@
+"""Deterministic perf smoke — extend with your app's real budgets.
+
+Runs in the gate's perf-smoke job (tests/test_perf_smoke.py). Keep every
+assertion time-bounded so the gate stays deterministic.
+"""
+import time
+
+
+def test_import_time_budget():
+    """Importing the app must stay under 5s (catches dependency bloat early)."""
+    import subprocess
+    import sys
+
+    start = time.time()
+    r = subprocess.run(
+        [sys.executable, "-c", "import app.main"],
+        capture_output=True,
+        timeout=30,
+    )
+    elapsed = time.time() - start
+    # TODO: replace `app.main` with your real entry module if different.
+    assert r.returncode == 0, f"import failed: {r.stderr.decode()[:300]}"
+    assert elapsed < 5.0, f"import took {elapsed:.1f}s (budget 5s)"
+
+
+# TODO: add endpoint-level budgets here once deployed behind uvicorn:
+#   def test_health_latency(client): assert client.get('/health').elapsed < 200ms

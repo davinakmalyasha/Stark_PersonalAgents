@@ -45,7 +45,7 @@ try:
 except Exception:
     pass
 
-from llm.llm_config import TASK_CATEGORIES, get_task_category
+from llm.llm_config import TASK_CATEGORIES, get_task_category, DEEPSEEK_MODEL_VISION, supports_vision
 
 class StrWithMetadata(str):
     def __new__(cls, value, reasoning=None):
@@ -59,9 +59,25 @@ from llm.llm_stats import TokenUsageTracker, update_token_stats
 load_dotenv(override=True)
 T = TypeVar("T", bound=BaseModel)
 
-# Override to route DeepSeek calls through a compatible gateway (e.g. OpenCode Zen:
-# DEEPSEEK_BASE_URL=https://opencode.ai/zen/v1 with OPENCODE_API_KEY set) temporarily.
+# Override to route DeepSeek calls through a compatible gateway (e.g. OpenCode Go:
+# DEEPSEEK_BASE_URL=https://opencode.ai/zen/go/v1 with OPENCODE_API_KEY set) temporarily.
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+
+def _messages_have_images(messages: list) -> bool:
+    """True if any message carries an image content part.
+
+    Accepts every common image-part spelling (OpenAI image_url, Anthropic image,
+    Responses input_image). Only user-role parts are valid to the API, but the
+    presence check is role-agnostic on purpose: an image anywhere means the
+    call must go to a vision model or it will hard-400."""
+    for msg in messages or []:
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image"):
+                    return True
+    return False
 
 
 def _is_off_peak() -> bool:
@@ -172,7 +188,7 @@ def _resolve_llm_provider() -> dict:
 
     Resolution order: shared_state['llm_provider'] (running server / UI) → persisted file
     (survives subprocesses and restarts) → env default. "opencode" routes paid DeepSeek calls
-    through OpenCode Zen (https://opencode.ai/zen/v1, OPENCODE_API_KEY); anything else uses the
+    through OpenCode Go (https://opencode.ai/zen/go/v1, OPENCODE_API_KEY); anything else uses the
     direct DeepSeek API (or DEEPSEEK_BASE_URL if set). Pro maps to flash on OpenCode.
     """
     provider = ""
@@ -192,6 +208,7 @@ def _resolve_llm_provider() -> dict:
             "key": os.getenv("OPENCODE_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", ""),
             "flash": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4-flash"),
             "pro": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4-flash"),
+            "vision": os.getenv("DEEPSEEK_MODEL_VISION", DEEPSEEK_MODEL_VISION),
         }
     # default: direct DeepSeek API (or DEEPSEEK_BASE_URL override from .env)
     return {
@@ -199,16 +216,21 @@ def _resolve_llm_provider() -> dict:
         "key": os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("OPENCODE_API_KEY", ""),
         "flash": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4-flash"),
         "pro": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4-pro"),
+        "vision": os.getenv("DEEPSEEK_MODEL_VISION", DEEPSEEK_MODEL_VISION),
     }
 
 
 def _map_model(model: str) -> str:
-    """Map a canonical model name (deepseek-v4-flash/pro) to the active provider's name."""
+    """Map a canonical model name (deepseek-v4-flash/pro/vision-exp) to the active provider's name."""
     cfg = _resolve_llm_provider()
     if model == "deepseek-v4-flash":
         return cfg["flash"]
     if model == "deepseek-v4-pro":
         return cfg["pro"]
+    if model in (DEEPSEEK_MODEL_VISION, "deepseek-v4-flash-vision-exp"):
+        # Same slug on the DeepSeek API and the OpenCode Go listing; env
+        # override covers any gateway that names it differently.
+        return os.getenv("DEEPSEEK_MODEL_VISION", DEEPSEEK_MODEL_VISION)
     return model
 
 
@@ -221,7 +243,7 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
         raise ValueError(
             "DEEPSEEK_API_KEY not set in .env. "
             "Get one at https://platform.deepseek.com/api_keys (or set OPENCODE_API_KEY "
-            "when routing through OpenCode Zen)."
+            "when routing through OpenCode Go)."
         )
 
     # No per-call max_tokens — the model decides how much to output.
@@ -346,8 +368,7 @@ class ConcurrencyThrottle:
         while True:
             with self.lock:
                 now = time.time()
-                is_economic = os.environ.get("DEEP_AGENTS_LLM_MODE", "").upper() == "ECONOMIC"
-                limit = 1 if (is_economic or now < self.cooldown_until) else self.max_concurrency
+                limit = 1 if now < self.cooldown_until else self.max_concurrency
                 if self.active_requests < limit:
                     self.active_requests += 1
                     break
@@ -475,7 +496,15 @@ def _handle_rate_limit(err_str: str, attempt: int) -> int:
     return min(max(wait, 1), 60)  # 1s floor, 60s cap
 
 
-def _log_cache_debug(messages, tracker, role: str, model: str) -> None:
+def _log_cache_debug(
+    messages,
+    tracker,
+    role: str,
+    model: str,
+    tools: Optional[list[dict]] = None,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+) -> None:
     """CF3: CACHE_DEBUG=1 → log a payload-content hash + cache tokens per call.
 
     DeepSeek prefix caching is a byte-prefix match. If cache_hit stays 0 across
@@ -486,10 +515,34 @@ def _log_cache_debug(messages, tracker, role: str, model: str) -> None:
         return
     try:
         import hashlib
-        payload = "".join(str(getattr(m, "content", "")) for m in messages)
+        message_payload = []
+        for message in messages:
+            item = {
+                "type": type(message).__name__,
+                "content": getattr(message, "content", ""),
+            }
+            for field in ("name", "tool_call_id", "tool_calls", "additional_kwargs"):
+                if hasattr(message, field):
+                    item[field] = getattr(message, field)
+            message_payload.append(item)
+        payload = json.dumps(
+            {
+                "messages": message_payload,
+                # Tool schemas and thinking configuration are request inputs
+                # even though they are not LangChain message objects.
+                "tools": tools or [],
+                "reasoning_effort": reasoning_effort,
+                "reasoning_budget": reasoning_budget,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
         digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:16]
         log_terminal(
             f"[CACHE-DEBUG] role={role} model={model} payload_sha={digest} len={len(payload)} "
+            f"tools={len(tools or [])} reasoning={reasoning_effort or 'default'} "
             f"in={getattr(tracker, 'input_tokens', 0)} out={getattr(tracker, 'output_tokens', 0)} "
             f"cache_hit={getattr(tracker, 'cache_hit_tokens', 0)}\n"
         )
@@ -511,9 +564,6 @@ def invoke_with_fallback(
     category = get_task_category(role)
     queue = TASK_CATEGORIES[category].copy()
 
-    # Under ECONOMIC mode, strip out any 'pro' models from the queue
-    if os.environ.get("DEEP_AGENTS_LLM_MODE", "").upper() == "ECONOMIC":
-        queue = [item for item in queue if "pro" not in item["model"].lower()]
     # Map canonical model names to the active provider's models (deepseek | opencode)
     queue = [{"provider": item["provider"], "model": _map_model(item["model"])} for item in queue]
 
@@ -535,7 +585,6 @@ def invoke_with_fallback(
     for item in queue:
         model = item["model"]
         try:
-            off_peak = " [Off-Peak Discount Active]" if _is_off_peak() else ""
             if role != "MemoryArchivist":
                 # Show what the agent is working on, not just the model name
                 action = where[:120].replace('\n', ' ').strip() if where else "processing..."
@@ -717,22 +766,51 @@ def _compact_prompt(text: str) -> str:
     return "\n".join(compacted_lines)
 
 
-def strip_thinking_from_messages(messages: list, strip: bool = True) -> list:
-    """Claude Code-style Thinking Block Stripping.
+def _message_has_tool_calls(message: Any) -> bool:
+    """Return whether an AI message participates in a native tool-call round trip.
 
-    Removes `reasoning_content` from the `additional_kwargs` of every AI message in
-    the outgoing payload. Reasoning from PREVIOUS turns already happened, adds nothing
-    to the next completion, and only re-sends those tokens as cache-miss input.
-    DeepSeek docs: reasoning does not need to participate in context concatenation.
-    `tool_calls` and all other kwargs are preserved (required for native function
-    calling). Applied uniformly from turn 1 so the provider's prefix cache stays
-    consistent. When `strip` is False the message list is returned unchanged.
+    LangChain normally exposes calls through ``AIMessage.tool_calls``. Some
+    OpenAI-compatible responses keep the raw calls in ``additional_kwargs``
+    instead, so check both representations before deciding whether DeepSeek's
+    ``reasoning_content`` may be removed.
+    """
+    try:
+        if getattr(message, "tool_calls", None):
+            return True
+    except Exception:
+        pass
+    try:
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        return bool(
+            isinstance(additional_kwargs, dict)
+            and additional_kwargs.get("tool_calls")
+        )
+    except Exception:
+        return False
+
+
+def strip_thinking_from_messages(messages: list, strip: bool = True) -> list:
+    """Remove only discardable previous DeepSeek reasoning.
+
+    DeepSeek allows ``reasoning_content`` to be omitted from an assistant turn
+    that did not call a tool. It requires the reasoning to be replayed for an
+    assistant turn that did call a tool, including all later requests in that
+    tool-call conversation. Preserve the latter while stripping the former to
+    reduce prompt size without breaking the native tool protocol.
+
+    When ``strip`` is False the message list is returned unchanged.
     """
     if not strip:
         return messages
     out = []
     for msg in messages:
-        if type(msg).__name__ == "AIMessage" and hasattr(msg, "additional_kwargs") and isinstance(msg.additional_kwargs, dict) and "reasoning_content" in msg.additional_kwargs:
+        if (
+            type(msg).__name__ == "AIMessage"
+            and hasattr(msg, "additional_kwargs")
+            and isinstance(msg.additional_kwargs, dict)
+            and "reasoning_content" in msg.additional_kwargs
+            and not _message_has_tool_calls(msg)
+        ):
             try:
                 new_msg = msg.model_copy(deep=False)
                 new_msg.additional_kwargs = {k: v for k, v in msg.additional_kwargs.items() if k != "reasoning_content"}
@@ -784,13 +862,11 @@ def _prepare_llm_call(
         pass
 
     trimmed_messages = []
-    # Thinking Block Stripping (Claude Code style): reasoning from PREVIOUS turns is
-    # NOT sent back to the API. It already happened, adds nothing to the next
-    # completion, and only re-sends those tokens as cache-miss input. DeepSeek docs:
-    # reasoning does not need to participate in context concatenation. Tool calls are
-    # preserved (required for native function-calling round trips). Applied uniformly
-    # from turn 1 so the provider's prefix cache stays consistent. STRIP_THINKING=0
-    # restores the old echo behavior for A/B comparison.
+    # Thinking Block Stripping: reasoning from previous text-only turns is NOT
+    # needed for the next completion and only re-sends tokens as input. DeepSeek
+    # requires reasoning_content to remain on every previous assistant turn that
+    # made a tool call, so strip_thinking_from_messages preserves those turns.
+    # STRIP_THINKING=0 restores the old echo behavior for A/B comparison.
     strip_thinking = os.environ.get("STRIP_THINKING", "1").lower() not in ("0", "false", "no", "off")
     if strip_thinking:
         messages = strip_thinking_from_messages(messages)
@@ -806,7 +882,12 @@ def _prepare_llm_call(
                 if hasattr(msg, field):
                     kwargs[field] = getattr(msg, field)
 
-            if strip_thinking and type(msg).__name__ == "AIMessage" and isinstance(kwargs.get("additional_kwargs"), dict):
+            if (
+                strip_thinking
+                and type(msg).__name__ == "AIMessage"
+                and isinstance(kwargs.get("additional_kwargs"), dict)
+                and not _message_has_tool_calls(msg)
+            ):
                 if "reasoning_content" in kwargs["additional_kwargs"]:
                     kwargs["additional_kwargs"] = {
                         k: v for k, v in kwargs["additional_kwargs"].items() if k != "reasoning_content"
@@ -834,7 +915,28 @@ def _prepare_llm_call(
                 for field in ["id", "name", "tool_calls", "additional_kwargs", "tool_call_id"]:
                     if hasattr(last_msg, field):
                         kwargs[field] = getattr(last_msg, field)
-                trimmed_messages[-1] = type(last_msg)(content=str(last_msg.content) + guideline, **kwargs)
+                last_content = last_msg.content
+                if isinstance(last_content, list):
+                    new_content = list(last_content) + [{"type": "text", "text": guideline}]
+                else:
+                    new_content = str(last_content) + guideline
+                trimmed_messages[-1] = type(last_msg)(content=new_content, **kwargs)
+
+    # ── Vision auto-switch ────────────────────────────────────────────────────
+    # If any message carries an image part and the queued head model cannot see
+    # images, swap the ENTIRE queue to the vision model for THIS call only —
+    # text models would hard-400 on images, so falling back to them after a
+    # vision failure is pointless. Next text-only turn reverts to the normal
+    # queue automatically. Single vision model by design (premium/experimental);
+    # extend VISION_MODELS in llm_config when more arrive at normal prices.
+    try:
+        if _messages_have_images(trimmed_messages) and not (queue and supports_vision(queue[0]["model"])):
+            vision_model = _map_model(DEEPSEEK_MODEL_VISION)
+            if supports_vision(vision_model):
+                queue = [{"provider": "deepseek", "model": vision_model}]
+                log_terminal(f"[LLM] Images present → routed to {vision_model}")
+    except Exception:
+        pass
 
     return queue, trimmed_messages, selected_temp
 
@@ -966,7 +1068,6 @@ def invoke_messages_with_fallback_stream(
     for item in queue:
         m = item["model"]
         try:
-            off_peak = " [Off-Peak Discount Active]" if _is_off_peak() else ""
             if role != "MemoryArchivist":
                 action = where[:120].replace('\n', ' ').strip() if where else "processing..."
                 log_terminal(f"[{role}] {action}")
@@ -982,7 +1083,11 @@ def invoke_messages_with_fallback_stream(
                 reasoning_effort=reasoning_effort,
                 reasoning_budget=reasoning_budget,
             )
-            _log_cache_debug(trimmed_messages, tracker, role, m)
+            _log_cache_debug(
+                trimmed_messages, tracker, role, m,
+                tools=tools, reasoning_effort=reasoning_effort,
+                reasoning_budget=reasoning_budget,
+            )
             _emit("end", "\n")
 
             native_tool_calls = _build_native_tool_calls(tool_chunks)
@@ -1029,7 +1134,11 @@ def invoke_messages_with_fallback_stream(
                             reasoning_effort=reasoning_effort,
                             reasoning_budget=reasoning_budget,
                         )
-                        _log_cache_debug(trimmed_messages, tracker, role, m)
+                        _log_cache_debug(
+                            trimmed_messages, tracker, role, m,
+                            tools=tools, reasoning_effort=reasoning_effort,
+                            reasoning_budget=reasoning_budget,
+                        )
                         _emit("end", "\n")
                         native_tool_calls = _build_native_tool_calls(tool_chunks)
                         if tools is not None:
@@ -1092,7 +1201,6 @@ def invoke_messages_with_fallback(
     for item in queue:
         model = item["model"]
         try:
-            off_peak = " [Off-Peak Discount Active]" if _is_off_peak() else ""
             if role != "MemoryArchivist":
                 # Show what the agent is working on, not just the model name
                 action = where[:120].replace('\n', ' ').strip() if where else "processing..."
@@ -1121,7 +1229,11 @@ def invoke_messages_with_fallback(
                 reasoning_effort=reasoning_effort,
                 reasoning_budget=reasoning_budget,
             )
-            _log_cache_debug(trimmed_messages, tracker, role, model)
+            _log_cache_debug(
+                trimmed_messages, tracker, role, model,
+                tools=tools, reasoning_effort=reasoning_effort,
+                reasoning_budget=reasoning_budget,
+            )
             # Return structured result: tuple with (text, tool_calls, reasoning) if tools active
             if tools is not None:
                 if native_tool_calls:
@@ -1181,7 +1293,11 @@ def invoke_messages_with_fallback(
                             reasoning_effort=reasoning_effort,
                             reasoning_budget=reasoning_budget,
                         )
-                        _log_cache_debug(trimmed_messages, tracker, role, model)
+                        _log_cache_debug(
+                            trimmed_messages, tracker, role, model,
+                            tools=tools, reasoning_effort=reasoning_effort,
+                            reasoning_budget=reasoning_budget,
+                        )
                         if tools is not None:
                             if native_tool_calls:
                                 return (val or "", native_tool_calls, reasoning)
@@ -1207,30 +1323,3 @@ def invoke_messages_with_fallback(
         "Check your DEEPSEEK_API_KEY and account balance at https://platform.deepseek.com."
     )
 
-
-def get_llm() -> BaseChatModel:
-    """Get a default LLM client (for legacy callers)."""
-    _cfg = _resolve_llm_provider()
-    if _cfg["key"] and not _cfg["key"].startswith("your_"):
-        return ChatOpenAI(
-            model=_cfg["flash"],
-            api_key=_cfg["key"],
-            base_url=_cfg["base"],
-            temperature=0.1,
-        )
-
-    class MockChatModel(BaseChatModel):
-        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-            from langchain_core.outputs import ChatResult, ChatGeneration
-            from langchain_core.messages import AIMessage
-            return ChatResult(
-                generations=[
-                    ChatGeneration(message=AIMessage(content="Mock response"))
-                ]
-            )
-
-        @property
-        def _llm_type(self) -> str:
-            return "mock"
-
-    return MockChatModel()

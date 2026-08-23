@@ -1,7 +1,7 @@
 {
   "_comment": "LEVEL 5 (stack): a complete recipe for a greenfield project. NOT new code — it composes existing L3/L4 templates, pre-connected into one working project. One call = full backend.",
   "name": "stack-webapp",
-  "description": "Complete FastAPI backend: project-fastapi + feature-errors + feature-auth + feature-crud + github-ci-python + docker-compose + nginx. One call = full greenfield backend.",
+  "description": "Complete FastAPI backend: project-fastapi + feature-errors + feature-auth + feature-crud + security gate (CI included) + docker-compose + nginx. One call = full greenfield backend.",
   "category": "stack",
   "variables": [
     {"name": "project_name", "type": "string", "required": true, "description": "Python package name, e.g. 'demo_api' (drives all nested packages)"},
@@ -14,7 +14,6 @@
     {"template": "feature-errors", "variables": {"app_name": "{{ project_name }}"}},
     {"template": "feature-auth", "variables": {"app_name": "{{ project_name }}"}},
     {"template": "feature-crud", "variables": {"package_dir": "{{ project_name }}"}},
-    "github-ci-python",
     "github-ci-security-python",
     "docker-compose",
     "nginx"

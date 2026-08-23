@@ -73,6 +73,10 @@ def browser_extract(what: str = "text", selector: str = "") -> str:
 def browser_screenshot(path: str = "") -> str:
     """Take a screenshot of the current browser page.
 
+    Saves the PNG to disk AND queues it for inline vision injection: the agent
+    loop drains tools.vision_channel after this ToolMessage and appends the
+    image as a user message, so a vision-capable model can SEE the page.
+
     Args:
         path: Optional file path to save the screenshot. Auto-named if empty.
     """
@@ -85,7 +89,13 @@ def browser_screenshot(path: str = "") -> str:
     result = _browser_cmd(["screenshot", "--full", path], timeout_sec=20)
     if os.path.isfile(path):
         size = os.path.getsize(path)
-        return f"[SCREENSHOT] Saved to {path} ({size} bytes)"
+        try:
+            from tools.vision_channel import queue_image_file
+            queued = queue_image_file(path, note=f"Browser screenshot ({size} bytes)")
+        except Exception:
+            queued = False
+        inline = " — image attached inline (vision)" if queued else ""
+        return f"[SCREENSHOT] Saved to {path} ({size} bytes){inline}"
     return f"(screenshot result: {result})"
 
 def browser_click(selector: str) -> str:

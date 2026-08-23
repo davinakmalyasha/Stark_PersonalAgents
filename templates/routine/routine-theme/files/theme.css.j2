@@ -1,0 +1,38 @@
+/* Theme: CSS variables for light/dark — {{ project_name }} */
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f6f6f6;
+  --text: #111827;
+  --muted: #6b7280;
+  --border: #e5e7eb;
+  --primary: #111827;
+}
+
+[data-theme="dark"] {
+  --bg: #0a0a0a;
+  --bg-soft: #141414;
+  --text: #f9fafb;
+  --muted: #9ca3af;
+  --border: #27272a;
+  --primary: #fafafa;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* Toggle button */
+.theme-toggle {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+/* Usage: wrap app in <div data-theme={theme}> and toggle via localStorage. */

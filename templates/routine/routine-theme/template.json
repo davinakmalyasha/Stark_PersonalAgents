@@ -1,0 +1,14 @@
+{
+  "_comment": "LEVEL routine: theme CSS variables + toggle — dark/light support for every frontend. Stack-saas future: routine-theme will be in stack-webapp-full uses[].",
+  "name": "routine-theme",
+  "description": "Theme: CSS variables for light/dark mode + toggle button. Works with any frontend.",
+  "category": "routine",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Project name for CSS comment header"}
+  ],
+  "files": [
+    {"src": "theme.css.j2", "dest": "src/theme.css"}
+  ],
+  "notes": "After applying: import 'src/theme.css' in main.tsx, wrap app in <div data-theme={theme}> and toggle via button + localStorage. Stack-saas will include this.",
+  "sample_vars": {"project_name": "my-app"}
+}

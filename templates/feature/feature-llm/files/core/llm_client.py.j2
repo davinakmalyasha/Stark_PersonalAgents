@@ -1,0 +1,79 @@
+"""OpenAI-compatible chat-completions client for {{ app_name }} (stdlib httpx).
+
+Streams SSE chunks from any OpenAI-style endpoint. Set the key in the env var
+named by `secret_env` before use.
+"""
+import json
+import os
+from typing import Iterator
+
+import httpx
+
+BASE_URL = "{{ llm_base_url }}"
+MODEL = "{{ llm_model }}"
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+def _api_key() -> str:
+    key = os.environ.get("{{ secret_env }}", "")
+    if not key:
+        raise LLMError("Missing API key: set {{ secret_env }} in .env")
+    return key
+
+
+def stream_chat(
+    messages: list[dict],
+    model: str = MODEL,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+) -> Iterator[str]:
+    """Yield assistant text deltas from an OpenAI-compatible /chat/completions.
+
+    messages: [{"role": "system"|"user"|"assistant", "content": "..."}, ...]
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        with client.stream(
+            "POST",
+            f"{BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {_api_key()}",
+                     "Content-Type": "application/json"},
+            json=payload,
+        ) as resp:
+            if resp.status_code != 200:
+                body = resp.read().decode("utf-8", "replace")[:500]
+                raise LLMError(f"LLM HTTP {resp.status_code}: {body}")
+            for line in resp.iter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    text = delta.get("content") or ""
+                    if text:
+                        yield text
+                except Exception:
+                    continue  # keep-alive / comment lines
+
+
+def complete(messages: list[dict], **kwargs) -> str:
+    """Non-streaming convenience: returns the full assistant message."""
+    return "".join(stream_chat(messages, **kwargs))
+
+
+# TODO: add tool/function-calling passthrough and per-request model override here.

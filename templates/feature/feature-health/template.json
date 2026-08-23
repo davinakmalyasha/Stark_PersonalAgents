@@ -1,0 +1,14 @@
+{
+  "_comment": "LEVEL 3 (feature): health probes — liveness + readiness for k8s. Stack-prod uses: feature-health.",
+  "name": "feature-health",
+  "description": "Health probes: GET /health (liveness) + GET /ready (DB check) for k8s. Unauthenticated.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app'"}
+  ],
+  "files": [
+    {"src": "routers/health.py.j2", "dest": "{{ app_name }}/routers/health.py"}
+  ],
+  "notes": "After applying: app.include_router(router) — no auth, k8s needs it. Liveness: is it alive? Readiness: can it serve? (DB ok?).",
+  "sample_vars": {"app_name": "app"}
+}

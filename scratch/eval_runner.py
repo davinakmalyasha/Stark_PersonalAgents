@@ -30,10 +30,10 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_runs")
 _EVENTS_LOG = os.path.join(_OUTDIR, "_events.jsonl")
-
-
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _emit(kind: str, **fields):
     """Emit a structured progress event — printed live as `[EVENT] {json}` and appended to
     scratch/eval_runs/_events.jsonl so an external agent (e.g. OpenCode) can watch the run."""
@@ -1764,8 +1764,11 @@ def run_single(task_id, keep=False):
 #  Summary
 # ──────────────────────────────────────────────────────────────────────────
 
-def summarize():
+def summarize(task_ids=None):
     files = sorted(glob.glob(os.path.join(_OUTDIR, "*.json")))
+    if task_ids is not None:
+        wanted = set(task_ids)
+        files = [f for f in files if os.path.splitext(os.path.basename(f))[0] in wanted]
     if not files:
         print("no reports yet — run some tasks first")
         return
@@ -1917,14 +1920,29 @@ def main():
         wall_cap = int(os.environ.get("BSA_TASK_WALL_CAP", "2400"))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            proc = subprocess.Popen(cmd, cwd=os.path.dirname(script), env=env, creationflags=flags)
+            proc = subprocess.Popen(
+                cmd,
+                cwd=os.path.dirname(script),
+                env=env,
+                creationflags=flags,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             try:
-                rc = proc.wait(timeout=wall_cap)
+                child_output, _ = proc.communicate(timeout=wall_cap)
+                rc = proc.returncode
             except subprocess.TimeoutExpired:
                 # Wall-cap hit (a stuck repair loop should not eat hours): kill the
                 # whole process tree and record an honest TIMEOUT report.
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                                capture_output=True, timeout=15, creationflags=flags)
+                try:
+                    child_output, _ = proc.communicate(timeout=15)
+                except Exception:
+                    child_output = ""
                 os.makedirs(_OUTDIR, exist_ok=True)
                 with open(os.path.join(_OUTDIR, f"{t['id']}.json"), "w", encoding="utf-8") as f:
                     json.dump({
@@ -1939,7 +1957,8 @@ def main():
                 print(f"    [WALL-CAP TIMEOUT after {wall_cap}s]", flush=True)
                 return
             if rc != 0:
-                print(f"    [child exit {rc}]")
+                tail = (child_output or "").strip()[-2400:]
+                print(f"    [child exit {rc}]" + (f"\n{tail}" if tail else ""), flush=True)
         except Exception as e:
             print(f"    [spawn error: {e}]", flush=True)
 
@@ -1955,7 +1974,7 @@ def main():
         for t in tasks:
             _run_one(t)
 
-    summarize()
+    summarize([t["id"] for t in tasks])
     return 0
 
 

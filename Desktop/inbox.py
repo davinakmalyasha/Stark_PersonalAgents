@@ -141,15 +141,6 @@ def pending_counts(chat_id: str) -> dict:
         }
 
 
-def clear_all(chat_id: str) -> None:
-    with _inboxes_lock:
-        ib = _inboxes.pop(chat_id, None)
-        if ib is not None:
-            with ib.lock:
-                ib.steering.clear()
-                ib.follow_up.clear()
-
-
 def clear_inbox_registry() -> None:
     with _inboxes_lock:
         _inboxes.clear()

@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 4 (component): log viewer UI — filterable table for ops logs. Pairs with feature-observability.",
+  "name": "comp-log-viewer",
+  "description": "Log viewer UI: filterable table for ops logs. Pairs with observability backend.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "React components directory"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix"}
+  ],
+  "files": [
+    {"src": "LogViewer.tsx.j2", "dest": "[[ components_dir ]]/LogViewer.tsx"}
+  ],
+  "notes": "After applying: wire to feature-observability GET {{ base_path }}/admin/logs. Stack-prod will include this for ops log viewing.",
+  "sample_vars": {"components_dir": "src/components", "base_path": "/api"},
+  "delimiters": ["[[", "]]", "<%", "%>"]
+}

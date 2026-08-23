@@ -1,1 +1,81 @@
 /* App-level styles — all in index.css via Tailwind */
+
+/* ── PlanDock (codex-style, monochrome dark) ─────────────────────────────── */
+.plan-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 12px 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(12, 12, 14, 0.6);
+}
+.plan-dock-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+  text-align: left;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition: color 0.18s ease;
+}
+.plan-dock-header:hover { color: #d4d4d8; }
+.plan-dock-eyebrow { font-weight: 700; }
+.plan-dock-scope {
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #a1a1aa;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+}
+.plan-dock-count { margin-left: auto; color: #a1a1aa; }
+.plan-dock-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 128px;
+  overflow: auto;
+}
+.plan-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 2px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.plan-marker {
+  display: grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-top: 1px;
+  border-radius: 999px;
+}
+.plan-dot { width: 5px; height: 5px; border-radius: 999px; background: #52525b; }
+.plan-step { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-item-pending .plan-step { color: #52525b; }
+.plan-item-in_progress .plan-step { color: #f4f4f5; }
+.plan-item-in_progress .plan-dot {
+  background: #fafafa;
+  animation: plan-pulse 1.4s ease-in-out infinite;
+}
+.plan-item-completed .plan-step { color: #52525b; text-decoration: line-through; }
+.plan-item-completed .plan-marker {
+  background: rgba(255, 255, 255, 0.08);
+  color: #a1a1aa;
+}
+.plan-item-completed .plan-dot { background: #3f3f46; }
+@keyframes plan-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(250, 250, 250, 0.35); }
+  50% { opacity: 0.55; box-shadow: 0 0 0 3px rgba(250, 250, 250, 0.12); }
+}

@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 4 (component): file manager UI — grid/list browser for uploaded files, pairs with comp-dropzone + feature-upload. Stack-saas future: comp-file-manager will be in stack-saas uses[] for admin file sections.",
+  "name": "comp-file-manager",
+  "description": "File manager UI: grid/list view, upload, delete, size display. Pairs with dropzone + upload backend.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "React components directory"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix for upload endpoints"}
+  ],
+  "files": [
+    {"src": "FileManager.tsx.j2", "dest": "[[ components_dir ]]/FileManager.tsx"}
+  ],
+  "notes": "After applying: wire onUpload to comp-dropzone + feature-upload POST {{ base_path }}/upload, onDelete to DELETE. Stack-saas will compose this for file sections.",
+  "sample_vars": {"components_dir": "src/components", "base_path": "/api"},
+  "delimiters": ["[[", "]]", "<%", "%>"]
+}

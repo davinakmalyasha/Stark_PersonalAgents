@@ -70,6 +70,41 @@ export interface StreamDelta {
   ts?: number;
 }
 
+export interface PlanItem {
+  step: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
+export interface McpServerStatus {
+  name: string;
+  status: string;
+  transport: 'stdio' | 'http';
+  error: string;
+  tool_count: number;
+  scopes: string[];
+}
+
+export interface McpServerConfig {
+  name?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  env_vars?: string[];
+  cwd?: string;
+  scopes?: string[];
+  enabled_tools?: string[];
+  disabled_tools?: string[];
+  approval?: 'auto' | 'prompt';
+  instructions?: string;
+  startup_timeout_sec?: number;
+  tool_timeout_sec?: number;
+  status?: string;
+  error?: string;
+  tool_count?: number;
+  transport?: 'stdio' | 'http';
+}
+
 export interface AppState {
   active_node: string;
   next_agent: string;
@@ -79,6 +114,10 @@ export interface AppState {
   outputs: AgentOutputs;
   project_path: string;
   agents_plan: string;
+  /** Codex-style plans per scope: {"developer": [{step, status}, ...]}. */
+  plan?: Record<string, PlanItem[]>;
+  /** Live MCP server status snapshots from the backend bridge. */
+  mcp_servers?: McpServerStatus[];
   antigravity_log: { sender: string; prompt: string; response: string; timestamp: string }[];
   live_terminal_log: string;
   selected_model: string;

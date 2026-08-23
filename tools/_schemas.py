@@ -1,3 +1,5 @@
+from typing import Optional
+
 """Central model-facing tool schemas and compact tool documentation.
 
 The facade imports these values back so existing callers continue to use
@@ -7,35 +9,40 @@ tools.TOOL_DEFINITIONS, tools._TOOL_DOCS, and tools._TOOL_REQUIRED_ARGS.
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
-        "description": "Reads a file from the local filesystem. Use this to inspect code, configs, or any project file.",
+        "description": "Reads a file from the local filesystem. Use this to inspect code, configs, or any project file. Supports multi-file read via file_paths.",
         "parameters": {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute or relative path to the file to read."
+                    "description": "The absolute or relative path to the file to read. Alias for single-file reads; use file_paths for multi-file."
+                },
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. Read multiple files in one turn — returns per-file sections with headers."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Optional. Line number to start reading from."
+                    "description": "Optional. Line number to start reading from (single-file only; ignored for multi-file)."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Optional. Maximum number of lines to read."
+                    "description": "Optional. Maximum number of lines to read (single-file only; ignored for multi-file)."
                 }
             },
-            "required": ["file_path"]
+            "required": []
         }
     },
     {
         "name": "edit_file",
-        "description": "Edit an existing file using SEARCH/REPLACE blocks. Supports single or multiple blocks in one call. PREFERRED method for all file edits.",
+        "description": "Edit an existing file using SEARCH/REPLACE blocks, a unified diff, or a multi-file patch. PREFERRED method for all file edits.",
         "parameters": {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute or relative path to the file to modify."
+                    "description": "The absolute or relative path to the file to modify. Ignored for multi-file patches (paths come from the patch headers)."
                 },
                 "old_string": {
                     "type": "string",
@@ -47,7 +54,11 @@ TOOL_DEFINITIONS = [
                 },
                 "diff": {
                     "type": "string",
-                    "description": "One or more SEARCH/REPLACE blocks (batch edit mode). Format: <<<<<<< SEARCH\\n[old]\\n=======\\n[new]\\n>>>>>>> REPLACE"
+                    "description": "Batch edit mode. Accepts (1) SEARCH/REPLACE blocks: <<<<<<< SEARCH\\n[old]\\n=======\\n[new]\\n>>>>>>> REPLACE; (2) a unified diff (git-style @@ hunks, uses file_path); or (3) a MULTI-FILE patch with opencode-style markers ('*** Add File: path', '*** Update File: path', '*** Delete File: path', '*** Move to: path') or '--- a/path' / '+++ b/path' headers. Multi-file patches apply every section transactionally per file and return a per-file [OK]/[ERROR] summary."
+                },
+                "verify": {
+                    "type": "string",
+                    "description": "Optional. Opt-in check after a successful write: 'py_compile', 'tsc', or any shell command (e.g. 'pytest -q'). Omit to skip."
                 }
             },
             "required": ["file_path"]
@@ -55,7 +66,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "run_command",
-        "description": "Executes a shell command. Can be run in foreground (blocking, streams logs in real-time) or background (non-blocking, returns immediately). Use process_action parameter to list, view logs, or kill background processes.",
+        "description": "Executes a shell command. Can be run in foreground (blocking, streams logs in real-time) or background (non-blocking, returns immediately). Use process_action parameter to list, view logs, or kill background processes. Supports workdir, expect regex, and streaming.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -78,6 +89,18 @@ TOOL_DEFINITIONS = [
                 "shell": {
                     "type": "string",
                     "description": "Optional shell override: 'bash' (default, POSIX) or 'cmd' for legacy plain cmd (.bat files)."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional working directory to run the command in. Defaults to project root."
+                },
+                "expect": {
+                    "type": "string",
+                    "description": "Optional regex to expect in output — returns typed pass/fail with structured exit handling."
+                },
+                "stream": {
+                    "type": "boolean",
+                    "description": "Optional. If true, stream output as it arrives (currently returns full output; future: incremental deltas)."
                 }
             },
             "required": []
@@ -85,13 +108,18 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "search_code",
-        "description": "Searches file contents using Python regex (ripgrep-style patterns). Use this to find functions, classes, imports, or patterns across the codebase.",
+        "description": "Searches code. Default 'content' mode regex-matches file contents (ripgrep-style). Use 'files' mode with a glob pattern (e.g. '**/*.py', 'setup*') to find files by name. Supports multi-pattern via patterns=[...] with ranked results.",
         "parameters": {
             "type": "object",
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "The regex pattern to search for in file contents."
+                    "description": "Content mode: the regex pattern to search for in file contents. Files mode: the glob pattern (or filename fragment) to match against paths."
+                },
+                "patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. Multiple patterns — returns ranked results with why-matched per file."
                 },
                 "path": {
                     "type": "string",
@@ -100,14 +128,19 @@ TOOL_DEFINITIONS = [
                 "glob": {
                     "type": "string",
                     "description": "Optional glob pattern to filter files (e.g. '*.py', '*.tsx')."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["content", "files"],
+                    "description": "Optional. 'content' (default) searches file contents with regex. 'files' matches filenames with the glob pattern and returns matching file paths."
                 }
             },
-            "required": ["pattern"]
+            "required": []
         }
     },
     {
         "name": "ask_user",
-        "description": "Ask the human a structured question and wait for the answer. Use when the request is ambiguous, a decision is required, or a plan needs approval (plan-review intent).",
+        "description": "Ask the human a structured question and wait for the answer. Use when the request is ambiguous, a decision is required, or a plan needs approval.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -139,55 +172,14 @@ TOOL_DEFINITIONS = [
                         "required": ["id", "question"],
                     },
                 },
-                "timeout": {"type": "integer", "description": "Optional seconds to wait before aborting (default 600)."},
+                "timeout": {"type": "integer", "description": "Seconds to wait before aborting (default 600)."},
             },
             "required": ["questions"]
         }
     },
     {
-        "name": "send_message",
-        "description": "Deliver a follow-up turn to a continuable subagent. Resumes it from its durable session if idle; queues the message if it is running.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "child_id": {"type": "string", "description": "Child id from list_agents()."},
-                "message": {"type": "string", "description": "The follow-up instruction."},
-                "timeout": {"type": "integer", "description": "Optional seconds to wait for the reply (default 1800)."},
-            },
-            "required": ["child_id", "message"]
-        }
-    },
-    {
-        "name": "list_agents",
-        "description": "List continuable subagents and their statuses (running/idle). Durable enumeration — no agent is resumed.",
-        "parameters": {"type": "object", "properties": {}, "required": []}
-    },
-    {
-        "name": "interrupt_agent",
-        "description": "Request a running continuable subagent to stop at its next step. Queued messages are kept.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "child_id": {"type": "string", "description": "Child id from list_agents()."},
-            },
-            "required": ["child_id"]
-        }
-    },
-    {
-        "name": "report",
-        "description": "Report progress back to the parent agent (continuable subagents only). Default wakes the parent; quiet=True records without waking.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "message": {"type": "string", "description": "The report content."},
-                "quiet": {"type": "boolean", "description": "Record without waking the parent (default false)."},
-            },
-            "required": ["message"]
-        }
-    },
-    {
         "name": "browser_act",
-        "description": "The ONLY browser tool. Actions: navigate → click → fill/type → press → extract → screenshot → close (selector = CSS or @ref tag from the navigate snapshot). Start your app with run_command background=True BEFORE navigating; assert the page shows what you built; close the session when done.",
+        "description": "Browser automation. Actions: navigate, click, fill, type, press, extract, screenshot, close. Selector = CSS or @ref from navigate snapshot. Start server with run_command(background=True) before navigating.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -301,7 +293,7 @@ TOOL_DEFINITIONS = [
     # -- GitHub tools (gh CLI bridge) --
     {
         "name": "github_apply_gate",
-        "description": "The ONE gate tool: optionally create the repo (create=True, plain name) and install the security/perf gate: seed the profile's workflow files (security.yml with SAST/SCA/secrets/quality/coverage/perf/semgrep/container/codeql/zizmor + ci.yml), wait for the first run, then enforce branch protection (merge blocked until all checks pass). NON-DESTRUCTIVE: existing project files are never overwritten. Confirms with the user by default (gate: 'ask'|'yes'|'no'). stack: 'auto' (detect: package.json→node, composer.json→php, go.mod→go, pyproject/requirements→python, else generic). NO templates are applied — templates are only used when a task needs them.",
+        "description": "Create a repo and/or install the CI/security gate: seeds security.yml (SAST/SCA/secrets/quality/coverage/semgrep/codeql) + ci.yml, waits for first run, enforces branch protection. NON-DESTRUCTIVE. Stack auto-detected from manifest (auto/python/node/go/php/generic). Confirms by default (gate=ask).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -317,37 +309,8 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "apply_template",
-        "description": "Write a template's boilerplate files into the project (Jinja2 render). USE THIS for repetitive file creation (CRUD features, CI configs, project scaffolds, spec docs, test suites) — it replaces writing boilerplate token-by-token with one tool call. Two-phase: everything renders before anything is written (no partial applies). Existing files are SKIPPED by default (safe re-applies); overwrite=true replaces them. Returns created files + TODO markers + conventions (quiet=true default = compact summary).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "template": {"type": "string", "description": "Template name (see template_list)."},
-                "target_dir": {"type": "string", "description": "Destination directory; empty = workspace root."},
-                "variables": {"type": "object", "description": "Template variables, e.g. {'feature_name': 'User', 'model_fields': 'name:string,email:string'}. Check template_list(template=...) for the required set."},
-                "overwrite": {"type": "boolean", "description": "True = replace files that already exist (default False = skip them)."},
-                "dry_run": {"type": "boolean", "description": "True = render and preview without writing anything."},
-                "quiet": {"type": "boolean", "description": "True (default) = compact summary (counts + file lists). False = verbose (per-template nesting, TODOs, notes)."}
-            },
-            "required": ["template"]
-        }
-    },
-    {
-        "name": "template_list",
-        "description": "List/search templates. No args = full catalog; query=keyword search across name/description/category; category=filter by level; template=name shows variables, files, example call and notes for one template.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "template": {"type": "string", "description": "Template name for the detailed view (variables, files, notes)."},
-                "category": {"type": "string", "description": "Filter by level/category: stack, feature, component, snippet, project, config, routine, spec."},
-                "query": {"type": "string", "description": "Keyword search (case-insensitive) across template name, category and description."}
-            },
-            "required": []
-        }
-    },
-    {
         "name": "template_new",
-        "description": "Author a NEW template into templates/<level>/<name>/. Write the .j2 boilerplate files into templates/<level>/<name>/files/ with edit_file FIRST, then call this tool with the metadata — it writes template.json and validates the new template renders with sample_vars. Levels: stack, feature, component, snippet, project, config, routine, spec.",
+        "description": "Author a new template: write .j2 files into templates/<level>/<name>/files/ with edit_file first, then call this with metadata to write template.json and validate rendering. Levels: stack, feature, component, snippet, project, config, routine, spec.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -377,7 +340,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "find_project_dev",
-        "description": "Resolve an existing project (by name or folder path) and return its durable Dev agent child_id. Use before send_message so follow-up coding work continues the SAME Dev session instead of spawning a new one.",
+        "description": "Resolve an existing project (by name or folder path) and return its durable Dev agent child_id. Prefer resume_project(name, message) for one-call resume; use this when you need the child_id directly.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -386,38 +349,123 @@ TOOL_DEFINITIONS = [
             "required": ["name"]
         }
     },
+    {
+        "name": "update_plan",
+        "description": "Update the task plan. Provide an optional explanation and the ENTIRE plan array — this is a full replacement, always send every step. At most one step may be in_progress at a time.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional explanation for this plan update."
+                },
+                "plan": {
+                    "type": "array",
+                    "description": "The complete list of steps.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "string", "description": "The task step text."},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Step status: pending, in_progress (at most one), or completed."
+                            }
+                        },
+                        "required": ["step", "status"]
+                    }
+                }
+            },
+            "required": ["plan"]
+        }
+    },
+    {
+        "name": "task",
+        "description": "Delegate a subtask to a specialized subagent (orchestrator only). Spawns a subagent with its own tools and model; returns a compact handoff report.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Subagent type: Dev, FreeAgent, or general-purpose."},
+                "task": {"type": "string", "description": "Detailed instruction for the subagent."},
+                "reasoning_effort": {"type": "string", "enum": ["max", "high", "medium", "low", "disabled"], "description": "Thinking budget override."}
+            },
+            "required": ["name", "task"]
+        }
+    },
+    {
+        "name": "resume_project",
+        "description": "Resume an existing project's durable Dev agent in one call: resolves the project by name/path and delivers the follow-up message. Replaces find_project_dev + send_message + list_agents. If the project is not found, returns [NOT FOUND] with available names.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Project name or folder path (fuzzy match, e.g. 'my-app')."},
+                "message": {"type": "string", "description": "Follow-up instruction to deliver to the project's Dev agent."},
+                "timeout": {"type": "integer", "description": "Seconds to wait for the reply (default 1800)."}
+            },
+            "required": ["name", "message"]
+        }
+    },
+    {
+        "name": "async_task",
+        "description": "Unified async subagent task manager. action=start: fire-and-forget a subagent (like start_async_task) and return task_id. action=status: poll one task, optionally wait (like check_async_task). action=list: list all async tasks and their statuses. Replaces start_async_task / check_async_task / list_async_tasks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["start", "status", "list"], "description": "Action to perform: start a new async task, check one task, or list all."},
+                "name": {"type": "string", "description": "Subagent type for action=start (e.g. Dev, FreeAgent, general-purpose)."},
+                "task": {"type": "string", "description": "Task description for action=start."},
+                "task_id": {"type": "string", "description": "Task id for action=status (from start)."},
+                "wait_seconds": {"type": "integer", "description": "For action=status: wait up to N seconds (0-300) before returning."}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "template",
+        "description": "Unified template manager. action=list: catalog; action=search: ranked keyword search; action=show: per-template details; action=apply: render boilerplate into project. Replaces apply_template + template_list.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "search", "show", "apply"], "description": "Action: list catalog, search by query, show one template, or apply boilerplate."},
+                "template": {"type": "string", "description": "Template name for show/apply (e.g. feature-crud)."},
+                "category": {"type": "string", "description": "Filter by level for list/search: stack, feature, component, snippet, project, config, routine, spec."},
+                "query": {"type": "string", "description": "Keyword search for search (also regex/symbol/semantic)."},
+                "target_dir": {"type": "string", "description": "Destination for apply; empty = workspace root."},
+                "variables": {"type": "object", "description": "Template variables for apply, e.g. {'feature_name': 'User'}."},
+                "overwrite": {"type": "boolean", "description": "For apply: replace existing files (default skip)."},
+                "dry_run": {"type": "boolean", "description": "For apply: preview without writing."},
+                "quiet": {"type": "boolean", "description": "For apply: compact summary (default true)."}
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 _TOOL_DOCS = {
-    "read_file": "read_file(file_path, offset?, limit?) â€” Read file.",
-    "edit_file": "edit_file(file_path, old_string?, new_string?, diff?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Boilerplate → apply_template first.",
-    "run_command": "run_command(command, timeout?, background?, process_action?, shell?) — Full POSIX bash (default): pipes, &&, $( ), jq, gh pipelines all work. shell='cmd' for legacy plain cmd. Run tests, git, gh, rg, curl, compilers here.",
-    "search_code": "search_code(pattern, path?, glob?) â€” Regex search across files.",
-    "browser_navigate": "browser_navigate(url, wait_ms?) â€” Open URL in headless Chromium, returns snapshot with @ref selectors.",
-    "browser_act": "browser_act(action, selector?, text?, key?, what?, path?) â€” click / fill / type / press / extract / screenshot / close.",
-    "browser_extract": "browser_extract(what?, selector?) â€” Extract text/html/value from current browser page.",
-    "browser_screenshot": "browser_screenshot(path?) â€” Screenshot of current browser page.",
-    "browser_click": "browser_click(selector) â€” Click an element using CSS selector or snapshot @ref tag.",
-    "browser_fill": "browser_fill(selector, text) â€” Clear and fill an input element.",
-    "browser_close": "browser_close() â€” Close browser session and free resources.",
-    "create_docx": "create_docx(file_path, title?, content?) â€” Create a Word document (.docx).",
-    "create_xlsx": "create_xlsx(file_path, headers, rows) â€” Create an Excel spreadsheet (.xlsx).",
-    "read_pdf": "read_pdf(file_path, max_pages?, page_numbers?) â€” Read text from a PDF file.",
-    "task": "task(name, task, reasoning_effort?) â€” Delegate a subtask to a subagent (delegators only).",
-    "start_async_task": "start_async_task(name, task) â€” Fire-and-forget parallel subagent; returns a task_id.",
-    "check_async_task": "check_async_task(task_id, wait_seconds?) â€” Poll an async task; optionally wait.",
-    "list_async_tasks": "list_async_tasks() â€” List async tasks and statuses.",
-    "ask_user": "ask_user(questions, timeout?) â€” Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
-    "send_message": "send_message(child_id, message) â€” Follow up with a continuable subagent (resumes it from its durable session if idle; queues the message if it is running).",
-    "list_agents": "list_agents() â€” List your continuable subagents and their statuses.",
-    "interrupt_agent": "interrupt_agent(child_id) â€” Request a running continuable subagent to stop at its next step (queued messages are kept).",
-    "report": "report(message, quiet?) â€” Report progress back to the parent agent. Default wakes the parent; quiet=1 only records it.",
+    "read_file": "read_file(file_path?, file_paths?, offset?, limit?) — Read file(s). Single file via file_path; multi-file via file_paths=[paths].",
+    "edit_file": "edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Boilerplate → template(action=\"apply\") first.",
+    "run_command": "run_command(command, timeout?, background?, process_action?, shell?, workdir?, expect?, stream?) — Full POSIX bash (default): pipes, &&, $( ), jq, gh pipelines all work. shell='cmd' for legacy, workdir sets cwd, expect checks output regex, stream for live output.",
+    "search_code": "search_code(pattern?, patterns?, path?, glob?) — Regex search across files. Multi-pattern via patterns=[...] ranked.",
+    "browser_navigate": "browser_navigate(url, wait_ms?) — Open URL in headless Chromium, returns snapshot with @ref selectors.",
+    "browser_act": "browser_act(action, selector?, text?, key?, what?, path?) — click / fill / type / press / extract / screenshot / close.",
+    "browser_extract": "browser_extract(what?, selector?) — Extract text/html/value from current browser page.",
+    "browser_screenshot": "browser_screenshot(path?) — Screenshot of current browser page.",
+    "browser_click": "browser_click(selector) — Click an element using CSS selector or snapshot @ref tag.",
+    "browser_fill": "browser_fill(selector, text) — Clear and fill an input element.",
+    "browser_close": "browser_close() — Close browser session and free resources.",
+    "create_docx": "create_docx(file_path, title?, content?) — Create a Word document (.docx).",
+    "create_xlsx": "create_xlsx(file_path, headers, rows) — Create an Excel spreadsheet (.xlsx).",
+    "read_pdf": "read_pdf(file_path, max_pages?, page_numbers?) — Read text from a PDF file.",
+    "task": "task(name, task, reasoning_effort?) — Delegate a subtask to a subagent (delegators only).",
+    "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
-    "apply_template": "apply_template(template, target_dir?, variables?, overwrite?, dry_run?, quiet?) â€” Write a template's boilerplate files (Jinja2 render, sandboxed). Two-phase render-then-write; existing files skipped by default (overwrite=true to replace); dry_run=true previews; quiet=true (default) compact summary. ~30 tokens vs writing boilerplate manually.",
-    "template_list": "template_list(template?, category?, query?) â€” No arg = catalog; query= ranked search (regex, words, code symbols, semantic); template name = variables + files + example + notes.",
-    "template_new": "template_new(name, level, description, sample_vars, variables?, files?, uses?, notes?) â€” Author a new template (write .j2 files first, then metadata; auto-validates render).",
-    "create_project": "create_project(name, concept) â€” Create a NEW project: folder under D:\\MyProject + workspace + chat + a durable Dev agent assigned to it. ONLY for genuinely new projects requested by the user.",
-    "find_project_dev": "find_project_dev(name) â€” Resolve an existing project and return its Dev agent child_id (then send_message to it). Never spawn a duplicate Dev for an existing project.",
+    "template_new": "template_new(name, level, description, sample_vars, variables?, files?, uses?, notes?) — Author a new template (write .j2 files first, then metadata; auto-validates render).",
+    "create_project": "create_project(name, concept) — Create a NEW project: folder under D:\\MyProject + workspace + chat + a durable Dev agent assigned to it. ONLY for genuinely new projects requested by the user.",
+    "find_project_dev": "find_project_dev(name) — Resolve an existing project and return its Dev agent child_id. Prefer resume_project for one-call resume.",
+    "resume_project": "resume_project(name, message, timeout?) — One-call resume: find the project's Dev and deliver the message (replaces find_project_dev + send_message).",
+    "async_task": "async_task(action, name?, task?, task_id?, wait_seconds?) — Unified async: start/status/list (replaces start_async_task/check_async_task/list_async_tasks).",
+    "template": "template(action, template?, category?, query?, target_dir?, variables?, overwrite?, dry_run?, quiet?) — Unified template: list/search/show/apply (replaces apply_template + template_list).",
+    "update_plan": "update_plan(explanation?, plan=[{step, status}]) — Maintain the task plan. FULL replacement: always send every step. At most one step in_progress.",
 }
 
 _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {
@@ -426,17 +474,21 @@ _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {
 }
 
 
-def get_native_tools() -> list[dict]:
-    """Return all exposed tools as DeepSeek/OpenAI-native function definitions,
-    derived from TOOL_DEFINITIONS."""
+def get_native_tools(scope: Optional[str] = None) -> list[dict]:
+    """Return tools as DeepSeek/OpenAI-native function definitions,
+    optionally filtered by scope."""
     tools = []
+    allowed = set(_SCOPE_MAP[scope.lower()]) if scope and scope.lower() in _SCOPE_MAP else None
     for d in TOOL_DEFINITIONS:
         if d.get("exposed") is False:
+            continue
+        if allowed is not None and d["name"] not in allowed:
             continue
         tools.append({
             "type": "function",
             "function": {
                 "name": d["name"],
+                "description": d.get("description", ""),
                 "parameters": d.get("parameters") or {
                     "type": "object",
                     "properties": {},
@@ -444,4 +496,62 @@ def get_native_tools() -> list[dict]:
                 },
             },
         })
+    try:
+        from tools.mcp.mcp_bridge import mcp_tool_defs_for_scope
+        tools.extend(mcp_tool_defs_for_scope(scope or ""))
+    except Exception:
+        pass
     return sorted(tools, key=lambda t: t["function"]["name"])
+
+_SCOPE_MAP: dict[str, list[str]] = {
+    "developer": [
+        "read_file", "edit_file", "run_command", "search_code",
+        "task", "browser_act", "template",
+        "ask_user", "github_apply_gate", "update_plan",
+    ],
+    "orchestrator": [
+        "run_command",
+        "create_project", "resume_project",
+        "ask_user",
+        "task", "async_task",
+        "update_plan",
+    ],
+    "free_agent": [
+        "edit_file", "run_command",
+        "read_pdf", "create_docx", "create_xlsx", "ask_user",
+    ],
+}
+
+
+def get_native_tool_names(scope: Optional[str] = None) -> list[str]:
+    """Return tool names, optionally filtered by scope."""
+    if scope and scope.lower() in _SCOPE_MAP:
+        allowed = set(_SCOPE_MAP[scope.lower()])
+        names = [d["name"] for d in TOOL_DEFINITIONS if d["name"] in allowed and d.get("exposed") is not False]
+    else:
+        names = [d["name"] for d in TOOL_DEFINITIONS if d.get("exposed") is not False]
+    try:
+        from tools.mcp.mcp_bridge import mcp_tool_names_for_scope
+        names.extend(mcp_tool_names_for_scope(scope or ""))
+    except Exception:
+        pass
+    return names
+
+
+def get_compact_tool_docs(scope: Optional[str] = None, names: Optional[list[str]] = None) -> dict[str, str]:
+    """Return compact tool docstrings dictionary."""
+    target_names = set(names) if names else set(get_native_tool_names(scope))
+    return {k: v for k, v in _TOOL_DOCS.items() if k in target_names}
+
+
+def format_compact_tool_help(names: Optional[list[str]] = None, scope: Optional[str] = None) -> str:
+    """Format compact tool help lines for prompt injection or diagnostic logging."""
+    docs = get_compact_tool_docs(scope=scope, names=names)
+    lines = [f"- {v}" for v in docs.values()]
+    try:
+        from tools.mcp.mcp_bridge import mcp_instructions_for_scope
+        for server, instr in mcp_instructions_for_scope(scope or ""):
+            lines.append(f"- [{server} MCP] {instr}")
+    except Exception:
+        pass
+    return "\n".join(lines)

@@ -9,24 +9,17 @@ state_lock = threading.Lock()
 shared_state = {
     "state_version": 0,
     "active_node": "",
-    "next_agent": "",
-    "completed_nodes": [],
-    "thoughts": {
-        "supervisor": "", "developer": "", "orchestrator": "", "agent": ""
-    },
     "client_request": "",
     "outputs": {
         "requirements": "", "tech_spec": "", "code": "", "agent_report": "",
-        "test_report": "", "devops_config": "", "analytics_report": ""
+        "test_report": ""
     },
     "project_path": "",
-    "agents_plan": "",
-    "deep_agents_log": [],
+    "plan": {},
+    "mcp_servers": [],
     "live_terminal_log": "",
     "selected_model": "Automatic",
     "selected_temp": 0.7,
-    "failed_models": [],
-    "remaining_steps": 40,
     "token_usage": {
         "total_input_tokens": 0,
         "total_output_tokens": 0,
@@ -41,10 +34,7 @@ def safe_get_state() -> dict:
     """Returns a thread-safe shallow-copied snapshot of shared_state."""
     with state_lock:
         copied = shared_state.copy()
-        copied["thoughts"] = shared_state["thoughts"].copy()
         copied["outputs"] = shared_state["outputs"].copy()
-        if "completed_nodes" in shared_state:
-            copied["completed_nodes"] = list(shared_state["completed_nodes"])
         if "token_usage" in shared_state:
             copied["token_usage"] = {
                 "total_input_tokens": shared_state["token_usage"]["total_input_tokens"],
@@ -54,22 +44,21 @@ def safe_get_state() -> dict:
                 "total_cost": shared_state["token_usage"]["total_cost"],
                 "calls": list(shared_state["token_usage"]["calls"])
             }
-        if "deep_agents_log" in shared_state:
-            copied["deep_agents_log"] = list(shared_state["deep_agents_log"])
-        if "failed_models" in shared_state:
-            copied["failed_models"] = list(shared_state["failed_models"])
+        if isinstance(shared_state.get("plan"), dict):
+            copied["plan"] = {
+                k: [dict(it) for it in v] if isinstance(v, list) else v
+                for k, v in shared_state["plan"].items()
+            }
+        if isinstance(shared_state.get("mcp_servers"), list):
+            copied["mcp_servers"] = list(shared_state["mcp_servers"])
         return copied
 
 def safe_update_state(updates: dict):
     """Safely updates shared_state under lock."""
     with state_lock:
         for k, v in updates.items():
-            if k == "thoughts" and isinstance(v, dict):
-                shared_state["thoughts"].update(v)
-            elif k == "outputs" and isinstance(v, dict):
+            if k == "outputs" and isinstance(v, dict):
                 shared_state["outputs"].update(v)
-            elif k == "completed_nodes" and isinstance(v, list):
-                shared_state["completed_nodes"] = list(v)
             elif k == "token_usage" and isinstance(v, dict):
                 shared_state["token_usage"] = {
                     "total_input_tokens": v.get("total_input_tokens", shared_state["token_usage"]["total_input_tokens"]),
@@ -116,20 +105,14 @@ def reset_shared_state():
     """Fully reset shared_state to defaults. Use between independent task runs."""
     with state_lock:
         shared_state["active_node"] = ""
-        shared_state["next_agent"] = ""
-        shared_state["completed_nodes"] = []
-        shared_state["thoughts"] = {"supervisor": "", "developer": "", "orchestrator": "", "agent": ""}
         shared_state["client_request"] = ""
         shared_state["outputs"] = {
             "requirements": "", "tech_spec": "", "code": "", "agent_report": "",
-            "test_report": "", "devops_config": "", "analytics_report": ""
+            "test_report": ""
         }
         shared_state["project_path"] = ""
-        shared_state["agents_plan"] = ""
-        shared_state["deep_agents_log"] = []
+        shared_state["plan"] = {}
         shared_state["live_terminal_log"] = ""
-        shared_state["failed_models"] = []
-        shared_state["developer_tool_log"] = ""
         shared_state["token_usage"] = {
             "total_input_tokens": 0,
             "total_output_tokens": 0,
@@ -139,4 +122,3 @@ def reset_shared_state():
             "calls": []
         }
         shared_state["state_version"] = 0
-

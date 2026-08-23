@@ -5,95 +5,13 @@ permissions:
 
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   pull_request:
-
-concurrency:
-  group: gate
-  cancel-in-progress: true
-
-jobs:
-  sca:
-    name: sca
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: osv-scanner (SCA) — all ecosystems, fail on known CVEs
-        run: |
-          curl -sSfL https://github.com/google/osv-scanner/releases/download/v{{ osv_scanner_version }}/osv-scanner_linux_amd64 -o /tmp/osv-scanner
-          chmod +x /tmp/osv-scanner
-          /tmp/osv-scanner scan --recursive . || exit 1
-
-  secrets:
-    name: secrets
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: gitleaks — fail on any leaked secret
-        run: |
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v{{ gitleaks_version }}/gitleaks_{{ gitleaks_version }}_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
-          /tmp/gitleaks detect --source . --redact --exit-code 1
-
-  tests:
-    name: tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Run detected test command
-        run: |
-          if grep -q '"test"' package.json 2>/dev/null; then
-            npm install --silent || true
-            npm test || exit 1
-          elif [ -f go.mod ]; then
-            go test ./... || exit 1
-          elif [ -f pytest.ini ] || grep -q 'pytest' pyproject.toml 2>/dev/null; then
-            pip install --quiet pytest
-            [ -f requirements.txt ] && pip install -r requirements.txt -q || true
-            python -m pytest -q || exit 1
-          else
-            echo "no test command detected — tests skipped"
-          fi
-{% if codeql_on == 'true' or codeql_on == True %}
-  codeql:
-    name: codeql
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Check for code
-        id: has_code
-        run: |
-          if find . \( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.go' -o -name '*.java' -o -name '*.php' -o -name '*.rb' -o -name '*.cs' -o -name '*.c' -o -name '*.cpp' -o -name '*.kt' -o -name '*.swift' \) -not -path './.git/*' 2>/dev/null | grep -q .; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.has_code.outputs.found == 'true'
-        uses: github/codeql-action/init@d6317709a54fd87078d323eeb0e48ec331c8e621 # v3
-        with:
-          languages: python, javascript-typescript, go, java, php, ruby, csharp, c-cpp
-      - if: steps.has_code.outputs.found == 'true'
-        uses: github/codeql-action/analyze@d6317709a54fd87078d323eeb0e48ec331c8e621 # v3
-{% endif %}
-  zizmor:
-    name: zizmor
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: zizmor — audit the repo's own workflows
-        run: |
-          curl -sSfL https://github.com/woodruffw/zizmor/releases/download/v{{ zizmor_version }}/zizmor-x86_64-unknown-linux-gnu.tar.gz -o /tmp/zizmor.tar.gz
-          tar -xzf /tmp/zizmor.tar.gz -C /tmp
-          /tmp/zizmor --min-severity medium .
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:

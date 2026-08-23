@@ -1,0 +1,33 @@
+{
+  "_comment": "LEVEL 5 (stack): fullstack SaaS — backend (auth+tenancy+billing+search+CRUD) + frontend shell. No new code: pure composition. Billing+tenancy+search-infra are the widening you requested (stack-saas ties them together).",
+  "name": "stack-saas",
+  "description": "Fullstack SaaS: FastAPI (JWT auth + tenancy + billing subscriptions + search-infra + CRUD) + React shell (layout, login, dashboard). One apply for a subscription + multi-tenant product.",
+  "category": "stack",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Project folder name, e.g. 'acme-saas' (drives package dir and stack inference)"},
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' (for nested imports)"},
+    {"name": "feature_name", "type": "string", "required": true, "description": "Demo resource for the CRUD slice, e.g. 'Product' or 'Item' (avoid 'User')"},
+    {"name": "model_fields", "type": "string", "default": "name:string,price:float", "description": "CRUD model fields, e.g. 'name:string,price:float,active:bool'"},
+    {"name": "service_name", "type": "string", "default": "web", "description": "Docker service name"}
+  ],
+  "files": [],
+  "uses": [
+    "project-fastapi",
+    "feature-errors",
+    "feature-auth",
+    "feature-tenancy",
+    "feature-billing",
+    "feature-search-infra",
+    "feature-crud",
+    "github-ci-security-python",
+    "docker-compose",
+    "nginx",
+    "project-frontend",
+    "comp-layout",
+    "comp-login",
+    "comp-dashboard",
+    "comp-search-filter"
+  ],
+  "notes": "After applying stack-saas: 1) set JWT_SECRET + SEARCH_URL/SEARCH_API_KEY in .env, 2) import every new model in main.py so Base.metadata.create_all creates tables (users, tenants, plans, subscriptions, invoices), 3) app.include_router for each new router (auth, tenants, billing, search, <feature_name>), 4) scope business queries with tenancy.scoped() and protect billing create with require_role('admin'), 5) pair feature-search-infra index calls from your CRUD service. Stack is pure composition — re-apply is safe (skips byte-identical files, now reports = unchanged).",
+  "sample_vars": {"project_name": "demo_saas", "app_name": "app", "feature_name": "Product", "model_fields": "name:string,price:float", "service_name": "web"}
+}

@@ -282,11 +282,11 @@ def get_file_signatures_with_lines(file_path: str, ext: str, full_depth: bool = 
 
 # ── Compact map formatting ────────────────────────────────────────────────────
 #
-# The map is CACHED (byte-stable per project) so it must be:
+# The full map is CACHED (byte-stable per project) so it must be:
 #   * deterministic — bytes depend ONLY on the files (no task keywords)
 #   * compact       — max navigation value per token
-#   * append-only   — new files get appended at the BOTTOM; tail appends are
-#     the only cache-safe mutation (everything above stays a prefix hit)
+#   * replaceable   — a checkpoint replaces the one canonical snapshot from the
+#     current codebase; transient projectMap+ events never enter this file
 
 
 def _strip_kw(text: str) -> str:
@@ -427,67 +427,195 @@ def _format_compact(entries: List[Tuple[str, int, bool]]) -> str:
 
 
 class RepoMapGenerator:
-    """Orchestrates Repository Map compilation for the workspace.
+    """Build a small plain-English navigation guide from the import graph.
 
-    Deterministic, compact output: one line per file,
-    `path: name(a,b) Class{member member}` — cache-stable per project.
+    The map is intentionally not a source listing. It describes major areas,
+    a handful of high-value files, and direct relationships between files.
+    Live files and search_code remain authoritative.
     """
+
+    IGNORED_DIRS = {
+        "node_modules", "vendor", ".git", "venv", ".venv", "__pycache__",
+        ".deep_agents", ".claude", "dist", "build", ".pytest_cache",
+        ".vscode", ".idea", "storage", "public", "venv312", "scratch",
+        ".antigravity", "skills", ".agents"
+    }
+    SUPPORTED_EXTS = {".py", ".php", ".ts", ".tsx", ".js", ".jsx", ".dart"}
+    MAP_MARKER = "projectMap:"
 
     def __init__(self, project_path: str) -> None:
         self.project_path = os.path.normpath(os.path.abspath(project_path))
+        self.max_chars = max(2000, int(os.environ.get("MAP_MAX_CHARS", "6000")))
+
+    def _files(self) -> list[str]:
+        files: list[str] = []
+        for root, dirs, names in os.walk(self.project_path):
+            dirs[:] = sorted(d for d in dirs if d not in self.IGNORED_DIRS)
+            for name in names:
+                if os.path.splitext(name)[1].lower() not in self.SUPPORTED_EXTS:
+                    continue
+                path = os.path.relpath(os.path.join(root, name), self.project_path)
+                files.append(path.replace("\\", "/"))
+        return sorted(files)[:int(os.environ.get("MAP_MAX_FILES", "600"))]
+
+    def _imports(self, rel_path: str) -> list[str]:
+        try:
+            with open(os.path.join(self.project_path, rel_path), "r", encoding="utf-8", errors="replace") as f:
+                source = f.read()
+        except Exception:
+            return []
+
+        targets: list[str] = []
+        # Python module imports.
+        targets.extend(re.findall(r"(?m)^\s*from\s+([A-Za-z_][\w.]*)\s+import\s", source))
+        targets.extend(re.findall(r"(?m)^\s*import\s+([A-Za-z_][\w.]*)", source))
+        # Relative JS/TS/PHP/Dart imports and includes.
+        targets.extend(re.findall(
+            r"(?:from|import|require|include|include_once)\s*(?:\([^)]*)?\s*['\"]([^'\"]+)['\"]",
+            source,
+        ))
+        return list(dict.fromkeys(targets))
+
+    @staticmethod
+    def _candidate_paths(source: str, target: str) -> list[str]:
+        target = target.replace("\\", "/")
+        if target.startswith("."):
+            base = os.path.dirname(source).replace("\\", "/")
+            stem = os.path.normpath(os.path.join(base, target)).replace("\\", "/")
+        elif re.match(r"^[A-Za-z_][\w.]*$", target):
+            stem = target.replace(".", "/")
+        else:
+            return []
+        ext = os.path.splitext(stem)[1].lower()
+        candidates = [stem]
+        if not ext:
+            candidates.extend(stem + e for e in (".py", ".ts", ".tsx", ".js", ".jsx", ".php", ".dart"))
+        candidates.extend(os.path.join(stem, "__init__.py").replace("\\", "/") for _ in [0])
+        candidates.extend(os.path.join(stem, "index" + e).replace("\\", "/") for e in (".ts", ".tsx", ".js", ".jsx"))
+        return candidates
+
+    def _graph(self, files: list[str]) -> dict[str, set[str]]:
+        known = set(files)
+        graph = {path: set() for path in files}
+        for source in files:
+            for target in self._imports(source):
+                for candidate in self._candidate_paths(source, target):
+                    if candidate in known and candidate != source:
+                        graph[source].add(candidate)
+                        break
+        return graph
+
+    def topology_snapshot(self) -> dict[str, list[str]]:
+        """Return the current file-relation graph for change detection.
+
+        The project map is a navigation graph, so body-only edits must not
+        create map updates. A snapshot changes only when a supported source
+        file appears/disappears or its resolved outgoing relationships change.
+        """
+        files = self._files()
+        graph = self._graph(files)
+        return {path: sorted(graph.get(path, set())) for path in files}
+
+    def generate_delta(self, changes: dict[str, list[str]]) -> str:
+        """Describe changed topology as compact current adjacency lines."""
+        files = self._files()
+        graph = self._graph(files)
+        current = set(files)
+        lines: list[str] = []
+        for status, prefix in (("added", "+"), ("modified", "~"), ("removed", "-")):
+            for path in sorted(changes.get(status, [])):
+                if status == "removed" or path not in current:
+                    lines.append(f"{prefix} {path} -> none [removed]")
+                    continue
+                links = sorted(graph.get(path, set()))[:6]
+                targets = ", ".join(links) if links else "none"
+                lines.append(f"{prefix} {path} -> {targets}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _role(path: str) -> str:
+        lower = path.lower()
+        name = os.path.basename(lower)
+        if "orchestrator" in name:
+            return "routes work and coordinates agents"
+        if "developer_agent" in name:
+            return "implements coding tasks"
+        if "repo_map" in name:
+            return "builds repository navigation context"
+        if "memory_manager" in name or "/memory/" in lower:
+            return "stores project identity and navigation cache"
+        if "/agents/" in f"/{lower}":
+            return "agent and delegation logic"
+        if "/tools/" in f"/{lower}":
+            return "tool implementation"
+        if "/templates/" in f"/{lower}":
+            return "reusable template data"
+        if name in {"main.py", "app.py", "server.py", "api_server.py"}:
+            return "application entry point"
+        if name in {"index.js", "index.ts", "index.tsx", "index.jsx"}:
+            return "module entry point"
+        return "source module"
+
+    def _bounded(self, lines: list[str]) -> str:
+        out: list[str] = []
+        size = 0
+        for line in lines:
+            addition = len(line) + (1 if out else 0)
+            if size + addition > self.max_chars - 36:
+                out.append("[truncated: use search_code for more]")
+                break
+            out.append(line)
+            size += addition
+        return "\n".join(out)
 
     def generate_map(self) -> str:
-        """Walk the directory, extract signatures, and format the compact map."""
-        ignored_dirs = {
-            "node_modules", "vendor", ".git", "venv", ".venv", "__pycache__",
-            ".deep_agents", ".claude", "dist", "build", ".pytest_cache",
-            ".vscode", ".idea", "storage", "public", "venv312", "scratch",
-            ".antigravity"
-        }
-        
-        supported_exts = {".py", ".php", ".ts", ".tsx", ".js", ".jsx", ".dart"}
-        max_files = int(os.environ.get("MAP_MAX_FILES", "300"))
-        
-        # 1. Walk directory and group file paths
-        files_to_process: List[str] = []
+        """Return a bounded, deterministic relationship-oriented map."""
         try:
-            for root, dirs, files in os.walk(self.project_path):
-                dirs[:] = [d for d in dirs if d not in ignored_dirs]
-                for file in files:
-                    _, ext = os.path.splitext(file)
-                    if ext.lower() in supported_exts:
-                        rel_path = os.path.relpath(os.path.join(root, file), self.project_path).replace("\\", "/")
-                        files_to_process.append(rel_path)
+            files = self._files()
         except Exception as e:
-            return f"Error walking directory: {e}"
+            return f"{self.MAP_MARKER}\nUnable to scan workspace: {e}"
+        if not files:
+            return f"{self.MAP_MARKER}\nNo supported source modules found."
 
-        # Deterministic path order — cache-stable bytes across generations
-        files_to_process.sort()
-        files_to_process = files_to_process[:max_files]
+        graph = self._graph(files)
+        incoming = {path: 0 for path in files}
+        for targets in graph.values():
+            for target in targets:
+                incoming[target] += 1
 
-        map_lines: List[str] = []
-        for rel_path in files_to_process:
-            _, ext = os.path.splitext(rel_path)
-            abs_path = os.path.join(self.project_path, rel_path)
-            signatures = get_file_signatures(abs_path, ext.lower(), is_hot=False, full_depth=True)
-            if not signatures:
-                continue
+        areas: dict[str, int] = {}
+        for path in files:
+            area = path.split("/", 1)[0] if "/" in path else "root"
+            areas[area] = areas.get(area, 0) + 1
 
-            entries: List[Tuple[str, int, bool]] = []
-            for sig, depth, _doc in signatures:
-                kind = _classify_sig(sig)
-                if kind in ("class", "interface"):
-                    entries.append((_compact_class(sig, kind), depth, True))
-                elif kind == "type_alias":
-                    entries.append((_compact_class(sig, "type_alias"), depth, False))
-                elif kind == "function":
-                    entries.append((_compact_fn(sig), depth, False))
-                else:
-                    entries.append((_compact_property(sig), depth, False))
-            if not entries:
-                continue
-            map_lines.append(f"{rel_path}: {_format_compact(entries)}")
+        known_names = {
+            "main.py", "app.py", "server.py", "api_server.py", "orchestrator_agent.py",
+            "developer_agent.py", "memory_manager.py", "repo_map_generator.py",
+            "package.json", "pyproject.toml"
+        }
+        ranked = sorted(
+            files,
+            key=lambda p: (
+                -(incoming[p] * 4 + len(graph[p]) * 2 + (10 if os.path.basename(p).lower() in known_names else 0)),
+                p,
+            ),
+        )
+        key_files = [p for p in ranked if incoming[p] or graph[p] or os.path.basename(p).lower() in known_names][:12]
+        if not key_files:
+            key_files = files[:12]
 
-        if not map_lines:
-            return "(No classes or functions found in workspace files)"
-        return "\n".join(map_lines).strip()
+        top_areas = sorted(areas.items(), key=lambda item: (-item[1], item[0]))[:8]
+        lines = [
+            self.MAP_MARKER,
+            "Purpose: compact navigation hint; inspect live files before editing.",
+            "Areas: " + "; ".join(f"{area} ({count} modules)" for area, count in top_areas),
+            "Key files:",
+        ]
+        lines.extend(f"- {path} — {self._role(path)}." for path in key_files)
+        lines.append("Connections:")
+        connected = [(source, sorted(graph[source])[:6]) for source in sorted(graph) if graph[source]]
+        if connected:
+            lines.extend(f"- {source} -> {', '.join(targets)}" for source, targets in connected[:24])
+        else:
+            lines.append("- No internal file connections detected; use search_code.")
+        return self._bounded(lines)

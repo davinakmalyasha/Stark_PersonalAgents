@@ -1,0 +1,80 @@
+"""Tenant scoping primitives: context, dependency, and a scoped-query helper.
+
+Usage pattern for any tenant-owned model:
+
+    stmt = scoped(select(Project), tenant_id)   # adds WHERE tenant_id = :tid
+
+`get_current_tenant` resolves the tenant from (in order): X-Tenant-Slug header,
+?tenant= query param, or the user's single membership. Pair with
+feature-auth's get_current_user.
+"""
+from contextvars import ContextVar
+
+from fastapi import Depends, Header, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..models.tenant import Tenant, TenantMembership
+
+# Request-scoped tenant id (set by get_current_tenant).
+current_tenant_id: ContextVar[int] = ContextVar("current_tenant_id", default=0)
+
+
+def _resolve_membership(db: Session, user_id: int, slug: str | None) -> TenantMembership:
+    stmt = select(TenantMembership).where(TenantMembership.user_id == user_id)
+    if slug:
+        tenant = db.execute(select(Tenant).where(Tenant.slug == slug)).scalar_one_or_none()
+        if tenant is None or not tenant.is_active:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail="Tenant not found")
+        stmt = stmt.where(TenantMembership.tenant_id == tenant.id)
+    membership = db.execute(stmt.order_by(TenantMembership.created_at)).scalars().first()
+    if membership is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="No tenant membership")
+    return membership
+
+
+def get_current_tenant(
+    claims: dict = Depends(get_current_user),
+    x_tenant_slug: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> Tenant:
+    """Resolve + pin the active tenant for this request."""
+    membership = _resolve_membership(db, int(claims["sub"]), x_tenant_slug)
+    tenant = db.get(Tenant, membership.tenant_id)
+    current_tenant_id.set(tenant.id)
+    return tenant
+
+
+def require_role(role: str):
+    """Dependency factory: get_current_tenant but 403 unless membership.role matches."""
+    def _dep(
+        claims: dict = Depends(get_current_user),
+        x_tenant_slug: str | None = Header(default=None),
+        db: Session = Depends(get_db),
+    ) -> Tenant:
+        tenant = get_current_tenant(claims, x_tenant_slug=x_tenant_slug, db=db)
+        membership = db.execute(
+            select(TenantMembership).where(
+                TenantMembership.tenant_id == tenant.id,
+                TenantMembership.user_id == int(claims["sub"]),
+            )
+        ).scalar_one()
+        if membership.role != role and membership.role != "owner":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail=f"Requires {role} role")
+        return tenant
+    return _dep
+
+
+def scoped(stmt, tenant_id: int):
+    """Append a tenant_id filter to any select over a tenant-scoped table."""
+    column = getattr(stmt.column_descriptions[0]["entity"], "tenant_id", None)
+    if column is None:
+        raise ValueError("Model is not tenant-scoped (missing tenant_id column)")
+    return stmt.where(column == tenant_id)
+
+
+# TODO: add per-request DB engine switching here if you shard by tenant instead of row-scoping.

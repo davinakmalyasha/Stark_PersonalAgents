@@ -1,0 +1,48 @@
+import { useEffect, useState } from "react";
+
+type LogEntry = { ts: string; level: string; message: string; request_id?: string };
+
+export default function LogViewer({ apiBase = "{{ base_path }}" }: { apiBase?: string }) {
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [level, setLevel] = useState("");
+  const [q, setQ] = useState("");
+
+  useEffect(() => {
+    const url = `${apiBase}/admin/logs?level=${level}&q=${encodeURIComponent(q)}`;
+    fetch(url, { headers: { Authorization: `Bearer ${localStorage.getItem("auth_token") || ""}` } })
+      .then((r) => r.json())
+      .then((d) => setLogs(d.logs || []))
+      .catch(() => {});
+  }, [level, q, apiBase]);
+
+  return (
+    <div className="log-viewer">
+      <div className="log-filters">
+        <select value={level} onChange={(e) => setLevel(e.target.value)}>
+          <option value="">All levels</option>
+          <option value="error">Error</option>
+          <option value="warning">Warning</option>
+          <option value="info">Info</option>
+        </select>
+        <input placeholder="Search..." value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Level</th><th>Message</th></tr>
+        </thead>
+        <tbody>
+          {logs.map((l, i) => (
+            <tr key={i}>
+              <td>{l.ts}</td>
+              <td>{l.level}</td>
+              <td>{l.message}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {logs.length === 0 && <p>No logs.</p>}
+    </div>
+  );
+}
+
+// TODO: wire to feature-observability GET {{ base_path }}/admin/logs. Add pagination.

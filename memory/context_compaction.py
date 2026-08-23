@@ -1,43 +1,128 @@
-"""
-Context Compaction module.
-Two-tier compaction for multi-agent context window management.
+"""Single-checkpoint context management for agent transcripts.
 
-Tier 1 (Light): strip thinking blocks, deduplicate superseded file reads,
-                truncate outputs >40K chars. Never destroys semantic content.
-Tier 2 (Heavy): collapse everything before the last N messages into a
-                structured resume summary. Used when approaching context limit.
+Normal turns are append-only.  Once the shared checkpoint threshold is
+reached, the harness performs one atomic rewrite: refresh the full repository
+map, summarize the replaceable transcript with the dedicated free compactor,
+retain a small exact tail, and rebuild the transcript once.
 
-No [TOOL OK] markers. File reads are never compacted away — the model needs
-the content it learned, not a reminder that it read something.
+Native assistant tool calls and their ToolMessage results are kept together.
 """
 import os
 import re
-import uuid
-from langchain_core.messages import HumanMessage, AIMessage
-from memory.context_budget import estimate_tokens
+import threading
+from dataclasses import dataclass
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from memory.context_budget import estimate_message_tokens, estimate_messages, estimate_tokens
 
 
-def _get_active_ws():
-    """Import tools lazily and compute the active workspace path."""
-    from tools import shared_state, WORKSPACE
-    return os.path.abspath(shared_state.get("project_path") or WORKSPACE or ".")
+# ── Shared compaction policy ────────────────────────────────────────────────
+#
+# Keep the thresholds in one place.  The defaults assume a 1M-token provider
+# context and leave room for the model response and native tool schemas.  The
+# hard guard invokes the exact same checkpoint operation as the normal trigger;
+# it is not a second compaction tier.
+
+_DEFAULT_TAIL_TOKENS = 12_000
+_MAX_TAIL_TOKENS = 20_000
 
 
-# ── Thresholds ──
-# OpenCode uses PRUNE_PROTECT=40K tokens for tool output pruning.
-# We use 40K chars (~13K tokens for mixed code/text) — output smaller than
-# this is ~1.3% of a 1M token window and not worth touching.
-_TOOL_TRUNCATE_CHARS = 40_000
+@dataclass(frozen=True)
+class CompactionPolicy:
+    """One append-only/checkpoint budget shared by all agents."""
 
-# Error/failure indicators — never truncate or compact messages containing these
-_ERROR_SIGNALS = (
-    "error", "failed", "traceback", "exception", "exit code: 1",
-    "status: fail", "permission denied", "not found", "timeout",
-    "command not found", "cannot", "denied", "stack trace",
-    "syntaxerror", "indentationerror", "modulenotfounderror",
-    "importerror", "attributeerror", "typeerror", "valueerror",
-    "keyerror", "indexerror", "runtimeerror", "connectionerror",
-)
+    role: str = "developer"
+    checkpoint_trigger: int = 600_000
+    hard_limit: int = 700_000
+    tail_budget_tokens: int = _DEFAULT_TAIL_TOKENS
+    summary_output_tokens: int = 4_096
+
+
+def _positive_int(name: str, default: int) -> int:
+    """Read a positive integer environment override without raising in a run."""
+    try:
+        value = int(os.environ.get(name, ""))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def get_compaction_policy(role: str = "developer") -> CompactionPolicy:
+    """Return the shared policy, with optional global/per-role overrides.
+
+    Settings use ``COMPACTION_*`` (or ``<ROLE>_COMPACTION_*``).
+    """
+    role_key = re.sub(r"[^A-Za-z0-9]", "_", str(role or "developer")).upper()
+
+    def setting(suffix: str, default: int) -> int:
+        role_name = f"{role_key}_COMPACTION_{suffix}"
+        return _positive_int(role_name, _positive_int(f"COMPACTION_{suffix}", default))
+
+    tail = setting("TAIL_TOKENS", _DEFAULT_TAIL_TOKENS)
+    tail = min(max(tail, 4_000), _MAX_TAIL_TOKENS)
+
+    return CompactionPolicy(
+        role=role,
+        checkpoint_trigger=setting("CHECKPOINT_TOKENS", 600_000),
+        hard_limit=setting("HARD_LIMIT", 700_000),
+        tail_budget_tokens=tail,
+        summary_output_tokens=setting("SUMMARY_OUTPUT_TOKENS", 4_096),
+    )
+
+
+_LEGACY_TOOL_NAMES = {
+    "read_file", "safe_read_file", "edit_file", "batch_edit", "write_to_file",
+    "replace_file_content", "multi_replace_file_content", "run_command",
+    "exec_command", "search_code", "ask_user",
+    "browser_act", "browser_navigate", "browser_extract", "browser_screenshot",
+    "browser_click", "browser_fill", "browser_close", "template_list",
+    "apply_template", "template_new", "github_apply_gate",
+}
+_LEGACY_TOOL_HEAD = re.compile(r"^\[([a-zA-Z0-9_-]+)\]\s*:", re.IGNORECASE)
+
+
+def _is_tool_result(message) -> bool:
+    """Return whether a message carries a native or legacy tool result.
+
+    Older checkpoints encoded tool output as HumanMessage. Treating every
+    HumanMessage as a tool result would let compaction rewrite tasks, nudges,
+    and summaries, so legacy results are identified by their tool-labelled
+    payload instead.
+    """
+    if isinstance(message, ToolMessage):
+        return True
+    if not isinstance(message, HumanMessage):
+        return False
+    content = _tool_result_content(message).lstrip()
+    match = _LEGACY_TOOL_HEAD.match(content)
+    if not match:
+        return False
+    label = match.group(1).lower()
+    if label in _LEGACY_TOOL_NAMES:
+        return True
+    # Preserve compatibility with future/removed tools when an old merged
+    # result contains an unmistakable tool-output marker.
+    return "TOOL ERROR" in content[:500] or "[FILE]" in content[:500]
+
+
+def _tool_result_content(message) -> str:
+    return str(getattr(message, "content", ""))
+
+
+def _is_project_map_message(message) -> bool:
+    """Return whether a transcript message carries an injected map block."""
+    content = str(getattr(message, "content", "") or "").lstrip()
+    if not content.startswith(("<current-context>", "projectMap:", "projectMap+:")):
+        return False
+    return bool(re.search(r"(?m)^projectMap\+?:\s*$", content))
+
+
+def _is_full_project_map_message(message) -> bool:
+    """Return whether a message is a full project-map anchor."""
+    content = str(getattr(message, "content", "") or "").lstrip()
+    if not content.startswith(("<current-context>", "projectMap:")):
+        return False
+    return bool(re.search(r"(?m)^projectMap:\s*$", content))
+
 
 # Teaching note appended to truncated outputs — SWE-agent pattern: tell the
 # model WHY output was clipped and HOW to avoid re-dumping it.
@@ -50,136 +135,15 @@ def truncation_note(orig_len: int, cap: int) -> str:
     )
 
 
-# ── Tool-Result Sidecar Offloading ──
-# Tier-0 upgrades destructive stubbing to RETRIEVABLE offloading: raw output is
-# saved to <ws>/.agent-cache/<run-id>/ and the in-context message becomes a
-# lightweight pointer (read_file can fetch it back on demand). Zero LLM calls;
-# nothing is lost — only moved to disk. SIDECAR_OFFLOAD=0 restores the old
-# destructive stub behavior for A/B comparison.
-
-_SIDECAR_SUBDIR = ".agent-cache"
-_SIDECAR_MAX_AGE_HOURS = 48
-
-def _get_sidecar_run_id() -> str:
-    """Per-process run id for the sidecar subdir (one dir per harness process)."""
-    run_id = getattr(_get_sidecar_run_id, "_run_id", None)
-    if run_id is None:
-        run_id = os.environ.get("RUN_ID") or uuid.uuid4().hex[:8]
-        _get_sidecar_run_id._run_id = run_id
-    return run_id
-
-
-def _offload_to_sidecar(ws: str, content: str, msg_key: str, tool_label: str) -> str | None:
-    """
-    Write raw tool output to the workspace sidecar cache.
-    Returns the workspace-relative sidecar path, or None on any failure
-    (caller falls back to the destructive stub — offloading is best-effort).
-    """
-    try:
-        run_id = _get_sidecar_run_id()
-        sidecar_dir = os.path.join(ws, _SIDECAR_SUBDIR, run_id)
-        os.makedirs(sidecar_dir, exist_ok=True)
-        safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(msg_key))[:80] or "tool"
-        fname = f"tool_{tool_label}_{safe_key}.log"
-        fpath = os.path.join(sidecar_dir, fname)
-        with open(fpath, "w", encoding="utf-8", errors="replace") as f:
-            f.write(content)
-        return os.path.join(_SIDECAR_SUBDIR, run_id, fname).replace("\\", "/")
-    except Exception:
-        return None
-
-
-def _cleanup_old_sidecars(ws: str) -> None:
-    """Best-effort: drop sidecar files older than _SIDECAR_MAX_AGE_HOURS."""
-    try:
-        root = os.path.join(ws, _SIDECAR_SUBDIR)
-        if not os.path.isdir(root):
-            return
-        import time as _time
-        cutoff = _time.time() - _SIDECAR_MAX_AGE_HOURS * 3600
-        for dirpath, _, files in os.walk(root):
-            for fn in files:
-                if not fn.startswith("tool_"):
-                    continue
-                fp = os.path.join(dirpath, fn)
-                try:
-                    if os.path.getmtime(fp) < cutoff:
-                        os.remove(fp)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
-# ── Git-Anchored Context Compression ──
-# When tier-2 condenses many write/edit messages, the working tree itself is the
-# authoritative state. If the workspace is a git repo, collapse all intermediate
-# edit payloads into ONE <accumulated_changes> block (git diff --stat + truncated
-# diff) — byte-exact, zero LLM calls. Non-git workspaces keep the old one-liner
-# path untouched. GIT_DIFF_BLOCK=0 disables it.
-
-_GIT_STAT_MAX_CHARS = 1200
-_GIT_DIFF_MAX_CHARS = 2600
-
-def _git_changes_block(ws: str) -> str | None:
-    """Best-effort <accumulated_changes> block from the working tree, or None."""
-    if os.environ.get("GIT_DIFF_BLOCK", "1") != "1":
-        return None
-    if not ws or not os.path.isdir(ws):
-        return None
-    try:
-        import subprocess
-        def _run(cmd: list[str], timeout: int = 10) -> str:
-            try:
-                r = subprocess.run(
-                    ["git", "-C", ws] + cmd,
-                    capture_output=True, text=True, timeout=timeout,
-                    shell=False, errors="replace",
-                )
-                return r.stdout.strip() if r.returncode == 0 else ""
-            except Exception:
-                return ""
-
-        if _run(["rev-parse", "--is-inside-work-tree"]) != "true":
-            return None  # not a git repo — keep the one-liner fallback
-        # Scope to the workspace subtree: a task dir nested inside a larger repo
-        # must only ever report ITS OWN changes, not the parent repo's diff.
-        stat = _run(["diff", "--stat", "--", "."])
-        if not stat:
-            return None  # clean tree — nothing to report
-        stat = stat[:_GIT_STAT_MAX_CHARS]
-
-        diff = _run(["diff", "-U1", "--", "."])
-        if diff:
-            if len(diff) > _GIT_DIFF_MAX_CHARS:
-                head, tail = diff[:1600], diff[-1000:]
-                diff = f"{head}\n... [{len(diff):,} chars of diff omitted] ...\n{tail}"
-        else:
-            diff = ""
-
-        lines = [stat]
-        if diff:
-            lines.append(diff)
-        return (
-            "<accumulated_changes>\n"
-            + "\n".join(lines)
-            + "\n</accumulated_changes>\n"
-            "[All file edits above are saved on disk; content is the current working tree. "
-            "Do not re-apply them. Re-read only the exact lines you still need.]"
-        )
-    except Exception:
-        return None
-
-
-# ── Tail selection (B5): keep the last N TURNS up to a token budget ──
-# Replaces fixed keep_last_n message counts with a token-budget-aware tail that
-# preserves recency proportionally to window size (opencode select() pattern).
+# ── Tail selection: keep the newest exact messages up to a token budget ──
+# The checkpoint stores a bounded exact tail after the durable summary. No
+# message is rewritten or pruned before that single checkpoint.
 
 def select_tail_indices(
     messages: list,
     budget_tokens: int,
     keep_recent_turns: int = 2,
-    min_keep_messages: int = 6,
+    min_keep_messages: int = 3,
 ) -> set:
     """
     Pick the indices to KEEP from the tail of the conversation.
@@ -190,20 +154,26 @@ def select_tail_indices(
     """
     if not messages:
         return set()
+    if len(messages) == 1:
+        return {0}
+    body_start = 1  # the frozen SystemMessage is never part of the tail
     if budget_tokens <= 0:
-        budget_tokens = estimate_tokens(" ".join(str(m.content) for m in messages[-min_keep_messages:]))
+        budget_tokens = sum(
+            estimate_message_tokens(message)
+            for message in messages[max(body_start, len(messages) - min_keep_messages):]
+        )
 
     # Segment into turns scanning backward: a turn ends at an AIMessage
     turns = []  # (start_idx, end_idx, tokens) in forward order
     cur = []
-    for i in range(len(messages) - 1, -1, -1):
+    for i in range(len(messages) - 1, body_start - 1, -1):
         cur.append(i)
         if isinstance(messages[i], AIMessage):
-            toks = sum(estimate_tokens(str(messages[j].content)) for j in cur)
+            toks = sum(estimate_message_tokens(messages[j]) for j in cur)
             turns.append((cur[-1], cur[0] + 1, toks))
             cur = []
     if cur:
-        toks = sum(estimate_tokens(str(messages[j].content)) for j in cur)
+        toks = sum(estimate_message_tokens(messages[j]) for j in cur)
         turns.append((cur[-1], cur[0] + 1, toks))
     turns.reverse()
 
@@ -218,135 +188,121 @@ def select_tail_indices(
             remaining = budget_tokens - total
             idx = end - 1
             while idx >= start and remaining > 0:
-                t = estimate_tokens(str(messages[idx].content))
+                t = estimate_message_tokens(messages[idx])
                 if t <= remaining:
                     keep.append(idx)
                     remaining -= t
                 idx -= 1
             break
 
-    keep_set = set(keep)
+    keep_set = _bound_tail_indices(
+        messages,
+        _expand_tool_protocol_indices(messages, set(keep)),
+        budget_tokens,
+    )
     if len(keep_set) < min_keep_messages:
-        keep_set = set(range(len(messages) - min_keep_messages, len(messages)))
+        keep_set = _bound_tail_indices(
+            messages,
+            _expand_tool_protocol_indices(
+                messages,
+                set(range(max(body_start, len(messages) - min_keep_messages), len(messages))),
+            ),
+            budget_tokens,
+        )
     return keep_set
 
 
-# ── Prune stage (B6): erase bodies of old tool outputs, keep stubs ──
+def _expand_tool_protocol_indices(messages: list, indices: set[int]) -> set[int]:
+    """Keep native assistant-tool-result units together during tail selection.
 
-_TOOL_RESULT_HEAD = re.compile(r"^\[([a-zA-Z0-9_-]+)\]")
-_PRUNE_STUB_KEEP = 300  # head chars kept in the stub
-_PRUNE_MIN_CHARS = 60_000  # only commit if at least this much is freed
-_PRUNE_PROTECT_CHARS = 120_000  # protect the most recent this-many chars of tool outputs
-
-
-def prune_stale_tool_outputs(
-    messages: list,
-    protect_chars: int = _PRUNE_PROTECT_CHARS,
-    min_prune_chars: int = _PRUNE_MIN_CHARS,
-    keep_recent_turns: int = 2,
-) -> tuple:
+    Providers expect an assistant tool-call message to be immediately followed
+    by its ToolMessage results. A token boundary may land inside that unit, so
+    expand the selected set to include the owning AIMessage and all adjacent
+    ToolMessages. This only adds a few protocol tokens and prevents malformed
+    histories after compaction.
     """
-    Incremental tier-0 compaction: walk backward from the tail, erase the BODIES
-    of old tool-result messages (keeping a stub + tool name) so context frees up
-    without an LLM call or a full history rebuild. Keeps recent turns intact,
-    never touches error-signal messages or file reads.
+    expanded = {i for i in indices if 0 <= i < len(messages)}
+    for index in list(expanded):
+        message = messages[index]
+        if isinstance(message, ToolMessage):
+            owner = index - 1
+            while owner >= 0 and isinstance(messages[owner], ToolMessage):
+                owner -= 1
+            if owner >= 0 and isinstance(messages[owner], AIMessage):
+                expanded.add(owner)
+                cursor = owner + 1
+                while cursor < len(messages) and isinstance(messages[cursor], ToolMessage):
+                    expanded.add(cursor)
+                    cursor += 1
+        elif isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            cursor = index + 1
+            while cursor < len(messages) and isinstance(messages[cursor], ToolMessage):
+                expanded.add(cursor)
+                cursor += 1
+    return expanded
 
-    Raw output is offloaded to a workspace sidecar (<ws>/.agent-cache/<run-id>/)
-    before stubbing — retrievable via read_file — so nothing is lost
-    (SIDECAR_OFFLOAD=0 restores the old destructive stub).
 
-    Returns (new_messages, pruned_chars).
+def _bound_tail_indices(messages: list, indices: set[int], budget_tokens: int) -> set[int]:
+    """Keep the newest complete protocol units within the tail budget.
+
+    Tool-call assistants and their adjacent ToolMessages are indivisible. If
+    one such unit is itself larger than the cap, it is retained intact because
+    dropping half of a native round would make the transcript invalid; normal
+    insertion-time tool offloading keeps that case rare.
     """
-    if len(messages) < 8:
-        return messages, 0
+    selected = {i for i in indices if i > 0 and i < len(messages)}
+    if not selected or budget_tokens <= 0:
+        return selected
 
-    # Boundary: keep the most recent N turns untouched
-    ai_seen = 0
-    boundary = 0
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], AIMessage):
-            ai_seen += 1
-            if ai_seen >= keep_recent_turns:
-                boundary = i
-                break
-    if boundary <= 0:
-        boundary = len(messages) - 6
+    def unit_for(index: int) -> set[int]:
+        message = messages[index]
+        if isinstance(message, ToolMessage):
+            owner = index - 1
+            while owner >= 0 and isinstance(messages[owner], ToolMessage):
+                owner -= 1
+            if owner >= 0 and isinstance(messages[owner], AIMessage):
+                unit = {owner}
+                cursor = owner + 1
+                while cursor < len(messages) and isinstance(messages[cursor], ToolMessage):
+                    unit.add(cursor)
+                    cursor += 1
+                return unit
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            unit = {index}
+            cursor = index + 1
+            while cursor < len(messages) and isinstance(messages[cursor], ToolMessage):
+                unit.add(cursor)
+                cursor += 1
+            return unit
+        return {index}
 
-    # Collect pruneable tool-result messages in the OLD region (before boundary),
-    # newest-first (descending index). Skip error-signal messages, file reads,
-    # and the Zone-1/Zone-2 header ({0,1} — CF2: the task message must never be
-    # stubbed; index 1 sits at the prefix boundary, any rewrite kills the cache).
-    header_indices = get_header_indices(messages)
-    candidates: list[tuple[int, int]] = []
-    for i in range(boundary - 1, -1, -1):
-        if i in header_indices:
+    groups: list[set[int]] = []
+    seen: set[int] = set()
+    for index in sorted(selected):
+        if index in seen:
             continue
-        msg = messages[i]
-        if not isinstance(msg, HumanMessage):
+        group = unit_for(index) & selected
+        if not group:
             continue
-        content = msg.content if hasattr(msg, "content") else str(msg)
-        low = content.lower()
-        if any(e in low for e in _ERROR_SIGNALS):
-            continue  # never prune error/assertion content
-        if "[FILE]" in content:
-            continue  # file reads are knowledge — never pruned
-        if len(content) < 500:
-            continue  # not worth stubbing
-        candidates.append((i, len(content)))
+        groups.append(group)
+        seen.update(group)
 
-    # Protect the most recent protect_chars worth of tool output; prune the rest
-    prunable: list[tuple[int, int]] = []
-    acc = 0
-    for i, n in candidates:  # newest-first
-        acc += n
-        if acc > protect_chars:
-            prunable.append((i, n))
-
-    total_pruned = sum(n for _, n in prunable)
-    if total_pruned < min_prune_chars or not prunable:
-        return messages, 0
-
-    sidecar_on = os.environ.get("SIDECAR_OFFLOAD", "1") == "1"
-    if sidecar_on:
-        _cleanup_old_sidecars(_get_active_ws())
-
-    result = list(messages)
-    for idx, n in prunable:
-        msg = result[idx]
-        content = msg.content if hasattr(msg, "content") else str(msg)
-        head_match = _TOOL_RESULT_HEAD.match(content)
-        tool_label = head_match.group(1) if head_match else "tool"
-        sidecar_rel = None
-        if sidecar_on:
-            # Offload the full output first; the stub then points at it.
-            msg_key = getattr(msg, "id", None) or f"m{idx}"
-            sidecar_rel = _offload_to_sidecar(_get_active_ws(), content, msg_key, tool_label)
-        if sidecar_rel:
-            stub = (
-                f"[{tool_label}] output offloaded to sidecar: {sidecar_rel} "
-                f"({n:,} chars). Use read_file to inspect if needed."
-            )
-        else:
-            stub = content[:_PRUNE_STUB_KEEP]
-            stub = re.sub(r"^\[[^\]]+\]\s*", "", stub)  # avoid double tool label in the stub
-            stub = f"[{tool_label}] output pruned ({n:,} chars) — was:\n{stub}"
-        result[idx] = HumanMessage(
-            content=stub,
-            id=getattr(msg, "id", None),
-            additional_kwargs=getattr(msg, "additional_kwargs", {}),
-        )
-    return result, total_pruned
+    total = sum(estimate_message_tokens(messages[index]) for index in selected)
+    while groups and total > budget_tokens and len(groups) > 1:
+        oldest = groups.pop(0)
+        selected.difference_update(oldest)
+        total -= sum(estimate_message_tokens(messages[index]) for index in oldest)
+    return selected
 
 
-def get_header_indices(messages: list) -> set:
-    """Indices of the frozen header (SystemMessage + task HumanMessage).
-
-    Messages 0..1 are never compacted away — they carry the system prompt and
-    the original task. Mirrors checkpoint_compact's header_end=2 boundary.
-    """
-    if not messages:
-        return set()
-    return {0, 1}
+def _latest_full_project_map_index(messages: list) -> int | None:
+    """Return the newest full map index, excluding the frozen system message."""
+    full_indices = [
+        index
+        for index, message in enumerate(messages[1:], start=1)
+        if _is_full_project_map_message(message)
+    ]
+    return max(full_indices) if full_indices else None
 
 
 def strip_thinking(text: str) -> str:
@@ -356,760 +312,517 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
 
 
-def extract_paths_from_text(text: str) -> list[str]:
-    """Helper to extract file paths from various write/edit tool result formats."""
-    active_ws = _get_active_ws()
+# ── Single checkpoint compaction ────────────────────────────────────────────
 
-    paths = []
-    # 1. Look for uncompacted write/edit markers
-    for m in re.finditer(r"(?:[Ww]rote|[Ee]dited|[Aa]pplied diff to)\s+(\S+)", text):
-        paths.append(m.group(1))
-
-    # 2. Look for explicit JSON-like or Key-value properties
-    for m in re.finditer(r"(?:file_path|path|TargetFile|target_file)[:=]\s*([^\s,;\"'\(\)]+)", text):
-        paths.append(m.group(1))
-
-    # 3. Look for structured summary lists
-    for line in text.split("\n"):
-        if line.startswith("Files Modified:") or line.startswith("Files Created:"):
-            parts = line.split(":", 1)[1].split(",")
-            for p in parts:
-                p_clean = p.strip()
-                if p_clean:
-                    paths.append(p_clean)
-
-    # Clean and resolve to absolute paths
-    resolved_paths = []
-    for p in paths:
-        clean = p.strip("[](),;'\"")
-        if clean:
-            if not os.path.isabs(clean):
-                abs_p = os.path.abspath(os.path.join(active_ws, clean))
-            else:
-                abs_p = os.path.abspath(clean)
-            resolved_paths.append(os.path.normpath(abs_p).lower())
-    return list(set(resolved_paths))
+class CheckpointCompactionError(RuntimeError):
+    """Raised when a checkpoint cannot be committed without losing context."""
 
 
-def invalidate_stale_reads(messages: list) -> list:
-    """
-    Mark read_file results as stale if the file was later modified.
-    Preserves the file path metadata so the model knows to re-read.
-    Does NOT destroy content — only marks it.
-    """
-    result = list(messages)
-    modified_files: set[str] = set()
-    active_ws = _get_active_ws()
-
-    for idx in range(len(result) - 1, -1, -1):
-        msg = result[idx]
-
-        # Detect write/edit tool calls in AI messages (backwards)
-        if isinstance(msg, AIMessage):
-            content = msg.content if hasattr(msg, "content") else str(msg)
-            tool_calls = []
-            try:
-                from agents.developer_agent import parse_all_tool_calls
-                tool_calls = parse_all_tool_calls(content) if content else []
-            except Exception:
-                pass
-
-            for tc in tool_calls:
-                tool_name = tc.get("tool", "")
-                if tool_name in (
-                    "edit_file",
-                    "batch_edit", "write_to_file", "replace_file_content",
-                    "multi_replace_file_content"
-                ):
-                    args = tc.get("args") or {}
-                    path = (
-                        args.get("file_path") or args.get("path") or
-                        args.get("TargetFile") or args.get("target_file")
-                    )
-                    if path:
-                        if not os.path.isabs(path):
-                            abs_p = os.path.abspath(os.path.join(active_ws, path))
-                        else:
-                            abs_p = os.path.abspath(path)
-                        modified_files.add(os.path.normpath(abs_p).lower())
-
-        # Detect write/edit results in Human messages
-        elif isinstance(msg, HumanMessage):
-            content = msg.content if hasattr(msg, "content") else str(msg)
-            content_lower = content.lower()
-
-            is_write_edit_result = False
-            tool_name = None
-            name_match = re.search(r"Tool '([^']+)'|\[([a-zA-Z0-9_-]+)\]", content[:200])
-            if name_match:
-                tool_name = name_match.group(1) or name_match.group(2)
-
-            write_tools = {"edit_file", "batch_edit", "write_to_file", "replace_file_content", "multi_replace_file_content"}
-            if (tool_name in write_tools):
-                is_write_edit_result = True
-
-            if is_write_edit_result:
-                paths = extract_paths_from_text(content)
-                for p in paths:
-                    modified_files.add(p)
-
-            # Mark stale reads
-            if not is_write_edit_result and "[FILE]" in content:
-                m = re.search(r"\[FILE\]\s+([^\s\n]+)", content)
-                if m:
-                    file_path_str = m.group(1).strip()
-                    if not os.path.isabs(file_path_str):
-                        abs_read_p = os.path.abspath(os.path.join(active_ws, file_path_str))
-                    else:
-                        abs_read_p = os.path.abspath(file_path_str)
-                    norm_read_path = os.path.normpath(abs_read_p).lower()
-
-                    if norm_read_path in modified_files:
-                        stale_content = f"[read_file]:\n[FILE] {file_path_str} (content stale - file was modified later)"
-                        result[idx] = type(msg)(
-                            content=stale_content,
-                            id=getattr(msg, "id", None),
-                            additional_kwargs=getattr(msg, "additional_kwargs", {})
-                        )
-
-    return result
+_CHECKPOINT_LOCKS: dict[str, threading.Lock] = {}
+_CHECKPOINT_LOCKS_GUARD = threading.Lock()
 
 
-# ── Adaptive Compaction Threshold ──
+def _checkpoint_lock(workspace_path: str | None, chat_id: str | None) -> threading.Lock:
+    key = f"{os.path.abspath(workspace_path or '.')}: {chat_id or '-'}"
+    with _CHECKPOINT_LOCKS_GUARD:
+        lock = _CHECKPOINT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CHECKPOINT_LOCKS[key] = lock
+        return lock
 
-
-
-# ── Tier 1: Light Compaction ──
-
-def tier1_compact(messages: list, keep_last_n: int = 8, tail_budget_tokens: int = None) -> list:
-    """
-    Tier 1 (Light Compaction):
-      - Strips <thinking> blocks from AI messages.
-      - Deduplicates superseded file reads (keeps only the latest read of each file).
-      - Truncates tool outputs >40K chars in older messages.
-      - Protects headers and the tail (last N messages, or a token-budgeted tail).
-
-    Does NOT destroy semantic content. Does NOT use [TOOL OK] markers.
-    File reads are never compacted away — only superseded duplicates are removed.
-    """
-    header_indices = get_header_indices(messages)
-    if tail_budget_tokens:
-        protected = select_tail_indices(messages, tail_budget_tokens)
-    else:
-        protected = set(range(len(messages) - keep_last_n, len(messages)))
-
-    # Backwards scan to find superseded reads
-    seen_reads = set()
-    superseded_indices = set()
-    for idx in range(len(messages) - 1, -1, -1):
-        if idx in header_indices or idx in protected:
-            continue
-        msg = messages[idx]
-        if isinstance(msg, HumanMessage):
-            content = msg.content if hasattr(msg, "content") else str(msg)
-            if "[FILE]" in content:
-                m = re.search(r"\[FILE\]\s+([^\s\n]+)", content)
-                if m:
-                    file_path = os.path.normpath(m.group(1).strip()).lower()
-                    if file_path in seen_reads:
-                        superseded_indices.add(idx)
-                    else:
-                        seen_reads.add(file_path)
-
-    compacted = []
-    for i, msg in enumerate(messages):
-        if i in header_indices or i in protected:
-            compacted.append(msg)
-            continue
-
-        content = msg.content if hasattr(msg, "content") else str(msg)
-
-        if isinstance(msg, AIMessage):
-            # Strip thinking blocks, keep everything else
-            content = strip_thinking(content)
-            # Retain tool blocks if present (the actionable parts)
-            tool_blocks = re.findall(r"```tool\s*\n.*?\n```", content, flags=re.DOTALL)
-            if tool_blocks:
-                content = "\n\n".join(tool_blocks)
-            compacted.append(AIMessage(
-                content=content,
-                id=getattr(msg, "id", None),
-                tool_calls=getattr(msg, "tool_calls", []),
-                additional_kwargs=getattr(msg, "additional_kwargs", {})
-            ))
-            continue
-
-        if isinstance(msg, HumanMessage):
-            # Superseded read → keep the path metadata so model knows it was read
-            if i in superseded_indices:
-                read_match = re.search(r"\[FILE\]\s+([^\s\n]+)", content)
-                file_name = read_match.group(1) if read_match else "file"
-                compacted.append(HumanMessage(
-                    content=f"[read_file]:\n[FILE] {file_name} (content superseded by a later read)",
-                    id=getattr(msg, "id", None),
-                    additional_kwargs=getattr(msg, "additional_kwargs", {})
-                ))
-                continue
-
-            content_lower = content.lower()
-            # Error messages stay intact
-            if any(e in content_lower for e in _ERROR_SIGNALS):
-                compacted.append(msg)
-                continue
-
-            # Truncate only outputs >40K chars to prevent context overflow
-            if len(content) > _TOOL_TRUNCATE_CHARS:
-                orig_len = len(content)
-                head = content[:2000]
-                tail = content[-1000:]
-                content = f"{head}\n... [{orig_len} chars total — truncated at {_TOOL_TRUNCATE_CHARS} limit] ...\n{tail}"
-                content += truncation_note(orig_len, _TOOL_TRUNCATE_CHARS)
-
-            compacted.append(HumanMessage(
-                content=content,
-                id=getattr(msg, "id", None),
-                additional_kwargs=getattr(msg, "additional_kwargs", {})
-            ))
-            continue
-
-        compacted.append(msg)
-
-    return compacted
-
-
-# ── Tier 2: Medium Compaction ──
-
-def tier2_compact(messages: list, keep_last_n: int = 8, tail_budget_tokens: int = None) -> list:
-    """
-    Tier 2 (Medium Compaction):
-      - Runs Tier 1 compaction first (strip thinking, dedup reads, truncate >40K).
-      - For successful write/edit tool outputs: condense to one line with file path.
-      - When many edits were condensed AND the workspace is a git repo, they are
-        replaced by a single <accumulated_changes> block (git diff --stat + diff).
-      - For large run_command outputs (>40K): truncate, keep small ones intact.
-      - File reads are NEVER compacted — the model needs the content.
-
-    No [TOOL OK] markers. No content destruction.
-    When more aggressive compaction is needed, use checkpoint_compact instead.
-    """
-    # 1. Run Tier 1 first
-    messages = tier1_compact(messages, keep_last_n, tail_budget_tokens)
-
-    header_indices = get_header_indices(messages)
-    if tail_budget_tokens:
-        protected = select_tail_indices(messages, tail_budget_tokens)
-    else:
-        protected = set(range(len(messages) - keep_last_n, len(messages)))
-
-    compacted = []
-    action_count = 0
-    git_block = None
-    git_inserted = False
-    action_tools = {
-        "edit_file", "batch_edit",
-        "write_to_file", "replace_file_content",
-        "multi_replace_file_content",
-    }
-    # First pass: count condenseable write/edit messages in the old region so the
-    # git-anchored block (when present) can replace them wholesale.
-    for i, msg in enumerate(messages):
-        if i in header_indices or i in protected:
-            continue
-        if not isinstance(msg, HumanMessage):
-            continue
-        content = str(msg.content) if hasattr(msg, "content") else str(msg)
-        if any(e in content.lower() for e in _ERROR_SIGNALS):
-            continue
-        name_match = re.search(r"Tool '([^']+)'|\[([a-zA-Z0-9_-]+)\]", content[:200])
-        tool_name = name_match.group(1) or name_match.group(2) if name_match else ""
-        if tool_name in action_tools:
-            action_count += 1
-
-    git_block = None
-    if action_count >= 3:
-        try:
-            git_block = _git_changes_block(_get_active_ws())
-        except Exception:
-            git_block = None
-
-    for i, msg in enumerate(messages):
-        if i in header_indices or i in protected:
-            if git_block is not None and not git_inserted and i >= 2:
-                compacted.append(HumanMessage(content=git_block))
-                git_inserted = True
-            compacted.append(msg)
-            continue
-
-        content = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(msg, HumanMessage):
-            content_lower = content.lower()
-
-            # Always keep error messages intact
-            if any(e in content_lower for e in _ERROR_SIGNALS):
-                compacted.append(msg)
-                continue
-
-            # Extract tool name
-            tool_name = "tool"
-            name_match = re.search(r"Tool '([^']+)'|\[([a-zA-Z0-9_-]+)\]", content[:200])
-            if name_match:
-                tool_name = name_match.group(1) or name_match.group(2)
-
-            # Write/edit actions — can condense since content is on disk.
-            # Checked BEFORE the [FILE] guard: edit results often embed "[FILE]",
-            # but the tool name is authoritative (an edit result is not a read).
-            if tool_name in action_tools:
-                if git_block is not None:
-                    # The accumulated_changes block carries the full state —
-                    # individual edit payloads are dropped entirely.
-                    continue
-                # Extract file path from the output
-                fp = None
-                for ptn in [r"\[FILE\]\s+(\S+)", r"wrote\s+(\S+)", r"edited\s+(\S+)", r"file_path['\"]?\s*[:=]\s*['\"]?([^\s,;)'\"]+)", r"path['\"]?\s*[:=]\s*['\"]?([^\s,;)'\"]+)"]:
-                    m = re.search(ptn, content[:500], re.IGNORECASE)
-                    if m:
-                        fp = m.group(1)
-                        break
-                if fp:
-                    content = f"[{tool_name}]:\nWrote/edited {fp} — file content is on disk."
-                else:
-                    # Fallback: keep first 200 chars
-                    content = content[:200]
-                compacted.append(HumanMessage(
-                    content=content,
-                    id=getattr(msg, "id", None),
-                    additional_kwargs=getattr(msg, "additional_kwargs", {})
-                ))
-                continue
-
-            # File reads — NEVER compact. Content is knowledge, not side effect.
-            if tool_name in ("read_file", "safe_read_file") or "[FILE]" in content:
-                # Keep the read intact, but truncate if >40K
-                if len(content) > _TOOL_TRUNCATE_CHARS:
-                    orig_len = len(content)
-                    file_match = re.search(r"\[FILE\]\s+(\S+)", content)
-                    fname = file_match.group(1) if file_match else "file"
-                    head = content[:2000]
-                    tail = content[-1000:]
-                    content = f"[read_file]:\n[FILE] {fname}\n{head}\n... [{orig_len} chars total — truncated] ...\n{tail}"
-                    content += truncation_note(orig_len, _TOOL_TRUNCATE_CHARS)
-                compacted.append(HumanMessage(
-                    content=content,
-                    id=getattr(msg, "id", None),
-                    additional_kwargs=getattr(msg, "additional_kwargs", {})
-                ))
-                continue
-
-            # run_command — keep if small (<40K), truncate if large
-            if tool_name in ("run_command", "exec_command"):
-                if len(content) > _TOOL_TRUNCATE_CHARS:
-                    orig_len = len(content)
-                    head = content[:1000]
-                    tail = content[-500:]
-                    content = f"[{tool_name}]:\n{head}\n... [{orig_len} chars total — truncated] ...\n{tail}"
-                    content += truncation_note(orig_len, _TOOL_TRUNCATE_CHARS)
-                compacted.append(HumanMessage(
-                    content=content,
-                    id=getattr(msg, "id", None),
-                    additional_kwargs=getattr(msg, "additional_kwargs", {})
-                ))
-                continue
-
-            # Everything else — keep intact, truncate if >40K
-            if len(content) > _TOOL_TRUNCATE_CHARS:
-                orig_len = len(content)
-                head = content[:2000]
-                tail = content[-1000:]
-                content = f"{head}\n... [{orig_len} chars total — truncated] ...\n{tail}"
-                content += truncation_note(orig_len, _TOOL_TRUNCATE_CHARS)
-
-        compacted.append(msg)
-    return compacted
-
-
-# ── Checkpoint Compaction (Nuclear) ──
 
 def build_structured_resume_summary(tool_call_log: list, created: list, modified: list) -> str:
-    """Build structured summary preserving decisions, errors, and outcomes."""
-    sections = []
+    """Build exact harness facts to append to the semantic checkpoint."""
+    fields = []
+
+    def compact_values(values, limit: int = 2_000) -> str:
+        unique = list(dict.fromkeys(str(value) for value in (values or []) if str(value).strip()))
+        value = ", ".join(unique)
+        if len(value) <= limit:
+            return value
+        return value[:limit].rsplit(",", 1)[0] + ", …"
+
+    artifact_parts = []
     if created:
-        sections.append(f"Files Created: {', '.join(created)}")
+        artifact_parts.append(f"created={compact_values(created)}")
     if modified:
-        sections.append(f"Files Modified: {', '.join(modified)}")
+        artifact_parts.append(f"modified={compact_values(modified)}")
+    if artifact_parts:
+        fields.append("artifacts: " + "; ".join(artifact_parts))
 
-    # Extract key milestones from tool call log
     tool_types_seen = {}
-    for entry in tool_call_log:
-        tn = entry.get("tool", "")
-        tool_types_seen[tn] = tool_types_seen.get(tn, 0) + 1
-
+    for entry in tool_call_log or []:
+        if not isinstance(entry, dict):
+            continue
+        tool_name = str(entry.get("tool", "")).strip()
+        if tool_name:
+            tool_types_seen[tool_name] = tool_types_seen.get(tool_name, 0) + 1
     if tool_types_seen:
-        summary = ", ".join(f"{k} ({v}x)" for k, v in tool_types_seen.items())
-        sections.append(f"Tool Activity: {summary}")
+        activity = ", ".join(f"{name}×{count}" for name, count in tool_types_seen.items())
+        fields.append(f"facts: tool_activity={activity}")
 
-    return "\n".join(sections)
+    return "\n".join(fields)
 
 
-def _build_semantic_resume_summary(messages: list, header_end: int, tail_start: int) -> str | None:
-    """B2: one cheap flash call summarizing the DROPPED region semantically.
+_FREE_COMPACTION_SYSTEM = """You are a generic transcript compactor inside an agent harness.
+You are not the primary agent and must not greet the user or take actions.
+Summarize the supplied chronological transcript into durable state. Preserve
+user requirements and constraints, decisions, completed outcomes, exact useful
+errors, verification evidence, artifact identifiers, unresolved work, and next
+actions. Do not invent facts, repeat system rules, include source code, or dump
+tool output. The workspace can be coding, household, research, or general.
+Return only this compact format, omitting empty fields and keeping each field
+brief. Aim for at most 2,048 output tokens and never exceed the requested cap:
+[COMPACTION]
+goal:
+requirements:
+state: done|in_progress|blocked|unknown
+completed:
+decisions:
+facts:
+artifacts:
+failures:
+verification:
+open:
+next:
+[/COMPACTION]"""
 
-    The structural summary (file lists + tool counts) preserves WHAT changed;
-    this preserves WHY — decisions, failures, open items. Best-effort: any
-    error falls back to the structural summary (caller keeps it).
-    Gated by T3_LLM_SUMMARY (default 1) and a min dropped-size floor
-    (T3_LLM_SUMMARY_MIN_CHARS, default 150K) so small compactions never
-    pay for a call.
-    """
-    if os.environ.get("T3_LLM_SUMMARY", "1") != "1":
+
+def _message_role(message) -> str:
+    if isinstance(message, AIMessage):
+        return "assistant"
+    if isinstance(message, ToolMessage) or _is_tool_result(message):
+        return "tool"
+    if isinstance(message, HumanMessage):
+        return "user"
+    if isinstance(message, SystemMessage):
+        return "system"
+    return "message"
+
+
+def _message_content_text(message) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, (list, tuple, dict)):
+        try:
+            content = __import__("json").dumps(content, ensure_ascii=False, default=str)
+        except Exception:
+            content = str(content)
+    content = str(content or "")
+    if isinstance(message, AIMessage):
+        content = strip_thinking(content)
+    return content.strip() or "(empty)"
+
+
+def _render_compactor_message(index: int, message) -> str:
+    """Render a complete message without duplicating native tool schemas."""
+    role = _message_role(message)
+    content = _message_content_text(message)
+    lines = [f"[{index} {role}]", content]
+    calls = getattr(message, "tool_calls", None) or []
+    if calls:
+        try:
+            encoded = __import__("json").dumps(calls, ensure_ascii=False, default=str, separators=(",", ":"))
+        except Exception:
+            encoded = str(calls)
+        lines.insert(1, f"tool_calls={encoded}")
+    if isinstance(message, ToolMessage):
+        tool_name = getattr(message, "name", None)
+        call_id = getattr(message, "tool_call_id", None)
+        if tool_name or call_id:
+            lines.insert(1, f"tool={tool_name or '-'} call_id={call_id or '-'}")
+    return "\n".join(lines)
+
+
+def _compactor_records(messages: list) -> list[str]:
+    """Return replaceable transcript records, excluding stable system/map data."""
+    records = []
+    for index, message in enumerate(messages or []):
+        if isinstance(message, SystemMessage):
+            continue
+        # The current full projectMap is rebuilt independently and must not be
+        # duplicated inside the history summary.
+        if _is_full_project_map_message(message):
+            continue
+        records.append(_render_compactor_message(index, message))
+    return records
+
+
+def _split_compactor_records(records: list[str], budget_tokens: int) -> list[str]:
+    """Split records without dropping a long user/tool message."""
+    budget_tokens = max(int(budget_tokens), 1_000)
+    max_chars = budget_tokens * 3
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+    for record in records:
+        pieces = [record]
+        if estimate_tokens(record) > budget_tokens:
+            pieces = [record[start:start + max_chars] for start in range(0, len(record), max_chars)]
+        for piece in pieces:
+            piece_tokens = estimate_tokens(piece)
+            if current and current_tokens + piece_tokens > budget_tokens:
+                chunks.append("\n\n".join(current))
+                current = []
+                current_tokens = 0
+            current.append(piece)
+            current_tokens += piece_tokens
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks or ["(no replaceable transcript)"]
+
+
+def _cap_compaction_summary(summary: str, max_chars: int = 12_000) -> str | None:
+    """Normalize and cap a compactor response before storing it in history."""
+    value = re.sub(r"```(?:text|markdown)?", "", str(summary or ""), flags=re.IGNORECASE)
+    value = value.replace("```", "").strip()
+    if not value:
         return None
+    # Normalize even a partially formed model response so the durable
+    # checkpoint always has exactly one bounded canonical envelope.
+    if "[COMPACTION]" in value:
+        value = value.split("[COMPACTION]", 1)[1]
+    if "[/COMPACTION]" in value:
+        value = value.split("[/COMPACTION]", 1)[0]
+    body = value.strip()
+    if not body:
+        return None
+
+    opening = "[COMPACTION]\n"
+    closing = "\n[/COMPACTION]"
+    max_body = max(1, int(max_chars) - len(opening) - len(closing))
+    if len(body) > max_body:
+        body = body[:max_body].rsplit("\n", 1)[0].rstrip()
+    normalized = opening + body + closing
+    return normalized if len(body) >= 20 else None
+
+
+def _compactor_call(
+    agent,
+    payload: str,
+    policy: CompactionPolicy,
+    context_sensitive: bool = True,
+    abort_check=None,
+) -> str:
+    """Call the dedicated free compactor with context-aware routing."""
+    from agents.free_agent import ContextWindowExceededError
+
+    required_context = (
+        estimate_tokens(_FREE_COMPACTION_SYSTEM)
+        + estimate_tokens(payload)
+        + policy.summary_output_tokens
+        + 1_024
+    )
     try:
-        dropped = messages[header_end:tail_start]
-        dropped_chars = sum(len(str(getattr(m, "content", ""))) for m in dropped)
-        min_chars = int(os.environ.get("T3_LLM_SUMMARY_MIN_CHARS", "150000"))
-        if dropped_chars < min_chars:
-            return None
-
-        # Compact transcript sample: last ~12 dropped messages, ~300 chars each
-        sample = []
-        for m in dropped[-12:]:
-            c = str(getattr(m, "content", ""))
-            c = re.sub(r"\s+", " ", c)[:300]
-            label = "AI" if isinstance(m, AIMessage) else "tool-result"
-            sample.append(f"[{label}] {c}")
-        transcript = "\n".join(sample)
-
-        from llm import invoke_with_fallback
-        summary = invoke_with_fallback(
-            role="MemoryArchivist",
-            sys_inst=(
-                "You are a context-compaction summarizer. From the agent work "
-                "transcript below, write a tight 5-8 line summary capturing: "
-                "what was accomplished, what FAILED or is BLOCKED (with the "
-                "exact error/failure), decisions made and why, and what remains "
-                "to do next. Output ONLY the summary text — no headers, no "
-                "markdown, no preamble."
-            ),
-            prompt=f"Transcript of agent work (older history, being compacted):\n\n{transcript}",
-            temp=0.3,
-            where="context compaction summary",
+        reply = agent.chat(
+            payload,
+            system_prompt=_FREE_COMPACTION_SYSTEM,
+            capability="text",
+            temperature=0.1,
+            max_tokens=policy.summary_output_tokens,
+            min_context_tokens=required_context,
+            prefer_context=True,
+            retry_forever=True,
+            context_sensitive=context_sensitive,
+            abort_check=abort_check,
         )
-        s = str(summary).strip()
-        if len(s) >= 40:
-            return s
-    except Exception:
-        pass
-    return None
+    except ContextWindowExceededError:
+        raise
+    normalized = _cap_compaction_summary(
+        reply,
+        max_chars=max(8_000, policy.summary_output_tokens * 3),
+    )
+    if not normalized:
+        raise CheckpointCompactionError("The free compactor returned an empty summary.")
+    return normalized
+
+
+def _reduce_compactor_summaries(
+    agent,
+    summaries: list[str],
+    policy: CompactionPolicy,
+    max_context: int,
+    abort_check=None,
+) -> str:
+    """Reduce chronological partial states until one canonical checkpoint remains."""
+    current = list(summaries)
+    reserve = estimate_tokens(_FREE_COMPACTION_SYSTEM) + policy.summary_output_tokens + 1_024
+    merge_prefix = (
+        "Merge these chronological partial checkpoint states. Earlier entries "
+        "establish context; later entries supersede them when they conflict. "
+        "Return the same canonical [COMPACTION] format.\n\n"
+    )
+    group_budget = max(1_000, max_context - reserve - estimate_tokens(merge_prefix))
+    while len(current) > 1 or estimate_tokens("\n\n---\n\n".join(current)) + reserve > max_context:
+        groups: list[list[str]] = []
+        group: list[str] = []
+        group_tokens = 0
+        for summary in current:
+            summary_tokens = estimate_tokens(summary)
+            if group and group_tokens + summary_tokens > group_budget:
+                groups.append(group)
+                group = []
+                group_tokens = 0
+            group.append(summary)
+            group_tokens += summary_tokens
+        if group:
+            groups.append(group)
+        next_round = []
+        for group in groups:
+            payload = merge_prefix + "\n\n---\n\n".join(group)
+            next_round.append(_compactor_call(agent, payload, policy, abort_check=abort_check))
+        if len(next_round) == len(current) and len(next_round) > 1:
+            # A pathological provider/model limit should not create an endless
+            # local reduction loop. Each group call already produced a valid
+            # compact state, so the final call can merge the bounded results.
+            break
+        current = next_round
+    if not current:
+        raise CheckpointCompactionError("No partial compactor state was produced.")
+    if len(current) == 1:
+        return current[0]
+    payload = (
+        "Produce the final durable checkpoint by merging these chronological "
+        "partial states. Preserve requirements, decisions, failures, verification, "
+        "open work, and next actions. Return only the canonical format.\n\n"
+        + "\n\n---\n\n".join(current)
+    )
+    return _compactor_call(agent, payload, policy, abort_check=abort_check)
+
+
+def _build_free_compaction_summary(messages: list, policy: CompactionPolicy, abort_check=None) -> str:
+    """Summarize the full replaceable transcript with the free-only agent."""
+    records = _compactor_records(messages)
+    if not records:
+        return "[COMPACTION]\nstate: unknown\n[/COMPACTION]"
+
+    from agents.free_agent import FreeAgent
+
+    agent = FreeAgent()
+    serialized = "\n\n".join(records)
+    reserve = estimate_tokens(_FREE_COMPACTION_SYSTEM) + policy.summary_output_tokens + 1_024
+    capacities = agent.available_model_contexts("text")
+    if not capacities:
+        raise CheckpointCompactionError("No configured free text model is available for compaction.")
+    max_context = max(capacities)
+
+    full_prefix = (
+        "Summarize the complete chronological transcript below. The current full "
+        "project map is managed separately; do not reproduce it.\n\n"
+    )
+    full_payload = full_prefix + serialized
+    if estimate_tokens(full_payload) + reserve <= max_context:
+        try:
+            return _compactor_call(agent, full_payload, policy, abort_check=abort_check)
+        except Exception as exc:
+            # A provider can advertise a catalog context that rejects the real
+            # serialized request. Fall through to chunking for that case; other
+            # provider failures are retried indefinitely by FreeAgent.
+            from agents.free_agent import ContextWindowExceededError
+            if not isinstance(exc, ContextWindowExceededError):
+                raise
+
+    chunk_prefix = (
+        "Summarize chronological transcript chunk 1/1. Return a partial "
+        "[COMPACTION] state; do not omit requirements, decisions, failures, "
+        "verification, or next actions present in this chunk.\n\n"
+    )
+    chunk_budget = max_context - reserve - estimate_tokens(chunk_prefix)
+    if chunk_budget < 8_000:
+        raise CheckpointCompactionError("Configured free models leave no usable compaction context.")
+    from agents.free_agent import ContextWindowExceededError
+
+    while True:
+        chunks = _split_compactor_records(records, chunk_budget)
+        partials = []
+        try:
+            for position, chunk in enumerate(chunks, start=1):
+                payload = (
+                    f"Summarize chronological transcript chunk {position}/{len(chunks)}. "
+                    "Return a partial [COMPACTION] state; do not omit requirements, decisions, "
+                    "failures, verification, or next actions present in this chunk.\n\n"
+                    + chunk
+                )
+                partials.append(_compactor_call(agent, payload, policy, abort_check=abort_check))
+        except ContextWindowExceededError:
+            # Providers sometimes advertise a rounded context size. Retry the
+            # chunk pass with a smaller payload, while still committing only
+            # one final Developer transcript rewrite.
+            if chunk_budget <= 8_000:
+                raise
+            chunk_budget = max(8_000, chunk_budget // 2)
+            continue
+        break
+    return _reduce_compactor_summaries(agent, partials, policy, max_context, abort_check=abort_check)
+
+
+def _is_compaction_message(message) -> bool:
+    return "[COMPACTION]" in str(getattr(message, "content", "") or "")
+
+
+def _full_map_message(content: str | None) -> HumanMessage | None:
+    value = str(content or "").strip()
+    if not value:
+        return None
+    if value.startswith("<current-context>"):
+        return HumanMessage(content=value)
+    return HumanMessage(content=f"<current-context>\n{value}\n</current-context>")
 
 
 def checkpoint_compact(
     messages: list,
-    tool_call_log: list,
-    created: list,
-    modified: list,
+    tool_call_log: list | None = None,
+    created: list | None = None,
+    modified: list | None = None,
     keep_last_n: int = 12,
-    tail_budget_tokens: int = None,
+    tail_budget_tokens: int = _DEFAULT_TAIL_TOKENS,
+    policy: CompactionPolicy | None = None,
+    full_project_map: str | None = None,
+    summary_text: str | None = None,
 ) -> list:
-    """
-    Checkpoint-Based Compaction.
-    Collapses everything between the header and the tail into a structured
-    resume summary. Preserves system prompt + task + tail (last N messages, or
-    a token-budgeted tail).
+    """Build the one committed checkpoint message layout.
 
-    The resume summary is CHAINED: any prior compaction summary found in the
-    dropped region is folded into the new summary instead of being lost (M3).
-    A semantic LLM summary of the dropped region (B2) is prepended when the
-    dropped region is large — best-effort, structural fallback on any failure.
-
-    This is the heavy compaction for when we're approaching the context limit.
-    Unlike [TOOL OK] approach, the resume summary preserves dense factual
-    information about what was accomplished.
+    This pure rebuild function does not refresh the filesystem or call an LLM;
+    :func:`compact_history` performs those preparatory steps before invoking it.
+    Any old full map and every old ``projectMap+`` event are removed from the
+    committed list when a new full map is supplied.
     """
+    if not messages or len(messages) <= 2:
+        return messages
+    policy = policy or get_compaction_policy()
     if tail_budget_tokens:
+        tail_budget_tokens = min(max(int(tail_budget_tokens), 4_000), _MAX_TAIL_TOKENS)
         tail_indices = select_tail_indices(messages, tail_budget_tokens)
-        tail_start = min(tail_indices) if tail_indices else len(messages)
-        if tail_start < 3:
-            return messages  # conversation fits the budget — nothing to collapse
     else:
-        tail_start = len(messages) - keep_last_n
-        if len(messages) <= keep_last_n + 2:
-            return messages
-    if tail_start >= len(messages):
+        tail_indices = _expand_tool_protocol_indices(
+            messages,
+            set(range(max(1, len(messages) - max(1, keep_last_n)), len(messages))),
+        )
+    tail_indices = {index for index in tail_indices if index > 0}
+    if not tail_indices:
         return messages
 
-    header_end = 2
-    summary_msg_content = build_structured_resume_summary(tool_call_log, created, modified)
+    latest_full_map = _latest_full_project_map_index(messages)
+    map_content = full_project_map
+    if not map_content and latest_full_map is not None:
+        map_content = str(getattr(messages[latest_full_map], "content", "") or "")
+    map_message = _full_map_message(map_content)
 
-    # B2: semantic LLM summary of the dropped region, prepended when available
-    semantic = _build_semantic_resume_summary(messages, header_end, tail_start)
-    if semantic:
-        summary_msg_content = (
-            "SEMANTIC SESSION SUMMARY (what happened and why):\n"
-            f"{semantic}\n\n"
-            "STRUCTURAL STATE (files + tool activity):\n"
-            f"{summary_msg_content}"
-        )
+    structural = build_structured_resume_summary(
+        tool_call_log or [],
+        created or [],
+        modified or [],
+    )
+    summary = _cap_compaction_summary(summary_text, max_chars=max(8_000, policy.summary_output_tokens * 3))
+    if not summary:
+        summary = "[COMPACTION]\nstate: history_compacted\n[/COMPACTION]"
+    if structural:
+        summary = _cap_compaction_summary(
+            summary.replace("\n[/COMPACTION]", "") + "\n" + structural,
+            max_chars=max(8_000, policy.summary_output_tokens * 3),
+        ) or summary
 
-    # M3: chain prior compaction summaries from the dropped region
-    prior_summaries = []
-    for msg in messages[header_end:tail_start]:
-        content = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(content, str) and content.startswith("[SYSTEM INFO] History compacted"):
-            prior_summaries.append(content)
-    if prior_summaries:
-        last_prior = prior_summaries[-1]
-        summary_msg_content = (
-            "PREVIOUS SUMMARY (from earlier compaction):\n"
-            f"{last_prior[:1500]}\n\n"
-            "NEW ACTIVITY SINCE THEN:\n"
-            f"{summary_msg_content}"
-        )
+    retained_tail = []
+    for index in sorted(tail_indices):
+        message = messages[index]
+        # The refreshed full map supersedes every old full/delta map event.
+        if _is_project_map_message(message) or _is_compaction_message(message):
+            continue
+        retained_tail.append(message)
 
-    # Preserve decisions from the tail messages
-    decisions = []
-    for msg in list(messages)[tail_start:]:
-        if isinstance(msg, AIMessage):
-            c = msg.content if hasattr(msg, "content") else str(msg)
-            # Extract any tool calls mentioned
-            call_match = re.findall(r'```tool\s*{\s*"tool":\s*"([^"]+)"', c)
-            if call_match:
-                decisions.append(f"Called: {', '.join(call_match[:3])}")
-
-    if decisions:
-        summary_msg_content += "\n\nRecent Actions:\n" + "\n".join(f"- {d}" for d in decisions)
-
-    summary_msg = HumanMessage(content=f"[SYSTEM INFO] History compacted. Summary of progress so far:\n\n{summary_msg_content}")
-
-    compacted = list(messages[:header_end])
-    compacted.append(summary_msg)
-    compacted.extend(messages[tail_start:])
+    compacted = []
+    if messages:
+        compacted.append(messages[0])
+    if map_message is not None:
+        compacted.append(map_message)
+    compacted.append(HumanMessage(content=summary))
+    compacted.extend(retained_tail)
     return compacted
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pi-style session-log compaction (P3): summary entry + retainedTail checkpoint
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _entry_char_size(entry) -> int:
-    """Rough char size of a session entry for cut-point math."""
-    try:
-        from session_log import CompactionEntry, BranchSummaryEntry, MessageEntry, message_text
-        if isinstance(entry, MessageEntry):
-            total = len(message_text(entry.content))
-            if isinstance(entry.content, list):
-                for block in entry.content:
-                    if getattr(block, "type", "") == "toolCall":
-                        total += len(str(block.arguments))
-            return total
-        if isinstance(entry, CompactionEntry):
-            return len(entry.summary)
-        if isinstance(entry, BranchSummaryEntry):
-            return len(entry.summary)
-        return 0
-    except Exception:
-        return 0
-
-
-def _entries_chars(entries: list) -> int:
-    return sum(_entry_char_size(e) for e in entries)
-
-
-def _log_cut_valid(entry) -> bool:
-    """Cut points must be user/assistant messages — never a tool result
-    (it must stay with its tool call)."""
-    try:
-        from session_log import MessageEntry
-        return isinstance(entry, MessageEntry) and entry.role in ("user", "assistant")
-    except Exception:
-        return False
-
-
-def find_log_cut_point(entries: list, keep_recent_chars: int) -> tuple[int, int]:
-    """Walk backwards from the newest entry accumulating char size; cut at the
-    first valid user/assistant boundary that fits the budget. Returns
-    (cut_index, accumulated_chars); entries[:cut] are summarized."""
-    if not entries:
-        return 0, 0
-    acc = 0
-    for i in range(len(entries) - 1, -1, -1):
-        acc += _entry_char_size(entries[i])
-        if acc >= keep_recent_chars:
-            j = i
-            while j >= 0 and not _log_cut_valid(entries[j]):
-                j -= 1
-            return max(j, 0), acc
-    return 0, acc
-
-
-def serialize_entries(entries: list, tool_result_cap: int = 2000) -> str:
-    """Serialize session entries to plain text for summarization (Pi-style).
-
-    The flat [User]/[Assistant]/[Tool result] framing keeps the summarizer from
-    treating the transcript as a conversation to continue.
-    """
-    from session_log import (CompactionEntry, BranchSummaryEntry, MessageEntry,
-                             message_text)
-    lines = []
-    for e in entries:
-        try:
-            if isinstance(e, CompactionEntry):
-                lines.append(f"[Context summary]: {e.summary[:2000]}")
-            elif isinstance(e, BranchSummaryEntry):
-                lines.append(f"[Branch summary]: {e.summary[:2000]}")
-            elif isinstance(e, MessageEntry):
-                if e.role == "user":
-                    lines.append(f"[User]: {message_text(e.content)[:4000]}")
-                elif e.role == "assistant":
-                    thinking = ""
-                    calls = []
-                    text = ""
-                    if isinstance(e.content, list):
-                        for block in e.content:
-                            bt = getattr(block, "type", "")
-                            if bt == "thinking":
-                                thinking = block.thinking
-                            elif bt == "toolCall":
-                                calls.append(f"{block.name}({block.arguments})")
-                            elif bt == "text":
-                                text = block.text
-                    else:
-                        text = str(e.content)
-                    if thinking:
-                        lines.append(f"[Assistant thinking]: {thinking[:1500]}")
-                    if calls:
-                        lines.append(f"[Assistant tool calls]: {'; '.join(calls)[:1500]}")
-                    if text:
-                        lines.append(f"[Assistant]: {text[:4000]}")
-                elif e.role == "toolResult":
-                    t = message_text(e.content)
-                    if len(t) > tool_result_cap:
-                        t = f"{t[:tool_result_cap]}... [{len(t)} chars truncated]"
-                    lines.append(f"[Tool result]: {t}")
-        except Exception:
-            continue
-    return "\n".join(lines)
-
-
-def extract_log_file_ops(entries: list) -> tuple[list, list]:
-    """Cumulative read/modified file tracking from toolCall blocks."""
-    from session_log import MessageEntry
-    read_files: list[str] = []
-    modified_files: list[str] = []
-    seen_r, seen_m = set(), set()
-
-    def _add(dst, seen, path):
-        if path and path not in seen:
-            seen.add(path)
-            dst.append(path)
-
-    for e in entries:
-        if not isinstance(e, MessageEntry) or not isinstance(e.content, list):
-            continue
-        for block in e.content:
-            bt = getattr(block, "type", "")
-            if bt != "toolCall":
-                continue
-            args = block.arguments or {}
-            path = str(args.get("file_path") or args.get("path") or "")
-            if not path:
-                continue
-            if block.name in ("read_file", "ls"):
-                _add(read_files, seen_r, path)
-            elif block.name in ("edit_file", "revert_last_change", "apply_patch"):
-                _add(modified_files, seen_m, path)
-    return read_files, modified_files
-
-
-_LOG_SUMMARY_SYSTEM = (
-    "You are a context-compaction summarizer. From the agent work transcript "
-    "below, produce a summary in this exact structure:\n"
-    "## Goal\nWhat the user is trying to accomplish\n"
-    "## Constraints & Preferences\n- requirements mentioned\n"
-    "## Progress\n### Done\n- completed items\n### In Progress\n- current work\n"
-    "### Blocked\n- issues with exact errors\n"
-    "## Key Decisions\n- **decision**: rationale\n"
-    "## Next Steps\n1. what should happen next\n"
-    "## Critical Context\n- data needed to continue\n"
-    "Include a <read-files> and <modified-files> block at the end. "
-    "Output ONLY the summary."
-)
-
-
-def _summarize_entries(entries: list, previous_summaries: list) -> str | None:
-    """One flash call summarizing the dropped region (best-effort)."""
-    if os.environ.get("LOG_LLM_SUMMARY", "1") != "1":
+def _refresh_checkpoint_map(workspace_path: str | None) -> str | None:
+    if not workspace_path:
         return None
     try:
-        transcript = serialize_entries(entries)
-        if len(transcript) < 2000:
-            return None
-        prev = ""
-        if previous_summaries:
-            prev = "PREVIOUS SUMMARIES (fold into context):\n" + \
-                "\n---\n".join(s[:1500] for s in previous_summaries[-2:]) + "\n\n"
-        from llm import invoke_with_fallback
-        summary = invoke_with_fallback(
-            role="MemoryArchivist",
-            sys_inst=_LOG_SUMMARY_SYSTEM,
-            prompt=f"{prev}Transcript of agent work (older history, being compacted):\n\n{transcript}",
-            temp=0.3,
-            where="session log compaction summary",
+        from memory.memory_manager import refresh_code_map_context
+        result = refresh_code_map_context(
+            workspace_path,
+            force_full=True,
+            include_cached_full=True,
         )
-        s = str(summary).strip()
-        return s if len(s) >= 40 else None
-    except Exception:
-        return None
+    except Exception as exc:
+        raise CheckpointCompactionError(f"Full projectMap refresh failed: {exc}") from exc
+    content = str(result.get("content") or "").strip() if isinstance(result, dict) else ""
+    if not content.startswith("projectMap:"):
+        raise CheckpointCompactionError("Full projectMap refresh returned no valid snapshot.")
+    return content
 
 
-def compact_session_log(session_mgr, keep_recent_chars: int | None = None) -> str | None:
-    """Pi-style compaction on a session log (P3).
+def compact_history(
+    messages: list,
+    tool_call_log: list | None = None,
+    created: list | None = None,
+    modified: list | None = None,
+    policy: CompactionPolicy | None = None,
+    workspace_path: str | None = None,
+    chat_id: str | None = None,
+    projected_tokens: int | None = None,
+    abort_check=None,
+) -> tuple[list, dict]:
+    """Append below the checkpoint threshold; otherwise commit one checkpoint.
 
-    Finds a safe cut point (never at a tool result), summarizes the dropped
-    region, and appends a ``compaction`` entry whose ``retainedTail`` is a
-    self-contained checkpoint: ``build_context_entries()`` then rebuilds
-    context without walking the older entries. Returns the summary, or None
-    when nothing was compacted.
+    No old message is touched below the normal trigger. The 700K guard uses the
+    same code path as the 600K trigger and exists only to catch a large
+    projected addition before the next model call.
     """
-    if os.environ.get("LOG_COMPACT", "1") != "1":
-        return None
-    if keep_recent_chars is None:
-        keep_recent_chars = int(os.environ.get("LOG_KEEP_RECENT_CHARS", "80000"))
-    try:
-        from session_log import CompactionEntry, MessageEntry
-        entries = session_mgr.build_context_entries()
-        if len(entries) < 8:
-            return None
-        cut, acc = find_log_cut_point(entries, keep_recent_chars)
-        if cut <= 0:
-            return None  # log fits the budget — nothing to compact
+    policy = policy or get_compaction_policy()
+    before = estimate_messages(messages)
+    projected = max(before, int(projected_tokens or 0))
+    due = projected >= policy.checkpoint_trigger
+    if not due or len(messages) <= 2:
+        return messages, {
+            "checkpoint": False,
+            "trigger": None,
+            "before": before,
+            "after": before,
+            "map_refreshed": False,
+        }
 
-        to_summarize = entries[:cut]
-        retained = entries[cut:]
-        read_files, modified_files = extract_log_file_ops(entries)
-        previous_summaries = [e.summary for e in entries if isinstance(e, CompactionEntry)]
+    trigger = "hard_guard" if projected >= policy.hard_limit else "checkpoint"
+    lock = _checkpoint_lock(workspace_path, chat_id)
+    with lock:
+        # Another caller may have compacted while this invocation was waiting.
+        # The local list is still the caller's snapshot, so only avoid a second
+        # operation when it is already below the threshold.
+        current_before = estimate_messages(messages)
+        if current_before < policy.checkpoint_trigger and projected < policy.hard_limit:
+            return messages, {
+                "checkpoint": False,
+                "trigger": None,
+                "before": current_before,
+                "after": current_before,
+                "map_refreshed": False,
+            }
 
-        summary = _summarize_entries(to_summarize, previous_summaries)
-        if not summary:
-            files = []
-            if modified_files:
-                files.append("Modified: " + ", ".join(modified_files[:20]))
-            if read_files:
-                files.append("Read: " + ", ".join(read_files[:20]))
-            summary = (
-                "## Progress\n### Done\n- session progress compacted at checkpoint\n"
-                + ("## Critical Context\n" + "\n".join(f"- {f}" for f in files) if files else "")
-            )
-
-        retained_tail = [e for e in retained if isinstance(e, MessageEntry)]
-        first_kept = retained[0].id if retained else None
-        tokens_before = _entries_chars(to_summarize) // 3  # ~3.5 chars/token
-        session_mgr.append_compaction(
-            summary,
-            first_kept_entry_id=first_kept,
-            retained_tail=retained_tail,
-            tokens_before=tokens_before,
-            read_files=read_files,
-            modified_files=modified_files,
+        full_map = _refresh_checkpoint_map(workspace_path)
+        semantic = _build_free_compaction_summary(messages, policy, abort_check=abort_check)
+        rebuilt = checkpoint_compact(
+            messages,
+            tool_call_log=tool_call_log or [],
+            created=created or [],
+            modified=modified or [],
+            tail_budget_tokens=policy.tail_budget_tokens,
+            policy=policy,
+            full_project_map=full_map,
+            summary_text=semantic,
         )
-        return summary
-    except Exception:
-        return None
+        return rebuilt, {
+            "checkpoint": rebuilt is not messages,
+            "trigger": trigger,
+            "before": current_before,
+            "after": estimate_messages(rebuilt),
+            "map_refreshed": bool(full_map),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────

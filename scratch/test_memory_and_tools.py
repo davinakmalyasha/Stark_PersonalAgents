@@ -1,5 +1,4 @@
-"""Tests for memory refinement (code-map descriptions, always-inject, fix-mode,
-6K cap) and tool refinements (view_signatures 3-tuples, SDET registry).
+"""Tests for the compact project-cache contract and tool refinements.
 
 Run:  venv312/Scripts/python.exe -m pytest scratch/test_memory_and_tools.py -q
 """
@@ -10,81 +9,154 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _make_sandbox(features_md="", project_md=""):
+def _make_sandbox(project_md=""):
     d = tempfile.mkdtemp()
     mem = os.path.join(d, ".agent-memory")
     os.makedirs(mem, exist_ok=True)
     if project_md:
         with open(os.path.join(mem, "project.md"), "w", encoding="utf-8") as f:
             f.write(project_md)
-    if features_md:
-        with open(os.path.join(mem, "features.md"), "w", encoding="utf-8") as f:
-            f.write(features_md)
     return d
 
 
-def test_memory_always_includes_code_map():
-    from memory.dev_memory_helper import get_developer_memory_context
-    from memory.memory_manager import CODE_MAP_START, CODE_MAP_END
+def test_project_cache_contains_identity_and_compact_map_only():
+    from memory.memory_manager import ensure_project_cache, load_cached_code_map
+
     d = _make_sandbox(
-        project_md="# Project Overview\n**Auto-generated**: 2026-08-05\n## Tech Stack\n- Node.js\n",
-        features_md=(
-            "# Features\n"
-            f"{CODE_MAP_START}\n"
-            "## Code Map (auto-generated)\n"
-            "utils.js:\n"
-            "\u2502 formatMoney  # Rounds floats to 2 decimals\n"
-            f"{CODE_MAP_END}\n"
-            "## Cart Feature\n- checkout flow\n"
-        ),
+        project_md="# Project Overview\n## Tech Stack\n- Python\n",
     )
-    ctx = get_developer_memory_context(d, "fix the cart checkout flow")
-    assert "Code Map" in ctx
-    assert "formatMoney" in ctx
-    assert "Cart Feature" in ctx  # request-matched feature included on top of the map
+    with open(os.path.join(d, "app.py"), "w", encoding="utf-8") as f:
+        f.write("from utils import format_money\n")
+    with open(os.path.join(d, "utils.py"), "w", encoding="utf-8") as f:
+        f.write("def format_money(value):\n    return value\n")
+
+    ensure_project_cache(d)
+    code_map = load_cached_code_map(d)
+    assert code_map.startswith("projectMap:")
+    assert "app.py" in code_map
+    assert "utils.py" in code_map
+    assert not os.path.exists(os.path.join(d, ".agent-memory", "features.md"))
+    assert not os.path.exists(os.path.join(d, ".agent-memory", "lessons.md"))
 
 
-def test_memory_cap_6k():
-    from memory.dev_memory_helper import get_developer_memory_context
-    from memory.memory_manager import CODE_MAP_START, CODE_MAP_END
-    big = "\n".join(f"line {i} " + "x" * 50 for i in range(300))
-    d = _make_sandbox(
-        project_md="# Project Overview\n- Node.js\n",
-        features_md=f"{CODE_MAP_START}\n## Code Map\n{big}\n{CODE_MAP_END}\n",
+def test_project_map_is_bounded():
+    from memory.repo_map_generator import RepoMapGenerator
+
+    d = _make_sandbox()
+    for i in range(100):
+        with open(os.path.join(d, f"module_{i}.py"), "w", encoding="utf-8") as f:
+            f.write(f"def function_{i}(value):\n    return value\n")
+    code_map = RepoMapGenerator(d).generate_map()
+    assert len(code_map) <= 6000
+
+
+def test_project_map_context_uses_full_anchor_then_delta():
+    from memory.memory_manager import (
+        load_cached_code_map,
+        refresh_code_map_context,
     )
-    ctx = get_developer_memory_context(d, "anything at all here")
-    assert len(ctx) <= 6000
+
+    d = _make_sandbox()
+    with open(os.path.join(d, "app.py"), "w", encoding="utf-8") as f:
+        f.write("from utils import value\nprint(value())\n")
+    with open(os.path.join(d, "utils.py"), "w", encoding="utf-8") as f:
+        f.write("def value():\n    return 1\n")
+
+    first = refresh_code_map_context(d, include_cached_full=True)
+    assert first["kind"] == "full"
+    assert first["content"].startswith("projectMap:")
+
+    with open(os.path.join(d, "utils.py"), "a", encoding="utf-8") as f:
+        f.write("\n# body-only change\n")
+    unchanged = refresh_code_map_context(d)
+    assert unchanged["kind"] == "none"
+
+    with open(os.path.join(d, "fresh_module.py"), "w", encoding="utf-8") as f:
+        f.write("def fresh():\n    return True\n")
+    fresh_after_change = refresh_code_map_context(d, include_cached_full=True)
+    assert fresh_after_change["kind"] == "full"
+    assert fresh_after_change["content"].startswith("projectMap:")
+    # The compact map intentionally lists only high-value connected files; the
+    # full refresh still snapshots every supported file in its topology state.
+    from memory.repo_map_generator import RepoMapGenerator
+    assert "fresh_module.py" in RepoMapGenerator(d).topology_snapshot()
+
+    with open(os.path.join(d, "new_module.py"), "w", encoding="utf-8") as f:
+        f.write("def created():\n    return True\n")
+    delta = refresh_code_map_context(d)
+    assert delta["kind"] == "delta"
+    assert delta["content"].startswith("projectMap+:")
+    assert "new_module.py" in delta["content"]
+    # The canonical file stays byte-stable until the checkpoint; this event is
+    # transcript-only and must not create a mutable cumulative map.
+    assert "new_module.py" not in load_cached_code_map(d)
+
+    rebuilt = refresh_code_map_context(d, force_full=True)
+    assert rebuilt["kind"] == "full"
+    assert rebuilt["content"].startswith("projectMap:")
+    assert "projectMap+:" not in rebuilt["content"]
 
 
-def test_memory_code_map_only_fix_mode():
-    from memory.dev_memory_helper import get_developer_memory_context
-    from memory.memory_manager import CODE_MAP_START, CODE_MAP_END
-    d = _make_sandbox(
-        project_md="# Project Overview\n- Node.js\n- something meaningful\n",
-        features_md=f"{CODE_MAP_START}\n## Code Map\nutils.js:\n\u2502 formatMoney\n{CODE_MAP_END}\n",
+def test_checkpoint_replaces_old_project_map_deltas_with_full_anchor():
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    from memory.context_compaction import checkpoint_compact
+
+    full = "<current-context>\nprojectMap:\nKey files:\n- app.py\n</current-context>"
+    delta = "<current-context>\nprojectMap+:\n+ new.py -> none\n</current-context>"
+    messages = [
+        SystemMessage(content="stable"),
+        HumanMessage(content=full),
+        HumanMessage(content="## Task\nold task"),
+        AIMessage(content="old analysis"),
+        HumanMessage(content="old tool output"),
+        HumanMessage(content=delta),
+        HumanMessage(content="## Task\nnew task"),
+        AIMessage(content="new analysis"),
+        HumanMessage(content="new tool output"),
+    ]
+
+    compacted = checkpoint_compact(
+        messages,
+        tool_call_log=[],
+        created=[],
+        modified=[],
+        keep_last_n=3,
     )
-    ctx = get_developer_memory_context(d, "fix", include_code_map_only=True)
-    assert "Code Map" in ctx
-    assert "formatMoney" in ctx
-    assert "Project Overview" not in ctx  # project.md excluded in fix mode
+    contents = [str(message.content) for message in compacted]
+    assert any("projectMap:" in content for content in contents)
+    assert not any("projectMap+:" in content for content in contents)
+    assert any("new task" in content for content in contents)
+
+
+def test_project_cache_never_records_session_text():
+    from memory.memory_manager import ensure_project_cache
+
+    d = _make_sandbox()
+    with open(os.path.join(d, "main.py"), "w", encoding="utf-8") as f:
+        f.write("print('ok')\n")
+    ensure_project_cache(d)
+    memory_files = os.listdir(os.path.join(d, ".agent-memory"))
+    assert "features.md" not in memory_files
+    assert "lessons.md" not in memory_files
+    assert all("session" not in name.lower() for name in memory_files)
 
 
 def test_symbol_doc_python_docstring():
-    from repo_map_generator import _extract_symbol_doc
+    from memory.repo_map_generator import _extract_symbol_doc
     lines = ["def foo(a):", '    """Rounds floats to 2 decimals, handles negative zero."""', "    return a"]
     doc = _extract_symbol_doc(lines, 0, "python")
     assert "Rounds floats" in doc
 
 
 def test_symbol_doc_js_leading_comment():
-    from repo_map_generator import _extract_symbol_doc
+    from memory.repo_map_generator import _extract_symbol_doc
     lines = ["// Formats a price with currency", "function formatMoney(v) {", "  return v;", "}"]
     doc = _extract_symbol_doc(lines, 1, "javascript")
     assert "Formats a price" in doc
 
 
 def test_get_file_signatures_three_tuple():
-    from repo_map_generator import get_file_signatures
+    from memory.repo_map_generator import get_file_signatures
     d = tempfile.mkdtemp()
     path = os.path.join(d, "utils.py")
     with open(path, "w", encoding="utf-8") as f:
@@ -96,11 +168,11 @@ def test_get_file_signatures_three_tuple():
     assert "Rounds a float" in doc
 
 
-def test_devsecops_registry_still_max():
+def test_dev_registry_is_loaded():
     from tools import _SUBAGENTS_REGISTRY, _load_subagents
     if not _SUBAGENTS_REGISTRY:
         _load_subagents()
-    assert _SUBAGENTS_REGISTRY["DevSecOps"]["reasoning_effort"] == "max"
+    assert _SUBAGENTS_REGISTRY["Dev"]["name"] == "Dev"
 
 
 def test_read_file_cached_stub():

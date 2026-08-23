@@ -28,7 +28,6 @@ from .llm_stats import (
 )
 from .loop_detector import (
     LoopGuard,
-    detect_stagnation_or_loop,
 )
 from .llm import (
     invoke_messages_with_fallback,
@@ -54,7 +53,6 @@ __all__ = [
     "update_token_stats",
     "calculate_cost",
     "LoopGuard",
-    "detect_stagnation_or_loop",
     "invoke_messages_with_fallback",
     "invoke_messages_with_fallback_stream",
     "invoke_with_fallback",

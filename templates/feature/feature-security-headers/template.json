@@ -1,0 +1,14 @@
+{
+  "_comment": "LEVEL 3 (feature): security headers — CSP/HSTS. Stack-prod uses: feature-security-headers.",
+  "name": "feature-security-headers",
+  "description": "Security headers: CSP/HSTS/X-Frame-Options middleware. Hardened for prod.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app'"}
+  ],
+  "files": [
+    {"src": "core/security_headers.py.j2", "dest": "{{ app_name }}/core/security_headers.py"}
+  ],
+  "notes": "After applying: app.add_middleware(SecurityHeadersMiddleware) in main.py. Adjust CSP for frontend needs.",
+  "sample_vars": {"app_name": "app"}
+}

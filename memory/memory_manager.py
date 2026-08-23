@@ -1,11 +1,13 @@
-"""
-Long-term project memory. Persistent across sessions.
-Auto-generates from codebase scan on first use.
-Orchestrator reads at session start, updates as it discovers new info.
+"""Stable project identity and generated repository-map cache.
+
+This module deliberately does not create or update conversation-derived
+project artifacts or session journals. ``project.md`` is a small identity card
+and ``repository_map.md`` is generated navigation data.
 """
 import os
 import json
 import re
+import time
 from datetime import datetime
 
 MEMORY_DIR = ".agent-memory"
@@ -25,98 +27,209 @@ def _project_file(workspace_path: str) -> str:
     return os.path.join(_memory_path(workspace_path), "project.md")
 
 
-def _features_file(workspace_path: str) -> str:
-    return os.path.join(_memory_path(workspace_path), "features.md")
+def _repository_map_file(workspace_path: str) -> str:
+    """Return the dedicated generated repository-map path.
 
-
-CODE_MAP_START = "<!-- CODE-MAP:START (auto-generated — do not edit) -->"
-CODE_MAP_END = "<!-- CODE-MAP:END -->"
-
-
-def _split_map_blocks(map_text: str) -> list[tuple[str, str]]:
-    """Split a generated map into (file path, block text) pairs.
-
-    Each block starts with a `<path>: ` line. Used to diff fresh generations
-    against the persisted section for append-only updates.
+     Repository navigation is derived cache data, separate from the stable
+     identity card, so refreshes never rewrite identity data.
     """
-    blocks = []
-    cur_path, cur_lines = None, []
-    path_re = re.compile(r"^[^\s:]+(?:/[^\s:]+)*:\s")
-    for line in map_text.split("\n"):
-        if path_re.match(line):
-            if cur_path:
-                blocks.append((cur_path, "\n".join(cur_lines)))
-            cur_path = line.split(":", 1)[0].strip()
-            cur_lines = [line]
-        else:
-            cur_lines.append(line)
-    if cur_path:
-        blocks.append((cur_path, "\n".join(cur_lines)))
-    return blocks
+    return os.path.join(_memory_path(workspace_path), "repository_map.md")
 
 
-def refresh_code_map(workspace_path: str) -> bool:
-    """Update the `## Code Map` section inside features.md — APPEND-ONLY.
+def _repository_map_state_file(workspace_path: str) -> str:
+    """Return the private topology state for the append-only map stream."""
+    return os.path.join(_memory_path(workspace_path), "repository_map_state.json")
 
-    The map is the byte-stable source of truth injected into the cached
-    system messages of Dev. Existing file blocks are NEVER
-    rewritten or removed (that would shift every later byte and break the
-    prefix cache) — only brand-new files get appended at the BOTTOM, behind
-    a `[added: <utc>]` marker. Edited/deleted files keep their old block
-    (harmless stale pointers — the agents read the real files).
+
+PROJECT_MAP_DELTA_MAX_CHARS = int(os.environ.get("PROJECT_MAP_DELTA_MAX_CHARS", "1800"))
+
+
+def _load_repository_map_state(workspace_path: str) -> dict:
+    raw = _read_file_safe(_repository_map_state_file(workspace_path))
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_repository_map_state(workspace_path: str, state: dict) -> bool:
+    return _write_file_safe(
+        _repository_map_state_file(workspace_path),
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+    )
+
+
+def _topology_changes(previous: dict, current: dict) -> dict[str, list[str]]:
+    """Compare file presence and outgoing relationships, not file bodies."""
+    old_paths = set(previous)
+    new_paths = set(current)
+
+    def targets(value: object) -> set[str]:
+        return set(value) if isinstance(value, (list, tuple, set)) else set()
+
+    return {
+        "added": sorted(new_paths - old_paths),
+        "removed": sorted(old_paths - new_paths),
+        "modified": sorted(
+            path for path in old_paths & new_paths
+            if targets(previous.get(path)) != targets(current.get(path))
+        ),
+    }
+
+
+def refresh_code_map_context(
+    workspace_path: str,
+    force_full: bool = False,
+    include_cached_full: bool = False,
+) -> dict:
+    """Refresh the map and return the smallest context event for the caller.
+
+    The on-disk cache contains only the last canonical full ``projectMap``.
+    Continuing transcripts receive immutable ``projectMap+`` events for small
+    topology changes; those events are not appended to the canonical file.
+    The transcript is the source of truth for deltas until the next single
+    checkpoint refreshes the full map.
+
+    This function returns one of three events:
+
+    ``full``  - the current full snapshot (initial/invalid/forced refresh)
+    ``delta`` - only the new compact ``projectMap+`` relationship lines
+    ``none``  - no new map context is needed
+
+    ``include_cached_full`` is used when there is no existing transcript
+    anchor, such as a fresh Dev run.  If the filesystem topology changed
+    since the cached snapshot, a fresh run gets a new full snapshot rather
+    than an unanchored delta.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
-        return False
+        return {"kind": "none", "content": "", "changed": False}
     _ensure_dir(_memory_path(workspace_path))
     try:
         from memory.repo_map_generator import RepoMapGenerator
         generator = RepoMapGenerator(workspace_path)
-        code_map = generator.generate_map()
+        current_topology = generator.topology_snapshot()
     except Exception as e:
-        print(f"[MEMORY] Code map generation failed: {e}")
-        return False
-    if not code_map or code_map.startswith("("):
-        return False
+        print(f"[MEMORY] Project map snapshot failed: {e}")
+        return {"kind": "none", "content": "", "changed": False}
 
-    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    feat_file = _features_file(workspace_path)
-    existing = _read_file_safe(feat_file) or "# Features\n"
+    map_file = _repository_map_file(workspace_path)
+    existing = _read_file_safe(map_file) or ""
+    state = _load_repository_map_state(workspace_path)
+    state_topology = state.get("topology")
+    has_topology_state = isinstance(state_topology, dict)
+    previous_topology = state_topology if has_topology_state else {}
+    changes = _topology_changes(previous_topology, current_topology)
+    changed_count = sum(len(v) for v in changes.values())
+    now = time.time()
+    try:
+        full_at = float(state.get("full_at", 0) or 0)
+    except (TypeError, ValueError):
+        full_at = 0
+    legacy_updates_marker = "Updates:" in existing or "projectMap+:" in existing
+    valid_map_marker = (
+        existing.startswith("projectMap:")
+        and existing.count("projectMap:") == 1
+        and not legacy_updates_marker
+    )
+    # A full rebuild is allowed only for an explicit checkpoint/initial
+    # refresh, an invalid/missing cache, or a fresh transcript whose cached
+    # topology no longer matches the filesystem. There is intentionally no
+    # elapsed-time refresh: an hourly rewrite would create an avoidable cache
+    # boundary while the conversation is otherwise unchanged.
+    full_due = (
+        force_full
+        or not valid_map_marker
+        or not has_topology_state
+        or (include_cached_full and bool(changed_count))
+    )
 
-    if CODE_MAP_START in existing and CODE_MAP_END in existing:
-        old = existing[existing.index(CODE_MAP_START):existing.index(CODE_MAP_END)]
-        old_paths = {p for p, _ in _split_map_blocks(old)}
-        new_blocks = _split_map_blocks(code_map)
-        to_append = [b for p, b in new_blocks if p not in old_paths]
-        if not to_append:
-            return False
-        delta = "\n\n[added: " + stamp + "]\n\n" + "\n\n".join(to_append)
-        end = existing.index(CODE_MAP_END)
-        updated = existing[:end] + delta + existing[end:]
-    else:
-        block = (
-            f"{CODE_MAP_START}\n"
-            "## Code Map (auto-generated, append-only — do not edit)\n"
-            "Compact symbol index. OLDEST entries at the top, NEWEST at the "
-            "bottom. Blocks are never rewritten — entries for edited or deleted "
-            "files may be stale; read the real file. New files are appended "
-            "below with an [added:] marker.\n\n"
-            f"[generated: {stamp}]\n\n"
-            f"{code_map}\n"
-            f"{CODE_MAP_END}\n"
-        )
-        updated = existing.rstrip() + "\n\n" + block
+    if not changed_count and not full_due:
+        if include_cached_full and valid_map_marker:
+            return {
+                "kind": "full",
+                "content": existing.strip(),
+                "changed": False,
+            }
+        return {"kind": "none", "content": "", "changed": False}
 
-    if _write_file_safe(feat_file, updated):
-        print(f"[MEMORY] Refreshed code map in features.md ({len(code_map)} chars)")
-        return True
-    return False
-# ── Auto-generation ──────────────────────────────────────────────────────────
+    # Continuing sessions stay append-only even for larger topology changes.
+    # The delta is bounded so an unusually large change cannot become a
+    # second hidden full-map refresh. The next checkpoint will regenerate the
+    # canonical snapshot from the current filesystem.
+    if not full_due:
+        try:
+            delta = generator.generate_delta(changes).strip()
+        except Exception as e:
+            print(f"[MEMORY] Project map delta failed: {e}")
+            return {"kind": "none", "content": "", "changed": False}
+        if not delta:
+            return {"kind": "none", "content": "", "changed": False}
+        if len(delta) > PROJECT_MAP_DELTA_MAX_CHARS:
+            delta = (
+                delta[:PROJECT_MAP_DELTA_MAX_CHARS].rsplit("\n", 1)[0]
+                + "\n[delta clipped; full snapshot at next checkpoint]"
+            )
+        _save_repository_map_state(workspace_path, {
+            "topology": current_topology,
+            "full_at": full_at,
+            "last_refresh": now,
+        })
+        print(f"[MEMORY] projectMap+ event emitted ({len(delta)} chars)")
+        return {
+            "kind": "delta",
+            "content": "projectMap+:\n" + delta,
+            "changed": True,
+        }
+
+    try:
+        full_map = generator.generate_map()
+    except Exception as e:
+        print(f"[MEMORY] Project map full rebuild failed: {e}")
+        return {"kind": "none", "content": "", "changed": False}
+    if not full_map or not full_map.startswith("projectMap:"):
+        return {"kind": "none", "content": "", "changed": False}
+    updated = full_map.strip() + "\n"
+    wrote = _write_file_safe(map_file, updated)
+    if wrote:
+        _save_repository_map_state(workspace_path, {
+            "topology": current_topology,
+            "full_at": now,
+            "last_refresh": now,
+        })
+        print(f"[MEMORY] projectMap fully rebuilt ({len(updated)} chars)")
+    return {
+        "kind": "full" if wrote else "none",
+        "content": full_map.strip() if wrote else "",
+        "changed": bool(wrote),
+    }
+
+
+def refresh_code_map(workspace_path: str, force_full: bool = False) -> bool:
+    """Maintain the canonical ``projectMap`` cache.
+
+    This compatibility wrapper preserves the historical boolean API.  Dev
+    uses :func:`refresh_code_map_context` when it needs the cache-efficient
+    full-versus-delta injection event.
+    """
+    # The compatibility/cache-initialization path has no transcript anchor,
+    # so topology changes must become a full snapshot here. Continuing Dev
+    # transcripts use refresh_code_map_context directly and receive deltas.
+    result = refresh_code_map_context(
+        workspace_path,
+        force_full=force_full,
+        include_cached_full=True,
+    )
+    return bool(result.get("changed"))
+
 
 # ── Project identity card ────────────────────────────────────────────────────
 #
 # project.md is the write-once IDENTITY CARD: name / description / purpose /
 # stack / version + a status. It adapts to reality ONLY by APPENDING corrected
-# `stack:`/`version:` lines at the bottom behind an [updated:] marker (same
+# \stack:\/\ersion:\ lines at the bottom behind an [updated:] marker (same
 # append-only mechanics as the code map) — old lines are never rewritten; the
 # last occurrence wins.
 #
@@ -248,9 +361,53 @@ def ensure_project_identity(workspace_path: str, name: str = "", description: st
     return False
 
 
+def _format_compact_project_identity(content: str, workspace_path: str = "") -> str:
+    """Project raw card content into a clean, compact 4-line bullet format.
+
+    - Fixed four-line order: project, purpose, stack, runtime
+    - No markdown headings, timestamps, [updated] markers, or status lines
+    - Last occurrence wins for each fact
+    """
+    proj_name = ""
+    purpose = ""
+    description = ""
+    stack = ""
+    runtime = ""
+
+    for line in content.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if low.startswith("name:"):
+            proj_name = s[len("name:"):].strip()
+        elif low.startswith("project:"):
+            proj_name = s[len("project:"):].strip()
+        elif low.startswith("purpose:"):
+            purpose = s[len("purpose:"):].strip()
+        elif low.startswith("description:"):
+            description = s[len("description:"):].strip()
+        elif low.startswith("stack:"):
+            stack = s[len("stack:"):].strip()
+        elif low.startswith("version:"):
+            runtime = s[len("version:"):].strip()
+        elif low.startswith("runtime:"):
+            runtime = s[len("runtime:"):].strip()
+
+    final_proj = proj_name or (os.path.basename(os.path.normpath(workspace_path)) if workspace_path else "Project")
+    final_purpose = purpose or description or "General development"
+    final_stack = stack or (_detect_stack_summary(workspace_path) if workspace_path else "unknown")
+    final_runtime = runtime or (_detect_version_summary(workspace_path) if workspace_path else "unpinned")
+
+    return (
+        f"- project: {final_proj}\n"
+        f"- purpose: {final_purpose}\n"
+        f"- stack: {final_stack}\n"
+        f"- runtime: {final_runtime}"
+    )
+
+
 def _project_identity_for_injection(workspace_path: str) -> str:
-    """The identity card content, but ONLY when its status is `stable`
-    (draft cards are dormant — never injected into any agent context).
+    """The identity card content projected into compact format, ONLY when
+    status is `stable` (draft cards are dormant — never injected).
     Read-only; creation/promotion happen in ensure_project_identity /
     refresh_project_identity."""
     if not workspace_path or not os.path.isdir(workspace_path):
@@ -260,7 +417,7 @@ def _project_identity_for_injection(workspace_path: str) -> str:
         return ""
     if _card_last_status(content) != "stable":
         return ""
-    return content.strip()
+    return _format_compact_project_identity(content, workspace_path)
 
 
 def load_cached_project_identity(workspace_path: str) -> str:
@@ -326,41 +483,19 @@ def refresh_project_identity(workspace_path: str) -> bool:
     return False
 
 
-def auto_generate_memory(workspace_path: str) -> bool:
-    """Scan workspace and generate initial project.md + features.md.
-    Returns True if files were created, False if they already existed.
+def ensure_project_cache(workspace_path: str) -> bool:
+    """Ensure only the identity card and repository map cache exist.
+
+    This is intentionally the sole automatic project-context initializer. It
+    never creates feature, lesson, session, or greeting files.
     """
     mem_dir = _memory_path(workspace_path)
     _ensure_dir(mem_dir)
 
-    proj_file = _project_file(workspace_path)
-    feat_file = _features_file(workspace_path)
-
-    # Don't overwrite existing memory
-    if os.path.isfile(feat_file):
-        return False
-
-    # project.md — the write-once identity card (name/description/purpose/
-    # stack/version), seeded from detection ONCE, then frozen. It adapts to
-    # reality only via append-only [updated:] drift corrections.
+    before_identity = os.path.isfile(_project_file(workspace_path))
     ensure_project_identity(workspace_path)
-
-    # Write features.md (starts as template — orchestrator populates)
-    feat_lines = [
-        "# Features",
-        f"**Auto-generated**: {datetime.now().strftime('%Y-%m-%d')}",
-        "",
-        "_Features are added here by the orchestrator as work is done._",
-        "",
-    ]
-    _write_file_safe(feat_file, "\n".join(feat_lines))
-
-    # Seed the Aider-style code map immediately so features.md is useful
-    # on a fresh project instead of an empty template.
     refresh_code_map(workspace_path)
-
-    print(f"[MEMORY] Auto-generated at {mem_dir}")
-    return True
+    return not before_identity
 
 
 # ── Tech detection ───────────────────────────────────────────────────────────
@@ -582,178 +717,24 @@ def _detect_architecture(workspace_path: str) -> list[str]:
 
 # ── Reading ──────────────────────────────────────────────────────────────────
 
-def _strip_code_map_section(features_md: str) -> str:
-    """Remove the Code Map section from features.md content.
-
-    Used by load_project_memory: the orchestrator dispatches tasks, it does
-    NOT navigate code — the map is injected (cached) into Dev
-    system messages instead, and would be dead weight here.
-    """
-    if CODE_MAP_START in features_md and CODE_MAP_END in features_md:
-        start = features_md.index(CODE_MAP_START)
-        end = features_md.index(CODE_MAP_END) + len(CODE_MAP_END)
-        return features_md[:start] + features_md[end:]
-    return features_md
-
-
 def load_cached_code_map(workspace_path: str) -> str:
-    """Return the persisted, byte-stable Code Map section (features.md), or "".
+    """Return the dedicated repository map, or an empty string.
 
-    Read-only — never generates side effects. Generation/append happens in
-    refresh_code_map (eval attempt start / orchestrator session / daemon).
-    The bytes are stable across sessions, so the map cache-hits once warm.
+    Read-only — never generates side effects. Invalid or legacy map files are
+    ignored so they cannot enter a prompt.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return ""
-    existing = _read_file_safe(_features_file(workspace_path))
-    if not existing or CODE_MAP_START not in existing or CODE_MAP_END not in existing:
-        return ""
-    start = existing.index(CODE_MAP_START) + len(CODE_MAP_START)
-    end = existing.index(CODE_MAP_END)
-    content = existing[start:end].strip()
-    if not content or content.startswith("("):
+    content = (_read_file_safe(_repository_map_file(workspace_path)) or "").strip()
+    if (
+        not content
+        or not content.startswith("projectMap:")
+        or content.count("projectMap:") != 1
+        or "projectMap+:" in content
+        or "Updates:" in content
+    ):
         return ""
     return content
-
-
-def load_project_memory(workspace_path: str) -> str:
-    """Read memory files and return formatted string for Zone 2 injection."""
-    mem_dir = _memory_path(workspace_path)
-    if not os.path.isdir(mem_dir):
-        return ""
-
-    parts = []
-    # The identity card is included only when stable — draft cards are
-    # dormant (the orchestrator sees no card until the project is committed).
-    project = _project_identity_for_injection(workspace_path)
-    if project:
-        parts.append(project)
-
-    features = _read_file_safe(_features_file(workspace_path))
-    if features:
-        # The Code Map section is NOT included — the orchestrator dispatches
-        # tasks and never navigates code; the map is injected (cached) into
-        # the code-touching subagents' system messages instead.
-        features = _strip_code_map_section(features)
-        lines = features.strip().split("\n")
-        if len(lines) > 3:
-            parts.append(features)
-
-    # MEMORY.md is retired — its "LLM lessons from chat logs" role is replaced
-    # by the verified failure→fix pattern library (error_patterns.py), which
-    # only stores evidence-backed lessons (hidden-test-verified diffs).
-
-    if not parts:
-        return ""
-    return "\n\n---\n\n".join(parts)
-
-
-# ── Writing ──────────────────────────────────────────────────────────────────
-
-def update_feature(workspace_path: str, feature_name: str, description: str = "", file_refs: list[dict] | None = None) -> bool:
-    """Add or update a feature entry in features.md.
-    file_refs: [{"path": "file.py", "lines": "45-120", "purpose": "main logic"}, ...]
-    Description is persisted as the entry's summary line when provided.
-    """
-    if file_refs is None:
-        file_refs = []
-    feat_file = _features_file(workspace_path)
-    _ensure_dir(_memory_path(workspace_path))
-
-    existing = _read_file_safe(feat_file)
-    lines = existing.split("\n") if existing else ["# Features", ""]
-
-    entry_lines = [""]
-    entry_lines.append(f"## {feature_name}")
-    if description and description.strip():
-        entry_lines.append(description.strip())
-        entry_lines.append("")
-    for ref in file_refs:
-        path = ref.get("path", "")
-        lr = ref.get("lines", "")
-        purpose = ref.get("purpose", "")
-        if lr:
-            entry_lines.append(f"- `{path}:{lr}` — {purpose}")
-        else:
-            entry_lines.append(f"- `{path}` — {purpose}")
-    entry_lines.append("")
-
-    # Replace existing feature or append
-    heading = f"## {feature_name}"
-    if heading in lines:
-        start = lines.index(heading)
-        end = len(lines)
-        for i in range(start + 1, len(lines)):
-            if lines[i].startswith("## "):
-                end = i
-                break
-        lines = lines[:start] + entry_lines[1:] + lines[end:]
-    else:
-        lines = lines + entry_lines[1:]
-
-    result = _write_file_safe(feat_file, "\n".join(lines))
-    if result:
-        print(f"[MEMORY] Updated feature: {feature_name}")
-    return result
-
-
-def update_project_meta(workspace_path: str, key: str, value: str) -> bool:
-    """Agent-facing project metadata tool — REROUTED to features.md.
-
-    project.md is the write-once identity card injected into the cached
-    stable zone; agents must never rewrite it (any change would break cache
-    identity for every code-touching agent). Session knowledge belongs in
-    features.md.
-    """
-    return update_feature(workspace_path, key, str(value)[:400])
-
-
-# ── Lessons journal (lessons.md) ─────────────────────────────────────────────
-
-def _lessons_file(workspace_path: str) -> str:
-    return os.path.join(_memory_path(workspace_path), "lessons.md")
-
-
-def append_lesson(workspace_path: str, status: str, title: str, body: str, max_entries: int = 20) -> bool:
-    """Append a failure/blocker lesson to lessons.md (deduped, bounded).
-
-    status: BLOCKED / FAILED / SAVED (SAVED = agent-initiated via save_memory).
-    Dedup: identical (title + body head) entries are skipped — a recurring
-    failure must not stack duplicate lessons.
-    Keeps the newest max_entries, oldest dropped.
-    """
-    if not workspace_path:
-        return False
-    try:
-        _ensure_dir(_memory_path(workspace_path))
-        fpath = _lessons_file(workspace_path)
-        from datetime import datetime
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        import hashlib
-        dedup_key = hashlib.sha256(f"{title}|{body[:300]}".encode("utf-8", "replace")).hexdigest()[:12]
-
-        existing = _read_file_safe(fpath) or "# Lessons\n"
-        if dedup_key in existing:
-            return True  # already recorded — skip duplicates
-
-        entry = (
-            f"\n## {stamp} [{status}] {title[:120]}\n"
-            f"<!-- lesson-id: {dedup_key} -->\n"
-            f"{body.strip()[:600]}\n"
-        )
-        updated = existing + entry
-
-        # Bound the journal to the newest max_entries (drop oldest blocks)
-        blocks = [b for b in updated.split("## ") if b.strip()]
-        if len(blocks) > max_entries + 1:  # +1 for the "# Lessons" header
-            updated = "# Lessons" + "".join(f"\n## {b}" for b in blocks[-max_entries:])
-
-        if _write_file_safe(fpath, updated):
-            print(f"[MEMORY] Lesson appended: [{status}] {title[:60]}")
-            return True
-    except Exception as e:
-        print(f"[MEMORY] Lesson append failed: {e}")
-    return False
 
 
 # ── File helpers ─────────────────────────────────────────────────────────────
@@ -774,19 +755,6 @@ def _write_file_safe(path: str, content: str) -> bool:
     except Exception as e:
         print(f"[MEMORY] Error writing {path}: {e}")
         return False
-
-
-# ── Convenience ──────────────────────────────────────────────────────────────
-
-def ensure_memory(workspace_path: str) -> str:
-    """Ensure memory exists (auto-generate if needed), refresh the code map
-    and project identity (append-only), and return formatted content."""
-    if not workspace_path or not os.path.isdir(workspace_path):
-        return ""
-    auto_generate_memory(workspace_path)
-    refresh_code_map(workspace_path)  # keep the symbol index fresh each session
-    refresh_project_identity(workspace_path)  # rare append-only reality drift
-    return load_project_memory(workspace_path)
 
 
 def is_valid_build_request(text: str) -> bool:

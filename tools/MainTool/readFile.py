@@ -56,10 +56,53 @@ def _log_offload_read(file_path: str) -> None:
         pass
 
 
-def read_file(file_path: str, offset: int = 0, limit: Optional[int] = None) -> str:
-    """Read a file with optional offset and limit. Uses session cache (#9)."""
+# Image extensions handled by the vision channel: read_file on an image returns
+# a text stub AND queues the pixels for inline injection (agent loop drains
+# tools.vision_channel after this ToolMessage and appends a user-message image).
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def read_file(file_path: str = "", file_paths: Optional[list] = None, offset: int = 0, limit: Optional[int] = None) -> str:
+    """Read a file with optional offset and limit. Uses session cache (#9).
+    Supports multi-file read via file_paths=[paths] — returns per-file sections.
+
+    Image files (.png/.jpg/.jpeg/.gif/.webp) are returned as an inline vision
+    image instead of binary garbage — requires a vision-capable model."""
     from tools import enforce_fs_permission, get_vfs_router, _sanitize_path, _FILE_CACHE
+    # Multi-file dispatch
+    if file_paths is not None:
+        if isinstance(file_paths, list) and len(file_paths) > 0:
+            parts = []
+            for p in file_paths:
+                if not isinstance(p, str) or not p.strip():
+                    continue
+                parts.append(read_file(file_path=p.strip()))
+            return "\n\n".join(parts) if parts else "Error: file_paths empty or invalid"
+        elif isinstance(file_paths, str) and file_paths.strip():
+            return read_file(file_path=file_paths.strip())
+    if not file_path or not str(file_path).strip():
+        return "Error: read_file requires file_path or file_paths"
+    file_path = str(file_path).strip()
     enforce_fs_permission("read", file_path)
+
+    # ── Vision path: image extensions → inline image via tools.vision_channel.
+    # Must run before any text-mode read; offset/limit are meaningless for bytes.
+    try:
+        ext = os.path.splitext(str(file_path))[1].lower()
+        if ext in _IMAGE_EXTS:
+            real_img = _sanitize_path(file_path)
+            if os.path.isfile(real_img):
+                from tools.vision_channel import queue_image_file
+                if queue_image_file(real_img, note=f"read_file({file_path})"):
+                    _log_tool("read_file", {"file_path": file_path, "image": True},
+                              f"[IMAGE] {file_path}")
+                    return (f"[IMAGE] {file_path} — attached inline below (vision). "
+                            f"The picture follows as an image block in the next user message.")
+                return (f"Error: image '{file_path}' too large to inline. "
+                        f"Ask the user to view it, or process it with run_command instead.")
+    except Exception:
+        pass  # fall through to the normal text path
+
     # â”€â”€ VFS Composite Routing â”€â”€
     vfs_path = file_path.replace("\\", "/")
     try:

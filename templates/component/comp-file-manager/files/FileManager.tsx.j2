@@ -1,0 +1,47 @@
+import { useState } from "react";
+
+type FileItem = { name: string; size: number; type: string; url?: string };
+
+export default function FileManager({
+  files,
+  onUpload,
+  onDelete,
+  componentsDir = "{{ components_dir }}",
+}: {
+  files: FileItem[];
+  onUpload: (files: FileList) => void;
+  onDelete: (name: string) => void;
+  componentsDir?: string;
+}) {
+  const [view, setView] = useState<"grid" | "list">("grid");
+
+  return (
+    <div className="file-manager">
+      <div className="file-manager-toolbar">
+        <button onClick={() => setView(view === "grid" ? "list" : "grid")}>
+          {view === "grid" ? "List view" : "Grid view"}
+        </button>
+        <label className="file-manager-upload">
+          Upload
+          <input type="file" multiple hidden onChange={(e) => e.target.files && onUpload(e.target.files)} />
+        </label>
+      </div>
+      <div className={`file-manager-${view}`}>
+        {files.length === 0 ? (
+          <p>No files yet.</p>
+        ) : (
+          files.map((f) => (
+            <div key={f.name} className="file-item">
+              <span>{f.name}</span>
+              <small>{(f.size / 1024).toFixed(1)} KB</small>
+              <button onClick={() => onDelete(f.name)}>Delete</button>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// TODO: wire onUpload to comp-dropzone + feature-upload, onDelete to DELETE {{ base_path }}/upload/{name}.
+// Pairs with comp-dropzone for drag-and-drop and feature-upload for validation.

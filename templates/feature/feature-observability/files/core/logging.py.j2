@@ -1,0 +1,44 @@
+"""Structured JSON logging for {{ app_name }} — one JSON line per request.
+
+Pairs with comp-log-viewer (filterable table). No external deps.
+"""
+import json
+import logging
+import time
+import uuid
+from pythonjsonlogger import jsonlogger  # if missing, falls back to stdlib json
+
+try:
+    from pythonjsonlogger import jsonlogger  # noqa: F401
+    HAS_JSONLOGGER = True
+except Exception:
+    HAS_JSONLOGGER = False
+
+
+def setup_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler()
+    if HAS_JSONLOGGER:
+        formatter = jsonlogger.JsonFormatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s %(request_id)s"
+        )
+        handler.setFormatter(formatter)
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
+def get_request_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def log_structured(logger_name: str, level: str, message: str, **fields) -> None:
+    logger = logging.getLogger(logger_name)
+    extra = {k: str(v) for k, v in fields.items()}
+    extra["request_id"] = fields.get("request_id") or get_request_id()
+    extra["ts"] = time.time()
+    getattr(logger, level.lower(), logger.info)(message, extra=extra)
+
+
+# TODO: wire setup_logging() in main.py lifespan, and log_structured("app", "info", "request", path=request.url.path) in middleware.

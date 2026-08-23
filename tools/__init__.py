@@ -20,17 +20,22 @@ from contextvars import ContextVar
 from ._schemas import (
     TOOL_DEFINITIONS,
     get_native_tools,
+    get_native_tool_names,
+    get_compact_tool_docs,
+    format_compact_tool_help,
     _TOOL_DOCS,
     _TOOL_REQUIRED_ARGS,
 )
 from ._registry import (
     ToolDefinition,
+    ToolExecutionResult,
     ToolRegistry,
     active_tool_scope,
     get_registry,
     reset_registry,
     ensure_tool_registry,
     execute_tool,
+    execute_tool_detailed,
     pre_validate_tool_args,
     TOOL_MAP,
     _tool_registry,
@@ -39,14 +44,17 @@ from ._registry import (
     _tool_result_post_hook,
     validate_tool_definitions,
     _legacy_execute_tool,
+    _current_scope,
+    _current_chat,
 )
 
 # 2. Tool cluster implementations
 from .DocTool import create_docx, create_xlsx, read_pdf
 from .MainTool import (
-    _clean_terminal_output, _fmt_args, _log_tool, _validate_syntax,
+    _clean_terminal_output, _fmt_args, _log_tool,
     _apply_diff, apply_search_replace, apply_unified_diff, _edit_snippet,
     edit_file, _write_file, read_file, search_code, run_command,
+    update_plan, get_plan_for_context,
 )
 from .AddOnTool import (
     browser_navigate,
@@ -91,6 +99,7 @@ from .AddOnTool import (
     start_async_task,
     check_async_task,
     list_async_tasks,
+    async_task,
     ask_user,
     send_message,
     list_agents,
@@ -98,9 +107,15 @@ from .AddOnTool import (
     report,
     apply_template,
     template_list,
+    template,
+    build_template_map,
     template_new,
     create_project,
     find_project_dev,
+    resume_project,
+    _SUBAGENTS_REGISTRY,
+    _TASK_DEPTH,
+    _load_subagents,
 )
 
 # Shared state and caching utilities
@@ -113,6 +128,12 @@ from ._runtime import (
     _RUN_OUTPUT_CACHE,
     _TOOL_RESPONSE_CACHE,
     _TOOL_MTIME_MAP,
+    WORKSPACE,
+    active_permissions,
+    enforce_fs_permission,
+    _increment_cache_version,
+    auto_offload_result,
+    _tool_cap,
     _make_tool_cache_key,
     _check_tool_cache,
     _set_tool_cache,

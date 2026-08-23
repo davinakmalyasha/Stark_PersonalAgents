@@ -45,8 +45,9 @@ def build_chat_context(
                 continue
 
             if role == "agent":
-                # Keep the full text so the next turn knows what was discussed.
-                # Strip any tool call blocks to avoid confusing the model.
+                # Keep the useful conversational text.  Strip only historical
+                # pseudo-tool/thinking blocks so old persisted chats cannot
+                # reintroduce a retired protocol into a native-tool turn.
                 clean = re.sub(r'```tool\s*\n.*?\n```', '', text, flags=re.DOTALL)
                 clean = re.sub(r'<tool>.*?</tool>', '', clean, flags=re.DOTALL)
                 clean = re.sub(r'<thinking>.*?</thinking>', '', clean, flags=re.DOTALL)

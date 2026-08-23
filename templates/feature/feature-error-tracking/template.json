@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 3 (feature): error tracking — Sentry DSN + recent errors API. Stack-prod uses: feature-error-tracking. Connects to Sentry SaaS.",
+  "name": "feature-error-tracking",
+  "description": "Error tracking: Sentry SDK init (SENTRY_DSN) + recent errors API. Connects to Sentry SaaS for grouping/alerting.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/admin/errors)"}
+  ],
+  "files": [
+    {"src": "core/sentry.py.j2", "dest": "{{ app_name }}/core/sentry.py"},
+    {"src": "routers/ops_errors.py.j2", "dest": "{{ app_name }}/routers/ops_errors.py"}
+  ],
+  "notes": "After applying: 1) set SENTRY_DSN in .env, 2) call init_sentry() in main.py lifespan, 3) app.include_router(router), 4) grouping/alerting lives in Sentry SaaS — this template only wires the DSN and a local recent-errors stub.",
+  "sample_vars": {"app_name": "app", "base_path": "/api"}
+}

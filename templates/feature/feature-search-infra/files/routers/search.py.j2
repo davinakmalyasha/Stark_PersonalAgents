@@ -1,0 +1,39 @@
+"""Search endpoints: query + index (admin) for {{ app_name }}."""
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
+
+from ..core.search_config import SEARCH_INDEX
+from ..services import search_service
+
+router = APIRouter(prefix="{{ base_path }}/search", tags=["search"])
+
+
+class IndexRequest(BaseModel):
+    id: str
+    payload: dict
+
+
+@router.get("", response_model=list[dict])
+def search(q: str = Query(min_length=1), limit: int = Query(default=20, ge=1, le=100)):
+    try:
+        return search_service.search(q, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+
+@router.post("/index", status_code=status.HTTP_201_CREATED)
+def index_document(data: IndexRequest):
+    # TODO: guard with require_role("admin") from feature-rbac
+    try:
+        return search_service.index_document(data.id, data.payload)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+
+@router.get("/health")
+def search_health():
+    return {"index": SEARCH_INDEX, "status": "ok"}
+
+
+# TODO: register this router in main.py (app.include_router(router)).
+# TODO: add search UI with comp-search-filter + comp-paginated-table.

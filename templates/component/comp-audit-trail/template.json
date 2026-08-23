@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 4 (component): audit trail UI — timeline on top of feature-audit-log. Stack-prod uses: comp-audit-trail.",
+  "name": "comp-audit-trail",
+  "description": "Audit trail UI: timeline of who changed what, when. Pairs with audit-log API.",
+  "category": "component",
+  "variables": [
+    {"name": "components_dir", "type": "string", "default": "src/components", "description": "React components directory"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix"}
+  ],
+  "files": [
+    {"src": "AuditTrail.tsx.j2", "dest": "[[ components_dir ]]/AuditTrail.tsx"}
+  ],
+  "notes": "After applying: wire to feature-audit-log GET {{ base_path }}/admin/audit. Stack-prod will include this for audit timeline.",
+  "sample_vars": {"components_dir": "src/components", "base_path": "/api"},
+  "delimiters": ["[[", "]]", "<%", "%>"]
+}

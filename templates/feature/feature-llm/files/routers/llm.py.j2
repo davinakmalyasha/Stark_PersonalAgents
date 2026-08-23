@@ -1,0 +1,56 @@
+"""LLM endpoints: streaming chat (SSE) + usage summary."""
+from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..core.security import get_current_user
+from ..database import get_db
+from ..services.llm_service import LLMUsage  # model lives beside the service (move to models/ if you prefer)
+from ..services import llm_service
+
+router = APIRouter(prefix="{{ base_path }}/llm", tags=["llm"])
+
+
+class ChatRequest(BaseModel):
+    text: str = Field(min_length=1)
+    history: list[dict] = Field(default_factory=list)  # [{"role","content"}, ...]
+
+
+@router.post("/chat")
+def chat(
+    data: ChatRequest,
+    claims: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    gen = llm_service.chat_stream(db, int(claims["sub"]), data.history, data.text)
+
+    def sse():
+        for delta in gen:
+            yield f"data: {delta!r}\n\n"  # JSON-escape each delta
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no"})
+
+
+@router.get("/usage")
+def usage(
+    claims: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = list(db.execute(
+        select(LLMUsage)
+        .where(LLMUsage.user_id == int(claims["sub"]))
+        .order_by(LLMUsage.created_at.desc())
+        .limit(50)
+    ).scalars())
+    return {
+        "calls": len(rows),
+        "prompt_chars": sum(r.prompt_chars for r in rows),
+        "completion_chars": sum(r.completion_chars for r in rows),
+    }
+
+
+# TODO: register this router in main.py (app.include_router(router)).

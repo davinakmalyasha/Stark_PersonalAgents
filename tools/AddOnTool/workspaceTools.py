@@ -4,78 +4,12 @@ Facade state and cross-tool calls are imported lazily to avoid cycles.
 """
 import os
 import re
-import time
-
-def _snapshot_dir() -> str:
-    from tools import shared_state, WORKSPACE
-    import uuid
-    ws = os.path.abspath(shared_state.get("project_path") or WORKSPACE or ".")
-    snap_dir = os.path.join(ws, ".deep_agents", "snapshots")
-    os.makedirs(snap_dir, exist_ok=True)
-    return snap_dir
-
-def _snapshot_file(file_path: str) -> str:
-    """Snapshot existing file content before a mutation. Returns snapshot path or ''."""
-    if os.environ.get("SNAPSHOT", "1") != "1":
-        return ""
-    try:
-        import uuid
-        import glob
-        import hashlib
-        norm = os.path.normpath(os.path.abspath(file_path))
-        if not os.path.isfile(norm):
-            return ""
-        with open(norm, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        digest = hashlib.sha256(norm.lower().encode("utf-8", "replace")).hexdigest()[:12]
-        fname = "".join(c if c.isalnum() or c in "-_." else "_" for c in os.path.basename(norm))[:40] or "file"
-        snap_path = os.path.join(
-            _snapshot_dir(),
-            f"{digest}_{fname}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.snap",
-        )
-        with open(snap_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        # Bound storage: keep the 5 most recent snapshots per file digest
-        try:
-            olds = sorted(glob.glob(os.path.join(_snapshot_dir(), f"{digest}_*.snap")))
-            for old in olds[:-5]:
-                os.remove(old)
-        except Exception:
-            pass
-        return snap_path
-    except Exception:
-        return ""
-
-def revert_last_change(file_path: str = "") -> str:
-    """Restore the most recent snapshot of a file (undo the last write/edit)."""
-    from tools import _invalidate_file_cache
-    try:
-        import glob
-        import hashlib
-        if not file_path:
-            return "Error: revert_last_change requires 'file_path'."
-        norm = os.path.normpath(os.path.abspath(file_path))
-        digest = hashlib.sha256(norm.lower().encode("utf-8", "replace")).hexdigest()[:12]
-        snaps = sorted(glob.glob(os.path.join(_snapshot_dir(), f"{digest}_*.snap")))
-        if not snaps:
-            return f"Error: No snapshots found for {file_path}."
-        latest = snaps[-1]
-        with open(latest, "r", encoding="utf-8") as f:
-            content = f.read()
-        os.makedirs(os.path.dirname(norm) or ".", exist_ok=True)
-        with open(norm, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.remove(latest)
-        _invalidate_file_cache(norm)
-        return f"[OK] Reverted {file_path} to snapshot {os.path.basename(latest)} ({len(content)} chars restored)."
-    except Exception as e:
-        return f"Error reverting {file_path}: {e}"
 
 def capture_workspace_delta(max_chars: int = 6000) -> str:
     """Best-effort git diff + status of the active workspace for salvage-on-death.
 
-    Called on hard-stop / safety-ceiling so a dead agent still delivers its
-    partial work. Returns '' when the workspace is not a git repo.
+    Called only for diagnostics on cancellation/error handoffs so a partial
+    change can be reported. Returns '' when the workspace is not a git repo.
     """
     from tools import shared_state, WORKSPACE
     try:
@@ -187,30 +121,3 @@ def redact_secrets(text: str) -> str:
     except Exception:
         pass
     return text
-
-def save_memory(key: str = "", value: str = "", scope: str = "features") -> str:
-    """Save a note to persistent project memory (.agent-memory/).
-
-    scope="features": a `## <key>` entry in features.md — remembered on every
-    future session (decisions, facts, API contracts, gotchas).
-    scope="lessons": appended to lessons.md — a failure/blocker lesson that
-    future tasks should avoid repeating.
-    Persists across sessions and is injected into future system prompts.
-    """
-    from tools import shared_state, WORKSPACE
-    try:
-        from memory.memory_manager import update_feature as _mem_feature, append_lesson as _mem_lesson
-        ws = shared_state.get("project_path") or WORKSPACE
-        key = (key or "").strip()
-        value = (value or "").strip()
-        if not key:
-            return "Error: save_memory requires 'key'."
-        if not value:
-            return "Error: save_memory requires 'value'."
-        if scope == "lessons":
-            ok = _mem_lesson(ws, "SAVED", key, value[:800])
-        else:
-            ok = _mem_feature(ws, key, value[:800])
-        return f"[OK] Memory '{key}' saved (scope={scope})." if ok else f"[ERR] Could not save memory '{key}'."
-    except Exception as e:
-        return f"Error saving memory: {e}"

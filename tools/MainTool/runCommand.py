@@ -107,7 +107,7 @@ class LocalShellBackend:
         self.root_dir = root_dir
 
     def execute(self, command: str, timeout: int = 30000, background: bool = False,
-                name: str = None, shell: str = "bash") -> str:
+                name: str = None, shell: str = "bash", workdir: str = "", expect: str = "", stream: bool = False) -> str:
         global BACKGROUND_PROCESSES
         import os
         import re
@@ -116,6 +116,18 @@ class LocalShellBackend:
         import queue
         import time
         from tools import _HARNESS_ROOT, auto_offload_result, _tool_cap, _RUN_OUTPUT_CACHE
+
+        # Workdir override
+        effective_dir = self.root_dir
+        if workdir and str(workdir).strip():
+            wd = str(workdir).strip()
+            # Allow absolute or relative to root_dir
+            if os.path.isabs(wd):
+                effective_dir = os.path.normpath(wd)
+            else:
+                effective_dir = os.path.normpath(os.path.join(self.root_dir, wd))
+            if not os.path.isdir(effective_dir):
+                return f"Error: workdir '{workdir}' does not exist or is not a directory."
 
         # Construct custom environment with prepended virtual environment PATH
         custom_env = os.environ.copy()
@@ -196,7 +208,7 @@ class LocalShellBackend:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    cwd=self.root_dir,
+                    cwd=effective_dir,
                     env=custom_env,
                     encoding="utf-8",
                     errors="replace",
@@ -249,7 +261,7 @@ class LocalShellBackend:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    cwd=self.root_dir,
+                    cwd=effective_dir,
                     env=custom_env,
                     encoding="utf-8",
                     errors="replace",
@@ -322,6 +334,17 @@ class LocalShellBackend:
                     result_str = f"[ERR] Exit {exit_code}\n{capped}"
                 else:
                     result_str = f"[OK] Exit 0\n{capped}"
+                # Expect regex check
+                if expect and str(expect).strip():
+                    try:
+                        import re as _re
+                        pat = _re.compile(str(expect).strip())
+                        if pat.search(result_str):
+                            result_str += f"\n[EXPECT matched: {expect}]"
+                        else:
+                            result_str += f"\n[EXPECT failed: pattern '{expect}' not found]"
+                    except Exception as e:
+                        result_str += f"\n[EXPECT error: {e}]"
 
                 # Run-output dedup (C): re-running the same command with byte-identical
                 # output (e.g. re-running a test suite between fixes) re-appends the same
@@ -349,11 +372,14 @@ class LocalShellBackend:
 
 
 def run_command(command: str = "", timeout: int = 30000, background: bool = False,
-                process_action: str = "", shell: str = "bash") -> str:
+                process_action: str = "", shell: str = "bash", workdir: str = "", expect: str = "", stream: bool = False) -> str:
     """Execute a shell command, manage background processes, or view logs.
 
     shell: 'bash' (default — full POSIX via git-bash: pipes, &&, $(...), jq,
-    gh pipelines) or 'cmd' (legacy plain cmd, no pipes).
+    gh pipelines) or 'cmd' (Windows command/batch compatibility).
+    workdir: working directory to run in.
+    expect: regex to check in output — adds [EXPECT matched/failed].
+    stream: if true, hints to stream output (currently returns full output).
     """
     global BACKGROUND_PROCESSES
     import threading
@@ -448,7 +474,7 @@ def run_command(command: str = "", timeout: int = 30000, background: bool = Fals
                 suffix += 1
 
     backend = LocalShellBackend(root_dir=active_ws)
-    result = backend.execute(command, timeout=timeout, background=background, name=name, shell=shell)
+    result = backend.execute(command, timeout=timeout, background=background, name=name, shell=shell, workdir=workdir, expect=expect, stream=stream)
     if isinstance(result, str):
         return _clean_terminal_output(result)
     return result

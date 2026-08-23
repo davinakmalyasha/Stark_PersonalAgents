@@ -1,0 +1,16 @@
+// Deterministic perf smoke — main-entry import budget.
+// Runs in the gate's perf-smoke job (tests/perf-smoke.mjs).
+const budgetMs = Number(process.env.PERF_IMPORT_BUDGET_MS || 5000);
+
+const start = performance.now();
+await import("../src/main.ts").catch((e) => {
+  console.error("main entry import failed:", e?.message || e);
+  process.exit(1);
+});
+const elapsed = performance.now() - start;
+
+if (elapsed > budgetMs) {
+  console.error(`import took ${elapsed.toFixed(0)}ms (budget ${budgetMs}ms)`);
+  process.exit(1);
+}
+console.log(`import OK: ${elapsed.toFixed(0)}ms (budget ${budgetMs}ms)`);

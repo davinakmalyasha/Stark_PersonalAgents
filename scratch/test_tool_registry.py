@@ -5,7 +5,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tool_registry import ToolDefinition, active_tool_scope, get_registry
+from tools._registry import ToolDefinition, active_tool_scope, get_registry
 
 PASS = 0
 
@@ -52,6 +52,8 @@ def main():
 
     # execution pipeline: allow / deny / unknown
     check("execute ok", reg.execute("demo_tool", {"x": "hi"}) == "ran hi")
+    detailed = reg.execute_detailed("demo_tool", {"x": "hi"})
+    check("structured execution result", detailed.content == "ran hi" and not detailed.is_error)
     check("execute scoped", reg.execute("demo_tool", {"x": "hi"}, scope="demo-scope") == "ran hi")
     denied = reg.execute("demo_tool", {"x": "hi"}, scope="deny-scope")
     check("execute denied by scope", denied.startswith("Error: Unknown tool"))
@@ -110,14 +112,17 @@ def main():
     tools._load_subagents()
     dev_defs = tools.ensure_tool_registry().compact_defs_for("Dev")
     check("Dev scope registered", len(dev_defs) > 5)
-    check("doc line preserved", dev_defs.get("run_command", "").startswith("run_command(command,"))
+    check("generated doc reflects schema", dev_defs.get("run_command", "").startswith("run_command(command?,"))
 
     # orchestrator scope
-    from tool_registry import active_tool_scope as ats
+    from tools._registry import TOOL_MAP, active_tool_scope as ats
+    check("runtime names use canonical definitions", set(TOOL_MAP.keys()) == set(tools.get_native_tool_names()))
     t = ats.set("Orchestrator")
-    tools.ensure_tool_registry().restrict_scope("Orchestrator", allow=["task", "update_feature", "ask_user"])
+    tools.ensure_tool_registry().restrict_scope("Orchestrator", allow=["task", "ask_user"])
     check("orchestrator sees task", "task" in tools.ensure_tool_registry().names_for())
     check("orchestrator denied write_file", "write_file" not in tools.ensure_tool_registry().names_for())
+    orch_native = tools.get_native_tools("orchestrator")
+    check("orchestrator native schemas", {t["function"]["name"] for t in orch_native} == set(tools.get_native_tool_names("orchestrator")))
     ats.reset(t)
 
     print(f"\nALL {PASS} CHECKS PASSED")

@@ -144,6 +144,54 @@ def _safe_dest_path(target_dir: str, dest_rel: str) -> Optional[str]:
         return None
     return joined
 
+def _infer_project_variables(template: str, target_dir: str, variables: dict) -> tuple[dict, list[str]]:
+    """O2: infer boring identity variables from the active workspace when the
+    caller didn't supply them. Only infers variables the template actually
+    declares (avoids unused-variable warnings). Explicit variables always win.
+
+    Returns (inferred_map, warning_lines) — warnings are transparent, never silent.
+    """
+    inferred: dict[str, str] = {}
+    warns: list[str] = []
+    base = os.path.basename(os.path.normpath(str(target_dir))).strip()
+    if not base:
+        return inferred, warns
+
+    # Only infer variables the template declares
+    declared = set()
+    try:
+        meta = _template_meta(template) if template else None
+        if meta and isinstance(meta.get("variables"), list):
+            declared = {str(v.get("name", "")).strip() for v in meta["variables"] if v.get("name")}
+    except Exception:
+        declared = set()
+
+    def _kebab(s: str) -> str:
+        s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
+        return s or "project"
+
+    def _ident(s: str) -> str:
+        s = re.sub(r"\W", "_", s).lower()
+        if not s or s[0].isdigit():
+            s = "_" + s
+        return s
+
+    kebab = _kebab(base)
+    ident = _ident(kebab)
+    if "project_name" in declared and "project_name" not in (variables or {}):
+        inferred["project_name"] = kebab
+        warns.append(f"~ inferred project_name='{kebab}' from workspace '{base}'")
+    for key in ("app_name", "package_dir"):
+        if key in declared and key not in (variables or {}):
+            inferred[key] = ident
+            warns.append(f"~ inferred {key}='{ident}' from workspace '{base}'")
+    if "app_name" in inferred:
+        warns.append(f"~ inferred app_name='{ident}' from workspace '{base}'")
+    if "package_dir" in inferred:
+        warns.append(f"~ inferred package_dir='{ident}' from workspace '{base}'")
+    return inferred, warns
+
+
 def apply_template(template: str, target_dir: str = "", variables: dict = None,
                    overwrite: bool = False, dry_run: bool = False,
                    quiet: bool = True) -> str:
@@ -172,8 +220,15 @@ def apply_template(template: str, target_dir: str = "", variables: dict = None,
     target_dir = os.path.normpath(str(target_dir))
     if not os.path.isdir(target_dir):
         return f"Error: target_dir '{target_dir}' does not exist."
-    plan, visited, warnings, errors = [], set(), [], []
-    lines = _apply_template_inner(template, dict(variables or {}), plan, visited, 0,
+    # O2: infer identity variables (project_name/app_name/package_dir) from the
+    # workspace when the caller omitted them — only for variables the template
+    # actually declares. Explicit variables always win.
+    variables = dict(variables or {})
+    inferred, infer_warns = _infer_project_variables(template, target_dir, variables)
+    variables.update(inferred)
+    warnings = list(infer_warns)
+    plan, visited, errors = [], set(), []
+    lines = _apply_template_inner(template, variables, plan, visited, 0,
                                   warnings, errors)
     body = "\n".join(lines)
     if errors:
@@ -191,13 +246,22 @@ def apply_template(template: str, target_dir: str = "", variables: dict = None,
         final_plan.append(entry)
 
     # ── Commit phase (only after the WHOLE composition rendered) ──
-    created, skipped, overwritten, todos = [], [], [], []
+    created, skipped, overwritten, todos, unchanged = [], [], [], [], []
     for entry in final_plan:
         dest_path = _safe_dest_path(target_dir, entry["dest_rel"])
         if dest_path is None:
             errors.append(f"! unsafe dest '{entry['dest_rel']}' (escapes {target_dir})")
             continue
         exists = os.path.exists(dest_path)
+        # E1: incremental apply — byte-identical files are unchanged, not skipped/overwritten.
+        if exists:
+            try:
+                with open(dest_path, "r", encoding="utf-8", errors="replace") as _ef:
+                    if _ef.read() == entry["content"]:
+                        unchanged.append(entry["dest_rel"])
+                        continue
+            except Exception:
+                pass
         mode = entry.get("if_exists") or ("overwrite" if overwrite else "skip")
         if exists and mode == "error":
             errors.append(f"! {entry['dest_rel']} already exists (if_exists=error)")
@@ -220,11 +284,49 @@ def apply_template(template: str, target_dir: str = "", variables: dict = None,
         except Exception as e:
             errors.append(f"! write {entry['dest_rel']}: {e}")
 
+    # E4: apply writes real files — invalidate the read/tool caches the same
+    # way edit_file does, so a follow-up read_file can't serve stale content.
+    if not dry_run and (created or overwritten):
+        try:
+            from tools import _increment_cache_version
+            _increment_cache_version()
+        except Exception:
+            pass
+
     # ── Summary ──
     # quiet (default): flat counts + file lists only. verbose: nesting + TODOs + notes.
     summary = []
     if dry_run:
         summary.append(f"[DRY RUN — nothing written] preview of '{template}' -> {target_dir}")
+        # A2: unified diff preview — if file exists, show diff; else first 40 new lines. Capped.
+        import difflib
+        preview_budget = 2000
+        shown = 0
+        for entry in final_plan[:3]:
+            dest_path = _safe_dest_path(target_dir, entry["dest_rel"])
+            if dest_path and os.path.isfile(dest_path):
+                try:
+                    with open(dest_path, "r", encoding="utf-8", errors="replace") as _ef:
+                        old_lines = _ef.read().splitlines()
+                    new_lines = entry["content"].splitlines()
+                    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{entry['dest_rel']}", tofile=f"b/{entry['dest_rel']}", lineterm=""))
+                    if diff:
+                        block = "\n".join(diff[:60])
+                        if len(diff) > 60:
+                            block += f"\n... ({len(diff) - 60} more lines)"
+                    else:
+                        block = f"--- {entry['dest_rel']} (no textual diff — byte-identical preview) ---"
+                except Exception:
+                    snippet_lines = entry["content"].splitlines()[:40]
+                    block = f"--- {entry['dest_rel']} (first {len(snippet_lines)} lines) ---\n" + "\n".join(snippet_lines)
+            else:
+                snippet_lines = entry["content"].splitlines()[:40]
+                block = f"--- {entry['dest_rel']} (first {len(snippet_lines)} lines) ---\n" + "\n".join(snippet_lines)
+            if shown + len(block) > preview_budget:
+                summary.append(f"(preview truncated — {len(final_plan)} files total)")
+                break
+            summary.append(block)
+            shown += len(block)
     elif len(visited) > 1:
         summary.append(f"Composed {len(visited)} templates into {target_dir}")
     if created:
@@ -234,6 +336,11 @@ def apply_template(template: str, target_dir: str = "", variables: dict = None,
             (f"~ skipped ({len(skipped)}) — already exists:" if len(skipped) <= 6
              else f"~ skipped ({len(skipped)}) — already exists (first few):")
             + "\n" + "\n".join(f"  ~ {d}" for d in skipped[:6]))
+    if unchanged:
+        summary.append(
+            (f"= unchanged ({len(unchanged)}) — byte-identical, skipped:" if len(unchanged) <= 6
+             else f"= unchanged ({len(unchanged)}) — byte-identical, skipped (first few):")
+            + "\n" + "\n".join(f"  = {d}" for d in unchanged[:6]))
     if overwritten:
         summary.append(f"~ overwritten ({len(overwritten)}):\n"
                        + "\n".join(f"  ~ {d}" for d in overwritten))
@@ -243,6 +350,17 @@ def apply_template(template: str, target_dir: str = "", variables: dict = None,
         summary.append(f"! errors ({len(errors)}):\n" + "\n".join(f"  ! {e}" for e in errors[:8]))
     out = "\n".join(summary)
     if quiet:
+        # O3/A4: TODO + NOTES are the finish-the-feature checklist — surface them
+        # even in quiet mode so "resolve TODOs" and wiring instructions never need an extra call.
+        if todos:
+            out += f"\nTODO ({len(todos)}):\n" + "\n".join(f"  * {t}" for t in todos[:10])
+        try:
+            _n = _template_meta(template)
+            _notes = _n.get("notes") if _n else None
+            if _notes:
+                out += f"\nNOTES: {str(_notes)[:400]}"
+        except Exception:
+            pass
         return out
     out = body + (("\n" + out) if out else "")
     if todos:
@@ -438,6 +556,18 @@ def _template_source_view(template: str) -> str:
     for v in meta.get("variables", []):
         req = "required" if v.get("required") else f"default: {v.get('default', '')}"
         lines.append(f"  var {v['name']} ({v.get('type', 'string')}, {req}): {v.get('description', '')}")
+    # A1: variable autocomplete — show what would be inferred from the workspace
+    try:
+        from tools import shared_state
+        proj = shared_state.get("project_path") or ""
+        if proj:
+            _inf, _ = _infer_project_variables(template, proj, {})
+            if _inf:
+                sug = ", ".join(f"{k}='{v}'" for k, v in _inf.items())
+                base = os.path.basename(os.path.normpath(proj))
+                lines.append(f"Suggested (inferred from workspace '{base}'): {sug}")
+    except Exception:
+        pass
     if meta.get("files"):
         lines.append("Writes files to:")
         for fspec in meta.get("files", []):
@@ -451,6 +581,7 @@ def _template_source_view(template: str) -> str:
             else:
                 pairs.append(f"{k}={json.dumps(v)}")
         lines.append(f"Example: apply_template(\"{template}\", variables={{{', '.join(pairs)}}})")
+        lines.append(f"Example (unified): template(action=\"apply\", template=\"{template}\", variables={{{', '.join(pairs)}}})")
     notes = meta.get("notes")
     if notes:
         lines.append(f"NOTES: {str(notes)[:500]}")
@@ -609,28 +740,79 @@ def _template_search(query: str, category: str = "") -> str:
         hay = " ".join([e["name"], e["category"], e["description"]]).lower()
         symbols_txt = " ".join(e["symbols"]).lower()
         rest_txt = " ".join(e["dests"] + e["uses"] + e["variables"]).lower()
-        if is_regex and rx:
+        # Exact / prefix name match — strongest signal, checked first.
+        nl = e["name"].lower()
+        for w in words:
+            if w == nl:
+                score += 40
+                why.append("exact name")
+                break
+            if nl.startswith(w) and len(w) >= 4:
+                score += 15
+                why.append("name prefix")
+                break
+        # Additive scoring: multi-field matches sum (an elif chain under-counted
+        # a word hitting name+description+symbol as 60 instead of 120).
+        for w in words:
+            matched = False
+            if w in nl:
+                score += 60
+                why.append(w)
+                matched = True
+            if w in e["description"].lower():
+                score += 25
+                why.append(w)
+                matched = True
+            if any(w in s.lower() for s in e["symbols"]):
+                score += 35
+                why.append(f"symbol:{w}")
+                matched = True
+            if w in e["notes"].lower():
+                score += 12
+                why.append(w)
+                matched = True
+            if not matched and w in rest_txt:
+                score += 15
+                why.append(w)
+        # Regex: only when the query is long enough to be intentional (a lone
+        # "a|b" used to trigger the 100-point regex bonus on noise).
+        if is_regex and rx and len(q.strip()) >= 3:
             if rx.search(hay) or rx.search(symbols_txt) or rx.search(e["notes"].lower()):
                 score += 100
                 why.append("regex match")
-        for w in words:
-            if w in e["name"].lower():
-                score += 60
-                why.append(w)
-            elif w in e["description"].lower():
-                score += 25
-                why.append(w)
-            elif w in e["notes"].lower():
-                score += 12
-                why.append(w)
-            elif any(w in s.lower() for s in e["symbols"]):
-                score += 35
-                why.append(f"symbol:{w}")
-            elif w in rest_txt:
-                score += 15
-                why.append(w)
         if score:
             scored.append([score, e, list(dict.fromkeys(why))])
+
+    # ── Stack-aware boost: python project → boost feature-*, frontend → boost component.
+    try:
+        from tools import shared_state
+        proj = shared_state.get("project_path") or ""
+        is_python = False
+        is_node = False
+        if proj and os.path.isdir(proj):
+            if any(os.path.isfile(os.path.join(proj, f)) for f in ["pyproject.toml", "requirements.txt", "setup.py", "pyproject.toml.j2"]):
+                is_python = True
+            if os.path.isfile(os.path.join(proj, "package.json")):
+                is_node = True
+        q_lower = q.lower()
+        if any(k in q_lower for k in ["react", "frontend", "ui", "component"]):
+            is_node = True
+            if "python" not in q_lower and "fastapi" not in q_lower:
+                is_python = False
+        for item in scored:
+            cat = item[1]["category"]
+            name = item[1]["name"]
+            if is_python and cat == "feature":
+                item[0] += 20
+                if "stack:python" not in item[2]:
+                    item[2].append("stack:python")
+            elif is_node and cat == "component":
+                if any("src/components" in d or "src/lib" in d for d in item[1]["dests"]):
+                    item[0] += 20
+                    if "stack:frontend" not in item[2]:
+                        item[2].append("stack:frontend")
+    except Exception:
+        pass
 
     # ── L3 semantic boost (only when the model is ALREADY loaded in this
     # process — e.g. search_codebase warmed it — so a template search never
@@ -672,25 +854,61 @@ def _template_search(query: str, category: str = "") -> str:
     return "\n".join(lines)
 
 def build_template_map() -> str:
-    """Compact `## Template Map` for Zone 1 injection — WHAT exists, grouped by
-    category, stale-safe (template_list() is the live source, like search_code)."""
-    entries = _build_template_index()
-    by_cat = {}
-    for e in entries.values():
-        by_cat.setdefault(e["category"], []).append(e)
-    lines = [
-        "## Template Map",
-        "Stale-safe pointer (like the Repository Map) — template_list() shows live "
-        "details. Naming = task type: comp-* component | feature-* vertical slice | "
-        "project-*/stack-* scaffold | github-ci-* CI gates | config/routine/spec. "
-        "Small helpers: write with edit_file — never template them.",
-    ]
-    for cat in sorted(by_cat):
-        lines.append(f"[{cat}]")
-        for e in sorted(by_cat[cat], key=lambda x: x["name"]):
-            desc = (e["description"] or "")[:80]
-            lines.append(f"  {e['name']} — {desc}")
-    return "\n".join(lines)
+    """Return the fixed, cached pointer for the live template catalog.
+
+    The system prompt should advertise the capability, not duplicate the
+    catalog returned by template_list(). Keeping this byte-stable also means a
+    newly synced template cannot invalidate the larger cached prompt prefix.
+    """
+    return (
+        "templateMap: reusable boilerplate is live; search with "
+        "template(action=\"search\", query=...), inspect with template(action=\"show\", template=...), "
+        "then use template(action=\"apply\", ...) for new files."
+    )
+
+
+def template(action: str, template: str = "", category: str = "", query: str = "",
+             target_dir: str = "", variables: dict = None, overwrite: bool = False,
+             dry_run=None, quiet: bool = True) -> str:
+    """Unified template manager — flexible single tool for developer.
+
+    action=list   → catalog (template_list)
+    action=search → ranked search (template_list query)
+    action=show   → per-template details (template_list template)
+    action=apply  → render boilerplate (apply_template)
+
+    Safe-preview default (O1): when dry_run is omitted (None), a multi-template
+    composition (stack) or an overwrite request previews first instead of
+    writing; explicit dry_run=true/false always wins.
+
+    Replaces apply_template + template_list. Old tools stay for compat.
+    """
+    a = (action or "").strip().lower()
+    if a in ("list", "ls", "catalog"):
+        if template:
+            return template_list(template=template)
+        if query:
+            return template_list(category=category, query=query)
+        return template_list(category=category)
+    if a in ("search", "find", "query"):
+        return template_list(category=category, query=query or template)
+    if a in ("show", "view", "info", "details"):
+        if not template:
+            return "Error: template action=show requires template name."
+        return template_list(template=template)
+    if a in ("apply", "use", "render", "create"):
+        if not template:
+            return "Error: template action=apply requires template name."
+        meta = _template_meta(template)
+        composes_multi = bool(meta and isinstance(meta.get("uses"), list) and meta.get("uses"))
+        effective_dry = dry_run
+        if effective_dry is None:
+            effective_dry = bool(composes_multi or overwrite)
+        return apply_template(template=template, target_dir=target_dir or "",
+                              variables=variables, overwrite=bool(overwrite),
+                              dry_run=bool(effective_dry), quiet=bool(quiet))
+    return "Error: template action must be one of: list, search, show, apply. Got: '{}'".format(action)
+
 
 def template_new(name: str, level: str, description: str, sample_vars: dict,
                  variables: list = None, files: list = None, uses: list = None,
@@ -803,7 +1021,7 @@ def template_pull(repo: str = "davinakmalyasha/agent-templates", ref: str = "mai
     paths = [p for p in tree.splitlines() if p.strip()]
     if not paths:
         return f"No files found in {repo} @ {ref}."
-    written, errors = [], []
+    written, errors, conflicts = [], [], []
     for p in paths:
         if p == _SYNC_STAMP:
             continue
@@ -814,6 +1032,18 @@ def template_pull(repo: str = "davinakmalyasha/agent-templates", ref: str = "mai
         try:
             content = b64decode(out.replace("\n", "")).decode("utf-8", "replace")
             dest = os.path.join(_TEMPLATES_DIR, p)
+            # E3: conflict detection — if local exists and differs from hub, keep local
+            if os.path.isfile(dest):
+                try:
+                    with open(dest, "r", encoding="utf-8", errors="replace") as lf:
+                        local = lf.read()
+                    if local == content:
+                        continue  # already up to date
+                    # Both changed (local edited + hub updated) — keep local
+                    conflicts.append(p)
+                    continue
+                except Exception:
+                    pass
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
@@ -831,6 +1061,8 @@ def template_pull(repo: str = "davinakmalyasha/agent-templates", ref: str = "mai
         pass
     _invalidate_tool_cache_all()  # template_list catalog changed
     out = f"Pulled {len(written)} files from {repo} @ {sha or ref} into templates/."
+    if conflicts:
+        out += f"\nConflicts kept local ({len(conflicts)}):\n" + "\n".join(f"  ! {c} (local differs — kept local)" for c in conflicts[:10])
     if errors:
         out += f"\nErrors ({len(errors)}):\n" + "\n".join(f"  ! {e}" for e in errors[:10])
     return out

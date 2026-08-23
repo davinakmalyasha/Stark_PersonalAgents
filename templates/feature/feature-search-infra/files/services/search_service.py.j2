@@ -1,0 +1,47 @@
+"""Search service: indexing + query for {{ app_name }}.
+
+Wraps Meilisearch HTTP API via httpx. Swap for Typesense by changing
+search_provider and adjusting the client paths.
+"""
+import httpx
+
+from ..core.search_config import SEARCH_API_KEY, SEARCH_INDEX, SEARCH_PROVIDER, SEARCH_URL
+
+
+def _headers() -> dict:
+    if SEARCH_PROVIDER == "meilisearch":
+        return {"Authorization": f"Bearer {SEARCH_API_KEY}", "Content-Type": "application/json"}
+    return {"X-TYPESENSE-API-KEY": SEARCH_API_KEY, "Content-Type": "application/json"}
+
+
+def index_document(doc_id: str, payload: dict) -> dict:
+    """Index one document. Returns provider response."""
+    url = f"{SEARCH_URL}/indexes/{SEARCH_INDEX}/documents"
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.post(url, headers=_headers(), json=[payload])
+        resp.raise_for_status()
+        return resp.json()
+
+
+def search(query: str, limit: int = 20) -> list[dict]:
+    """Search index. Returns hits array."""
+    url = f"{SEARCH_URL}/indexes/{SEARCH_INDEX}/search"
+    params = {"q": query, "limit": limit}
+    with httpx.Client(timeout=5.0) as client:
+        resp = client.get(url, headers=_headers(), params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        # Meilisearch: {hits: [...]}, Typesense: {hits: [{document: {...}}]}
+        if isinstance(data.get("hits"), list) and data["hits"] and isinstance(data["hits"][0], dict) and "document" in data["hits"][0]:
+            return [h["document"] for h in data["hits"]]
+        return data.get("hits", [])
+
+
+def delete_index() -> None:
+    """Dangerous — wipes the index. Use only in tests."""
+    url = f"{SEARCH_URL}/indexes/{SEARCH_INDEX}"
+    with httpx.Client(timeout=5.0) as client:
+        client.delete(url, headers=_headers())
+
+
+# TODO: add bulk index + faceting + typo-tolerance tuning per provider.

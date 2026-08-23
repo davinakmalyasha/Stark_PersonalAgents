@@ -1,20 +1,20 @@
-"""
-Subagent Manager — continuable subagents (dsh-style).
+﻿"""
+Subagent Manager â€” continuable subagents (dsh-style).
 
 A **continuable child** is a durable child session (P1 JSONL) with:
 
 - a ``subagent/descriptor`` custom entry (name, label, parent links)
 - at most one live **Activation**: ``running`` (a turn owns the thread) or
   ``idle`` (quiescent, resumable)
-- FIFO follow-up turns via :func:`send_message` — cold-resumes from the log
-- :func:`interrupt_agent` — cooperative per-iteration cancel
-- child → parent :func:`report` — wakeup (follow-up to the parent chat) or
+- FIFO follow-up turns via :func:`send_message` â€” cold-resumes from the log
+- :func:`interrupt_agent` â€” cooperative per-iteration cancel
+- child â†’ parent :func:`report` â€” wakeup (follow-up to the parent chat) or
   quiet (log-only)
-- durable enumeration via :func:`list_agents` — reads session headers, never
+- durable enumeration via :func:`list_agents` â€” reads session headers, never
   resumes an agent
 
 Follow-up authority: only the durable direct parent session (or the live
-parent chat) may message or interrupt a child — enforced by child_id prefix
+parent chat) may message or interrupt a child â€” enforced by child_id prefix
 and parent-session matching.
 
 Thread-safe. Never raises on misuse (tools return error strings instead).
@@ -98,7 +98,7 @@ def _descriptor_of(mgr: SessionManager) -> Optional[dict]:
     return None
 
 
-# ── Build the child's system prompt from the subagent registry ────────────────
+# â”€â”€ Build the child's system prompt from the subagent registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _child_system_prompt(name: str) -> str:
@@ -115,9 +115,6 @@ def _child_system_prompt(name: str) -> str:
                 from tools import ensure_tool_registry
                 reg = ensure_tool_registry()
                 reg.restrict_scope(name, allow=list(tool_names))
-                defs = reg.compact_defs_for(name)
-                lines = [defs.get(t, f"{t}() — Execute {t}") for t in tool_names]
-                sys_prompt = f"{sys_prompt}\n\n## Available Tools\n" + "\n".join(f"- {l}" for l in lines)
             except Exception:
                 pass
         return sys_prompt
@@ -147,7 +144,7 @@ def _child_permissions(name: str) -> list:
         return []
 
 
-# ── The turn loop ─────────────────────────────────────────────────────────────
+# â”€â”€ The turn loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: list[str]) -> str:
@@ -156,11 +153,12 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
     Appends every step to the child session log. Cooperative with
     ``act["interrupt"]`` (checked per iteration). Returns the final text.
     """
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
     from llm import invoke_messages_with_fallback_stream
-    from agents.developer_agent import _parse_tool_call
-    from tools import (execute_tool, auto_offload_result, _tool_cap,
-                       active_permissions, _TASK_DEPTH, active_tool_scope)
+    from tools import (execute_tool_detailed, auto_offload_result, _tool_cap,
+                       active_permissions, _TASK_DEPTH, active_tool_scope,
+                       get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents,
+                       _current_chat)
     from session_log import convert_to_llm
 
     with act["lock"]:
@@ -172,23 +170,61 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
     _depth_token = _TASK_DEPTH.set(1)
     _perm_token = active_permissions.set(_child_permissions(name))
     _scope_token = active_tool_scope.set(name)
+    _descriptor = _descriptor_of(session) or {}
+    _parent_chat = _descriptor.get("parent_chat_id", "") or ""
+    _chat_token = _current_chat.set(_parent_chat)
 
-    max_iters = int(os.environ.get("SUBAGENT_MAX_ITERS", "25"))
     interrupted = False
 
     try:
         # Context = full child history (compaction checkpoints honored)
         entries = session.build_context_entries()
-        messages = convert_to_llm(entries, native_tool_calls=False)
+        messages = convert_to_llm(entries, native_tool_calls=True)
         has_sys = any(type(m).__name__ == "SystemMessage" for m in messages)
         if not has_sys:
             messages.insert(0, SystemMessage(content=_child_system_prompt(name)))
+
+        # Codex-style plan re-injection: the child's plan is part of its session
+        # state; restore it on resume. Empty for first turns (the model writes
+        # the plan there via update_plan).
+        try:
+            from tools import get_plan_for_context
+            plan_block = get_plan_for_context(name, _parent_chat)
+            if plan_block:
+                messages.append(HumanMessage(content=plan_block))
+        except Exception as e:
+            print(f"[SUBAGENT] Error restoring plan block: {e}")
+
         for text in extra_messages:
             messages.append(HumanMessage(content=text))
             session.append_message("user", text, source="followup")
 
+        # Vision: inject user-attached images stashed by the API layer.
+        try:
+            from tools.vision_channel import drain_attachment_images
+            if drain_attachment_images(messages):
+                session.append_message("system", "[VISION] user attachment image(s) injected")
+        except Exception:
+            pass
+
+        if not _SUBAGENTS_REGISTRY:
+            _load_subagents()
+        spec = _SUBAGENTS_REGISTRY.get(name) or {}
+        allowed_tools = set(spec.get("tools", []))
+        native_tools = [
+            definition for definition in get_native_tools()
+            if definition.get("function", {}).get("name") in allowed_tools
+        ]
+        try:
+            from tools.mcp.mcp_bridge import mcp_tool_defs_for_scope
+            native_tools.extend(mcp_tool_defs_for_scope(name))
+        except Exception:
+            pass
+
         content = ""
-        for i in range(max_iters):
+        i = 0
+        while True:
+            i += 1
             if act["interrupt"]:
                 interrupted = True
                 break
@@ -197,8 +233,9 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
                     role=name,
                     messages=list(messages),
                     temp=0.2,
+                    tools=native_tools or None,
                     reasoning_effort=os.environ.get("REASONING_SUBAGENT_ROUTINE", "disabled"),
-                    where=f"{name} continuable iter {i + 1}",
+                    where=f"{name} continuable iter {i}",
                 )
             except Exception:
                 break
@@ -212,25 +249,17 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
                 response_text = getattr(res, "content", str(res))
             response_text = str(response_text)
 
-            # parse tool calls (native first, text blocks fallback)
-            import re as _re
+            # Native tool calls only. The provider API owns the tool protocol;
+            # pseudo-tool text is not generated or parsed in durable sessions.
             tool_calls = []
-            if native_tool_calls:
-                for tc in native_tool_calls:
+            for call_index, tc in enumerate(native_tool_calls or []):
+                tname = tc.get("tool") or tc.get("name", "")
+                if tname:
                     tool_calls.append({
-                        "tool": tc.get("tool") or tc.get("name", ""),
+                        "tool": tname,
                         "args": tc.get("args") or {},
-                        "id": tc.get("id", ""),
+                        "id": tc.get("id") or f"cont-{i}-{call_index + 1}",
                     })
-            else:
-                for match in _re.finditer(r'```tool\s*\n(.*?)\n```', response_text, _re.DOTALL):
-                    tc = _parse_tool_call(match.group(0))
-                    if tc:
-                        tool_calls.append(tc)
-                if not tool_calls:
-                    tc = _parse_tool_call(response_text)
-                    if tc:
-                        tool_calls.append(tc)
 
             blocks = [{"type": "text", "text": response_text}]
             if reasoning:
@@ -255,20 +284,33 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
                 if act["interrupt"]:
                     interrupted = True
                     break
-                call_id = tc.get("id") or f"cont-{i}-{tname}"
+                call_id = tc["id"]
                 try:
-                    r = execute_tool(tname, targs)
-                    r = auto_offload_result(str(r), tname, max_chars=_tool_cap("subagent"))
+                    execution = execute_tool_detailed(tname, targs, scope=name)
+                    r = auto_offload_result(execution.content, tname, max_chars=_tool_cap("subagent"))
                     session.append_tool_result(r, tool_call_id=call_id, tool_name=tname)
                 except Exception as e:
                     r = f"Error: {e}"
                     session.append_tool_result(
                         str(e)[:300], tool_call_id=call_id, tool_name=tname, is_error=True,
                     )
-                results.append(f"[{tname}] {r}")
+                results.append(str(r))
             if interrupted:
                 break
-            messages.append(HumanMessage(content="Tool results:\n" + "\n".join(results)))
+            for tc, result in zip(tool_calls, results):
+                messages.append(ToolMessage(
+                    content=str(result),
+                    tool_call_id=tc["id"],
+                    name=tc.get("tool", ""),
+                ))
+
+            # Vision: drain tool-queued inline images into ONE user message.
+            try:
+                from tools.vision_channel import drain_into_messages
+                if drain_into_messages(messages, header="[Inline image(s) from tool result]"):
+                    session.append_message("system", "[VISION] inline image(s) injected")
+            except Exception:
+                pass
 
         if interrupted:
             content = content or "INTERRUPTED"
@@ -278,12 +320,13 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
         active_permissions.reset(_perm_token)
         _TASK_DEPTH.reset(_depth_token)
         active_tool_scope.reset(_scope_token)
+        _current_chat.reset(_chat_token)
         with act["lock"]:
             act["status"] = "idle"
             act["interrupt"] = False
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def start_continuable(
@@ -426,7 +469,7 @@ def list_agents(workspace: str, chat_id: Optional[str] = None) -> list[dict]:
 
 
 def report(message: str, quiet: bool = False) -> str:
-    """Child → parent report. Wakeup (default) queues a follow-up to the
+    """Child â†’ parent report. Wakeup (default) queues a follow-up to the
     parent chat; quiet only records the message in the child's log."""
     child_id = current_child.get()
     if not child_id:

@@ -1,13 +1,9 @@
 """MainTool._shared — helpers shared across several tools (cross-cutting).
 
-Terminal-output cleaning (run_command/search_code), syntax validation
-(write_file/edit_file), and the tool-logging pipeline used by ~all tools.
-Self-contained: stdlib + state_sync only.
+Terminal-output cleaning (run_command/search_code) and the tool-logging
+pipeline used by ~all tools. Self-contained: stdlib + state_sync only.
 """
-import os
 import re
-import subprocess
-from typing import Optional
 from sync.state_sync import safe_append_live_log
 
 
@@ -57,46 +53,3 @@ def _fmt_args(args: dict) -> str:
         else:
             parts.append(f"{k}={v!r}")
     return ", ".join(parts)
-
-
-def _validate_syntax(file_path: str) -> Optional[str]:
-    """Inspects syntax of written/edited files to prevent syntax bugs."""
-    if not os.path.isfile(file_path):
-        return None
-    
-    ext = file_path.split(".")[-1].lower()
-    try:
-        if ext == "py":
-            import ast
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                ast.parse(f.read())
-        elif ext == "json":
-            import json
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                json.load(f)
-        elif ext in ("js", "jsx"):
-            res = subprocess.run(
-                ["node", "-c", file_path],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if res.returncode != 0:
-                return f"JavaScript Syntax Error:\n{res.stderr.strip()}"
-        elif ext == "php":
-            res = subprocess.run(
-                ["php", "-l", file_path],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if res.returncode != 0:
-                return f"PHP Syntax Error:\n{res.stderr.strip() or res.stdout.strip()}"
-    except Exception as e:
-        if isinstance(e, SyntaxError):
-            return f"Python Syntax Error: {e.msg} at line {e.lineno}, col {e.offset}."
-        elif isinstance(e, json.JSONDecodeError):
-            return f"JSON Parsing Error: {e.msg} at line {e.lineno}, col {e.colno}."
-        # Silently ignore other exceptions (e.g. node not installed)
-        pass
-    return None

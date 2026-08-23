@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { X, Plus, Trash2, Shield, FolderGit, User } from 'lucide-react';
-import { fetchProfile, saveProfile, fetchWorkspaceRules, saveWorkspaceRules } from '../../services/api';
-import type { UserProfile, WorkspaceRules, WorkspaceInfo } from '../../types';
+import { X, Plus, Trash2, Shield, FolderGit, User, Server, RefreshCw } from 'lucide-react';
+import { fetchProfile, saveProfile, fetchWorkspaceRules, saveWorkspaceRules, fetchMcpServers, upsertMcpServer, deleteMcpServer, restartMcpServer } from '../../services/api';
+import type { UserProfile, WorkspaceRules, WorkspaceInfo, McpServerConfig } from '../../types';
 
 interface Props {
   isOpen: boolean;
@@ -10,7 +10,7 @@ interface Props {
 }
 
 export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Props) {
-  const [activeTab, setActiveTab] = useState<'profile' | 'workspace'>('profile');
+  const [activeTab, setActiveTab] = useState<'profile' | 'workspace' | 'mcp'>('profile');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -25,6 +25,19 @@ export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Prop
   const [stackDatabase, setStackDatabase] = useState('');
   const [workspaceRules, setWorkspaceRules] = useState<string[]>([]);
   const [newWorkspaceRule, setNewWorkspaceRule] = useState('');
+
+  // MCP Server State
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([]);
+  const [mcpForm, setMcpForm] = useState({
+    name: '',
+    command: '',
+    args: '',
+    url: '',
+    scopes: '',
+    approval: 'auto' as 'auto' | 'prompt',
+    instructions: '',
+  });
+  const [mcpBusy, setMcpBusy] = useState<string | null>(null);
 
   // Load Data
   useEffect(() => {
@@ -46,6 +59,7 @@ export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Prop
           setStackDatabase(Array.isArray(stack.database) ? stack.database.join(', ') : '');
           setWorkspaceRules(rules.workspace_rules || []);
         }
+        setMcpServers(await fetchMcpServers());
       } catch (err: any) {
         setError(err.message || 'Failed to load settings');
       } finally {
@@ -55,6 +69,64 @@ export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Prop
 
     loadData();
   }, [isOpen, activeWorkspace]);
+
+  const refreshMcpServers = async () => {
+    setMcpServers(await fetchMcpServers());
+  };
+
+  const handleUpsertMcpServer = async () => {
+    const name = mcpForm.name.trim();
+    if (!name) return;
+    const config: Omit<McpServerConfig, 'name' | 'status' | 'error' | 'tool_count' | 'transport'> = {
+      command: mcpForm.command.trim(),
+      args: mcpForm.args.split(',').map((s) => s.trim()).filter(Boolean),
+      url: mcpForm.url.trim(),
+      scopes: mcpForm.scopes.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+      approval: mcpForm.approval,
+      instructions: mcpForm.instructions.trim(),
+    };
+    setMcpBusy('save');
+    setError(null);
+    try {
+      const ok = await upsertMcpServer(name, config);
+      if (!ok) {
+        setError('Failed to save MCP server');
+      } else {
+        setMcpForm({ name: '', command: '', args: '', url: '', scopes: '', approval: 'auto', instructions: '' });
+      }
+      await refreshMcpServers();
+    } catch (err: any) {
+      setError(err.message || 'Failed to save MCP server');
+    } finally {
+      setMcpBusy(null);
+    }
+  };
+
+  const handleDeleteMcpServer = async (name: string) => {
+    setMcpBusy(name);
+    setError(null);
+    try {
+      await deleteMcpServer(name);
+      await refreshMcpServers();
+    } catch (err: any) {
+      setError(err.message || 'Failed to delete MCP server');
+    } finally {
+      setMcpBusy(null);
+    }
+  };
+
+  const handleRestartMcpServer = async (name: string) => {
+    setMcpBusy(name);
+    setError(null);
+    try {
+      await restartMcpServer(name);
+      await refreshMcpServers();
+    } catch (err: any) {
+      setError(err.message || 'Failed to restart MCP server');
+    } finally {
+      setMcpBusy(null);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -165,6 +237,17 @@ export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Prop
             <FolderGit size={13} />
             Workspace Rules
           </button>
+          <button
+            onClick={() => setActiveTab('mcp')}
+            className={`flex items-center gap-2 px-5 py-3 text-xs font-semibold uppercase tracking-wider border-b-2 transition-colors ${
+              activeTab === 'mcp'
+                ? 'border-blue-500 text-zinc-100 bg-zinc-800/10'
+                : 'border-transparent text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            <Server size={13} />
+            MCP Servers
+          </button>
         </div>
 
         {/* Main Panel Content */}
@@ -239,6 +322,153 @@ export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Prop
                     <Plus size={14} />
                   </button>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'mcp' && (
+            <div className="space-y-6">
+              {/* Server list */}
+              <div>
+                <label className="block text-[11px] text-zinc-400 font-semibold uppercase tracking-wider mb-2">
+                  Connected Servers
+                </label>
+                <div className="space-y-2 max-h-[200px] overflow-y-auto mb-3 border border-zinc-800 bg-zinc-950/20 p-2 rounded-lg">
+                  {mcpServers.length === 0 && (
+                    <div className="text-zinc-600 text-xs italic p-2 text-center">No MCP servers configured yet. Add one below.</div>
+                  )}
+                  {mcpServers.map((s) => (
+                    <div key={s.name} className="flex gap-2 items-center p-2 bg-zinc-950/60 border border-zinc-800/40 rounded-md">
+                      <Server size={12} className="text-zinc-500 flex-shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] text-zinc-200 font-medium">{s.name}</span>
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
+                            s.status === 'connected'
+                              ? 'bg-emerald-900/40 text-emerald-400'
+                              : s.status === 'failed'
+                                ? 'bg-red-900/40 text-red-400'
+                                : 'bg-zinc-800 text-zinc-400'
+                          }`}>
+                            {s.status || 'stopped'}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-zinc-500 truncate">
+                          {s.transport === 'http' ? `http · ${s.url ?? ''}` : `stdio · ${s.command ?? ''}`}
+                          {s.tool_count != null && ` · ${s.tool_count} tools`}
+                          {s.scopes && s.scopes.length > 0 && ` · scopes: ${s.scopes.join(', ')}`}
+                        </div>
+                        {s.error && <div className="text-[10px] text-red-400 truncate">{s.error}</div>}
+                      </div>
+                      <button
+                        onClick={() => handleRestartMcpServer(s.name!)}
+                        disabled={!!mcpBusy}
+                        title="Restart server"
+                        className="p-1.5 rounded text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
+                      >
+                        <RefreshCw size={12} className={mcpBusy === s.name ? 'animate-spin' : ''} />
+                      </button>
+                      <button
+                        onClick={() => handleDeleteMcpServer(s.name!)}
+                        disabled={!!mcpBusy}
+                        title="Remove server"
+                        className="p-1.5 rounded text-zinc-600 hover:text-red-400 hover:bg-zinc-800 transition-colors"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Add / edit form */}
+              <div className="border border-zinc-800 bg-zinc-950/20 rounded-lg p-3 space-y-3">
+                <label className="block text-[11px] text-zinc-400 font-semibold uppercase tracking-wider">
+                  Add MCP Server
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <span className="text-[10px] text-zinc-500 block mb-1">Name (unique, a-z 0-9 _ -)</span>
+                    <input
+                      type="text"
+                      value={mcpForm.name}
+                      onChange={(e) => setMcpForm({ ...mcpForm, name: e.target.value })}
+                      placeholder="e.g. github"
+                      className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-blue-500/50 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-zinc-500 block mb-1">Approval</span>
+                    <select
+                      value={mcpForm.approval}
+                      onChange={(e) => setMcpForm({ ...mcpForm, approval: e.target.value as 'auto' | 'prompt' })}
+                      className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 focus:border-blue-500/50 outline-none"
+                    >
+                      <option value="auto">auto — run without asking</option>
+                      <option value="prompt">prompt — confirm each call</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <span className="text-[10px] text-zinc-500 block mb-1">Command (stdio transport)</span>
+                  <input
+                    type="text"
+                    value={mcpForm.command}
+                    onChange={(e) => setMcpForm({ ...mcpForm, command: e.target.value })}
+                    placeholder="e.g. npx -y @modelcontextprotocol/server-github"
+                    className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-blue-500/50 outline-none"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <span className="text-[10px] text-zinc-500 block mb-1">Args (comma-separated, optional)</span>
+                    <input
+                      type="text"
+                      value={mcpForm.args}
+                      onChange={(e) => setMcpForm({ ...mcpForm, args: e.target.value })}
+                      placeholder="e.g. --transport, stdio"
+                      className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-blue-500/50 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-zinc-500 block mb-1">URL (HTTP transport, instead of command)</span>
+                    <input
+                      type="text"
+                      value={mcpForm.url}
+                      onChange={(e) => setMcpForm({ ...mcpForm, url: e.target.value })}
+                      placeholder="e.g. https://mcp.example.com/sse"
+                      className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-blue-500/50 outline-none"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <span className="text-[10px] text-zinc-500 block mb-1">Scopes (comma-separated: developer, orchestrator, free_agent — empty = all)</span>
+                  <input
+                    type="text"
+                    value={mcpForm.scopes}
+                    onChange={(e) => setMcpForm({ ...mcpForm, scopes: e.target.value })}
+                    placeholder="e.g. developer, orchestrator"
+                    className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-blue-500/50 outline-none"
+                  />
+                </div>
+                <div>
+                  <span className="text-[10px] text-zinc-500 block mb-1">Instructions (shown to the agent, ≤512 chars)</span>
+                  <textarea
+                    value={mcpForm.instructions}
+                    onChange={(e) => setMcpForm({ ...mcpForm, instructions: e.target.value })}
+                    rows={2}
+                    placeholder="e.g. Use this server for GitHub operations; prefer GraphQL when possible."
+                    className="w-full px-2.5 py-1.5 bg-zinc-950 border border-zinc-800 rounded-lg text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-blue-500/50 outline-none resize-none"
+                  />
+                </div>
+                <button
+                  onClick={handleUpsertMcpServer}
+                  disabled={mcpBusy === 'save' || !mcpForm.name.trim() || (!mcpForm.command.trim() && !mcpForm.url.trim())}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 rounded-lg text-xs text-zinc-200 transition-colors"
+                >
+                  <Plus size={13} />
+                  {mcpBusy === 'save' ? 'Saving...' : mcpServers.some((s) => s.name === mcpForm.name.trim()) ? 'Update Server' : 'Add Server'}
+                </button>
               </div>
             </div>
           )}
@@ -344,10 +574,10 @@ export default function SettingsModal({ isOpen, onClose, activeWorkspace }: Prop
           </button>
           <button
             onClick={activeTab === 'profile' ? handleSaveProfile : handleSaveWorkspaceRules}
-            disabled={isLoading}
+            disabled={isLoading || activeTab === 'mcp'}
             className="px-5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded-lg transition-colors"
           >
-            Save Changes
+            {activeTab === 'mcp' ? 'Changes Apply Immediately' : 'Save Changes'}
           </button>
         </div>
       </div>

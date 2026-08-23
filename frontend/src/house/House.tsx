@@ -7,6 +7,7 @@ import HouseSidebar from './HouseSidebar';
 import HousePortal from './HousePortal';
 import AddTaskModal from '../components/Canvas/AddTaskModal';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
+import SettingsModal from '../components/Layout/SettingsModal';
 import { useHouseChat } from './useHouseChat';
 import { seedAssistantMemory } from './assistant';
 import { fetchWorkspaces, fetchChats } from '../services/api';
@@ -16,6 +17,7 @@ export default function House() {
   const [transitioning, setTransitioning] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isStatsOpen, setIsStatsOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [workspaceCount, setWorkspaceCount] = useState<number | null>(null);
   const [chatCount, setChatCount] = useState<number | null>(null);
@@ -85,6 +87,7 @@ export default function House() {
         onOpenTasks={openTasks}
         onTaskStart={chat.handleTaskStart}
         onTaskDelete={chat.handleTaskDelete}
+        onOpenSettings={() => setIsSettingsOpen(true)}
       />
 
       <main className="relative z-10 flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -131,6 +134,12 @@ export default function House() {
         onClose={() => setIsStatsOpen(false)}
         tokenUsage={chat.combinedTokenUsage}
         lastModelName={chat.lastModelName}
+      />
+
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        activeWorkspace={null}
       />
 
       {taskModalOpen && (

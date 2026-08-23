@@ -1,0 +1,388 @@
+name: Release Heavy
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-heavy
+  cancel-in-progress: false
+
+jobs:
+  # ── Universal: container scan + size budget (any project with Dockerfile) ──
+  container-full:
+    name: container-full
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build image + Trivy image scan + size budget
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "no Dockerfile — container-full skipped"
+            exit 0
+          fi
+          docker build -t gate-release:audit .
+          curl -sSfL https://github.com/aquasecurity/trivy/releases/download/v{{ trivy_version }}/trivy_{{ trivy_version }}_Linux-64bit.tar.gz -o /tmp/trivy.tar.gz
+          tar -xzf /tmp/trivy.tar.gz -C /tmp
+          /tmp/trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed gate-release:audit
+      - name: Image size budget
+        run: |
+          SIZE_BYTES=$(docker inspect gate-release:audit | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['Size'])")
+          SIZE_MB=$(( SIZE_BYTES / 1024 / 1024 ))
+          BUDGET_MB={{ image_size_budget_mb }}
+          echo "Image size: ${SIZE_MB}MB (budget ${BUDGET_MB}MB)"
+          if [ "$SIZE_MB" -gt "$BUDGET_MB" ]; then
+            echo "FAIL: image exceeds budget by $(( SIZE_MB - BUDGET_MB ))MB"
+            exit 1
+          fi
+
+  # ── Universal: SBOM (auto-detects ecosystem) ──
+  sbom-cyclonedx:
+    name: sbom-cyclonedx
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('requirements.txt') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('package-lock.json') != '' && hashFiles('requirements.txt') == ''
+        with:
+          node-version: '22'
+      - name: Generate SBOM — Python (requirements.txt)
+        if: hashFiles('requirements.txt') != ''
+        run: |
+          pip install --quiet cyclonedx-bom
+          cyclonedx-py requirements requirements.txt --output-format json --output-file sbom.json
+      - name: Generate SBOM — Node (package-lock.json)
+        if: hashFiles('requirements.txt') == '' && hashFiles('package-lock.json') != ''
+        run: |
+          npm ci --silent || npm install --silent
+          npx --yes @cyclonedx/cyclonedx-npm --output-file sbom.json
+      - name: No manifest found
+        if: hashFiles('requirements.txt') == '' && hashFiles('package-lock.json') == ''
+        run: echo "no dependency manifest — SBOM skipped"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx-release
+          path: sbom.json
+          if-no-files-found: ignore
+
+  # ── Universal: license compliance (needs SBOM) ──
+  license-compliance:
+    name: license-compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    needs: sbom-cyclonedx
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom-cyclonedx-release
+      - name: License audit — fail on denylist
+        run: |
+          if [ ! -f sbom.json ]; then
+            echo "no SBOM artifact — license audit skipped"
+            exit 0
+          fi
+          python3 -c "
+          import json, sys
+          denylist = '{{ license_denylist }}'.split(',')
+          sbom = json.load(open('sbom.json'))
+          violations = []
+          for comp in sbom.get('components', []):
+              licenses = [l.get('id', l.get('name','')) for l in comp.get('licenses',[])]
+              for lic in licenses:
+                  if lic in denylist:
+                      violations.append(f\"{comp.get('name','?')} ({comp.get('version','?')}): {lic}\")
+          if violations:
+              print('LICENSE VIOLATIONS:')
+              for v in violations: print(f'  ! {v}')
+              sys.exit(1)
+          print('All licenses OK')
+          "
+
+  # ── Universal: env var audit (scans .py/.js/.ts/.tsx) ──
+  env-audit:
+    name: env-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Env var audit — code refs vs .env.example
+        run: |
+          REFS=$(grep -rhoP '(?:os\.environ(?:\.get)?\[?\(?["\x27]|os\.getenv\(["\x27]|process\.env\.)\K[A-Z_][A-Z0-9_]*(?=["\x27\]\s)]|$)' \
+            --include='*.py' --include='*.js' --include='*.ts' --include='*.tsx' . 2>/dev/null | sort -u | grep -v '^$' || true)
+          if [ -z "$REFS" ]; then
+            echo "no env var references found — audit skipped"
+            exit 0
+          fi
+          if [ ! -f .env.example ]; then
+            echo "! no .env.example found — all env refs undocumented"
+            echo "$REFS" | while read var; do echo "  ! $var"; done
+            exit 1
+          fi
+          DOCS=$(grep -oP '^[A-Z_][A-Z0-9_]*' .env.example | sort -u || true)
+          UNDOCUMENTED=$(comm -23 <(echo "$REFS") <(echo "$DOCS"))
+          COUNT=$(echo "$UNDOCUMENTED" | grep -cv '^$' || true)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "FAIL: $COUNT env variable(s) referenced but not documented:"
+            echo "$UNDOCUMENTED" | while read var; do echo "  ! $var"; done
+            exit 1
+          fi
+          echo "All $(echo "$REFS" | wc -l) env variables documented"
+
+  # ── Universal: zizmor deep pass ──
+  zizmor-full:
+    name: zizmor-full
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: zizmor — nightly strict pass (low severity included)
+        run: |
+          curl -sSfL https://github.com/woodruffw/zizmor/releases/download/v{{ zizmor_version }}/zizmor-x86_64-unknown-linux-gnu.tar.gz -o /tmp/zizmor.tar.gz
+          tar -xzf /tmp/zizmor.tar.gz -C /tmp
+          /tmp/zizmor --min-severity low .
+
+  # ── Python-only jobs (graceful-skip when no .py files) ──
+  debug-audit:
+    name: debug-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: hashFiles('**/*.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Packaging + import sanity
+        run: |
+          pip install --quiet pytest
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          python -m compileall -q . || exit 1
+          PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+          if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+            python -c "import $PKG.main" || exit 1
+            echo "import $PKG.main OK"
+          fi
+
+  migration-check:
+    name: migration-check
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: hashFiles('alembic.ini') != '' || hashFiles('**/migrations/env.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Verify migrations are up-to-date and reversible
+        run: |
+          pip install --quiet pytest alembic
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          echo "--- Pending migration SQL (dry-run) ---"
+          alembic upgrade head --sql || { echo "FAIL: cannot generate upgrade SQL"; exit 1; }
+          echo "--- Migration heads ---"
+          alembic heads || exit 1
+          BRANCHES=$(alembic branches | grep -c "^\s" || true)
+          if [ "$BRANCHES" -gt 0 ]; then
+            echo "FAIL: $BRANCHES branch(ed) migrations detected"
+            exit 1
+          fi
+          echo "Migrations OK (single head, no pending)"
+
+  endpoint-smoke:
+    name: endpoint-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: hashFiles('**/main.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Start server + hit health/ready endpoints
+        run: |
+          pip install --quiet uvicorn fastapi httpx
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          PKG=""
+          for d in $(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$'); do
+            [ -f "$d/main.py" ] && PKG="$d" && break
+          done
+          if [ -z "$PKG" ]; then
+            echo "no main.py found — endpoint smoke skipped"
+            exit 0
+          fi
+          uvicorn "$PKG.main:app" --host 127.0.0.1 --port 8000 &
+          SERVER_PID=$!
+          trap "kill $SERVER_PID 2>/dev/null" EXIT
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && break
+            sleep 1
+          done
+          HEALTH=$(curl -sf http://127.0.0.1:8000/health 2>/dev/null)
+          if [ -z "$HEALTH" ]; then
+            echo "FAIL: /health unreachable after 30s"
+            kill $SERVER_PID 2>/dev/null
+            exit 1
+          fi
+          echo "/health OK: $HEALTH"
+          READY=$(curl -sf http://127.0.0.1:8000/ready 2>/dev/null)
+          if [ -n "$READY" ]; then echo "/ready OK"; else echo "/ready not present or failed (non-fatal)"; fi
+
+  api-contract-diff:
+    name: api-contract-diff
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    continue-on-error: true
+    if: hashFiles('**/main.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Generate current openapi.json + diff against previous tag
+        run: |
+          pip install --quiet uvicorn fastapi PyYAML
+          PKG=""
+          for d in $(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$'); do
+            [ -f "$d/main.py" ] && PKG="$d" && break
+          done
+          if [ -z "$PKG" ]; then
+            echo "no main.py — skipped"
+            exit 0
+          fi
+          python -c "
+          import json, importlib
+          mod = importlib.import_module('$PKG.main')
+          spec = mod.app.openapi()
+          with open('openapi-current.json', 'w') as f:
+              json.dump(spec, f, indent=2)
+          "
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "no previous tag — diff skipped"
+            exit 0
+          fi
+          git show "$PREV_TAG:$PKG/openapi.json" > openapi-prev.json 2>/dev/null || {
+            echo "no openapi.json at $PREV_TAG — diff skipped"
+            exit 0
+          }
+          REMOVED=$(python3 -c "
+          import json
+          cur = json.load(open('openapi-current.json')).get('paths', {})
+          prev = json.load(open('openapi-prev.json')).get('paths', {})
+          removed = set(prev.keys()) - set(cur.keys())
+          for p in sorted(removed): print(f'  ! REMOVED: {p}')
+          for p in sorted(set(prev) & set(cur)):
+              prev_methods = set(prev[p].keys())
+              cur_methods = set(cur[p].keys())
+              for m in sorted(prev_methods - cur_methods):
+                  print(f'  ! REMOVED: {m.upper()} {p}')
+          ")
+          if [ -n "$REMOVED" ]; then
+            echo "BREAKING CHANGES DETECTED:"
+            echo "$REMOVED"
+            exit 1
+          fi
+          echo "No breaking API changes"
+
+  perf-benchmark:
+    name: perf-benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    continue-on-error: true
+    if: hashFiles('tests/test_perf_smoke.py') != '' || hashFiles('tests/perf-smoke.mjs') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('tests/test_perf_smoke.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Perf benchmark (Python)
+        if: hashFiles('tests/test_perf_smoke.py') != ''
+        run: |
+          pip install --quiet pytest
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          python -m pytest {{ perf_test_path | default("tests/test_perf_smoke.py") }} -v
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('tests/perf-smoke.mjs') != '' && hashFiles('tests/test_perf_smoke.py') == ''
+        with:
+          node-version: '22'
+      - name: Perf benchmark (Node)
+        if: hashFiles('tests/perf-smoke.mjs') != '' && hashFiles('tests/test_perf_smoke.py') == ''
+        run: node tests/perf-smoke.mjs
+
+  # ── Node-only job (graceful-skip when no package.json) ──
+  build-full:
+    name: build-full
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: hashFiles('package.json') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Clean install + full production build
+        run: |
+          npm ci || npm install
+          if grep -q '"build"' package.json; then
+            npm run build || exit 1
+            echo "full production build OK"
+          fi
+
+  # ── Generic fallback: detected test command ──
+  tests-detected:
+    name: tests-detected
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run detected test command (nightly confirmation)
+        run: |
+          if grep -q '"test"' package.json 2>/dev/null; then
+            npm install --silent || true
+            npm test || exit 1
+          elif [ -f go.mod ]; then
+            go test ./... || exit 1
+          elif [ -f pytest.ini ] || grep -q 'pytest' pyproject.toml 2>/dev/null; then
+            pip install --quiet pytest
+            [ -f requirements.txt ] && pip install -r requirements.txt -q || true
+            python -m pytest -q || exit 1
+          else
+            echo "no test command detected — skipped"
+          fi

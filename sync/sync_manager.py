@@ -12,7 +12,7 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
     The caller already resolves "continue" etc. — we just load context and run."""
     from sync.sync_helpers import (
         load_existing_specs,
-        load_task_tracking, build_task_progress_block,
+        load_task_tracking, build_plan_progress_block,
     )
 
     # ── P9: direct-to-Dev routing — messages bound for an existing project's
@@ -39,21 +39,21 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         except Exception as e:
             print(f"[SYNC] Error probing environment for workspace {project_path}: {e}")
 
-    # Inject task progress block if task.json exists
+    # Inject the current plan block if task.json has one (LLM-driven update_plan)
     resolved_request = client_request
     if project_path:
         try:
             task_data = load_task_tracking(project_path, chat_id)
             # A "completed" task file is stale for a NEW request (the orchestrator must
-            # re-evaluate it, not trust the old completion) — skip the progress block
+            # re-evaluate it, not trust the old completion) — skip the plan block
             # or the orchestrator may skip delegation entirely.
-            if task_data and task_data.get("steps") and task_data.get("status") != "completed":
-                progress_block = build_task_progress_block(task_data)
-                if progress_block and "=== TASK PROGRESS" not in resolved_request:
-                    resolved_request = resolved_request + "\n\n" + progress_block
-                    print(f"[SYNC] Appended task progress ({task_data.get('current_step', 0)}/{len(task_data['steps'])} steps)")
+            if task_data and task_data.get("plan") and task_data.get("status") != "completed":
+                plan_block = build_plan_progress_block(task_data)
+                if plan_block and "=== CURRENT PLAN" not in resolved_request:
+                    resolved_request = resolved_request + "\n\n" + plan_block
+                    print(f"[SYNC] Appended plan block ({len(task_data.get('plan', {}))} scope(s))")
         except Exception as e:
-            print(f"[SYNC] Error appending task progress: {e}")
+            print(f"[SYNC] Error appending plan block: {e}")
 
 
 
@@ -156,17 +156,6 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         # Inject error into live_terminal_log so the frontend shows it
         safe_append_live_log(f"\n[SYNC CRASH] {e}\n[ASSISTANT] ERROR: {e}")
         raise e
-
-    # ── Pillar 17: Memory consolidation moved to background daemon ──
-    # The inline MemoryArchivist LLM call is REMOVED from the active execution loop.
-    # Instead, the background memory_consolidation_daemon (started by api_server.py)
-    # periodically reviews recent conversation logs and consolidates facts offline.
-    # This saves $0.001/task and 5-15 seconds of user-facing latency per run.
-    # Raw logs are still saved to /conversation_history/ for the daemon to process.
-    #
-    # To force an immediate consolidation (e.g., post-deploy), call:
-    #   from memory_consolidation_daemon import consolidate_memories
-    #   consolidate_memories()
 
     # Clear the lazy hydration store to prevent unbounded memory growth across runs
     try:

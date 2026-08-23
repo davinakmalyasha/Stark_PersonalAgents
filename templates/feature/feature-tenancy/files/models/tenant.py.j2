@@ -1,0 +1,29 @@
+"""Multi-tenancy models: tenants and per-user memberships for {{ app_name }}."""
+from datetime import datetime
+
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+
+from ..database import Base
+
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(63), unique=True, index=True, nullable=False)  # URL-safe id
+    name = Column(String(120), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class TenantMembership(Base):
+    __tablename__ = "tenant_memberships"
+    __table_args__ = (UniqueConstraint("tenant_id", "user_id", name="uq_tenant_user"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    role = Column(String(20), default="member", nullable=False)  # owner | admin | member
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # TODO: add invitations table (email + token + expiry) if you need invite flows.

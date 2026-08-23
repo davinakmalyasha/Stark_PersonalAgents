@@ -1,0 +1,83 @@
+name: Fast Checks
+
+permissions:
+  contents: read
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+
+concurrency:
+  group: {% raw %}fast-${{ github.ref }}{% endraw %}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-secrets:
+    name: lint-and-secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # ── Secrets (always) ──
+      - name: Gitleaks (HEAD-only, shallow)
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v{{ gitleaks_version }}/gitleaks_{{ gitleaks_version }}_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+          /tmp/gitleaks detect --source . --redact --exit-code 1 --no-git || exit 1
+
+      # ── Python (if any .py file exists) ──
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('**/*.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Python — ruff + py_compile
+        if: hashFiles('**/*.py') != ''
+        run: |
+          pip install --quiet ruff
+          ruff check . --select E4,E7,E9,F,S,B --output-format concise || exit 1
+          python -m compileall -q . || exit 1
+
+      # ── Node/TypeScript (if package.json exists) ──
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('package.json') != ''
+        with:
+          node-version: '{{ node_version | default("22") }}'
+      - name: Node/TS — eslint + tsc (each only if configured)
+        if: hashFiles('package.json') != ''
+        run: |
+          npm install --silent
+          if [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.cjs ] || ls .eslintrc* >/dev/null 2>&1; then
+            npx eslint . --max-warnings=0 || exit 1
+          else
+            echo "no eslint config — skipped"
+          fi
+          if [ -f tsconfig.json ]; then
+            npx tsc --noEmit || exit 1
+          else
+            echo "no tsconfig — skipped"
+          fi
+
+      # ── Go (if go.mod exists) ──
+      - uses: actions/setup-go@0a12ed9cc28a8f4e3899db4d5d1e2c4d4d4d4d4d # v5
+        if: hashFiles('go.mod') != ''
+        with:
+          go-version-file: 'go.mod'
+      - name: Go — vet
+        if: hashFiles('go.mod') != ''
+        run: go vet ./... || exit 1
+
+      # ── PHP (if composer.json exists) ──
+      - uses: shivammathur/setup-php@c541c155eee45413f91358c6b0a30da1cbdc5c16 # v2
+        if: hashFiles('composer.json') != ''
+        with:
+          php-version: '8.3'
+      - name: PHP — syntax check
+        if: hashFiles('composer.json') != ''
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -exec php -l {} \; | grep -v "No syntax errors" && exit 1 || true

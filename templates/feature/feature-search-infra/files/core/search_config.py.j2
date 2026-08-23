@@ -1,0 +1,13 @@
+"""Search infra config for {{ app_name }} — Meilisearch/Typesense client.
+
+Set SEARCH_URL and SEARCH_API_KEY in .env. Provider-agnostic: swap
+meilisearch for typesense by changing search_provider.
+"""
+import os
+
+SEARCH_PROVIDER = "{{ search_provider }}"
+SEARCH_URL = os.environ.get("SEARCH_URL", "{{ search_url }}")
+SEARCH_API_KEY = os.environ.get("SEARCH_API_KEY", "")
+SEARCH_INDEX = "{{ search_index }}"
+
+# TODO: add index auto-creation on startup if SEARCH_PROVIDER == "meilisearch".

@@ -19,7 +19,6 @@
     {"template": "feature-audit-log", "variables": {"app_name": "{{ project_name }}", "base_path": "/api"}},
     {"template": "feature-upload", "variables": {"app_name": "{{ project_name }}"}},
     {"template": "feature-email", "variables": {"app_name": "{{ project_name }}"}},
-    "github-ci-python",
     "github-ci-security-python",
     "docker-compose",
     "nginx",

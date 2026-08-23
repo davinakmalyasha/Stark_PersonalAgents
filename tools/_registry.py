@@ -12,11 +12,18 @@ from __future__ import annotations
 
 import contextvars
 import inspect
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from ._schemas import TOOL_DEFINITIONS, get_native_tools, _TOOL_DOCS, _TOOL_REQUIRED_ARGS
+from ._schemas import (
+    TOOL_DEFINITIONS,
+    get_native_tools,
+    get_native_tool_names,
+    get_compact_tool_docs,
+    _TOOL_REQUIRED_ARGS,
+)
 
 active_tool_scope: contextvars.ContextVar[str] = contextvars.ContextVar(
     "active_tool_scope", default="default"
@@ -34,6 +41,60 @@ class ToolDefinition:
     timeout_ms: int = 0
     is_concurrency_safe: bool = False
     source: str = ""
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    """Structured result for one tool invocation.
+
+    Tool implementations keep their compact text contract for compatibility,
+    while the harness also exposes deterministic execution metadata.  The
+    metadata is derived at the registry boundary so the Developer loop does
+    not have to infer success from arbitrary output prose.
+    """
+
+    name: str
+    args: dict
+    content: str
+    is_error: bool
+    exit_code: Optional[int] = None
+    timed_out: bool = False
+    offloaded: bool = False
+
+    @classmethod
+    def from_content(cls, name: str, args: dict, content: Any) -> "ToolExecutionResult":
+        text = str(content or "")
+        first_line = text.lstrip().splitlines()[0] if text.strip() else ""
+
+        exit_code = None
+        match = re.match(r"\[(?:OK|ERR)\]\s+Exit\s+(-?\d+)", first_line, re.IGNORECASE)
+        if match:
+            exit_code = int(match.group(1))
+        else:
+            match = re.search(r"Exit\s+code\s+(-?\d+)", first_line, re.IGNORECASE)
+            if match:
+                exit_code = int(match.group(1))
+
+        timed_out = "[TIMEOUT]" in text or "timed out" in text.lower()
+        offloaded = "offloaded" in text.lower() or "/scratch/" in text.lower()
+        explicit_error = text.lstrip().startswith((
+            "Error:",
+            "Error ",
+            "[ERR]",
+            "[ERROR]",
+            "[BLOCKED]",
+            "Tool execution error",
+        ))
+        is_error = explicit_error or timed_out or (exit_code is not None and exit_code != 0)
+        return cls(
+            name=name,
+            args=dict(args or {}),
+            content=text,
+            is_error=is_error,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            offloaded=offloaded,
+        )
 
 
 class ToolRegistry:
@@ -178,6 +239,12 @@ class ToolRegistry:
         scope = self._resolve_scope(scope)
         d = self.get(name)
         if d is None or not self._visible(name, scope):
+            if name.startswith("mcp__"):
+                try:
+                    from tools.mcp.mcp_bridge import mcp_execute
+                    return mcp_execute(name, dict(args or {}), scope)
+                except Exception as e:
+                    return f"Error: MCP tool call failed: {e}"
             available = ", ".join(self.names_for(scope)[:60])
             return f"Error: Unknown tool '{name}'. Available tools: {available}"
 
@@ -243,6 +310,14 @@ class ToolRegistry:
             if updated is not None:
                 result, is_error = updated
         return result
+
+    def execute_detailed(
+        self, name: str, args: dict, scope: Optional[str] = None
+    ) -> ToolExecutionResult:
+        """Execute a tool and return its canonical structured outcome."""
+        normalized_args = dict(args or {})
+        result = self.execute(name, normalized_args, scope)
+        return ToolExecutionResult.from_content(name, normalized_args, result)
 
 
 _registry: Optional[ToolRegistry] = None
@@ -333,11 +408,6 @@ def validate_tool_definitions(tool_map: dict) -> None:
                 raise ValueError(f"tool '{name}': required arg '{req}' not in properties")
         if d.get("exposed") is not False and name not in tool_map:
             raise ValueError(f"tool '{name}' is exposed to the model but missing from TOOL_MAP")
-    for doc_name in _TOOL_DOCS:
-        if doc_name not in tool_map:
-            raise ValueError(f"_TOOL_DOCS references unknown tool '{doc_name}'")
-
-
 def ensure_tool_registry():
     global _tool_registry
     if _tool_registry is not None:
@@ -350,13 +420,14 @@ def ensure_tool_registry():
         tool_map = _facade.TOOL_MAP
         validate_tool_definitions(tool_map)
         reg = get_registry()
+        compact_docs = get_compact_tool_docs()
         _defs_by_name = {d["name"]: d for d in TOOL_DEFINITIONS}
         definitions = []
         for name, fn in tool_map.items():
             defn = _defs_by_name.get(name, {})
             definitions.append(ToolDefinition(
                 name=name,
-                description=(_TOOL_DOCS.get(name)
+                description=(compact_docs.get(name)
                              or defn.get("description", "")
                              or f"{name}() — Execute {name}"),
                 parameters=defn.get("parameters") or None,
@@ -377,6 +448,33 @@ def execute_tool(name: str, args: dict) -> str:
     except Exception:
         import tools as _facade
         return _facade._legacy_execute_tool(name, args)
+
+
+_current_scope = contextvars.ContextVar("current_tool_scope", default="agent")
+_current_chat = contextvars.ContextVar("current_tool_chat", default="")
+
+
+def execute_tool_detailed(
+    name: str,
+    args: dict,
+    scope: Optional[str] = None,
+) -> ToolExecutionResult:
+    """Execute through the canonical registry and return structured metadata."""
+    token = _current_scope.set(scope or "agent")
+    try:
+        try:
+            return ensure_tool_registry().execute_detailed(name, args, scope)
+        except Exception as exc:
+            try:
+                import tools as _facade
+                result = _facade._legacy_execute_tool(name, args)
+            except Exception as legacy_exc:
+                result = f"Error executing {name}: {legacy_exc}"
+            if not result:
+                result = f"Error executing {name}: {exc}"
+            return ToolExecutionResult.from_content(name, args, result)
+    finally:
+        _current_scope.reset(token)
 
 
 def pre_validate_tool_args(tool_name: str, args: dict) -> tuple[bool, str]:
@@ -400,16 +498,9 @@ def pre_validate_tool_args(tool_name: str, args: dict) -> tuple[bool, str]:
 
 
 class _LazyToolMap(dict):
-    _TOOL_NAMES = [
-        'read_file', 'edit_file', 'run_command', 'search_code', 'task',
-        'start_async_task', 'check_async_task', 'list_async_tasks',
-        'browser_navigate', 'browser_act', 'browser_extract', 'browser_screenshot',
-        'browser_click', 'browser_fill', 'browser_close', 'github_apply_gate',
-        'apply_template', 'template_list', 'template_new', 'create_docx',
-        'create_xlsx', 'read_pdf', 'update_feature', 'update_project_meta',
-        'ask_user', 'send_message', 'list_agents', 'interrupt_agent', 'report',
-        'create_project', 'find_project_dev'
-    ]
+    # Runtime exposure is derived from the same canonical definitions used by
+    # native schemas and compact fallback documentation.
+    _TOOL_NAMES = list(get_native_tool_names())
 
     def __getitem__(self, item):
         import tools as _facade

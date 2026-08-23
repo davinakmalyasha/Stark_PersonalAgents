@@ -1,0 +1,124 @@
+"""Billing service: plan catalog, subscribe/cancel, invoice recording.
+
+Provider-agnostic by design — the gateway (Stripe/Paddle/…) only needs to
+call `record_invoice` from its webhook handler (pair with feature-webhook).
+"""
+from datetime import datetime, timedelta
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..models.billing import Invoice, Plan, Subscription
+from ..schemas.billing import PlanCreate
+
+PERIOD_DAYS = {"month": 30, "year": 365}
+
+
+def list_plans(db: Session, include_inactive: bool = False) -> list[Plan]:
+    stmt = select(Plan).order_by(Plan.price_cents)
+    if not include_inactive:
+        stmt = stmt.where(Plan.is_active.is_(True))
+    return list(db.execute(stmt).scalars())
+
+
+def create_plan(db: Session, data: PlanCreate, currency: str) -> Plan:
+    plan = Plan(
+        code=data.code,
+        name=data.name,
+        price_cents=data.price_cents,
+        currency=currency,
+        interval=data.interval,
+        is_active=data.is_active,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def subscribe(db: Session, user_id: int, plan_code: str) -> Subscription:
+    plan = db.execute(select(Plan).where(Plan.code == plan_code)).scalar_one_or_none()
+    if plan is None or not plan.is_active:
+        raise ValueError(f"Unknown or inactive plan '{plan_code}'")
+    # One active subscription per user: cancel any previous one.
+    prev = db.execute(
+        select(Subscription).where(
+            Subscription.user_id == user_id,
+            Subscription.status == "active",
+        )
+    ).scalars()
+    for sub in prev:
+        sub.status = "canceled"
+        sub.canceled_at = datetime.utcnow()
+
+    period_days = PERIOD_DAYS.get(plan.interval, 30)
+    sub = Subscription(
+        user_id=user_id,
+        plan_id=plan.id,
+        status="active",
+        current_period_end=datetime.utcnow() + timedelta(days=period_days),
+    )
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+
+def cancel(db: Session, user_id: int) -> Subscription | None:
+    sub = db.execute(
+        select(Subscription)
+        .where(Subscription.user_id == user_id, Subscription.status == "active")
+        .order_by(Subscription.created_at.desc())
+    ).scalars().first()
+    if sub is None:
+        return None
+    sub.status = "canceled"
+    sub.canceled_at = datetime.utcnow()
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+
+def record_invoice(
+    db: Session,
+    user_id: int,
+    amount_cents: int,
+    currency: str,
+    provider: str = "manual",
+    provider_invoice_id: str | None = None,
+    subscription_id: int | None = None,
+) -> Invoice:
+    """Idempotent per (provider, provider_invoice_id) — safe from webhooks."""
+    if provider_invoice_id:
+        existing = db.execute(
+            select(Invoice).where(
+                Invoice.provider == provider,
+                Invoice.provider_invoice_id == provider_invoice_id,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+    inv = Invoice(
+        user_id=user_id,
+        subscription_id=subscription_id,
+        amount_cents=amount_cents,
+        currency=currency,
+        provider=provider,
+        provider_invoice_id=provider_invoice_id,
+        status="paid",
+    )
+    db.add(inv)
+    db.commit()
+    db.refresh(inv)
+    return inv
+
+
+def list_invoices(db: Session, user_id: int) -> list[Invoice]:
+    return list(db.execute(
+        select(Invoice)
+        .where(Invoice.user_id == user_id)
+        .order_by(Invoice.created_at.desc())
+    ).scalars())
+
+
+# TODO: add proration + renewal worker (flip past_due when current_period_end passes).

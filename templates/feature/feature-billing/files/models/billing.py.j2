@@ -1,0 +1,51 @@
+"""Billing models: plans, subscriptions, invoices for {{ app_name }}.
+
+Money is stored as integer cents — never floats. Provider-agnostic: wire
+Stripe/Paddle/etc. by recording their invoice ids in provider_invoice_id.
+"""
+from datetime import datetime
+
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+
+from ..database import Base
+
+
+class Plan(Base):
+    __tablename__ = "billing_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(50), unique=True, index=True, nullable=False)  # e.g. "pro-monthly"
+    name = Column(String(100), nullable=False)
+    price_cents = Column(Integer, nullable=False)
+    currency = Column(String(8), default="{{ currency }}", nullable=False)
+    interval = Column(String(20), default="month", nullable=False)      # month | year
+    is_active = Column(Boolean, default=True, nullable=False)
+
+
+class Subscription(Base):
+    __tablename__ = "billing_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    plan_id = Column(Integer, ForeignKey("billing_plans.id"), index=True, nullable=False)
+    status = Column(String(20), default="active", nullable=False)       # active | canceled | past_due
+    current_period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    canceled_at = Column(DateTime, nullable=True)
+
+
+class Invoice(Base):
+    __tablename__ = "billing_invoices"
+    __table_args__ = (UniqueConstraint("provider", "provider_invoice_id", name="uq_provider_invoice"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    subscription_id = Column(Integer, ForeignKey("billing_subscriptions.id"), index=True, nullable=True)
+    amount_cents = Column(Integer, nullable=False)
+    currency = Column(String(8), default="{{ currency }}", nullable=False)
+    status = Column(String(20), default="open", nullable=False)         # open | paid | void
+    provider = Column(String(30), default="manual", nullable=False)     # manual | stripe | paddle | ...
+    provider_invoice_id = Column(String(120), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # TODO: add metered usage line items if you need usage-based billing.

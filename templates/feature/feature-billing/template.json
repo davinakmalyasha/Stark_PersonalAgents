@@ -1,0 +1,19 @@
+{
+  "_comment": "LEVEL 3 (feature): billing vertical slice — plans, subscribe/cancel, invoices. Money in integer cents, provider-agnostic (record_invoice is idempotent for gateway webhooks). Pairs with feature-auth (get_current_user) and feature-webhook.",
+  "name": "feature-billing",
+  "description": "Subscription billing: plan catalog + subscribe/cancel + idempotent invoice recording. Provider-agnostic — wire Stripe/Paddle via record_invoice from webhooks.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api' (drives all nested imports)"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/billing/plans, /api/billing/subscribe)"},
+    {"name": "currency", "type": "string", "default": "usd", "description": "Default ISO currency code for new money columns"}
+  ],
+  "files": [
+    {"src": "models/billing.py.j2", "dest": "{{ app_name }}/models/billing.py"},
+    {"src": "schemas/billing.py.j2", "dest": "{{ app_name }}/schemas/billing.py"},
+    {"src": "services/billing_service.py.j2", "dest": "{{ app_name }}/services/billing_service.py"},
+    {"src": "routers/billing.py.j2", "dest": "{{ app_name }}/routers/billing.py"}
+  ],
+  "notes": "After applying: 1) app.include_router(router) in main.py and import models.billing so tables are created, 2) requires the users table from feature-auth (ForeignKey users.id), 3) set a payment gateway: call billing_service.record_invoice from its webhook (pair with feature-webhook), 4) protect create_plan with require_role('admin') from feature-rbac, 5) money is integer cents everywhere — never floats.",
+  "sample_vars": {"app_name": "app", "base_path": "/api", "currency": "usd"}
+}

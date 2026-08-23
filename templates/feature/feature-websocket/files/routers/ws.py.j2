@@ -1,0 +1,55 @@
+"""WebSocket endpoint: room join + echo/broadcast demo with auth hook."""
+import json
+import uuid
+
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+
+from ..core.ws_manager import manager
+
+router = APIRouter()
+
+
+async def _validate_token(token: str | None) -> int:
+    """Resolve the connecting user. Replace with real JWT validation:
+
+    from ..core.security import decode_token
+    try:
+        claims = decode_token(token or "")
+        return int(claims["sub"])
+    except Exception:
+        raise WebSocketException(code=1008)  # policy violation
+
+    Demo mode accepts any token and maps it to a pseudo-user.
+    """
+    return abs(hash(token or "anon")) % 100000
+
+
+@router.websocket("{{ ws_path }}/{room}")
+async def room_socket(
+    ws: WebSocket,
+    room: str,
+    token: str | None = Query(default=None),
+):
+    user_id = await _validate_token(token)
+    conn_id = f"{user_id}-{uuid.uuid4().hex[:8]}"
+    await manager.connect(room, conn_id, ws)
+    await manager.broadcast(room, {"type": "join", "conn_id": conn_id},
+                            exclude=conn_id)
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {"type": "message", "text": raw[:2000]}
+            payload.update({"from": conn_id, "room": room})
+            # Echo back + fan out to the rest of the room.
+            await manager.send_personal(room, conn_id, payload)
+            await manager.broadcast(room, payload, exclude=conn_id)
+    except WebSocketDisconnect:
+        manager.disconnect(room, conn_id)
+        await manager.broadcast(room, {"type": "leave", "conn_id": conn_id})
+
+
+# TODO: register in main.py — this module uses @router.websocket, so include_router works the same as HTTP routes.
+# TODO: enforce per-room authorization inside _validate_token (membership check against feature-tenancy).

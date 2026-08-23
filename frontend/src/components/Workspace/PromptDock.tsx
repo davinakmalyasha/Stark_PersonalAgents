@@ -110,11 +110,11 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
               value={provider}
               onChange={(e) => changeProvider(e.target.value as 'deepseek' | 'opencode')}
               className="provider-select"
-              title={provider === 'opencode' ? 'LLM provider: OpenCode Zen' : 'LLM provider: DeepSeek API'}
+              title={provider === 'opencode' ? 'LLM provider: OpenCode Go' : 'LLM provider: DeepSeek API'}
               aria-label="LLM provider"
             >
               <option value="deepseek">DeepSeek API</option>
-              <option value="opencode">OpenCode Zen</option>
+              <option value="opencode">OpenCode Go</option>
             </select>
             {models.length > 0 && onModelChange && (
               <select

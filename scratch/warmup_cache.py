@@ -6,9 +6,8 @@ the huge shared prefixes cached, so every task's first call hits instead of
 missing ~10k tokens. Run once before the parallel eval starts.
 
 Optional arg: a project path — warms the Dev system message for that project
-including its cached repo map (Dev's map is the LAST stable section, so the
-full message is prefix-warmable). SDET/DevSecOps embed the map after their
-tool lists, so their map warms on the project's first real call instead.
+using the same prompt builder that developer_agent uses at runtime, so the
+cached prefix is byte-for-byte identical to what real tasks will send.
 """
 import sys
 import os
@@ -18,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from langchain_core.messages import SystemMessage, HumanMessage
 
 
-def warm(role, system_text, reasoning_effort="disabled"):
+def warm(role: str, system_text: str, reasoning_effort: str = "disabled") -> None:
     try:
         from llm import invoke_messages_with_fallback
         invoke_messages_with_fallback(
@@ -33,36 +32,32 @@ def warm(role, system_text, reasoning_effort="disabled"):
         print(f"[WARM] {role} failed: {str(e)[:120]}")
 
 
-def warm_project(project_path):
-    """Warm the Dev system message for a project, including its cached repo map."""
-    from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE as dev_prompt
-    from memory.memory_manager import load_cached_code_map
-    cached_map = load_cached_code_map(project_path)
-    if not cached_map:
-        print(f"[WARM] project {project_path}: no cached map (refresh_code_map first)")
-        return
+def warm_project(project_path: str) -> None:
+    """Warm the Dev system message for a project.
+
+    Uses developer_agent._build_system_prompt() directly so the warmed prefix
+    is byte-for-byte identical to what the real Developer agent sends on its
+    first turn. Any layout drift in the agent is automatically reflected here.
+    """
     try:
-        from workspace_manager import get_workspace_rules_and_profile
-        from memory.memory_manager import load_cached_project_identity
-        stable = [dev_prompt]
-        rules_context = get_workspace_rules_and_profile(project_path) or ""
-        if rules_context:
-            stable.append(f"## Workspace Rules & Profile\n{rules_context}")
-        from memory.memory_manager import load_cached_code_map
-        cached_map = load_cached_code_map(project_path)
-        if cached_map:
-            stable.append(f"## Repository Map (cached, append-only)\n{cached_map}")
-        project_card = load_cached_project_identity(project_path)
-        if project_card:
-            stable.append(f"## Project Overview\n{project_card}")
-        warm("Developer(project)", "\n\n".join(stable))
+        from agents.developer_agent import _build_system_prompt
+        static_system, _ = _build_system_prompt(
+            task="",
+            project_path=project_path,
+            is_first_call=True,
+        )
+        if not static_system:
+            print(f"[WARM] project {project_path}: empty system prompt (no stable identity yet?)")
+            return
+        warm("Developer(project)", static_system)
     except Exception as e:
         print(f"[WARM] project warm failed: {str(e)[:120]}")
 
 
-def main():
+def main() -> None:
     from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE as dev_prompt
     from agents.orchestrator_agent import _ORCHESTRATOR_SYSTEM_TEMPLATE as orch_prompt
+
     # Warm EVERY reasoning-config bucket the agents actually send: DeepSeek's
     # prefix cache is keyed per thinking config, so a base warmed under
     # "disabled" is invisible to a session starting with "high" — the first
@@ -71,8 +66,10 @@ def main():
         warm("Developer", dev_prompt, effort)
     for effort in ("disabled", "low"):
         warm("Orchestrator", orch_prompt, effort)
+
     if len(sys.argv) > 1:
         warm_project(sys.argv[1])
+
     print("[WARM] done")
 
 

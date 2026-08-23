@@ -93,10 +93,25 @@ def _increment_cache_version() -> None:
 WORKSPACE = _HARNESS_ROOT
 
 _TOOL_CAP_DEFAULTS = {
+    # Keep every model-facing result bounded and recoverable. Individual tools
+    # already use these caps where possible; the developer loop also applies
+    # them as a final guard for legacy or third-party implementations.
+    "read_file": 5000,
+    "search_code": 5000,
+    "edit_file": 5000,
     "run_command": 6000,          # test runs: head+tail preview is enough; install noise offloads
     "run_command_timeout": 5000,  # hung-process junk: offload sooner
     "logs": 6000,                 # streaming server logs: poll + page
+    "browser_act": 6000,
+    "ask_user": 2500,
+    "github_apply_gate": 6000,
+    "apply_template": 5000,
+    "template_list": 5000,
+    "template": 5000,
+    "template_new": 4000,
+    "update_plan": 500,           # tiny fixed-size result: status counts only
     "subagent": 6000,             # subagent internal tool results: enough for the NEXT decision, not a dump
+    "mcp": 6000,                  # MCP tool results: bounded, offloadable like run_command
 }
 
 def _tool_cap(site: str) -> int:
@@ -211,7 +226,7 @@ def _make_tool_cache_key(tool_name: str, args: dict) -> str:
 def _check_tool_cache(tool_name: str, args: dict) -> Optional[str]:
     """Check if a read-only tool call has a fresh cached result. Returns None on miss."""
     if tool_name not in ("read_file", "search_code",
-                         "template_list"):
+                         "template"):
         return None
     now = time.time()
     key = _make_tool_cache_key(tool_name, args)
@@ -242,7 +257,7 @@ def _check_tool_cache(tool_name: str, args: dict) -> Optional[str]:
 def _set_tool_cache(tool_name: str, args: dict, result: str) -> None:
     """Store a read-only tool result in the response cache."""
     if tool_name not in ("read_file", "search_code",
-                         "template_list"):
+                         "template"):
         return
     key = _make_tool_cache_key(tool_name, args)
     _TOOL_RESPONSE_CACHE[key] = (time.time(), result)

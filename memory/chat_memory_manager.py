@@ -221,7 +221,7 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
     is_resume = is_continue_command(text_lower)
     
     if is_resume:
-        # Check if task.json exists in progress. If it does, we always resolve to executing the plan for this task,
+        # Check if task.json exists in progress. If it does, we always resolve to continuing the plan for this task,
         # since it is the active, incomplete task. This correctly handles mid-task pivots and resumes.
         try:
             from sync.sync_helpers import load_task_tracking
@@ -229,12 +229,12 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
             if task_data and task_data.get("status") == "in_progress":
                 goal = task_data.get("user_request") or ""
                 # Strip progress blocks
-                goal = goal.split("=== TASK PROGRESS")[0].strip()
+                goal = goal.split("=== CURRENT PLAN")[0].strip()
                 # Strip /plan
                 goal = re.sub(r"(?:^|\s)/plan(?:\s|$|\b|,)", " ", goal, flags=re.IGNORECASE).strip()
                 goal = re.sub(r"\s*,\s*", " ", goal).strip()
                 if goal:
-                    return f"Execute the plan from planning.md for: {goal}"
+                    return f"Continue the active plan for: {goal}"
         except Exception as e:
             print(f"Error checking active task.json: {e}")
 
@@ -267,42 +267,8 @@ def resolve_request_text(req: str, workspace_path: str = "", chat_id: str = "") 
                             if not is_valid_build_request(content):
                                 continue
                             
-                            # Check if the found user message was a /plan command
-                            if bool(re.search(r"(?:^|\s)/plan(?:\s|$|\b|,)", content.lower())):
-                                goal = re.sub(r"(?:^|\s)/plan(?:\s|$|\b|,)", " ", content, flags=re.IGNORECASE).strip()
-                                goal = re.sub(r"\s*,\s*", " ", goal).strip()
-                                return f"Execute the plan from planning.md for: {goal}"
                             return content
             except Exception as e:
                 print(f"Error extracting last request from chat history: {e}")
 
-        # Fallback to scanning the supervisor memory file if chat history is empty/unavailable
-        from memory.memory_io import load_memory
-        mem = load_memory(workspace_path)
-        past_requests = mem.get("past_requests", [])
-        if past_requests:
-            last_req = past_requests[-1]
-            if bool(re.search(r"(?:^|\s)/plan(?:\s|$|\b|,)", last_req.lower())):
-                goal = re.sub(r"(?:^|\s)/plan(?:\s|$|\b|,)", " ", last_req, flags=re.IGNORECASE).strip()
-                # Clean up duplicate whitespace or commas
-                goal = re.sub(r"\s*,\s*", " ", goal).strip()
-                return f"Execute the plan from planning.md for: {goal}"
-            return last_req
-            
-    # 2. Check if the text matches plan answers, option selection, or contains a go on/proceed indicator (multi-turn guidance)
-    has_numbering = bool(re.search(r"^\s*\d+[\.\)]", text_lower))
-    is_option_select = text_lower in ("a", "b", "c", "d") or any(text_lower == f"option {x}" for x in ("a", "b", "c", "d"))
-    ends_with_go = any(text_lower.endswith(x) for x in ["go on", "proceed", "go"])
-    contains_guidance_indicators = any(x in text_lower for x in ["sounds good", "yes", "no", "separate", "basic", "tailwind", "confirm", "proceed"])
-    
-    if has_numbering or is_option_select or ends_with_go or contains_guidance_indicators:
-        from memory.memory_io import load_memory
-        mem = load_memory(workspace_path)
-        past_requests = mem.get("past_requests", [])
-        if past_requests:
-            last_request = past_requests[-1]
-            # Avoid appending guidance repeatedly if they match
-            if "(User Guidance:" not in last_request:
-                return f"{last_request} (User Guidance: {req})"
-                
     return req

@@ -1,0 +1,86 @@
+"""Tenant endpoints: create tenants, list mine, members management."""
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..core.security import get_current_user
+from ..core.tenancy import require_role
+from ..database import get_db
+from ..models.tenant import Tenant, TenantMembership
+
+router = APIRouter(prefix="{{ base_path }}/tenants", tags=["tenants"])
+
+
+class TenantCreate(BaseModel):
+    slug: str = Field(min_length=2, max_length=63, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    name: str = Field(min_length=1, max_length=120)
+
+
+class TenantRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    slug: str
+    name: str
+    is_active: bool
+
+
+class MemberAdd(BaseModel):
+    username_id: int = Field(ge=1)  # user id to add
+    role: str = "member"
+
+
+@router.post("", response_model=TenantRead, status_code=status.HTTP_201_CREATED)
+def create_tenant(
+    data: TenantCreate,
+    claims: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    exists = db.execute(select(Tenant).where(Tenant.slug == data.slug)).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug taken")
+    tenant = Tenant(slug=data.slug, name=data.name)
+    db.add(tenant)
+    db.flush()
+    db.add(TenantMembership(tenant_id=tenant.id, user_id=int(claims["sub"]), role="owner"))
+    db.commit()
+    db.refresh(tenant)
+    return tenant
+
+
+@router.get("", response_model=list[TenantRead])
+def my_tenants(
+    claims: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        select(Tenant)
+        .join(TenantMembership, TenantMembership.tenant_id == Tenant.id)
+        .where(TenantMembership.user_id == int(claims["sub"]))
+    ).scalars()
+    return list(rows)
+
+
+@router.post("/{tenant_id}/members", status_code=status.HTTP_201_CREATED)
+def add_member(
+    tenant_id: int,
+    data: MemberAdd,
+    _tenant: Tenant = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    exists = db.execute(
+        select(TenantMembership).where(
+            TenantMembership.tenant_id == tenant_id,
+            TenantMembership.user_id == data.username_id,
+        )
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Already a member")
+    db.add(TenantMembership(tenant_id=tenant_id, user_id=data.username_id, role=data.role))
+    db.commit()
+    return {"ok": True}
+
+
+# TODO: register this router in main.py (app.include_router(router)).
+# TODO: scope business queries with tenancy.scoped(stmt, tenant.id).

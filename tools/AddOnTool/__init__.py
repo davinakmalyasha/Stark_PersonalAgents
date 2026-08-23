@@ -77,14 +77,10 @@ from .templateTools import (
     _template_search_blob,
     _template_search,
     build_template_map,
+    template,
     template_new,
     template_pull,
     template_push,
-)
-
-from .memoryTools import (
-    update_feature,
-    update_project_meta,
 )
 
 from .orchestrationTools import (
@@ -96,6 +92,7 @@ from .orchestrationTools import (
     create_project,
     find_project_dev,
     list_projects_tool,
+    resume_project,
 )
 
 from .webTools import (
@@ -104,15 +101,11 @@ from .webTools import (
 )
 
 from .workspaceTools import (
-    _snapshot_dir,
-    _snapshot_file,
-    revert_last_change,
     capture_workspace_delta,
     launch_parallel_attempts,
     _REDACT_PATTERNS,
     _GENERIC_SECRET_PAT,
     redact_secrets,
-    save_memory,
 )
 
 from .subagentTools import (
@@ -123,20 +116,17 @@ from .subagentTools import (
     _ASYNC_EXECUTOR,
     _TASK_DEPTH,
     _MAX_TASK_DEPTH,
-    _DELEGATION_TOOLS,
     _load_subagents,
     _HANDOFF_MAX_CHARS,
     _classify_error,
     _compact_handoff,
     _handoff,
-    _log_taxonomy,
-    _private_requery_subagent,
     task,
     _run_subagent_in_thread,
     start_async_task,
     check_async_task,
     list_async_tasks,
-    compact_conversation,
+    async_task,
 )
 
 __all__ = [
@@ -196,6 +186,7 @@ __all__ = [
     'apply_template',
     '_apply_template_inner',
     'template_list',
+    'template',
     '_template_source_view',
     '_template_index',
     '_template_embeddings',
@@ -210,8 +201,6 @@ __all__ = [
     'template_new',
     'template_pull',
     'template_push',
-    'update_feature',
-    'update_project_meta',
     'send_message',
     'list_agents',
     'interrupt_agent',
@@ -220,17 +209,14 @@ __all__ = [
     'create_project',
     'find_project_dev',
     'list_projects_tool',
+    'resume_project',
     'web_fetch',
     'web_search',
-    '_snapshot_dir',
-    '_snapshot_file',
-    'revert_last_change',
     'capture_workspace_delta',
     'launch_parallel_attempts',
     '_REDACT_PATTERNS',
     '_GENERIC_SECRET_PAT',
     'redact_secrets',
-    'save_memory',
     'SubagentsRegistry',
     '_SUBAGENTS_REGISTRY',
     '_ASYNC_TASKS',
@@ -238,18 +224,15 @@ __all__ = [
     '_ASYNC_EXECUTOR',
     '_TASK_DEPTH',
     '_MAX_TASK_DEPTH',
-    '_DELEGATION_TOOLS',
     '_load_subagents',
     '_HANDOFF_MAX_CHARS',
     '_classify_error',
     '_compact_handoff',
     '_handoff',
-    '_log_taxonomy',
-    '_private_requery_subagent',
     'task',
     '_run_subagent_in_thread',
     'start_async_task',
     'check_async_task',
     'list_async_tasks',
-    'compact_conversation',
+    'async_task',
 ]

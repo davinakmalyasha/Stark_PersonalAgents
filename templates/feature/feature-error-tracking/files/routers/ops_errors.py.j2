@@ -1,0 +1,22 @@
+"""Ops error list — recent exceptions for {{ app_name }}."""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from ..core.security import get_current_user
+from ..database import get_db
+
+router = APIRouter(prefix="{{ base_path }}/admin/errors", tags=["ops"])
+
+
+@router.get("")
+def recent_errors(
+    limit: int = Query(default=50, ge=1, le=200),
+    claims: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # TODO: require_role("admin")
+    # Stub: query Sentry API or local error table. This stub returns empty until wired.
+    return {"errors": [], "note": "Wire to Sentry API (core/sentry.py) or local error table here. Set SENTRY_DSN to enable."}
+
+
+# TODO: register router in main.py

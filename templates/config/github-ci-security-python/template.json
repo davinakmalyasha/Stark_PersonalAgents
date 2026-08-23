@@ -4,18 +4,113 @@
   "description": "Enterprise-grade python gate: Bandit SAST, pip-audit SCA, gitleaks secrets, Ruff S+B + format + mypy, coverage threshold, perf-smoke, Semgrep, Trivy, CodeQL, zizmor. All jobs SHA-pinned, graceful-skip when a dependency is absent.",
   "category": "config",
   "variables": [
-    {"name": "python_version", "type": "string", "default": "3.12", "description": "Python version for scan jobs"},
-    {"name": "gitleaks_version", "type": "string", "default": "8.30.1", "description": "Pinned gitleaks release (asset names are versioned — never /latest)"},
-    {"name": "zizmor_version", "type": "string", "default": "1.29.0", "description": "Pinned zizmor release (workflow self-audit)"},
-    {"name": "trivy_version", "type": "string", "default": "0.73.0", "description": "Pinned trivy release (container/fs scan)"},
-    {"name": "codeql_on", "type": "string", "default": "true", "description": "true/false — include the CodeQL job (free on public repos)"},
-    {"name": "coverage_threshold", "type": "string", "default": "80", "description": "Minimum line coverage enforced on detected packages (enterprise standard)"},
-    {"name": "pytest_path", "type": "string", "default": "tests", "description": "Where pytest collects tests"},
-    {"name": "perf_test_path", "type": "string", "default": "tests/test_perf_smoke.py", "description": "Perf-smoke test file path"}
+    {
+      "name": "python_version",
+      "type": "string",
+      "default": "3.12",
+      "description": "Python version for scan jobs"
+    },
+    {
+      "name": "gitleaks_version",
+      "type": "string",
+      "default": "8.30.1",
+      "description": "Pinned gitleaks release (asset names are versioned — never /latest)"
+    },
+    {
+      "name": "zizmor_version",
+      "type": "string",
+      "default": "1.29.0",
+      "description": "Pinned zizmor release (workflow self-audit)"
+    },
+    {
+      "name": "trivy_version",
+      "type": "string",
+      "default": "0.73.0",
+      "description": "Pinned trivy release (container/fs scan)"
+    },
+    {
+      "name": "codeql_on",
+      "type": "string",
+      "default": "true",
+      "description": "true/false — include the CodeQL job (free on public repos)"
+    },
+    {
+      "name": "coverage_threshold",
+      "type": "string",
+      "default": "80",
+      "description": "Minimum line coverage enforced on detected packages (enterprise standard)"
+    },
+    {
+      "name": "coverage_strict",
+      "type": "string",
+      "default": "false",
+      "description": "true = no importable package FAILS the coverage job instead of skipping"
+    },
+    {
+      "name": "bandit_level",
+      "type": "string",
+      "default": "lll",
+      "description": "Bandit severity flag: lll=HIGH only, ll=MEDIUM+HIGH"
+    },
+    {
+      "name": "job_timeout_minutes",
+      "type": "string",
+      "default": "15",
+      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
+    },
+    {
+      "name": "pytest_path",
+      "type": "string",
+      "default": "tests",
+      "description": "Where pytest collects tests"
+    },
+    {
+      "name": "perf_test_path",
+      "type": "string",
+      "default": "tests/test_perf_smoke.py",
+      "description": "Perf-smoke test file path"
+    },
+    {
+      "name": "semgrep_config_ref",
+      "type": "string",
+      "default": "security-audit",
+      "description": "Pinned Semgrep registry config — deterministic findings across pushes"
+    },
+    {
+      "name": "license_denylist",
+      "type": "string",
+      "default": "GPL-3.0,AGPL-3.0",
+      "description": "Comma-separated license IDs that block deployment"
+    },
+    {
+      "name": "image_size_budget_mb",
+      "type": "string",
+      "default": "500",
+      "description": "Docker image size budget (MB) — fails if exceeded"
+    }
   ],
   "files": [
-    {"src": "security.yml.j2", "dest": ".github/workflows/security.yml"}
+    {
+      "src": "security.yml.j2",
+      "dest": ".github/workflows/security.yml"
+    },
+    {
+      "src": "tests/test_perf_smoke.py.j2",
+      "dest": "tests/test_perf_smoke.py"
+    },
+    {
+      "src": "fast-checks.yml.j2",
+      "dest": ".github/workflows/fast-checks.yml"
+    },
+    {
+      "src": "release-heavy.yml.j2",
+      "dest": ".github/workflows/release-heavy.yml"
+    }
   ],
-  "notes": "Job names are the branch-protection contexts: sast, sca, secrets, quality, coverage, perf-smoke, semgrep, container, codeql, zizmor. Coverage enforces only when a real importable package exists (never on CI boilerplate). Perf budgets are universal defaults — tune tests/test_perf_smoke.py after first green. Graceful-skip philosophy everywhere: a fresh repo stays green.",
-  "sample_vars": {"python_version": "3.12", "codeql_on": "true", "coverage_threshold": "80"}
+  "notes": "Two-speed gate: fast-checks.yml (every push, ~30s: lint+syntax+secrets HEAD) + security.yml (PR/push to main only: full deterministic gate) + release-heavy.yml (nightly/tags: deep pass). Branch protection contexts = security.yml jobs only. Docs-only changes skip everything.",
+  "sample_vars": {
+    "python_version": "3.12",
+    "codeql_on": "true",
+    "coverage_threshold": "80"
+  }
 }

@@ -1,6 +1,6 @@
 // ── Antigravity 2.0 API Client ──
 
-import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules, ChatAttachment, AgentTask, TaskSchedule, StreamDelta } from '../types';
+import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules, ChatAttachment, AgentTask, TaskSchedule, StreamDelta, McpServerConfig } from '../types';
 
 const API_BASE = '/api';
 
@@ -253,6 +253,52 @@ export async function saveWorkspaceRules(workspaceId: string, rules: WorkspaceRu
     body: JSON.stringify(rules),
   });
   if (!res.ok) throw new Error('Failed to save workspace rules');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// MCP Server API
+// ═══════════════════════════════════════════════════════════════════════
+
+export async function fetchMcpServers(): Promise<McpServerConfig[]> {
+  try {
+    const res = await fetch(`${API_BASE}/mcp/servers`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.servers) ? data.servers : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function upsertMcpServer(name: string, config: Omit<McpServerConfig, 'name' | 'status' | 'error' | 'tool_count' | 'transport'>): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteMcpServer(name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function restartMcpServer(name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(name)}/restart`, { method: 'POST' });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**

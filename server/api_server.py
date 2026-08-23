@@ -1,3 +1,4 @@
+import difflib
 import os
 import sys
 
@@ -77,6 +78,15 @@ _orphans_removed = wm.cleanup_orphaned_chat_dirs()
 if _orphans_removed:
     print(f"[STARTUP] Cleaned up {_orphans_removed} orphaned workspace chat directories")
 
+# Start MCP servers in the background (codex-style lifecycle: spawn once at
+# startup, keep alive, cache tools/list). Connection happens on a daemon
+# thread; tools become visible to the agents as servers report "connected".
+try:
+    from tools.mcp.mcp_bridge import mcp_start_all
+    threading.Thread(target=mcp_start_all, kwargs={"background": True}, daemon=True).start()
+except Exception as e:
+    print(f"[STARTUP] MCP init failed: {e}")
+
 app = FastAPI(title="Deep Agents API", version="2.0")
 
 app.add_middleware(
@@ -87,8 +97,8 @@ app.add_middleware(
 )
 
 
-@app.get("/api/health")
-async def health():
+@app.get("/api/health/voice")
+async def voice_health():
     """Engine status — quick check that Moonshine + Kokoro are loadable."""
     asr_ok = False
     tts_ok = False
@@ -405,6 +415,73 @@ async def get_state():
     return JSONResponse(content=json.loads(safe_serialize_state()))
 
 
+# ── MCP servers ──────────────────────────────────────────────────────────────
+
+class McpServerUpdate(BaseModel):
+    command: str = ""
+    args: list[str] = []
+    url: str = ""
+    env: dict[str, str] = {}
+    env_vars: list[str] = []
+    cwd: str = ""
+    scopes: list[str] = []
+    enabled_tools: list[str] = []
+    disabled_tools: list[str] = []
+    approval: str = "auto"  # auto | prompt
+    instructions: str = ""
+    startup_timeout_sec: float = 10.0
+    tool_timeout_sec: float = 60.0
+
+
+def _mcp_manager():
+    from tools.mcp.mcp_bridge import get_manager
+    return get_manager()
+
+
+@app.get("/api/mcp/servers")
+async def list_mcp_servers():
+    """List configured servers and their live connection status."""
+    mgr = _mcp_manager()
+    status = {s["name"]: s for s in mgr.status_snapshot()}
+    out = []
+    for name, cfg in mgr.load_config().get("servers", {}).items():
+        merged = dict(cfg)
+        merged["name"] = name
+        merged["status"] = status.get(name, {}).get("status", "stopped")
+        merged["error"] = status.get(name, {}).get("error", "")
+        merged["tool_count"] = status.get(name, {}).get("tool_count", 0)
+        merged["transport"] = "http" if cfg.get("url") else "stdio"
+        out.append(merged)
+    return JSONResponse(content={"servers": out})
+
+
+@app.post("/api/mcp/servers/{server_name}")
+async def upsert_mcp_server(server_name: str, update: McpServerUpdate):
+    """Create or replace a server config; restarts it if configured."""
+    try:
+        snapshot = _mcp_manager().upsert_server(server_name, update.model_dump(exclude_none=True))
+        return JSONResponse(content={"servers": snapshot})
+    except ValueError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+
+
+@app.delete("/api/mcp/servers/{server_name}")
+async def delete_mcp_server(server_name: str):
+    """Remove a server config and disconnect it."""
+    snapshot = _mcp_manager().remove_server(server_name)
+    return JSONResponse(content={"servers": snapshot})
+
+
+@app.post("/api/mcp/servers/{server_name}/restart")
+async def restart_mcp_server(server_name: str):
+    """Disconnect and reconnect a single server (pick up config changes)."""
+    try:
+        snapshot = _mcp_manager().restart_server(server_name)
+        return JSONResponse(content={"servers": snapshot})
+    except ValueError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=404)
+
+
 def _workspace_path_for_id(workspace_id: str) -> str:
     if workspace_id == wm.GENERAL_WORKSPACE_ID:
         return wm.GENERAL_WORKSPACE_ID
@@ -646,6 +723,16 @@ async def run_pipeline(req: RunRequest, request: Request):
             f"- {item.get('name', 'attachment')} ({item.get('path', item.get('url', 'uploaded file'))})"
             for item in req.attachments
         )
+        # Vision: stash image paths so the agent's Zone-2 builder can inject
+        # them as real image blocks (visible from turn one). FreeAgent gets
+        # them directly below; the graph path consumes the shared_state key.
+        try:
+            _img_paths = [item.get("path") for item in req.attachments
+                          if item.get("isImage") and item.get("path")]
+            if _img_paths:
+                safe_update_state({"attachment_image_paths": [str(p) for p in _img_paths]})
+        except Exception:
+            pass
     prompt_with_attachments = req.prompt + attachment_note
     wm_add_message(req.workspace_path, req.chat_id, "user", req.prompt, {"attachments": req.attachments} if req.attachments else None)
     resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
@@ -771,17 +858,6 @@ async def run_pipeline(req: RunRequest, request: Request):
         # The frontend persists one unified trace message containing the final
         # answer and execution metadata. Do not save a second plain agent
         # message here, otherwise every response appears twice in the chat.
-        agent_report = safe_get_state().get("outputs", {}).get("agent_report", "")
-
-        # Also save a session note to .agent-memory/ so the ORCHESTRATOR (not chat) remembers
-        try:
-            if agent_report and req.workspace_path:
-                from memory.memory_manager import update_project_meta
-                snippet = agent_report[:500].replace("\n", " ")
-                update_project_meta(req.workspace_path, "Last Session", snippet)
-        except Exception as e:
-            print(f"[API] Error saving session memory: {e}")
-
         # Final state, including the files changed during this run.
         final_state = json.loads(safe_serialize_state())
         final_state["artifacts"] = _collect_run_artifacts(req.workspace_path, run_context)
@@ -984,7 +1060,7 @@ async def get_models():
     return JSONResponse(content={
         "models": [
             {"id": "Automatic Fallback", "name": "Automatic Fallback", "provider": "auto"},
-            {"id": "deepseek-v4-flash-free", "name": "DeepSeek V4 Flash 0731 (Free)", "provider": "opencode"},
+            {"id": "deepseek-v4-flash-vision-exp", "name": "DeepSeek V4 Flash Vision Exp (Go)", "provider": "opencode"},
             {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash 0731 (Free)", "provider": "cline"},
             {"id": "deepseek/deepseek-chat", "name": "DeepSeek Chat", "provider": "openrouter"},
             {"id": "deepseek/deepseek-r1", "name": "DeepSeek R1", "provider": "openrouter"},
@@ -1015,6 +1091,7 @@ async def get_provider():
         "base_url": cfg["base"],
         "model_flash": cfg["flash"],
         "model_pro": cfg["pro"],
+        "model_vision": cfg.get("vision", ""),
         "has_key": bool(cfg["key"]) and not cfg["key"].startswith("your_"),
     })
 
@@ -1100,35 +1177,7 @@ async def get_chat_endpoint(workspace_id: str, chat_id: str):
 
 @app.get("/api/workspaces/{workspace_id}/chats/{chat_id}/subagents/{subagent_name}")
 async def get_subagent_history_endpoint(workspace_id: str, chat_id: str, subagent_name: str):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    
-    valid_subagents = {"Dev", "FreeAgent", "Vision"}
-    if subagent_name not in valid_subagents:
-        return JSONResponse(content={"error": "Invalid subagent name"}, status_code=400)
-    
-    from agents.subagent_swarm import load_subagent_history
-    try:
-        messages = load_subagent_history(chat_id, subagent_name)
-        serialized = []
-        for m in messages:
-            role = "user"
-            m_type = type(m).__name__
-            if m_type == "SystemMessage":
-                role = "system"
-            elif m_type == "AIMessage":
-                role = "assistant"
-            elif m_type == "HumanMessage":
-                role = "user"
-            
-            serialized.append({
-                "role": role,
-                "content": m.content,
-            })
-        return JSONResponse(content=serialized)
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return JSONResponse(content={"error": "Subagent history endpoint removed (legacy swarm module deleted). Use session_log directly."}, status_code=410)
 
 
 @app.delete("/api/workspaces/{workspace_id}/chats/{chat_id}")
@@ -1294,24 +1343,6 @@ async def save_workspace_rules(workspace_id: str, req: Request):
         return {"status": "ok"}
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-def start_consolidation_daemon():
-    """Starts a periodic background daemon thread for memory consolidation."""
-    import time
-    from memory.memory_consolidation_daemon import consolidate_memories
-    
-    def daemon_loop():
-        print("[DAEMON] Background memory consolidation daemon started.")
-        while True:
-            try:
-                consolidate_memories()
-            except Exception as e:
-                print(f"[DAEMON] Memory consolidation failed: {e}")
-            # Run every 6 hours
-            time.sleep(21600)
-            
-    threading.Thread(target=daemon_loop, daemon=True).start()
 
 
 # ── Voice transcription ────────────────────────────────────────────────────────
@@ -1559,12 +1590,6 @@ if __name__ == "__main__":
         print("[API] Telegram bot started in background.")
     except Exception as e:
         print(f"[API] Failed to start Telegram bot: {e}")
-        
-    # Start Memory Consolidation Daemon in background
-    try:
-        start_consolidation_daemon()
-    except Exception as e:
-        print(f"[API] Failed to start memory consolidation daemon: {e}")
         
     if reload_mode:
         uvicorn.run("api_server:app", host="127.0.0.1", port=8000, reload=True)

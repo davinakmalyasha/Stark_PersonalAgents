@@ -1,0 +1,49 @@
+"""WebSocket connection manager for {{ app_name }}.
+
+Tracks live connections per room and provides send/broadcast helpers.
+Rooms are plain strings (e.g. "chat:42", "org:7") — keep them namespaced.
+"""
+import json
+from collections import defaultdict
+
+from fastapi import WebSocket
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self._rooms: dict[str, dict[str, WebSocket]] = defaultdict(dict)
+
+    async def connect(self, room: str, conn_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self._rooms[room][conn_id] = ws
+
+    def disconnect(self, room: str, conn_id: str) -> None:
+        self._rooms.get(room, {}).pop(conn_id, None)
+        if room in self._rooms and not self._rooms[room]:
+            del self._rooms[room]
+
+    def room_size(self, room: str) -> int:
+        return len(self._rooms.get(room, {}))
+
+    async def send_personal(self, room: str, conn_id: str, payload: dict) -> None:
+        ws = self._rooms.get(room, {}).get(conn_id)
+        if ws is not None:
+            await ws.send_text(json.dumps(payload))
+
+    async def broadcast(self, room: str, payload: dict, exclude: str | None = None) -> None:
+        text = json.dumps(payload)
+        dead: list[str] = []
+        for conn_id, ws in list(self._rooms.get(room, {}).items()):
+            if conn_id == exclude:
+                continue
+            try:
+                await ws.send_text(text)
+            except Exception:
+                dead.append(conn_id)
+        for conn_id in dead:
+            self.disconnect(room, conn_id)
+
+
+manager = ConnectionManager()
+
+# TODO: add a Redis pub/sub adapter here if you run multiple API replicas.

@@ -1,0 +1,16 @@
+{
+  "_comment": "LEVEL 3 (feature): realtime WebSocket slice — room-based ConnectionManager + authenticated socket endpoint with echo/broadcast demo. Complements feature-sse (SSE = server-to-client only; WS = bidirectional).",
+  "name": "feature-websocket",
+  "description": "Realtime WebSocket: per-room ConnectionManager (connect/disconnect/broadcast, dead-socket cleanup) + authenticated /ws/{room} endpoint with token hook.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name (kept for import symmetry with other features)"},
+    {"name": "ws_path", "type": "string", "default": "/ws", "description": "WebSocket route prefix, e.g. '/ws' (clients connect to ws://host/ws/<room>?token=...)"}
+  ],
+  "files": [
+    {"src": "core/ws_manager.py.j2", "dest": "{{ app_name }}/core/ws_manager.py"},
+    {"src": "routers/ws.py.j2", "dest": "{{ app_name }}/routers/ws.py"}
+  ],
+  "notes": "After applying: 1) app.include_router(router) in main.py — websocket routes include the same way as HTTP, 2) replace _validate_token's demo body with decode_token from feature-auth and raise WebSocketException(1008) on failure, 3) frontend: new WebSocket(`ws://host{{ ws_path }}/<room>?token=<jwt>`) — pair with comp-chat for a live chat UI, 4) single-replica only; add a Redis pub/sub adapter in ws_manager when you scale out. No extra deps (uses FastAPI/Starlette websockets support).",
+  "sample_vars": {"app_name": "app", "ws_path": "/ws"}
+}

@@ -1,0 +1,26 @@
+"""Health probes for {{ app_name }} — liveness + readiness for k8s."""
+from fastapi import APIRouter, Depends
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+
+router = APIRouter(tags=["ops"])
+
+
+@router.get("/health")
+def liveness():
+    return {"status": "ok"}
+
+
+@router.get("/ready")
+def readiness(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "ready", "db": "ok"}
+    except Exception as e:
+        return {"status": "not_ready", "db": str(e)}
+
+
+# TODO: register router in main.py (no auth — k8s needs unauthenticated probes).
+# Liveness: is it alive? Readiness: can it serve? (DB ok?)

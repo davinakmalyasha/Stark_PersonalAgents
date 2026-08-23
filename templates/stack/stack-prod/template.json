@@ -1,0 +1,29 @@
+{
+  "_comment": "LEVEL 5 (stack): COMPLETE production deploy in ONE call — observability + error tracking + health ready for going live. No new code: pure composition.",
+  "name": "stack-prod",
+  "description": "Complete production going-live: structured logging + error tracking (Sentry) + health/readiness + audit trail + ops dashboard + security headers, plus CI/gate/deploy. One call = full production deploy skeleton.",
+  "category": "stack",
+  "variables": [
+    {"name": "project_name", "type": "string", "required": true, "description": "Project folder, e.g. 'acme-prod'"},
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package, e.g. 'app'"},
+    {"name": "service_name", "type": "string", "default": "web", "description": "Docker service name"},
+    {"name": "sentry_dsn", "type": "string", "default": "", "description": "Sentry DSN env value (optional — when empty, error tracking runs in log-only mode)"}
+  ],
+  "files": [],
+  "uses": [
+    "project-fastapi",
+    "feature-observability",
+    "feature-error-tracking",
+    "feature-health",
+    "feature-audit-log",
+    "feature-security-headers",
+    "comp-log-viewer",
+    "comp-ops-dashboard",
+    "comp-audit-trail",
+    "github-ci-security-python",
+    "docker-compose",
+    "nginx"
+  ],
+  "notes": "Production going-live starter. Structured logging, error tracking, health checks, audit trail, ops dashboard, and security headers come pre-wired plus CI/gate/deploy. After apply: set SENTRY_DSN + JWT_SECRET in .env, import new models in main.py so tables create, app.include_router for ops-health/logs/errors/audit routers, docker compose up --build, nginx TLS via certbot.",
+  "sample_vars": {"project_name": "demo_prod", "app_name": "app", "service_name": "web", "sentry_dsn": ""}
+}

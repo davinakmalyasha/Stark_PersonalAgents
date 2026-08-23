@@ -4,18 +4,102 @@
   "description": "Enterprise-grade node/Next.js gate: npm audit SCA, gitleaks secrets, ESLint+prettier+tsc quality, c8 coverage threshold, bundle-size budget, perf-smoke, Semgrep, Trivy, CodeQL-js, zizmor.",
   "category": "config",
   "variables": [
-    {"name": "node_version", "type": "string", "default": "22", "description": "Node major version"},
-    {"name": "gitleaks_version", "type": "string", "default": "8.30.1", "description": "Pinned gitleaks release"},
-    {"name": "zizmor_version", "type": "string", "default": "1.29.0", "description": "Pinned zizmor release"},
-    {"name": "trivy_version", "type": "string", "default": "0.73.0", "description": "Pinned trivy release"},
-    {"name": "codeql_on", "type": "string", "default": "true", "description": "Include the CodeQL job"},
-    {"name": "coverage_threshold", "type": "string", "default": "80", "description": "c8 line coverage threshold"},
-    {"name": "bundle_budget_kb", "type": "string", "default": "500", "description": "Largest emitted asset budget (KB)"},
-    {"name": "perf_import_budget_ms", "type": "string", "default": "5000", "description": "Main-entry import budget (ms)"}
+    {
+      "name": "node_version",
+      "type": "string",
+      "default": "22",
+      "description": "Node major version"
+    },
+    {
+      "name": "gitleaks_version",
+      "type": "string",
+      "default": "8.30.1",
+      "description": "Pinned gitleaks release"
+    },
+    {
+      "name": "zizmor_version",
+      "type": "string",
+      "default": "1.29.0",
+      "description": "Pinned zizmor release"
+    },
+    {
+      "name": "trivy_version",
+      "type": "string",
+      "default": "0.73.0",
+      "description": "Pinned trivy release"
+    },
+    {
+      "name": "codeql_on",
+      "type": "string",
+      "default": "true",
+      "description": "Include the CodeQL job"
+    },
+    {
+      "name": "coverage_threshold",
+      "type": "string",
+      "default": "80",
+      "description": "c8 line coverage threshold"
+    },
+    {
+      "name": "bundle_budget_kb",
+      "type": "string",
+      "default": "500",
+      "description": "Largest emitted asset budget (KB)"
+    },
+    {
+      "name": "perf_import_budget_ms",
+      "type": "string",
+      "default": "5000",
+      "description": "Main-entry import budget (ms)"
+    },
+    {
+      "name": "job_timeout_minutes",
+      "type": "string",
+      "default": "15",
+      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
+    },
+    {
+      "name": "semgrep_config_ref",
+      "type": "string",
+      "default": "security-audit",
+      "description": "Pinned Semgrep registry config — deterministic findings across pushes"
+    },
+    {
+      "name": "license_denylist",
+      "type": "string",
+      "default": "GPL-3.0,AGPL-3.0",
+      "description": "Comma-separated license IDs that block deployment"
+    },
+    {
+      "name": "image_size_budget_mb",
+      "type": "string",
+      "default": "500",
+      "description": "Docker image size budget (MB) — fails if exceeded"
+    }
   ],
   "files": [
-    {"src": "security.yml.j2", "dest": ".github/workflows/security.yml"}
+    {
+      "src": "security.yml.j2",
+      "dest": ".github/workflows/security.yml"
+    },
+    {
+      "src": "tests/perf-smoke.mjs.j2",
+      "dest": "tests/perf-smoke.mjs"
+    },
+    {
+      "src": "fast-checks.yml.j2",
+      "dest": ".github/workflows/fast-checks.yml"
+    },
+    {
+      "src": "release-heavy.yml.j2",
+      "dest": ".github/workflows/release-heavy.yml"
+    }
   ],
-  "notes": "Contexts: sca, secrets, quality, coverage, bundle, perf-smoke, semgrep, container, codeql, zizmor. Next.js projects: 'npm run lint' runs next lint, 'npm run build' runs next build, tsc --noEmit type-checks — no profile change needed. All jobs graceful-skip when the dependency/config is absent.",
-  "sample_vars": {"node_version": "22", "codeql_on": "true", "coverage_threshold": "80", "bundle_budget_kb": "500"}
+  "notes": "Two-speed gate: fast-checks.yml (every push, ~30s: lint+syntax+secrets HEAD) + security.yml (PR/push to main only: full deterministic gate) + release-heavy.yml (nightly/tags: deep pass). Branch protection contexts = security.yml jobs only. Docs-only changes skip everything.",
+  "sample_vars": {
+    "node_version": "22",
+    "codeql_on": "true",
+    "coverage_threshold": "80",
+    "bundle_budget_kb": "500"
+  }
 }

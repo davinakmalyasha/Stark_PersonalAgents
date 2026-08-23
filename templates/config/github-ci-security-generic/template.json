@@ -4,14 +4,71 @@
   "description": "Universal fallback gate for any language: osv-scanner SCA, gitleaks secrets, multi-language CodeQL, detected test command, zizmor.",
   "category": "config",
   "variables": [
-    {"name": "gitleaks_version", "type": "string", "default": "8.30.1", "description": "Pinned gitleaks release"},
-    {"name": "zizmor_version", "type": "string", "default": "1.29.0", "description": "Pinned zizmor release"},
-    {"name": "osv_scanner_version", "type": "string", "default": "2.5.0", "description": "Pinned osv-scanner release"},
-    {"name": "codeql_on", "type": "string", "default": "true", "description": "Include the CodeQL job (analyzes whatever languages are present)"}
+    {
+      "name": "gitleaks_version",
+      "type": "string",
+      "default": "8.30.1",
+      "description": "Pinned gitleaks release"
+    },
+    {
+      "name": "zizmor_version",
+      "type": "string",
+      "default": "1.29.0",
+      "description": "Pinned zizmor release"
+    },
+    {
+      "name": "osv_scanner_version",
+      "type": "string",
+      "default": "2.5.0",
+      "description": "Pinned osv-scanner release"
+    },
+    {
+      "name": "codeql_on",
+      "type": "string",
+      "default": "true",
+      "description": "Include the CodeQL job (analyzes whatever languages are present)"
+    },
+    {
+      "name": "job_timeout_minutes",
+      "type": "string",
+      "default": "15",
+      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
+    },
+    {
+      "name": "license_denylist",
+      "type": "string",
+      "default": "GPL-3.0,AGPL-3.0",
+      "description": "Comma-separated license IDs that block deployment"
+    },
+    {
+      "name": "image_size_budget_mb",
+      "type": "string",
+      "default": "500",
+      "description": "Docker image size budget (MB) — fails if exceeded"
+    },
+    {
+      "name": "trivy_version",
+      "type": "string",
+      "default": "0.73.0",
+      "description": "Pinned trivy release (container/image scan)"
+    }
   ],
   "files": [
-    {"src": "security.yml.j2", "dest": ".github/workflows/security.yml"}
+    {
+      "src": "security.yml.j2",
+      "dest": ".github/workflows/security.yml"
+    },
+    {
+      "src": "fast-checks.yml.j2",
+      "dest": ".github/workflows/fast-checks.yml"
+    },
+    {
+      "src": "release-heavy.yml.j2",
+      "dest": ".github/workflows/release-heavy.yml"
+    }
   ],
-  "notes": "Contexts: sca, secrets, codeql, tests, zizmor. The tests job detects a runnable test command (npm test / go test / pytest); nothing detected = skipped. osv-scanner covers npm, PyPI, Go, Maven, Cargo, RubyGems, composer and more.",
-  "sample_vars": {"codeql_on": "true"}
+  "notes": "Two-speed gate: fast-checks.yml (every push, ~30s: lint+syntax+secrets HEAD) + security.yml (PR/push to main only: full deterministic gate) + release-heavy.yml (nightly/tags: deep pass). Branch protection contexts = security.yml jobs only. Docs-only changes skip everything.",
+  "sample_vars": {
+    "codeql_on": "true"
+  }
 }

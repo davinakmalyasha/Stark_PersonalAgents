@@ -6,8 +6,8 @@ import threading
 import time
 from types import SimpleNamespace
 
-# Unit-test the mocked path: disable token streaming so the continuable
-# loop calls the mocked invoke_messages_with_fallback (no real API calls).
+# Unit-test the mocked path directly so the continuable loop never calls a
+# provider. The runtime imports the streaming entry point at turn time.
 os.environ["TOKEN_STREAMING"] = "0"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,7 +25,7 @@ def check(label, cond):
 
 def main():
     import llm
-    from agents from agents import subagent_manager
+    from agents import subagent_manager
     from agents.subagent_manager import (start_continuable, send_message, interrupt,
                                   list_agents, report, _ACTIVATIONS, reset_manager)
     from inbox import pending_counts, clear_inbox_registry
@@ -37,6 +37,7 @@ def main():
     llm.invoke_messages_with_fallback = lambda role, messages, **kw: SimpleNamespace(
         content="Done with the task.", reasoning_content=None,
     )
+    llm.invoke_messages_with_fallback_stream = llm.invoke_messages_with_fallback
     r = start_continuable("chatA", ws, "general-purpose", "Do something", label="research")
     child_id = r["child_id"]
     check("start returns child_id", child_id.startswith("cont-"))
@@ -66,6 +67,7 @@ def main():
     llm.invoke_messages_with_fallback = lambda role, messages, **kw: SimpleNamespace(
         content="Follow-up answered.", reasoning_content=None,
     )
+    llm.invoke_messages_with_fallback_stream = llm.invoke_messages_with_fallback
     r2 = send_message(child_id, "Now also check the docs.", ws)
     check("follow-up result", "Follow-up answered." in r2["result"])
     mgr2 = SessionManager.open(path)
@@ -76,10 +78,9 @@ def main():
     # ── 4. queue while running + interrupt ──
     def _looping_mock(role, messages, **kw):
         time.sleep(0.4)  # keep the turn alive long enough to observe "running"
-        return SimpleNamespace(
-            content='```tool\n{"tool": "list_files", "args": {"path": "/workspace"}}\n```',
-        )
+        return ("", [{"tool": "list_agents", "args": {}, "id": "loop-call"}], None)
     llm.invoke_messages_with_fallback = _looping_mock
+    llm.invoke_messages_with_fallback_stream = _looping_mock
     r3_holder = {}
 
     def worker():

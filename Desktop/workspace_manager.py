@@ -516,7 +516,6 @@ def probe_environment(workspace_path: str) -> dict:
     """
     import subprocess
     import socket
-    from memory.memory_io import load_memory, save_memory
     
     # 1. Check CLI tools
     tools = ["composer", "npm", "php", "python", "go", "git"]
@@ -571,14 +570,6 @@ def probe_environment(workspace_path: str) -> dict:
         "ports": port_status,
         "timestamp": datetime.now().isoformat()
     }
-
-    # 3. Save to workspace_memory.json
-    try:
-        mem = load_memory(workspace_path)
-        mem["environment_profile"] = profile
-        save_memory(mem, workspace_path)
-    except Exception as e:
-        print(f"Failed to save environment profile to memory: {e}")
 
     return profile
 
@@ -680,41 +671,6 @@ def get_workspace_rules_and_profile(workspace_path: str) -> str:
         sections.append("## Workspace Rules")
         for rule in workspace_rules:
             sections.append(f"- {rule}")
-
-    # Load and append environment profile
-    env_profile_data = {}
-    try:
-        from memory.memory_io import load_memory
-        mem = load_memory(workspace_path)
-        env_profile_data = mem.get("environment_profile", {})
-    except Exception:
-        pass
-
-    if env_profile_data:
-        sections.append("## System Environment Profile")
-        cli_tools = env_profile_data.get("cli_tools", {})
-        if cli_tools:
-            available_tools = []
-            for tool, info in cli_tools.items():
-                if info.get("available"):
-                    raw_ver = info.get("version") or "unknown version"
-                    import re
-                    match = re.search(r'\b\d+(?:\.\d+)+\b', raw_ver)
-                    ver = match.group(0) if match else raw_ver.split('\n')[0][:15].strip()
-                    available_tools.append(f"{tool} ({ver})")
-            if available_tools:
-                sections.append(f"- Available CLI Tools: {', '.join(available_tools)}")
-        
-        ports = env_profile_data.get("ports", {})
-        if ports:
-            conflict_ports = []
-            for port, status in ports.items():
-                if status == "IN_USE":
-                    conflict_ports.append(f"Port {port}: IN_USE (Conflict warning! Another service is running on this port. Do NOT run server on this port.)")
-            if conflict_ports:
-                sections.append("### Dev Server Ports Conflict Warnings")
-                for cp in conflict_ports:
-                    sections.append(f"- {cp}")
 
     if sections:
         return "\n".join([

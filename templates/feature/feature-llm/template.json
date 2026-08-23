@@ -1,0 +1,26 @@
+{
+  "_comment": "LEVEL 3 (feature): LLM chat vertical slice — OpenAI-compatible streaming client (httpx), per-user usage tracking, SSE endpoint. Pairs with feature-sse patterns and feature-auth.",
+  "name": "feature-llm",
+  "description": "AI chat backend: OpenAI-compatible streaming client + per-user usage table + SSE /chat endpoint and /usage summary. Works with DeepSeek/OpenRouter/any OpenAI-style gateway.",
+  "category": "feature",
+  "variables": [
+    {"name": "app_name", "type": "string", "required": true, "description": "Python package name, e.g. 'app' or 'demo_api'"},
+    {"name": "base_path", "type": "string", "default": "/api", "description": "API prefix, e.g. '/api' (routes: /api/llm/chat, /api/llm/usage)"},
+    {"name": "llm_base_url", "type": "string", "default": "https://api.deepseek.com", "description": "OpenAI-compatible base URL (no trailing /v1 needed for DeepSeek)"},
+    {"name": "llm_model", "type": "string", "default": "deepseek-v4-flash", "description": "Default model id sent with each request"},
+    {"name": "secret_env", "type": "string", "default": "LLM_API_KEY", "description": "Env var name holding the API key"}
+  ],
+  "files": [
+    {"src": "core/llm_client.py.j2", "dest": "{{ app_name }}/core/llm_client.py"},
+    {"src": "services/llm_service.py.j2", "dest": "{{ app_name }}/services/llm_service.py"},
+    {"src": "routers/llm.py.j2", "dest": "{{ app_name }}/routers/llm.py"}
+  ],
+  "notes": "After applying: 1) set {{ secret_env }} in .env, 2) import services.llm_service in main.py so llm_usage table is created (LLMUsage lives in llm_service — move to models/ if you prefer), 3) app.include_router(router), 4) frontend pairs with comp-chat (SSE consumption) and comp-markdown-viewer, 5) add quotas via llm_service before chat(). Requires httpx in requirements.",
+  "sample_vars": {
+    "app_name": "app",
+    "base_path": "/api",
+    "llm_base_url": "https://api.deepseek.com",
+    "llm_model": "deepseek-v4-flash",
+    "secret_env": "LLM_API_KEY"
+  }
+}

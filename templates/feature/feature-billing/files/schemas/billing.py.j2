@@ -1,0 +1,55 @@
+"""Pydantic schemas for {{ app_name }} billing endpoints."""
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PlanCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=50)
+    name: str = Field(min_length=1, max_length=100)
+    price_cents: int = Field(ge=0)
+    interval: str = "month"
+    is_active: bool = True
+
+
+class PlanRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    code: str
+    name: str
+    price_cents: int
+    currency: str
+    interval: str
+    is_active: bool
+
+
+class SubscribeRequest(BaseModel):
+    plan_code: str
+
+
+class SubscriptionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    plan_id: int
+    status: str
+    current_period_end: Optional[datetime] = None
+    created_at: datetime
+
+
+class InvoiceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    amount_cents: int
+    currency: str
+    status: str
+    provider: str
+    provider_invoice_id: Optional[str] = None
+    created_at: datetime
+
+
+# TODO: add CheckoutRequest / WebhookEvent schemas when you wire a provider.

@@ -12,11 +12,12 @@ interface HouseHeaderProps {
   onOpenTasks: () => void;
   onTaskStart: (taskId: string) => void;
   onTaskDelete: (taskId: string) => void;
+  onOpenSettings: () => void;
 }
 
 export default function HouseHeader({
   timeStr, isRunning, tasks,
-  onOpenSidebar, onNewChat, onOpenTasks, onTaskStart, onTaskDelete,
+  onOpenSidebar, onNewChat, onOpenTasks, onTaskStart, onTaskDelete, onOpenSettings,
 }: HouseHeaderProps) {
   const isElectron = typeof window !== 'undefined' && !!window.antigravity;
   const assistantName = getAssistantName();
@@ -163,7 +164,7 @@ export default function HouseHeader({
         style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
       >
         <span className="text-zinc-400 tabular-nums font-medium">{timeStr}</span>
-        <button className="hover:text-zinc-300 transition-colors cursor-pointer" title="Settings">
+        <button onClick={onOpenSettings} className="hover:text-zinc-300 transition-colors cursor-pointer" title="Settings">
           <Settings size={14} className="text-zinc-600 hover:text-zinc-300" />
         </button>
       </div>

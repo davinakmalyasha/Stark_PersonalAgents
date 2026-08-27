@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useCanvasAgentState } from '../../hooks/useCanvasAgentState';
 import CanvasWorkspace from './CanvasWorkspace';
-import SubagentDrawer from './SubagentDrawer';
+import SubagentSessionView from '../../house/SubagentSessionView';
 import ChatView from '../Workspace/ChatView';
 import type { AppState, ChatMessage, ModelOption } from '../../types';
 import type { AgentTask } from '../../types';
@@ -48,6 +48,7 @@ export default function AgentCanvas(props: Props) {
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<AgentTask | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [subagentView, setSubagentView] = useState<{ childId: string; label: string } | null>(null);
 
   // Track when the current run started so running cards show a live elapsed clock.
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
@@ -101,9 +102,6 @@ export default function AgentCanvas(props: Props) {
       .catch(() => setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: prev } : item)));
   };
 
-  const selectedAgentMeta = selectedAgent ? agents.find((a) => a.id === selectedAgent) ?? null : null;
-  const selectedAgentSteps = selectedAgent ? steps.filter((s) => s.agent === selectedAgent) : [];
-
   return (
     <div className="relative flex flex-1 min-w-0 h-full overflow-hidden border-l border-zinc-800/80 bg-[#0a0a0c]">
       <CanvasWorkspace
@@ -128,18 +126,22 @@ export default function AgentCanvas(props: Props) {
         chatId={props.chatId}
       />
 
-      <ChatView {...props} traceSteps={steps} />
+      <ChatView {...props} traceSteps={steps} onOpenSubagentSession={(childId, label) => setSubagentView({ childId, label })} />
 
-      <SubagentDrawer
-        isOpen={Boolean(selectedAgent)}
-        subagentName={selectedAgent}
-        status={selectedAgentMeta?.status ?? 'idle'}
-        taskDesc={selectedAgentMeta?.task ?? ''}
-        steps={selectedAgentSteps}
-        workspaceId={props.workspaceId}
-        chatId={props.chatId}
-        onClose={() => setSelectedAgent(null)}
-      />
+      {/* Subagent session drawer — child-keyed, read-only transcript */}
+      {subagentView && (
+        <div className="absolute top-0 right-0 h-full w-[440px] bg-[#0c0c0f] border-l border-zinc-800 shadow-2xl flex flex-col z-50">
+          <div className="flex-1 min-h-0 px-3 pt-1 pb-3">
+            <SubagentSessionView
+              workspaceId={props.workspaceId ?? ''}
+              childId={subagentView.childId}
+              label={subagentView.label}
+              parentTitle={props.chatTitle ?? 'Main session'}
+              onBack={() => setSubagentView(null)}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

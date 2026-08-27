@@ -3,6 +3,7 @@ import type { DragEvent } from 'react';
 import { CalendarClock, Clock3, Loader2, Paperclip, Pencil, Play, Plus, Timer, Trash2 } from 'lucide-react';
 import type { AgentTask } from '../../types';
 import type { BoardAgent } from '../../types/board.types';
+import { formatRecurrence } from '../../utils/recurrence';
 import AddTaskModal from './AddTaskModal';
 import { COLUMN_ORDER, agentStatusDot, columnConfig } from './board.styles';
 
@@ -122,7 +123,7 @@ function TaskCard({ task, runStartedAt, now, onStartTask, onEditTask, onDeleteTa
               <span className="truncate">Runs {new Date(task.schedule.nextRunAt).toLocaleString()}</span>
               {task.schedule.recurrence !== 'none' && (
                 <span className="px-1.5 py-px rounded bg-purple-400/15 border border-purple-400/25 text-[8px] font-semibold uppercase tracking-wide">
-                  {task.schedule.recurrence}
+                  {formatRecurrence(task.schedule.recurrence)}
                 </span>
               )}
             </div>

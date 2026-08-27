@@ -60,7 +60,7 @@ def welcome(msg: telebot.types.Message) -> None:
             "• _\"Make a calculator app\"_ → spec & plan → Dev implementation → CI gate verification\n"
             "• _\"Harden my deployment / set up CI/CD\"_ → Dev + the CI security gate\n"
             "• _\"Write requirements for a CRM\"_ → requirements analysis\n"
-            "• _\"Quick question or research\"_ → FreeAgent (zero cost)\n\n"
+            "• _\"Quick question or research\"_ → General (non-coding assistant)\n\n"
             "Ready to generate documentation, establish project environments, and build functional systems.",
             parse_mode="Markdown",
         )

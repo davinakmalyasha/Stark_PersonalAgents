@@ -2,8 +2,8 @@
 
 The local harness verification gate (adaptive_verify, repair rounds, smoke
 checks) has been REMOVED. Dev verifies its own work naturally (feature tests),
-and delivered code is pushed to GitHub by the harness, where the universal
-gate (github-ci-security workflows) runs. Failures are steered back to Dev
+and delivered code is pushed to GitHub by the harness, where the tiered
+gate (fast-checks / staging / release-heavy workflows) runs. Failures are steered back to Dev
 automatically by ci_gate — see ci_gate.py.
 """
 import os

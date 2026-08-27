@@ -51,7 +51,7 @@ function startApiServer() {
   } else if (fs.existsSync(venvPython) && fs.existsSync(path.join(__dirname, '..', '..', 'venv', 'pyvenv.cfg'))) {
     pythonCmd = venvPython;
   }
-  const apiPath = path.join(__dirname, '..', '..', 'api_server.py');
+  const apiPath = path.join(__dirname, '..', '..', 'server', 'api_server.py');
 
   killPort(8000).then(() => {
     const args = [apiPath];

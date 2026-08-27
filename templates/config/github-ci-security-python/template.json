@@ -1,7 +1,7 @@
 {
-  "_comment": "THE GATE — python profile. Security + performance + bug detection on every push: SAST, SCA, secrets, quality (lint+format+type), coverage, perf-smoke, semgrep, container, codeql, zizmor. Action SHAs are pinned; every job has explicit permissions. Installed by github_apply_gate / github_init_project.",
+  "_comment": "Python profile shim — composes the universal gates: github-fast-checks (Tier 1, dev/feature pushes ~18s: secrets+lint+tests+audit across py/node/go/php/deno) + github-release-heavy (Tier 3, prod pushes/tags deterministic: image/SBOM/license/zizmor/migration/contract/perf/build). Pure composition recipe + perf test fixture — ships NO workflow file of its own; exactly one workflow per tier exists in gated repos.",
   "name": "github-ci-security-python",
-  "description": "Enterprise-grade python gate: Bandit SAST, pip-audit SCA, gitleaks secrets, Ruff S+B + format + mypy, coverage threshold, perf-smoke, Semgrep, Trivy, CodeQL, zizmor. All jobs SHA-pinned, graceful-skip when a dependency is absent.",
+  "description": "Python gate via universal tiers: fast-checks (dev/feature pushes, ~18s universal) + release-heavy (prod pushes/tags, deterministic). Composition recipe only — no extra workflow file.",
   "category": "config",
   "variables": [
     {
@@ -26,55 +26,13 @@
       "name": "trivy_version",
       "type": "string",
       "default": "0.73.0",
-      "description": "Pinned trivy release (container/fs scan)"
-    },
-    {
-      "name": "codeql_on",
-      "type": "string",
-      "default": "true",
-      "description": "true/false — include the CodeQL job (free on public repos)"
-    },
-    {
-      "name": "coverage_threshold",
-      "type": "string",
-      "default": "80",
-      "description": "Minimum line coverage enforced on detected packages (enterprise standard)"
-    },
-    {
-      "name": "coverage_strict",
-      "type": "string",
-      "default": "false",
-      "description": "true = no importable package FAILS the coverage job instead of skipping"
-    },
-    {
-      "name": "bandit_level",
-      "type": "string",
-      "default": "lll",
-      "description": "Bandit severity flag: lll=HIGH only, ll=MEDIUM+HIGH"
-    },
-    {
-      "name": "job_timeout_minutes",
-      "type": "string",
-      "default": "15",
-      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
-    },
-    {
-      "name": "pytest_path",
-      "type": "string",
-      "default": "tests",
-      "description": "Where pytest collects tests"
+      "description": "Pinned trivy release (consumed by github-release-heavy)"
     },
     {
       "name": "perf_test_path",
       "type": "string",
       "default": "tests/test_perf_smoke.py",
-      "description": "Perf-smoke test file path"
-    },
-    {
-      "name": "semgrep_config_ref",
-      "type": "string",
-      "default": "security-audit",
-      "description": "Pinned Semgrep registry config — deterministic findings across pushes"
+      "description": "Perf-smoke test file path (consumed by github-release-heavy)"
     },
     {
       "name": "license_denylist",
@@ -87,30 +45,29 @@
       "type": "string",
       "default": "500",
       "description": "Docker image size budget (MB) — fails if exceeded"
+    },
+    {
+      "name": "prod_branches",
+      "type": "string",
+      "default": "main,master",
+      "description": "Comma-separated production-level branch names (T3 push trigger; T1 excludes them)"
+    },
+    {
+      "name": "staging_branch",
+      "type": "string",
+      "default": "staging",
+      "description": "Staging-level branch name (T2 push trigger; T1 excludes it)"
     }
   ],
+  "uses": ["github-fast-checks", "github-release-heavy"],
   "files": [
-    {
-      "src": "security.yml.j2",
-      "dest": ".github/workflows/security.yml"
-    },
     {
       "src": "tests/test_perf_smoke.py.j2",
       "dest": "tests/test_perf_smoke.py"
-    },
-    {
-      "src": "fast-checks.yml.j2",
-      "dest": ".github/workflows/fast-checks.yml"
-    },
-    {
-      "src": "release-heavy.yml.j2",
-      "dest": ".github/workflows/release-heavy.yml"
     }
   ],
-  "notes": "Two-speed gate: fast-checks.yml (every push, ~30s: lint+syntax+secrets HEAD) + security.yml (PR/push to main only: full deterministic gate) + release-heavy.yml (nightly/tags: deep pass). Branch protection contexts = security.yml jobs only. Docs-only changes skip everything.",
+  "notes": "Shim composing universal tiered gates mapped to branch levels: Tier 1 github-fast-checks (dev-level + feature-branch pushes ~18s: gitleaks secrets, ruff/eslint/vet/php-l/deno-lint, pytest/npm-test/go-test, pip-audit/npm-audit/govulncheck/composer-audit high-only) + Tier 3 github-release-heavy (prod-level pushes + tags v*: trivy image+budget+digest, CycloneDX SBOM py/node/go/php/deno + license denylist, env-audit, zizmor low, alembic drift/migration DDL+downgrade, config-validation, adaptive endpoint-smoke 200/404/503, graceful-shutdown, oasdiff contract diff, perf-benchmark, build+asset integrity, tests-detected, rollback-readiness). Branch names come from prod_branches/staging_branch variables (.harness-ci.json at install time). Ships no workflow file of its own — a future dedicated SAST tier would be authored as its own template. Docs-only pushes skip everything.",
   "sample_vars": {
-    "python_version": "3.12",
-    "codeql_on": "true",
-    "coverage_threshold": "80"
+    "python_version": "3.12"
   }
 }

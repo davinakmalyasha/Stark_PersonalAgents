@@ -1,28 +1,53 @@
 """Typed application settings — single source of truth, loaded from env / .env."""
-import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
-from dotenv import load_dotenv
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-load_dotenv(BASE_DIR / ".env")
 
 
-class Settings:
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     APP_NAME: str = "{{ app_title }}"
-    ENV: str = os.environ.get("APP_ENV", "development")
-    DEBUG: bool = ENV != "production"
+    ENV: str = Field(default="development", validation_alias="APP_ENV")
+    DATABASE_URL: Optional[str] = None
+    JWT_SECRET: Optional[str] = None
+    SECRET_KEY: Optional[str] = None
+    CORS_ORIGINS: Union[List[str], str] = []
 
-    DATABASE_URL: Optional[str] = os.environ.get("DATABASE_URL")
-    JWT_SECRET: Optional[str] = os.environ.get("JWT_SECRET")
-    CORS_ORIGINS: List[str] = [
-        o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()
-    ]
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        if isinstance(v, str):
+            return [o.strip() for o in v.split(",") if o.strip()]
+        return v
+
+    @property
+    def DEBUG(self) -> bool:
+        return self.ENV != "production"
 
     @property
     def is_production(self) -> bool:
         return self.ENV == "production"
+
+    @model_validator(mode="after")
+    def validate_production_invariants(self) -> "Settings":
+        if self.is_production:
+            secret = self.JWT_SECRET or self.SECRET_KEY
+            if not secret or len(secret) < 32:
+                raise ValueError("JWT_SECRET/SECRET_KEY must be >= 32 characters in production")
+            if not self.CORS_ORIGINS or "*" in self.CORS_ORIGINS or ["*"] == self.CORS_ORIGINS:
+                raise ValueError("CORS_ORIGINS cannot allow wildcard '*' in production")
+            if not self.DATABASE_URL:
+                raise ValueError("DATABASE_URL is required in production")
+        return self
 
 
 settings = Settings()

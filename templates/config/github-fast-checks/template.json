@@ -1,0 +1,93 @@
+{
+  "_comment": "TIER 1 — universal fast gate: one file for all stacks (py/node/go/php/deno). Auto-detects via hashFiles, caches, parallel jobs (secrets + lint + tests + audit), graceful-skip when stack absent. No docker — docker stays Tier 3. Blocking on high vulns only; full denylist in Tier 3.",
+  "name": "github-fast-checks",
+  "description": "TIER 1 universal: secrets (gitleaks+actionlint) + lint (ruff/eslint/tsc/gofmt/php -l/deno lint) + tests (pytest/vitest/go test/phpunit/deno test) + quick-audit (pip-audit/npm audit/govulncheck/composer/deno) — all hashFiles-gated, cached, parallel. No profile fragmentation.",
+  "category": "config",
+  "variables": [
+    {
+      "name": "python_version",
+      "type": "string",
+      "default": "3.12",
+      "description": "Python version for lint/tests/audit"
+    },
+    {
+      "name": "node_version",
+      "type": "string",
+      "default": "22",
+      "description": "Node version for lint/tests"
+    },
+    {
+      "name": "gitleaks_version",
+      "type": "string",
+      "default": "8.30.1",
+      "description": "Pinned gitleaks release"
+    },
+    {
+      "name": "actionlint_version",
+      "type": "string",
+      "default": "1.7.7",
+      "description": "Pinned actionlint release (no pipe-to-bash latest)"
+    },
+    {
+      "name": "shellcheck_version",
+      "type": "string",
+      "default": "0.10.0",
+      "description": "Pinned shellcheck — actionlint auto-lints run: scripts when on PATH"
+    },
+    {
+      "name": "ruff_version",
+      "type": "string",
+      "default": "0.9.6",
+      "description": "Pinned standalone ruff release (cached tarball, no pip install)"
+    },
+    {
+      "name": "govulncheck_version",
+      "type": "string",
+      "default": "v1.1.4",
+      "description": "Pinned govulncheck version"
+    },
+    {
+      "name": "deno_version",
+      "type": "string",
+      "default": "v2.x",
+      "description": "Deno version for deno stacks"
+    },
+    {
+      "name": "job_timeout_minutes",
+      "type": "string",
+      "default": "5",
+      "description": "Per-job timeout for fast tier"
+    },
+    {
+      "name": "prod_branches",
+      "type": "string",
+      "default": "main,master",
+      "description": "Comma-separated production-level branch names excluded from Tier 1 push triggers (branch-level map: T1=dev/feature, T2=staging push, T3=prod push/tags)"
+    },
+    {
+      "name": "staging_branch",
+      "type": "string",
+      "default": "staging",
+      "description": "Staging-level branch name — also excluded from Tier 1 pushes (strict one-tier-per-level)"
+    }
+  ],
+  "files": [
+    {
+      "src": "fast-checks.yml.j2",
+      "dest": ".github/workflows/fast-checks.yml"
+    }
+  ],
+  "notes": "Single source of truth for Tier 1. Consumed by github-ci-security-python/node/generic via uses: [github-fast-checks]. Inline diff-gating: each consumer job runs pinned dorny/paths-filter (v3 commit 0e4a8c6effa4802afeda77dc8d303f8176d7dfad) as its first step, guarded to push/pull_request only — workflow_dispatch and merge_group always full-run; no cross-job needs so all runners boot in parallel. Stack filters defined once (jinja STACK_FILTERS) and rendered byte-identical into all three steps — add a stack in ONE place. Actionlint runs with shellcheck on PATH → embedded run: scripts get linted at PR time. pytest falls back to the full suite ONLY on rc=5 (everything deselected by 'not slow'); real failures propagate once. Caches: gitleaks/actionlint/shellcheck/ruff tarballs, node_modules, .eslintcache + *.tsbuildinfo, govulncheck binary, .venv-fast (exact key). Kill switches: vars.FASTCHECK_NO_TESTS / FASTCHECK_NO_AUDIT = 'true'.",
+  "sample_vars": {
+    "python_version": "3.12",
+    "node_version": "22",
+    "gitleaks_version": "8.30.1",
+    "actionlint_version": "1.7.7",
+    "shellcheck_version": "0.10.0",
+    "ruff_version": "0.9.6",
+    "govulncheck_version": "v1.1.4",
+    "deno_version": "v2.x",
+    "job_timeout_minutes": "5",
+    "prod_branches": "main,master"
+  }
+}

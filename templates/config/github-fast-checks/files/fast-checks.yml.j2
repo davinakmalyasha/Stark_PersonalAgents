@@ -1,0 +1,797 @@
+name: Fast Checks  # TIER 1 — every push/PR, ~18s, universal (py/node/go/php/deno, inline diff-gating)
+
+# ── TIER 1 — fast: universal secrets+lint+tests+audit, parallel jobs, inline diff-gating ──
+# Each consumer job (lint/tests/quick-audit) computes its own changed-stacks via pinned
+# dorny/paths-filter as a FIRST STEP — no cross-job `needs`, so all runners boot in parallel
+# (no serialization tax). The filter step runs only on push/pull_request; workflow_dispatch
+# AND merge_group always run FULL (merge queue is the last gate before main).
+# Stack filters are defined ONCE below (jinja STACK_FILTERS) and rendered into all three
+# consumer steps — byte-identical by construction.
+# Caches: gitleaks/actionlint/shellcheck/ruff tarballs, node_modules, .eslintcache,
+# *.tsbuildinfo, govulncheck binary, .venv-fast (exact key on dependency hashes).
+# Kill switches: vars.FASTCHECK_NO_TESTS='true' / vars.FASTCHECK_NO_AUDIT='true'.
+# No docker (stays Tier 3). Next: Tier 2 staging (push to staging-level branch) → Tier 3 release-heavy (prod pushes + tags v*).
+{% set PROD_BRANCHES = (prod_branches | default('main,master')).split(',') | map('trim') | list %}
+
+{% set STACK_FILTERS -%}
+py:
+  - '**/*.py'
+  - 'requirements*.txt'
+  - 'pyproject.toml'
+node:
+  - '**/*.js'
+  - '**/*.jsx'
+  - '**/*.ts'
+  - '**/*.tsx'
+  - '**/*.mjs'
+  - '**/*.cjs'
+  - 'package.json'
+  - 'package-lock.json'
+  - 'yarn.lock'
+  - 'pnpm-lock.yaml'
+go:
+  - '**/*.go'
+  - 'go.mod'
+  - 'go.sum'
+php:
+  - '**/*.php'
+  - 'composer.json'
+  - 'composer.lock'
+deno:
+  - '**/*.ts'
+  - '**/*.js'
+  - 'deno.json'
+  - 'deno.jsonc'
+{%- endset %}
+
+{%- set T1_IGNORES = (((prod_branches | default('main,master')) ~ ',' ~ (staging_branch | default('staging'))).split(',') | map('trim') | select | unique | join("', '")) %}
+permissions:
+  contents: read
+
+on:
+  push:
+    # TIER 1 owns dev-level + feature branches ONLY. Prod-level AND staging-level
+    # names are excluded (rendered from .harness-ci.json at install time) so
+    # exactly one tier fires per branch level: T2=staging push, T3=prod push/tags.
+    branches-ignore: ['{{ T1_IGNORES }}']
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: {% raw %}fast-${{ github.ref }}{% endraw %}
+  cancel-in-progress: true
+
+jobs:
+  secrets-workflow:
+    name: secrets-workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default(5) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache gitleaks
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/gitleaks.tar.gz
+          key: gitleaks-{{ gitleaks_version | default('8.30.1') }}-linux_x64
+      - name: Gitleaks (always — secrets anywhere count)
+        run: |
+          if [ ! -f /tmp/gitleaks.tar.gz ]; then
+            curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v{{ gitleaks_version | default('8.30.1') }}/gitleaks_{{ gitleaks_version | default('8.30.1') }}_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          fi
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+          /tmp/gitleaks detect --source . --redact --exit-code 1 --no-git --max-target-megabytes 5 || exit 1
+      - name: Cache shellcheck + actionlint
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: hashFiles('.github/workflows/**') != ''
+        with:
+          path: |
+            /tmp/actionlint.tar.gz
+            /tmp/shellcheck.tar.xz
+          key: lint-tools-actionlint-{{ actionlint_version | default('1.7.7') }}-shellcheck-{{ shellcheck_version | default('0.10.0') }}
+      - name: Actionlint (+shellcheck for embedded run scripts)
+        if: hashFiles('.github/workflows/**') != ''
+        run: |
+          if [ ! -f /tmp/shellcheck.tar.xz ]; then
+            curl -sSfL https://github.com/koalaman/shellcheck/releases/download/v{{ shellcheck_version | default('0.10.0') }}/shellcheck-v{{ shellcheck_version | default('0.10.0') }}.linux.x86_64.tar.xz -o /tmp/shellcheck.tar.xz
+          fi
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          export PATH="/tmp/shellcheck-v{{ shellcheck_version | default('0.10.0') }}:$PATH"
+          if [ ! -f /tmp/actionlint.tar.gz ]; then
+            curl -sSfL https://github.com/rhysd/actionlint/releases/download/v{{ actionlint_version | default('1.7.7') }}/actionlint_{{ actionlint_version | default('1.7.7') }}_linux_amd64.tar.gz -o /tmp/actionlint.tar.gz
+          fi
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp
+          # actionlint auto-invokes the SC linter when on PATH -> lints run scripts too.
+          # -ignore list = documented policy, not a blanket pass:
+          #   - hashFiles in job-level if: the GitHub runtime accepts it, actionlint
+          #     is stricter than the real schema. Genuine expression errors still fail.
+          #   - style/info/warning nits from the SC linter inside the SHIPPED scripts:
+          #     SC2002 2015 2016 2034 2061 2064 2086 2155 2162. Error-severity
+          #     findings still fail the gate.
+          /tmp/actionlint -color -ignore 'calling function "hashFiles" is not allowed here' -ignore 'shellcheck reported issue in this script: SC(2002|2015|2016|2034|2061|2064|2086|2155|2162):(style|info|warning)' || exit 1
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default(5) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Detect changed stacks (inline — only on diff events)
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+{{ STACK_FILTERS | indent(14, true) }}
+
+      # ── Python (changed + present; dispatch/merge_group = full) ──
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: >-
+          hashFiles('**/*.py') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Cache ruff binary
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: >-
+          hashFiles('**/*.py') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        with:
+          path: /tmp/ruff.tar.gz
+          key: ruff-{{ ruff_version | default('0.9.6') }}-x86_64-linux-gnu
+      - name: Python — ruff check + format + compile (standalone ruff, no pip)
+        if: >-
+          hashFiles('**/*.py') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        run: |
+          if [ ! -f /tmp/ruff.tar.gz ]; then
+            curl -sSfL https://github.com/astral-sh/ruff/releases/download/{{ ruff_version | default('0.9.6') }}/ruff-x86_64-unknown-linux-gnu.tar.gz -o /tmp/ruff.tar.gz
+          fi
+          mkdir -p /tmp/ruff-bin && tar -xzf /tmp/ruff.tar.gz -C /tmp/ruff-bin --strip-components=1
+          export PATH=/tmp/ruff-bin:$PATH
+          # emit annotations for file-level problems (shows in PR Files-changed inline, not just logs)
+          rlog=/tmp/ruff.json; ruff check . --select E4,E7,E9,F,S,B --output-format json > "$rlog" 2>/dev/null || true
+          cat "$rlog" | python3 -c "import json,sys; [print(f\"::error file={e['filename']},line={e['location']['row']},col={e['location']['column']}::ruff {e['code']}: {e['message']}\") for e in json.load(open(sys.argv[1]))]" "$rlog" 2>/dev/null || true
+          ruff check . --select E4,E7,E9,F,S,B --output-format concise || exit 1
+          ruff format --check . || {
+            echo "::error::ruff format: run 'ruff format .' locally and commit"
+            exit 1
+          }
+          python -m compileall -q . 2>&1 | python3 -c "import sys,re; [print(f\"::error file={m.group(1)},line=1::{m.group(0)}\") for l in sys.stdin for m in [re.search(r\"^\\*\\*\\* Error: (.+)\", l)] if m]" || true
+          python -m compileall -q . || exit 1
+
+      # ── Node/TypeScript (changed + present) ──
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            yarn.lock
+            pnpm-lock.yaml
+      - name: Cache node_modules
+        id: nodemod
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        with:
+          path: node_modules
+          key: {% raw %}node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}{% endraw %}
+          restore-keys: |
+            {% raw %}node-modules-${{ runner.os }}-{% endraw %}
+      - name: Node — install deps (exact-hit skip; prefix-hit forces clean ci)
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        run: |
+          HIT="{% raw %}${{ steps.nodemod.outputs.cache-hit }}{% endraw %}"
+          if [ "$HIT" = "true" ] && [ -d node_modules ] && [ -n "$(ls -A node_modules 2>/dev/null)" ]; then
+            echo "node_modules restored from exact-key cache"
+          else
+            if [ -d node_modules ] && [ "$HIT" != "true" ]; then
+              echo "prefix-restored tree may be stale vs lockfile — forcing npm ci (wipes node_modules)"
+            fi
+            if [ -f package-lock.json ]; then npm ci --prefer-offline --silent || npm install --silent; else npm install --silent; fi
+          fi
+      - name: Node/TS — eslint (cached) + tsc (incremental) + prettier
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        run: |
+          if [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.cjs ] || ls .eslintrc* >/dev/null 2>&1; then
+            # eslint JSON → ::error annotations per file/line
+            elog=/tmp/eslint.json; npx eslint . --cache --cache-location .eslintcache --max-warnings=0 -f json > "$elog" 2>/dev/null || ec=$?
+            cat "$elog" | python3 -c "import json,sys; [print(f\"::error file={m['filePath']},line={e['line']},col={e['column']}::eslint {e['ruleId']}: {e['message']}\") for m in json.load(open(sys.argv[1])) for e in m.get('messages',[])]" "$elog" 2>/dev/null || true
+            test "${ec:-0}" = "0" || { npx eslint . --cache --cache-location .eslintcache --max-warnings=0 2>/dev/null; exit 1; }
+          else
+            echo "no eslint config — skipped"
+          fi
+          if [ -f tsconfig.json ]; then
+            # tsc output → ::error per TS error
+            tsc_out=/tmp/tsc.out; npx tsc --noEmit --incremental 2>&1 | tee "$tsc_out"; ec=${PIPESTATUS[0]}
+            cat "$tsc_out" | python3 -c "import sys,re; [print(f\"::error file={m.group(1)},line={m.group(2)},col={m.group(3)}::tsc {m.group(4)}\") for l in sys.stdin for m in [re.match(r'(.+)\((\d+),(\d+)\): error (.+)', l)] if m]" 2>/dev/null || true
+            test "$ec" = "0" || exit 1
+          else
+            echo "no tsconfig — skipped"
+          fi
+          if [ -f prettier.config.js ] || [ -f prettier.config.mjs ] || [ -f prettier.config.cjs ] || ls .prettierrc* >/dev/null 2>&1; then
+            pre_log=/tmp/prettier.log; npx prettier --check . 2>&1 | tee "$pre_log"; ec=${PIPESTATUS[0]}
+            cat "$pre_log" | python3 -c "import sys; [print(f\"::error file={l.split('[')[0].strip()}::prettier check failed — run 'npx prettier --write .'\") for l in sys.stdin if l.strip().endswith('.js') or l.strip().endswith('.ts') or '.tsx' in l]" 2>/dev/null || true
+            test "$ec" = "0" || exit 1
+          else
+            echo "no prettier config — skipped"
+          fi
+      - name: Cache tool caches (eslint + tsc buildinfo)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        with:
+          path: |
+            .eslintcache
+            **/*.tsbuildinfo
+          key: {% raw %}toolcache-node-${{ runner.os }}-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}{% endraw %}
+
+      # ── Go (changed + present) ──
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Go — vet + gofmt
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        run: |
+          go vet ./... || exit 1
+          fmt_out=$(gofmt -l . 2>/dev/null | grep -v vendor || true)
+          if [ -n "$fmt_out" ]; then echo "FAIL: gofmt needed:"; echo "$fmt_out"; exit 1; fi
+          echo "go vet + gofmt OK"
+
+      # ── PHP (changed + present) ──
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: >-
+          hashFiles('composer.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.php == 'true')
+        with:
+          php-version: '8.3'
+          coverage: none
+      - name: PHP — syntax check
+        if: >-
+          hashFiles('composer.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.php == 'true')
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -exec php -l {} \; | grep -v "No syntax errors" && exit 1 || true
+          echo "php -l OK"
+
+      # ── Deno (changed + present) ──
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: >-
+          (hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.deno == 'true')
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Deno — lint + fmt + check (git ls-files entrypoints)
+        if: >-
+          (hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.deno == 'true')
+        run: |
+          deno lint || exit 1
+          if grep -q '"fmt"' deno.json deno.jsonc 2>/dev/null; then
+            deno fmt --check || exit 1
+          else
+            echo "deno fmt not configured — skipped"
+          fi
+          files=$(git ls-files '*.ts')
+          if [ -n "$files" ]; then deno check $files || exit 1; else echo "deno check: no ts entrypoints"; fi
+          echo "deno lint+fmt+check OK"
+
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default(5) }}
+    if: vars.FASTCHECK_NO_TESTS != 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Detect changed stacks (inline — only on diff events)
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+{{ STACK_FILTERS | indent(14, true) }}
+
+      # ── Python tests (changed) ──
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: >-
+          (hashFiles('**/test_*.py') != '' || hashFiles('tests/**') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Cache venv (exact key — fresh env whenever deps change)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: >-
+          (hashFiles('**/test_*.py') != '' || hashFiles('tests/**') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+      - name: Test selection lane (Repowise call-graph — opt-in)
+        id: testsel
+        # Opt in via repo VARIABLE FASTCHECK_TESTSEL=true. Deterministic call-graph
+        # test selection; empty result means unknown — full suite always wins.
+        if: >-
+          vars.FASTCHECK_TESTSEL == 'true' &&
+          (hashFiles('**/test_*.py') != '' || hashFiles('tests/**') != '') &&
+          (github.event_name == 'pull_request' || github.event_name == 'push') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        env:
+          REPOWISE_VERSION: '{{ repowise_version | default("0.45.0") }}'
+          GH_EVENT: {% raw %}${{ github.event_name }}{% endraw %}
+          PR_BASE_REF: {% raw %}${{ github.event.pull_request.base.ref || '' }}{% endraw %}
+          DEFAULT_BRANCH: {% raw %}${{ github.event.repository.default_branch || 'main' }}{% endraw %}
+        run: |
+          : > "$HOME/testsel_paths.txt"
+          VENV=$HOME/.venv-fast
+          "$VENV/bin/pip" install --quiet "repowise==$REPOWISE_VERSION" 2>/dev/null \
+            || { echo "repowise unavailable — selection disabled"; exit 0; }
+          RW="$VENV/bin/repowise"
+          if [ "$GH_EVENT" = "pull_request" ] && [ -n "$PR_BASE_REF" ]; then
+            git fetch --quiet origin "$PR_BASE_REF" 2>/dev/null || true
+            RANGE="origin/$PR_BASE_REF..HEAD"
+          else
+            git fetch --quiet origin "$DEFAULT_BRANCH" 2>/dev/null || true
+            MB=$(git merge-base HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null) \
+              || { echo "no merge-base — running full suite"; exit 0; }
+            RANGE="$MB..HEAD"
+          fi
+          "$RW" init --no-prose -y >/tmp/rw-init.log 2>&1 \
+            || { echo "repowise index failed — running full suite"; tail -3 /tmp/rw-init.log; exit 0; }
+          "$RW" impacted-tests "$RANGE" --format list >"$HOME/testsel_raw.txt" 2>/tmp/rw-caveats.txt \
+            || { echo "impacted-tests failed — running full suite"; exit 0; }
+          while IFS= read -r tid; do
+            [ -z "$tid" ] && continue
+            f="${tid%%::*}"
+            case "$f" in
+              test_*.py|*/test_*.py|tests/*) [ -e "$f" ] && echo "$tid" >> "$HOME/testsel_paths.txt" ;;
+            esac
+          done < "$HOME/testsel_raw.txt"
+          N=$(grep -c . "$HOME/testsel_paths.txt" 2>/dev/null || echo 0)
+          TOTAL=$(find . -name 'test_*.py' -not -path '*/.venv*' -not -path '*/node_modules/*' | wc -l)
+          echo "selected $N of $TOTAL python test files"
+          head -3 /tmp/rw-caveats.txt 2>/dev/null || true
+          if [ "${N:-0}" -eq 0 ] || [ "${N:-0}" -ge "${TOTAL:-1}" ]; then
+            echo "selection not beneficial — running full suite"
+            : > "$HOME/testsel_paths.txt"
+          fi
+
+      - name: Python — pytest -x -q (rc=5-only fallback to full suite)
+        env:
+          COVERAGE_MIN: '{{ coverage_min | default(0) }}'
+        if: >-
+          (hashFiles('**/test_*.py') != '' || hashFiles('tests/**') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        run: |
+          VENV=$HOME/.venv-fast
+          if [ ! -x "$VENV/bin/python" ]; then
+            python -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --upgrade pip
+            "$VENV/bin/pip" install --quiet pytest
+            [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+          else
+            echo "venv restored from cache"
+          fi
+          # best-effort coverage instrumentation — report-only unless coverage_min > 0
+          COV=""
+          if "$VENV/bin/pip" install --quiet pytest-cov 2>/dev/null && "$VENV/bin/python" -c "import pytest_cov" 2>/dev/null; then
+            mkdir -p _gate
+            COV="--cov=. --cov-report=term-missing --cov-report=json:_gate/coverage.json --junitxml=_gate/junit.xml"
+          else
+            echo "pytest-cov unavailable — skipping coverage artifacts"
+          fi
+          rc=""
+          TARGETS=""
+          if [ -s "$HOME/testsel_paths.txt" ]; then
+            TARGETS=$(tr '\n' ' ' < "$HOME/testsel_paths.txt")
+            echo "test selection lane active — running selected subset"
+          fi
+          "$VENV/bin/python" -m pytest -x -q -m "not slow" $COV $TARGETS || rc=$?
+          if [ "$rc" = "5" ]; then
+            echo "all tests deselected by 'not slow' marker — running full suite"
+            "$VENV/bin/python" -m pytest -x -q --tb=short $COV $TARGETS || exit 1
+          elif [ -n "$rc" ]; then
+            exit $rc
+          fi
+          # optional hard floor — active only when owner sets coverage_min > 0
+          if [ -f _gate/coverage.json ] && [ "$COVERAGE_MIN" != "0" ]; then
+            ACT=$(python3 -c "import json;print(json.load(open('_gate/coverage.json'))['totals']['percent_covered'])" 2>/dev/null || echo "")
+            if [ -n "$ACT" ]; then
+              BELOW=$(python3 -c "print(1 if float('$ACT') < float('$COVERAGE_MIN') else 0)" 2>/dev/null || echo 0)
+              if [ "$BELOW" = "1" ]; then
+                echo "FAIL: coverage ${ACT}% below minimum ${COVERAGE_MIN}%"
+                exit 1
+              fi
+            fi
+          fi
+          echo "pytest OK"
+
+      - name: Upload test reports (coverage + junit)
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-reports-T1
+          path: |
+            _gate/coverage.json
+            _gate/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── Node tests (changed) ──
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - name: Cache node_modules
+        id: nodemod
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        with:
+          path: node_modules
+          key: {% raw %}node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}{% endraw %}
+          restore-keys: |
+            {% raw %}node-modules-${{ runner.os }}-{% endraw %}
+      - name: Node — npm test (single invocation)
+        if: >-
+          hashFiles('package.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        run: |
+          if ! grep -q '"test"' package.json 2>/dev/null; then echo "no test script — skipped"; exit 0; fi
+          HIT="{% raw %}${{ steps.nodemod.outputs.cache-hit }}{% endraw %}"
+          if [ "$HIT" = "true" ] && [ -d node_modules ] && [ -n "$(ls -A node_modules 2>/dev/null)" ]; then
+            echo "node_modules exact-hit — installing skipped"
+          else
+            if [ -d node_modules ] && [ "$HIT" != "true" ]; then echo "prefix-hit may be stale — npm ci wipes and reinstalls"; fi
+            if [ -f package-lock.json ]; then npm ci --prefer-offline --silent || npm install --silent; else npm install --silent; fi
+          fi
+          npm test || exit 1
+
+      # ── Go tests (changed) ──
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Go — go test (single run, result-cache friendly)
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        run: go test ./... -short || exit 1
+
+      # ── PHP tests (changed) ──
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: >-
+          hashFiles('composer.json') != '' && (hashFiles('phpunit.xml') != '' || hashFiles('phpunit.xml.dist') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.php == 'true')
+        with:
+          php-version: '8.3'
+          coverage: none
+      - name: PHP — phpunit (single run)
+        if: >-
+          hashFiles('composer.json') != '' && (hashFiles('phpunit.xml') != '' || hashFiles('phpunit.xml.dist') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.php == 'true')
+        run: |
+          if [ -f vendor/bin/phpunit ]; then vendor/bin/phpunit --stop-on-failure || exit 1; else composer install --quiet && vendor/bin/phpunit --stop-on-failure || exit 1; fi
+
+      # ── Deno tests (changed) ──
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: >-
+          (hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.deno == 'true')
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Deno — deno test (single run)
+        if: >-
+          (hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.deno == 'true')
+        run: deno test --allow-read --allow-env || exit 1
+
+  quick-audit:
+    name: quick-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default(5) }}
+    if: vars.FASTCHECK_NO_AUDIT != 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Detect changed stacks (inline — only on diff events)
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+{{ STACK_FILTERS | indent(14, true) }}
+
+      # ── Python audit (deps changed) ──
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: >-
+          (hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Python — pip-audit (high only, single JSON run)
+        if: >-
+          (hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.py == 'true')
+        run: |
+          pip install --quiet pip-audit
+          if [ -f requirements.txt ]; then
+            export AUDIT_OUT=$(pip-audit --local --disable-pip --requirement requirements.txt --format json 2>/dev/null)
+          else
+            export AUDIT_OUT=$(pip-audit --local --disable-pip --format json 2>/dev/null)
+          fi
+          python3 - << 'PY'
+          import json, sys, os
+          out = os.environ.get("AUDIT_OUT", "")
+          if not out.strip():
+              print("pip-audit: empty output (env-only audit) — OK")
+              sys.exit(0)
+          try:
+              data = json.loads(out)
+          except Exception:
+              print("pip-audit output not JSON — treating as clean")
+              sys.exit(0)
+          deps = data.get("dependencies", data if isinstance(data, list) else [])
+          highs = []
+          for dep in deps:
+              for v in dep.get("vulns", []):
+                  descs = json.dumps(v).lower()
+                  if '"high"' in descs or "critical" in descs:
+                      highs.append(f"{dep.get('name','?')} {v.get('id', v.get('fix_versions',''))}")
+          if highs:
+              print("FAIL: pip-audit HIGH/CRITICAL:")
+              for h in highs: print("  !", h)
+              sys.exit(1)
+          print("pip-audit high OK (moderate/low warn-only)")
+          PY
+
+      # ── Node audit (deps changed) ──
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: >-
+          hashFiles('package-lock.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - name: Node — npm audit (high only, single invocation)
+        if: >-
+          hashFiles('package-lock.json') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.node == 'true')
+        run: |
+          npm audit --audit-level=high || exit 1
+          echo "npm audit high OK"
+
+      # ── Go audit (deps changed) ──
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Cache govulncheck
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        with:
+          path: ~/go/bin/govulncheck
+          key: govulncheck-{{ govulncheck_version | default('v1.1.4') }}-go
+      - name: Go — govulncheck (pinned, single run)
+        if: >-
+          hashFiles('go.mod') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.go == 'true')
+        run: |
+          if [ ! -f ~/go/bin/govulncheck ]; then go install golang.org/x/vuln/cmd/govulncheck@{{ govulncheck_version | default('v1.1.4') }}; fi
+          ~/go/bin/govulncheck ./... || exit 1
+          echo "govulncheck OK"
+
+      # ── PHP audit (deps changed) ──
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: >-
+          hashFiles('composer.json') != '' && hashFiles('composer.lock') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.php == 'true')
+        with:
+          php-version: '8.3'
+          coverage: none
+      - name: PHP — composer audit (severity-parsed JSON)
+        if: >-
+          hashFiles('composer.json') != '' && hashFiles('composer.lock') != '' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.php == 'true')
+        run: |
+          OUT=$(composer audit --format=json 2>/dev/null) || RC=$?
+          echo "$OUT" | head -c 400; echo
+          echo "$OUT" | python3 -c "
+          import json, sys
+          try:
+              data = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          advisories = data.get('advisories', [])
+          high = [a for a in advisories if str(a.get('severity','')).lower() in ('high','critical')]
+          if high:
+              print('FAIL: composer HIGH/CRITICAL:', len(high))
+              for a in high[:10]: print('  !', a.get('advisoryId','?'), a.get('packageName','?'), a.get('severity'))
+              sys.exit(1)
+          print('composer audit high OK')
+          " || exit 1
+
+      # ── Deno audit surface (deps changed) ──
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: >-
+          (hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != '' || hashFiles('deno.lock') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.deno == 'true')
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Deno — info sanity (audit surface)
+        if: >-
+          (hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != '' || hashFiles('deno.lock') != '') &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.deno == 'true')
+        run: |
+          deno --version
+          if [ -f deno.lock ]; then echo "deno.lock present ($(grep -c '"' deno.lock) quote-lines)"; fi
+          echo "deno audit surface OK (deep scan lives in Tier 2/3)"
+
+  fast-summary:
+    name: fast-summary
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default(5) }}
+    needs: [secrets-workflow, lint, tests, quick-audit]
+    if: always() && !cancelled()
+    steps:
+      - name: Retrieve test reports for summary (best-effort)
+        continue-on-error: true
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gate-reports-T1
+          path: _gate-in
+      - name: Fast gate summary
+        env:
+          R_SECRETS: {% raw %}${{ needs.secrets-workflow.result }}{% endraw %}
+          R_LINT: {% raw %}${{ needs.lint.result }}{% endraw %}
+          R_TESTS: {% raw %}${{ needs.tests.result }}{% endraw %}
+          R_AUDIT: {% raw %}${{ needs.quick-audit.result }}{% endraw %}
+          COVERAGE_MIN: '{{ coverage_min | default(0) }}'
+        run: |
+          echo "================ FAST GATE (Tier 1) ================"
+          echo "secrets-workflow: $R_SECRETS"
+          echo "lint:             $R_LINT"
+          echo "tests:            $R_TESTS"
+          echo "quick-audit:      $R_AUDIT"
+          echo "===================================================="
+          {
+            echo "## Fast gate (Tier 1 — dispatched side-tool)"
+            echo ""
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| secrets-workflow | $R_SECRETS |"
+            echo "| lint | $R_LINT |"
+            echo "| tests | $R_TESTS |"
+            echo "| quick-audit | $R_AUDIT |"
+            echo ""
+            echo "skipped = stack not present or diff-gated; never a failure"
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p _gate
+          GATE_TIER=T1 python3 - << 'PY'
+          import json, os
+          pairs = [
+              ("secrets-workflow", "R_SECRETS"),
+              ("lint", "R_LINT"),
+              ("tests", "R_TESTS"),
+              ("quick-audit", "R_AUDIT"),
+          ]
+          jobs = dict((name, os.environ.get(env, "unknown")) for name, env in pairs)
+          failed = sorted(k for k, v in jobs.items() if v == "failure")
+          doc = {
+              "schema": "gate-summary/v1",
+              "tier": os.environ.get("GATE_TIER", "T1"),
+              "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+              "run_id": int(os.environ.get("GITHUB_RUN_ID") or 0),
+              "run_url": "{}/{}/actions/runs/{}".format(
+                  os.environ.get("GITHUB_SERVER_URL", ""),
+                  os.environ.get("GITHUB_REPOSITORY", ""),
+                  os.environ.get("GITHUB_RUN_ID", "")),
+              "branch": os.environ.get("GITHUB_REF_NAME", ""),
+              "sha": os.environ.get("GITHUB_SHA", ""),
+              "conclusion": "failure" if failed else "success",
+              "jobs": jobs,
+              "failed_jobs": failed,
+              "notes": ["skipped = stack absent or diff-gated; never a failure"],
+          }
+          for cp in ("_gate-in/coverage.json", "_gate/coverage.json"):
+              if os.path.exists(cp):
+                  try:
+                      pct = float(json.load(open(cp)).get("totals", {}).get("percent_covered", 0))
+                      doc["coverage"] = {
+                          "actual_pct": round(pct, 1),
+                          "min_pct": float(os.environ.get("COVERAGE_MIN", "0")),
+                          "artifact": "gate-reports-T1",
+                      }
+                  except Exception:
+                      pass
+                  break
+          jp = "_gate-in/junit.xml"
+          if os.path.exists(jp):
+              try:
+                  import xml.etree.ElementTree as ET
+                  failures = []
+                  for tc in ET.parse(jp).getroot().iter("testcase"):
+                      f = tc.find("failure")
+                      if f is None:
+                          f = tc.find("error")
+                      if f is None:
+                          continue
+                      failures.append({
+                          "name": ((tc.get("classname") or "") + "::" + (tc.get("name") or "")).lstrip(":"),
+                          "file": tc.get("file") or "",
+                          "line": int(tc.get("line") or 0),
+                          "message": (f.get("message") or "")[:300],
+                      })
+                      if len(failures) >= 10:
+                          break
+                  if failures:
+                      doc["test_failures"] = failures
+                      doc["failures_artifact"] = "gate-reports-T1"
+              except Exception:
+                  pass
+          with open("_gate/gate-summary.json", "w") as f:
+              json.dump(doc, f, indent=2)
+          print("gate-summary:", json.dumps(doc)[:400])
+          PY
+          fail=0
+          for r in "$R_SECRETS" "$R_LINT" "$R_TESTS" "$R_AUDIT"; do
+            if [ "$r" = "failure" ]; then fail=1; break; fi
+          done
+          if [ "$fail" != "0" ]; then echo "FAIL: fast gate has a failed job — see annotations above + step logs"; exit 1; fi
+          echo "FAST-READY — all fast proofs passed"
+
+      - name: Upload gate summary (machine-readable)
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-summary-T1
+          path: _gate/gate-summary.json
+          if-no-files-found: ignore
+          retention-days: 30

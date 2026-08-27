@@ -1,0 +1,944 @@
+name: Staging  # TIER 2 — push to {{ staging_branch | default('staging') }} — live integration proofs (dev-triggered only)
+
+# ── TIER 2 — staging: live integration that Tier 1 (fast) + Tier 3 (release-heavy) cannot prove ──
+# Tier 1 fast (~18s): lint/unit/secrets, no infra.  Tier 3 release-heavy (tags): deterministic
+# image/SBOM/zizmor/migration --sql/oasdiff — no live URL, no vault, no DNS/TLS.  Tier 2 staging:
+# every job spins a real service or hits a real URL. No schedule — dev triggers via push to the
+# staging-level branch or dispatch.
+#
+# GOLDEN UPGRADES:
+#   • /ready semantics: 200 pass · 404 WARN (probe not implemented — not a staging failure) ·
+#     503 FAIL (DB genuinely down) · other 4xx/5xx FAIL
+#   • Backup drill proves DATA round-trip via MD5 checksum restored into a FRESH db
+#     with ON_ERROR_STOP (not row-count existence, not same-db over-errors)
+#   • N-1 asserts forward upgrade reached head (`alembic current` == `alembic heads`);
+#     tag==HEAD tautology is detected and skipped
+#   • ONE shared diff gate (`changes` job) feeds every worker via needs — service
+#     containers never boot on non-backend pushes; workflow_dispatch always full
+#   • Live-only jobs skip at JOB level when unwired (vars/inputs URL) — 0 runner
+#     boots; STAGING_NO_LIVE=true forces ephemeral targets everywhere (no live hits)
+#   • Caches: one shared ~/.venv-fast key (+restore-keys prefix), k6 tarball exact-key
+#   • Probe paths configurable: health_path / ready_path (default /health, /ready)
+#   • Kill switches: vars.STAGING_NO_DB_DRILLS / STAGING_NO_K6 / STAGING_NO_LIVE /
+#     STAGING_NO_ROTATION = 'true' · STAGING_INTERNAL_DNS=true tolerates split-horizon DNS
+#   • Configurable thresholds: k6_vus, k6_duration_s, k6_p95_ms, k6_error_rate_pct,
+#     tls_min_days, rotation_days, pg_version
+#   • staging-summary emits a $GITHUB_STEP_SUMMARY results table; anything not
+#     success/skipped fails the gate (cancelled included)
+#
+# Promotion: PR -> Tier 1 fast -> merge to {{ staging_branch }} -> Tier 2 staging (this file,
+# dev-triggered: push to the staging-level branch or workflow_dispatch) -> prod push or
+# tag v* -> Tier 3 release-heavy -> deploy (prod). Tiers never chain each other.
+
+{% set BACKEND_FILTERS -%}
+backend:
+  - '**/*.py'
+  - 'requirements*.txt'
+  - 'pyproject.toml'
+  - 'migrations/**'
+  - 'alembic.ini'
+  - 'alembic/**'
+  # any-stack coverage — Node/Go/PHP/Deno changes also signal backend work
+  - '**/*.js'
+  - '**/*.jsx'
+  - '**/*.ts'
+  - '**/*.tsx'
+  - '**/*.mjs'
+  - '**/*.cjs'
+  - 'package.json'
+  - 'package-lock.json'
+  - 'yarn.lock'
+  - 'pnpm-lock.yaml'
+  - '**/*.go'
+  - 'go.mod'
+  - 'go.sum'
+  - '**/*.php'
+  - 'composer.json'
+  - 'composer.lock'
+  - 'deno.json'
+  - 'deno.jsonc'
+  - 'deno.lock'
+{%- endset %}
+
+{% set URL_PROLOGUE -%}
+URL="${INPUT_URL:-$STAGING_URL}"
+if [ -z "$URL" ] || [ "$URL" = "" ]; then
+  URL="{{ staging_url }}"
+fi
+{%- endset %}
+
+permissions:
+  contents: read
+
+on:
+  push:
+    # no native paths filters here: paths+branches combos on push are a
+    # phantom-run hazard (zero-job failure records on non-matching branches).
+    # Diff-gating belongs in the dorny `changes` job below.
+    branches: ["{{ staging_branch | default('staging') }}"]
+  workflow_dispatch:
+    inputs:
+      staging_url:
+        description: "Override STAGING_URL for this run (e.g. https://staging.example.com)"
+        required: false
+        default: ""
+  # pull_request opt-in (uncomment to enable label-gated PR staging):
+  # pull_request:
+  #   types: [labeled]
+  #   paths-ignore: ["**.md", "docs/**"]
+
+concurrency:
+  group: staging-{{ staging_branch | default('staging') }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Shared diff gate: ONE paths-filter execution feeds every worker job ──
+  # Heavy jobs declare needs: [changes] so service containers (postgres) never
+  # boot on non-backend pushes. workflow_dispatch always reports backend=true.
+  changes:
+    name: backend-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default(20) }}
+    outputs:
+      backend: {% raw %}${{ steps.filter.outputs.backend || steps.force.outputs.backend }}{% endraw %}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - name: Detect changed backend
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+{{ BACKEND_FILTERS | indent(12, true) }}
+      - name: Dispatch ⇒ always full
+        id: force
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "backend=true" >> "$GITHUB_OUTPUT"
+
+  # ── #3 Backup drill — pg_dump + restore into FRESH db + CHECKSUM data round-trip ──
+  backup-drill:
+    name: backup-drill
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: vars.STAGING_NO_DB_DRILLS != 'true' && needs.changes.outputs.backend == 'true'
+    services:
+      postgres:
+        image: postgres:{{ pg_version | default('16-alpine') }}
+        env:
+          POSTGRES_DB: stage_backup
+          POSTGRES_USER: stage_user
+          POSTGRES_PASSWORD: stage_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache venv (shared key)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+          restore-keys: {% raw %}venv-fast-${{ runner.os }}-{% endraw %}
+      - name: Backup drill — seed → checksum → pg_dump → drop → restore(fresh db) → verify checksum
+        env:
+          DATABASE_URL: postgresql+psycopg://stage_user:stage_pass@localhost:5432/stage_backup
+          # libpq tools (pg_dump/psql) ignore DATABASE_URL — they need this:
+          PGPASSWORD: stage_pass
+        run: |
+          VENV=$HOME/.venv-fast
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --upgrade pip
+          fi
+          "$VENV/bin/pip" install --quiet sqlalchemy psycopg[binary] alembic
+          [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+          export PATH="$VENV/bin:$PATH"
+          PY="$VENV/bin/python"
+
+          # wait for postgres (fail loudly instead of limping into a misleading error)
+          pg_ok=""
+          for i in $(seq 1 30); do if pg_isready -h localhost -p 5432 -U stage_user >/dev/null 2>&1; then pg_ok=1; break; fi; sleep 1; done
+          [ -n "$pg_ok" ] || { echo "FAIL: postgres never became ready (backup drill)"; exit 1; }
+
+          # bring schema to head (or create_all when no alembic)
+          if [ -f alembic.ini ]; then
+            alembic upgrade head || { echo "FAIL: alembic upgrade head failed in backup drill"; exit 1; }
+          else
+            PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+            if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+              "$PY" -c "import $PKG.main" 2>/dev/null || true
+            fi
+          fi
+
+          "$PY" << 'PYEOF'
+          import os
+          from sqlalchemy import create_engine, text
+          eng = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+          with eng.begin() as c:
+              c.execute(text("CREATE TABLE IF NOT EXISTS _backup_probe (id serial PRIMARY KEY, v text)"))
+              c.execute(text("DELETE FROM _backup_probe"))
+              c.execute(text("INSERT INTO _backup_probe (v) VALUES ('stage-drill-' || now()::text), ('row-two-' || md5(random()::text))"))
+              n = c.execute(text("SELECT count(*) FROM _backup_probe")).scalar()
+              ck = c.execute(text("SELECT md5(string_agg(v, ',' ORDER BY id)) FROM _backup_probe")).scalar()
+              open("/tmp/probe.md5", "w").write(ck)
+              print(f"seeded rows={n} checksum={ck[:12]}…")
+          PYEOF
+
+          pg_dump -h localhost -U stage_user -d stage_backup --no-owner --no-privileges > /tmp/stage.dump.sql
+          test -s /tmp/stage.dump.sql || { echo "FAIL: pg_dump produced empty file"; exit 1; }
+          echo "dump size $(wc -c < /tmp/stage.dump.sql) bytes"
+
+          # prove restore is not a tautology: drop the probe, then restore the
+          # dump into a FRESH database with ON_ERROR_STOP — restoring over the
+          # same (still-populated) DB with errors ignored proves nothing
+          "$PY" << 'PYEOF'
+          from sqlalchemy import create_engine, text
+          import os
+          eng = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, isolation_level="AUTOCOMMIT")
+          with eng.begin() as c:
+              c.execute(text("DROP TABLE IF EXISTS _backup_probe"))
+          print("dropped _backup_probe")
+          PYEOF
+
+          psql -h localhost -U stage_user -d stage_backup -c "DROP DATABASE IF EXISTS stage_restore;"
+          psql -h localhost -U stage_user -d stage_backup -c "CREATE DATABASE stage_restore;"
+          psql -h localhost -U stage_user -d stage_restore -v ON_ERROR_STOP=1 -f /tmp/stage.dump.sql > /dev/null \
+            || { echo "FAIL: restore into fresh DB errored (ON_ERROR_STOP) — backup is not cleanly restorable"; exit 1; }
+
+          RESTORE_URL=$(printf '%s' "$DATABASE_URL" | sed 's|/stage_backup$|/stage_restore|')
+          "$PY" << 'PYEOF'
+          from sqlalchemy import create_engine, text
+          import os, sys
+          eng = create_engine(os.environ["RESTORE_URL"], pool_pre_ping=True)
+          with eng.connect() as c:
+              n = c.execute(text("SELECT count(*) FROM _backup_probe")).scalar()
+              got = c.execute(text("SELECT md5(string_agg(v, ',' ORDER BY id)) FROM _backup_probe")).scalar()
+          want = open("/tmp/probe.md5").read().strip()
+          print(f"restored rows={n}")
+          if n < 1:
+              print("FAIL: restored table missing rows — backup is not restorable")
+              sys.exit(1)
+          if got != want:
+              print(f"FAIL: DATA MISMATCH after restore (want={want[:12]}… got={got[:12]}…) — backup corrupts content")
+              sys.exit(1)
+          print("Backup drill OK — dump restores with IDENTICAL data (md5 verified)")
+          PYEOF
+
+  # ── #4 N-1 compat — previous tag schema → current code reads it ──
+  n-minus-one:
+    name: n-minus-one
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: vars.STAGING_NO_DB_DRILLS != 'true' && needs.changes.outputs.backend == 'true' && (hashFiles('alembic.ini') != '' || hashFiles('**/migrations/**') != '')
+    services:
+      postgres:
+        image: postgres:{{ pg_version | default('16-alpine') }}
+        env:
+          POSTGRES_DB: stage_n1
+          POSTGRES_USER: stage_user
+          POSTGRES_PASSWORD: stage_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Cache venv (shared key)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+          restore-keys: {% raw %}venv-fast-${{ runner.os }}-{% endraw %}
+      - name: N-1 compat — previous tag schema → current code reads it (head asserted)
+        env:
+          DATABASE_URL: postgresql+psycopg://stage_user:stage_pass@localhost:5432/stage_n1
+          # libpq tools need this too:
+          PGPASSWORD: stage_pass
+        run: |
+          VENV=$HOME/.venv-fast
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --upgrade pip
+          fi
+          "$VENV/bin/pip" install --quiet sqlalchemy psycopg[binary] alembic pytest
+          [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+          export PATH="$VENV/bin:$PATH"
+          PY="$VENV/bin/python"
+          pg_ok=""
+          for i in $(seq 1 30); do if pg_isready -h localhost -p 5432 -U stage_user >/dev/null 2>&1; then pg_ok=1; break; fi; sleep 1; done
+          [ -n "$pg_ok" ] || { echo "FAIL: postgres never became ready (N-1)"; exit 1; }
+
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git describe --tags --abbrev=0 HEAD 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "no previous tag — N-1 skipped (need at least one v* tag)"
+            exit 0
+          fi
+          if [ "$(git rev-parse "$PREV_TAG" 2>/dev/null)" = "$(git rev-parse HEAD)" ]; then
+            echo "WARN: previous tag points at HEAD itself — nothing older to prove N-1 against; skipping"
+            exit 0
+          fi
+          echo "previous tag: $PREV_TAG"
+
+          rm -rf /tmp/curr_migrations
+          mkdir -p /tmp/curr_migrations
+          [ -f alembic.ini ] && cp alembic.ini /tmp/curr_alembic.ini || true
+          [ -d migrations ] && cp -r migrations /tmp/curr_migrations/ || true
+          [ -d alembic ] && cp -r alembic /tmp/curr_migrations/ || true
+
+          # write to a temp file FIRST: redirecting straight onto alembic.ini
+          # would truncate it before git show runs, leaving a 0-byte config
+          # whose upgrade failure reads as "previous migrations broken"
+          if git show "$PREV_TAG:alembic.ini" > /tmp/prev_alembic.ini 2>/dev/null; then
+            cp /tmp/prev_alembic.ini alembic.ini
+          else
+            echo "no alembic.ini at $PREV_TAG — using current"
+          fi
+          rm -rf migrations alembic
+          git checkout "$PREV_TAG" -- migrations 2>/dev/null || git checkout "$PREV_TAG" -- alembic 2>/dev/null || true
+
+          if [ -f alembic.ini ]; then
+            alembic upgrade head || { echo "FAIL: previous tag migrations failed to apply"; exit 1; }
+            echo "old DB at $PREV_TAG applied"
+          else
+            echo "no migrations at $PREV_TAG — old DB is empty"
+          fi
+
+          [ -f /tmp/curr_alembic.ini ] && cp /tmp/curr_alembic.ini alembic.ini || true
+          rm -rf migrations alembic
+          [ -d /tmp/curr_migrations/migrations ] && cp -r /tmp/curr_migrations/migrations ./ || true
+          [ -d /tmp/curr_migrations/alembic ] && cp -r /tmp/curr_migrations/alembic ./ || true
+
+          if [ -f alembic.ini ]; then
+            alembic upgrade head || { echo "FAIL: N-1 forward migration (old DB -> current) failed"; exit 1; }
+            CUR=$(alembic current 2>/dev/null | grep -v '^$' | tail -1 | awk '{print $1}')
+            HD=$(alembic heads | grep -v '^$' | tail -1 | awk '{print $1}')
+            if [ -z "$CUR" ] || [ "$CUR" != "$HD" ]; then
+              echo "FAIL: N-1 forward upgrade incomplete (current='$CUR' head='$HD')"
+              exit 1
+            fi
+            echo "N-1 forward migration OK (current == head: $CUR)"
+          fi
+
+          PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+          if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+            "$PY" -c "import $PKG.main; print('import $PKG.main OK against N-1 DB')" || { echo "FAIL: current code cannot import against N-1 DB"; exit 1; }
+          fi
+
+          if [ -d tests ] && ls tests/test_*.py 1>/dev/null 2>&1; then
+            "$PY" -m pytest tests -q || { echo "FAIL: tests failed on N-1-migrated DB"; exit 1; }
+          fi
+          echo "N-1 compat OK"
+
+  # ── #6 Rotation age — vault ages when wired; repo heuristic otherwise (Tier 1 gitleaks covers per-push secrets) ──
+  rotation-check:
+    name: rotation-check
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    # NOTE: `secrets.` context is ILLEGAL in job-level if (workflow rejected).
+    # Vault-vs-heuristic mode is chosen inside the step via env presence.
+    if: vars.STAGING_NO_ROTATION != 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 50
+      - name: Secret rotation age
+        env:
+          VAULT_ADDR: {% raw %}${{ secrets.VAULT_ADDR }}{% endraw %}
+          VAULT_TOKEN: {% raw %}${{ secrets.VAULT_TOKEN }}{% endraw %}
+        run: |
+          ROT_DAYS={{ rotation_days | default(90) }}
+          echo "rotation budget: ${ROT_DAYS}d"
+
+          if [ -n "$VAULT_ADDR" ] && [ -n "$VAULT_TOKEN" ]; then
+            echo "vault mode — checking ages"
+            for path in secret/data/jwt secret/data/db secret/data/app; do
+              meta=$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/$path" 2>/dev/null || true)
+              if [ -z "$meta" ]; then echo "  · $path: no data (skipped)"; continue; fi
+              created=$(echo "$meta" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data',{}).get('metadata',{}).get('created_time','') or d.get('data',{}).get('created_time',''))" 2>/dev/null || true)
+              if [ -z "$created" ] || [ "$created" = "None" ]; then echo "  · $path: no created_time (skipped)"; continue; fi
+              age_days=$(python3 -c "import datetime; c=datetime.datetime.fromisoformat('$created'.replace('Z','+00:00')); print((datetime.datetime.now(datetime.timezone.utc)-c).days)" 2>/dev/null || echo 0)
+              echo "  · $path: age ${age_days}d (created $created)"
+              if [ "$age_days" -gt "$ROT_DAYS" ]; then echo "FAIL: $path age ${age_days}d exceeds ${ROT_DAYS}d — rotate"; exit 1; fi
+            done
+            echo "Vault rotation check OK"
+            exit 0
+          fi
+
+          echo "no vault — repo heuristic mode"
+          if grep -r "JWT_SECRET.*=.*['\"][^'\"]\\{8,\\}['\"]" --include="*.py" --include="*.env*" . 2>/dev/null | grep -v "os.environ" | grep -v "example" | head -n 5; then
+            echo "FAIL: hardcoded secret-like assignment found — must come from env/vault"
+            exit 1
+          fi
+          oldest=$(git log -1 --format=%ct -- .env.example 2>/dev/null || echo "")
+          if [ -n "$oldest" ]; then
+            age_days=$(( ($(date +%s) - oldest) / 86400 ))
+            echo "  · repo secret-docs age: ${age_days}d"
+            if [ "$age_days" -gt "$ROT_DAYS" ]; then
+              echo "WARN: secret docs unchanged for ${age_days}d — consider rotation review (heuristic, not blocking)"
+            fi
+          fi
+          echo "Rotation check OK (heuristic)"
+
+  # ── #10 Multi-worker audit — 2 workers, concurrent burst (dead fallback removed) ──
+  multi-worker:
+    name: multi-worker
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    needs: [changes]
+    if: hashFiles('**/main.py') != '' && needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache venv (shared key)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+          restore-keys: {% raw %}venv-fast-${{ runner.os }}-{% endraw %}
+      - name: Multi-worker — prove no in-memory singleton races
+        run: |
+          VENV=$HOME/.venv-fast
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --upgrade pip
+          fi
+          "$VENV/bin/pip" install --quiet fastapi uvicorn gunicorn httpx
+          [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+          export PATH="$VENV/bin:$PATH"
+
+          PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+          if [ -z "$PKG" ] || [ ! -f "$PKG/main.py" ]; then
+            echo "no main.py — multi-worker skipped"
+            exit 0
+          fi
+
+          if ! grep -R "workers\|--workers\|WEB_CONCURRENCY\|gunicorn" --include="*.py" --include="Dockerfile*" --include="Procfile" --include="*.yml" --include="*.yaml" . >/dev/null 2>&1; then
+            echo "WARN: no workers declaration found — probing 2 workers anyway (staging standard)"
+          fi
+
+          gunicorn "$PKG.main:app" -w 2 -k uvicorn.workers.UvicornWorker --bind 127.0.0.1:8000 --timeout 30 > /tmp/gunicorn.log 2>&1 &
+          SERVER_PID=$!
+          trap "kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null || true" EXIT
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000{{ health_path | default('/health') }} >/dev/null 2>&1 && break; sleep 1; done
+          curl -sf http://127.0.0.1:8000{{ health_path | default('/health') }} >/dev/null || { echo "FAIL: /health unreachable with 2 workers"; exit 1; }
+
+          python3 << 'PYEOF'
+          import httpx, asyncio
+          async def burst():
+              async with httpx.AsyncClient(timeout=10) as c:
+                  rs = await asyncio.gather(*[c.get("http://127.0.0.1:8000{{ health_path | default('/health') }}") for _ in range(30)])
+                  bad = [r.status_code for r in rs if r.status_code != 200]
+                  if bad:
+                      raise SystemExit(f"FAIL: {len(bad)}/30 requests non-200 with 2 workers: {bad[:5]}")
+                  print("multi-worker burst OK — 30/30 x 200 with 2 workers")
+          asyncio.run(burst())
+          PYEOF
+          if grep -q "Traceback" /tmp/gunicorn.log 2>/dev/null; then
+            echo "FAIL: Tracebacks logged under concurrent load:"
+            tail -n 60 /tmp/gunicorn.log
+            exit 1
+          fi
+          echo "Multi-worker OK — no Tracebacks under load"
+
+  # ── #18 DNS preflight — live-only, JOB-level skip when unwired (0 boots) ──
+  dns-preflight:
+    name: dns-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    # inputs.staging_url (not a bare dispatch clause) so a bare dispatch does
+    # not boot runners that would instantly no-op
+    if: vars.STAGING_NO_LIVE != 'true' && (vars.STAGING_URL != '' || inputs.staging_url != '')
+    steps:
+      - name: DNS preflight
+        env:
+          STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
+          INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
+          INTERNAL_DNS: {% raw %}${{ vars.STAGING_INTERNAL_DNS || '' }}{% endraw %}
+        run: |
+{{ URL_PROLOGUE | indent(10, true) }}
+          if [ -z "$URL" ] || [ "$URL" = "" ]; then
+            echo "dispatch without input — dns-preflight skipped"
+            exit 0
+          fi
+          echo "STAGING_URL=$URL"
+          HOST=$(echo "$URL" | sed -E 's|https?://||' | cut -d/ -f1 | cut -d: -f1)
+          echo "host=$HOST"
+
+          if ! command -v dig >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils; fi
+
+          dig +short A "$HOST" > /tmp/dig_a.txt 2>&1; cat /tmp/dig_a.txt
+          if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /tmp/dig_a.txt; then
+            if [ "$INTERNAL_DNS" = "true" ]; then
+              echo "WARN: no public A record for $HOST — STAGING_INTERNAL_DNS=true, treating as internal hostname (not a failure)"
+            else
+              echo "FAIL: DNS A record missing for $HOST (split-horizon/internal host? set vars.STAGING_INTERNAL_DNS=true)"
+              exit 1
+            fi
+          else
+            echo "DNS A OK"
+          fi
+
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -I "$URL{{ health_path | default('/health') }}" 2>/dev/null || echo 000)
+          if [ "$code" = "000" ] && curl -sk -o /dev/null --max-time 10 -I "$URL{{ health_path | default('/health') }}" 2>/dev/null; then
+            echo "WARN: edge unreachable over verified TLS but responds with -k (self-signed/internal CA) — accepted"
+            code=200
+          fi
+          if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then
+            code2=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -I "$URL/" 2>/dev/null || echo 000)
+            if [ "$code2" = "000" ] || [ "$code2" -ge 500 ]; then
+              echo "FAIL: edge HEAD failed — /health=$code /=$code2"
+              exit 1
+            fi
+            echo "DNS preflight OK (edge / OK, code $code2)"
+          else
+            echo "DNS preflight OK (edge /health $code)"
+          fi
+
+  # ── #17 TLS monitor — configurable budget, live-only job guard ──
+  tls-check:
+    name: tls-check
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: vars.STAGING_NO_LIVE != 'true' && (vars.STAGING_URL != '' || inputs.staging_url != '')
+    steps:
+      - name: TLS expiry check
+        env:
+          STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
+          INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
+        run: |
+{{ URL_PROLOGUE | indent(10, true) }}
+          if [ -z "$URL" ] || [ "$URL" = "" ]; then
+            echo "dispatch without input — tls-check skipped"
+            exit 0
+          fi
+          case "$URL" in https://*) ;; *) echo "STAGING_URL is not https — tls-check skipped ($URL)"; exit 0;; esac
+          HOST=$(echo "$URL" | sed -E 's|https://||' | cut -d/ -f1 | cut -d: -f1)
+          PORT=$(echo "$URL" | sed -E 's|https://[^/:]+||' | sed -E 's|^:||' | cut -d/ -f1); [ -z "$PORT" ] && PORT=443
+          echo "checking TLS for $HOST:$PORT"
+
+          TLS_MIN={{ tls_min_days | default(30) }}
+          enddate=$(echo | openssl s_client -connect "$HOST:$PORT" -servername "$HOST" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          if [ -z "$enddate" ]; then echo "FAIL: cannot fetch TLS cert for $HOST:$PORT"; exit 1; fi
+          echo "cert notAfter: $enddate"
+          exp=$(date -d "$enddate" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$enddate" +%s 2>/dev/null || echo 0)
+          if [ "$exp" = "0" ]; then echo "WARN: cannot parse cert date — skipping expiry gate"; exit 0; fi
+          days_left=$(( (exp - $(date +%s)) / 86400 ))
+          echo "days left: $days_left (budget ${TLS_MIN}d)"
+          if [ "$days_left" -lt "$TLS_MIN" ]; then echo "FAIL: TLS cert expires in ${days_left}d (<${TLS_MIN}d) for $HOST"; exit 1; fi
+          if [ "$days_left" -lt $((TLS_MIN + 15)) ]; then echo "WARN: TLS cert <$((TLS_MIN + 15))d — renew soon"; fi
+          echo "TLS OK — ${days_left}d remaining"
+
+  # ── #19 External service smoke — live-only job guard ──
+  external-smoke:
+    name: external-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    # external targets may be configured WITHOUT a staging URL (EXTERNAL_SMOKE_URLS)
+    if: vars.STAGING_NO_LIVE != 'true' && (vars.STAGING_URL != '' || inputs.staging_url != '' || vars.EXTERNAL_SMOKE_URLS != '')
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: External service smoke (staging sandbox only)
+        env:
+          STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
+          INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
+          EXTERNAL_SMOKE_URLS: {% raw %}${{ vars.EXTERNAL_SMOKE_URLS || '' }}{% endraw %}
+        run: |
+{{ URL_PROLOGUE | indent(10, true) }}
+
+          TARGETS=""
+          if [ -n "$EXTERNAL_SMOKE_URLS" ]; then
+            TARGETS="$EXTERNAL_SMOKE_URLS"
+          elif [ -n "$URL" ] && [ "$URL" != "" ]; then
+            TARGETS="$URL{{ health_path | default('/health') }} $URL{{ ready_path | default('/ready') }}"
+          fi
+          if [ -f .staging-smoke.txt ]; then
+            extra=$(grep -v '^#' .staging-smoke.txt | grep -v '^$' | tr '\n' ' ' || true)
+            TARGETS="$TARGETS $extra"
+          fi
+          if [ -z "$(echo "$TARGETS" | tr -d ' ')" ]; then
+            echo "dispatch without targets — external-smoke skipped"
+            exit 0
+          fi
+          echo "targets: $TARGETS"
+          fail=0
+          for t in $TARGETS; do
+            echo "— GET $t"
+            code=$(curl -s -o /tmp/ext_body.txt -w "%{http_code}" --max-time 15 "$t" 2>/dev/null || echo 000)
+            if [ "$code" = "000" ] && curl -sk -o /dev/null --max-time 15 "$t" 2>/dev/null; then
+              echo "  WARN: unreachable over verified TLS but responds with -k (self-signed/internal CA) — accepted"
+              code=200
+            fi
+            echo "  -> $code $(head -c 200 /tmp/ext_body.txt | tr '\n' ' ')"
+            case "$t" in
+              *{{ ready_path | default('/ready') }}) if [ "$code" = "404" ]; then echo "  WARN: ready probe not implemented — not a failure"; continue; fi ;;
+            esac
+            if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then echo "  FAIL: $t -> $code"; fail=1; fi
+          done
+          if [ "$fail" != "0" ]; then echo "FAIL: one or more external targets 5xx/unreachable"; exit 1; fi
+          echo "External smoke OK"
+
+  # ── #20 k6 load — configurable thresholds, cached binary, ephemeral fallback ──
+  k6-load:
+    name: k6-load
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: vars.STAGING_NO_K6 != 'true' && (hashFiles('**/main.py') != '' || vars.STAGING_URL != '' || inputs.staging_url != '') && needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache k6 binary
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/k6.tar.gz
+          key: k6-{{ k6_version | default('0.54.0') }}-linux-amd64
+      - name: Cache venv (shared key)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+          restore-keys: {% raw %}venv-fast-${{ runner.os }}-{% endraw %}
+      - name: k6 — load against staging (or ephemeral localhost)
+        env:
+          STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
+          INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
+          NO_LIVE: {% raw %}${{ vars.STAGING_NO_LIVE || '' }}{% endraw %}
+        run: |
+{{ URL_PROLOGUE | indent(10, true) }}
+          if [ "$NO_LIVE" = "true" ] && [ -n "$URL" ]; then
+            echo "STAGING_NO_LIVE=true — ignoring live STAGING_URL, forcing ephemeral target"
+            URL=""
+          fi
+          if [ -z "$URL" ] || [ "$URL" = "" ]; then
+            echo "no STAGING_URL — k6 will run against ephemeral localhost"
+            URL="http://127.0.0.1:8000"
+            VENV=$HOME/.venv-fast
+            if [ ! -x "$VENV/bin/python" ]; then
+              python3 -m venv "$VENV"
+              "$VENV/bin/pip" install --quiet --upgrade pip
+            fi
+            "$VENV/bin/pip" install --quiet fastapi uvicorn
+            [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+            PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+            if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+              "$VENV/bin/python" -m uvicorn "$PKG.main:app" --host 127.0.0.1 --port 8000 > /tmp/k6-server.log 2>&1 &
+              EPH_PID=$!
+              trap "kill $EPH_PID 2>/dev/null || true" EXIT
+              for i in $(seq 1 30); do curl -sf "$URL{{ health_path | default('/health') }}" >/dev/null 2>&1 && break; sleep 1; done
+              curl -sf "$URL{{ health_path | default('/health') }}" >/dev/null || { echo "ephemeral app failed to start — k6 skipped"; exit 0; }
+              echo "ephemeral app at $URL"
+            else
+              echo "no main.py — k6 skipped (need either STAGING_URL or a runnable app)"
+              exit 0
+            fi
+          fi
+          echo "k6 target: $URL"
+
+          if [ ! -f /tmp/k6.tar.gz ]; then
+            curl -sSfL https://github.com/grafana/k6/releases/download/v{{ k6_version | default('0.54.0') }}/k6-v{{ k6_version | default('0.54.0') }}-linux-amd64.tar.gz -o /tmp/k6.tar.gz
+          fi
+          tar -xzf /tmp/k6.tar.gz -C /tmp
+          K6=/tmp/k6-v{{ k6_version | default('0.54.0') }}-linux-amd64/k6
+          chmod +x "$K6"
+
+          SCRIPT=""
+          for c in k6/script.js tests/k6.js load/k6.js; do [ -f "$c" ] && SCRIPT="$c" && break; done
+          if [ -z "$SCRIPT" ]; then
+            cat > /tmp/k6-smoke.js << 'JS'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          export const options = {
+            vus: Number(__ENV.VUS),
+            duration: __ENV.DURATION,
+            thresholds: {
+              http_req_failed: [`rate<${Number(__ENV.ERR_PCT) / 100}`],
+              http_req_duration: [`p(95)<${Number(__ENV.P95_MS)}`],
+            },
+          };
+          export default function () {
+            const r = http.get(`${__ENV.TARGET_URL}{{ health_path | default('/health') }}`);
+            check(r, { '200': (x) => x.status === 200 });
+            sleep(0.1);
+          }
+          JS
+            SCRIPT=/tmp/k6-smoke.js
+          fi
+          echo "k6 script: $SCRIPT (vus={{ k6_vus | default(10) }} dur={{ k6_duration_s | default(30) }}s p95={{ k6_p95_ms | default(500) }}ms err={{ k6_error_rate_pct | default(1) }}%)"
+          TARGET_URL="$URL" VUS='{{ k6_vus | default(10) }}' DURATION='{{ k6_duration_s | default(30) }}s' P95_MS='{{ k6_p95_ms | default(500) }}' ERR_PCT='{{ k6_error_rate_pct | default(1) }}' "$K6" run "$SCRIPT" || { echo "FAIL: k6 thresholds breached"; exit 1; }
+          if [ -f /tmp/k6-server.log ] && grep -q "Traceback" /tmp/k6-server.log 2>/dev/null; then
+            echo "FAIL: Tracebacks in ephemeral k6 target:"
+            tail -n 40 /tmp/k6-server.log; exit 1
+          fi
+          echo "k6 load OK"
+
+  # ── Staging live smoke — /ready semantic matrix (200·404·503-aware) ──
+  staging-smoke:
+    name: staging-smoke
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: (hashFiles('**/main.py') != '' || vars.STAGING_URL != '' || inputs.staging_url != '') && needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache venv (shared key)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+          restore-keys: {% raw %}venv-fast-${{ runner.os }}-{% endraw %}
+      - name: Staging smoke — hit STAGING_URL or ephemeral stack, assert health + readiness semantics
+        env:
+          STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
+          INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
+          NO_LIVE: {% raw %}${{ vars.STAGING_NO_LIVE || '' }}{% endraw %}
+        run: |
+{{ URL_PROLOGUE | indent(10, true) }}
+          if [ "$NO_LIVE" = "true" ] && [ -n "$URL" ]; then
+            echo "STAGING_NO_LIVE=true — ignoring live STAGING_URL, forcing ephemeral stack"
+            URL=""
+          fi
+          if [ -z "$URL" ] || [ "$URL" = "" ]; then
+            echo "no STAGING_URL — spinning ephemeral stack on localhost"
+            URL="http://127.0.0.1:8000"
+            VENV=$HOME/.venv-fast
+            if [ ! -x "$VENV/bin/python" ]; then
+              python3 -m venv "$VENV"
+              "$VENV/bin/pip" install --quiet --upgrade pip
+            fi
+            "$VENV/bin/pip" install --quiet fastapi uvicorn httpx
+            [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+            PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+            if [ -z "$PKG" ] || [ ! -f "$PKG/main.py" ]; then
+              echo "no main.py — staging-smoke skipped"
+              exit 0
+            fi
+            "$VENV/bin/python" -m uvicorn "$PKG.main:app" --host 127.0.0.1 --port 8000 > /tmp/smoke-server.log 2>&1 &
+            EPH_PID=$!
+            trap "kill $EPH_PID 2>/dev/null || true" EXIT
+            for i in $(seq 1 30); do curl -sf "$URL{{ health_path | default('/health') }}" >/dev/null 2>&1 && break; sleep 1; done
+          fi
+          echo "staging smoke target: $URL"
+
+          code_h=$(curl -s -o /tmp/h.json -w "%{http_code}" --max-time 10 "$URL{{ health_path | default('/health') }}" 2>/dev/null || echo 000)
+          echo "/health -> $code_h $(cat /tmp/h.json 2>/dev/null | head -c 300)"
+          if [ "$code_h" != "200" ]; then echo "FAIL: $URL/health -> $code_h"; exit 1; fi
+
+          code_r=$(curl -s -o /tmp/r.json -w "%{http_code}" --max-time 10 "$URL{{ ready_path | default('/ready') }}" 2>/dev/null || echo 000)
+          body_r=$(head -c 400 /tmp/r.json 2>/dev/null | tr '\n' ' ')
+          case "$code_r" in
+            200)
+              echo "/ready -> 200 $body_r"
+              echo "Readiness OK" ;;
+            404)
+              echo "WARN: /ready -> 404 — readiness probe NOT IMPLEMENTED (apply feature-health template). Not a staging failure."
+              { echo ""; echo "⚠️ /ready 404 — readiness probe not implemented (apply \`feature-health\`)"; } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true ;;
+            503)
+              echo "FAIL: /ready -> 503 — DB genuinely down per readiness contract"
+              echo "body: $body_r"
+              exit 1 ;;
+            *)
+              echo "FAIL: /ready -> $code_r (unexpected)"
+              echo "body: $body_r"
+              exit 1 ;;
+          esac
+          if [ -f /tmp/smoke-server.log ] && grep -q "Traceback" /tmp/smoke-server.log 2>/dev/null; then
+            echo "FAIL: Tracebacks in smoke target:"
+            tail -n 40 /tmp/smoke-server.log; exit 1
+          fi
+          echo "Staging smoke OK — $URL answers /health (+ readiness semantics respected)"
+
+  # ── Summary — results table in $GITHUB_STEP_SUMMARY + strict failure propagation ──
+  keploy-replay:
+    name: keploy-replay
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    needs: [changes]
+    # Opt-in dependency virtualization (Keploy): replays recorded API/DB flows
+    # offline via eBPF capture. Boots only when recorded suites exist
+    # (keploy/**) and the kill switch is off. Real Postgres drills above are
+    # NOT replaced — this adds coverage for external/DB flows you recorded.
+    if: >-
+      vars.STAGING_NO_KEPLOY != 'true' &&
+      hashFiles('keploy/**') != '' &&
+      needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('**/main.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Install pinned Keploy binary
+        env:
+          KEPLOY_VERSION: '{{ keploy_version | default("v3.6.25") }}'
+        run: |
+          curl -sSfL "https://github.com/keploy/keploy/releases/download/${KEPLOY_VERSION}/keploy_linux_amd64.tar.gz" -o /tmp/keploy.tar.gz \
+            || { echo "FAIL: pinned keploy download failed (${KEPLOY_VERSION})"; exit 1; }
+          sudo tar -xzf /tmp/keploy.tar.gz -C /usr/local/bin keploy
+          keploy --version
+      - name: Replay recorded suites against an ephemeral app
+        env:
+          HEALTH_PATH: "{{ health_path | default('/health') }}"
+        run: |
+          APP_CMD=""
+          PY_MAIN=$(find . -maxdepth 3 -name 'main.py' -not -path './venv*' -not -path './node_modules/*' -print -quit 2>/dev/null)
+          if [ -n "$PY_MAIN" ] && [ -f requirements.txt ]; then
+            python -m venv /tmp/kvenv
+            /tmp/kvenv/bin/pip install --quiet -r requirements.txt uvicorn fastapi || true
+            PKG=""
+            for d in $(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||'); do
+              [ -f "$d/main.py" ] && PKG="$d" && break
+            done
+            [ -n "$PKG" ] && APP_CMD="/tmp/kvenv/bin/python -m uvicorn $PKG.main:app --host 127.0.0.1 --port 8000"
+          elif [ -f package.json ] && grep -q '"start"' package.json; then
+            npm install --silent || true
+            APP_CMD="npm start"
+          fi
+          if [ -z "$APP_CMD" ]; then
+            echo "no runnable app entry detected — keploy-replay skipped"
+            exit 0
+          fi
+          echo "app command: $APP_CMD"
+          sudo keploy test -c "$APP_CMD" --delay 10 || {
+            echo "FAIL: keploy replay found failing test cases — see keploy test reports above"
+            exit 1
+          }
+          echo "KEPLOY-REPLAY OK"
+
+  staging-summary:
+    name: staging-summary
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    needs: [changes, backup-drill, n-minus-one, rotation-check, multi-worker, dns-preflight, tls-check, external-smoke, k6-load, staging-smoke, keploy-replay]
+    if: always() && !cancelled()
+    steps:
+      - name: Staging gate summary
+        env:
+          R_CHANGES: {% raw %}${{ needs.changes.result }}{% endraw %}
+          R_BACKUP: {% raw %}${{ needs.backup-drill.result }}{% endraw %}
+          R_N1: {% raw %}${{ needs.n-minus-one.result }}{% endraw %}
+          R_ROT: {% raw %}${{ needs.rotation-check.result }}{% endraw %}
+          R_WORK: {% raw %}${{ needs.multi-worker.result }}{% endraw %}
+          R_DNS: {% raw %}${{ needs.dns-preflight.result }}{% endraw %}
+          R_TLS: {% raw %}${{ needs.tls-check.result }}{% endraw %}
+          R_EXT: {% raw %}${{ needs.external-smoke.result }}{% endraw %}
+          R_K6: {% raw %}${{ needs.k6-load.result }}{% endraw %}
+          R_SMOKE: {% raw %}${{ needs.staging-smoke.result }}{% endraw %}
+          R_KEPLOY: {% raw %}${{ needs.keploy-replay.result }}{% endraw %}
+          MODE: {% raw %}${{ (vars.STAGING_URL != '' || inputs.staging_url != '') && 'STAGING_URL (live)' || 'ephemeral/local' }}{% endraw %}
+        run: |
+          echo "================ STAGING GATE ================"
+          echo "changes:   $R_CHANGES"
+          echo "backup:    $R_BACKUP"
+          echo "n-1:       $R_N1"
+          echo "rotation:  $R_ROT"
+          echo "workers:   $R_WORK"
+          echo "dns:       $R_DNS"
+          echo "tls:       $R_TLS"
+          echo "external:  $R_EXT"
+          echo "k6:        $R_K6"
+          echo "smoke:     $R_SMOKE"
+          echo "=============================================="
+
+          {
+            echo "## Staging gate (Tier 2)"
+            echo ""
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| backend-changes | $R_CHANGES |"
+            echo "| backup-drill | $R_BACKUP |"
+            echo "| n-minus-one | $R_N1 |"
+            echo "| rotation-check | $R_ROT |"
+            echo "| multi-worker | $R_WORK |"
+            echo "| dns-preflight | $R_DNS |"
+            echo "| tls-check | $R_TLS |"
+            echo "| external-smoke | $R_EXT |"
+            echo "| k6-load | $R_K6 |"
+          echo "| keploy-replay | $R_KEPLOY |"
+            echo "| staging-smoke | $R_SMOKE |"
+            echo ""
+            echo "mode: **$MODE** · skipped = infra absent, never a failure"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          mkdir -p _gate
+          GATE_TIER=T2 python3 - << 'PY'
+          import json, os
+          pairs = [
+              ("backend-changes", "R_CHANGES"),
+              ("backup-drill", "R_BACKUP"),
+              ("n-minus-one", "R_N1"),
+              ("rotation-check", "R_ROT"),
+              ("multi-worker", "R_WORK"),
+              ("dns-preflight", "R_DNS"),
+              ("tls-check", "R_TLS"),
+              ("external-smoke", "R_EXT"),
+              ("k6-load", "R_K6"),
+              ("staging-smoke", "R_SMOKE"),
+              ("keploy-replay", "R_KEPLOY"),
+          ]
+          jobs = dict((name, os.environ.get(env, "unknown")) for name, env in pairs)
+          failed = sorted(k for k, v in jobs.items() if v == "failure")
+          doc = {
+              "schema": "gate-summary/v1",
+              "tier": os.environ.get("GATE_TIER", "T2"),
+              "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+              "run_id": int(os.environ.get("GITHUB_RUN_ID") or 0),
+              "run_url": "{}/{}/actions/runs/{}".format(
+                  os.environ.get("GITHUB_SERVER_URL", ""),
+                  os.environ.get("GITHUB_REPOSITORY", ""),
+                  os.environ.get("GITHUB_RUN_ID", "")),
+              "branch": os.environ.get("GITHUB_REF_NAME", ""),
+              "sha": os.environ.get("GITHUB_SHA", ""),
+              "conclusion": "failure" if failed else "success",
+              "jobs": jobs,
+              "failed_jobs": failed,
+              "mode": os.environ.get("MODE", ""),
+              "notes": ["skipped = infra absent; never a failure"],
+          }
+          with open("_gate/gate-summary.json", "w") as f:
+              json.dump(doc, f, indent=2)
+          print("gate-summary:", json.dumps(doc)[:400])
+          PY
+
+          fail=0
+          for r in "$R_CHANGES" "$R_BACKUP" "$R_N1" "$R_ROT" "$R_WORK" "$R_DNS" "$R_TLS" "$R_EXT" "$R_K6" "$R_SMOKE" "$R_KEPLOY"; do
+            # skipped = infra absent (fine); anything that is not success/skipped fails
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then fail=1; break; fi
+          done
+          if [ "$fail" != "0" ]; then echo "FAIL: staging gate has a failed job"; exit 1; fi
+          echo "STAGING-READY — all integration proofs passed (skipped = no infra, not a failure)"
+
+      - name: Upload gate summary (machine-readable)
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-summary-T2
+          path: _gate/gate-summary.json
+          if-no-files-found: ignore
+          retention-days: 30

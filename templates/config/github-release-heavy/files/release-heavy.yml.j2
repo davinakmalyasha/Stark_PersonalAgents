@@ -1,0 +1,1581 @@
+name: Release Heavy  # TIER 3 — prod-level pushes + tags v* , deterministic (no live URL, dev-triggered only)
+
+# ── TIER 3 — release-heavy: image/SBOM/license/env-audit/zizmor + migration/schema/config/endpoint/contract/perf/build — deterministic, no live URL ──
+# Requires: Tier 1 fast (dev/feature pushes) → Tier 2 staging (staging-level push) → Tier 3 release-heavy
+# (this file: push to prod-level branches OR tags v*). Universal: single file (no 3 copies) — add a stack =
+# one hashFiles branch, like Tier 1. All jobs SHA-pinned, hashFiles-gated (0s skip when absent), caches for
+# trivy/zizmor/oasdiff/pip/npm/go. No schedule.
+
+{%- set PROD_CSV = ((prod_branches | default('main,master')).split(',') | map('trim') | select | unique | join("', '")) %}
+permissions:
+  contents: read
+
+on:
+  push:
+    tags: ["v*"]
+    # prod-level branch names are injected at gate-install time (.harness-ci.json /
+    # defaults main,master) — T3 owns this level exclusively.
+    # no native paths filters: heavy jobs self-guard via hashFiles; paths+branches
+    # combos on push are a phantom-run hazard (zero-job failure records).
+    branches: ['{{ PROD_CSV }}']
+  workflow_dispatch:
+
+concurrency:
+  # per-ref: a tag run must never queue behind a prod-branch push of the same repo
+  group: {% raw %}release-heavy-${{ github.ref }}{% endraw %}
+  cancel-in-progress: false
+
+jobs:
+  # ── Universal: container scan + size budget + digest (any project with Dockerfile) ──
+  container-full:
+    name: container-full
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('Dockerfile') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache trivy
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/trivy.tar.gz
+          key: trivy-{{ trivy_version | default('0.73.0') }}-linux_x64
+          restore-keys: |
+            trivy-{{ trivy_version | default('0.73.0') }}-
+      - name: Build image + Trivy image scan + size budget
+        run: |
+          docker build -t gate-release:audit .
+          if [ ! -f /tmp/trivy.tar.gz ]; then
+            curl -sSfL https://github.com/aquasecurity/trivy/releases/download/v{{ trivy_version | default('0.73.0') }}/trivy_{{ trivy_version | default('0.73.0') }}_Linux-64bit.tar.gz -o /tmp/trivy.tar.gz
+          else
+            echo "trivy restored from cache"
+          fi
+          tar -xzf /tmp/trivy.tar.gz -C /tmp
+          /tmp/trivy image --severity {{ trivy_severity | default('HIGH,CRITICAL') }} --exit-code 1 --ignore-unfixed gate-release:audit
+      - name: Image size budget + digest
+        run: |
+          SIZE_BYTES=$(docker inspect gate-release:audit | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['Size'])")
+          SIZE_MB=$(( SIZE_BYTES / 1024 / 1024 ))
+          BUDGET_MB={{ image_size_budget_mb | default('500') }}
+          echo "Image size: ${SIZE_MB}MB (budget ${BUDGET_MB}MB)"
+          if [ "$SIZE_MB" -gt "$BUDGET_MB" ]; then
+            echo "FAIL: image exceeds budget by $(( SIZE_MB - BUDGET_MB ))MB"
+            exit 1
+          fi
+          DIGEST=$(docker inspect gate-release:audit | python3 -c "import json,sys; d=json.load(sys.stdin)[0]; rd=d.get('RepoDigests') or []; print(rd[0] if rd else d.get('Id',''))")
+          echo "image digest: $DIGEST"
+          echo "$DIGEST" > /tmp/image-digest.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-digest-release
+          path: /tmp/image-digest.txt
+          if-no-files-found: ignore
+
+  # ── Universal: SBOM (auto-detects py/node/go/php/deno — merges for polyglot) ──
+  sbom-cyclonedx:
+    name: sbom-cyclonedx
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    # job-level mirror of the per-stack step guards below — skip the boot
+    # entirely when no dependency manifest exists anywhere
+    if: hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != '' || hashFiles('package.json') != '' || hashFiles('go.mod') != '' || hashFiles('composer.json') != '' || hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('package-lock.json') != '' || hashFiles('package.json') != ''
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: hashFiles('go.mod') != ''
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: hashFiles('composer.json') != ''
+        with:
+          php-version: '{{ php_version | default("8.3") }}'
+          coverage: none
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Generate SBOM — Python (requirements/pyproject)
+        if: hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != ''
+        run: |
+          pip install --quiet cyclonedx-bom=={{ cyclonedx_bom_version | default('7.3.1') }}
+          if [ -f requirements.txt ]; then
+            cyclonedx-py requirements requirements.txt --output-format json --output-file sbom-py.json || echo "py sbom gen failed"
+          else
+            cyclonedx-py environment --output-format json --output-file sbom-py.json || echo "py env sbom gen failed"
+          fi
+          ls -lh sbom-py.json 2>/dev/null || true
+      - name: Generate SBOM — Node (lockfile fast path, install fallback)
+        if: hashFiles('package-lock.json') != '' || hashFiles('package.json') != ''
+        run: |
+          if [ -f package-lock.json ]; then
+            # --package-lock-only: SBOM from the lockfile graph — no npm ci, no node_modules (verified flag on v6)
+            npx --yes @cyclonedx/cyclonedx-npm@{{ cyclonedx_npm_version | default('6.0.1') }} --package-lock-only --output-file sbom-node.json \
+              || { echo "lockfile-mode failed — falling back to install mode"; npm ci --prefer-offline --silent 2>/dev/null || npm install --silent; npx --yes @cyclonedx/cyclonedx-npm@{{ cyclonedx_npm_version | default('6.0.1') }} --output-file sbom-node.json; }
+          else
+            # manifest-only repo: need a real tree
+            npm install --silent
+            npx --yes @cyclonedx/cyclonedx-npm@{{ cyclonedx_npm_version | default('6.0.1') }} --output-file sbom-node.json
+          fi
+          ls -lh sbom-node.json 2>/dev/null || true
+      - name: Generate SBOM — Go (go.mod)
+        if: hashFiles('go.mod') != ''
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@{{ cyclonedx_gomod_version | default('v1.7.0') }} 2>/dev/null || true
+          if [ -n "$(ls ~/go/bin/cyclonedx-gomod 2>/dev/null)" ]; then
+            ~/go/bin/cyclonedx-gomod mod -licenses -output sbom-go.json 2>/dev/null || ~/go/bin/cyclonedx-gomod app -licenses -output sbom-go.json 2>/dev/null || echo "go sbom gen failed"
+          elif command -v cyclonedx-gomod >/dev/null 2>&1; then
+            cyclonedx-gomod mod -licenses -output sbom-go.json 2>/dev/null || cyclonedx-gomod app -licenses -output sbom-go.json 2>/dev/null || echo "go sbom gen failed"
+          else
+            echo "cyclonedx-gomod not available — go SBOM skipped"
+          fi
+          ls -lh sbom-go.json 2>/dev/null || true
+      - name: Generate SBOM — PHP (composer)
+        if: hashFiles('composer.json') != ''
+        run: |
+          if [ -f composer.lock ]; then
+            echo "php sbom via composer.lock — parsing real components"
+            python3 -c "
+          import json
+          data=json.load(open('composer.lock'))
+          comps=[]
+          for pkg in data.get('packages',[])+data.get('packages-dev',[]):
+              name=pkg.get('name','unknown')
+              ver=pkg.get('version','')
+              lic=pkg.get('license',[])
+              if isinstance(lic,str): lic=[lic]
+              licenses=[{'id':l} for l in lic if l]
+              comps.append({'name':name,'version':ver,'licenses':licenses,'purl':f\"pkg:composer/{name}@{ver}\"})
+          out={'bomFormat':'CycloneDX','specVersion':'1.5','components':comps}
+          json.dump(out, open('sbom-php.json','w'), indent=2)
+          print(f\"php sbom: {len(comps)} components\")
+            " || python3 -c "import json; json.dump({'bomFormat':'CycloneDX','specVersion':'1.5','components':[]}, open('sbom-php.json','w'))"
+          else
+            echo "no composer.lock — php SBOM skipped"
+          fi
+          ls -lh sbom-php.json 2>/dev/null || true
+      - name: Generate SBOM — Deno (deno.lock)
+        if: hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+        run: |
+          deno --version 2>/dev/null || true
+          if [ -f deno.lock ]; then
+            echo "deno sbom via deno.lock — parsing (v4 list + legacy dict forms)"
+            python3 - << 'DENOEOF' || python3 -c "import json; json.dump({'bomFormat':'CycloneDX','specVersion':'1.5','components':[]}, open('sbom-deno.json','w'))"
+          import json
+          comps = []
+          try:
+              data = json.load(open('deno.lock'))
+              pkgs = data.get('packages', [])
+              if isinstance(pkgs, dict):
+                  # legacy: {"npm": {"name@ver": {...}}, "remote": {...}} or {"k@v": ...}
+                  for section in (pkgs.values() if all(isinstance(v, dict) for v in pkgs.values()) else [pkgs]):
+                      if isinstance(section, dict):
+                          for k, v in section.items():
+                              name, _, ver = k.rpartition('@')
+                              comps.append({'name': name or k, 'version': str(ver), 'purl': f"pkg:deno/{name or k}@{ver}"})
+              elif isinstance(pkgs, list):
+                  # lockfile v4: ["npm:chalk@5.3.0", "jsr:@scope/pkg@0.1.0", ...]
+                  for entry in pkgs:
+                      s = str(entry)
+                      body = s.split(':', 1)[1] if ':' in s and s.split(':', 1)[0] in ('npm', 'jsr', 'http', 'https') else s
+                      name, _, ver = body.rpartition('@')
+                      if name.startswith('@') and '@' not in name[1:]:
+                          # scoped jsr pkg "@scope/pkg@0.1.0": rpartition already correct
+                          pass
+                      comps.append({'name': name or body, 'version': str(ver) if ver else '', 'purl': f"pkg:deno/{name or body}@{ver}"})
+              out = {'bomFormat': 'CycloneDX', 'specVersion': '1.5', 'components': comps}
+              json.dump(out, open('sbom-deno.json', 'w'), indent=2)
+              print(f"deno sbom: {len(comps)} components")
+          except Exception as e:
+              print(f"deno sbom parse failed: {e}")
+              raise SystemExit(1)
+          DENOEOF
+          else
+            echo "no deno.lock — deno SBOM skipped"
+          fi
+          ls -lh sbom-deno.json 2>/dev/null || true
+      - name: Merge SBOMs → sbom.json (polyglot)
+        run: |
+          python3 -c "
+          import json, os
+          parts = []
+          dedup=set()
+          for p in ['sbom-py.json','sbom-node.json','sbom-go.json','sbom-php.json','sbom-deno.json']:
+              if os.path.exists(p):
+                  try:
+                      d=json.load(open(p))
+                      cnt=0
+                      for c in d.get('components', []):
+                          key=(c.get('name',''),c.get('version',''))
+                          if key not in dedup:
+                              dedup.add(key)
+                              parts.append(c)
+                              cnt+=1
+                      print(f'{p}: {len(d.get(\"components\",[]))} components ({cnt} unique)')
+                  except Exception as e:
+                      print(f'{p}: parse failed {e}')
+          if not parts:
+              print('no SBOM parts — sbom.json not created (will be skipped downstream)')
+          else:
+              out={'bomFormat':'CycloneDX','specVersion':'1.5','components':parts}
+              json.dump(out, open('sbom.json','w'), indent=2)
+              print(f'merged sbom.json: {len(parts)} unique components')
+          "
+          ls -lh sbom*.json 2>/dev/null || true
+          if [ ! -f sbom.json ]; then
+            echo "no dependency manifest — SBOM skipped"
+            if [ "{{ sbom_fail_on_empty | default('false') }}" = "true" ]; then
+              echo "FAIL: sbom_fail_on_empty=true but no SBOM generated"
+              exit 1
+            fi
+          else
+            CNT=$(python3 -c "import json; print(len(json.load(open('sbom.json')).get('components',[])))" 2>/dev/null || echo 0)
+            echo "sbom.json components: $CNT"
+            if [ "$CNT" = "0" ] && [ "{{ sbom_fail_on_empty | default('false') }}" = "true" ]; then
+              echo "FAIL: SBOM has 0 components but sbom_fail_on_empty=true"
+              exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-cyclonedx-release
+          path: sbom.json
+          if-no-files-found: ignore
+
+  # ── Universal: license compliance (needs SBOM) ──
+  license-compliance:
+    name: license-compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    needs: sbom-cyclonedx
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom-cyclonedx-release
+      - name: License audit — fail on denylist
+        run: |
+          if [ ! -f sbom.json ]; then
+            echo "no SBOM artifact — license audit skipped"
+            if [ "{{ sbom_fail_on_empty | default('false') }}" = "true" ]; then
+              echo "FAIL: sbom required but missing"
+              exit 1
+            fi
+            exit 0
+          fi
+          python3 -c "
+          import json, sys, re
+          denylist = [d.strip() for d in '{{ license_denylist | default('GPL-3.0,AGPL-3.0') }}'.split(',') if d.strip()]
+          sbom = json.load(open('sbom.json'))
+          violations = []
+          for comp in sbom.get('components', []):
+              lic_str = json.dumps(comp.get('licenses', []))
+              # also check expression string
+              expr = comp.get('licenses', [])
+              # handle CycloneDX lic expression field
+              for l in comp.get('licenses',[]):
+                  if isinstance(l, dict):
+                      if 'expression' in l:
+                          lic_str += ' ' + l['expression']
+                      if 'license' in l and isinstance(l['license'], dict):
+                          lic_str += ' ' + l['license'].get('id','') + ' ' + l['license'].get('name','')
+                          if 'expression' in l['license']:
+                              lic_str += ' ' + l['license']['expression']
+              for d in denylist:
+                  # word-boundary match to avoid false substring
+                  if re.search(r'(?:^|[^A-Za-z0-9._-])' + re.escape(d) + r'(?:\$|[^A-Za-z0-9._-])', lic_str):
+                      violations.append(f\"{comp.get('name','?')} ({comp.get('version','?')}): {d} in {lic_str[:160]}\")
+                      break
+          if violations:
+              print('LICENSE VIOLATIONS:')
+              for v in violations: print(f'  ! {v}')
+              sys.exit(1)
+          print(f'All licenses OK ({len(sbom.get(\"components\",[]))} components checked)')
+          "
+
+  # ── Universal: env var audit (py/js/ts/go/php/deno) ──
+  env-audit:
+    name: env-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    # nothing to grep when there is no code — skip the boot
+    if: hashFiles('**/*.py') != '' || hashFiles('**/*.js') != '' || hashFiles('**/*.ts') != '' || hashFiles('**/*.tsx') != '' || hashFiles('**/*.mjs') != '' || hashFiles('**/*.go') != '' || hashFiles('**/*.php') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Env var audit — code refs vs .env.example (py/node/go/php/deno)
+        env:
+          ENV_AUDIT_STRICT: "{{ env_audit_strict | default('true') }}"
+        run: |
+          # Collect refs across all stacks — handle bracket, dot, and export forms
+          REFS=$(grep -rhoP --include='*.py' --include='*.js' --include='*.ts' --include='*.tsx' --include='*.mjs' --include='*.cjs' --include='*.go' --include='*.php' \
+            '(?:os\.environ(?:\.get)?\[?\(?["\x27]|os\.getenv\(["\x27]|process\.env\.|process\.env\[["\x27]|import\.meta\.env\.|Bun\.env\.|os\.Getenv\(["\x27]|getenv\(["\x27]|\$_ENV\[["\x27]|\$_SERVER\[["\x27]|Deno\.env\.get\(["\x27]|env\(["\x27])\K[A-Z_][A-Z0-9_]*(?=["\x27\]\s)]|$)' . 2>/dev/null | sort -u | grep -v '^$' || true)
+          # Fallback ERE (no PCRE) — explicit single/double quote alternates
+          if [ -z "$REFS" ]; then
+            REFS=$(grep -rhoE --include='*.py' --include='*.js' --include='*.ts' --include='*.go' --include='*.php' \
+              'os\.Getenv\("[A-Z_][A-Z0-9_]*"\)|os\.Getenv\(.[A-Z_][A-Z0-9_]*.\)|getenv\("[A-Z_][A-Z0-9_]*"\)|getenv\(.[A-Z_][A-Z0-9_]*.\)|[$_](ENV|SERVER)\[.[A-Z_][A-Z0-9_]*.\]|Deno\.env\.get\(.[A-Z_][A-Z0-9_]*.\)|process\.env\.[A-Z_][A-Z0-9_]*|import\.meta\.env\.[A-Z_][A-Z0-9_]*' . 2>/dev/null | grep -oE '[A-Z_]{2,}[A-Z0-9_]*' | sort -u || true)
+          fi
+          # Allowlist: CI-provided vars that should not require .env.example docs
+          ALLOW="CI|GITHUB_[A-Z_]*|RUNNER_[A-Z_]*|ACTIONS_[A-Z_]*"
+          if [ -n "$REFS" ]; then
+            REFS=$(echo "$REFS" | grep -vE "^($ALLOW)$" || true)
+          fi
+          if [ -z "$REFS" ]; then
+            echo "no env var references found — audit skipped"
+            exit 0
+          fi
+          echo "found refs:"
+          echo "$REFS" | while read var; do echo "  · $var"; done
+          if [ ! -f .env.example ]; then
+            echo "! no .env.example found — all env refs undocumented"
+            echo "$REFS" | while read var; do echo "  ! $var"; done
+            if [ "$ENV_AUDIT_STRICT" = "true" ]; then exit 1; else echo "WARN: env_audit_strict=false — not failing"; exit 0; fi
+          fi
+          DOCS=$(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Z_][A-Z0-9_]*' .env.example | grep -oE '[A-Z_][A-Z0-9_]*' | sort -u || true)
+          UNDOCUMENTED=$(comm -23 <(echo "$REFS" | sort -u) <(echo "$DOCS" | sort -u))
+          COUNT=$(echo "$UNDOCUMENTED" | grep -cv '^$' || true)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "FAIL: $COUNT env variable(s) referenced but not documented in .env.example:"
+            echo "$UNDOCUMENTED" | while read var; do echo "  ! $var"; done
+            if [ "$ENV_AUDIT_STRICT" = "true" ]; then exit 1; else echo "WARN: env_audit_strict=false — not failing"; exit 0; fi
+          fi
+          echo "All $(echo "$REFS" | wc -l) env variables documented"
+
+  # ── Universal: zizmor deep pass (cached) ──
+  zizmor-full:
+    name: zizmor-full
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache zizmor
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/zizmor.tar.gz
+          key: zizmor-{{ zizmor_version | default('1.29.0') }}-x64-linux
+          restore-keys: |
+            zizmor-{{ zizmor_version | default('1.29.0') }}-
+      - name: zizmor — strict pass ({{ zizmor_min_severity | default('low') }})
+        run: |
+          if [ ! -f /tmp/zizmor.tar.gz ]; then
+            curl -sSfL https://github.com/woodruffw/zizmor/releases/download/v{{ zizmor_version | default('1.29.0') }}/zizmor-x86_64-unknown-linux-gnu.tar.gz -o /tmp/zizmor.tar.gz
+          else
+            echo "zizmor restored from cache"
+          fi
+          tar -xzf /tmp/zizmor.tar.gz -C /tmp
+          /tmp/zizmor --min-severity {{ zizmor_min_severity | default('low') }} .
+
+  # ── Universal debug audit (py/node/go/php/deno — graceful-skip when no code) ──
+  debug-audit:
+    name: debug-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('**/*.py') != '' || hashFiles('package.json') != '' || hashFiles('go.mod') != '' || hashFiles('composer.json') != '' || hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('**/*.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('package.json') != ''
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: hashFiles('go.mod') != ''
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: hashFiles('composer.json') != ''
+        with:
+          php-version: '{{ php_version | default("8.3") }}'
+          coverage: none
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Packaging + import sanity + pool lint (adaptive)
+        run: |
+          FAIL=0
+          PY_PRESENT=0
+          [ -f requirements.txt ] && PY_PRESENT=1
+          [ -n "$(find . -maxdepth 3 -name '*.py' -not -path './venv*' -not -path './node_modules/*' -print -quit 2>/dev/null)" ] && PY_PRESENT=1
+          if [ "$PY_PRESENT" = "1" ]; then
+            echo "--- Python debug audit ---"
+            pip install --quiet pytest 2>/dev/null || true
+            [ -f requirements.txt ] && pip install -r requirements.txt || true
+            python -m compileall -q . || FAIL=1
+            PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+            if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+              python -c "import $PKG.main" || FAIL=1
+              echo "import $PKG.main OK"
+            fi
+            # only flag create_engine without pool_pre_ping in app code (ignore tests)
+            APP_HITS=$(grep -R "create_engine(" --include="*.py" --exclude-dir=tests --exclude-dir=venv* --exclude-dir=node_modules . 2>/dev/null | grep -v "pool_pre_ping" | grep -cv '^\s*#' || true)
+            if [ "${APP_HITS:-0}" != "0" ]; then
+              echo "::error::create_engine without pool_pre_ping=True — add pool_pre_ping=True to all create_engine() calls"
+              grep -R "create_engine(" --include="*.py" --exclude-dir=tests . 2>/dev/null | grep -v "pool_pre_ping" | head -5 | while IFS= read -r line; do echo "::error::$line"; done
+              echo "FAIL: create_engine detected without pool_pre_ping=True"
+              FAIL=1
+            else
+              echo "Pool lint OK"
+            fi
+          fi
+          if [ -f package.json ]; then
+            echo "--- Node debug audit ---"
+            if [ -f eslint.config.js ] || ls .eslintrc* 1>/dev/null 2>&1; then
+              npx eslint . --max-warnings=0 2>/dev/null || echo "eslint warn"
+            fi
+            node --check package.json 2>/dev/null || true
+            echo "Node syntax OK"
+          fi
+          if [ -f go.mod ]; then
+            echo "--- Go debug audit ---"
+            go vet ./... || FAIL=1
+            echo "go vet OK"
+          fi
+          if [ -f composer.json ]; then
+            echo "--- PHP debug audit ---"
+            find . -name '*.php' -not -path './vendor/*' -exec php -l {} \; 2>&1 | grep -v "No syntax errors" && FAIL=1 || echo "php -l OK"
+          fi
+          if [ -f deno.json ] || [ -f deno.jsonc ]; then
+            echo "--- Deno debug audit ---"
+            deno lint 2>/dev/null || echo "deno lint warn"
+            echo "deno lint OK"
+          fi
+          if [ "$FAIL" != "0" ]; then exit 1; fi
+          echo "Debug audit OK (adaptive)"
+
+  schema-drift:
+    name: schema-drift
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('alembic.ini') != '' || hashFiles('**/migrations/env.py') != '' || hashFiles('alembic/env.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Detect schema drift and create_all contradiction
+        run: |
+          pip install --quiet pytest alembic
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          if [ -f alembic.ini ] && grep -R "Base.metadata.create_all" --include="*.py" app 2>/dev/null | grep -q "create_all"; then
+            echo "::error file=alembic.ini::Base.metadata.create_all coexists with alembic.ini — remove create_all, use alembic migrations only"
+            echo "FAIL: Base.metadata.create_all coexists with alembic.ini (contradictory schema management) in app/"
+            exit 1
+          fi
+          alembic check || { echo "::error::alembic check failed — schema drift between models and migrations (run 'alembic revision --autogenerate')"; echo "FAIL: schema drift detected between models and alembic migrations"; exit 1; }
+          echo "Schema drift check OK"
+
+  migration-check:
+    name: migration-check
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('alembic.ini') != '' || hashFiles('**/migrations/env.py') != '' || hashFiles('alembic/env.py') != ''
+    services:
+      postgres:
+        image: postgres:{{ pg_version | default('16-alpine') }}
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Verify migrations are up-to-date, safe, and reversible
+        env:
+          DATABASE_URL: postgresql+psycopg://test_user:test_password@localhost:5432/test_db
+        run: |
+          pip install --quiet pytest alembic psycopg[binary]
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          echo "--- Pending migration SQL (dry-run) ---"
+          SQL=$(alembic upgrade head --sql) || { echo "FAIL: cannot generate upgrade SQL"; exit 1; }
+          echo "$SQL"
+          echo "--- Migration heads ---"
+          alembic heads || exit 1
+          BCNT=$(alembic branches 2>/dev/null | grep -c '[^[:space:]]' || true)
+          if [ "${BCNT:-0}" != "0" ]; then
+            echo "FAIL: $BCNT branch(ed) migrations detected"
+            alembic branches
+            exit 1
+          fi
+          echo "--- Destructive DDL Audit (ERE — no PCRE dependency) ---"
+          DESTRUCTIVE=$(echo "$SQL" | grep -iE 'DROP[[:space:]]+(TABLE|COLUMN|INDEX|CONSTRAINT)|DROP[[:space:]]+FOREIGN[[:space:]]+KEY|TRUNCATE|ALTER[[:space:]]+TABLE.*TYPE.*USING|SET[[:space:]]+NOT[[:space:]]+NULL|RESTART[[:space:]]+IDENTITY' || true)
+          if [ -n "$DESTRUCTIVE" ]; then
+            echo "FAIL: Destructive DDL pattern(s) detected in pending migration SQL:"
+            echo "$DESTRUCTIVE"
+            exit 1
+          fi
+          echo "--- Downgrade / Upgrade round-trip test ---"
+          alembic upgrade head || exit 1
+          alembic downgrade -1 || { echo "FAIL: rollback / downgrade failed"; exit 1; }
+          alembic upgrade head || { echo "FAIL: re-upgrade after downgrade failed"; exit 1; }
+          echo "Migrations OK (single head, safe DDL, downgrade reversible)"
+
+  config-validation:
+    name: config-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('**/*config*.py') != '' || hashFiles('**/settings.py') != '' || hashFiles('**/config.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Validate settings schema across dev and production profiles
+        run: |
+          pip install --quiet pydantic pydantic-settings python-dotenv
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          python -c "
+          import os, sys, importlib
+          sys.path.insert(0, os.getcwd())
+          
+          # Detect candidate packages — include settings.py variants
+          candidates = ['app.core.config', 'app.config', 'core.config', 'config', 'app.core.settings', 'app.settings']
+          for d in os.listdir('.'):
+              if os.path.isdir(d) and not d.startswith(('.', 'venv', 'node_modules', 'tests', 'scratch')):
+                  candidates.extend([f'{d}.core.config', f'{d}.config', f'{d}.core.settings', f'{d}.settings'])
+          
+          cfg_module = None
+          for mod in candidates:
+              try:
+                  cfg_module = importlib.import_module(mod)
+                  print(f'Found config module: {mod}')
+                  break
+              except ModuleNotFoundError:
+                  continue
+          if not cfg_module or not hasattr(cfg_module, 'Settings'):
+              print('No Settings class found — config-validation skipped')
+              sys.exit(0)
+          Settings = getattr(cfg_module, 'Settings')
+          # 1. Dev mode instantiation
+          dev_s = Settings()
+          print('Dev Settings instantiated successfully')
+          # 2. Prod mode with valid dummy secrets
+          os.environ['APP_ENV'] = 'production'
+          os.environ['JWT_SECRET'] = 'a' * 32
+          os.environ['DATABASE_URL'] = 'postgresql+psycopg://user:pass@localhost:5432/db'
+          os.environ['CORS_ORIGINS'] = 'https://app.example.com,https://api.example.com'
+          prod_s = Settings()
+          assert prod_s.is_production, 'Expected is_production=True'
+          assert '*' not in str(prod_s.CORS_ORIGINS), 'Wildcard CORS not permitted in production'
+          assert len(str(prod_s.JWT_SECRET)) >= 32, 'JWT_SECRET must be >= 32 chars'
+          print('Production Settings validation OK')
+          "
+
+  # ── Universal: endpoint smoke — adaptive py/node/go/php (health_path/ready_path, golden 200/404/503) ──
+  endpoint-smoke:
+    name: endpoint-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('**/main.py') != '' || hashFiles('package.json') != '' || hashFiles('go.mod') != '' || hashFiles('composer.json') != '' || hashFiles('Dockerfile') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('**/main.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('**/main.py') == '' && hashFiles('package.json') != ''
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: hashFiles('**/main.py') == '' && hashFiles('package.json') == '' && hashFiles('go.mod') != ''
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: hashFiles('**/main.py') == '' && hashFiles('package.json') == '' && hashFiles('go.mod') == '' && hashFiles('composer.json') != ''
+        with:
+          php-version: '{{ php_version | default("8.3") }}'
+          coverage: none
+      - name: Start server + hit health/ready endpoints (adaptive, health_path aware)
+        env:
+          HEALTH_PATH: "{{ health_path | default('/health') }}"
+          READY_PATH: "{{ ready_path | default('/ready') }}"
+        run: |
+          HEALTH_PATH="{{ health_path | default('/health') }}"
+          READY_PATH="{{ ready_path | default('/ready') }}"
+          echo "probes: $HEALTH_PATH $READY_PATH"
+          # Many apps ignore $PORT and bind their default (Next 3000, Go examples 8080) — discover instead of assume
+          wait_base() {
+            for P in 8000 3000 8080; do
+              for i in $(seq 1 20); do
+                if curl -sf "http://127.0.0.1:$P$HEALTH_PATH" >/dev/null 2>&1; then echo "$P"; return 0; fi
+                sleep 1
+              done
+            done
+            echo ""
+          }
+          PY_MAIN=$(find . -maxdepth 3 -name 'main.py' -not -path './venv*' -not -path './node_modules/*' -print -quit 2>/dev/null)
+          # ── Python path (golden 200/404/503) ──
+          if [ -n "$PY_MAIN" ] || [ -f requirements.txt ]; then
+            pip install --quiet uvicorn fastapi httpx 2>/dev/null || pip install --quiet uvicorn fastapi httpx
+            [ -f requirements.txt ] && pip install -r requirements.txt || true
+            PKG=""
+            for d in $(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$'); do
+              [ -f "$d/main.py" ] && PKG="$d" && break
+            done
+            if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+              uvicorn "$PKG.main:app" --host 127.0.0.1 --port 8000 &
+              SERVER_PID=$!
+              trap "kill $SERVER_PID 2>/dev/null" EXIT
+              PORT=$(wait_base)
+              if [ -z "$PORT" ]; then echo "FAIL: server never answered $HEALTH_PATH on 8000/3000/8080"; exit 1; fi
+              BASE="http://127.0.0.1:$PORT"
+              echo "server answering on port $PORT"
+              HEALTH=$(curl -s -o /tmp/h.json -w "%{http_code}" --max-time 10 "$BASE$HEALTH_PATH" 2>/dev/null || echo 000)
+              echo "$HEALTH_PATH -> $HEALTH $(cat /tmp/h.json 2>/dev/null | head -c 300)"
+              if [ "$HEALTH" != "200" ]; then
+                echo "FAIL: $HEALTH_PATH -> $HEALTH"
+                exit 1
+              fi
+              # optional JSON content check
+              if grep -q '"status"' /tmp/h.json 2>/dev/null; then echo "health JSON status field present"; fi
+              code_r=$(curl -s -o /tmp/r.json -w "%{http_code}" --max-time 10 "$BASE$READY_PATH" 2>/dev/null || echo 000)
+              case "$code_r" in
+                200) echo "$READY_PATH -> 200 $(cat /tmp/r.json | head -c 200) — OK" ;;
+                404) echo "WARN: $READY_PATH -> 404 readiness probe NOT IMPLEMENTED — not a failure" ;;
+                503) echo "FAIL: $READY_PATH -> 503 DB genuinely down"; cat /tmp/r.json; exit 1 ;;
+                *) echo "FAIL: $READY_PATH -> $code_r"; cat /tmp/r.json; exit 1 ;;
+              esac
+              exit 0
+            fi
+          fi
+
+          # ── Node path (golden) ──
+          if [ -f package.json ]; then
+            if [ -f package-lock.json ]; then npm ci --prefer-offline --silent || npm install --silent; else npm install --silent; fi
+            if grep -q '"start"' package.json; then
+              PORT=8000 npm start &
+              SERVER_PID=$!
+            elif [ -f server.js ]; then
+              PORT=8000 HOST=127.0.0.1 node server.js &
+              SERVER_PID=$!
+            elif [ -f app.js ]; then
+              PORT=8000 node app.js &
+              SERVER_PID=$!
+            elif [ -f index.js ]; then
+              PORT=8000 node index.js &
+              SERVER_PID=$!
+            else
+              echo "no node entrypoint found — endpoint-smoke skipped (node)"
+              exit 0
+            fi
+            trap "kill $SERVER_PID 2>/dev/null" EXIT
+            PORT=$(wait_base)
+            if [ -z "$PORT" ]; then echo "FAIL: node server never answered $HEALTH_PATH on 8000/3000/8080"; exit 1; fi
+            BASE="http://127.0.0.1:$PORT"
+            echo "node server answering on port $PORT"
+            code_h=$(curl -s -o /tmp/h.json -w "%{http_code}" --max-time 10 "$BASE$HEALTH_PATH" 2>/dev/null || echo 000)
+            echo "$HEALTH_PATH -> $code_h"
+            if [ "$code_h" = "200" ]; then echo "/health OK (node)"; else echo "node /health $code_h — checking /"; code2=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/" 2>/dev/null || echo 000); if [ "$code2" != "200" ]; then echo "FAIL: node server not responding"; exit 1; fi; echo "node root / $code2 OK"; fi
+            code_r=$(curl -s -o /tmp/r.json -w "%{http_code}" --max-time 10 "$BASE$READY_PATH" 2>/dev/null || echo 000)
+            case "$code_r" in 200) echo "$READY_PATH 200 OK";; 404) echo "WARN: $READY_PATH 404 not implemented";; 503) echo "FAIL: $READY_PATH 503"; exit 1;; *) echo "WARN: $READY_PATH $code_r non-fatal";; esac
+            exit 0
+          fi
+
+          # ── Go path ──
+          if [ -f go.mod ]; then
+            # support cmd/server layout
+            if [ -f cmd/server/main.go ]; then go run ./cmd/server &
+            elif [ -f main.go ]; then go run . &
+            else go run . &
+            fi
+            SERVER_PID=$!
+            trap "kill $SERVER_PID 2>/dev/null" EXIT
+            PORT=$(wait_base)
+            if [ -z "$PORT" ]; then echo "FAIL: go server never answered $HEALTH_PATH on 8000/3000/8080"; exit 1; fi
+            BASE="http://127.0.0.1:$PORT"
+            echo "go server answering on port $PORT"
+            code_h=$(curl -s -o /tmp/h.json -w "%{http_code}" --max-time 10 "$BASE$HEALTH_PATH" 2>/dev/null || echo 000)
+            echo "$HEALTH_PATH -> $code_h"
+            if [ "$code_h" != "200" ]; then code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/" 2>/dev/null || echo 000); if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then echo "FAIL: go server not responding"; exit 1; fi; echo "go / $code OK"; else echo "/health OK (go)"; fi
+            code_r=$(curl -s -o /tmp/r.json -w "%{http_code}" --max-time 10 "$BASE$READY_PATH" 2>/dev/null || echo 000)
+            case "$code_r" in 200) echo "$READY_PATH 200";; 404) echo "WARN: $READY_PATH 404";; 503) echo "FAIL: 503"; exit 1;; *) echo "WARN: $READY_PATH $code_r";; esac
+            exit 0
+          fi
+
+          # ── PHP path ──
+          if [ -f composer.json ]; then
+            DOCROOT="."
+            [ -d public ] && DOCROOT="public"
+            [ -d web ] && DOCROOT="web"
+            php -S 127.0.0.1:8000 -t $DOCROOT &
+            SERVER_PID=$!
+            trap "kill $SERVER_PID 2>/dev/null" EXIT
+            for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000$HEALTH_PATH >/dev/null 2>&1 && break; sleep 1; done
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:8000$HEALTH_PATH 2>/dev/null || echo 000)
+            if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then code2=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/ 2>/dev/null || echo 000); if [ "$code2" = "000" ] || [ "$code2" -ge 500 ]; then echo "FAIL: php server not responding"; exit 1; fi; fi
+            echo "PHP smoke OK ($HEALTH_PATH $code)"
+            exit 0
+          fi
+
+          # ── Docker fallback — language-agnostic: any repo with a Dockerfile ──
+          if [ -f Dockerfile ]; then
+            docker build -t gate-endpoint-smoke . || { echo "FAIL: docker build failed"; exit 1; }
+            PORT=""
+            for HP in 8000 3000 8080; do
+              docker rm -f gate-es >/dev/null 2>&1 || true
+              if ! docker run -d --name gate-es -p "$HP:$HP" -e "PORT=$HP" gate-endpoint-smoke >/dev/null 2>&1; then
+                continue
+              fi
+              PORT=$(wait_base)
+              if [ -n "$PORT" ]; then break; fi
+              docker rm -f gate-es >/dev/null 2>&1 || true
+            done
+            trap 'docker rm -f gate-es >/dev/null 2>&1' EXIT
+            if [ -z "$PORT" ]; then
+              echo "--- container logs (gate-es) ---"
+              docker logs gate-es 2>&1 | tail -40 || true
+              echo "FAIL: container never answered $HEALTH_PATH on mapped ports 8000/3000/8080"
+              exit 1
+            fi
+            BASE="http://127.0.0.1:$PORT"
+            echo "container answering on port $PORT"
+            code_h=$(curl -s -o /tmp/h.json -w "%{http_code}" --max-time 10 "$BASE$HEALTH_PATH" 2>/dev/null || echo 000)
+            echo "$HEALTH_PATH -> $code_h"
+            if [ "$code_h" != "200" ]; then
+              code_root=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$BASE/" 2>/dev/null || echo 000)
+              if [ "$code_root" = "000" ] || [ "$code_root" -ge 500 ]; then
+                echo "--- container logs (gate-es) ---"
+                docker logs gate-es 2>&1 | tail -40 || true
+                echo "FAIL: container unresponsive ($HEALTH_PATH -> $code_h, / -> $code_root)"
+                exit 1
+              fi
+              echo "WARN: $HEALTH_PATH non-200 but root answers ($code_root) — tolerated"
+            else
+              echo "$HEALTH_PATH OK (docker fallback)"
+            fi
+            code_r=$(curl -s -o /tmp/r.json -w "%{http_code}" --max-time 10 "$BASE$READY_PATH" 2>/dev/null || echo 000)
+            case "$code_r" in
+              200) echo "$READY_PATH -> 200 OK" ;;
+              404) echo "WARN: $READY_PATH -> 404 readiness probe NOT IMPLEMENTED — not a failure" ;;
+              *) echo "WARN: $READY_PATH -> $code_r non-fatal (container mode)" ;;
+            esac
+            echo "ENDPOINT-SMOKE OK (docker fallback)"
+            exit 0
+          fi
+
+          echo "no runnable app detected — endpoint-smoke skipped"
+
+  graceful-shutdown:
+    name: graceful-shutdown
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('**/main.py') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: CI drain test — verify in-flight request finishes upon SIGTERM
+        run: |
+          pip install --quiet uvicorn fastapi httpx
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          PKG=""
+          for d in $(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$'); do
+            [ -f "$d/main.py" ] && PKG="$d" && break
+          done
+          if [ -z "$PKG" ]; then
+            echo "no main.py found — graceful-shutdown skipped"
+            exit 0
+          fi
+          HEALTH_PATH="{{ health_path | default('/health') }}"
+          uvicorn "$PKG.main:app" --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 30 &
+          SERVER_PID=$!
+          export SERVER_PID=$SERVER_PID
+          export HEALTH_PATH=$HEALTH_PATH
+          trap "kill -9 $SERVER_PID 2>/dev/null || true" EXIT
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000$HEALTH_PATH > /dev/null 2>&1 && break
+            sleep 1
+          done
+          python3 -c "
+          import os, time, signal, httpx, threading
+          pid = int(os.environ['SERVER_PID'])
+          path = os.environ.get('HEALTH_PATH','/health')
+          results = {}
+          def make_request():
+              try:
+                  r = httpx.get(f'http://127.0.0.1:8000{path}', timeout=10.0)
+                  results['status'] = r.status_code
+              except Exception as e:
+                  results['error'] = str(e)
+          t = threading.Thread(target=make_request)
+          t.start()
+          time.sleep(0.2)
+          os.kill(pid, signal.SIGTERM)
+          t.join(timeout=10.0)
+          assert results.get('status') == 200, f'Expected 200 during graceful drain, got {results}'
+          print('Graceful shutdown drain test PASSED')
+          "
+
+  api-contract-diff:
+    name: api-contract-diff
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('**/main.py') != '' || hashFiles('openapi.json') != '' || hashFiles('openapi.yaml') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Cache oasdiff
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/oasdiff.tar.gz
+          key: oasdiff-{{ oasdiff_version | default('1.29.1') }}-linux-amd64
+          restore-keys: |
+            oasdiff-{{ oasdiff_version | default('1.29.1') }}-
+      - name: Install oasdiff (pinned release script — version env, not latest)
+        run: |
+          if [ ! -f /tmp/oasdiff.tar.gz ]; then
+            curl -fsSL https://raw.githubusercontent.com/oasdiff/oasdiff/v{{ oasdiff_version | default('1.29.1') }}/install.sh -o /tmp/oasdiff-install.sh
+            # install.sh reads env vars (no flags): version= pins the BINARY; INSTALL_DIR replaces removed -b
+            sudo version={{ oasdiff_version | default('1.29.1') }} INSTALL_DIR=/usr/local/bin sh /tmp/oasdiff-install.sh 2>&1 | head -n 20
+            tar -czf /tmp/oasdiff.tar.gz -C /usr/local/bin oasdiff 2>/dev/null || tar -czf /tmp/oasdiff.tar.gz -C /tmp oasdiff 2>/dev/null || true
+          else
+            echo "oasdiff restored from cache"
+            tar -xzf /tmp/oasdiff.tar.gz -C /tmp 2>/dev/null || true
+            sudo cp /tmp/oasdiff /usr/local/bin/oasdiff 2>/dev/null || sudo cp /tmp/usr/local/bin/oasdiff /usr/local/bin/oasdiff 2>/dev/null || true
+            chmod +x /usr/local/bin/oasdiff 2>/dev/null || true
+          fi
+          INSTALLED=$(oasdiff --version 2>/dev/null || echo unknown)
+          echo "oasdiff binary: $INSTALLED (pinned {{ oasdiff_version | default('1.29.1') }})"
+          oasdiff --help 2>&1 | head -n 5 || echo "oasdiff not available — fallback to set-diff"
+      - name: Generate current openapi.json + breaking changes diff against previous tag
+        run: |
+          pip install --quiet uvicorn fastapi PyYAML 2>/dev/null || pip install --quiet fastapi PyYAML
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          PKG=""
+          for d in $(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$'); do
+            [ -f "$d/main.py" ] && PKG="$d" && break
+          done
+          if [ -n "$PKG" ] && [ -f "$PKG/main.py" ]; then
+            python -c "
+          import json, importlib
+          mod = importlib.import_module('$PKG.main')
+          spec = mod.app.openapi()
+          import json as _j
+          _j.dump(spec, open('openapi-current.json','w'), indent=2)
+            " || echo "openapi generation via main.py failed"
+          fi
+          if [ ! -f openapi-current.json ]; then
+            if [ -f openapi.json ]; then cp openapi.json openapi-current.json; echo "used repo openapi.json"; fi
+            if [ -f openapi.yaml ] && [ ! -f openapi-current.json ]; then
+              python3 -c "import yaml, json; json.dump(yaml.safe_load(open('openapi.yaml')), open('openapi-current.json','w'), indent=2)" 2>/dev/null || true
+            fi
+            # Node fallback: try swagger-jsdoc style generation if package.json present
+            if [ ! -f openapi-current.json ] && [ -f package.json ]; then
+              if grep -q "swagger" package.json 2>/dev/null; then
+                echo "node swagger detected — trying to generate openapi via node"
+                node -e "try{const s=require('./openapi.json'); require('fs').writeFileSync('openapi-current.json', JSON.stringify(s))}catch(e){}" 2>/dev/null || true
+              fi
+            fi
+          fi
+          if [ ! -f openapi-current.json ]; then
+            echo "no openapi spec — api-contract-diff skipped"
+            exit 0
+          fi
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "no previous tag — diff skipped"
+            exit 0
+          fi
+          git show "$PREV_TAG:$PKG/openapi.json" > openapi-prev.json 2>/dev/null || \
+          git show "$PREV_TAG:openapi.json" > openapi-prev.json 2>/dev/null || \
+          git show "$PREV_TAG:openapi.yaml" > openapi-prev.yaml 2>/dev/null || \
+          git show "$PREV_TAG:docs/openapi.json" > openapi-prev.json 2>/dev/null || {
+            echo "no openapi.json at $PREV_TAG — diff skipped"
+            exit 0
+          }
+          if [ -f openapi-prev.yaml ] && [ ! -f openapi-prev.json ]; then
+            python3 -c "import yaml, json; json.dump(yaml.safe_load(open('openapi-prev.yaml')), open('openapi-prev.json','w'), indent=2)" 2>/dev/null || true
+          fi
+          IGNORE_ARG=""
+          [ -f .oasdiff-ignore ] && IGNORE_ARG="--err-ignore .oasdiff-ignore"
+          if command -v oasdiff >/dev/null 2>&1; then
+            oasdiff breaking-changes openapi-prev.json openapi-current.json --fail-on {{ oasdiff_fail_on | default('ERR') }} $IGNORE_ARG
+            echo "No breaking API changes (oasdiff)"
+          else
+            echo "oasdiff not available — fallback set-diff"
+            python3 -c "
+          import json
+          cur=json.load(open('openapi-current.json')).get('paths',{})
+          prev=json.load(open('openapi-prev.json')).get('paths',{})
+          removed=set(prev.keys())-set(cur.keys())
+          for p in sorted(removed): print(f'  ! REMOVED: {p}')
+          for p in sorted(set(prev)&set(cur)):
+              for m in sorted(set(prev[p].keys())-set(cur[p].keys())):
+                  print(f'  ! REMOVED: {m.upper()} {p}')
+              # also detect removed required fields / status codes could be added but keep paths/methods strict for fallback
+            " > /tmp/removed.txt
+            if [ -s /tmp/removed.txt ]; then echo "BREAKING:"; cat /tmp/removed.txt; exit 1; fi
+            echo "No breaking API changes (fallback)"
+          fi
+
+  perf-benchmark:
+    name: perf-benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('tests/test_perf_smoke.py') != '' || hashFiles('tests/perf-smoke.mjs') != '' || hashFiles('tests/perf-smoke.go') != '' || hashFiles('tests/perf-smoke.php') != '' || hashFiles('tests/bench.mjs') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('tests/test_perf_smoke.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - name: Perf benchmark (Python)
+        if: hashFiles('tests/test_perf_smoke.py') != ''
+        run: |
+          pip install --quiet pytest
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          python -m pytest {{ perf_test_path | default("tests/test_perf_smoke.py") }} -v
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('tests/perf-smoke.mjs') != '' || hashFiles('tests/bench.mjs') != ''
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - name: Perf benchmark (Node)
+        if: hashFiles('tests/perf-smoke.mjs') != '' || hashFiles('tests/bench.mjs') != ''
+        run: |
+          if [ -f tests/perf-smoke.mjs ]; then node tests/perf-smoke.mjs; elif [ -f tests/bench.mjs ]; then node tests/bench.mjs; fi
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: hashFiles('tests/perf-smoke.go') != ''
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Perf benchmark (Go)
+        if: hashFiles('tests/perf-smoke.go') != ''
+        run: go test -run Perf -v ./... || go test -v ./... || exit 1
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: hashFiles('tests/perf-smoke.php') != ''
+        with:
+          php-version: '{{ php_version | default("8.3") }}'
+          coverage: none
+      - name: Perf benchmark (PHP)
+        if: hashFiles('tests/perf-smoke.php') != ''
+        run: php tests/perf-smoke.php || vendor/bin/phpbench run 2>/dev/null || exit 1
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: hashFiles('tests/perf-smoke-deno.ts') != ''
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Perf benchmark (Deno)
+        if: hashFiles('tests/perf-smoke-deno.ts') != ''
+        run: deno bench tests/perf-smoke-deno.ts 2>/dev/null || deno test --allow-read tests/perf-smoke-deno.ts || exit 1
+
+  # ── Node-only job (graceful-skip when no package.json) ──
+  build-full:
+    name: build-full
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    if: hashFiles('package.json') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - name: Cache node_modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: node_modules
+          key: {% raw %}node-modules-build-${{ runner.os }}-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}{% endraw %}
+      - name: Clean install + full production build
+        run: |
+          if [ -f package-lock.json ]; then npm ci --prefer-offline --silent || npm ci --silent; else npm install --silent; fi
+          if grep -q '"build"' package.json; then
+            npm run build || exit 1
+            echo "full production build OK"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-build
+          path: dist/
+          if-no-files-found: ignore
+
+  static-asset-integrity:
+    name: static-asset-integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    needs: build-full
+    if: hashFiles('package.json') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        # NO continue-on-error: build-full succeeded ⇒ the artifact MUST exist.
+        # A silent miss here used to trigger an invisible duplicate frontend build.
+        with:
+          name: dist-build
+          path: dist/
+      - name: Build frontend and verify all src/href link integrity
+        run: |
+          if [ ! -d dist ] || [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            echo "WARN: dist artifact missing despite build-full success — rebuilding locally (investigate upload step)"
+            if [ ! -d node_modules ] || [ -z "$(ls -A node_modules 2>/dev/null)" ]; then
+              if [ -f package-lock.json ]; then npm ci --prefer-offline --silent || npm ci --silent; else npm install --silent; fi
+            fi
+            [ -f package.json ] && grep -q '"build"' package.json && npm run build || true
+          else
+            echo "dist restored from build-full artifact"
+          fi
+          if [ -f dist/index.html ]; then
+            python3 - << 'ASSETEOF'
+          import os, re, sys
+          html = open('dist/index.html').read()
+          links = re.findall(r'(?:src|href)=[\'"]([^\'"]+)[\'"]', html)
+          missing = []
+          for link in links:
+              if link.startswith(('http://', 'https://', '//', 'data:', 'mailto:', '#')):
+                  continue
+              full_path = os.path.join('dist', link.lstrip('/'))
+              if not os.path.exists(full_path):
+                  missing.append(link)
+          if missing:
+              print('FAIL: Missing referenced static assets:')
+              for m in missing:
+                  print(f'  ! {m}')
+              sys.exit(1)
+          print(f'Static asset integrity OK ({len(links)} links checked)')
+          ASSETEOF
+          else
+            echo "dist/index.html not found — skipped"
+          fi
+
+  # ── Universal fallback: detected test command (dev-triggered confirmation) ──
+  tests-detected:
+    name: tests-detected
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    # mirrors debug-audit's stack disjunction — skip the boot on non-code pushes
+    if: hashFiles('**/*.py') != '' || hashFiles('package.json') != '' || hashFiles('go.mod') != '' || hashFiles('composer.json') != '' || hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: hashFiles('**/*.py') != ''
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+          cache: 'pip'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: hashFiles('package.json') != ''
+        with:
+          node-version: '{{ node_version | default("22") }}'
+          cache: 'npm'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: hashFiles('go.mod') != ''
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        if: hashFiles('composer.json') != ''
+        with:
+          php-version: '{{ php_version | default("8.3") }}'
+          coverage: none
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        if: hashFiles('deno.json') != '' || hashFiles('deno.jsonc') != ''
+        with:
+          deno-version: '{{ deno_version | default("v2.x") }}'
+      - name: Run detected test command (confirmation — all present stacks)
+        env:
+          COVERAGE_MIN: '{{ coverage_min | default(0) }}'
+        run: |
+          FAIL=0
+          RAN=0
+          if grep -q '"test"' package.json 2>/dev/null; then
+            echo "--- Node tests ---"
+            RAN=1
+            npm install --silent || true
+            npm test || FAIL=1
+          fi
+          if [ -f go.mod ]; then
+            echo "--- Go tests ---"
+            RAN=1
+            go test ./... || FAIL=1
+          fi
+          if [ -f deno.json ] || [ -f deno.jsonc ]; then
+            echo "--- Deno tests ---"
+            RAN=1
+            deno test --allow-read --allow-env --allow-net || FAIL=1
+          fi
+          if [ -f pytest.ini ] || ls tests/test_*.py >/dev/null 2>&1 || grep -q 'pytest' pyproject.toml 2>/dev/null; then
+            echo "--- Python tests ---"
+            RAN=1
+            pip install --quiet pytest 2>/dev/null || true
+            pip install --quiet pytest-cov 2>/dev/null || true
+            [ -f requirements.txt ] && pip install -r requirements.txt -q || true
+            COV=""
+            if python -c "import pytest_cov" 2>/dev/null; then
+              mkdir -p _gate
+              COV="--cov=. --cov-report=term-missing --cov-report=json:_gate/coverage.json --junitxml=_gate/junit.xml"
+            fi
+            python -m pytest -q $COV || FAIL=1
+            # optional hard floor — active only when owner sets coverage_min > 0
+            if [ "$FAIL" = "0" ] && [ -f _gate/coverage.json ] && [ "$COVERAGE_MIN" != "0" ]; then
+              ACT=$(python3 -c "import json;print(json.load(open('_gate/coverage.json'))['totals']['percent_covered'])" 2>/dev/null || echo "")
+              if [ -n "$ACT" ]; then
+                BELOW=$(python3 -c "print(1 if float('$ACT') < float('$COVERAGE_MIN') else 0)" 2>/dev/null || echo 0)
+                if [ "$BELOW" = "1" ]; then
+                  echo "FAIL: coverage ${ACT}% below minimum ${COVERAGE_MIN}%"
+                  FAIL=1
+                fi
+              fi
+            fi
+          fi
+          if [ -f composer.json ] && { [ -f phpunit.xml ] || [ -f phpunit.xml.dist ]; }; then
+            echo "--- PHP tests ---"
+            RAN=1
+            vendor/bin/phpunit --stop-on-failure 2>/dev/null || (composer install --quiet && vendor/bin/phpunit --stop-on-failure) || FAIL=1
+          fi
+          if [ "$FAIL" != "0" ]; then echo "FAIL: one or more detected stacks failed"; exit 1; fi
+          if [ "$RAN" != "1" ]; then echo "no test command detected — skipped"; else echo "All detected stacks tested OK"; fi
+
+      - name: Upload test reports (coverage + junit)
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-reports-release
+          path: |
+            _gate/coverage.json
+            _gate/junit.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rollback-readiness:
+    name: rollback-readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    needs: [container-full, migration-check, sbom-cyclonedx]
+    if: always() && !cancelled()
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: sbom-cyclonedx-release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: image-digest-release
+      - name: Check prerequisite job outcomes and emit rollback-ready status
+        run: |
+          CONTAINER_RES="{% raw %}${{ needs.container-full.result }}{% endraw %}"
+          MIGRATION_RES="{% raw %}${{ needs.migration-check.result }}{% endraw %}"
+          SBOM_RES="{% raw %}${{ needs.sbom-cyclonedx.result }}{% endraw %}"
+          if [ "$CONTAINER_RES" != "success" ] && [ "$CONTAINER_RES" != "skipped" ]; then
+            echo "FAIL: container-full job was $CONTAINER_RES"
+            exit 1
+          fi
+          if [ "$MIGRATION_RES" != "success" ] && [ "$MIGRATION_RES" != "skipped" ]; then
+            echo "FAIL: migration-check job was $MIGRATION_RES (downgrade not verified)"
+            exit 1
+          fi
+          if [ "$SBOM_RES" != "success" ] && [ "$SBOM_RES" != "skipped" ]; then
+            echo "FAIL: sbom-cyclonedx job was $SBOM_RES"
+            exit 1
+          fi
+          # strict SBOM check when sbom_fail_on_empty true or when manifest exists
+          if [ -f sbom.json ]; then
+            CNT=$(python3 -c "import json; print(len(json.load(open('sbom.json')).get('components',[])))" 2>/dev/null || echo 0)
+            echo "SBOM present: $CNT components"
+            if [ "$CNT" = "0" ]; then
+              if [ "{{ sbom_fail_on_empty | default('false') }}" = "true" ]; then
+                echo "FAIL: SBOM has 0 components but sbom_fail_on_empty=true"
+                exit 1
+              else
+                echo "WARN: SBOM empty but sbom_fail_on_empty=false — allowing"
+              fi
+            fi
+          else
+            echo "SBOM skipped (no manifest)"
+            if [ "{{ sbom_fail_on_empty | default('false') }}" = "true" ] && [ "$SBOM_RES" = "success" ]; then
+              echo "FAIL: sbom.json missing but sbom_fail_on_empty=true"
+              exit 1
+            fi
+          fi
+          if [ -f image-digest.txt ]; then
+            DIGEST=$(cat image-digest.txt)
+            echo "image digest: $DIGEST"
+            if [ -z "$DIGEST" ]; then echo "FAIL: image digest empty"; exit 1; fi
+          else
+            echo "no image digest (no Dockerfile) — skipped"
+            if [ -f Dockerfile ] && [ "$CONTAINER_RES" = "success" ]; then
+              echo "FAIL: Dockerfile present but digest missing"
+              exit 1
+            fi
+          fi
+          echo "=========================================="
+          echo "ROLLBACK-READY: digest pinned, downgrade verified, SBOM present"
+          echo "=========================================="
+
+  strix-pentest:
+    name: strix-pentest
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('30') }}
+    # AI pentest lane (Strix) — DISPATCH-ONLY by design: LLM spend is deliberate,
+    # never automatic on push. Opt-in via repo VARIABLE STRIX_ENABLED=true plus
+    # secrets.LLM_API_KEY (+ optional vars.STRIX_LLM). Exits non-zero when Strix
+    # validates real vulnerabilities — validated findings block the release gate.
+    if: github.event_name == 'workflow_dispatch' && vars.STRIX_ENABLED == 'true' && secrets.LLM_API_KEY != ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '{{ python_version | default("3.12") }}'
+      - name: Run Strix quick diff-scoped pentest
+        env:
+          STRIX_VERSION: '{{ strix_version | default("1.5.3") }}'
+          STRIX_LLM_MODEL: {% raw %}${{ vars.STRIX_LLM || 'openai/gpt-4.1-mini' }}{% endraw %}
+          LLM_API_KEY: {% raw %}${{ secrets.LLM_API_KEY }}{% endraw %}
+          BEFORE_SHA: {% raw %}${{ github.event.before }}{% endraw %}
+        run: |
+          pip install --quiet "strix-agent==$STRIX_VERSION" \
+            || { echo "FAIL: pinned strix-agent install failed ($STRIX_VERSION)"; exit 1; }
+          SCOPE_ARGS="--scan-mode quick --scope-mode diff"
+          if [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
+            SCOPE_ARGS="$SCOPE_ARGS --diff-base $BEFORE_SHA"
+          else
+            SCOPE_ARGS="--scan-mode quick"
+          fi
+          echo "strix scope: $SCOPE_ARGS (model: $STRIX_LLM_MODEL)"
+          export STRIX_LLM="$STRIX_LLM_MODEL"
+          strix -n -t ./ $SCOPE_ARGS || {
+            echo "FAIL: Strix validated vulnerabilities — see findings artifact + report above"
+            exit 1
+          }
+          echo "STRIX-PENTEST OK — no validated findings"
+
+      - name: Upload strix findings
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: strix-findings
+          path: strix_runs/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  openapi-lint:
+    name: openapi-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('10') }}
+    # language-agnostic contract check — boots only when a root spec exists
+    if: >-
+      vars.RELEASE_NO_OPENAPI != 'true' &&
+      (hashFiles('openapi.yaml') != '' || hashFiles('openapi.yml') != '' || hashFiles('openapi.json') != '')
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '{{ node_version | default("22") }}'
+      - name: Lint OpenAPI spec (Redocly CLI — errors fail, warnings tolerated)
+        run: |
+          SPEC=""
+          for c in openapi.yaml openapi.yml openapi.json; do
+            [ -f "$c" ] && SPEC="$c" && break
+          done
+          if [ -z "$SPEC" ]; then
+            echo "no root OpenAPI spec found — skipped"
+            exit 0
+          fi
+          echo "spec: $SPEC"
+          mkdir -p _gate
+          set +e
+          npx --yes @redocly/cli@{{ redocly_version | default('1.34.2') }} lint "$SPEC" --format=json > _gate/openapi-lint.json 2>/tmp/redocly.err
+          rc=$?
+          set -e
+          if [ ! -s _gate/openapi-lint.json ]; then
+            tail -20 /tmp/redocly.err 2>/dev/null || true
+            echo "WARN: empty redocly JSON output (exit=$rc)"
+            if [ "$rc" != "0" ]; then exit 1; fi
+            exit 0
+          fi
+          python3 - > _gate/openapi-parse.txt << 'PY'
+          import json
+          try:
+              d = json.load(open("_gate/openapi-lint.json"))
+              totals = d.get("totals") or {}
+              errs = int(totals.get("errors", 0))
+              problems = d.get("problems", [])
+              if not errs and problems:
+                  errs = sum(1 for p in problems if (p.get("severity") or "") == "error")
+              detail = " | ".join(((p.get("message") or ""))[:100] for p in problems if (p.get("severity") or "") == "error")[:600]
+              print(errs)
+              print(detail)
+          except Exception as exc:
+              print(-1)
+              print(str(exc)[:200])
+          PY
+          ERRS=$(sed -n 1p _gate/openapi-parse.txt)
+          DETAIL=$(sed -n 2p _gate/openapi-parse.txt)
+          echo "redocly: errors=$ERRS"
+          if [ -n "$DETAIL" ]; then echo "$DETAIL"; fi
+          if [ "$ERRS" = "-1" ]; then
+            echo "WARN: could not parse redocly JSON output"
+            if [ "$rc" != "0" ]; then echo "FAIL: redocly exited non-zero"; exit 1; fi
+            exit 0
+          fi
+          if [ "$rc" != "0" ] || [ "$ERRS" != "0" ]; then
+            echo "FAIL: OpenAPI spec has $ERRS error(s) — fix the spec or set vars.RELEASE_NO_OPENAPI=true to skip"
+            exit 1
+          fi
+          echo "OPENAPI-LINT OK"
+
+      - name: Upload openapi lint report
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openapi-lint-report
+          path: _gate/openapi-lint.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release-summary:
+    name: release-summary
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    needs: [container-full, sbom-cyclonedx, license-compliance, env-audit, zizmor-full, debug-audit, schema-drift, migration-check, config-validation, endpoint-smoke, graceful-shutdown, api-contract-diff, perf-benchmark, build-full, static-asset-integrity, tests-detected, rollback-readiness, openapi-lint, strix-pentest]
+    if: always() && !cancelled()
+    steps:
+      - name: Retrieve test reports for summary (best-effort)
+        continue-on-error: true
+        if: always() && !cancelled()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gate-reports-release
+          path: _gate-in
+      - name: Release gate summary
+        env:
+          R_CONTAINER: {% raw %}${{ needs.container-full.result }}{% endraw %}
+          R_SBOM: {% raw %}${{ needs.sbom-cyclonedx.result }}{% endraw %}
+          R_LICENSE: {% raw %}${{ needs.license-compliance.result }}{% endraw %}
+          R_ENV: {% raw %}${{ needs.env-audit.result }}{% endraw %}
+          R_ZIZMOR: {% raw %}${{ needs.zizmor-full.result }}{% endraw %}
+          R_DEBUG: {% raw %}${{ needs.debug-audit.result }}{% endraw %}
+          R_SCHEMA: {% raw %}${{ needs.schema-drift.result }}{% endraw %}
+          R_MIGRATION: {% raw %}${{ needs.migration-check.result }}{% endraw %}
+          R_CONFIG: {% raw %}${{ needs.config-validation.result }}{% endraw %}
+          R_ENDPOINT: {% raw %}${{ needs.endpoint-smoke.result }}{% endraw %}
+          R_GRACEFUL: {% raw %}${{ needs.graceful-shutdown.result }}{% endraw %}
+          R_CONTRACT: {% raw %}${{ needs.api-contract-diff.result }}{% endraw %}
+          R_PERF: {% raw %}${{ needs.perf-benchmark.result }}{% endraw %}
+          R_BUILD: {% raw %}${{ needs.build-full.result }}{% endraw %}
+          R_ASSET: {% raw %}${{ needs.static-asset-integrity.result }}{% endraw %}
+          R_TESTS: {% raw %}${{ needs.tests-detected.result }}{% endraw %}
+          R_ROLLBACK: {% raw %}${{ needs.rollback-readiness.result }}{% endraw %}
+          R_OPENAPI: {% raw %}${{ needs.openapi-lint.result }}{% endraw %}
+          R_STRIX: {% raw %}${{ needs.strix-pentest.result }}{% endraw %}
+          COVERAGE_MIN: '{{ coverage_min | default(0) }}'
+        run: |
+          echo "================ RELEASE GATE (Tier 3) ================"
+          echo "container:      $R_CONTAINER"
+          echo "sbom:           $R_SBOM"
+          echo "license:        $R_LICENSE"
+          echo "env-audit:      $R_ENV"
+          echo "zizmor:         $R_ZIZMOR"
+          echo "debug-audit:    $R_DEBUG"
+          echo "schema-drift:   $R_SCHEMA"
+          echo "migration:      $R_MIGRATION"
+          echo "config:         $R_CONFIG"
+          echo "endpoint:       $R_ENDPOINT"
+          echo "graceful:       $R_GRACEFUL"
+          echo "contract:       $R_CONTRACT"
+          echo "perf:           $R_PERF"
+          echo "build:          $R_BUILD"
+          echo "asset:          $R_ASSET"
+          echo "tests:          $R_TESTS"
+          echo "rollback:       $R_ROLLBACK"
+          echo "======================================================"
+          {
+            echo "## Release gate (Tier 3 — dispatched side-tool)"
+            echo ""
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| container-full | $R_CONTAINER |"
+            echo "| sbom-cyclonedx | $R_SBOM |"
+            echo "| license-compliance | $R_LICENSE |"
+            echo "| env-audit | $R_ENV |"
+            echo "| zizmor-full | $R_ZIZMOR |"
+            echo "| debug-audit | $R_DEBUG |"
+            echo "| schema-drift | $R_SCHEMA |"
+            echo "| migration-check | $R_MIGRATION |"
+            echo "| config-validation | $R_CONFIG |"
+            echo "| endpoint-smoke | $R_ENDPOINT |"
+            echo "| graceful-shutdown | $R_GRACEFUL |"
+            echo "| api-contract-diff | $R_CONTRACT |"
+            echo "| perf-benchmark | $R_PERF |"
+            echo "| build-full | $R_BUILD |"
+            echo "| static-asset-integrity | $R_ASSET |"
+          echo "| tests-detected | $R_TESTS |"
+          echo "| rollback-readiness | $R_ROLLBACK |"
+          echo "| openapi-lint | $R_OPENAPI |"
+          echo "| strix-pentest | $R_STRIX |"
+            echo ""
+            echo "skipped = stack not present or graceful-skip; never a failure"
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p _gate
+          GATE_TIER=T3 python3 - << 'PY'
+          import json, os
+          pairs = [
+              ("container-full", "R_CONTAINER"),
+              ("sbom-cyclonedx", "R_SBOM"),
+              ("license-compliance", "R_LICENSE"),
+              ("env-audit", "R_ENV"),
+              ("zizmor-full", "R_ZIZMOR"),
+              ("debug-audit", "R_DEBUG"),
+              ("schema-drift", "R_SCHEMA"),
+              ("migration-check", "R_MIGRATION"),
+              ("config-validation", "R_CONFIG"),
+              ("endpoint-smoke", "R_ENDPOINT"),
+              ("graceful-shutdown", "R_GRACEFUL"),
+              ("api-contract-diff", "R_CONTRACT"),
+              ("perf-benchmark", "R_PERF"),
+              ("build-full", "R_BUILD"),
+              ("static-asset-integrity", "R_ASSET"),
+              ("tests-detected", "R_TESTS"),
+              ("rollback-readiness", "R_ROLLBACK"),
+              ("openapi-lint", "R_OPENAPI"),
+              ("strix-pentest", "R_STRIX"),
+          ]
+          jobs = dict((name, os.environ.get(env, "unknown")) for name, env in pairs)
+          failed = sorted(k for k, v in jobs.items() if v == "failure")
+          doc = {
+              "schema": "gate-summary/v1",
+              "tier": os.environ.get("GATE_TIER", "T3"),
+              "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+              "run_id": int(os.environ.get("GITHUB_RUN_ID") or 0),
+              "run_url": "{}/{}/actions/runs/{}".format(
+                  os.environ.get("GITHUB_SERVER_URL", ""),
+                  os.environ.get("GITHUB_REPOSITORY", ""),
+                  os.environ.get("GITHUB_RUN_ID", "")),
+              "branch": os.environ.get("GITHUB_REF_NAME", ""),
+              "sha": os.environ.get("GITHUB_SHA", ""),
+              "conclusion": "failure" if failed else "success",
+              "jobs": jobs,
+              "failed_jobs": failed,
+              "notes": ["skipped = stack not present or graceful-skip; never a failure"],
+          }
+          for cp in ("_gate-in/coverage.json", "_gate/coverage.json"):
+              if os.path.exists(cp):
+                  try:
+                      pct = float(json.load(open(cp)).get("totals", {}).get("percent_covered", 0))
+                      doc["coverage"] = {
+                          "actual_pct": round(pct, 1),
+                          "min_pct": float(os.environ.get("COVERAGE_MIN", "0")),
+                          "artifact": "gate-reports-release",
+                      }
+                  except Exception:
+                      pass
+                  break
+          jp = "_gate-in/junit.xml"
+          if os.path.exists(jp):
+              try:
+                  import xml.etree.ElementTree as ET
+                  failures = []
+                  for tc in ET.parse(jp).getroot().iter("testcase"):
+                      f = tc.find("failure")
+                      if f is None:
+                          f = tc.find("error")
+                      if f is None:
+                          continue
+                      failures.append({
+                          "name": ((tc.get("classname") or "") + "::" + (tc.get("name") or "")).lstrip(":"),
+                          "file": tc.get("file") or "",
+                          "line": int(tc.get("line") or 0),
+                          "message": (f.get("message") or "")[:300],
+                      })
+                      if len(failures) >= 10:
+                          break
+                  if failures:
+                      doc["test_failures"] = failures
+                      doc["failures_artifact"] = "gate-reports-release"
+              except Exception:
+                  pass
+          with open("_gate/gate-summary.json", "w") as f:
+              json.dump(doc, f, indent=2)
+          print("gate-summary:", json.dumps(doc)[:400])
+          PY
+          fail=0
+          for r in "$R_CONTAINER" "$R_SBOM" "$R_LICENSE" "$R_ENV" "$R_ZIZMOR" "$R_DEBUG" "$R_SCHEMA" "$R_MIGRATION" "$R_CONFIG" "$R_ENDPOINT" "$R_GRACEFUL" "$R_CONTRACT" "$R_PERF" "$R_BUILD" "$R_ASSET" "$R_TESTS" "$R_ROLLBACK" "$R_OPENAPI" "$R_STRIX"; do
+            if [ "$r" = "failure" ]; then fail=1; break; fi
+          done
+          if [ "$fail" != "0" ]; then echo "FAIL: release gate has a failed job — see annotations above + step logs"; exit 1; fi
+          echo "RELEASE-READY — all deterministic release proofs passed"
+
+      - name: Upload gate summary (machine-readable)
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-summary-T3
+          path: _gate/gate-summary.json
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,160 @@
+{
+  "_comment": "TIER 3 release-heavy — single universal source (like github-fast-checks for Tier 1). Deterministic prod-gate: image/SBOM/license/env-audit/zizmor + migration/schema/config/endpoint/contract/perf/build — no live URL. Triggers: push to prod-level branches (prod_branches var) OR tags v* OR workflow_dispatch (no schedule; never chained from Tier 1/2). All jobs SHA-pinned, per-stack hashFiles gates (0s skip), caches for trivy/zizmor/oasdiff/pip/npm/go. Flexible/adaptive to py/node/go/php/deno.",
+  "name": "github-release-heavy",
+  "description": "Universal Tier 3 deterministic release gate: Trivy image scan + size budget, CycloneDX SBOM (py/node/go/php/deno) + license denylist, env-audit (py/js/ts/go/php/deno), zizmor low, schema-drift/migration (postgres+DDL+round-trip), config-validation, endpoint-smoke (adaptive health_path/ready_path), graceful-shutdown, oasdiff contract diff, perf-benchmark (py/node/go/php/deno), build + static-asset integrity, tests-detected (all stacks), rollback-readiness. Flexible/adaptive to any stack, impactful, efficient.",
+  "category": "config",
+  "variables": [
+    {
+      "name": "python_version",
+      "type": "string",
+      "default": "3.12",
+      "description": "Python version for scan jobs"
+    },
+    {
+      "name": "node_version",
+      "type": "string",
+      "default": "22",
+      "description": "Node major version"
+    },
+    {
+      "name": "deno_version",
+      "type": "string",
+      "default": "v2.x",
+      "description": "Deno version"
+    },
+    {
+      "name": "php_version",
+      "type": "string",
+      "default": "8.3",
+      "description": "PHP version"
+    },
+    {
+      "name": "zizmor_version",
+      "type": "string",
+      "default": "1.29.0",
+      "description": "Pinned zizmor release (workflow self-audit)"
+    },
+    {
+      "name": "zizmor_min_severity",
+      "type": "string",
+      "default": "low",
+      "description": "Zizmor minimum severity (low/medium/high)"
+    },
+    {
+      "name": "trivy_version",
+      "type": "string",
+      "default": "0.73.0",
+      "description": "Pinned trivy release (container/image scan)"
+    },
+    {
+      "name": "trivy_severity",
+      "type": "string",
+      "default": "HIGH,CRITICAL",
+      "description": "Trivy severity filter"
+    },
+    {
+      "name": "oasdiff_version",
+      "type": "string",
+      "default": "1.29.1",
+      "description": "Pinned oasdiff release tag (repo oasdiff/oasdiff)"
+    },
+    {
+      "name": "oasdiff_fail_on",
+      "type": "string",
+      "default": "ERR",
+      "description": "oasdiff --fail-on level (ERR/WARN)"
+    },
+    {
+      "name": "cyclonedx_npm_version",
+      "type": "string",
+      "default": "6.0.1",
+      "description": "Pinned @cyclonedx/cyclonedx-npm version"
+    },
+    {
+      "name": "cyclonedx_bom_version",
+      "type": "string",
+      "default": "7.3.1",
+      "description": "Pinned cyclonedx-bom pip version"
+    },
+    {
+      "name": "cyclonedx_gomod_version",
+      "type": "string",
+      "default": "v1.7.0",
+      "description": "Pinned cyclonedx-gomod version"
+    },
+    {
+      "name": "job_timeout_minutes",
+      "type": "string",
+      "default": "15",
+      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
+    },
+    {
+      "name": "license_denylist",
+      "type": "string",
+      "default": "GPL-3.0,AGPL-3.0",
+      "description": "Comma-separated license IDs that block deployment"
+    },
+    {
+      "name": "image_size_budget_mb",
+      "type": "string",
+      "default": "500",
+      "description": "Docker image size budget (MB) — fails if exceeded"
+    },
+    {
+      "name": "pg_version",
+      "type": "string",
+      "default": "16-alpine",
+      "description": "Postgres image tag for migration-check"
+    },
+    {
+      "name": "health_path",
+      "type": "string",
+      "default": "/health",
+      "description": "Health probe path (configurable like Tier2)"
+    },
+    {
+      "name": "ready_path",
+      "type": "string",
+      "default": "/ready",
+      "description": "Readiness probe path (configurable like Tier2)"
+    },
+    {
+      "name": "perf_test_path",
+      "type": "string",
+      "default": "tests/test_perf_smoke.py",
+      "description": "Perf-smoke test file path (python)"
+    },
+    {
+      "name": "sbom_fail_on_empty",
+      "type": "string",
+      "default": "false",
+      "description": "true = fail release if SBOM has 0 components"
+    },
+    {
+      "name": "env_audit_strict",
+      "type": "string",
+      "default": "true",
+      "description": "true = fail on undocumented env vars, false = warn only"
+    },
+    {
+      "name": "prod_branches",
+      "type": "string",
+      "default": "main,master",
+      "description": "Comma-separated production-level branch names that trigger Tier 3 on push alongside tags v* (branch-level map: T1=dev/feature, T2=staging push, T3=prod)"
+    }
+  ],
+  "files": [
+    {
+      "src": "release-heavy.yml.j2",
+      "dest": ".github/workflows/release-heavy.yml"
+    }
+  ],
+  "notes": "Tier 3 single universal file (no 3 copies) — add a stack = one hashFiles branch. Triggers: push to prod-level branches (prod_branches) OR tags v*, docs-ignored, cancel:false deterministic — no schedule (nightly removed per dev-control request; never chained from Tier 1/2). Caches: trivy/zizmor/oasdiff tarballs + pip/npm/go. Stack-aware SBOM (py/node/go/php/deno real parsers, merged polyglot) / env-audit (py/js/ts/go/php/deno, health_path aware) / endpoint-smoke (adaptive, golden 200/404/503 ready semantics) / perf (py/node/go/php/deno) / tests-detected (all stacks). Promotion: PR→Tier1 fast →merge→staging push Tier2 →prod push or tag v*→Tier3 release-heavy (this file). No nightly.",
+  "sample_vars": {
+    "python_version": "3.12",
+    "image_size_budget_mb": "500",
+    "trivy_version": "0.73.0",
+    "health_path": "/health",
+    "prod_branches": "main,master"
+  }
+}

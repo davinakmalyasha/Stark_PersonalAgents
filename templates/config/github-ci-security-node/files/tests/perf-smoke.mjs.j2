@@ -1,9 +1,27 @@
 // Deterministic perf smoke — main-entry import budget.
 // Runs in the gate's perf-smoke job (tests/perf-smoke.mjs).
+// Skips cleanly when no known app entry exists (nothing to budget yet).
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const candidates = [
+  process.env.PERF_ENTRY_FILE,
+  'src/main.ts', 'src/main.js', 'src/index.ts', 'src/index.js',
+  'main.ts', 'main.js', 'index.ts', 'index.js',
+].filter(Boolean);
+
+const entry = candidates.map((c) => path.join(root, c)).find((p) => existsSync(p));
+if (!entry) {
+  console.log('PERF-SKIP: no app entry found (set PERF_ENTRY_FILE to enable the import budget)');
+  process.exit(0);
+}
+
 const budgetMs = Number(process.env.PERF_IMPORT_BUDGET_MS || 5000);
 
 const start = performance.now();
-await import("../src/main.ts").catch((e) => {
+await import(entry).catch((e) => {
   console.error("main entry import failed:", e?.message || e);
   process.exit(1);
 });

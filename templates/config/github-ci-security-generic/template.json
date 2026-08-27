@@ -1,7 +1,7 @@
 {
-  "_comment": "THE GATE — generic profile. For any language not otherwise profiled: osv-scanner SCA (all ecosystems), gitleaks, multi-language CodeQL, detected test command, zizmor. A repo is never ungated.",
+  "_comment": "Generic profile shim (any language) — composes universal gates: github-fast-checks (Tier 1, dev/feature pushes ~18s universal) + github-release-heavy (Tier 3, prod pushes/tags deterministic). Pure composition recipe — ships NO workflow file of its own; exactly one workflow per tier exists in gated repos.",
   "name": "github-ci-security-generic",
-  "description": "Universal fallback gate for any language: osv-scanner SCA, gitleaks secrets, multi-language CodeQL, detected test command, zizmor.",
+  "description": "Universal fallback gate via universal tiers: fast-checks (dev/feature pushes, ~18s) + release-heavy (prod pushes/tags). Composition recipe only — no extra workflow file.",
   "category": "config",
   "variables": [
     {
@@ -14,25 +14,7 @@
       "name": "zizmor_version",
       "type": "string",
       "default": "1.29.0",
-      "description": "Pinned zizmor release"
-    },
-    {
-      "name": "osv_scanner_version",
-      "type": "string",
-      "default": "2.5.0",
-      "description": "Pinned osv-scanner release"
-    },
-    {
-      "name": "codeql_on",
-      "type": "string",
-      "default": "true",
-      "description": "Include the CodeQL job (analyzes whatever languages are present)"
-    },
-    {
-      "name": "job_timeout_minutes",
-      "type": "string",
-      "default": "15",
-      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
+      "description": "Pinned zizmor release (workflow self-audit)"
     },
     {
       "name": "license_denylist",
@@ -41,34 +23,21 @@
       "description": "Comma-separated license IDs that block deployment"
     },
     {
-      "name": "image_size_budget_mb",
+      "name": "prod_branches",
       "type": "string",
-      "default": "500",
-      "description": "Docker image size budget (MB) — fails if exceeded"
+      "default": "main,master",
+      "description": "Comma-separated production-level branch names (T3 push trigger; T1 excludes them)"
     },
     {
-      "name": "trivy_version",
+      "name": "staging_branch",
       "type": "string",
-      "default": "0.73.0",
-      "description": "Pinned trivy release (container/image scan)"
+      "default": "staging",
+      "description": "Staging-level branch name (T2 push trigger; T1 excludes it)"
     }
   ],
-  "files": [
-    {
-      "src": "security.yml.j2",
-      "dest": ".github/workflows/security.yml"
-    },
-    {
-      "src": "fast-checks.yml.j2",
-      "dest": ".github/workflows/fast-checks.yml"
-    },
-    {
-      "src": "release-heavy.yml.j2",
-      "dest": ".github/workflows/release-heavy.yml"
-    }
-  ],
-  "notes": "Two-speed gate: fast-checks.yml (every push, ~30s: lint+syntax+secrets HEAD) + security.yml (PR/push to main only: full deterministic gate) + release-heavy.yml (nightly/tags: deep pass). Branch protection contexts = security.yml jobs only. Docs-only changes skip everything.",
+  "uses": ["github-fast-checks", "github-release-heavy"],
+  "files": [],
+  "notes": "Shim composing universal tiers: Tier 1 github-fast-checks (universal ~18s, any stack) + Tier 3 github-release-heavy (deterministic prod/tags). Ships no workflow file of its own — a future dedicated SAST tier would be authored as its own template. Docs-only skips.",
   "sample_vars": {
-    "codeql_on": "true"
-  }
+    }
 }

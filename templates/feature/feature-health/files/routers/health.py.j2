@@ -1,5 +1,5 @@
 """Health probes for {{ app_name }} — liveness + readiness for k8s."""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,10 @@ def readiness(db: Session = Depends(get_db)):
         db.execute(text("SELECT 1"))
         return {"status": "ready", "db": "ok"}
     except Exception as e:
-        return {"status": "not_ready", "db": str(e)}
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "not_ready", "db": str(e)},
+        )
 
 
 # TODO: register router in main.py (no auth — k8s needs unauthenticated probes).

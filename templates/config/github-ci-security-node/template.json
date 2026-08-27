@@ -1,7 +1,7 @@
 {
-  "_comment": "THE GATE — node profile. Covers plain node, Next.js, Vite/React, Express (same four jobs: quality, coverage, bundle, perf-smoke). npm audit SCA, gitleaks, ESLint+prettier+tsc, c8 coverage, bundle budget, main-import perf, semgrep, trivy, codeql-js, zizmor.",
+  "_comment": "Node profile shim — composes universal gates: github-fast-checks (Tier 1, dev/feature pushes ~18s universal) + github-release-heavy (Tier 3, prod pushes/tags deterministic). Pure composition recipe + perf test fixture — ships NO workflow file of its own; exactly one workflow per tier exists in gated repos.",
   "name": "github-ci-security-node",
-  "description": "Enterprise-grade node/Next.js gate: npm audit SCA, gitleaks secrets, ESLint+prettier+tsc quality, c8 coverage threshold, bundle-size budget, perf-smoke, Semgrep, Trivy, CodeQL-js, zizmor.",
+  "description": "Node gate via universal tiers: fast-checks (dev/feature pushes, ~18s universal) + release-heavy (prod pushes/tags, deterministic). Composition recipe only — no extra workflow file.",
   "category": "config",
   "variables": [
     {
@@ -26,43 +26,7 @@
       "name": "trivy_version",
       "type": "string",
       "default": "0.73.0",
-      "description": "Pinned trivy release"
-    },
-    {
-      "name": "codeql_on",
-      "type": "string",
-      "default": "true",
-      "description": "Include the CodeQL job"
-    },
-    {
-      "name": "coverage_threshold",
-      "type": "string",
-      "default": "80",
-      "description": "c8 line coverage threshold"
-    },
-    {
-      "name": "bundle_budget_kb",
-      "type": "string",
-      "default": "500",
-      "description": "Largest emitted asset budget (KB)"
-    },
-    {
-      "name": "perf_import_budget_ms",
-      "type": "string",
-      "default": "5000",
-      "description": "Main-entry import budget (ms)"
-    },
-    {
-      "name": "job_timeout_minutes",
-      "type": "string",
-      "default": "15",
-      "description": "Per-job timeout budget — hung jobs never burn runner minutes"
-    },
-    {
-      "name": "semgrep_config_ref",
-      "type": "string",
-      "default": "security-audit",
-      "description": "Pinned Semgrep registry config — deterministic findings across pushes"
+      "description": "Pinned trivy release (consumed by github-release-heavy)"
     },
     {
       "name": "license_denylist",
@@ -75,31 +39,29 @@
       "type": "string",
       "default": "500",
       "description": "Docker image size budget (MB) — fails if exceeded"
+    },
+    {
+      "name": "prod_branches",
+      "type": "string",
+      "default": "main,master",
+      "description": "Comma-separated production-level branch names (T3 push trigger; T1 excludes them)"
+    },
+    {
+      "name": "staging_branch",
+      "type": "string",
+      "default": "staging",
+      "description": "Staging-level branch name (T2 push trigger; T1 excludes it)"
     }
   ],
+  "uses": ["github-fast-checks", "github-release-heavy"],
   "files": [
-    {
-      "src": "security.yml.j2",
-      "dest": ".github/workflows/security.yml"
-    },
     {
       "src": "tests/perf-smoke.mjs.j2",
       "dest": "tests/perf-smoke.mjs"
-    },
-    {
-      "src": "fast-checks.yml.j2",
-      "dest": ".github/workflows/fast-checks.yml"
-    },
-    {
-      "src": "release-heavy.yml.j2",
-      "dest": ".github/workflows/release-heavy.yml"
     }
   ],
-  "notes": "Two-speed gate: fast-checks.yml (every push, ~30s: lint+syntax+secrets HEAD) + security.yml (PR/push to main only: full deterministic gate) + release-heavy.yml (nightly/tags: deep pass). Branch protection contexts = security.yml jobs only. Docs-only changes skip everything.",
+  "notes": "Shim composing universal tiers: Tier 1 github-fast-checks (universal ~18s — node projects also auto-get py/go/php/deno checks when present) + Tier 3 github-release-heavy (trivy/SBOM/license/env-audit/zizmor/migration-lite/endpoint/perf/build/tests/rollback). Ships no workflow file of its own — a future dedicated SAST tier would be authored as its own template. Docs-only skips.",
   "sample_vars": {
-    "node_version": "22",
-    "codeql_on": "true",
-    "coverage_threshold": "80",
-    "bundle_budget_kb": "500"
+    "node_version": "22"
   }
 }

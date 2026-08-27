@@ -1,11 +1,14 @@
-"""App entry point for {{ project_name }}."""
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .database import Base, engine
 
-Base.metadata.create_all(bind=engine)
+# Auto-create tables for development when alembic is not configured.
+# When alembic.ini exists, schema must be managed via migrations (alembic upgrade head).
+if not os.path.exists("alembic.ini"):
+    Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.APP_NAME, version="0.1.0")
 

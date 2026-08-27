@@ -51,7 +51,7 @@ Always agent-written (never templated):
 | feature   | L3       | feature-crud, feature-auth, feature-rbac, feature-upload, feature-email, feature-errors, feature-config, feature-export, feature-import, feature-audit-log, feature-notifications, feature-sse, feature-rate-limit, feature-password-reset, feature-webhook |
 | component | L4       | comp-csv-exporter, comp-queue-worker, comp-search-filter, comp-paginated-table, comp-charts, comp-form, comp-modal, comp-toast, comp-layout, comp-login, comp-http-client, comp-dropzone, comp-error-boundary, comp-crud-page, comp-dashboard, comp-settings, comp-chat, comp-page, comp-notification-bell, comp-markdown-viewer, comp-code-block, comp-landing, comp-signup |
 | project   | L1       | project-fastapi, project-frontend |
-| config    | —        | github-ci-python, github-ci-security-python, github-ci-security-generic, dockerfile-python, docker-compose, nginx |
+| config    | —        | github-ci-security-python, github-ci-security-node, github-ci-security-generic, github-fast-checks, github-staging, github-release-heavy, dockerfile-python, docker-compose, nginx |
 | routine   | —        | gitignore-python, gitignore-node, requirements, pyproject, readme |
 | spec      | —        | spec-feature |
 
@@ -95,27 +95,49 @@ Always agent-written (never templated):
 Installed by `github_apply_gate` / `github_init_project` (with user confirmation),
 non-destructively: existing project files are never overwritten.
 
+### Branch-level ladder (3 tiers ↔ 3 levels)
+
+The gate maps each tier to a branch LEVEL. Names are adaptive per company —
+resolved from `.harness-ci.json` in the repo > remote branch scan > defaults —
+and persisted back as `.harness-ci.json` so the agent harness auto-push obeys
+the same map:
+
+| Level | Default names | Tier | Fires on |
+|---|---|---|---|
+| dev | `development` | T1 fast-checks (~18s) | dev-level + feature-branch pushes, PRs |
+| staging | `staging` | T2 staging (live proofs) | staging-level push (+ dispatch) |
+| prod | `main`, `master` | T3 release-heavy | prod-level push + tags `v*` (+ dispatch) |
+
+`github_apply_gate` idempotently creates the dev/staging branches, seeds the
+workflows with the resolved names (`staging_branch` / `prod_branches` template
+variables), writes `.harness-ci.json`, and protects all three branches with the
+Tier 1 check contexts. The harness auto-push (`ci_gate.py`) lands on the
+dev-level branch only — production and staging are never auto-pushed.
+
 **Profiles** (auto-detected): `package.json`→node · `composer.json`→php ·
 `go.mod`→go · pyproject/requirements→python · none→generic (a repo is never ungated).
 
-| Job | python | node (incl. Next) | go | php | generic |
-|---|---|---|---|---|---|
-| secrets (gitleaks) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| sca | pip-audit | npm audit | govulncheck | composer audit | osv-scanner |
-| sast | Bandit | — | staticcheck | semgrep+CodeQL | — |
-| quality (lint+format+type) | Ruff S+B+format+mypy | ESLint+prettier+tsc | gofmt+go vet | php -l+PHPStan | — |
-| coverage threshold | ✅ | c8 | go cover | PHPUnit clover | — |
-| semgrep (p/security-audit) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| container (trivy, if Dockerfile) | ✅ | ✅ | — | ✅ | — |
-| codeql | py | js/ts | go | php | multi-lang |
-| zizmor (workflow self-audit) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| perf-smoke | ✅ | ✅ main-import | — | — | — |
-| bundle budget | — | ✅ | — | — | — |
-| perf-load (k6, dispatch-only) | ✅ | ✅ | — | — | — |
+**What each tier actually runs** (all SHA-pinned and graceful-skipping — a fresh
+repo stays green, a real project gets real enforcement):
 
-Every job is SHA-pinned and graceful-skipping: a fresh repo stays green, a real
-project gets real enforcement. Coverage applies only when a real package exists.
+- **T1 fast-checks (~18s, dev/feature pushes + PRs)**: gitleaks secrets ·
+  actionlint+shellcheck · lint (ruff / eslint+tsc / gofmt+vet / php -l / deno
+  lint) · tests (pytest / vitest / go test / phpunit / deno test) · quick audit
+  (pip-audit / npm audit / govulncheck / composer / deno) — high-severity only.
+  Diff-gated per stack; dispatch runs full.
+- **T2 staging (staging-level push)**: backup drill with MD5 data round-trip ·
+  alembic N-1 forward-upgrade head assert · rotation age (vault or heuristic) ·
+  multi-worker burst · DNS/TLS preflight · external smoke · k6 load · live smoke
+  with golden /ready semantics (200 pass · 404 warn · 503 fail). Live jobs skip
+  at job level when unwired; `STAGING_NO_LIVE=true` forces ephemeral targets.
+- **T3 release-heavy (prod-level push + tags `v*`)**: trivy image scan + size
+  budget · CycloneDX SBOM (py/node/go/php/deno) + license denylist · env-audit ·
+  zizmor workflow self-audit · schema-drift + migration round-trip · config
+  validation · endpoint smoke · graceful shutdown · oasdiff contract diff ·
+  perf benchmark · full build + static-asset integrity · tests-detected ·
+  rollback readiness.
+
 Perf budgets are universal defaults — tune after first green.
 
 CI (`scripts/validate_templates.py`) re-renders every template with its sample vars on
-every push — a broken template fails the build in seconds.
+every push AND YAML-parses every rendered workflow — a broken template fails the build in seconds.

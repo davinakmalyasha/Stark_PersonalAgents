@@ -374,6 +374,15 @@ def _format_compact_project_identity(content: str, workspace_path: str = "") -> 
     stack = ""
     runtime = ""
 
+    # Injected identity must be immutable: drift appends ([updated:] /
+    # [identity stabilized:]) describe reality churn but may never change
+    # the SystemMessage bytes, or every resume would invalidate the whole
+    # cached prefix. The projection freezes at the write-once head; the
+    # full file keeps its audit trail and still drives the stable-gate,
+    # which reads status from the complete file elsewhere.
+    for marker in ("[updated:", "[identity stabilized:"):
+        content = content.split(marker, 1)[0]
+
     for line in content.splitlines():
         s = line.strip()
         low = s.lower()

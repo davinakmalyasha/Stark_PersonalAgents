@@ -3,10 +3,12 @@ Repository Map Generator — Compiles codebases into a token-efficient signature
 Uses tree-sitter AST parsing for Python, PHP, TypeScript, and JavaScript.
 Falls back to robust regex signature extraction for Dart and parse failures.
 """
+import itertools
 import os
 import re
+import subprocess
 import sys
-from typing import List, Tuple, Dict, Set, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 # Reconfigure console output encoding to UTF-8
 try:
@@ -17,7 +19,7 @@ except Exception:
 # Try importing tree_sitter
 try:
     import tree_sitter_languages as tsl
-    from tree_sitter import Parser, Node
+    from tree_sitter import Node, Parser
     HAS_TREE_SITTER = True
 except ImportError:
     HAS_TREE_SITTER = False
@@ -426,19 +428,74 @@ def _format_compact(entries: List[Tuple[str, int, bool]]) -> str:
     return " ".join(out)
 
 
+# Generic low-architecture-value helpers (imported everywhere, say little
+# about where to edit) get their ranking score multiplied by
+# MAP_UTILITY_PENALTY. Matched on stem segments (token boundaries) so real
+# logic modules like "chat_context" never match while "db_config",
+# "sync_helpers" or "app_constants" always do. A file also counts as a
+# utility when a WHOLE parent directory is a generic bucket ("src/types/",
+# "lib/utils/"), catching type barrels like "types/index.ts".
+_UTILITY_STEM_RE = re.compile(
+    r"(?:^|_)(?:utils?|helpers?|loggers?|logging|constants?|consts?|"
+    r"settings?|configurations?|config|types?)(?:_|$)"
+)
+_UTILITY_SEGMENT_RE = re.compile(
+    r"^(?:utils?|helpers?|loggers?|logging|constants?|consts?|"
+    r"settings?|configurations?|config|types?)$"
+)
+
+
+def _is_utility_file(path: str) -> bool:
+    name = os.path.basename(path).lower()
+    if name.startswith("__init__."):
+        return True
+    stem = os.path.splitext(name)[0]
+    if _UTILITY_STEM_RE.search(stem):
+        return True
+    segments = [
+        seg for seg in os.path.dirname(path).replace("\\", "/").split("/") if seg
+    ]
+    return any(_UTILITY_SEGMENT_RE.match(seg) for seg in segments)
+
+
+# Delimiter injected into `git log --pretty=format:` output so per-commit
+# file lists can be split deterministically while parsing co-change history.
+_GIT_COMMIT_SEP = "@@C@@"
+
+
 class RepoMapGenerator:
     """Build a small plain-English navigation guide from the import graph.
 
     The map is intentionally not a source listing. It describes major areas,
     a handful of high-value files, and direct relationships between files.
     Live files and search_code remain authoritative.
+
+    Key files are ranked by PageRank over the import graph with generic
+    utilities demoted; full snapshots may additionally carry git co-change
+    hints. Both features are deterministic for a given repository state, so
+    the map stays byte-stable per project. Nothing here is keyed to specific
+    project names: ranking uses graph structure only.
     """
 
+    # Cross-ecosystem conventional entry-point basenames (stem only, any
+    # supported extension). Used ONLY as an eligibility fallback so a
+    # conventional-but-unconnected entry file can occupy a Key-files slot;
+    # ranking itself never sees names.
+    ENTRY_STEMS = frozenset({"__main__", "main", "app", "server", "index"})
+
     IGNORED_DIRS = {
-        "node_modules", "vendor", ".git", "venv", ".venv", "__pycache__",
-        ".deep_agents", ".claude", "dist", "build", ".pytest_cache",
-        ".vscode", ".idea", "storage", "public", "venv312", "scratch",
-        ".antigravity", "skills", ".agents"
+        # Dependency / vendor
+        "node_modules", "vendor", "bower_components", "venv", ".venv", "venv312",
+        # VCS / tooling / IDE
+        ".git", "__pycache__", ".deep_agents", ".claude", ".pytest_cache",
+        ".vscode", ".idea", ".antigravity", ".agents", "skills", "scratch",
+        # Build output
+        "dist", "build", "out", "obj", "target", ".next", ".nuxt",
+        ".svelte-kit", ".parcel-cache", "storybook-static", ".turbo",
+        # Temp / cache / logs / coverage / reports
+        "logs", "log", "tmp", "temp", "coverage", ".cache", ".gradle",
+        ".terraform", ".dart_tool", "test-results", "playwright-report",
+        "storage", "public",
     }
     SUPPORTED_EXTS = {".py", ".php", ".ts", ".tsx", ".js", ".jsx", ".dart"}
     MAP_MARKER = "projectMap:"
@@ -532,28 +589,138 @@ class RepoMapGenerator:
                 lines.append(f"{prefix} {path} -> {targets}")
         return "\n".join(lines)
 
+    def _pagerank_scores(self, files: list[str], graph: dict[str, set[str]]) -> dict[str, float]:
+        """PageRank over the import graph with generic utilities demoted.
+
+        Deterministic: fixed damping/iterations/convergence, sorted node
+        order, uniform reset mass. No name-based seeding — entry points and
+        coordinators win on graph structure alone (they import many modules
+        and are imported by launchers/tests). Generic helpers are multiplied
+        by MAP_UTILITY_PENALTY (default 0.4; 1 disables demotion) because
+        near-universal inbound imports otherwise elect logger/config/utils
+        files that carry little architectural signal. The multiplier biases
+        ORDERING only; MAP_MAX_UTILITY_FILES (see generate_map) is the hard
+        guarantee that utilities cannot crowd out logic hubs.
+        """
+        nodes = sorted(files)
+        n = len(nodes)
+        if not n:
+            return {}
+        index = {p: i for i, p in enumerate(nodes)}
+        out_links = [[index[t] for t in sorted(graph.get(p, ()))] for p in nodes]
+        try:
+            penalty = max(0.0, min(1.0, float(os.environ.get("MAP_UTILITY_PENALTY", "0.4"))))
+        except ValueError:
+            penalty = 0.4
+
+        reset = [1.0 / n] * n
+
+        ranks = [1.0 / n] * n
+        for _ in range(50):
+            dangling = sum(ranks[i] for i in range(n) if not out_links[i])
+            nxt = [(1 - 0.85) * reset[j] + 0.85 * dangling / n for j in range(n)]
+            for i in range(n):
+                targets = out_links[i]
+                if targets:
+                    share = 0.85 * ranks[i] / len(targets)
+                    for j in targets:
+                        nxt[j] += share
+            delta = sum(abs(a - b) for a, b in zip(nxt, ranks))
+            ranks = nxt
+            if delta < 1e-9:
+                break
+
+        def _weight(path: str) -> float:
+            name = os.path.basename(path).lower()
+            # Package markers (__init__) and nested barrels (index.*) are
+            # pure plumbing: near-universal inbound imports with zero logic,
+            # so they never compete for a Key-file slot. A ROOT-level
+            # index.* survives — it is often the runtime entry point.
+            if name.startswith("__init__."):
+                return 0.0
+            if os.path.splitext(name)[0] == "index" and "/" in path:
+                return 0.0
+            return penalty if _is_utility_file(path) else 1.0
+
+        return {p: ranks[index[p]] * _weight(p) for p in nodes}
+
+    def _cochange_pairs(self, files: list[str]) -> list[tuple[str, str]]:
+        """Git co-change pairs as raw (a, b) tuples.
+
+        Counts file pairs committed together over the last
+        MAP_COCHANGE_COMMITS commits (default 200); pairs changed together in
+        at least MAP_COCHANGE_MIN_COUNT commits (default 2 — young repos have
+        short histories; raise it to demand stronger evidence), capped at
+        MAP_COCHANGE_MAX lines (default 4). Any failure — missing .git,
+        missing git binary, timeout, non-zero exit — degrades silently to []
+        so the map stays purely import-derived. Computed only on full-map
+        builds: topology snapshots and deltas intentionally never contain
+        these lines, so mid-session commits cannot emit map events.
+        """
+        try:
+            limit = int(os.environ.get("MAP_COCHANGE_COMMITS", "200"))
+            min_count = int(os.environ.get("MAP_COCHANGE_MIN_COUNT", "2"))
+            max_pairs = int(os.environ.get("MAP_COCHANGE_MAX", "4"))
+        except ValueError:
+            limit, min_count, max_pairs = 200, 2, 4
+        try:
+            proc = subprocess.run(
+                ["git", "log", f"-n{max(1, limit)}", "--name-only",
+                 "--pretty=format:" + _GIT_COMMIT_SEP],
+                cwd=self.project_path,
+                capture_output=True, text=True, errors="replace", timeout=10,
+                check=False,
+            )
+        except Exception:
+            return []
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+
+        known = set(files)
+        counts: dict[tuple[str, str], int] = {}
+
+        def flush(block: set[str]) -> None:
+            paths = {p.strip().replace("\\", "/") for p in block}
+            paths &= known
+            # Skip oversized commits (bulk imports/merges co-change nothing).
+            if 2 <= len(paths) <= 50:
+                for a, b in itertools.combinations(sorted(paths), 2):
+                    counts[(a, b)] = counts.get((a, b), 0) + 1
+
+        block: set[str] = set()
+        marker = _GIT_COMMIT_SEP
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if stripped == marker:
+                flush(block)
+                block = set()
+            elif stripped:
+                block.add(stripped)
+        flush(block)
+
+        ranked = sorted(
+            ((count, pair) for pair, count in counts.items() if count >= max(1, min_count)),
+            key=lambda item: (-item[0], item[1]),
+        )
+        return [pair for _, pair in ranked[:max(0, max_pairs)]]
+
     @staticmethod
     def _role(path: str) -> str:
         lower = path.lower()
         name = os.path.basename(lower)
-        if "orchestrator" in name:
-            return "routes work and coordinates agents"
-        if "developer_agent" in name:
-            return "implements coding tasks"
-        if "repo_map" in name:
-            return "builds repository navigation context"
-        if "memory_manager" in name or "/memory/" in lower:
-            return "stores project identity and navigation cache"
-        if "/agents/" in f"/{lower}":
-            return "agent and delegation logic"
+        stem = os.path.splitext(name)[0]
+        # Only root-level conventional names count as THE application entry
+        # point; a nested "index.ts" is just some module's barrel.
+        if stem == "__main__" or ("/" not in path and stem in RepoMapGenerator.ENTRY_STEMS):
+            return "entry point"
+        if "/tests/" in f"/{lower}" or "/test/" in f"/{lower}":
+            return "tests"
         if "/tools/" in f"/{lower}":
-            return "tool implementation"
+            return "tools"
         if "/templates/" in f"/{lower}":
-            return "reusable template data"
-        if name in {"main.py", "app.py", "server.py", "api_server.py"}:
-            return "application entry point"
-        if name in {"index.js", "index.ts", "index.tsx", "index.jsx"}:
-            return "module entry point"
+            return "templates"
+        if "/agents/" in f"/{lower}":
+            return "agents"
         return "source module"
 
     def _bounded(self, lines: list[str]) -> str:
@@ -562,11 +729,84 @@ class RepoMapGenerator:
         for line in lines:
             addition = len(line) + (1 if out else 0)
             if size + addition > self.max_chars - 36:
-                out.append("[truncated: use search_code for more]")
+                omitted = len(lines) - len(out)
+                out.append(f"[truncated: {omitted} lines omitted; use search_code]")
                 break
             out.append(line)
             size += addition
         return "\n".join(out)
+
+    @staticmethod
+    def _min_unique_refs(paths: set[str]) -> dict[str, str]:
+        """Smallest root-relative tail per path that stays unambiguous.
+
+        Used only for cross-scope references. The grammar is exact: `./x`
+        means a file directly in the repo root, so ONLY single-segment paths
+        earn the "./" prefix; deeper files always carry at least one real
+        directory segment (`tools/x.py`, never `./x.py`). Tails grow until
+        unique across the whole reference vocabulary; full paths are unique
+        by construction, so this always terminates.
+        """
+        ordered = sorted(paths)
+        max_depth = max((len(p.split("/")) for p in ordered), default=0)
+        tables = []
+        for k in range(1, max_depth + 1):
+            counts: dict[str, int] = {}
+            for p in ordered:
+                tail = "/".join(p.split("/")[-k:])
+                counts[tail] = counts.get(tail, 0) + 1
+            tables.append(counts)
+        refs: dict[str, str] = {}
+        for p in ordered:
+            parts = p.split("/")
+            # A deep file must keep at least one directory segment; a bare
+            # basename with "./" is reserved for true repo-root files.
+            min_k = 1 if len(parts) == 1 else 2
+            for k in range(min_k, len(parts) + 1):
+                tail = "/".join(parts[-k:])
+                if tables[k - 1][tail] == 1:
+                    refs[p] = f"./{tail}" if len(parts) == 1 else tail
+                    break
+        return refs
+
+    @staticmethod
+    def _group_edges(
+        items: list[tuple[str, str, list[str]]], cross_refs: dict[str, str]
+    ) -> list[str]:
+        """Render edges grouped under `<dir>/` scope headers.
+
+        A bare filename lives inside the current scope; a token containing
+        `/` or starting with `./` is repo-root-relative. Repo-root files form
+        the implicit root scope and get no header. Every directory pays its
+        header once — all its edges merge at the scope's first appearance in
+        the ranked stream, so priority survives truncation. Grammar is
+        project-agnostic: extensions are kept so same-stem files in
+        different languages never collide.
+        """
+        scoped: dict[str, list[tuple[str, str, list[str]]]] = {}
+        order: list[str] = []
+        for primary, arrow, secondaries in items:
+            scope = os.path.dirname(primary)
+            if scope not in scoped:
+                scoped[scope] = []
+                order.append(scope)
+            scoped[scope].append((primary, arrow, secondaries))
+        out: list[str] = []
+        for scope in order:
+            if scope:
+                out.append(f"{scope}/")
+            for primary, arrow, secondaries in scoped[scope]:
+                refs = []
+                for sec in secondaries:
+                    if os.path.dirname(sec) == scope:
+                        refs.append(os.path.basename(sec))
+                    else:
+                        refs.append(cross_refs.get(sec, sec))
+                # Defensive: an empty ref can only mean a bug upstream —
+                # drop it rather than emit a dangling comma.
+                refs = [r for r in refs if r]
+                out.append(f"{os.path.basename(primary)}{arrow}{','.join(refs)}")
+        return out
 
     def generate_map(self) -> str:
         """Return a bounded, deterministic relationship-oriented map."""
@@ -583,39 +823,101 @@ class RepoMapGenerator:
             for target in targets:
                 incoming[target] += 1
 
-        areas: dict[str, int] = {}
-        for path in files:
-            area = path.split("/", 1)[0] if "/" in path else "root"
-            areas[area] = areas.get(area, 0) + 1
+        scores = self._pagerank_scores(files, graph)
 
-        known_names = {
-            "main.py", "app.py", "server.py", "api_server.py", "orchestrator_agent.py",
-            "developer_agent.py", "memory_manager.py", "repo_map_generator.py",
-            "package.json", "pyproject.toml"
-        }
-        ranked = sorted(
-            files,
-            key=lambda p: (
-                -(incoming[p] * 4 + len(graph[p]) * 2 + (10 if os.path.basename(p).lower() in known_names else 0)),
-                p,
-            ),
-        )
-        key_files = [p for p in ranked if incoming[p] or graph[p] or os.path.basename(p).lower() in known_names][:12]
+        # Areas carry PageRank mass from CONNECTED files only: a directory
+        # full of disconnected scripts contributes nothing an agent can
+        # navigate, so it sinks below the display cut without name rules.
+        area_mass: dict[str, float] = {}
+        for path in files:
+            if not (incoming[path] or graph[path]):
+                continue
+            area = path.split("/", 1)[0] if "/" in path else "root"
+            area_mass[area] = area_mass.get(area, 0.0) + scores.get(path, 0.0)
+        ranked = sorted(files, key=lambda p: (-scores.get(p, 0.0), p))
+
+        def _entry_like(path: str) -> bool:
+            stem = os.path.splitext(os.path.basename(path))[0].lower()
+            return stem in self.ENTRY_STEMS
+
+        # Hard guarantee on top of the score multiplier: however extreme the
+        # fan-in, generic utilities can never hold more than
+        # MAP_MAX_UTILITY_FILES of the 12 Key-files slots.
+        try:
+            max_utilities = max(0, int(os.environ.get("MAP_MAX_UTILITY_FILES", "3")))
+        except ValueError:
+            max_utilities = 3
+        eligible = [p for p in ranked if incoming[p] or graph[p] or _entry_like(p)]
+        key_files: list[str] = []
+        utilities = 0
+        for path in eligible:
+            if _is_utility_file(path):
+                if utilities >= max_utilities:
+                    continue
+                utilities += 1
+            key_files.append(path)
+            if len(key_files) == 12:
+                break
         if not key_files:
             key_files = files[:12]
 
-        top_areas = sorted(areas.items(), key=lambda item: (-item[1], item[0]))[:8]
-        lines = [
-            self.MAP_MARKER,
-            "Purpose: compact navigation hint; inspect live files before editing.",
-            "Areas: " + "; ".join(f"{area} ({count} modules)" for area, count in top_areas),
-            "Key files:",
+        top_areas = sorted(area_mass.items(), key=lambda item: (-item[1], item[0]))[:8]
+        key_set = set(key_files)
+
+        def _area_of(path: str) -> str:
+            return path.split("/", 1)[0] if "/" in path else "root"
+
+        # Connections: spend slots on navigation value, not alphabetical
+        # luck. Sources lead with hub files, then edges crossing area
+        # boundaries (an agent can guess co-located siblings; boundary edges
+        # are what a map exists for), then PageRank. Targets lead with hub
+        # files so the strongest architectural chains appear first.
+        def _source_rank(source: str) -> tuple:
+            cross = sum(1 for t in graph[source] if _area_of(t) != _area_of(source))
+            return (
+                0 if source in key_set else 1,
+                -cross,
+                -scores.get(source, 0.0),
+                source,
+            )
+
+        def _target_rank(target: str) -> tuple:
+            return (0 if target in key_set else 1, -scores.get(target, 0.0), target)
+
+        ranked_sources = sorted(
+            (source for source in graph if graph[source]), key=_source_rank
+        )[:24]
+
+        conn_items = [
+            (source, ">", sorted(graph[source], key=_target_rank)[:6])
+            for source in ranked_sources
         ]
-        lines.extend(f"- {path} — {self._role(path)}." for path in key_files)
-        lines.append("Connections:")
-        connected = [(source, sorted(graph[source])[:6]) for source in sorted(graph) if graph[source]]
-        if connected:
-            lines.extend(f"- {source} -> {', '.join(targets)}" for source, targets in connected[:24])
+        co_items = [
+            (left, "<->", [right]) for left, right in self._cochange_pairs(files)
+        ]
+
+        # Cross-scope references share one minimized vocabulary so a file is
+        # spelled identically everywhere it appears in the map.
+        cross_vocab: set[str] = set()
+        for items in (co_items, conn_items):
+            for primary, _, secondaries in items:
+                scope_dir = os.path.dirname(primary)
+                cross_vocab.update(
+                    s for s in secondaries if os.path.dirname(s) != scope_dir
+                )
+        cross_refs = self._min_unique_refs(cross_vocab)
+
+        body: list[str] = ["Areas: " + "; ".join(area for area, _ in top_areas), "Key files:"]
+        for path in key_files:
+            role = self._role(path)
+            # The default label carries no signal — omit it entirely.
+            body.append(f"- {path}" + (f" — {role}" if role != "source module" else ""))
+        if co_items:
+            body.append("Co-change hints:")
+            body.extend(self._group_edges(co_items, cross_refs))
+        body.append("Connections:")
+        if conn_items:
+            body.extend(self._group_edges(conn_items, cross_refs))
         else:
-            lines.append("- No internal file connections detected; use search_code.")
-        return self._bounded(lines)
+            body.append("No internal connections; use search_code.")
+        return self._bounded([self.MAP_MARKER, *body])

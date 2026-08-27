@@ -22,17 +22,22 @@ from memory.context_budget import estimate_message_tokens, estimate_messages, es
 # hard guard invokes the exact same checkpoint operation as the normal trigger;
 # it is not a second compaction tier.
 
-_DEFAULT_TAIL_TOKENS = 12_000
+_DEFAULT_TAIL_TOKENS = 20_000
 _MAX_TAIL_TOKENS = 20_000
 
 
 @dataclass(frozen=True)
 class CompactionPolicy:
-    """One append-only/checkpoint budget shared by all agents."""
+    """One append-only/checkpoint budget shared by all agents.
+
+    Defaults: trigger 400k / hard gate 440k / tail 20k newest msgs (Codex
+    20k parity) / summary 4096. Env overrides: COMPACTION_* or
+    <ROLE>_COMPACTION_*.
+    """
 
     role: str = "developer"
-    checkpoint_trigger: int = 600_000
-    hard_limit: int = 700_000
+    checkpoint_trigger: int = 400_000
+    hard_limit: int = 440_000
     tail_budget_tokens: int = _DEFAULT_TAIL_TOKENS
     summary_output_tokens: int = 4_096
 
@@ -62,8 +67,8 @@ def get_compaction_policy(role: str = "developer") -> CompactionPolicy:
 
     return CompactionPolicy(
         role=role,
-        checkpoint_trigger=setting("CHECKPOINT_TOKENS", 600_000),
-        hard_limit=setting("HARD_LIMIT", 700_000),
+        checkpoint_trigger=setting("CHECKPOINT_TOKENS", 400_000),
+        hard_limit=setting("HARD_LIMIT", 440_000),
         tail_budget_tokens=tail,
         summary_output_tokens=setting("SUMMARY_OUTPUT_TOKENS", 4_096),
     )
@@ -365,28 +370,32 @@ def build_structured_resume_summary(tool_call_log: list, created: list, modified
     return "\n".join(fields)
 
 
-_FREE_COMPACTION_SYSTEM = """You are a generic transcript compactor inside an agent harness.
-You are not the primary agent and must not greet the user or take actions.
-Summarize the supplied chronological transcript into durable state. Preserve
-user requirements and constraints, decisions, completed outcomes, exact useful
-errors, verification evidence, artifact identifiers, unresolved work, and next
-actions. Do not invent facts, repeat system rules, include source code, or dump
-tool output. The workspace can be coding, household, research, or general.
-Return only this compact format, omitting empty fields and keeping each field
-brief. Aim for at most 2,048 output tokens and never exceed the requested cap:
-[COMPACTION]
-goal:
-requirements:
-state: done|in_progress|blocked|unknown
-completed:
-decisions:
-facts:
-artifacts:
-failures:
-verification:
-open:
-next:
-[/COMPACTION]"""
+# Codex 256k compaction prompt (codex-rs/prompts/templates/compact/prompt.md).
+# Hard work at 256k went into a minimal, handoff-focused format.
+_COMPACTOR_SYSTEM = """You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work."""
+
+# Codex summary_prefix (codex-rs/prompts/templates/compact/summary_prefix.md) —
+# prepended when the summary becomes the last message in the compacted window.
+_SUMMARY_PREFIX = (
+    "Another language model started to solve this problem and produced a summary "
+    "of its thinking process. You also have access to the state of the tools that "
+    "were used by that language model. Use this to build on the work that has "
+    "already been done and avoid duplicating work. Here is the summary produced "
+    "by the other language model, use the information in this summary to assist "
+    "with your own analysis:"
+)
+
+# Backwards compat aliases.
+_FREE_COMPACTION_SYSTEM = _COMPACTOR_SYSTEM
+_CODEX_SUMMARY_PREFIX = _SUMMARY_PREFIX
 
 
 def _message_role(message) -> str:
@@ -473,28 +482,39 @@ def _split_compactor_records(records: list[str], budget_tokens: int) -> list[str
 
 
 def _cap_compaction_summary(summary: str, max_chars: int = 12_000) -> str | None:
-    """Normalize and cap a compactor response before storing it in history."""
+    """Normalize and cap a compactor response before storing it in history.
+
+    Supports both the legacy [COMPACTION] envelope and the Codex plain-bullet
+    handoff (no tags). Codex summaries are returned as-is (capped); legacy
+    blocks are re-wrapped. Both paths enforce the same char budget.
+    """
     value = re.sub(r"```(?:text|markdown)?", "", str(summary or ""), flags=re.IGNORECASE)
     value = value.replace("```", "").strip()
     if not value:
         return None
-    # Normalize even a partially formed model response so the durable
-    # checkpoint always has exactly one bounded canonical envelope.
+    # Legacy envelope: extract inner body and re-wrap canonically.
     if "[COMPACTION]" in value:
-        value = value.split("[COMPACTION]", 1)[1]
-    if "[/COMPACTION]" in value:
-        value = value.split("[/COMPACTION]", 1)[0]
+        if "[COMPACTION]" in value:
+            value = value.split("[COMPACTION]", 1)[1]
+        if "[/COMPACTION]" in value:
+            value = value.split("[/COMPACTION]", 1)[0]
+        body = value.strip()
+        if not body:
+            return None
+        opening = "[COMPACTION]\n"
+        closing = "\n[/COMPACTION]"
+        max_body = max(1, int(max_chars) - len(opening) - len(closing))
+        if len(body) > max_body:
+            body = body[:max_body].rsplit("\n", 1)[0].rstrip()
+        normalized = opening + body + closing
+        return normalized if len(body) >= 20 else None
+    # Codex plain handoff: cap raw bullets, no envelope.
     body = value.strip()
-    if not body:
+    if len(body) < 20:
         return None
-
-    opening = "[COMPACTION]\n"
-    closing = "\n[/COMPACTION]"
-    max_body = max(1, int(max_chars) - len(opening) - len(closing))
-    if len(body) > max_body:
-        body = body[:max_body].rsplit("\n", 1)[0].rstrip()
-    normalized = opening + body + closing
-    return normalized if len(body) >= 20 else None
+    if len(body) > max_chars:
+        body = body[:max_chars].rsplit("\n", 1)[0].rstrip()
+    return body
 
 
 def _compactor_call(
@@ -504,30 +524,73 @@ def _compactor_call(
     context_sensitive: bool = True,
     abort_check=None,
 ) -> str:
-    """Call the dedicated free compactor with context-aware routing."""
-    from agents.free_agent import ContextWindowExceededError
+    """Call the dedicated free compactor (specialist: Compactor).
+
+    The persona lives in agents/specialists/compactor.json; this function is
+    the engine-side delegation point (option A from the plan). The Python
+    engine owns chunk/reduce and the checkpoint rebuild — the LLM is a
+    stateless summarizer, the same architecture OpenCode and Codex CLI use
+    (one direct summarization call, engine owns the rebuild). Routing goes
+    through the free pool with max_context_tokens=1_000_000 so 1M+ models
+    are excluded per user request.
+    """
+    from llm.free_providers import ContextWindowExceededError
 
     required_context = (
-        estimate_tokens(_FREE_COMPACTION_SYSTEM)
+        estimate_tokens(_COMPACTOR_SYSTEM)
         + estimate_tokens(payload)
         + policy.summary_output_tokens
         + 1_024
     )
+    # Pre-check filtered window size before spending a provider call.
+    from llm.free_providers import FreeProviders
+
+    caps = FreeProviders().available_model_contexts("text", max_context_tokens=1_000_000)
+    if caps and required_context > max(caps):
+        raise ContextWindowExceededError(
+            f"No configured <1M text model fits {required_context:,} tokens."
+        )
+    # Primary: free pool via Compactor specialist persona (<1M).
+    # We go through free_native_turn so provider routing, the <1M cap,
+    # streaming, and retry all stay in one place.
     try:
-        reply = agent.chat(
-            payload,
-            system_prompt=_FREE_COMPACTION_SYSTEM,
+        from llm.free_providers import free_native_turn
+
+        reply, _calls, _reasoning = free_native_turn(
+            "Compactor",
+            messages=[
+                {"role": "system", "content": _COMPACTOR_SYSTEM},
+                {"role": "user", "content": payload},
+            ],
             capability="text",
             temperature=0.1,
-            max_tokens=policy.summary_output_tokens,
-            min_context_tokens=required_context,
-            prefer_context=True,
-            retry_forever=True,
-            context_sensitive=context_sensitive,
-            abort_check=abort_check,
+            prefer_reasoning=False,
+            max_context_tokens=1_000_000,
         )
     except ContextWindowExceededError:
         raise
+    except Exception as exc:
+        # Specialist path failed for a non-context reason (pool exhausted,
+        # transient). Fall back to the legacy direct agent.chat path so the
+        # checkpoint still has a chance with retry_forever.
+        try:
+            reply = agent.chat(
+                payload,
+                system_prompt=_COMPACTOR_SYSTEM,
+                capability="text",
+                temperature=0.1,
+                max_tokens=policy.summary_output_tokens,
+                min_context_tokens=required_context,
+                prefer_context=True,
+                retry_forever=True,
+                context_sensitive=context_sensitive,
+                abort_check=abort_check,
+                max_context_tokens=1_000_000,
+            )
+        except ContextWindowExceededError:
+            raise
+        except Exception:
+            raise CheckpointCompactionError(f"Compactor failed: {exc}") from exc
     normalized = _cap_compaction_summary(
         reply,
         max_chars=max(8_000, policy.summary_output_tokens * 3),
@@ -546,7 +609,7 @@ def _reduce_compactor_summaries(
 ) -> str:
     """Reduce chronological partial states until one canonical checkpoint remains."""
     current = list(summaries)
-    reserve = estimate_tokens(_FREE_COMPACTION_SYSTEM) + policy.summary_output_tokens + 1_024
+    reserve = estimate_tokens(_COMPACTOR_SYSTEM) + policy.summary_output_tokens + 1_024
     merge_prefix = (
         "Merge these chronological partial checkpoint states. Earlier entries "
         "establish context; later entries supersede them when they conflict. "
@@ -596,12 +659,12 @@ def _build_free_compaction_summary(messages: list, policy: CompactionPolicy, abo
     if not records:
         return "[COMPACTION]\nstate: unknown\n[/COMPACTION]"
 
-    from agents.free_agent import FreeAgent
+    from llm.free_providers import FreeProviders
 
-    agent = FreeAgent()
+    agent = FreeProviders()
     serialized = "\n\n".join(records)
-    reserve = estimate_tokens(_FREE_COMPACTION_SYSTEM) + policy.summary_output_tokens + 1_024
-    capacities = agent.available_model_contexts("text")
+    reserve = estimate_tokens(_COMPACTOR_SYSTEM) + policy.summary_output_tokens + 1_024
+    capacities = agent.available_model_contexts("text", max_context_tokens=1_000_000)
     if not capacities:
         raise CheckpointCompactionError("No configured free text model is available for compaction.")
     max_context = max(capacities)
@@ -617,8 +680,8 @@ def _build_free_compaction_summary(messages: list, policy: CompactionPolicy, abo
         except Exception as exc:
             # A provider can advertise a catalog context that rejects the real
             # serialized request. Fall through to chunking for that case; other
-            # provider failures are retried indefinitely by FreeAgent.
-            from agents.free_agent import ContextWindowExceededError
+            # provider failures are retried indefinitely by the free pool.
+            from llm.free_providers import ContextWindowExceededError
             if not isinstance(exc, ContextWindowExceededError):
                 raise
 
@@ -630,7 +693,7 @@ def _build_free_compaction_summary(messages: list, policy: CompactionPolicy, abo
     chunk_budget = max_context - reserve - estimate_tokens(chunk_prefix)
     if chunk_budget < 8_000:
         raise CheckpointCompactionError("Configured free models leave no usable compaction context.")
-    from agents.free_agent import ContextWindowExceededError
+    from llm.free_providers import ContextWindowExceededError
 
     while True:
         chunks = _split_compactor_records(records, chunk_budget)
@@ -657,7 +720,8 @@ def _build_free_compaction_summary(messages: list, policy: CompactionPolicy, abo
 
 
 def _is_compaction_message(message) -> bool:
-    return "[COMPACTION]" in str(getattr(message, "content", "") or "")
+    text = str(getattr(message, "content", "") or "")
+    return "[COMPACTION]" in text or _SUMMARY_PREFIX[:40] in text or "Another language model started" in text
 
 
 def _full_map_message(content: str | None) -> HumanMessage | None:
@@ -715,12 +779,33 @@ def checkpoint_compact(
     )
     summary = _cap_compaction_summary(summary_text, max_chars=max(8_000, policy.summary_output_tokens * 3))
     if not summary:
-        summary = "[COMPACTION]\nstate: history_compacted\n[/COMPACTION]"
+        # Fallback preserves the incoming style (legacy [COMPACTION] vs Codex bullets)
+        # so short-but-valid legacy test fixtures still produce a [COMPACTION] block.
+        if summary_text and "[COMPACTION]" in str(summary_text):
+            summary = "[COMPACTION]\nstate: history_compacted\n[/COMPACTION]"
+        else:
+            summary = (
+                f"{_SUMMARY_PREFIX}\n"
+                "- Current progress: history_compacted\n"
+                "- What remains: continue the task"
+            )
+    # Codex: stored compaction is prefix + bullets. Legacy [COMPACTION] blocks
+    # keep structural resume appended inside the envelope; Codex bullets get it
+    # as appended lines (still capped).
     if structural:
-        summary = _cap_compaction_summary(
-            summary.replace("\n[/COMPACTION]", "") + "\n" + structural,
-            max_chars=max(8_000, policy.summary_output_tokens * 3),
-        ) or summary
+        if "[COMPACTION]" in summary:
+            summary = _cap_compaction_summary(
+                summary.replace("\n[/COMPACTION]", "") + "\n" + structural,
+                max_chars=max(8_000, policy.summary_output_tokens * 3),
+            ) or summary
+        else:
+            summary = _cap_compaction_summary(
+                summary + "\n" + structural,
+                max_chars=max(8_000, policy.summary_output_tokens * 3),
+            ) or summary
+    # Codex summary_prefix: ensure the stored compaction reads as a handoff.
+    if "[COMPACTION]" not in summary and _SUMMARY_PREFIX[:20] not in summary:
+        summary = f"{_SUMMARY_PREFIX}\n{summary}"
 
     retained_tail = []
     for index in sorted(tail_indices):

@@ -152,6 +152,24 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     # The native API tool schemas are passed separately by the LLM adapter; do
     # not duplicate them in this cached prompt.
     static_system_parts = [base_prompt]
+
+    # Specialist subagent catalog (agents/specialists/*.json) lives in the
+    # cached prefix; it changes only when the config files change.
+    try:
+        from tools.AddOnTool.subagentTools import subagent_catalog
+        _catalog = subagent_catalog(filter_kind="subagent")
+        if _catalog:
+            static_system_parts.append(
+                "## SUBAGENTS\n"
+                "Specialist work outside routine coding is delegated, not done inline:\n"
+                f"{_catalog}\n"
+                "Delegate with `call_subagent(name, task)` — a complete instruction "
+                "with goal, targets, and acceptance check. Its final report is "
+                "the result."
+            )
+    except Exception as e:
+        print(f"Error rendering subagent catalog: {e}")
+
     if stable_context:
         static_system_parts.append(stable_context)
     static_system = "\n\n".join(static_system_parts)
@@ -222,6 +240,66 @@ def _task_tail_content(
 ) -> str:
     """Append a map only when it is a new snapshot, then append the task."""
     return "\n\n".join(_task_tail_parts(current_context, task, messages))
+
+
+_PLAN_BLOCK_PREFIX = "=== CURRENT PLAN "
+
+
+def _is_plan_message(message) -> bool:
+    content = getattr(message, "content", "")
+    return isinstance(content, str) and content.startswith(_PLAN_BLOCK_PREFIX)
+
+
+def _latest_plan_message_index(messages: list):
+    """Index of the newest plan block in history, or None."""
+    for idx in range(len(messages) - 1, -1, -1):
+        if _is_plan_message(messages[idx]):
+            return idx
+    return None
+
+
+def _strip_plan_messages(messages: list) -> None:
+    messages[:] = [m for m in messages if not _is_plan_message(m)]
+
+
+def _plan_block_complete(plan_block: str) -> bool:
+    """True when the block header reports every step completed (N/N, N>0).
+
+    The model owns completion through update_plan full replacement — the
+    harness never judges step status itself.
+    """
+    try:
+        inner = plan_block.split("\n", 1)[0].split("(", 1)[-1]
+        done_s, rest = inner.split("/", 1)
+        total_s = rest.split(" ", 1)[0]
+        done, total = int(done_s.strip()), int(total_s.strip())
+        return done > 0 and done >= total
+    except Exception:
+        return False
+
+
+def _apply_plan_reinjection(messages: list, plan_block: str) -> None:
+    """Newest-wins plan re-injection policy for resume paths.
+
+    History must hold at most ONE plan block — the current one:
+      * identical to latest block → skip entirely (zero cache impact);
+      * revised plan              → strip old copies, append newest;
+      * fully-completed plan      → strip blocks, append nothing (the model
+        declared done via update_plan; a finished checklist steers nobody);
+      * empty store               → strip stale blocks if any.
+    """
+    if not plan_block:
+        if _latest_plan_message_index(messages) is not None:
+            _strip_plan_messages(messages)
+        return
+    if _plan_block_complete(plan_block):
+        _strip_plan_messages(messages)
+        return
+    latest = _latest_plan_message_index(messages)
+    if latest is not None and getattr(messages[latest], "content", "") == plan_block:
+        return
+    _strip_plan_messages(messages)
+    messages.append(HumanMessage(content=plan_block))
 
 def _extract_text_response(text: str) -> str:
     """Extract the user-facing text from a final native-tool response."""
@@ -509,14 +587,16 @@ def developer_node(s: ITState) -> dict:
         tracked_files_modified = developer_state["tracked_files_modified"]
         last_response_text = developer_state["last_response_text"]
 
-        # Codex-style plan re-injection: the plan is part of the agent's
-        # session state; restore it on resume so the model keeps driving it.
+        # Codex-style plan re-injection: newest wins. The model owns the plan
+        # through update_plan full replacement; history must hold at most
+        # one block — identical copies are skipped, revised plans replace
+        # older ones, and a fully-completed plan is removed entirely.
         try:
             plan_block = get_plan_for_context("developer")
-            if plan_block:
-                messages.append(HumanMessage(content=plan_block))
         except Exception as e:
+            plan_block = ""
             print(f"[DEVELOPER] Error restoring plan block: {e}")
+        _apply_plan_reinjection(messages, plan_block)
         
     else:
         # Stable system prefix followed by a separate full-map anchor and task
@@ -662,14 +742,23 @@ def developer_node(s: ITState) -> dict:
                 # discovery rung cost that miss while producing ~0 reasoning.
                 # Trouble signals flip the NEXT turn back to "high" (cheap: the
                 # high-config request is already cached from iter-1).
-                # Knobs: REASONING_ITER1 (planning depth, "high"),
+                # Knobs: REASONING_ITER1 (planning depth, mode default "high"),
                 #        REASONING_ROUTINE (routine depth, "disabled"),
                 #        FLIP_ON_TEST_ONLY=1 (default) → flip to high only
                 #        on real TEST failures; tool errors don't flip. With
                 #        Dev self-verification off there are no mid-session
                 #        test failures → the session is config-stable
                 #        (iter-1 high, everything else disabled, zero flips).
-                iter1_effort = os.environ.get("REASONING_ITER1", "high")
+                _dev_plan: dict = {}
+                try:
+                    from llm.provider_modes import get_role_plan
+
+                    _dev_plan = get_role_plan("Developer")
+                except Exception:
+                    _dev_plan = {}
+                iter1_effort = os.environ.get(
+                    "REASONING_ITER1", str(_dev_plan.get("iter_effort") or "high")
+                )
                 routine_effort = os.environ.get("REASONING_ROUTINE", "disabled")
                 flip_on_test_only = os.environ.get("FLIP_ON_TEST_ONLY", "1") == "1"
                 think_hard = (
@@ -684,14 +773,27 @@ def developer_node(s: ITState) -> dict:
                     reasoning_effort = routine_effort
                     reasoning_budget = None
 
-                llm_result = invoke_messages_with_fallback_stream(
-                    role="Developer",
-                    messages=run_messages,
-                    tools=native_dev_tools,
-                    where=where_tag,
-                    reasoning_effort=reasoning_effort,
-                    reasoning_budget=reasoning_budget,
-                )
+                if str(_dev_plan.get("backend")) == "free":
+                    # Free-provider mode: full tool loop rides the free pool
+                    # with live streaming; same result shape as the paid path.
+                    from llm.free_providers import free_native_turn
+
+                    llm_result = free_native_turn(
+                        "Developer",
+                        run_messages,
+                        tools=native_dev_tools,
+                        capability="coding",
+                        prefer_reasoning=bool(_dev_plan.get("think_bias", True)),
+                    )
+                else:
+                    llm_result = invoke_messages_with_fallback_stream(
+                        role="Developer",
+                        messages=run_messages,
+                        tools=native_dev_tools,
+                        where=where_tag,
+                        reasoning_effort=reasoning_effort,
+                        reasoning_budget=reasoning_budget,
+                    )
 
                 # Unpack the provider result. Native calls are kept as
                 # structured metadata; text-only results simply finish.
@@ -856,6 +958,12 @@ def developer_node(s: ITState) -> dict:
                         if "developer_state" in task_tracking_data:
                             save_task_tracking({k: v for k, v in task_tracking_data.items() if k != "developer_state"}, project_path, chat_id)
                             del task_tracking_data["developer_state"]
+                        # A finished checklist must not resurrect in the UI
+                        # state mirror; the model declared it done via
+                        # update_plan and the thread is being retired.
+                        plans = task_tracking_data.get("plan")
+                        if isinstance(plans, dict):
+                            plans.pop("developer", None)
                     save_task_tracking(task_tracking_data, project_path, chat_id)
             except Exception as e:
                 print(f"[DEVELOPER] Error updating task tracking: {e}")
@@ -980,8 +1088,6 @@ def developer_node(s: ITState) -> dict:
             elif tool_name == "search_code":
                 pat = str(tool_args.get("pattern", ""))[:60]
                 tool_label = f"search \"{pat}\""
-            elif tool_name == "task":
-                tool_label = f"delegate {str(tool_args.get('name', ''))[:40]}"
             elif tool_name == "start_async_task":
                 tool_label = f"async {str(tool_args.get('name', ''))[:40]}"
             else:

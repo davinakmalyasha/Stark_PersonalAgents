@@ -1,6 +1,6 @@
 """
 Agents Package
-Provides orchestrator, developer, free agent, and subagent swarm management.
+Provides orchestrator, developer, general, and subagent swarm management.
 """
 import os
 import sys
@@ -26,14 +26,14 @@ from .developer_prompt import _STATIC_SYSTEM_TEMPLATE as DEVELOPER_SYSTEM_PROMPT
 from .developer_agent import (
     developer_node,
 )
+from .general_prompt import _GENERAL_SYSTEM_TEMPLATE as GENERAL_SYSTEM_PROMPT
+from .general_agent import (
+    general_node,
+    run_general_direct,
+)
 from .orchestrator_agent import (
     orchestrator_node,
     _ORCHESTRATOR_SYSTEM_TEMPLATE,
-)
-from .free_agent import (
-    free_agent_node,
-    run_freeagent_direct,
-    chat,
 )
 from .subagent_manager import (
     start_continuable,
@@ -57,12 +57,12 @@ from .project_router import (
 __all__ = [
     "ITState",
     "DEVELOPER_SYSTEM_PROMPT",
+    "GENERAL_SYSTEM_PROMPT",
     "developer_node",
+    "general_node",
+    "run_general_direct",
     "orchestrator_node",
     "_ORCHESTRATOR_SYSTEM_TEMPLATE",
-    "free_agent_node",
-    "run_freeagent_direct",
-    "chat",
     "start_continuable",
     "send_message",
     "interrupt",

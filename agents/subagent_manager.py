@@ -98,6 +98,33 @@ def _descriptor_of(mgr: SessionManager) -> Optional[dict]:
     return None
 
 
+def _task_label(task: str) -> str:
+    """Short human label for a spawn, derived from the task text (UI block title)."""
+    text = " ".join((task or "").split())
+    if not text:
+        return ""
+    cut = text[:42]
+    if len(text) > 42:
+        last_space = cut.rfind(" ")
+        if last_space >= 18:
+            cut = cut[:last_space]
+        cut = cut.rstrip(" ,;:.") + "…"
+    return cut
+
+
+def _log_spawn(child_id: str, name: str, label: str) -> None:
+    """Announce the spawn in the parent's live terminal log.
+
+    The frontend's log parser turns this line into a clickable subagent block
+    (child_id → drill-in session view) persisted in the parent's trace steps.
+    """
+    try:
+        from sync.state_sync import safe_append_live_log
+        safe_append_live_log(f"[SUBAGENT] child={child_id} name={name} label={label or name}")
+    except Exception:
+        pass
+
+
 # â”€â”€ Build the child's system prompt from the subagent registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
@@ -147,14 +174,20 @@ def _child_permissions(name: str) -> list:
 # â”€â”€ The turn loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
-def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: list[str]) -> str:
+def _run_turn(
+    act: dict,
+    session: SessionManager,
+    name: str,
+    extra_messages: list[str],
+    reasoning_effort: Optional[str] = None,
+) -> str:
     """Run one turn (user message -> loop -> done) on a continuable child.
 
     Appends every step to the child session log. Cooperative with
     ``act["interrupt"]`` (checked per iteration). Returns the final text.
     """
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-    from llm import invoke_messages_with_fallback_stream
+    from tools.AddOnTool.subagentTools import _specialist_call_backend
     from tools import (execute_tool_detailed, auto_offload_result, _tool_cap,
                        active_permissions, _TASK_DEPTH, active_tool_scope,
                        get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents,
@@ -229,11 +262,10 @@ def _run_turn(act: dict, session: SessionManager, name: str, extra_messages: lis
                 interrupted = True
                 break
             try:
-                res = invoke_messages_with_fallback_stream(
-                    role=name,
-                    messages=list(messages),
-                    temp=0.2,
-                    tools=native_tools or None,
+                res = _specialist_call_backend(
+                    name,
+                    list(messages),
+                    native_tools=native_tools or None,
                     reasoning_effort=os.environ.get("REASONING_SUBAGENT_ROUTINE", "disabled"),
                     where=f"{name} continuable iter {i}",
                 )
@@ -336,6 +368,7 @@ def start_continuable(
     task: str,
     label: Optional[str] = None,
     parent_session: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> dict:
     """Create a durable continuable child and run its first turn (blocking).
 
@@ -349,14 +382,16 @@ def start_continuable(
         delegation_depth=1,
         chat_name=label or name,
     )
+    spawn_label = label or _task_label(task) or name
     session.append_custom_entry(_DESCRIPTOR, {
         "name": name,
-        "label": label or name,
+        "label": spawn_label,
         "parent_session": parent_session,
         "parent_chat_id": chat_id,
         "created": int(time.time() * 1000),
     })
     session.append_message("user", task, source="user")
+    _log_spawn(child_id, name, spawn_label)
 
     act = _activation(child_id)
     act["name"] = name
@@ -365,7 +400,7 @@ def start_continuable(
 
     token = current_child.set(child_id)
     try:
-        result = _run_turn(act, session, name, extra_messages=[])
+        result = _run_turn(act, session, name, extra_messages=[], reasoning_effort=reasoning_effort)
     finally:
         current_child.reset(token)
 
@@ -423,10 +458,12 @@ def interrupt(child_id: str) -> bool:
 
 
 def list_agents(workspace: str, chat_id: Optional[str] = None) -> list[dict]:
-    """Durable enumeration of continuable children (no resume needed).
+    """Durable enumeration of children (no resume needed).
 
     Reads session headers + descriptor/status entries from disk, merged with
-    live activation state.
+    live activation state. Covers both child kinds: ``cont-`` continuable
+    children (descriptor + status) and ``sub-`` task() spawn logs (name parsed
+    from the id, status always idle — they have no activation tracking).
     """
     sdir = _sessions_dir(workspace)
     out: list[dict] = []
@@ -442,10 +479,15 @@ def list_agents(workspace: str, chat_id: Optional[str] = None) -> list[dict]:
             continue
         hdr = mgr.get_header()
         cid = hdr.chat_id or ""
-        if not cid.startswith(_CONTINUABLE_PREFIX):
+        is_cont = cid.startswith(_CONTINUABLE_PREFIX)
+        is_sub = cid.startswith("sub-")
+        if not is_cont and not is_sub:
             continue
-        if chat_id and not cid.startswith(f"{_CONTINUABLE_PREFIX}{chat_id}-"):
-            continue
+        if chat_id:
+            if is_cont and not cid.startswith(f"{_CONTINUABLE_PREFIX}{chat_id}-"):
+                continue
+            if is_sub and not cid.startswith(f"sub-{chat_id}-"):
+                continue
         desc = _descriptor_of(mgr) or {}
         status = "idle"
         for e in reversed(mgr.get_entries()):
@@ -456,16 +498,113 @@ def list_agents(workspace: str, chat_id: Optional[str] = None) -> list[dict]:
         live_status = live["status"] if live else None
         if live_status == "running":
             status = "running"
+        if is_cont:
+            name = desc.get("name") or cid.split("-")[2] if len(cid.split("-")) > 2 else ""
+            label = desc.get("label") or desc.get("name") or cid
+            created = desc.get("created") or 0
+        else:
+            parts = cid.split("-")
+            name = desc.get("name") or (parts[-2] if len(parts) >= 3 else cid)
+            label = desc.get("label") or desc.get("name") or name or cid
+            try:
+                created = desc.get("created") or int(os.path.getmtime(path) * 1000)
+            except Exception:
+                created = 0
         out.append({
             "child_id": cid,
-            "name": desc.get("name") or cid.split("-")[2] if len(cid.split("-")) > 2 else "",
-            "label": desc.get("label") or desc.get("name") or cid,
+            "name": name,
+            "label": label,
             "status": status,
-            "created": desc.get("created") or 0,
+            "created": created,
             "parent_session": hdr.parent_session,
         })
     out.sort(key=lambda a: a["created"], reverse=True)
     return out
+
+
+def read_child_session(workspace: str, child_id: str) -> Optional[dict]:
+    """Read a continuable child's session for the UI drill-in view.
+
+    Returns ``{"info": {...}, "entries": [...]}`` or None when the child is
+    unknown. Entries are a display projection: user / assistant text and tool
+    results (tool outputs capped, thinking excluded, toolCall blocks folded
+    into their toolResult rows via tool_call_id pairing).
+    """
+    path = _find_child_session(child_id, workspace)
+    if path is None:
+        return None
+    try:
+        mgr = SessionManager.open(path)
+    except Exception:
+        return None
+    desc = _descriptor_of(mgr) or {}
+    status = "idle"
+    for e in reversed(mgr.get_entries()):
+        if getattr(e, "type", "") == "custom" and getattr(e, "custom_type", "") == _STATUS:
+            status = (e.data or {}).get("status", "idle")
+            break
+    with _ACTIVATIONS_LOCK:
+        live = _ACTIVATIONS.get(child_id)
+    if live and live.get("status") == "running":
+        status = "running"
+
+    # Descriptor-less spawns (task()'s sub- logs): parse the agent name from
+    # the id tail ("sub-<chatId>-<Name>-<hex>").
+    parsed_name = ""
+    parts = child_id.split("-")
+    if len(parts) >= 3:
+        parsed_name = parts[-2]
+
+    def _text_of(entry) -> str:
+        content = entry.content
+        if isinstance(content, str):
+            return content
+        parts = []
+        for b in content:
+            if getattr(b, "type", "") == "text":
+                parts.append(b.text)
+        return "\n".join(parts)
+
+    entries: list[dict] = []
+    pending_calls: dict[str, str] = {}
+    for e in mgr.get_entries():
+        if getattr(e, "type", "") != "message":
+            continue
+        if e.role == "user":
+            text = _text_of(e)
+            if text.strip():
+                entries.append({"kind": "user", "content": text, "ts": e.timestamp})
+        elif e.role == "assistant":
+            content = e.content
+            if isinstance(content, list):
+                for b in content:
+                    if getattr(b, "type", "") == "toolCall" and getattr(b, "id", ""):
+                        pending_calls[b.id] = b.name
+            text = _text_of(e)
+            if text.strip():
+                entries.append({"kind": "assistant", "content": text, "ts": e.timestamp})
+        elif e.role == "toolResult":
+            tool_name = e.tool_name or pending_calls.get(e.tool_call_id or "", "tool")
+            entries.append({
+                "kind": "tool",
+                "toolName": tool_name,
+                "content": _text_of(e)[:4000],
+                "isError": bool(e.is_error),
+                "ts": e.timestamp,
+            })
+
+    return {
+        "info": {
+            "child_id": child_id,
+            "name": desc.get("name") or parsed_name or child_id,
+            "label": desc.get("label") or desc.get("name") or parsed_name or child_id,
+            "status": status,
+            "created": desc.get("created") or mgr.get_header().timestamp,
+            "parent_chat_id": desc.get("parent_chat_id") or "",
+            "session_file": path,
+        },
+        "entries": entries,
+    }
 
 
 def report(message: str, quiet: bool = False) -> str:

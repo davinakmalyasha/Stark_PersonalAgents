@@ -199,11 +199,57 @@ def _sanitize_name(name: str) -> str:
     return clean[:80]
 
 
-def create_project(name: str, concept: str, chat_id: str = "") -> dict:
+def _update_entry_child(workspace_path: str, child_id: str, first_reply: str) -> None:
+    """Persist a background-spawned Dev child onto its index entry (best-effort)."""
+    try:
+        with _LOCK:
+            idx = _load_index()
+            key = os.path.normpath(workspace_path).lower()
+            for p in idx.get("projects", []):
+                if os.path.normpath(p.get("workspace_path", "")).lower() == key:
+                    p["child_id"] = child_id
+                    break
+            _save_index(idx)
+    except Exception as e:
+        print(f"[PROJECT_ROUTER] Background child persist error (non-fatal): {e}")
+    if first_reply:
+        try:
+            entry = next((p for p in _load_index().get("projects", [])
+                          if os.path.normpath(p.get("workspace_path", "")).lower()
+                          == os.path.normpath(workspace_path).lower()), None)
+            if entry:
+                import workspace_manager as wm
+                wm.add_message(entry.get("workspace_path", ""), entry.get("chat_id", ""),
+                               "agent", first_reply, {"routed": True, "first_turn": True})
+        except Exception as e:
+            print(f"[PROJECT_ROUTER] First-reply mirror error (non-fatal): {e}")
+
+
+def _spawn_first_turn_background(workspace_path: str, chat_id: str, concept: str) -> None:
+    """Run the durable Dev's FIRST TURN in a background thread (wait=false)."""
+    def _worker():
+        try:
+            from agents.subagent_manager import start_continuable
+            child = start_continuable(
+                chat_id, workspace_path, "Dev",
+                task=concept or "Get familiar with the empty project and report what you will build.",
+                label=f"{os.path.basename(workspace_path)} · Dev",
+            )
+            _update_entry_child(workspace_path, child.get("child_id", ""), child.get("result", ""))
+        except Exception as e:
+            print(f"[PROJECT_ROUTER] Background first-turn error (non-fatal): {e}")
+
+    import threading
+    threading.Thread(target=_worker, daemon=True, name="project-first-turn").start()
+
+
+def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True) -> dict:
     """Create a project folder + workspace + chat + durable Dev child.
 
     ONLY the orchestrator LLM calls this (via the ``create_project`` tool).
-    Returns an error dict on invalid input; the caller surfaces it honestly.
+    ``wait=False`` registers everything and runs the Dev's first turn in the
+    background — use it when creating SEVERAL projects in one burst so they
+    spin up in parallel. Returns an error dict on invalid input.
     """
     safe = _sanitize_name(name)
     if not safe:
@@ -238,12 +284,6 @@ def create_project(name: str, concept: str, chat_id: str = "") -> dict:
             import workspace_manager as wm
             ws = wm.add_workspace(path, safe)
             chat = wm.create_chat(path, title=f"{safe} — Dev Session")
-            from agents.subagent_manager import start_continuable
-            child = start_continuable(
-                chat["id"], path, "Dev",
-                task=concept or "Get familiar with the empty project and report what you will build.",
-                label=f"{safe} · Dev",
-            )
         except Exception as e:
             return {"error": f"Failed to set up project '{safe}': {e}"}
 
@@ -252,7 +292,7 @@ def create_project(name: str, concept: str, chat_id: str = "") -> dict:
         "workspace_id": ws.get("id", ""),
         "workspace_path": path,
         "chat_id": chat.get("id", ""),
-        "child_id": child.get("child_id", ""),
+        "child_id": "",
         "created": datetime.now().isoformat(),
     }
     try:
@@ -271,7 +311,33 @@ def create_project(name: str, concept: str, chat_id: str = "") -> dict:
         except Exception as e:
             print(f"[PROJECT_ROUTER] git init skipped for {path}: {e}")
 
-    entry["first_reply"] = child.get("result", "")
+    if wait:
+        try:
+            from agents.subagent_manager import start_continuable
+            child = start_continuable(
+                chat["id"], path, "Dev",
+                task=concept or "Get familiar with the empty project and report what you will build.",
+                label=f"{safe} · Dev",
+            )
+            entry["child_id"] = child.get("child_id", "")
+            # Persist the resolved child id back onto the stored entry.
+            try:
+                with _LOCK:
+                    idx = _load_index()
+                    for p in idx.get("projects", []):
+                        if os.path.normpath(p.get("workspace_path", "")).lower() == key:
+                            p["child_id"] = entry["child_id"]
+                            break
+                    _save_index(idx)
+            except Exception:
+                pass
+            entry["first_reply"] = child.get("result", "")
+        except Exception as e:
+            return {"error": f"Failed to set up project '{safe}': {e}"}
+    else:
+        _spawn_first_turn_background(path, chat["id"], concept)
+        entry["background"] = True
+
     return entry
 
 

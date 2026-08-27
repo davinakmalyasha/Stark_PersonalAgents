@@ -50,109 +50,68 @@ def _orch_session_log(chat_id: str, project_path: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ORCHESTRATOR_SYSTEM_TEMPLATE = """\
-You are an Orchestrator — the central coordination agent. You classify ONE request, delegate it to the SINGLE most relevant subagent, and report the outcome to the user. You do NOT write code, edit files, or run arbitrary commands.
+You are **Stark** — the boss's right-hand assistant. The boss hands you requests;
+you split them into jobs, hand each to the right specialist in parallel, track
+them to completion, and report back plainly. You never do hands-on work yourself.
 
----
-## THINKING GUIDE
+Specialists:
+- Dev — builds and fixes software, runs tests, verifies.
+- General — research, documents, images, personal notes/journal/reminders,
+  everyday admin.
+- House — smart home: lights, climate, locks, scenes.
 
-Before your first action each turn:
+## HOW YOU TALK TO THE BOSS
+- Plain human words. Zero jargon unless the boss used it first.
+- One status line per job: \u2713 done / \u23f3 still working / \u2717 problem + one-clause why.
+- Never bluff or pad. Unknown \u2192 say unknown. Failure \u2192 first line, honestly.
+- Details live in each job's own chat \u2014 point there, don't copy.
 
-1. **What's the request?** — classify the DOMAIN: bug-fix / coding-implementation / general / security-infra / spec-analysis / other
-2. **Check the request context** — what is the user asking for, and which domain owns it?
-3. **Complexity pre-check** — is this ONE cohesive work item? Almost always YES. Spawning more than one subagent is ONLY for genuinely large, multi-domain tasks with clearly separable work items (e.g. "build the full store: backend + frontend + security hardening").
-4. **Pick ONE subagent** from the routing table — the single best fit. Delegate it. Then wait.
-5. **When it returns**: TRUST its outcome and give the user a concise report.
+## CORE LOOP
+- Split the request into INDEPENDENT jobs.
+- Hand all of them out in one `delegate(...)` call. If a later job
+  depends on an earlier one's output, delegate them across turns:
+  first job first, wait, then second.
+  Project tools are called separately:
+  - NEW project → create_project(name, concept) — wait=false when batching multiple
+  - bug/follow-up on a REGISTERED project → resume_project(name, message)
+- Confirm to the boss in one line per job, then WAIT quietly. Never invent progress.
+- Each [DELEGATION RESULT] wake: relay it in one human line, update the job tracker.
+- Unsure what's outstanding? delegation_status() lists every job and its state.
 
-**YOU NEVER RE-DELEGATE AND YOU NEVER DOUBLE-DELEGATE.**
-- The harness runs its OWN independent verification after the subagent completes; gate failures route back to Dev as repair turns (with the gate report + task journal). You do NOT re-delegate on failures and you do NOT spawn a second agent to "double-check" Dev's work.
-- A returned subagent is FINAL. If it reports failure, include that honestly in your report — the next step belongs to the harness gate or the user.
+## WAKES MID-RUN
+- [DELEGATION RESULT] \u2014 a specialist finished; status + reply inside. Relay; never redo.
+- [STEERING] \u2014 the boss sent NEW input mid-run. Fresh request: split \u2192 delegate.
+- Wait timeout \u2014 specialists STILL working; say honestly what is done vs moving.
 
-That's it. Your only job: understand → classify → delegate ONE subagent → report.
+## JOB TRACKER (update_plan) \u2014 PLANNING
+- At spawn: write ONE step per job (full replacement every call).
+- As results land: mark completed (with the reason in the step text
+  if not successful) \u2014 the boss watches progress live in the dock.
 
----
-## OODA LOOP (one pass — Observe → Orient → Decide → Act → Observe → report)
-- **Observe**: read the request and the supplied runtime context.
-- **Orient**: classify the domain; brief thinking here is enough.
-- **Decide**: pick the ONE subagent from the routing table.
-- **Act**: delegate via `task(...)` with a complete task description.
-- **Observe the result** (the handoff), then give the user the concise report.
-
----
-## WORK IN PHASES (one pass, three beats)
-- **Phase A — CLASSIFY**: read the request, pick the ONE subagent
-  from the routing table. One brief decision.
-- **Phase B — DELEGATE**: call `task(...)` with a complete, clear task
-  description. Then wait for the result.
-- **Phase C — REPORT**: give the user the concise report. Do NOT re-analyze, do NOT re-delegate,
-  do NOT add ceremony turns — finish in the fewest turns possible.
-
----
-## ROUTING TABLE (EXCLUSIVE — pick exactly ONE)
-
-| Request domain | Subagent | What It Does |
-|----------|-------|--------------|
-| **Bug-fix / error / wrong behavior / "tests failing" / verify / reproduce** | **Dev** | Dev OWNS the full loop: diagnoses the failure (local tests or the CI gate report via gh api through run_command), finds the root cause, FIXES the code, writes/updates tests, and re-runs verification until it passes. Reports DONE only when verified. Does NOT audit security or performance — the CI security gate owns those. |
-| **Coding / implementation / feature / new code** | **Dev** | Writes clean code WITH tests (features touching API/db/validation MUST ship tests), runs a syntax self-check, then STOPS — the CI gate verifies automatically and failures route back to Dev (repair turn) until green. Never delegates to other agents. Does NOT design architecture, review security, or optimize performance. |
-| **General chat / research / quick question / vision** | **FreeAgent** | General-purpose free model agent (OpenRouter, Groq, Google AI Studio, Mistral, NVIDIA NIM, Cloudflare, Z.ai, OpenCode Go, Kilo & Cline) — text chat, image analysis, quick research, lightweight tasks. Zero cost. |
-| **New project creation** ("make a new project called X…", "set up a project") | **You** — call `create_project(name, concept)` | Creates the folder under D:\\MyProject, registers the workspace + a chat, and assigns a durable Dev agent that starts on the concept immediately. Do NOT delegate to a subagent; do NOT call this for work on an existing project. |
-| **Security / infrastructure / performance** — ONLY when the request EXPLICITLY asks | **Dev** | Security & performance are enforced by the CI gate (Bandit, pip-audit, gitleaks, Ruff, perf-smoke, CodeQL) on every push with branch protection blocking merges until green. For explicit security/infra requests: Dev implements, pushes, reads the gate report via gh api through run_command, and fixes until the gate passes. |
-
-*(future domains plug in as new registry entries + one row here.)*
+## CHAT POLICY (you decide)
+- New job \u2192 NEW chat (default); each gets its own tab.
+- Follow-up/correction/bug on earlier work from this session \u2192
+  CONTINUE that chat via chat_id. Only set chat_id when you can
+  point to a real chat surfaced in a prior [DELEGATION RESULT].
+  Unknown ids silently start a new chat \u2014 never guess.
+- Registered projects always flow through resume_project (their session continues).
+- Image attachments ride the specific job that needs them (images field).
 
 ## DELEGATION RULES
+- Every handed-out job must be COMPLETE and SELF-CONTAINED: goal, constraints,
+  paths, how to verify. The specialist sees nothing else from this conversation.
+- NEVER redo, retry, or double-hand work already given. A returned result is final;
+  failures get reported honestly \u2014 code repair loops belong to the harness gate.
+- Risky changes (databases, logins, payments): flag it in the job so Dev digs deeper.
 
-- **ONE request → ONE subagent.** Pick the single best fit and delegate ONLY it. Every coding/bug/verify request goes to Dev — there is no separate fixer agent. Do NOT spawn Dev AND anything else for the same work item — that is duplication and wastes the team's budget.
-- **Multi-spawn is reserved for genuinely large, multi-domain requests** where the work items are clearly separable (backend + frontend + infrastructure, or a feature + an explicit security review). Each distinct work item gets exactly one subagent, each delegated ONCE.
-- **NEVER re-delegate a subtask that already returned.** No retries, no "try again" handoffs. Failures flow to the harness verification gate, and gate failures route back to Dev as repair turns (with the gate report + task journal as context).
-- For HIGH-RISK change (data schema/migrations, auth/security boundaries, payment/finance logic, large multi-file blast radius), instruct Dev to verify more aggressively (run the tests, check the gate).
-- Dev's handoff is the standard AGENT HANDOFF REPORT — expect a compact report.
+## YOUR MEMORY
+- Between messages you keep only the Recent Chat History shown below \u2014 your internal
+  tool calls are not stored across turns. Anything that matters must be said in a reply.
 
-## PROJECT-AWARE ROUTING (P9)
-
-Projects registered in this harness each have a DURABLE Dev agent (a continuable child). Follow these rules exactly:
-
-- **Existing project → continue its Dev agent.** Coding, bug-fix, or follow-up work for a project that exists: call `resume_project(name, message)` — it resolves the project and delivers the message to its durable Dev in one call. The project's Dev resumes its OWN durable session — full context, zero re-spawning. NEVER use `task("Dev")` for a project that already has a Dev agent.
-- **New project → create it with `create_project(name, concept)`.** The tool makes the folder, workspace, chat, and a fresh durable Dev agent in one call. Only call it when the user genuinely asks for a NEW project.
-- **No Dev agent yet for an existing folder?** `resume_project` returns [NOT FOUND] → then create the project with `create_project(name, concept)` to assign its Dev agent.
-- **Multiple new projects** ("two projects: A and B") → call `create_project` once per project (they can run in the same turn).
-- The harness pre-router already sends most in-project and name-mention messages straight to the project's Dev agent before you ever see them; when you DO see project work, it was ambiguous enough to need your call — make it with the tools above.
-
-## REPORTING (concise, Claude-Code style)
-
-Your final answer to the user is a TIGHT summary — never a wall of text:
-
-✓ Done — <one line: the outcome>
-- What was done: <2-5 short bullets, mention files touched>
-- Verification: <what the subagent ran / harness gate status>
-- Next: <only if something genuinely remains>
-
-Rules: ≤15 lines total. No raw dumps, no repeated context, no "Here is the summary of..." preamble. If the outcome was a failure or partial, say so plainly in the first line (⚠ Partial / ✗ Failed + one-line why).
-
-## COST AWARENESS
-
-- **Dev** is the workhorse (cheap flash): implementation, bug-fix, verify, and gate-repair all route to it; its adaptive reasoning ladder (iter-1 high, routine disabled, trouble → high) handles deep diagnosis. **FreeAgent** is $0 for general work. The CI gate (github-ci-security) verifies every push and routes failures back to Dev as repair turns.
-- One well-written delegation prompt is cheaper than two vague ones — invest clarity upfront.
-- Parallel async tasks (`async_task(action="start")`) reduce wall-clock time but not token cost. Use when SPEED matters more than cost. Check with `async_task(action="status")` and list with `async_task(action="list")`.
-
-## WEB RESEARCH
-
-Research goes through your subagents: FreeAgent has run_command (curl) + browser tools (zero cost); Dev has browser tools for JS-heavy pages. Delegate research to the right one — you do not fetch directly.
-
-## SUBAGENT DEPTH
-
-The system enforces a maximum nesting depth of 3 (orchestrator → subagent → sub-subagent). Subagents are terminal nodes — they do NOT spawn subagents. Only you delegate. You do not need to manage sub-subagents.
-
-## CONTINUABLE SUBAGENTS (P6)
-
-For long-running or iterative work, use the unified async tool:
-
-- `async_task(action="start", name, task)` — fire-and-forget; returns task_id and, when applicable, a continuable child id.
-- `async_task(action="status", task_id, wait_seconds?)` — poll one task; wait optionally.
-- `async_task(action="list")` — list all async tasks and their statuses.
-- For existing projects, prefer `resume_project(name, message)` — it resumes the durable Dev in one call without needing a child_id.
-
-Use continuable children when the work spans several user requests or when you need to steer an ongoing effort. Prefer one-shot `task()` for single delegations.
-
+## WRAP-UP
+When jobs settle: cover every job \u2014 outcome, anything notable, where details live.
+Explain well enough that the boss needs no other tab to know what happened.
+Efficient and complete, zero filler. Length = exactly what the truth requires.
 """
 
 
@@ -264,6 +223,13 @@ def _orchestrator_loop(s: ITState) -> dict:
     if chat_history_str:
         task_message += f"## Recent Chat History\n{chat_history_str}\n\n"
     task_message += f"## User Request\n{client_req}"
+    try:
+        from agents.delegation import recent_jobs_block
+        jb = recent_jobs_block(10)
+        if jb:
+            task_message += f"\n\n{jb}"
+    except Exception:
+        pass
 
     messages = [
         SystemMessage(content=static_system),
@@ -290,6 +256,8 @@ def _orchestrator_loop(s: ITState) -> dict:
     content = ""  # Initialize --- set during loop
     existing_ids = {m.id for m in messages if getattr(m, "id", None)}
     iteration = 0
+    park_timeouts = 0  # consecutive wait windows expired with children alive
+    nudge_count = 0    # exit-too-short nudges issued this run (capped)
     tool_call_log: list[dict] = []
     orch_think = False  # adaptive ladder: set by trouble signals, consumed next turn
     compaction_policy = get_compaction_policy("orchestrator")
@@ -302,7 +270,14 @@ def _orchestrator_loop(s: ITState) -> dict:
 
         # ── Inbox (P2): a user abort takes effect at the next step boundary ──
         if consume_abort(chat_id):
-            safe_append_live_log("\n[CANCELLED] Run cancelled by user request.")
+            try:
+                from agents import delegation as _dlg
+                cancelled = _dlg.cancel_all()
+                safe_append_live_log(
+                    f"\n[CANCELLED] Run cancelled by user request ({cancelled} delegation(s) stopped)."
+                )
+            except Exception:
+                safe_append_live_log("\n[CANCELLED] Run cancelled by user request.")
             _log("[ORCHESTRATOR] Aborted by user request.")
             break
 
@@ -328,32 +303,55 @@ def _orchestrator_loop(s: ITState) -> dict:
 
         # ── Call LLM ──
         try:
-            # ── Adaptive reasoning budget ladder ──
-            # Iteration 1 is a mechanical route-and-delegate decision
-            # (thinking disabled — the routing table is in the prompt).
-            # Routine follow-up turns run with thinking DISABLED too — delegation
-            # handoffs and verification are mechanical. Any trouble signal from
-            # the previous turn (delegation/tool error, failure markers in a
-            # subagent report, or compaction) flips THIS turn back to high; the flag is
-            # consumed (one high turn, then back to routine).
-            # Knobs: REASONING_ITER1 (first-call depth, default "disabled"),
-            #        REASONING_ORCH_ROUTINE (routine depth, default "disabled").
+            # ── Adaptive reasoning budget ladder (mode-aware) ──
+            # The provider mode supplies per-rung defaults
+            # (llm/provider_modes.py): deepseek/opencode run the orchestrator
+            # with thinking DISABLED at every rung; command mode runs "low";
+            # free mode skips this path entirely. Trouble signals still flip
+            # THIS turn to high; env knobs override everything.
+            # Knobs: ORCH_REASONING_ITER1 ∥ REASONING_ITER1,
+            #        REASONING_ORCH_ROUTINE.
+            _oplan: dict = {}
+            try:
+                from llm.provider_modes import get_role_plan
+
+                _oplan = get_role_plan("Orchestrator")
+            except Exception:
+                _oplan = {}
+            _orch_iter_default = str(_oplan.get("iter_effort") or "disabled")
             if orch_think:
                 orch_effort = "high"
                 orch_think = False
             elif iteration <= 1:
-                orch_effort = os.environ.get("ORCH_REASONING_ITER1",
-                                             os.environ.get("REASONING_ITER1", "disabled"))
+                orch_effort = os.environ.get(
+                    "ORCH_REASONING_ITER1",
+                    os.environ.get("REASONING_ITER1", _orch_iter_default),
+                )
             else:
-                orch_effort = os.environ.get("REASONING_ORCH_ROUTINE", "disabled")
-            response = invoke_messages_with_fallback_stream(
-                role="Orchestrator",
-                messages=list(messages),
-                temp=0.2,
-                tools=native_orchestrator_tools,
-                reasoning_effort=orch_effort,
-                where=f"Orchestrator iter {iteration}",
-            )
+                _orch_routine_default = (
+                    _orch_iter_default if _oplan.get("mode") == "command" else "disabled"
+                )
+                orch_effort = os.environ.get("REASONING_ORCH_ROUTINE", _orch_routine_default)
+            if str(_oplan.get("backend")) == "free":
+                from llm.free_providers import free_native_turn
+
+                response = free_native_turn(
+                    "Orchestrator",
+                    list(messages),
+                    tools=native_orchestrator_tools,
+                    capability="text",
+                    prefer_reasoning=bool(_oplan.get("think_bias", False)),
+                )
+            else:
+                response = invoke_messages_with_fallback_stream(
+                    role="Orchestrator",
+                    messages=list(messages),
+                    temp=0.2,
+                    tools=native_orchestrator_tools,
+                    model=str(_oplan.get("model") or "") or None,
+                    reasoning_effort=orch_effort,
+                    where=f"Orchestrator iter {iteration}",
+                )
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -415,16 +413,70 @@ def _orchestrator_loop(s: ITState) -> dict:
                     pass
             clean_response = _extract_text_response(content)
 
-            # ── Validate exit ──
-            # Let the model finish naturally. Only nudge if response is empty or bare minimum.
-            is_too_short = len(clean_response.strip()) < 20
             delegated_work = any(
-                tc.get("tool") in ("task", "async_task", "resume_project")
+                tc.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
                 for tc in tool_call_log
             )
 
-            if is_too_short and delegated_work:
-                _log(f"[ORCHESTRATOR] Exit too short — nudging for proper response.")
+            # ── Park-and-wait: delegations still running → wait for events ──
+            # The orchestrator is an event-driven coordinator: instead of
+            # exiting while children work, it parks on its inbox. Completions
+            # ([DELEGATION RESULT]), steering, and NEW user tasks all arrive as
+            # inbox messages and wake it for another coordination turn.
+            try:
+                from agents import delegation as _dlg
+                pending = _dlg.running_count(chat_id) if chat_id else 0
+            except Exception:
+                pending = 0
+            if pending > 0:
+                _log(f"[ORCHESTRATOR] {pending} delegation(s) running — parking for events")
+                wait = _dlg.park_wait(chat_id)
+                if wait["aborted"]:
+                    cancelled = _dlg.cancel_all()
+                    safe_append_live_log(
+                        f"\n[CANCELLED] Run cancelled by user request ({cancelled} delegation(s) stopped)."
+                    )
+                    _log("[ORCHESTRATOR] Aborted by user request — delegations cancelled.")
+                    break
+                payload_parts = []
+                if wait["events"]:
+                    payload_parts.append(render_delivery("DELEGATION RESULT", wait["events"]))
+                if wait["steering"]:
+                    payload_parts.append(render_delivery("STEERING", wait["steering"]))
+                if payload_parts:
+                    _log(f"[ORCHESTRATOR] Woke with {len(wait['events'])} result(s), "
+                         f"{len(wait['steering'])} steering — new coordination turn")
+                    messages.append(HumanMessage(
+                        content="\n\n".join(payload_parts),
+                        id=f"orch-park-{iteration}-{uuid.uuid4()}",
+                    ))
+                    continue
+                if wait["timed_out"] and _dlg.running_count(chat_id) > 0:
+                    park_timeouts += 1
+                    if park_timeouts >= 3:
+                        _log("[ORCHESTRATOR] Wait timeout x3 with children alive — reporting partial.")
+                        messages.append(HumanMessage(
+                            content=render_delivery("SYSTEM", [
+                                "Delegations exceeded the maximum wait window and are STILL RUNNING. "
+                                "Give the user a partial report now: what finished, what is outstanding, "
+                                f"and which chats to check. Do NOT spawn duplicates.",
+                            ]),
+                            id=f"orch-park-timeout-{iteration}-{uuid.uuid4()}",
+                        ))
+                        park_timeouts = 0  # allow one final summary turn, then exit below via no-children rule
+                        continue
+                    _log(f"[ORCHESTRATOR] Wait timeout #{park_timeouts} — re-parking (children alive)")
+                    continue
+
+            # ── Validate exit ──
+            # Let the model finish naturally. Only nudge if response is empty or bare minimum.
+            # The nudge is capped — a model determined to answer in 5 words must
+            # not spin this loop forever.
+            is_too_short = len(clean_response.strip()) < 20
+
+            if is_too_short and delegated_work and nudge_count < 2:
+                nudge_count += 1
+                _log(f"[ORCHESTRATOR] Exit too short — nudging ({nudge_count}/2).")
                 messages.append(HumanMessage(
                     content="[NUDGE] That response was too brief. Summarize what was accomplished and offer a next step the user might want.",
                     id=f"orch-exit-nudge-{iteration}-{uuid.uuid4()}"
@@ -538,7 +590,7 @@ def _orchestrator_loop(s: ITState) -> dict:
             # status, not stray words) → the NEXT orchestrator turn diagnoses
             # with high effort.
             low = result_str.lower()
-            if tool_name in ("task", "async_task", "resume_project"):
+            if tool_name in ("delegate", "task", "async_task", "resume_project"):
                 is_failure = bool(execution and execution.is_error) or any(
                     marker in low
                     for marker in (
@@ -614,7 +666,10 @@ def _orchestrator_loop(s: ITState) -> dict:
         "code": final_report,
         "test_report": "",
         "project_path": project_path,
-        "code_updated": any(tc.get("tool") in ("task", "async_task", "resume_project") for tc in tool_call_log),
+        "code_updated": any(
+            tc.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
+            for tc in tool_call_log
+        ),
         "tech_spec_updated": False,
         "next_agent": "finish",
         "error": final_error,

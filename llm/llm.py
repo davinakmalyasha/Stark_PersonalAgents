@@ -159,7 +159,11 @@ def _extract_native_tool_calls(res) -> list[dict]:
     return tool_calls
 
 
-_LLM_PROVIDER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "llm_provider.json")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Single persisted location: root .deep_agents (shared with every other settings file).
+_LLM_PROVIDER_FILE = os.path.join(_PROJECT_ROOT, ".deep_agents", "llm_provider.json")
+# Pre-unification twin written beside this module by older builds; adopted once, then retired.
+_LEGACY_LLM_PROVIDER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "llm_provider.json")
 
 
 def _load_persisted_provider() -> str:
@@ -169,6 +173,20 @@ def _load_persisted_provider() -> str:
         if os.path.isfile(_LLM_PROVIDER_FILE):
             with open(_LLM_PROVIDER_FILE, encoding="utf-8") as f:
                 return (json.load(f).get("provider") or "").strip().lower()
+    except Exception:
+        pass
+    # Legacy twin: migrate its value forward exactly once.
+    try:
+        if os.path.isfile(_LEGACY_LLM_PROVIDER_FILE):
+            with open(_LEGACY_LLM_PROVIDER_FILE, encoding="utf-8") as f:
+                legacy = (json.load(f).get("provider") or "").strip().lower()
+            if legacy and not os.path.isfile(_LLM_PROVIDER_FILE):
+                _save_persisted_provider(legacy)
+                try:
+                    os.replace(_LEGACY_LLM_PROVIDER_FILE, _LEGACY_LLM_PROVIDER_FILE + ".migrated")
+                except OSError:
+                    pass
+            return legacy
     except Exception:
         pass
     return ""
@@ -200,6 +218,20 @@ def _resolve_llm_provider() -> dict:
     if not provider:
         provider = _load_persisted_provider()
 
+    if provider == "command":
+        # Command Code Provider API — OpenAI/Anthropic-compatible gateway.
+        # Official endpoint by default; COMMAND_CODE_BASE_URL can point at any
+        # compatible gateway/proxy. Model slots are org-scoped catalog slugs;
+        # every one is env-overridable without code changes.
+        return {
+            "base": os.getenv("COMMAND_CODE_BASE_URL", "https://api.commandcode.ai/provider/v1"),
+            "key": os.getenv("COMMAND_CODE_API_KEY", ""),
+            "flash": os.getenv("COMMAND_CODE_MODEL_FLASH", "deepseek/deepseek-v4-flash"),
+            "pro": os.getenv("COMMAND_CODE_MODEL_PRO", "deepseek/deepseek-v4-pro"),
+            "vision": os.getenv("COMMAND_CODE_MODEL_VISION", "deepseek/deepseek-v4-flash-vision-exp"),
+            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "laguna-s-2.1-free"),
+            "light": os.getenv("COMMAND_CODE_MODEL_LIGHT", "laguna-s-2.1-free"),
+        }
     if provider == "opencode":
         # Go subscription endpoint — /zen/v1 is the generic/pay-per-use route that has no
         # balance for paid models (returns "Insufficient balance" even with an active Go sub).
@@ -223,14 +255,18 @@ def _resolve_llm_provider() -> dict:
 def _map_model(model: str) -> str:
     """Map a canonical model name (deepseek-v4-flash/pro/vision-exp) to the active provider's name."""
     cfg = _resolve_llm_provider()
+    if "/" in model:
+        # Org-scoped slug (e.g. "deepseek/deepseek-v4-flash", "laguna-s-2.1-free")
+        # is already provider-specific — pass through untouched.
+        return model
     if model == "deepseek-v4-flash":
         return cfg["flash"]
     if model == "deepseek-v4-pro":
         return cfg["pro"]
     if model in (DEEPSEEK_MODEL_VISION, "deepseek-v4-flash-vision-exp"):
-        # Same slug on the DeepSeek API and the OpenCode Go listing; env
-        # override covers any gateway that names it differently.
-        return os.getenv("DEEPSEEK_MODEL_VISION", DEEPSEEK_MODEL_VISION)
+        # Per-provider vision slot: same slug on the DeepSeek API and OpenCode
+        # Go listings; the command gateway names its own.
+        return cfg.get("vision") or DEEPSEEK_MODEL_VISION
     return model
 
 
@@ -241,9 +277,9 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
     key = _cfg["key"]
     if not key or key.startswith("your_"):
         raise ValueError(
-            "DEEPSEEK_API_KEY not set in .env. "
-            "Get one at https://platform.deepseek.com/api_keys (or set OPENCODE_API_KEY "
-            "when routing through OpenCode Go)."
+            f"LLM API key not set for base {base_url}. "
+            "Set DEEPSEEK_API_KEY (or OPENCODE_API_KEY for the OpenCode Go "
+            "gateway / COMMAND_CODE_API_KEY for Command Code)."
         )
 
     # No per-call max_tokens — the model decides how much to output.
@@ -267,35 +303,44 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
     # Only send thinking parameters if the model supports it or is a fallback model.
     is_reasoning_model = any(x in model.lower() for x in ["r1", "pro", "o1", "o3", "reasoning", "thinking", "fallback", "automatic", "flash"])
 
-    if is_reasoning_model:
-        if reasoning_effort is not None:
-            if reasoning_effort == "disabled":
-                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            else:
-                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                kwargs["reasoning_effort"] = reasoning_effort
-                # Adaptive per-turn reasoning budget (token ceiling). The model
-                # spends up to the cap as it judges; the ladder chooses the cap.
-                if reasoning_budget is not None:
-                    kwargs["extra_body"]["thinking"]["budget_tokens"] = int(reasoning_budget)
+    if reasoning_effort is not None:
+        # Explicit caller intent always wins and is always sent — the
+        # mode-aware ladders know the target model better than this heuristic.
+        effort = str(reasoning_effort).strip().lower()
+        if effort in ("disabled", "none", ""):
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         else:
-            is_orchestrator = (
-                role in ["Developer", "DeveloperFixing"]
-                or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
-            )
-            is_heavy = is_orchestrator or (
-                role in ["Supervisor", "sa", "Coder"]
-                or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"]))
-            )
+            budget_override = reasoning_budget
+            if effort == "max":
+                # Portable ceiling: effort tops out at "high" plus an explicit
+                # token budget the vendor can honor (REASONING_MAX_BUDGET).
+                effort = "high"
+                if budget_override is None:
+                    budget_override = int(os.getenv("REASONING_MAX_BUDGET", "32768"))
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            kwargs["reasoning_effort"] = effort
+            if budget_override is not None:
+                kwargs["extra_body"]["thinking"]["budget_tokens"] = int(budget_override)
+    elif is_reasoning_model:
+        # No explicit effort: role-based defaults. Developer-like/heavy roles
+        # think at high; everyone else runs with thinking disabled.
+        is_orchestrator = (
+            role in ["Developer", "DeveloperFixing"]
+            or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
+        )
+        is_heavy = is_orchestrator or (
+            role in ["Supervisor", "sa", "Coder"]
+            or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"]))
+        )
 
-            if is_orchestrator:
-                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                kwargs["reasoning_effort"] = "high"
-            elif is_heavy:
-                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                kwargs["reasoning_effort"] = "high"
-            else:
-                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if is_orchestrator:
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            kwargs["reasoning_effort"] = "high"
+        elif is_heavy:
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            kwargs["reasoning_effort"] = "high"
+        else:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
     return ChatOpenAI(**kwargs)
 
@@ -355,6 +400,26 @@ def _parse_schema_response(text: str, schema: Type[T]) -> T:
 
 
 import threading
+import contextvars
+
+#: Per-thread StreamBus target override. Parallel delegation threads set this
+#: to their own chat id so child deltas never interleave into the parent's
+#: stream (the bus key otherwise comes from the GLOBAL shared_state chat_id).
+stream_chat_override: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "stream_chat_override", default=""
+)
+
+
+def _effective_stream_chat_id() -> str:
+    override = stream_chat_override.get()
+    if override:
+        return override
+    try:
+        from sync.state_sync import shared_state
+        return str(shared_state.get("chat_id") or "")
+    except Exception:
+        return ""
+
 
 class ConcurrencyThrottle:
     def __init__(self):
@@ -988,12 +1053,7 @@ def invoke_messages_with_fallback_stream(
         role, messages, temp, schema, tools, reasoning_effort, reasoning_budget, model
     )
     errors_by_model: dict[str, str] = {}
-    chat_id = ""
-    try:
-        from sync.state_sync import shared_state
-        chat_id = str(shared_state.get("chat_id") or "")
-    except Exception:
-        pass
+    chat_id = _effective_stream_chat_id()
 
     def _emit(kind: str, text: str) -> None:
         _stream_emit(chat_id, kind, text, agent=role, model="")

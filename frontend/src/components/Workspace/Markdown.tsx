@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { memo, useState } from 'react';
 import { Copy, Check, Circle, CheckCircle2 } from 'lucide-react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import oneDark from 'react-syntax-highlighter/dist/esm/styles/prism/one-dark';
@@ -29,7 +29,7 @@ function CodeCopyButton({ text }: { text: string }) {
   );
 }
 
-export default function Markdown({ content }: Props) {
+function Markdown({ content }: Props) {
   if (!content) return null;
 
   const lines = content.split('\n');
@@ -388,3 +388,5 @@ export default function Markdown({ content }: Props) {
   flushAll(lines.length);
   return <div className="markdown-body select-text leading-[1.85]">{blocks}</div>;
 }
+
+export default memo(Markdown);

@@ -7,6 +7,7 @@ interface Props {
   group: GroupedTraceStep;
   isLastActive: boolean;
   onOpenSubagent?: (name: string, task: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string) => void;
   activeSubagent?: string | null;
   allTraceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -14,7 +15,7 @@ interface Props {
   onCloseSubagent?: () => void;
 }
 
-export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, activeSubagent, allTraceSteps, workspaceId, chatId, onCloseSubagent }: Props) {
+export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, onOpenSubagentSession, activeSubagent, allTraceSteps, workspaceId, chatId, onCloseSubagent }: Props) {
   const [expanded, setExpanded] = useState(isLastActive);
   const [activeSeconds, setActiveSeconds] = useState(0);
 
@@ -39,7 +40,7 @@ export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, act
     }
     if (group.type === 'thought') {
       const firstStep = group.steps[0];
-      const thoughtDuration = (firstStep as any)?.duration;
+      const thoughtDuration = firstStep?.duration;
       if (thoughtDuration) {
         const num = parseInt(thoughtDuration);
         return isNaN(num) ? `Thought for ${thoughtDuration}` : `Thought for ${num}s`;
@@ -67,7 +68,7 @@ export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, act
     return (
       <div className="trace-system-row">
         {group.steps.map((s) => (
-          <TraceStepRow key={s.id} step={s} onOpenSubagent={onOpenSubagent} isActive={isLastActive} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} />
+          <TraceStepRow key={s.id} step={s} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} isActive={isLastActive} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} />
         ))}
       </div>
     );
@@ -77,7 +78,7 @@ export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, act
   const lines = thoughtContent.split('\n').map(l => l.trim()).filter(Boolean);
 
   let thoughtTitle = '';
-  let thoughtBody = '';
+  let thoughtBody;
 
   if (lines.length > 1 && lines[0].length < 80) {
     thoughtTitle = lines[0];
@@ -113,7 +114,7 @@ export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, act
           ) : (
             <div className="trace-tool-stack">
               {group.steps.map((s) => (
-                <TraceStepRow key={s.id} step={s} onOpenSubagent={onOpenSubagent} isActive={isLastActive} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} />
+                <TraceStepRow key={s.id} step={s} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} isActive={isLastActive} activeSubagent={activeSubagent} allTraceSteps={allTraceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} />
               ))}
             </div>
           )}

@@ -12,7 +12,7 @@ interface Input {
 const AGENT_ROSTER: { id: string; label: string; role: BoardAgent['role'] }[] = [
   { id: 'Supervisor', label: 'Supervisor', role: 'Orchestrator' },
   { id: 'Dev', label: 'Developer Subagent', role: 'Subagent' },
-  { id: 'FreeAgent', label: 'FreeAgent', role: 'Subagent' },
+  { id: 'General', label: 'General Subagent', role: 'Subagent' },
   { id: 'Vision', label: 'Vision Agent', role: 'Subagent' },
 ];
 
@@ -25,7 +25,7 @@ function normalizeTokenAgent(nodeId: string): string[] {
     case 'sdet': return ['sdet', 'tester', 'qa'];
     case 'devsecops': return ['devsecops', 'devops'];
     case 'analytics': return ['analytics', 'data'];
-    case 'freeagent': return ['freeagent', 'free agent'];
+    case 'general': return ['general', 'freeagent', 'free agent'];
     case 'vision': return ['vision', 'visual'];
     case 'designer': return ['designer', 'ui/ux'];
     default: return [lower];

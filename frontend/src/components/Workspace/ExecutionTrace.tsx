@@ -5,6 +5,7 @@ interface Props {
   steps: TraceStep[];
   isActive?: boolean;
   onOpenSubagent?: (name: string, task: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string) => void;
   activeSubagent?: string | null;
   allTraceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -12,18 +13,19 @@ interface Props {
   onCloseSubagent?: () => void;
 }
 
-export default function ExecutionTrace({ steps, isActive, onOpenSubagent, activeSubagent, allTraceSteps, workspaceId, chatId, onCloseSubagent }: Props) {
+export default function ExecutionTrace({ steps, isActive, onOpenSubagent, onOpenSubagentSession, activeSubagent, allTraceSteps, workspaceId, chatId, onCloseSubagent }: Props) {
   const grouped = groupTraceSteps(steps);
   if (grouped.length === 0) return null;
 
   return (
     <div className="trace-timeline">
       {grouped.map((group, idx) => (
-        <TraceGroupRow 
-          key={group.id} 
-          group={group} 
-          isLastActive={!!isActive && idx === grouped.length - 1} 
+        <TraceGroupRow
+          key={group.id}
+          group={group}
+          isLastActive={!!isActive && idx === grouped.length - 1}
           onOpenSubagent={onOpenSubagent}
+          onOpenSubagentSession={onOpenSubagentSession}
           activeSubagent={activeSubagent}
           allTraceSteps={allTraceSteps}
           workspaceId={workspaceId}

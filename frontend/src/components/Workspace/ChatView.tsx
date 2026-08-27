@@ -34,6 +34,8 @@ interface Props {
   chatId: string | null;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
+  /** Session-keyed subagent drill-in (delegation rows carrying childId). */
+  onOpenSubagentSession?: (childId: string, label: string) => void;
 }
 
 export default function ChatView({
@@ -41,7 +43,7 @@ export default function ChatView({
   hasActiveChat, notification,
   onSend, onCancel, onClearNotification,
   isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
-  selectedModel, models, onModelChange, onRetry, state,
+  selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession,
 }: Props) {
   const [minimized, setMinimized] = useState(false);
   const [activeSubagent, setActiveSubagent] = useState<string | null>(null);
@@ -151,6 +153,7 @@ export default function ChatView({
           messages={visibleMessages}
           hasActiveChat={hasActiveChat}
           onOpenSubagent={(name) => setActiveSubagent(name)}
+          onOpenSubagentSession={onOpenSubagentSession}
           activeSubagent={activeSubagent}
           traceSteps={traceSteps}
           workspaceId={workspaceId}

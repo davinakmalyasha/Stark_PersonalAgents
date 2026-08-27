@@ -2,32 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { FileText, Folder, FolderOpen, Copy, X, ChevronRight, ChevronDown, Search } from 'lucide-react';
 import type { WorkspaceFileEntry } from '../../services/api';
 import { fetchWorkspaceFiles, fetchWorkspaceFile } from '../../services/api';
+import { buildTree, type TreeNode } from '../../utils/fileTree';
 
 interface Props {
   workspaceId: string | null;
   onClose: () => void;
-}
-
-interface TreeNode {
-  name: string;
-  path: string;
-  type: 'dir' | 'file';
-  size?: number;
-  children: TreeNode[];
-}
-
-function buildTree(entries: WorkspaceFileEntry[]): TreeNode[] {
-  const root: TreeNode[] = [];
-  const map = new Map<string, TreeNode>();
-  for (const e of entries) {
-    const node: TreeNode = { name: e.name, path: e.path, type: e.type, size: e.size, children: [] };
-    map.set(e.path, node);
-    const parentPath = e.path.includes('/') ? e.path.slice(0, e.path.lastIndexOf('/')) : '';
-    const parent = parentPath ? map.get(parentPath) : null;
-    if (parent) parent.children.push(node);
-    else root.push(node);
-  }
-  return root;
 }
 
 /** P10/Tier-3: workspace file explorer — list tree, click to preview. */

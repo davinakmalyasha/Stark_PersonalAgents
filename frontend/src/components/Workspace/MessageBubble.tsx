@@ -10,6 +10,7 @@ import DiffView from './DiffView';
 interface Props {
   message: ChatMessage;
   onOpenSubagent: (name: string, task: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string) => void;
   activeSubagent?: string | null;
   traceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -182,7 +183,7 @@ function StreamingThinking({ reasoning, rate, active }: { reasoning: string; rat
   );
 }
 
-export default function MessageBubble({ message, onOpenSubagent, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
+export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -279,6 +280,7 @@ export default function MessageBubble({ message, onOpenSubagent, activeSubagent,
                   isActive={message.duration === 'active'}
                   duration={message.metadata?.duration as string || message.duration}
                   onOpenSubagent={onOpenSubagent}
+                  onOpenSubagentSession={onOpenSubagentSession}
                   activeSubagent={activeSubagent}
                   allTraceSteps={traceSteps}
                   workspaceId={workspaceId}

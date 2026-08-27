@@ -17,6 +17,10 @@ interface UsePipelineReturn {
   isRunning: boolean;
   error: string | null;
   streaming: LiveStream;
+  /** How the current/last run reached this client: initiated here or mirrored from another client. */
+  runMode: 'local' | 'mirror' | null;
+  /** Watch an existing live run started by another client (phone ↔ laptop mirroring). */
+  attachMirror: (chatId: string) => void;
 }
 
 const EMPTY_STREAM: LiveStream = { text: '', reasoning: '', agent: '', active: false, rate: 0 };
@@ -27,6 +31,7 @@ export function usePipeline(): UsePipelineReturn {
   const [error, setError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState<LiveStream>(EMPTY_STREAM);
   const abortRef = useRef<AbortController | null>(null);
+  const [runMode, setRunMode] = useState<'local' | 'mirror' | null>(null);
 
   // tok/s estimation: chars since last delta / seconds since last delta, smoothed
   const rateRef = useRef({ lastTs: 0, lastChars: 0, ema: 0 });
@@ -67,6 +72,7 @@ export function usePipeline(): UsePipelineReturn {
   }, []);
 
   const run = useCallback((prompt: string, model: string, temp: number, workspacePath = '', chatId = '', attachments: ChatAttachment[] = []) => {
+    setRunMode('local');
     setIsRunning(true);
     setError(null);
     resetStream();
@@ -116,7 +122,82 @@ export function usePipeline(): UsePipelineReturn {
     abortRef.current?.abort();
     resetStream();
     setIsRunning(false);
+    setRunMode(null);
   }, [resetStream]);
 
-  return { run, cancel, state, isRunning, error, streaming };
+  /**
+   * Live mirroring (mobile/remote feature): subscribe to /api/stream/{chatId}
+   * and feed another client's run frames into this client's pipeline state.
+   * Errors are NOT raised locally — the initiating client owns persistence;
+   * mirrors only render and refresh on completion.
+   */
+  const attachMirror = useCallback((chatId: string) => {
+    if (!chatId) return;
+    setRunMode('mirror');
+    setIsRunning(true);
+    setError(null);
+    resetStream();
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    (async () => {
+      try {
+        const res = await fetch(`/api/stream/${encodeURIComponent(chatId)}`, { signal: controller.signal });
+        if (!res.ok || !res.body) {
+          setRunMode(null);
+          setIsRunning(false);
+          return;
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEvent = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              currentEvent = line.slice(7).trim();
+              continue;
+            }
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const parsed = JSON.parse(line.slice(6).trim());
+              if (currentEvent === 'delta') {
+                applyDelta(parsed as StreamDelta);
+              } else if (currentEvent === 'done') {
+                resetStream();
+                setIsRunning(false);
+                return;
+              } else if (parsed.error) {
+                // Render the failure state but leave persistence to the initiator.
+                setState(parsed as AppState);
+                resetStream();
+                setIsRunning(false);
+                return;
+              } else {
+                setState(parsed as AppState);
+              }
+            } catch { /* partial line */ }
+            currentEvent = '';
+          }
+        }
+        // Stream closed without an explicit done — stop mirroring quietly.
+        resetStream();
+        setIsRunning(false);
+      } catch (err) {
+        if ((err as Error)?.name !== 'AbortError') {
+          resetStream();
+          setIsRunning(false);
+        }
+      }
+    })();
+  }, [applyDelta, resetStream]);
+
+  return { run, cancel, state, isRunning, error, streaming, runMode, attachMirror };
 }

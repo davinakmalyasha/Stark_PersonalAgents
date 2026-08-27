@@ -10,6 +10,12 @@ export interface TraceStep {
   args?: string;
   isError?: boolean;
   duration?: string;
+  /** Spawned child session id — set by [SUBAGENT] lines; enables drill-in. */
+  childId?: string;
+  /** Short display label for the spawned child (task-derived). */
+  label?: string;
+  /** The spawned agent type (UI, Deploy…) — distinct from step.agent (the caller). */
+  childName?: string;
 }
 
 export interface GroupedTraceStep {
@@ -174,6 +180,37 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         };
         steps.push(currentStep);
       }
+    } else if (trimmed.startsWith('[SUBAGENT]')) {
+      // [SUBAGENT] child=<id> name=<Agent> label=<short task label>
+      // Links the spawn to its durable session → clickable drill-in block.
+      const match = trimmed.match(/^\[SUBAGENT\]\s+child=(\S+)\s+name=(\S+)\s+label=(.*)$/);
+      if (match) {
+        const [, childId, spawnName, spawnLabel] = match;
+        const label = spawnLabel.trim();
+        const isDelegationStep = !!currentStep && (
+          currentStep.toolName === 'task'
+          || currentStep.toolName === 'call_subagent'
+          || currentStep.toolName === 'start_async_task'
+          || currentStep.toolName === 'async_task'
+        );
+        if (isDelegationStep && currentStep) {
+          currentStep.childId = childId;
+          currentStep.label = label || currentStep.title;
+          currentStep.childName = normalizeAgentName(spawnName);
+        } else {
+          currentStep = {
+            id: `step-${stepCounter++}`,
+            type: 'system',
+            agent: normalizeAgentName(spawnName),
+            title: label || normalizeAgentName(spawnName),
+            content: '',
+            childId,
+            label,
+            childName: normalizeAgentName(spawnName),
+          };
+          steps.push(currentStep);
+        }
+      }
     } else if (trimmed.startsWith('[TOOL]')) {
       // Skip TOOL header prefix line
     } else if (trimmed.startsWith('[TOOL OUTPUT]')) {
@@ -200,8 +237,6 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
       currentStep = null;
     } else if (trimmed.startsWith('[DEVELOPER] Summary:')) {
       assistantResponse = trimmed.slice(20).trim();
-      currentStep = null;
-    } else if (trimmed.startsWith('[THINKING] Supervisor:')) {
       currentStep = null;
     } else if (trimmed.startsWith('[USER]') || trimmed.startsWith('[SESSION]')) {
       currentStep = null;
@@ -316,4 +351,15 @@ export function filterOrchestratorSteps(steps: TraceStep[]): TraceStep[] {
     // Subagent internals — drop
     return false;
   });
+}
+
+/**
+ * Subagent spawn steps from a persisted trace message's metadata.steps —
+ * only steps carrying a childId (drill-in capable) come back.
+ */
+export function extractSubagentSteps(steps: unknown): TraceStep[] {
+  if (!Array.isArray(steps)) return [];
+  return steps.filter(
+    (s): s is TraceStep => !!s && typeof s === 'object' && typeof (s as TraceStep).childId === 'string',
+  );
 }

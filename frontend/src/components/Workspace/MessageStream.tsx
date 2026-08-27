@@ -8,6 +8,7 @@ interface Props {
   messages: ChatMessage[];
   hasActiveChat: boolean;
   onOpenSubagent: (name: string, task: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string) => void;
   activeSubagent?: string | null;
   traceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -17,7 +18,7 @@ interface Props {
   onRetry?: (prompt: string) => void;
 }
 
-export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
+export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
@@ -142,7 +143,7 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
         ) : (
           <div ref={contentRef} className="max-w-[1100px] mx-auto" style={{ width: '100%' }}>
             {orderedMessages.map((msg) => (
-              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} />
+              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} />
             ))}
           </div>
         )}

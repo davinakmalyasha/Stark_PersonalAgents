@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import { fetchProvider, setProvider } from '../../services/api';
+import type { ProviderMode } from '../../services/api';
 import type { ModelOption } from '../../types';
+
+const PROVIDER_LABELS: Record<ProviderMode, string> = {
+  free: 'Free Providers',
+  deepseek: 'DeepSeek API',
+  opencode: 'OpenCode Go',
+  command: 'Command Code',
+};
 
 interface Props {
   onSend: (message: string, files: File[]) => void;
@@ -31,7 +39,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   const [files, setFiles] = useState<File[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [provider, setProviderState] = useState<'deepseek' | 'opencode'>('deepseek');
+  const [provider, setProviderState] = useState<ProviderMode>('deepseek');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
@@ -43,7 +51,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
     return () => { mounted = false; };
   }, []);
 
-  const changeProvider = async (value: 'deepseek' | 'opencode') => {
+  const changeProvider = async (value: ProviderMode) => {
     setProviderState(value);
     try { await setProvider(value); } catch (e) { console.error('Failed to set LLM provider', e); }
   };
@@ -108,13 +116,15 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
             <button type="button" onClick={() => inputRef.current?.click()} className="tool-button" title="Attach files"><Plus size={18} /></button>
             <select
               value={provider}
-              onChange={(e) => changeProvider(e.target.value as 'deepseek' | 'opencode')}
+              onChange={(e) => changeProvider(e.target.value as ProviderMode)}
               className="provider-select"
-              title={provider === 'opencode' ? 'LLM provider: OpenCode Go' : 'LLM provider: DeepSeek API'}
+              title={`LLM provider: ${PROVIDER_LABELS[provider] ?? provider}`}
               aria-label="LLM provider"
             >
+              <option value="free">Free Providers</option>
               <option value="deepseek">DeepSeek API</option>
               <option value="opencode">OpenCode Go</option>
+              <option value="command">Command Code</option>
             </select>
             {models.length > 0 && onModelChange && (
               <select

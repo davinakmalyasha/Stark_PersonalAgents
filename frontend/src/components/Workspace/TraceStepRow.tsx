@@ -5,6 +5,8 @@ import SubagentActivityPanel from './SubagentActivityPanel';
 interface Props {
   step: TraceStep;
   onOpenSubagent?: (name: string, task: string) => void;
+  /** Session-keyed drill-in (steps carrying childId) → opens the subagent view. */
+  onOpenSubagentSession?: (childId: string, label: string) => void;
   activeSubagent?: string | null;
   allTraceSteps?: TraceStep[];
   isActive?: boolean;
@@ -139,7 +141,7 @@ function parseLineCount(content: string): number | null {
   return null;
 }
 
-export default function TraceStepRow({ step, onOpenSubagent, activeSubagent, allTraceSteps = [], isActive = false, workspaceId = null, chatId = null, onCloseSubagent }: Props) {
+export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSession, activeSubagent, allTraceSteps = [], isActive = false, workspaceId = null, chatId = null, onCloseSubagent }: Props) {
   let fileName = '', cmdDisplay = '', lineRange = '';
 
   if (step.args) {
@@ -263,12 +265,41 @@ export default function TraceStepRow({ step, onOpenSubagent, activeSubagent, all
         const parsed = JSON.parse(step.args);
         name = parsed.name || 'Subagent';
         taskDesc = parsed.task || '';
-      } catch {}
+      } catch { /* args are best-effort display only */ }
     }
     const isAsync = step.toolName === 'start_async_task';
+
+    // Session-keyed spawn (new traces): opens the read-only drill-in view.
+    if (step.childId) {
+      const label = step.label || taskDesc.slice(0, 42) || name;
+      return (
+        <div className={`subagent-live-card ${isActive ? 'is-working' : ''}`}>
+          <div className="subagent-card-top">
+            <span className="subagent-avatar">{isActive ? <Bot size={14} /> : <Check size={14} />}</span>
+            <div className="min-w-0 flex-1">
+              <div className="subagent-name">{name} <span>subagent</span></div>
+              <div className={`subagent-state ${isActive ? 'is-working' : 'is-complete'}`}>
+                {isActive ? <Loader2 size={10} /> : <Check size={10} />}
+                {isActive ? (isAsync ? 'Running asynchronously' : 'Working on delegated task') : (isAsync ? 'Async task completed' : 'Delegated task completed')}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="subagent-open"
+              onClick={() => onOpenSubagentSession?.(step.childId!, label)}
+            >
+              Open session <ArrowUpRight size={12} />
+            </button>
+          </div>
+          {label && label !== name && <p className="subagent-task">{label}</p>}
+        </div>
+      );
+    }
+
+    // Legacy spawn (old traces without childId): name-keyed inline activity.
     const activityOpen = activeSubagent?.toLowerCase() === name.toLowerCase();
     return (
-      <div className={`subagent-live-card ${activityOpen ? 'is-open' : ''}`}>
+      <div className={`subagent-live-card ${activityOpen ? 'is-open' : ''} ${isActive ? 'is-working' : ''}`}>
         <div className="subagent-card-top">
           <span className="subagent-avatar">{isActive ? <Bot size={14} /> : <Check size={14} />}</span>
           <div className="min-w-0 flex-1">

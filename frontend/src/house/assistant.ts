@@ -23,7 +23,7 @@ export function setAssistantName(name: string): void {
 
 /**
  * Teach the general agent its identity and address style by writing into
- * the general profile (read by FreeAgent on every General-mode run):
+ * the general profile (read by the General agent on every General-mode run):
  *  - memory: the assistant's own name (Reminder)
  *  - instructions: always address the user as Sir (Preferences)
  * Runs once per browser.

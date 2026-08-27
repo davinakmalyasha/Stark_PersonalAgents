@@ -1,0 +1,212 @@
+/* ────────────────────────────────────────────────────────────────
+   House Workspace — control-room styles. Extends the monochrome
+   house.css tokens: near-black canvas, white text, hairline borders.
+   ──────────────────────────────────────────────────────────────── */
+
+.hw-root {
+  background: #0a0a0d;
+  background-image:
+    radial-gradient(circle at 50% 30%, rgba(255, 255, 255, 0.04), transparent 45%),
+    radial-gradient(circle at 85% 80%, rgba(255, 255, 255, 0.02), transparent 38%);
+  color: #fafafa;
+}
+
+/* ── Glass panel ── */
+.hw-panel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(160deg, rgba(26, 26, 31, 0.85), rgba(15, 15, 18, 0.9));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  transition: border-color 0.25s ease, box-shadow 0.3s ease, transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.hw-panel.is-hoverable:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* ── Floor plan ── */
+.hw-plan-room {
+  fill: rgba(255, 255, 255, 0.035);
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 1;
+  transition: fill 0.25s ease, stroke 0.25s ease;
+  cursor: pointer;
+}
+.hw-plan-room:hover { fill: rgba(255, 255, 255, 0.07); }
+.hw-plan-room.is-active { fill: rgba(255, 255, 255, 0.1); stroke: rgba(255, 255, 255, 0.4); }
+.hw-plan-label {
+  fill: rgba(255, 255, 255, 0.55);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  pointer-events: none;
+}
+.hw-plan-dot {
+  transition: r 0.2s ease, fill 0.25s ease;
+  pointer-events: none;
+}
+
+/* ── Stat cards ── */
+.hw-stat-value {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* ── Device cards ── */
+.hw-device-card { position: relative; overflow: hidden; }
+.hw-device-card.is-off { opacity: 0.72; }
+.hw-device-card.is-off:hover { opacity: 1; }
+.hw-device-icon {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.045);
+  transition: background 0.25s ease, color 0.25s ease, border-color 0.25s ease;
+}
+.hw-device-card.is-on .hw-device-icon {
+  background: #ffffff;
+  border-color: #ffffff;
+  color: #0a0a0d;
+}
+
+/* ── Toggle switch ── */
+.hw-switch {
+  width: 34px;
+  height: 19px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+  flex-shrink: 0;
+}
+.hw-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #a1a1aa;
+  transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.2s ease;
+}
+.hw-switch.is-on { background: #ffffff; border-color: #ffffff; }
+.hw-switch.is-on::after { transform: translateX(15px); background: #0a0a0d; }
+.hw-switch:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Sliders ── */
+.hw-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  outline: none;
+  cursor: pointer;
+}
+.hw-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: none;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.35);
+  transition: transform 0.15s ease;
+}
+.hw-slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+.hw-slider::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: none;
+}
+.hw-slider:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Scene chips ── */
+.hw-scene-chip {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), border-color 0.2s ease,
+    background 0.2s ease, box-shadow 0.2s ease;
+  cursor: pointer;
+}
+.hw-scene-chip:hover:not(:disabled) {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.09);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.hw-scene-chip:active:not(:disabled) { transform: translateY(0) scale(0.98); }
+.hw-scene-chip:disabled { opacity: 0.45; cursor: wait; }
+
+/* ── Segmented control (thermostat mode) ── */
+.hw-seg {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.hw-seg button {
+  transition: background 0.15s ease, color 0.15s ease;
+  color: #71717a;
+}
+.hw-seg button:hover { color: #e4e4e7; }
+.hw-seg button.is-active { background: #ffffff; color: #0a0a0d; font-weight: 600; }
+
+/* ── Energy sparkline ── */
+.hw-spark-line {
+  fill: none;
+  stroke: #fafafa;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.hw-spark-fill {
+  fill: url(#hwSparkGrad);
+  stroke: none;
+}
+
+/* ── Entrance animations ── */
+@keyframes hw-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.hw-rise-1 { animation: hw-rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.05s both; }
+.hw-rise-2 { animation: hw-rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.14s both; }
+.hw-rise-3 { animation: hw-rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) 0.24s both; }
+
+@keyframes hw-breathe {
+  0%, 100% { transform: scale(0.85); opacity: 0.55; }
+  50% { transform: scale(1.1); opacity: 1; }
+}
+.hw-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #fafafa;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+  animation: hw-breathe 2.4s ease-in-out infinite;
+}
+
+/* ── Toast ── */
+@keyframes hw-toast-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.hw-toast { animation: hw-toast-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* ── Scrollbar ── */
+.hw-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+.hw-scroll::-webkit-scrollbar { width: 4px; }
+.hw-scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hw-rise-1, .hw-rise-2, .hw-rise-3, .hw-toast, .hw-live-dot { animation: none !important; }
+}

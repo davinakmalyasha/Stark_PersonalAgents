@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, AgentTask } from '../types';
 import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, fetchTasks, startTask, deleteTask } from '../services/api';
-import { initHouseWorkspace, startHousePipeline, finishHouseMessage } from './houseChatService';
+import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from './houseChatService';
 import { getAssistantName } from './assistant';
 import { parseLogToSteps } from '../utils/logParser';
 
 interface UseHouseChatProps {
   onActive?: (payload: { wsId: string; chatId: string }) => void;
+  /** When set, this instance is bound to ONE dedicated conversation
+   *  (resolved/created by title, persisted via localStorage). Used by the
+   *  House Workspace dashboard so its history stays separate from the
+   *  House home chat list. */
+  pinnedChatTitle?: string;
 }
 
-export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
+export function useHouseChat({ onActive, pinnedChatTitle }: UseHouseChatProps = {}) {
   const [generalWs, setGeneralWs] = useState<WorkspaceInfo | null>(null);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -46,7 +51,7 @@ export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
   // ── Boot: resolve General workspace + conversations ──
   useEffect(() => {
     let cancelled = false;
-    initHouseWorkspace().then(({ ws, chats: c, initialMessages, initialChatId }) => {
+    initHouseWorkspace(pinnedChatTitle).then(({ ws, chats: c, initialMessages, initialChatId }) => {
       if (cancelled) return;
       setGeneralWs(ws);
       setChats(c);
@@ -60,6 +65,7 @@ export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
     }).catch(() => { if (!cancelled) setNotification('Backend unreachable.'); })
       .finally(() => { if (!cancelled) setIsLoading(false); });
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-scroll to the newest message
@@ -121,14 +127,17 @@ export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
     } catch { setNotification('Could not create chat.'); }
   }, [generalWs, isRunning]);
 
-  const handleSelectChat = useCallback(async (chatId: string) => {
+  const handleSelectChat = useCallback(async (chatId: string, opts?: { silent?: boolean }) => {
     if (!generalWs || isRunning) return;
     try {
       const chat = await fetchChat(generalWs.id, chatId);
       setActiveChatId(chat.id);
       setMessages(chat.messages || []);
       setTokenUsage(chat.token_usage ?? null);
-    } catch { setNotification('Could not load chat.'); }
+    } catch {
+      // Background tab-sync failures must not surface as user-facing errors.
+      if (!opts?.silent) setNotification('Could not load chat.');
+    }
   }, [generalWs, isRunning]);
 
   const handleRenameChat = useCallback(async (chatId: string, title: string) => {
@@ -186,7 +195,19 @@ export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
     }
 
     let chatId = activeChatId;
-    if (!chatId) {
+    if (!chatId && pinnedChatTitle) {
+      // Pinned conversation missing (deleted/recreated elsewhere) — re-resolve.
+      try {
+        const pinned = await resolvePinnedChat(ws, pinnedChatTitle);
+        if (!pinned) throw new Error('unavailable');
+        chatId = pinned.id;
+        setActiveChatId(chatId);
+        await refreshList(ws);
+      } catch {
+        setNotification('Could not open the House conversation.');
+        return;
+      }
+    } else if (!chatId) {
       try {
         const trimmed = prompt.trim();
         const title = (trimmed.slice(0, 32) || 'New Conversation') + (trimmed.length > 32 ? '...' : '');
@@ -245,7 +266,7 @@ export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
         setLiveState(null);
       },
     );
-  }, [isRunning, generalWs, activeChatId, refreshList, refreshTasks, onActive]);
+  }, [isRunning, generalWs, activeChatId, pinnedChatTitle, refreshList, refreshTasks, onActive]);
 
   // ── Task handlers ──
   const handleTaskCreated = useCallback((task: AgentTask) => {
@@ -277,10 +298,12 @@ export function useHouseChat({ onActive }: UseHouseChatProps = {}) {
   const liveParsed = parseLogToSteps(liveLog);
   const liveText = liveParsed.assistantResponse || liveState?.outputs?.agent_report || '';
   const displayMessages = [...messages];
-  if (isRunning && (liveText.trim() || messages.length === 0)) {
+  if (isRunning && (liveText.trim() || messages.length === 0 || liveParsed.steps.length > 0)) {
     displayMessages.push({
       id: 'house-live', role: 'agent', agentName: getAssistantName(), content: liveText,
       timestamp: new Date().toISOString(), duration: 'active',
+      // Steps carry [SUBAGENT] spawns → blocks render live in the thread.
+      metadata: { isTrace: true, duration: 'active', steps: liveParsed.steps },
     });
   }
 

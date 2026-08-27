@@ -9,193 +9,163 @@ tools.TOOL_DEFINITIONS, tools._TOOL_DOCS, and tools._TOOL_REQUIRED_ARGS.
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
-        "description": "Reads a file from the local filesystem. Use this to inspect code, configs, or any project file. Supports multi-file read via file_paths.",
+        "description": "Read a file, or several via file_paths (per-file sections).",
         "parameters": {
             "type": "object",
             "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute or relative path to the file to read. Alias for single-file reads; use file_paths for multi-file."
-                },
+                "file_path": {"type": "string"},
                 "file_paths": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional. Read multiple files in one turn — returns per-file sections with headers."
+                    "items": {"type": "string"}
                 },
-                "offset": {
-                    "type": "integer",
-                    "description": "Optional. Line number to start reading from (single-file only; ignored for multi-file)."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional. Maximum number of lines to read (single-file only; ignored for multi-file)."
-                }
+                "offset": {"type": "integer", "description": "Start line."},
+                "limit": {"type": "integer", "description": "Max lines."}
             },
             "required": []
         }
     },
     {
         "name": "edit_file",
-        "description": "Edit an existing file using SEARCH/REPLACE blocks, a unified diff, or a multi-file patch. PREFERRED method for all file edits.",
+        "description": "Edit or create files via exact replacement.",
         "parameters": {
             "type": "object",
             "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute or relative path to the file to modify. Ignored for multi-file patches (paths come from the patch headers)."
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "The exact text to replace (single edit mode). Must match the file content exactly."
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The text to replace it with (single edit mode)."
-                },
-                "diff": {
-                    "type": "string",
-                    "description": "Batch edit mode. Accepts (1) SEARCH/REPLACE blocks: <<<<<<< SEARCH\\n[old]\\n=======\\n[new]\\n>>>>>>> REPLACE; (2) a unified diff (git-style @@ hunks, uses file_path); or (3) a MULTI-FILE patch with opencode-style markers ('*** Add File: path', '*** Update File: path', '*** Delete File: path', '*** Move to: path') or '--- a/path' / '+++ b/path' headers. Multi-file patches apply every section transactionally per file and return a per-file [OK]/[ERROR] summary."
-                },
-                "verify": {
-                    "type": "string",
-                    "description": "Optional. Opt-in check after a successful write: 'py_compile', 'tsc', or any shell command (e.g. 'pytest -q'). Omit to skip."
-                }
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string", "description": "Exact existing text."},
+                "new_string": {"type": "string", "description": "Replacement; omit old_string to create/overwrite."},
+                "diff": {"type": "string", "description": "Batch mode. (1) SEARCH/REPLACE blocks: <<<<<<< SEARCH\\n[old]\\n=======\\n[new]\\n>>>>>>> REPLACE; (2) unified diff (git @@ hunks, uses file_path); (3) multi-file patch: '*** Add File: path', '*** Update File: path', '*** Delete File: path', '*** Move to: path' headers — applied per-file transactionally with [OK]/[ERROR] summary."},
+                "verify": {"type": "string", "description": "'py_compile' | 'tsc' | shell command — runs after write."}
             },
             "required": ["file_path"]
         }
     },
     {
         "name": "run_command",
-        "description": "Executes a shell command. Can be run in foreground (blocking, streams logs in real-time) or background (non-blocking, returns immediately). Use process_action parameter to list, view logs, or kill background processes. Supports workdir, expect regex, and streaming.",
+        "description": "Run a shell command. Foreground blocks and streams logs; background returns a key managed via process_action.",
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute. Optional if process_action is 'list', but required as the target process name/key for 'logs' or 'kill'."
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Optional timeout in milliseconds for foreground execution. Default 30000."
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Optional. If true, run command in background and return a key to manage it. Useful for starting servers."
-                },
-                "process_action": {
-                    "type": "string",
-                    "description": "Optional action to manage background processes: 'list' (list all), 'logs' (get logs for process named in command), 'kill' (terminate process named in command)."
-                },
-                "shell": {
-                    "type": "string",
-                    "description": "Optional shell override: 'bash' (default, POSIX) or 'cmd' for legacy plain cmd (.bat files)."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Optional working directory to run the command in. Defaults to project root."
-                },
-                "expect": {
-                    "type": "string",
-                    "description": "Optional regex to expect in output — returns typed pass/fail with structured exit handling."
-                },
-                "stream": {
-                    "type": "boolean",
-                    "description": "Optional. If true, stream output as it arrives (currently returns full output; future: incremental deltas)."
-                }
+                "command": {"type": "string", "description": "Shell command; also names the process for process_action='logs'|'kill'."},
+                "timeout": {"type": "integer", "description": "Foreground timeout ms."},
+                "background": {"type": "boolean"},
+                "process_action": {"type": "string", "description": "'list' | 'logs' | 'kill'."},
+                "shell": {"type": "string", "description": "'bash' (default) | 'cmd'."},
+                "workdir": {"type": "string", "description": "Working directory (default project root)."},
+                "expect": {"type": "string", "description": "Regex expected in output; typed pass/fail."}
             },
             "required": []
         }
     },
     {
-        "name": "search_code",
-        "description": "Searches code. Default 'content' mode regex-matches file contents (ripgrep-style). Use 'files' mode with a glob pattern (e.g. '**/*.py', 'setup*') to find files by name. Supports multi-pattern via patterns=[...] with ranked results.",
+        "name": "read_pdf",
+        "description": "Read text from a PDF file, optionally limited to specific pages.",
         "parameters": {
             "type": "object",
             "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Content mode: the regex pattern to search for in file contents. Files mode: the glob pattern (or filename fragment) to match against paths."
-                },
-                "patterns": {
+                "file_path": {"type": "string", "description": "Path to the PDF file."},
+                "max_pages": {"type": "integer", "description": "Max pages to read (default 20; 0 = all)."},
+                "page_numbers": {"type": "string", "description": "Specific pages to read, e.g. '1-3,5,7-9' (overrides max_pages)."}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "create_docx",
+        "description": "Create a Word document (.docx) with an optional title heading and paragraph content (one paragraph per line).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Output .docx path."},
+                "title": {"type": "string", "description": "Optional document title (heading level 1)."},
+                "content": {"type": "string", "description": "Document body — one paragraph per line."}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "create_xlsx",
+        "description": "Create an Excel spreadsheet (.xlsx) from headers + rows.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Output .xlsx path."},
+                "headers": {"type": "array", "items": {"type": "string"}, "description": "Optional header row."},
+                "rows": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional. Multiple patterns — returns ranked results with why-matched per file."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Optional directory or file to search in. Defaults to the project root."
-                },
-                "glob": {
-                    "type": "string",
-                    "description": "Optional glob pattern to filter files (e.g. '*.py', '*.tsx')."
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["content", "files"],
-                    "description": "Optional. 'content' (default) searches file contents with regex. 'files' matches filenames with the glob pattern and returns matching file paths."
+                    "items": {"type": "array", "items": {}},
+                    "description": "Data rows (each row is an array of cell values)."
                 }
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "search_code",
+        "description": "Regex-search file contents ('content', default) or match path globs ('files'). Multi-pattern results ranked.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regex (content mode) or glob/filename fragment (files mode)."},
+                "patterns": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string"},
+                "glob": {"type": "string", "description": "File filter, e.g. '*.py'."},
+                "mode": {"type": "string", "enum": ["content", "files"]}
             },
             "required": []
         }
     },
     {
         "name": "ask_user",
-        "description": "Ask the human a structured question and wait for the answer. Use when the request is ambiguous, a decision is required, or a plan needs approval.",
+        "description": "Ask the caller structured questions and wait for answers. Use on material ambiguity, a decision only the caller can make, or plan approval. Each question needs 2-4 options (use multiSelect=true if more than one may apply). For plan-approval flows, set intent.kind=\"plan-review\" on the question and put the approving option's label in intent.approve.",
         "parameters": {
             "type": "object",
             "properties": {
                 "questions": {
                     "type": "array",
-                    "description": "One or more questions to ask.",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Stable question id (echoed in the answer)."},
-                            "question": {"type": "string", "description": "The question to display."},
-                            "detail": {"type": "string", "description": "Optional supporting detail."},
-                            "header": {"type": "string", "description": "Optional short heading."},
-                            "options": {
-                                "type": "array",
-                                "description": "Optional selectable answers (label or {label, description}).",
-                                "items": {"type": "string"},
-                            },
-                            "multiSelect": {"type": "boolean", "description": "Allow more than one option (default false)."},
+                            "id": {"type": "string", "description": "Stable identifier for this question. Used to reference the answer in your next reply."},
+                            "question": {"type": "string"},
+                            "detail": {"type": "string"},
+                            "header": {"type": "string", "description": "Short chip label shown above the question, ≤12 chars. Example: 'Approve plan'."},
+                            "options": {"type": "array", "minItems": 2, "items": {"type": "string"}, "description": "2-4 choices shown to the user. The first option is the recommended one."},
+                            "multiSelect": {"type": "boolean", "description": "true = the user can pick multiple options. false (default) = pick exactly one."},
                             "intent": {
                                 "type": "object",
-                                "description": "Optional presentation intent.",
                                 "properties": {
                                     "kind": {"type": "string", "const": "plan-review"},
-                                    "approve": {"type": "string", "description": "Label of the option that approves the plan."},
+                                    "approve": {"type": "string", "description": "Option label that approves."},
                                 },
                             },
                         },
                         "required": ["id", "question"],
                     },
                 },
-                "timeout": {"type": "integer", "description": "Seconds to wait before aborting (default 600)."},
+                "timeout": {"type": "integer", "default": 600, "description": "Seconds to wait before aborting."},
             },
             "required": ["questions"]
         }
     },
     {
         "name": "browser_act",
-        "description": "Browser automation. Actions: navigate, click, fill, type, press, extract, screenshot, close. Selector = CSS or @ref from navigate snapshot. Start server with run_command(background=True) before navigating.",
+        "description": "Browser automation: navigate, click, fill, type, press, extract, screenshot, close. Selector = CSS or @ref from the navigate snapshot. Start servers with run_command(background=true) first.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ["navigate", "click", "fill", "type", "press",
-                             "extract", "screenshot", "close"],
-                    "description": "The browser action to perform."
+                             "extract", "screenshot", "close"]
                 },
-                "url": {"type": "string", "description": "URL for 'navigate'."},
-                "wait_ms": {"type": "integer", "description": "Optional wait after the action, ms."},
-                "selector": {"type": "string", "description": "CSS selector or @ref tag from the navigate snapshot."},
-                "text": {"type": "string", "description": "Text for 'fill' / 'type'."},
-                "key": {"type": "string", "description": "Key name for 'press'."},
-                "what": {"type": "string", "description": "Extraction target for 'extract': text/html/value/title/url."},
-                "path": {"type": "string", "description": "Screenshot path for 'screenshot'."}
+                "url": {"type": "string"},
+                "wait_ms": {"type": "integer", "description": "Wait after action, ms."},
+                "selector": {"type": "string", "description": "CSS or @ref from snapshot."},
+                "text": {"type": "string"},
+                "key": {"type": "string"},
+                "what": {"type": "string", "description": "'text'|'html'|'value'|'title'|'url'."},
+                "path": {"type": "string", "description": "Screenshot save path."}
             },
             "required": ["action"]
         }
@@ -293,17 +263,17 @@ TOOL_DEFINITIONS = [
     # -- GitHub tools (gh CLI bridge) --
     {
         "name": "github_apply_gate",
-        "description": "Create a repo and/or install the CI/security gate: seeds security.yml (SAST/SCA/secrets/quality/coverage/semgrep/codeql) + ci.yml, waits for first run, enforces branch protection. NON-DESTRUCTIVE. Stack auto-detected from manifest (auto/python/node/go/php/generic). Confirms by default (gate=ask).",
+        "description": "Create a repo and/or install the tiered CI/security gate: T1 fast-checks / T2 staging / T3 release workflows + .harness-ci.json, dev/staging/prod branch ladder, waits for first run, enforces prod branch protection. Non-destructive otherwise; stack auto-detected. Confirms first (gate=ask).",
         "parameters": {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "'owner/name' (or a plain name when create=True)."},
-                "stack": {"type": "string", "description": "'auto' (default), 'python', 'node', 'go', 'php', or 'generic'."},
-                "codeql_on": {"type": "boolean", "description": "Include the CodeQL job (default true; free on public repos)."},
-                "create": {"type": "boolean", "description": "True = create the repo first (repo must be a plain name)."},
-                "private": {"type": "boolean", "description": "Private repo when create=True."},
-                "description": {"type": "string", "description": "Repo description when create=True."},
-                "gate": {"type": "string", "description": "'ask' (default — confirm with the user), 'yes' (apply without asking), 'no' (skip the gate)."}
+                "repo": {"type": "string", "description": "'owner/name' (plain name when create=true)."},
+                "stack": {"type": "string", "description": "'auto'(default) | python | node | go | php | generic."},
+                "create": {"type": "boolean"},
+                "private": {"type": "boolean"},
+                "description": {"type": "string"},
+                "gate": {"type": "string", "description": "'ask'(default) | 'yes' | 'no'."},
+                "update_levels": {"type": "boolean", "description": "Re-render level-owned files after a branch rename."}
             },
             "required": ["repo"]
         }
@@ -328,51 +298,38 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "create_project",
-        "description": "Create a NEW project: creates the folder under D:\\MyProject, registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project.",
+        "description": "Create a NEW project: creates the folder under D:\\MyProject, registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background.",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The project/folder name."},
-                "concept": {"type": "string", "description": "The user's concept/goal for the project; the Dev agent starts from this."}
+                "name": {"type": "string", "description": "Project/folder name. 1-64 chars; filesystem-safe — avoid '/', '\\\\', '..', control characters, and leading dots. Use kebab-case or snake_case."},
+                "concept": {"type": "string", "description": "The user's concept/goal for the project; the Dev agent starts from this."},
+                "wait": {"type": "boolean", "default": true, "description": "Wait for the Dev's first turn before returning. Use false for multi-project bursts."}
             },
             "required": ["name", "concept"]
         }
     },
     {
-        "name": "find_project_dev",
-        "description": "Resolve an existing project (by name or folder path) and return its durable Dev agent child_id. Prefer resume_project(name, message) for one-call resume; use this when you need the child_id directly.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Project name or folder path."}
-            },
-            "required": ["name"]
-        }
-    },
-    {
         "name": "update_plan",
-        "description": "Update the task plan. Provide an optional explanation and the ENTIRE plan array — this is a full replacement, always send every step. At most one step may be in_progress at a time.",
+        "description": "Drive the live job tracker (the dock the boss watches). Call this whenever the set of jobs changes — at spawn, as results land, or when you abort. Each call is a FULL REPLACEMENT: send every step every time, with the current status. At most one step may be in_progress. Use status=completed (not a separate failed value) for any job that has settled — put the reason in the step text when not successful (e.g. 'Build snake game — failed: tests did not pass').",
         "parameters": {
             "type": "object",
             "properties": {
-                "explanation": {
-                    "type": "string",
-                    "description": "Optional explanation for this plan update."
-                },
+                "explanation": {"type": "string", "description": "Short note shown above the plan (e.g. 'Spawned 3 jobs, waiting for results'). Keep to one line."},
                 "plan": {
                     "type": "array",
-                    "description": "The complete list of steps.",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "step": {"type": "string", "description": "The task step text."},
+                            "step": {"type": "string", "minLength": 1, "description": "Short, human-readable job description. For settled jobs, prefix the reason when not successful (e.g. 'Build snake game — failed: tests did not pass')."},
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                                "description": "Step status: pending, in_progress (at most one), or completed."
+                                "enum": ["pending", "in_progress", "completed"]
                             }
                         },
-                        "required": ["step", "status"]
+                        "required": ["step", "status"],
+                        "additionalProperties": false
                     }
                 }
             },
@@ -380,16 +337,54 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "task",
-        "description": "Delegate a subtask to a specialized subagent (orchestrator only). Spawns a subagent with its own tools and model; returns a compact handoff report.",
+        "name": "delegate",
+        "description": "Spawn one or more workspace agents (Dev / General / House) IN PARALLEL. Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\nBATCHING — per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. Any agent mix is allowed and runs in parallel — solo scope (just Dev, just House, or just General) or mixed (Dev + House, Dev + General, all three). The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing — one call, all independent items.\n\nCHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat — so never guess an id.",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Subagent type: Dev, FreeAgent, or general-purpose."},
-                "task": {"type": "string", "description": "Detailed instruction for the subagent."},
-                "reasoning_effort": {"type": "string", "enum": ["max", "high", "medium", "low", "disabled"], "description": "Thinking budget override."}
+                "items": {
+                    "type": "array",
+                    "description": "Delegation items to launch concurrently.",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string", "enum": ["Dev", "General", "House"], "description": "Target workspace agent. Dev builds/fixes software; General handles research, docs, images, personal notes/admin; House controls smart-home devices. Case-insensitive."},
+                            "task": {"type": "string", "description": "Complete, self-contained instruction for this specialist. The agent sees only this text — include the goal, any constraints, relevant paths, and how to verify success."},
+                            "title": {"type": "string", "description": "Short label for the delegation chat (e.g. 'Space game · Dev')."},
+                            "chat_id": {"type": "string", "description": "Omit for a new chat. Set ONLY with a chat_id surfaced by an earlier [DELEGATION RESULT] in this session — never guess. Unknown ids silently start a new chat."},
+                            "workspace": {"type": "string", "description": "Workspace id, folder path, or name. Omit to use the default: current project for Dev, General workspace for General, House workspace for House."},
+                            "images": {"type": "array", "items": {"type": "string"}, "description": "Absolute file paths of image attachments relevant to THIS item. Missing files are silently dropped, so only attach paths you have verified exist."}
+                        },
+                        "required": ["agent", "task"],
+                        "additionalProperties": false
+                    },
+                    "examples": [
+                        {
+                            "items": [
+                                {"agent": "Dev", "task": "Build a snake game in Python with tests", "title": "Snake game · Dev"},
+                                {"agent": "House", "task": "Turn off the living room lights", "title": "Lights off · House"},
+                                {"agent": "General", "task": "Save a journal note: shipped v0.1", "title": "Note · General"}
+                            ]
+                        },
+                        {
+                            "items": [
+                                {"agent": "Dev", "task": "Fix the login crash (regression from PR #42)", "title": "Login crash fix", "chat_id": "<id from prior [DELEGATION RESULT]>"}
+                            ]
+                        }
+                    ]
+                }
             },
-            "required": ["name", "task"]
+            "required": ["items"]
+        }
+    },
+    {
+        "name": "delegation_status",
+        "description": "List all delegations spawned this session with live statuses (running / done / failed) and their chat ids. Call when you need to know what is still outstanding — typically before a wrap-up summary, after a long wait, or when you are unsure whether everything has settled.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
         }
     },
     {
@@ -406,37 +401,86 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "async_task",
-        "description": "Unified async subagent task manager. action=start: fire-and-forget a subagent (like start_async_task) and return task_id. action=status: poll one task, optionally wait (like check_async_task). action=list: list all async tasks and their statuses. Replaces start_async_task / check_async_task / list_async_tasks.",
+        "name": "call_subagent",
+        "description": "Spawn a specialist subagent (see Subagents list) and block until its final report.",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["start", "status", "list"], "description": "Action to perform: start a new async task, check one task, or list all."},
-                "name": {"type": "string", "description": "Subagent type for action=start (e.g. Dev, FreeAgent, general-purpose)."},
-                "task": {"type": "string", "description": "Task description for action=start."},
-                "task_id": {"type": "string", "description": "Task id for action=status (from start)."},
-                "wait_seconds": {"type": "integer", "description": "For action=status: wait up to N seconds (0-300) before returning."}
+                "name": {"type": "string", "description": "Subagent type, e.g. UI | Deploy."},
+                "task": {"type": "string", "description": "Goal, targets (files/URL/repo), acceptance check."}
             },
-            "required": ["action"]
+            "required": ["name", "task"]
         }
     },
     {
         "name": "template",
-        "description": "Unified template manager. action=list: catalog; action=search: ranked keyword search; action=show: per-template details; action=apply: render boilerplate into project. Replaces apply_template + template_list.",
+        "description": "Boilerplate catalog: list, keyword search, show details, apply (renders files; skips existing unless overwrite).",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["list", "search", "show", "apply"], "description": "Action: list catalog, search by query, show one template, or apply boilerplate."},
-                "template": {"type": "string", "description": "Template name for show/apply (e.g. feature-crud)."},
-                "category": {"type": "string", "description": "Filter by level for list/search: stack, feature, component, snippet, project, config, routine, spec."},
-                "query": {"type": "string", "description": "Keyword search for search (also regex/symbol/semantic)."},
-                "target_dir": {"type": "string", "description": "Destination for apply; empty = workspace root."},
-                "variables": {"type": "object", "description": "Template variables for apply, e.g. {'feature_name': 'User'}."},
-                "overwrite": {"type": "boolean", "description": "For apply: replace existing files (default skip)."},
-                "dry_run": {"type": "boolean", "description": "For apply: preview without writing."},
-                "quiet": {"type": "boolean", "description": "For apply: compact summary (default true)."}
+                "action": {"type": "string", "enum": ["list", "search", "show", "apply"]},
+                "template": {"type": "string", "description": "Name for show/apply."},
+                "category": {"type": "string"},
+                "query": {"type": "string", "description": "Keywords for search/list."},
+                "target_dir": {"type": "string", "description": "Apply destination (default workspace root)."},
+                "variables": {"type": "object", "description": "Template variables."},
+                "overwrite": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
+                "quiet": {"type": "boolean"}
             },
             "required": ["action"]
+        }
+    },
+    # -- House tools (mock smart home; single source of truth = house_manager) --
+    {
+        "name": "house_get_state",
+        "description": "Read the full house state: rooms, every device with its current state, scenes, energy and security summary. Call this first whenever the user asks about the house.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "house_get_device",
+        "description": "Read one house device: current state, writable capabilities, room and online status. Use to check a device before or after actuating it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device id, e.g. 'light-living-1', 'thermostat-bedroom', 'lock-garage'."}
+            },
+            "required": ["device_id"]
+        }
+    },
+    {
+        "name": "house_set_device",
+        "description": "Control a house device. state keys depend on type: light {power, brightness 0-100, colorTemp 2200-6500}; thermostat {targetTemp 10-35, mode off|heat|cool|auto}; lock {locked}; plug {power}; blinds {position 0-100}; camera {recording}. Sensors are read-only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device id to actuate."},
+                "state": {"type": "object", "description": "State patch, e.g. {\"power\": true, \"brightness\": 60} or {\"targetTemp\": 21.5}."}
+            },
+            "required": ["device_id", "state"]
+        }
+    },
+    {
+        "name": "house_run_scene",
+        "description": "Activate a house scene (applies all its device actions at once). Available scenes are listed in house_get_state, e.g. scene-morning, scene-night, scene-away, scene-movie, scene-focus.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scene_id": {"type": "string", "description": "Scene id, e.g. 'scene-night'."}
+            },
+            "required": ["scene_id"]
+        }
+    },
+    {
+        "name": "house_get_history",
+        "description": "Mock energy-usage history for one house device (hourly kWh series, up to 168 hours).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device id."},
+                "hours": {"type": "integer", "description": "Hours back (default 24, max 168)."}
+            },
+            "required": ["device_id"]
         }
     },
 ]
@@ -456,16 +500,21 @@ _TOOL_DOCS = {
     "create_docx": "create_docx(file_path, title?, content?) — Create a Word document (.docx).",
     "create_xlsx": "create_xlsx(file_path, headers, rows) — Create an Excel spreadsheet (.xlsx).",
     "read_pdf": "read_pdf(file_path, max_pages?, page_numbers?) — Read text from a PDF file.",
-    "task": "task(name, task, reasoning_effort?) — Delegate a subtask to a subagent (delegators only).",
+    "delegate": "delegate(items=[{agent, task, title?, chat_id?}]) — Spawn Dev/General/House agents IN PARALLEL; each gets its own chat, results arrive as [DELEGATION RESULT] events.",
+    "delegation_status": "delegation_status() — List this session's delegations with live statuses and chats.",
+    "call_subagent": "call_subagent(name, task) — Spawn a specialist subagent (UI, Deploy); blocks and returns its final report.",
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
     "template_new": "template_new(name, level, description, sample_vars, variables?, files?, uses?, notes?) — Author a new template (write .j2 files first, then metadata; auto-validates render).",
-    "create_project": "create_project(name, concept) — Create a NEW project: folder under D:\\MyProject + workspace + chat + a durable Dev agent assigned to it. ONLY for genuinely new projects requested by the user.",
-    "find_project_dev": "find_project_dev(name) — Resolve an existing project and return its Dev agent child_id. Prefer resume_project for one-call resume.",
+    "create_project": "create_project(name, concept, wait?) — Create a NEW project: folder under D:\\MyProject + workspace + chat + a durable Dev agent assigned to it. ONLY for genuinely new projects requested by the user. wait=false for multi-project bursts.",
     "resume_project": "resume_project(name, message, timeout?) — One-call resume: find the project's Dev and deliver the message (replaces find_project_dev + send_message).",
-    "async_task": "async_task(action, name?, task?, task_id?, wait_seconds?) — Unified async: start/status/list (replaces start_async_task/check_async_task/list_async_tasks).",
     "template": "template(action, template?, category?, query?, target_dir?, variables?, overwrite?, dry_run?, quiet?) — Unified template: list/search/show/apply (replaces apply_template + template_list).",
     "update_plan": "update_plan(explanation?, plan=[{step, status}]) — Maintain the task plan. FULL replacement: always send every step. At most one step in_progress.",
+    "house_get_state": "house_get_state() — Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question.",
+    "house_get_device": "house_get_device(device_id) — One device's state, capabilities, room, online status.",
+    "house_set_device": "house_set_device(device_id, state) — Actuate a device: light {power,brightness,colorTemp}, thermostat {targetTemp,mode}, lock {locked}, plug {power}, blinds {position}, camera {recording}. Sensors read-only.",
+    "house_run_scene": "house_run_scene(scene_id) — Activate a scene (applies all actions at once).",
+    "house_get_history": "house_get_history(device_id, hours?) — Mock hourly kWh usage series for a device (max 168h).",
 }
 
 _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {
@@ -504,21 +553,40 @@ def get_native_tools(scope: Optional[str] = None) -> list[dict]:
     return sorted(tools, key=lambda t: t["function"]["name"])
 
 _SCOPE_MAP: dict[str, list[str]] = {
+    # Dev keeps the routine coding loop inline; specialist work (browser
+    # verification, CI gate/deploy) is delegated via call_subagent so rare-use
+    # schemas never ride on every Dev turn.
     "developer": [
         "read_file", "edit_file", "run_command", "search_code",
-        "task", "browser_act", "template",
-        "ask_user", "github_apply_gate", "update_plan",
+        "template",
+        "ask_user", "update_plan",
+        "call_subagent",
+    ],
+    "ui": [
+        "browser_act", "read_file", "search_code", "run_command",
+    ],
+    "deploy": [
+        "github_apply_gate", "template", "run_command", "read_file",
     ],
     "orchestrator": [
-        "run_command",
         "create_project", "resume_project",
         "ask_user",
-        "task", "async_task",
+        "delegate", "delegation_status",
         "update_plan",
     ],
-    "free_agent": [
-        "edit_file", "run_command",
-        "read_pdf", "create_docx", "create_xlsx", "ask_user",
+    # General: non-coding life/work assistant. No read_file/edit_file by
+    # design — document access goes through read_pdf/browser/MCP, with
+    # run_command as the narrow escape hatch.
+    "general": [
+        "run_command", "read_pdf", "create_docx", "create_xlsx",
+        "ask_user", "update_plan", "browser_act",
+    ],
+    # House: home-control specialist. Owns the house_* actuation surface;
+    # read/run tools support inspection and verification. No codebase edits.
+    "house": [
+        "house_get_state", "house_get_device", "house_set_device",
+        "house_run_scene", "house_get_history",
+        "run_command", "browser_act", "ask_user", "update_plan",
     ],
 }
 

@@ -82,50 +82,49 @@ def ask_user(questions: list, timeout: int = None) -> str:
         lines.append(f"- {a.id}: {('; '.join(parts)) if parts else '(no answer)'}")
     return "[USER ANSWERS]\n" + "\n".join(lines)
 
-def create_project(name: str, concept: str) -> str:
+def create_project(name: str, concept: str, wait: bool = True) -> str:
     """Create a NEW project: folder + workspace + chat + durable Dev agent.
 
     Orchestrator-only tool. Never call for work on an existing project.
+    wait=false runs the Dev's first turn in the background — use it when
+    creating SEVERAL projects in one burst (they spin up in parallel).
     """
     from tools import shared_state
     from agents.project_router import create_project as _cp
     chat_id = str(shared_state.get("chat_id") or "")
     try:
-        entry = _cp(name, concept, chat_id)
+        entry = _cp(name, concept, chat_id, wait=bool(wait))
     except Exception as e:
         return f"Error: {e}"
     if entry.get("error"):
         return f"Error: {entry['error']}"
+    if entry.get("already_existed"):
+        return (
+            f"[OK] Project '{entry.get('name')}' already has a durable Dev agent.\n"
+            f"Chat: {entry.get('chat_id')}\n"
+            f"Dev agent: {entry.get('child_id')}\n"
+            "Use resume_project(name, message) to continue it."
+        )
     lines = [
         f"[OK] Project '{entry.get('name')}' created.",
         f"Folder: {entry.get('workspace_path')}",
         f"Workspace: {entry.get('workspace_id')}",
         f"Chat: {entry.get('chat_id')}",
-        f"Dev agent: {entry.get('child_id')}",
-        "",
-        "Dev's first report:",
-        str(entry.get("first_reply", ""))[:2000],
     ]
+    if entry.get("background"):
+        lines += [
+            "Dev agent: starting in the background — its first report lands in the project chat.",
+            "",
+            "Continue creating any other projects now; do not wait for this one.",
+        ]
+    else:
+        lines += [
+            f"Dev agent: {entry.get('child_id')}",
+            "",
+            "Dev's first report:",
+            str(entry.get("first_reply", ""))[:2000],
+        ]
     return "\n".join(lines)
-
-def find_project_dev(name: str) -> str:
-    """Resolve an existing project and return its Dev agent child_id."""
-    from agents.project_router import find_project_dev as _find
-    try:
-        info = _find(name)
-    except Exception as e:
-        return f"Error: {e}"
-    if not info:
-        return "[NOT FOUND] No registered project matches. Available projects: " + (
-            ", ".join(p.get("name", "") for p in list_projects_tool()) or "none"
-        )
-    return (
-        f"[OK] Project '{info.get('name')}'\n"
-        f"child_id: {info.get('child_id')}\n"
-        f"workspace_path: {info.get('workspace_path')}\n"
-        f"chat_id: {info.get('chat_id')}\n"
-        "Use resume_project(name, message) to continue its Dev session."
-    )
 
 def list_projects_tool() -> list:
     from agents.project_router import list_projects as _lp

@@ -24,8 +24,8 @@ import sys
 # re-exec ourselves with venv312 so the local ASR/TTS always work.
 def _ensure_venv312() -> None:
     try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        venv_py = os.path.join(here, "venv312", "Scripts", "python.exe")
+        # venv312 lives at the repo root, one level above server/.
+        venv_py = os.path.join(_ROOT, "venv312", "Scripts", "python.exe")
         if not os.path.exists(venv_py):
             print("[api_server] WARNING: venv312 not found — voice engines (Moonshine/Kokoro) unavailable")
             return
@@ -39,13 +39,17 @@ def _ensure_venv312() -> None:
 _ensure_venv312()
 
 # ── Voice module path (audio_engine, voice_services moved to Voice/) ──────────
-_VOICE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Voice")
+_VOICE_DIR = os.path.join(_ROOT, "Voice")
 if _VOICE_DIR not in sys.path:
     sys.path.insert(0, _VOICE_DIR)
 
-_DESKTOP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Desktop")
+_DESKTOP_DIR = os.path.join(_ROOT, "Desktop")
 if _DESKTOP_DIR not in sys.path:
     sys.path.insert(0, _DESKTOP_DIR)
+
+_TELEGRAM_DIR = os.path.join(_ROOT, "Telegram")
+if os.path.isdir(_TELEGRAM_DIR) and _TELEGRAM_DIR not in sys.path:
+    sys.path.insert(0, _TELEGRAM_DIR)
 
 import uuid
 import asyncio
@@ -95,6 +99,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Remote access guard (mobile/remote feature) ─────────────────────────────
+# Loopback clients (the desktop app on this machine) pass freely. Any other
+# client — e.g. the phone over Tailscale — must present the pairing token.
+@app.middleware("http")
+async def remote_token_guard(request: Request, call_next):
+    from remote_auth import is_loopback, get_pairing_token
+    if is_loopback(request):
+        return await call_next(request)
+    path = request.url.path
+    token = request.headers.get("x-api-token", "")
+    if token and token == get_pairing_token():
+        return await call_next(request)
+    print(f"[AUTH] Rejected unpaired remote request: {path} from {request.client.host if request.client else '?'}")
+    return JSONResponse(status_code=401, content={"error": "Pairing required"})
+
+
+@app.get("/api/pairing")
+async def pairing_info(request: Request):
+    """Hand out the pairing token — loopback callers only (desktop Settings)."""
+    from remote_auth import is_loopback, get_pairing_token
+    if not is_loopback(request):
+        return JSONResponse(status_code=403, content={"error": "Local only"})
+    return {"token": get_pairing_token()}
+
+
+@app.post("/api/pairing/rotate")
+async def pairing_rotate(request: Request):
+    """Invalidate the current token and issue a fresh one (local only)."""
+    from remote_auth import is_loopback, reset_pairing_token
+    if not is_loopback(request):
+        return JSONResponse(status_code=403, content={"error": "Local only"})
+    return {"token": reset_pairing_token()}
 
 
 @app.get("/api/health/voice")
@@ -407,12 +444,86 @@ def _format_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _mirror_publish(chat_id: str, event: str, data: dict) -> None:
+    """Fan one SSE frame out to mirroring clients via the live event bus.
+
+    No-op unless someone subscribed to /api/stream/{chat_id} — zero overhead
+    and zero behavior change for the client that initiated the run.
+    """
+    try:
+        from event_bus import publish as _bus_publish
+        _bus_publish(chat_id, event, data)
+    except Exception:
+        pass
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/state")
 async def get_state():
     """Return the current shared state as JSON."""
     return JSONResponse(content=json.loads(safe_serialize_state()))
+
+
+# ── Active run tracker ──────────────────────────────────────────────────────
+# The main workspace top bar shows one tab per chat session with a live
+# running/idle dot. The pipeline executes one run at a time (global shared
+# state), so a single tracker is enough to know which session is running.
+
+_active_run: dict = {"running": False, "workspace_path": "", "chat_id": "", "started_at": ""}
+_active_run_lock = threading.Lock()
+
+
+def _set_active_run(workspace_path: str, chat_id: str) -> None:
+    with _active_run_lock:
+        _active_run.update({
+            "running": True,
+            "workspace_path": workspace_path or "",
+            "chat_id": chat_id or "",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+def _clear_active_run() -> None:
+    with _active_run_lock:
+        _active_run.update({"running": False, "workspace_path": "", "chat_id": "", "started_at": ""})
+
+
+@app.get("/api/runs/active")
+async def get_active_run():
+    """Which chat session (if any) currently has a pipeline running."""
+    with _active_run_lock:
+        return JSONResponse(content=dict(_active_run))
+
+
+# ── UI state persistence (open session tabs, active tab) ───────────────────
+
+def _ui_state_path() -> str:
+    return os.path.join(_ROOT, ".deep_agents", "ui_state.json")
+
+
+@app.get("/api/ui/state")
+async def get_ui_state():
+    try:
+        with open(_ui_state_path(), "r", encoding="utf-8") as f:
+            return JSONResponse(content=json.load(f))
+    except Exception:
+        return JSONResponse(content={})
+
+
+@app.put("/api/ui/state")
+async def put_ui_state(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(content={"error": "invalid json"}, status_code=400)
+    try:
+        os.makedirs(os.path.dirname(_ui_state_path()), exist_ok=True)
+        with open(_ui_state_path(), "w", encoding="utf-8") as f:
+            json.dump(body, f, indent=2)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return JSONResponse(content={"status": "ok"})
 
 
 # ── MCP servers ──────────────────────────────────────────────────────────────
@@ -515,6 +626,14 @@ def _next_recurring_time(current: datetime, recurrence: str) -> datetime | None:
         year = current.year + (1 if current.month == 12 else 0)
         day = min(current.day, 28)
         return current.replace(year=year, month=month, day=day)
+    if recurrence and recurrence.startswith("interval-"):
+        try:
+            minutes = int(recurrence.split("-", 1)[1])
+        except (ValueError, IndexError):
+            return None
+        if minutes <= 0:
+            return None
+        return current + timedelta(minutes=minutes)
     return None
 
 
@@ -537,8 +656,8 @@ def _run_task_background(workspace_id: str, workspace_path: str, chat_id: str, t
         attachments = task.get("attachments", [])
         wm.add_message(workspace_path, chat_id, "user", prompt, {"attachments": attachments, "taskId": task_id} if attachments else {"taskId": task_id})
         if workspace_path in ("", wm.GENERAL_WORKSPACE_ID):
-            from agents.free_agent import run_freeagent_direct
-            for _ in run_freeagent_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
+            from agents.general_agent import run_general_direct
+            for _ in run_general_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
                 pass
         else:
             from verify_helper import run_graph_with_verify
@@ -724,7 +843,7 @@ async def run_pipeline(req: RunRequest, request: Request):
             for item in req.attachments
         )
         # Vision: stash image paths so the agent's Zone-2 builder can inject
-        # them as real image blocks (visible from turn one). FreeAgent gets
+        # them as real image blocks (visible from turn one). General gets
         # them directly below; the graph path consumes the shared_state key.
         try:
             _img_paths = [item.get("path") for item in req.attachments
@@ -781,10 +900,10 @@ async def run_pipeline(req: RunRequest, request: Request):
 
                 is_general = not req.workspace_path
                 if is_general:
-                    from agents.free_agent import run_freeagent_direct
+                    from agents.general_agent import run_general_direct
                     image_paths = [item.get("path") for item in req.attachments
                                    if item.get("isImage") and item.get("path")]
-                    for state_snapshot in run_freeagent_direct(resolved, chat_id=req.chat_id, images=image_paths or None):
+                    for state_snapshot in run_general_direct(resolved, chat_id=req.chat_id, images=image_paths or None):
                         q.put(state_snapshot)
                 else:
                     from verify_helper import run_graph_with_verify
@@ -827,6 +946,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                 deltas = _bus_drain(req.chat_id)
                 if deltas:
                     for d in deltas:
+                        _mirror_publish(req.chat_id, "delta", d)
                         yield _format_sse("delta", d)
                 now = time.time()
                 if now - last_bus_drain > 60:
@@ -840,6 +960,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                 if item is None:
                     break
                 if isinstance(item, dict):
+                    _mirror_publish(req.chat_id, "state", item)
                     yield _format_sse("state", item)
                     last_ver = item.get("state_version", 0)
             except queue.Empty:
@@ -849,6 +970,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                     if cur_ver > last_ver:
                         last_ver = cur_ver
                         snap["_intermediate"] = True
+                        _mirror_publish(req.chat_id, "state", snap)
                         yield _format_sse("state", snap)
                 await asyncio.sleep(0.05)
 
@@ -873,10 +995,22 @@ async def run_pipeline(req: RunRequest, request: Request):
         except Exception:
             pass
 
+        _mirror_publish(req.chat_id, "state", final_state)
         yield _format_sse("state", final_state)
+        _mirror_publish(req.chat_id, "done", {"status": "error" if had_error else "complete"})
         yield _format_sse("done", {"status": "error" if had_error else "complete"})
 
-    return StreamingResponse(build_stream(), media_type="text/event-stream")
+    async def tracked_stream() -> AsyncGenerator[str, None]:
+        """Wrap build_stream so the active-run tracker is cleared no matter
+        how the stream ends (complete, error, or client disconnect)."""
+        try:
+            async for chunk in build_stream():
+                yield chunk
+        finally:
+            _clear_active_run()
+
+    _set_active_run(req.workspace_path, req.chat_id)
+    return StreamingResponse(tracked_stream(), media_type="text/event-stream")
 
 
 class InboxRequest(BaseModel):
@@ -983,6 +1117,90 @@ async def get_workspace_file(workspace_id: str, path: str = ""):
     return {"path": path, "content": content, "truncated": len(content) >= 200_000}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# House Workspace API (mock smart home; single source of truth = house_manager)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _house_manager():
+    import house_manager as hm
+    return hm
+
+
+@app.get("/api/house/state")
+async def house_state():
+    """Full house state: rooms, devices, scenes, energy, security."""
+    try:
+        return JSONResponse(content=_house_manager().get_house_state())
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/api/house/devices/{device_id}")
+async def house_device(device_id: str):
+    hm = _house_manager()
+    device = hm.get_device(device_id)
+    if device is None:
+        return JSONResponse(content={"error": "Device not found"}, status_code=404)
+    return JSONResponse(content=device)
+
+
+class HouseStatePatch(BaseModel):
+    state: dict = {}
+
+
+@app.patch("/api/house/devices/{device_id}")
+async def house_set_device(device_id: str, req: HouseStatePatch):
+    """Write a state patch to one device (validated + clamped by the manager)."""
+    result = _house_manager().set_device(device_id, req.state)
+    if not result.get("ok"):
+        status = 404 if "Unknown device" in (result.get("error") or "") else 400
+        return JSONResponse(content={"error": result.get("error")}, status_code=status)
+    return JSONResponse(content=result.get("device"))
+
+
+@app.post("/api/house/rooms/{room_id}")
+async def house_set_room(room_id: str, req: HouseStatePatch):
+    """Apply one patch to every device in a room that supports those keys."""
+    result = _house_manager().set_room_state(room_id, req.state)
+    if result.get("error"):
+        return JSONResponse(content={"error": result["error"]}, status_code=404)
+    return JSONResponse(content={"applied": result.get("applied", []),
+                                 "skipped": result.get("skipped", [])})
+
+
+@app.post("/api/house/scenes/{scene_id}/run")
+async def house_run_scene(scene_id: str):
+    """Activate a scene (applies all its device actions)."""
+    result = _house_manager().run_scene(scene_id)
+    if not result.get("ok"):
+        return JSONResponse(content={"error": result.get("error")}, status_code=404)
+    scene = result.get("scene") or {}
+    return JSONResponse(content={
+        "sceneId": scene_id,
+        "name": scene.get("name", ""),
+        "applied": result.get("applied", []),
+        "skipped": result.get("skipped", []),
+    })
+
+
+@app.get("/api/house/history")
+async def house_history(device_id: str = "", hours: int = 24):
+    """Mock usage history for one device (hourly kWh series)."""
+    if not device_id:
+        return JSONResponse(content={"error": "device_id is required"}, status_code=400)
+    return JSONResponse(content=_house_manager().get_device_history(device_id, hours))
+
+
+@app.post("/api/house/reset")
+async def house_reset():
+    """Reseed the mock house state (demo/test helper)."""
+    result = _house_manager().reset_house_state()
+    if not result.get("ok"):
+        return JSONResponse(content={"error": result.get("error")}, status_code=400)
+    return JSONResponse(content=result)
+
+
 class AskAnswerRequest(BaseModel):
     batch_id: str
     answers: list[dict] = []
@@ -1082,12 +1300,27 @@ async def get_models():
 
 @app.get("/api/provider")
 async def get_provider():
-    """Return the active LLM provider (deepseek | opencode) and its resolved config summary."""
+    """Return the active LLM provider mode, its resolved config summary, and
+    the per-tier routing matrix (orchestrator / workspace / specialist)."""
     from llm import _resolve_llm_provider, _load_persisted_provider
+    from llm.provider_modes import MODES, get_role_plan
+
     provider = safe_get_state().get("llm_provider", "") or _load_persisted_provider() or "deepseek"
     cfg = _resolve_llm_provider()
+    matrix = {}
+    for role in ("Orchestrator", "Developer", "UI"):
+        plan = get_role_plan(role)
+        tier = plan.get("tier")
+        matrix[tier] = {
+            "backend": plan.get("backend"),
+            "model": plan.get("model"),
+            "iter_effort": plan.get("iter_effort"),
+            "think_bias": plan.get("think_bias"),
+        }
     return JSONResponse(content={
         "provider": provider,
+        "modes": list(MODES),
+        "matrix": matrix,
         "base_url": cfg["base"],
         "model_flash": cfg["flash"],
         "model_pro": cfg["pro"],
@@ -1098,12 +1331,17 @@ async def get_provider():
 
 @app.post("/api/provider")
 async def set_provider(req: Request):
-    """Set the active LLM provider for subsequent runs AND persist it (deepseek | opencode)."""
+    """Set the active LLM provider mode for subsequent runs AND persist it."""
     from llm import _save_persisted_provider
+    from llm.provider_modes import MODES
+
     body = await req.json()
     provider = str(body.get("provider", "")).strip().lower()
-    if provider not in ("deepseek", "opencode"):
-        return JSONResponse(content={"error": f"Invalid provider '{provider}'. Use 'deepseek' or 'opencode'."}, status_code=400)
+    if provider not in MODES:
+        return JSONResponse(
+            content={"error": f"Invalid provider '{provider}'. Use one of: {', '.join(MODES)}."},
+            status_code=400,
+        )
     safe_update_state({"llm_provider": provider})
     _save_persisted_provider(provider)
     return JSONResponse(content={"provider": provider, "ok": True})
@@ -1175,9 +1413,33 @@ async def get_chat_endpoint(workspace_id: str, chat_id: str):
     return JSONResponse(content=chat)
 
 
-@app.get("/api/workspaces/{workspace_id}/chats/{chat_id}/subagents/{subagent_name}")
-async def get_subagent_history_endpoint(workspace_id: str, chat_id: str, subagent_name: str):
-    return JSONResponse(content={"error": "Subagent history endpoint removed (legacy swarm module deleted). Use session_log directly."}, status_code=410)
+@app.get("/api/workspaces/{workspace_id}/chats/{chat_id}/subagents")
+async def list_chat_subagents(workspace_id: str, chat_id: str):
+    """Children spawned by this chat (cont- continuable + sub- task spawns)."""
+    ws = wm.get_workspace(workspace_id)
+    if not ws:
+        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
+    try:
+        from agents.subagent_manager import list_agents
+        return JSONResponse(content={"subagents": list_agents(ws["path"], chat_id)})
+    except Exception as e:
+        return JSONResponse(content={"subagents": [], "error": str(e)})
+
+
+@app.get("/api/workspaces/{workspace_id}/subagents/{child_id}")
+async def get_subagent_session(workspace_id: str, child_id: str):
+    """Read-only transcript of one spawned subagent session (drill-in view)."""
+    ws = wm.get_workspace(workspace_id)
+    if not ws:
+        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
+    try:
+        from agents.subagent_manager import read_child_session
+        data = read_child_session(ws["path"], child_id)
+    except Exception:
+        data = None
+    if not data:
+        return JSONResponse(content={"error": "Subagent session not found"}, status_code=404)
+    return JSONResponse(content=data)
 
 
 @app.delete("/api/workspaces/{workspace_id}/chats/{chat_id}")
@@ -1252,7 +1514,7 @@ async def update_chat_title(workspace_id: str, chat_id: str, req: Request):
 @app.get("/api/settings/general-profile")
 async def get_general_profile():
     """Get the General mode user profile (instructions + memory)."""
-    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)); profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
+    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT; profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
     default = {
         "user_info": {"name": "", "birthday": "", "education": ""},
         "instructions": "",
@@ -1270,7 +1532,7 @@ async def get_general_profile():
 @app.post("/api/settings/general-profile")
 async def save_general_profile(req: Request):
     """Save the General mode user profile."""
-    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)); profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
+    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT; profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
     body = await req.json()
     try:
         os.makedirs(os.path.dirname(profile_path), exist_ok=True)
@@ -1284,7 +1546,7 @@ async def save_general_profile(req: Request):
 @app.get("/api/settings/profile")
 
 async def get_profile():
-    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT
     profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
     default_profile = {
         "user_info": {"name": "Davin Akmal Yasha"},
@@ -1300,7 +1562,7 @@ async def get_profile():
 
 @app.post("/api/settings/profile")
 async def save_profile(req: Request):
-    harness_root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT
     profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
     body = await req.json()
     try:
@@ -1316,7 +1578,7 @@ async def get_workspace_rules(workspace_id: str):
     ws = wm.get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "rules", f"{workspace_id}.json")
+    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or _ROOT, ".deep_agents", "rules", f"{workspace_id}.json")
     default_rules = {
         "stack": {},
         "workspace_rules": []
@@ -1334,7 +1596,7 @@ async def save_workspace_rules(workspace_id: str, req: Request):
     ws = wm.get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "rules", f"{workspace_id}.json")
+    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or _ROOT, ".deep_agents", "rules", f"{workspace_id}.json")
     body = await req.json()
     try:
         os.makedirs(os.path.dirname(rules_path), exist_ok=True)
@@ -1496,7 +1758,7 @@ async def cleanup_text(req: CleanupRequest):
     if len(text) > 800:
         return JSONResponse(content={"text": text})
     try:
-        from agents import free_agent
+        from llm import free_providers
         prompt = (
             "You are a grammar corrector. Fix the grammar, spelling, and punctuation "
             "of the voice transcript below. Keep the exact meaning, wording, language "
@@ -1505,7 +1767,7 @@ async def cleanup_text(req: CleanupRequest):
             "ONLY the corrected transcript text, nothing else.\n\n"
             + text
         )
-        polished = await asyncio.to_thread(free_agent.chat, prompt)
+        polished = await asyncio.to_thread(free_providers.chat, prompt)
         polished = (polished or "").strip()
         if not _is_clean_polish(polished):
             return JSONResponse(content={"text": text})
@@ -1558,6 +1820,80 @@ async def tts(req: TTSRequest):
         return JSONResponse(status_code=503, content={"error": f"Kokoro TTS unavailable: {e}"})
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Live mirror stream (mobile/remote feature) — registered after /api/run so
+# any client can watch a chat's run frames in real time.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/stream/{chat_id}")
+async def stream_chat_events(chat_id: str, request: Request):
+    """Subscribe to another client's run frames for one chat (live mirroring).
+
+    Late joiners get the current shared state immediately when a run for this
+    chat is already active, then receive every subsequent frame identically to
+    the initiating client.
+    """
+    from event_bus import subscribe as bus_subscribe, unsubscribe as bus_unsubscribe
+    q = bus_subscribe(chat_id)
+
+    async def mirror_stream() -> AsyncGenerator[str, None]:
+        try:
+            yield _format_sse("hello", {"chat_id": chat_id})
+            with _active_run_lock:
+                running_here = _active_run.get("running") and _active_run.get("chat_id") == chat_id
+            if running_here:
+                # Catch the new viewer up so both screens render the same now.
+                try:
+                    snap = json.loads(safe_serialize_state())
+                    yield _format_sse("state", snap)
+                except Exception:
+                    pass
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event, data = await asyncio.to_thread(q.get, True, 0.5)
+                    yield _format_sse(event, data)
+                    if event == "done":
+                        break
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            bus_unsubscribe(chat_id, q)
+
+    return StreamingResponse(mirror_stream(), media_type="text/event-stream")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Static frontend serving (mobile/remote feature)
+# Serves the production Vite build from frontend/dist on the same origin as the
+# API, so the phone only needs http://<laptop>:8000. Registered LAST: every
+# /api/* route above matches first; anything else falls back to the SPA shell.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+
+if os.path.isdir(_FRONTEND_DIST):
+    _assets_dir = os.path.join(_FRONTEND_DIST, "assets")
+    if os.path.isdir(_assets_dir):
+        from fastapi.staticfiles import StaticFiles
+        app.mount("/assets", StaticFiles(directory=_assets_dir), name="spa-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str):
+        """Serve real static files (favicon/manifest/icons); index.html otherwise."""
+        candidate = os.path.realpath(os.path.join(_FRONTEND_DIST, full_path))
+        dist_root = os.path.realpath(_FRONTEND_DIST)
+        if full_path and candidate.startswith(dist_root + os.sep) and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        index_path = os.path.join(_FRONTEND_DIST, "index.html")
+        if os.path.isfile(index_path):
+            return FileResponse(index_path)
+        return JSONResponse(status_code=404, content={"error": "Frontend build not found (run npm run build)"})
+else:
+    print("[STARTUP] frontend/dist not found — UI serving disabled (Electron/dev mode unaffected)")
+
+
 # ── Startup ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1592,7 +1928,13 @@ if __name__ == "__main__":
         print(f"[API] Failed to start Telegram bot: {e}")
         
     if reload_mode:
-        uvicorn.run("api_server:app", host="127.0.0.1", port=8000, reload=True)
+        # Import-string form (required for reload): resolve as a package module
+        # since the file lives in server/, and Electron's cwd is the repo root.
+        uvicorn.run("server.api_server:app", host="127.0.0.1", port=8000, reload=True)
     else:
+        bind_host = os.environ.get("STARK_BIND", "127.0.0.1")
+        bind_port = int(os.environ.get("STARK_PORT", "8000"))
+        if bind_host == "0.0.0.0":
+            print("[API] Remote mode: listening on all interfaces — pairing token required for non-local clients.")
         print("[API] Running in production mode (reload disabled).")
-        uvicorn.run(app, host="127.0.0.1", port=8000)
+        uvicorn.run(app, host=bind_host, port=bind_port)

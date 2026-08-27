@@ -5,6 +5,7 @@ avoid an import cycle while preserving the legacy facade namespace.
 """
 import json
 import os
+import re
 import subprocess
 import time
 from typing import Optional
@@ -305,19 +306,29 @@ _GATE_CHECKS = {
     "generic": ["sca", "dependency-review", "secrets", "tests", "codeql", "zizmor"],
 }
 
-# Two-tier gate: the security workflow IS the merged CI+gate (runs on
-# push/PR/workflow_dispatch); release-heavy.yml (nightly/tags) is seeded by the
-# same template and never blocks branch protection.
+# Tiered gate mapped to branch levels: T1 fast-checks on dev/feature pushes,
+# T2 staging on the staging-level push, T3 release-heavy on prod pushes + tags.
+# The shim composes T1+T3; staging.yml is seeded alongside so the full ladder
+# exists in every gated repo. Branch names come from .harness-ci.json.
+# Branch-level names resolve via the shared <root>/branch_levels.py policy
+# module — candidates and fallbacks live there, not here.
+_LEVELS_CONFIG = ".harness-ci.json"
+
 _GATE_PROFILE_TEMPLATES = {
     "python": {"security": "github-ci-security-python", "ci": None,
+               "staging": "github-staging",
                "gitignore": "gitignore-python", "perf": None, "requirements": True},
     "node": {"security": "github-ci-security-node", "ci": None,
+             "staging": "github-staging",
              "gitignore": "gitignore-node", "perf": None, "requirements": False},
     "go": {"security": "github-ci-security-generic", "ci": None,
+           "staging": "github-staging",
            "gitignore": None, "perf": None, "requirements": False},
     "php": {"security": "github-ci-security-generic", "ci": None,
+            "staging": "github-staging",
             "gitignore": None, "perf": None, "requirements": False},
     "generic": {"security": "github-ci-security-generic", "ci": None,
+                "staging": "github-staging",
                 "gitignore": None, "perf": None, "requirements": False},
 }
 
@@ -326,6 +337,116 @@ def _repo_default_branch(repo: str) -> str:
     if out.startswith("Error") or not out.strip():
         return "main"
     return out.strip()
+
+def _resolve_branch_levels(repo: str) -> dict:
+    """Resolve the repo's 3-level branch map via the SHARED policy module
+    (branch_levels.py) so the installer and the harness auto-push agree.
+
+    Precedence: .harness-ci.json (via API) > env > remote branch scan > defaults.
+    Prod always includes main+master+detected default.
+    """
+    try:
+        import branch_levels as bl
+    except ImportError:
+        bl = None
+    declared = {}
+    out = _gh_api([f"repos/{repo}/contents/{_LEVELS_CONFIG}", "--jq", ".content"])
+    if not out.startswith("Error") and out.strip() and out.strip() != "null":
+        try:
+            from base64 import b64decode
+            data = json.loads(b64decode(out.replace("\n", "")).decode("utf-8"))
+            br = data.get("branches") or {}
+            raw = br.get("prod")
+            declared = {
+                "dev": str(br.get("dev") or "").strip(),
+                "staging": str(br.get("staging") or "").strip(),
+                "prod": [str(x).strip() for x in
+                         (raw if isinstance(raw, list) else [raw]) if str(x).strip()],
+                "auto_push": bool((data.get("harness") or {}).get("auto_push", True)),
+            }
+        except Exception:
+            declared = {}
+    heads_out = _gh_api([f"repos/{repo}/branches?per_page=100",
+                         "--jq", r"[.[].name] | join(\",\")"])
+    heads = [] if heads_out.startswith("Error") else \
+        [h.strip() for h in heads_out.split(",") if h.strip()]
+    default = _repo_default_branch(repo)
+    if bl is not None:
+        # The installer names things; it does not own pushing, so the kill
+        # switch must not blank out resolution here (respect_kill=False).
+        lv = bl.normalize(declared, bl.env_overrides(), heads=heads,
+                          default=default, respect_kill=False)
+        return {"dev": lv["dev"], "staging": bl.render_staging_name(lv),
+                "prod": lv["prod"], "declared": bool(declared)}
+    # stdlib-only fallback mirroring branch_levels.normalize (legacy runtimes)
+    prod = {p for p in declared.get("prod", []) if p} or set()
+    for p in (default, "main", "master"):
+        prod.add(p)
+    dev = declared.get("dev") or next((c for c in ("development", "develop", "dev") if c in heads), "")
+    staging = declared.get("staging") or next(
+        (c for c in ("staging", "stage", "stg", "qa", "uat", "test") if c in heads), "")
+    return {"dev": dev or "development",
+            "staging": staging or "staging",
+            "prod": sorted(prod), "declared": bool(declared)}
+
+def _ensure_branch(repo: str, branch: str, base_sha: str) -> str:
+    """Create refs/heads/<branch> at base_sha when missing (idempotent)."""
+    chk = _gh_api([f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".ref"])
+    if not chk.startswith("Error") and chk.strip():
+        return f"{branch}: exists"
+    out = _gh_api(["-X", "POST", f"repos/{repo}/git/refs",
+                   "-f", f"ref=refs/heads/{branch}", "-f", f"sha={base_sha}"])
+    if out.startswith("Error"):
+        return f"{branch}: FAILED ({str(out)[:90]})"
+    return f"{branch}: created"
+
+def _ensure_branch_ladder(repo: str, levels: dict) -> str:
+    """Idempotently create dev-level and staging-level branches from the default."""
+    base_ref = _repo_default_branch(repo)
+    base = _gh_api([f"repos/{repo}/git/ref/heads/{base_ref}", "--jq", ".object.sha"])
+    if not base.strip().startswith("Error") and len(base.strip()) == 40:
+        results = [_ensure_branch(repo, b, base.strip())
+                   for b in (levels["dev"], levels["staging"])
+                   if b and b not in levels["prod"]]
+        return "Branch ladder: " + "; ".join(results)
+    return f"Branch ladder skipped (base '{base_ref}' unresolved)."
+
+def _set_default_branch(repo: str, branch: str) -> str:
+    """Switch the repo's default branch (used for fresh repos only)."""
+    out = _gh_api(["-X", "PATCH", f"repos/{repo}", "-f", f"default_branch={branch}"])
+    if out.startswith("Error"):
+        return f"Default branch stays (PATCH failed): {str(out)[:100]}"
+    return f"Default branch switched to {branch}."
+
+def _job_ids_from_yaml(text: str) -> list[str]:
+    """Top-level job ids under `jobs:` — these are the check-run context names."""
+    ids, in_jobs = [], False
+    for ln in text.splitlines():
+        if in_jobs:
+            m = re.match(r"^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$", ln)
+            if m:
+                ids.append(m.group(1))
+            elif ln.strip() and not ln.startswith("  "):
+                break
+        elif ln.rstrip() == "jobs:":
+            in_jobs = True
+    return ids
+
+def _workflow_job_ids(repo: str, path: str, ref: str = "") -> list[str]:
+    """Fetch a workflow file from the repo and extract its job ids."""
+    from urllib.parse import quote
+    url = f"repos/{repo}/contents/{quote(path)}"
+    if ref:
+        url += f"?ref={ref}"
+    out = _gh_api([url, "--jq", ".content"])
+    if out.startswith("Error") or not out.strip() or out.strip() == "null":
+        return []
+    try:
+        from base64 import b64decode
+        text = b64decode(out.replace("\n", "")).decode("utf-8")
+        return _job_ids_from_yaml(text)
+    except Exception:
+        return []
 
 def _detect_stack(repo: str, ref: str = "") -> str:
     """Detect the project stack from the repo tree. Empty/unknown repos
@@ -381,11 +502,18 @@ def _ask_gate_choice(repo: str, mode: str, timeout: int = 120) -> Optional[bool]
         return None  # no provider / aborted — treated as no answer
 
 def _seed_gate(repo: str, profile: str = "python", codeql_on: bool = True,
-               ref: str = "") -> str:
+               ref: str = "", levels: dict | None = None,
+               force_levels: bool = False) -> str:
     """Seed the gate files into a repo via the Contents API, rendered from the
     template library. NON-DESTRUCTIVE: every file is skip-if-exists — existing
     project files (requirements, README, .gitignore, workflows, tests) are
-    kept untouched and reported."""
+    kept untouched and reported.
+
+    force_levels=True: the branch-level-owned files (.harness-ci.json and the
+    three tier workflow ymls) are OVERWRITTEN with the freshly resolved names
+    so a renamed ladder actually propagates. Everything else stays
+    skip-if-exists. Branch-level names are injected into the workflow triggers.
+    """
     from tools import apply_template
     from base64 import b64encode
     import tempfile
@@ -394,15 +522,24 @@ def _seed_gate(repo: str, profile: str = "python", codeql_on: bool = True,
     tpl = _GATE_PROFILE_TEMPLATES.get(profile)
     if tpl is None:
         return f"Error: unknown profile '{profile}'."
+    lv = levels or _resolve_branch_levels(repo)
+    prod_csv = ",".join(lv["prod"])
     tmp = tempfile.mkdtemp(prefix="gate-")
     repo_name = repo.split("/")[-1]
     try:
         r1 = apply_template(tpl["security"], target_dir=tmp,
-                            variables={"codeql_on": str(codeql_on).lower()})
+                            variables={"codeql_on": str(codeql_on).lower(),
+                                       "staging_branch": lv["staging"],
+                                       "prod_branches": prod_csv})
         if r1.startswith("Error"):
             return r1
         if tpl.get("ci"):
             apply_template(tpl["ci"], target_dir=tmp, variables={})
+        if tpl.get("staging"):
+            apply_template(tpl["staging"], target_dir=tmp,
+                           variables={"codeql_on": str(codeql_on).lower(),
+                                      "staging_branch": lv["staging"],
+                                      "prod_branches": prod_csv})
         if tpl.get("gitignore"):
             apply_template(tpl["gitignore"], target_dir=tmp, variables={})
         if tpl.get("requirements"):
@@ -414,7 +551,42 @@ def _seed_gate(repo: str, profile: str = "python", codeql_on: bool = True,
                        variables={"project_name": repo_name})
     except Exception as e:
         return f"Error: gate render failed: {e}"
+    # Persist the branch-level map so the harness auto-push obeys the same names.
+    cfg_path = os.path.join(tmp, _LEVELS_CONFIG)
+    if not os.path.exists(cfg_path):
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "_comment": ("Branch-level map consumed by the agent harness "
+                             "(auto-push) and the gate tooling. Tiers follow the "
+                             "levels: T1=dev/feature pushes, T2=staging push, "
+                             "T3=prod push + tags v*."),
+                "branches": {"dev": lv["dev"], "staging": lv["staging"],
+                             "prod": lv["prod"]},
+                "harness": {"auto_push": True},
+            }, f, indent=2)
+            f.write("\n")
     seeded, kept, errors = [], [], []
+    protected_rejects = []  # (path, content) — need the branch+PR fallback
+    level_owned = {".github/workflows/fast-checks.yml", ".github/workflows/staging.yml",
+                   ".github/workflows/release-heavy.yml", _LEVELS_CONFIG}
+
+    def _put_file(p: str, content: bytes, sha_val: str = "",
+                  branch: str = "") -> str:
+        encoded = b64encode(content).decode("ascii")
+        # Body via --input file: -f content=<b64> blows past the Windows
+        # ~32k command-line limit for real workflows (WinError 206).
+        body = {"message": "gate: add " + p, "content": encoded}
+        if sha_val:
+            body["sha"] = sha_val  # REQUIRED when overwriting an existing file
+        if branch:
+            body["branch"] = branch
+        body_path = os.path.join(tmp, ".gh-put-body.json")
+        with open(body_path, "w", encoding="utf-8") as bf:
+            json.dump(body, bf)
+        return _gh_api(["-X", "PUT", f"repos/{repo}/contents/{p}",
+                        "-H", "Content-Type: application/json",
+                        "--input", body_path])
+
     for root, _dirs, fns in os.walk(tmp):
         for fn in sorted(fns):
             p = os.path.relpath(os.path.join(root, fn), tmp).replace("\\", "/")
@@ -425,29 +597,98 @@ def _seed_gate(repo: str, profile: str = "python", codeql_on: bool = True,
                 errors.append(f"{p}: {e}")
                 continue
             sha = _gh_api([f"repos/{repo}/contents/{p}?ref={ref}", "--jq", ".sha"])
-            if not sha.startswith("Error") and sha.strip():
+            exists = not sha.startswith("Error") and bool(sha.strip())
+            if exists and not (force_levels and p in level_owned):
                 kept.append(p)  # skip-if-exists: never overwrite project files
                 continue
-            encoded = b64encode(content).decode("ascii")
-            args = ["-X", "PUT", f"repos/{repo}/contents/{p}",
-                    "-f", "message=gate: add " + p,
-                    "-f", "content=" + encoded]
-            out = _gh_api(args)
+            out = _put_file(p, content, sha_val=sha.strip() if exists else "")
             if out.startswith("Error"):
                 if "required status checks" in out.lower():
-                    errors.append(f"{p}: default branch is protected — push via a branch + PR (gh api git/refs + gh pr create through run_command)")
+                    # Branch is protected — direct writes are impossible by
+                    # design. Route through an update branch + PR instead.
+                    protected_rejects.append((p, content))
                 else:
                     errors.append(f"{p}: {str(out)[:100]}")
             else:
                 seeded.append(p)
+    if protected_rejects:
+        pr_note = _update_levels_via_pr(repo, ref, tmp, protected_rejects)
+        seeded.extend(p for p, _ in protected_rejects)
+        if pr_note:
+            msg_ext = pr_note
+        else:
+            msg_ext = ""
+    else:
+        msg_ext = ""
     msg = f"Seeded {len(seeded)} gate files into {repo}@{ref} (profile: {profile})."
     if seeded:
         msg += f"\n  added: {', '.join(seeded[:8])}"
     if kept:
         msg += f"\n  kept (exists, untouched): {', '.join(kept[:8])}"
+    if msg_ext:
+        msg += f"\n{msg_ext}"
     if errors:
         msg += "\nErrors: " + "; ".join(errors[:5])
     return msg
+
+def _update_levels_via_pr(repo: str, base_ref: str, tmp: str,
+                          files: list) -> str:
+    """Write level-owned files to an update branch and open a PR into base_ref.
+
+    Needed because branch protection (required status checks) rejects direct
+    Contents-API writes to the gated production branch — by design. The PR
+    runs the gate itself; merging propagates the repaired files.
+    """
+    update_branch = "gate/update-levels"
+    base = _gh_api([f"repos/{repo}/git/ref/heads/{base_ref}",
+                    "--jq", ".object.sha"]).strip()
+    if base.startswith("Error") or len(base) != 40:
+        return ("PR fallback failed: could not resolve base sha of "
+                f"{base_ref}: {base[:80]}")
+    _ensure_branch(repo, update_branch, base)
+    done = []
+    for p, content in files:
+        fsha = _gh_api([f"repos/{repo}/contents/{p}?ref={update_branch}",
+                        "--jq", ".sha"])
+        out = _put_file_local(repo, tmp, p, content,
+                              sha_val="" if fsha.startswith("Error") else fsha.strip(),
+                              branch=update_branch)
+        if not out.startswith("Error"):
+            done.append(p)
+    if not done:
+        return "PR fallback failed: no files written to the update branch."
+    pr = _run_gh(["pr", "create", "-R", repo,
+                  "--base", base_ref, "--head", update_branch,
+                  "--title", "gate: update branch-level files (levels re-render)",
+                  "--body", ("Automated gate update: re-rendered "
+                             ".harness-ci.json + tier workflows with the current "
+                             "branch-level names. Merge to propagate.")])
+    if pr.startswith("Error") and "already exists" in pr.lower():
+        return (f"Level-owned files updated on branch '{update_branch}' — "
+                f"an open PR to {base_ref} already exists: "
+                f"https://github.com/{repo}/pulls")
+    if pr.startswith("Error"):
+        return (f"Level-owned files updated on branch '{update_branch}' but "
+                f"PR creation failed: {str(pr)[:120]}")
+    return (f"Level-owned files routed via PR (branch '{update_branch}' → "
+            f"{base_ref}): {', '.join(done[:6])} — merge it to propagate.")
+
+def _put_file_local(repo: str, tmp: str, p: str, content: bytes,
+                    sha_val: str = "", branch: str = "") -> str:
+    """Contents-API PUT with a file body (Windows-safe); see _seed_gate."""
+    from base64 import b64encode as _b64e
+    body = {"message": "gate: update " + p,
+            "content": _b64e(content).decode("ascii")}
+    if sha_val:
+        body["sha"] = sha_val
+    if branch:
+        body["branch"] = branch
+    body_path = os.path.join(tmp, ".gh-put-body.json")
+    with open(body_path, "w", encoding="utf-8") as bf:
+        json.dump(body, bf)
+    return _gh_api(["-X", "PUT", f"repos/{repo}/contents/{p}",
+                    "-H", "Content-Type: application/json",
+                    "--input", body_path])
 
 def _wait_for_first_run(repo: str, timeout: int = 300) -> str:
     """Poll until the repo has at least one workflow run (the gate's first run)."""
@@ -463,49 +704,61 @@ def _wait_for_first_run(repo: str, timeout: int = 300) -> str:
         time.sleep(10)
     return "Timed out waiting for the first gate run — protection set anyway (runs on next push)."
 
-def _protect_default_branch(repo: str, profile: str = "python",
-                            codeql_on: bool = True) -> str:
-    """Require the gate checks on the default branch (blocks merges until green)."""
+def _protect_branch(repo: str, branch: str, checks: list) -> str:
+    """Require status checks on one branch (blocks merges until green).
+
+    Contexts must be REAL check-run names — extracted from the rendered
+    fast-checks.yml (Tier 1 runs on every PR, so contexts stay satisfiable).
+    """
+    if not branch:
+        return ""
     import tempfile
-    branch = _repo_default_branch(repo)
-    checks = [c for c in _GATE_CHECKS.get(profile, _GATE_CHECKS["python"])
-              if c != "codeql" or codeql_on]
     body = {
-        "required_status_checks": {"strict": True, "contexts": checks},
+        "required_status_checks": {"strict": True, "contexts": list(checks)},
         "enforce_admins": True,
         "required_pull_request_reviews": None,
         "restrictions": None,
     }
-    tmp = os.path.join(tempfile.gettempdir(), "protect.json")
+    tmp = os.path.join(tempfile.gettempdir(), f"protect-{branch}.json")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(body, f)
         out = _gh_api(["-X", "PUT", f"repos/{repo}/branches/{branch}/protection",
                        "--input", tmp])
     except Exception as e:
-        return f"Error: branch protection failed: {e}"
+        return f"Error: protection on {branch} failed: {e}"
     if out.startswith("Error"):
         return f"Error: branch protection on {branch}: {str(out)[:200]}"
-    return (f"Branch protection enforced on {branch}: merge requires "
-            f"{', '.join(checks)} to pass.")
+    shown = ", ".join(checks[:6]) + ("…" if len(checks) > 6 else "")
+    return f"Protected {branch}: requires [{shown}] to pass."
+
+def _protect_default_branch(repo: str, profile: str = "python",
+                            codeql_on: bool = True) -> str:
+    """Legacy entry point — protect the default branch with the profile checks."""
+    branch = _repo_default_branch(repo)
+    checks = [c for c in _GATE_CHECKS.get(profile, _GATE_CHECKS["python"])
+              if c != "codeql" or codeql_on]
+    msg = _protect_branch(repo, branch, checks)
+    if not msg.startswith("Error"):
+        msg += (" Merge requires these to pass.")
+    return msg
 
 def github_apply_gate(repo: str, stack: str = "auto", codeql_on: bool = True,
                       create: bool = False, private: bool = False,
-                      description: str = "", gate: str = "ask") -> str:
-    """The ONE gate tool: create the repo (optional) and install the security/perf
-    gate: seed CI files (non-destructive), wait for the first run, enforce branch
-    protection on the default branch.
+                      description: str = "", gate: str = "ask",
+                      update_levels: bool = False) -> str:
+    """The ONE gate tool: create the repo (optional), install the tiered gate
+    mapped to a 3-level branch ladder (dev/staging/prod): seed CI files
+    (non-destructive), ensure the ladder branches exist, wait for the first
+    run, enforce branch protection on the production branch.
 
-    create=True: repo is a plain name — the repo is created first (private /
-    description apply), then gated. create=False: repo must be 'owner/name'.
-    gate: 'ask' (default — confirms with the user for new AND existing repos),
-    'yes' (apply without asking), 'no' (skip).
-    stack: 'auto' (detect) | python | node | go | php | generic.
-    The gate renders its own ci.yml/security.yml from templates/config/
-    github-ci-* into a temp dir and pushes them via the Contents API
-    (skip-if-exists) — local template apply is NOT required.
+    update_levels=True re-renders the level-owned files (.harness-ci.json +
+    fast-checks/staging/release-heavy ymls) with freshly resolved names — use
+    after renaming a company's branch levels; everything else stays
+    skip-if-exists.
     """
     created_prefix = ""
+    is_new = bool(create)
     if create:
         if not repo or "/" in repo:
             return "Error: with create=True, repo must be a plain name (no owner prefix)."
@@ -531,15 +784,67 @@ def github_apply_gate(repo: str, stack: str = "auto", codeql_on: bool = True,
     if profile not in _GATE_CHECKS:
         return (f"Error: unknown stack '{stack}'. Valid: auto, python, node, "
                 f"go, php, generic")
-    seeded = _seed_gate(repo, profile=profile, codeql_on=codeql_on)
+
+    seed_ref = _repo_default_branch(repo)  # captured BEFORE any default-branch switch
+    levels = _resolve_branch_levels(repo)
+    seeded = _seed_gate(repo, profile=profile, codeql_on=codeql_on,
+                        ref=seed_ref, levels=levels, force_levels=update_levels)
     if seeded.startswith("Error"):
         return seeded
+    ladder = _ensure_branch_ladder(repo, levels)
+
+    switched = ""
+    if is_new and levels["dev"] != seed_ref:
+        switched = _set_default_branch(repo, levels["dev"])
+
     wait = _wait_for_first_run(repo)
-    protected = _protect_default_branch(repo, profile, codeql_on=codeql_on)
-    note = (f"\nNOTES: profile={profile}. Coverage threshold and perf budgets are "
-            "universal defaults — tune .github/workflows/security.yml after the "
-            "first green run (R4).")
-    return f"{created_prefix}{seeded}\n{wait}\n{protected}{note}"
+
+    # Protection: ONLY the prod/default branch gets required checks. dev-level
+    # and staging-level branches stay OPEN on purpose — the harness auto-pushes
+    # repairs directly to the dev level, and GitHub rejects direct pushes to a
+    # branch with required status checks.
+    #
+    # Contexts are the REAL Tier 1 job ids parsed from the workflow we just
+    # seeded (fetched from the seed ref, not the possibly-switched default).
+    # Never fall back to legacy name lists: wrong context names permanently
+    # lock merges behind checks that can never report.
+    ctx = _workflow_job_ids(repo, ".github/workflows/fast-checks.yml", ref=seed_ref)
+    if len(ctx) < 3:
+        prot_lines = [
+            f"WARNING: branch protection SKIPPED — parsed only {len(ctx)} job id(s) "
+            f"from fast-checks.yml@{seed_ref}: {ctx}. Inspect the seeded workflow "
+            "(invalid render?) before enforcing required checks."]
+    else:
+        # Protect the PRODUCTION line — never the dev level. On a re-run after
+        # the default-branch switch, the runtime default IS the dev level, so
+        # resolve the target from the resolved prod set (prefer the original
+        # seed ref when it is prod-level, else the first prod branch that
+        # exists remotely).
+        prot_branch = seed_ref if seed_ref in levels["prod"] else None
+        if prot_branch is None:
+            for b in levels["prod"]:
+                chk = _gh_api([f"repos/{repo}/git/ref/heads/{b}", "--jq", ".ref"])
+                if not chk.startswith("Error") and chk.strip():
+                    prot_branch = b
+                    break
+        if prot_branch is None:
+            prot_branch = levels["prod"][0] if levels["prod"] else seed_ref
+        prot_lines = [_protect_branch(repo, prot_branch, ctx)]
+
+    note = (f"\nNOTES: profile={profile}; branch map dev='{levels['dev']}' "
+            f"staging='{levels['staging']}' prod={levels['prod']} "
+            f"(persisted as {_LEVELS_CONFIG}; harness auto-push lands on "
+            f"'{levels['dev']}' → Tier 1 only; dev/staging branches are "
+            "intentionally unprotected so the harness can direct-push). Coverage "
+            "threshold and perf budgets are universal defaults — tune after the "
+            "first green run.")
+    parts = [created_prefix + seeded, ladder]
+    if switched:
+        parts.append(switched)
+    parts.append(wait)
+    parts.extend(p for p in prot_lines if p)
+    parts.append(note)
+    return "\n".join(parts)
 
 def github_init_project(name: str, private: bool = False, description: str = "",
                         gate: str = "ask", stack: str = "auto",

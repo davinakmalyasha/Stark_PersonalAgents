@@ -61,13 +61,18 @@ _env_cache = {}
 def _render_env(delims: Optional[list] = None):
     from jinja2 import StrictUndefined
     from jinja2.sandbox import SandboxedEnvironment
+    # trim_blocks/lstrip_blocks MUST stay False: with them on, any block tag
+    # ending a line ({% raw %}…{% endraw %} guarding ${{ }} GitHub expressions,
+    # {%- for %} list loops) eats the following newline and GLUES YAML lines
+    # together — seeded workflows rendered invalid ("sequence entries are not
+    # allowed here"). Keep in sync with scripts/validate_templates.py.
     key = tuple(delims or ())
     env = _env_cache.get(key)
     if env is None:
         env = SandboxedEnvironment(
             keep_trailing_newline=True,
-            trim_blocks=True,
-            lstrip_blocks=True,
+            trim_blocks=False,
+            lstrip_blocks=False,
             undefined=StrictUndefined,
             variable_start_string=(delims[0] if delims else "{{"),
             variable_end_string=(delims[1] if delims and len(delims) > 1 else "}}"),

@@ -90,7 +90,6 @@ from .orchestrationTools import (
     report,
     ask_user,
     create_project,
-    find_project_dev,
     list_projects_tool,
     resume_project,
 )
@@ -122,11 +121,18 @@ from .subagentTools import (
     _compact_handoff,
     _handoff,
     task,
+    call_subagent,
+    subagent_catalog,
     _run_subagent_in_thread,
     start_async_task,
     check_async_task,
     list_async_tasks,
     async_task,
+)
+
+from .delegationTools import (
+    delegate,
+    delegation_status,
 )
 
 __all__ = [
@@ -207,7 +213,6 @@ __all__ = [
     'report',
     'ask_user',
     'create_project',
-    'find_project_dev',
     'list_projects_tool',
     'resume_project',
     'web_fetch',
@@ -230,9 +235,13 @@ __all__ = [
     '_compact_handoff',
     '_handoff',
     'task',
+    'call_subagent',
+    'subagent_catalog',
     '_run_subagent_in_thread',
     'start_async_task',
     'check_async_task',
     'list_async_tasks',
     'async_task',
+    'delegate',
+    'delegation_status',
 ]

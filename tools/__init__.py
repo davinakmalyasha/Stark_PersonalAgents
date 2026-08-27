@@ -50,6 +50,13 @@ from ._registry import (
 
 # 2. Tool cluster implementations
 from .DocTool import create_docx, create_xlsx, read_pdf
+from .HouseTool import (
+    house_get_state,
+    house_get_device,
+    house_set_device,
+    house_run_scene,
+    house_get_history,
+)
 from .MainTool import (
     _clean_terminal_output, _fmt_args, _log_tool,
     _apply_diff, apply_search_replace, apply_unified_diff, _edit_snippet,
@@ -95,6 +102,8 @@ from .AddOnTool import (
     _TEMPLATE_CATEGORIES,
     _TEMPLATES_DIR,
     task,
+    call_subagent,
+    subagent_catalog,
     _ASYNC_TASKS,
     start_async_task,
     check_async_task,
@@ -111,11 +120,12 @@ from .AddOnTool import (
     build_template_map,
     template_new,
     create_project,
-    find_project_dev,
     resume_project,
     _SUBAGENTS_REGISTRY,
     _TASK_DEPTH,
     _load_subagents,
+    delegate,
+    delegation_status,
 )
 
 # Shared state and caching utilities

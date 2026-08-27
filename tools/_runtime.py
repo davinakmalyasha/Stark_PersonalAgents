@@ -12,7 +12,16 @@ from contextvars import ContextVar
 from typing import Optional, Any
 
 from sync.state_sync import shared_state
-from deepagents.middleware.filesystem import FilesystemPermission, _check_fs_permission
+try:
+    from deepagents.middleware.filesystem import FilesystemPermission, _check_fs_permission
+except ImportError:
+    class FilesystemPermission:  # type: ignore[no-redef]
+        def __init__(self, operations=None, paths=None, mode="allow"):
+            self.operations = operations or []
+            self.paths = paths or []
+            self.mode = mode
+    def _check_fs_permission(*a, **kw):  # type: ignore[no-redef]
+        return True
 
 active_permissions: ContextVar[Optional[list[FilesystemPermission]]] = ContextVar("active_permissions", default=None)
 

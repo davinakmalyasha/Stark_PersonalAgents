@@ -5,13 +5,21 @@ are imported lazily inside functions so the package can load without a cycle.
 """
 import collections
 import contextvars
+import json
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from deepagents.middleware.filesystem import FilesystemPermission
+try:
+    from deepagents.middleware.filesystem import FilesystemPermission
+except ImportError:
+    class FilesystemPermission:  # type: ignore[no-redef]
+        def __init__(self, operations=None, paths=None, mode="allow"):
+            self.operations = operations or []
+            self.paths = paths or []
+            self.mode = mode
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from tools import active_tool_scope, get_native_tool_names
 
@@ -58,7 +66,8 @@ def _load_subagents():
     global _SUBAGENTS_REGISTRY
     try:
         from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE as _DEV_SYSTEM_TEMPLATE
-        from agents.free_agent_prompt import _FREE_AGENT_SYSTEM_TEMPLATE
+        from agents.general_prompt import _GENERAL_SYSTEM_TEMPLATE
+        from agents.house_prompt import _HOUSE_SYSTEM_TEMPLATE
 
         subs = [
             {
@@ -69,11 +78,18 @@ def _load_subagents():
                 "model": "deepseek:v4-flash",
             },
             {
-                "name": "FreeAgent",
-                "description": "FreeAgent â€” general-purpose free model agent (OpenRouter, Groq, Google AI Studio, Mistral, NVIDIA NIM, Cloudflare, Z.ai, OpenCode Go, Kilo, Cline). Handles text chat, vision analysis, research, document creation, web browsing. Zero cost.",
-                "system_prompt": _FREE_AGENT_SYSTEM_TEMPLATE,
-                "tools": list(get_native_tool_names("free_agent")),
-                "model": "free/free-agent",
+                "name": "General",
+                "description": "General — non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder — code requests route back to Dev.",
+                "system_prompt": _GENERAL_SYSTEM_TEMPLATE,
+                "tools": list(get_native_tool_names("general")),
+                "model": "deepseek:v4-flash",
+            },
+            {
+                "name": "House",
+                "description": "House — home control specialist: reads and actuates the smart home via house_* tools (lights, climate, locks, plugs, blinds, cameras, scenes). NOT a coder — code requests route back to Dev.",
+                "system_prompt": _HOUSE_SYSTEM_TEMPLATE,
+                "tools": list(get_native_tool_names("house")),
+                "model": "deepseek:v4-flash",
             },
         ]
         for s in subs:
@@ -81,35 +97,252 @@ def _load_subagents():
             # across processes, which would make each subagent SystemMessage bytes
             # differ per restart/subprocess and silently invalidate the DeepSeek
             # prefix cache. dict.fromkeys preserves first-occurrence order.
-            # D2: terminal-node subagents (Dev/FreeAgent) get NO
+            # D2: terminal-node subagents (Dev/General) get NO
             # delegation tools — every prompt declares them terminal nodes and the
             # orchestrator is the only delegator. general-purpose keeps them below.
             s["tools"] = list(dict.fromkeys(s.get("tools", [])))
             _SUBAGENTS_REGISTRY[s["name"]] = s
 
-        # Register explicit aliases for backward compatibility and tests
+        # Register explicit aliases for backward compatibility and tests.
+        # FreeAgent/general-purpose now resolve to the General subagent; its own
+        # node runs the loop, so these names only affect prompt/tool resolution.
         aliases = {
-            "Vision": "FreeAgent",
+            "Vision": "General",
+            "FreeAgent": "General",
+            "general-purpose": "General",
         }
         for alias, base_name in aliases.items():
             if base_name in _SUBAGENTS_REGISTRY:
                 alias_spec = dict(_SUBAGENTS_REGISTRY[base_name])
                 alias_spec["name"] = alias
                 _SUBAGENTS_REGISTRY[alias] = alias_spec
+
+        # True subagents (task-scoped specialists) from agents/specialists/*.json.
+        # Workspace agents above stay code-defined; specialists are config-driven
+        # (opencode-style). Missing/corrupt file is a silent no-op so the three
+        # workspace agents always come up.
+        for spec in _load_subagents_config():
+            _SUBAGENTS_REGISTRY[spec["name"]] = spec
     except Exception as e:
         print(f"Error loading modularized subagents: {e}")
 
-    # General-purpose subagent â€” has ALL tools including delegation
-    _SUBAGENTS_REGISTRY["general-purpose"] = {
-        "name": "general-purpose",
-        "description": "General-purpose subagent for any complex multi-step task. Has all tools including the ability to spawn sub-subagents. Use for large tasks that need decomposition.",
-        "system_prompt": "You are a general-purpose AI agent. You have full tool access including the ability to spawn subagents. For large tasks, decompose into parallel subtasks using start_async_task. Check results with check_async_task. Synthesize and return a complete result.",
-        # Derive this surface from the canonical schema catalog so it cannot
-        # drift from the tools the registry actually exposes.
-        "tools": list(get_native_tool_names()),
-        "model": "deepseek:v4-pro",
-        "response_format": None,
+
+def _specialists_dir() -> str:
+    """Directory for per-specialist JSON files (agents/specialists/*.json)."""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "agents", "specialists",
+    )
+
+
+def _subagents_config_path() -> str:
+    """Legacy monolith path — kept as fallback until all clones migrate."""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "agents", "subagents.json",
+    )
+
+
+def _parse_specialist_entry(e: dict) -> dict | None:
+    """Normalize one raw JSON dict into a registry spec."""
+    if not isinstance(e, dict):
+        return None
+    name = str(e.get("name") or "").strip()
+    prompt = e.get("system_prompt")
+    if isinstance(prompt, list):
+        prompt = "\n".join(str(ln) for ln in prompt)
+    elif not isinstance(prompt, str):
+        prompt = ""
+    when_to_use = str(e.get("when_to_use") or "").strip()
+    tools = [str(t) for t in (e.get("tools") or [])]
+    internal = bool(e.get("internal"))
+    spec = {
+        "name": name,
+        "kind": "subagent",
+        "internal": internal,
+        "description": when_to_use or "Specialist subagent.",
+        "when_to_use": when_to_use,
+        "system_prompt": prompt or "You are a specialized subagent.",
+        "tools": list(dict.fromkeys(tools)),
+        "backend": str(e.get("backend") or "").strip().lower(),
     }
+    if e.get("model"):
+        spec["model"] = str(e["model"])
+    if not spec["name"]:
+        return None
+    # Internal specialists (Compactor) may have tools=[]; others need ≥1 tool.
+    if not spec["tools"] and not internal:
+        return None
+    return spec
+
+
+def _load_subagents_config() -> list[dict]:
+    """Load specialist specs from agents/specialists/*.json, falling back to
+    the legacy monolith agents/subagents.json. Never raises.
+    """
+    try:
+        import glob as _glob
+        import json as _json
+
+        out: list[dict] = []
+        spec_dir = _specialists_dir()
+        if os.path.isdir(spec_dir):
+            for path in sorted(_glob.glob(os.path.join(spec_dir, "*.json"))):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = _json.load(f)
+                    # Per-file format is a single spec dict; allow wrapped list too.
+                    entries: list[dict]
+                    if isinstance(data, dict) and "subagents" in data:
+                        entries = data.get("subagents") or []
+                    elif isinstance(data, dict) and data.get("name"):
+                        entries = [data]
+                    elif isinstance(data, list):
+                        entries = data
+                    else:
+                        continue
+                    for e in entries:
+                        spec = _parse_specialist_entry(e)
+                        if spec:
+                            out.append(spec)
+                except Exception as e:
+                    print(f"[SUBAGENT] {os.path.basename(path)} load skipped: {e}")
+            if out:
+                return out
+
+        # Legacy fallback.
+        legacy = _subagents_config_path()
+        if not os.path.isfile(legacy):
+            return out
+        with open(legacy, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        entries = data.get("subagents") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return out
+        for e in entries:
+            spec = _parse_specialist_entry(e)
+            if spec:
+                out.append(spec)
+        return out
+    except Exception as e:
+        print(f"[SUBAGENT] specialists load skipped: {e}")
+        return []
+
+
+def _subagent_only_names() -> list[str]:
+    """Names of true specialist subagents (excludes workspace agents/aliases and internal)."""
+    if not _SUBAGENTS_REGISTRY:
+        _load_subagents()
+    return [
+        s["name"] for s in _SUBAGENTS_REGISTRY.values()
+        if isinstance(s, dict) and s.get("kind") == "subagent" and not s.get("internal")
+    ]
+
+
+def subagent_catalog(filter_kind: str = "") -> str:
+    """Render the '- Name — when to use' catalog for prompt injection (internal excluded)."""
+    if not _SUBAGENTS_REGISTRY:
+        _load_subagents()
+    lines = []
+    for s in _SUBAGENTS_REGISTRY.values():
+        if isinstance(s, dict) and s.get("internal"):
+            continue
+        if filter_kind and (not isinstance(s, dict) or s.get("kind") != filter_kind):
+            continue
+        wtu = s.get("when_to_use") or s.get("description", "")
+        lines.append(f"- {s.get('name', '?')} — {wtu}")
+    return "\n".join(lines)
+
+
+def call_subagent(name: str = "", task: str = "") -> str:
+    """Spawn a specialist subagent and block until it finishes.
+
+    The subagent's final assistant message is returned verbatim as the tool
+    result (opencode/Claude-Code style); oversized output gets the standard
+    VFS offload pointer. Only true subagents from agents/specialists/*.json are
+    spawnable here; workspace-agent delegation stays on the task tool.
+    """
+    if not name or not task:
+        return "Error: call_subagent requires name and task."
+    allowed = _subagent_only_names()
+    if name not in allowed:
+        return f"Error: Unknown subagent '{name}'. Available: {', '.join(allowed)}"
+    return _TASK_TOOL_DELEGATE(name=name, task=task)
+
+
+def _specialist_backend(name: str) -> str:
+    """Resolve the LLM backend for a specialist subagent.
+
+    Precedence: SUBAGENT_MODEL_BACKEND env > active provider mode's
+    specialist entry > agents/specialists/*.json spec "backend" > "deepseek".
+    Only "free" dispatches to the free pool; every other value rides the paid
+    llm.py path (which itself resolves deepseek | opencode | command).
+    """
+    if not _SUBAGENTS_REGISTRY:
+        _load_subagents()
+    spec_backend = str((_SUBAGENTS_REGISTRY.get(name) or {}).get("backend") or "").strip().lower()
+    try:
+        from llm.provider_modes import specialist_backend as _mode_backend
+
+        return _mode_backend(spec_backend)
+    except Exception:
+        return spec_backend or "deepseek"
+
+
+def _specialist_call_backend(
+    name: str,
+    messages: list,
+    native_tools=None,
+    schema=None,
+    model: Optional[str] = None,
+    temp: float = 0.2,
+    reasoning_effort: Optional[str] = None,
+    where: str = "",
+):
+    """One LLM turn for a specialist subagent on its configured backend.
+
+    Returns the same shape the generic loop already consumes: a
+    ``(text, tool_calls, reasoning)`` tuple on the free transport, or the raw
+    invoke_messages_with_fallback_stream result on deepseek. Raises loudly on
+    total free-provider failure — no silent paid fallback by design.
+    """
+    if _specialist_backend(name) == "free":
+        # Free pool with live streaming to the parent chat bus; one bounded
+        # non-streaming retry on mid-stream failure. Returns the canonical
+        # (text, tool_calls, reasoning) triple. Raises loudly on total pool
+        # failure — no silent paid fallback by design.
+        from llm.free_providers import free_native_turn
+
+        return free_native_turn(
+            name,
+            messages,
+            tools=native_tools or None,
+            capability="coding",
+            temperature=temp,
+        )
+
+    from llm import invoke_messages_with_fallback_stream
+
+    if not model:
+        # Provider modes may pin a concrete specialist model (command mode ->
+        # laguna); canonical names map through llm.py's provider slots.
+        try:
+            from llm.provider_modes import specialist_model
+
+            model = specialist_model()
+        except Exception:
+            model = None
+
+    return invoke_messages_with_fallback_stream(
+        role=name,
+        messages=list(messages),
+        schema=schema,
+        temp=temp,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        tools=native_tools,
+        where=where,
+    )
 
 _HANDOFF_MAX_CHARS = 1000  # 1000 chars — compact structured report; oversized text offloads to VFS
 
@@ -261,7 +494,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     The parent agent never sees the subagent's intermediate work â€” only the result.
 
     Args:
-        name: Subagent type (for example Dev, FreeAgent, or general-purpose).
+        name: Subagent type (for example Dev or General).
         task: Detailed instruction describing what the subagent should accomplish.
         reasoning_effort: Optional thinking budget override for the subagent run
             (\"max\" / \"high\" / \"medium\" / \"low\" / \"disabled\"). Defaults to
@@ -378,12 +611,36 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
             
             return _handoff(res_dict.get("agent_report") or res_dict.get("code") or "Developer completed execution.", "Dev")
 
-        # FreeAgent routes through the free-provider implementation (OpenRouter/Groq/Gemini/
-        # Mistral/NVIDIA/Cloudflare), NOT the DeepSeek client. Previously it fell through to the
-        # DeepSeek generic loop with model "free/free-agent" â†’ 400 error from the DeepSeek API.
-        if name == "FreeAgent":
-            from agents.free_agent import free_agent_node
-            return _handoff(free_agent_node(task), name)
+        # General routes through its own node (agents/general_agent.py) —
+        # dual-backend loop (deepseek flash or free providers), profile and
+        # chat-history injection, session logging. The old FreeAgent
+        # single-shot special case is gone: task('FreeAgent') now resolves to
+        # the General spec via the registry alias.
+        if name in ("General", "general-purpose", "FreeAgent"):
+            from agents.general_agent import general_node
+            from sync.state_sync import safe_update_state
+
+            gen_state = {
+                "client_request": task,
+                "project_path": shared_state.get("project_path", _HARNESS_ROOT),
+                "chat_id": chat_id,
+            }
+            res_dict = general_node(gen_state)
+            return _handoff(res_dict.get("agent_report") or "General completed with no output.", name)
+
+        # House routes through its own node (agents/house_agent.py) —
+        # home-control loop over the house_* tools, same shape as General.
+        if name == "House":
+            from agents.house_agent import house_node
+            from sync.state_sync import safe_update_state
+
+            house_state = {
+                "client_request": task,
+                "project_path": shared_state.get("project_path", _HARNESS_ROOT),
+                "chat_id": chat_id,
+            }
+            res_dict = house_node(house_state)
+            return _handoff(res_dict.get("agent_report") or "House completed with no output.", name)
 
         # All other subagents use the same native loop with a fresh transcript.
         resolved_task = task
@@ -413,6 +670,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                 parent_session=parent_path,
             )
             sub_sess.append_message("user", resolved_task, source="user")
+            # Announce the spawn for the UI (trace step → clickable block).
+            # Observability only — the loop below is untouched.
+            try:
+                from agents.subagent_manager import _task_label, _log_spawn
+                _log_spawn(sub_sess.get_header().chat_id, name, _task_label(resolved_task))
+            except Exception:
+                pass
         except Exception:
             sub_sess = None
 
@@ -444,14 +708,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                     _sub_trouble = False
                 else:
                     _effort = _routine_effort
-                res = invoke_messages_with_fallback_stream(
-                    role=name,
-                    messages=list(messages),
+                res = _specialist_call_backend(
+                    name,
+                    list(messages),
+                    native_tools=native_tools,
                     schema=schema,
-                    temp=0.2,
                     model=subagent_model,
                     reasoning_effort=_effort,
-                    tools=native_tools,
                     where=f"{name} iter {sub_iter}: {_last_tool_name or 'start'}",
                 )
 
@@ -598,8 +861,8 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
             # No budget checks here; subagents are managed by LoopGuard and structural loops.
 
-            # [Security & performance are enforced by the CI gate on push
-            #  (github-ci-security) — the gate replaces the former DevSecOps
+            # [Security & performance are enforced by the tiered CI gate on push
+            #  (fast-checks / staging / release-heavy) — the gate replaces the former DevSecOps
             #  host-validation step.]
 
         except Exception:
@@ -609,6 +872,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         active_permissions.reset(token)
         _TASK_DEPTH.reset(depth_token)
         active_tool_scope.reset(scope_token)
+
+    # Specialist subagents (kind="subagent"): the final assistant message IS
+    # the tool result — verbatim, opencode/Claude-Code style. Only oversized
+    # text gets the harness-standard VFS offload pointer. Workspace agents
+    # above keep the structured AGENT HANDOFF contract their consumer parses.
+    if spec.get("kind") == "subagent":
+        return auto_offload_result(content, "subagent", max_chars=_tool_cap("subagent"))
 
     # Full output beyond the handoff cap is kept on disk (VFS) with a pointer in the
     # report; the handoff itself stays compact so the orchestrator's context never
@@ -637,6 +907,16 @@ def _run_subagent_in_thread(task_id: str, name: str, task_desc: str, depth: int)
         r = start_continuable(chat_id, ws, name, task_desc, parent_session=parent_path)
         result = r.get("result", "")
         child_id = r.get("child_id", "")
+        # Parity with the sync path: specialist results pass through verbatim
+        # (VFS offload only when oversized); workspace agents stay raw here.
+        try:
+            if not _SUBAGENTS_REGISTRY:
+                _load_subagents()
+            if (_SUBAGENTS_REGISTRY.get(name) or {}).get("kind") == "subagent":
+                from tools import _tool_cap as _tc, auto_offload_result as _aor
+                result = _aor(result, "subagent", max_chars=_tc("subagent"))
+        except Exception:
+            pass
         with _ASYNC_LOCK:
             if task_id in _ASYNC_TASKS:
                 _ASYNC_TASKS[task_id]["status"] = "completed"
@@ -655,7 +935,7 @@ def start_async_task(name: str, task: str) -> str:
     For immediate results, use the regular task() tool instead.
 
     Args:
-        name: Registered subagent type (for example Dev, FreeAgent, or general-purpose)
+        name: Registered subagent type (for example Dev or General)
         task: Detailed task description for the subagent
     """
     import uuid
@@ -803,4 +1083,9 @@ def async_task(action: str, name: str = "", task: str = "", task_id: str = "", w
     if a in ("list", "ls", "all"):
         return list_async_tasks()
     return "Error: async_task action must be one of: start, status, list. Got: '{}'".format(action)
+
+
+# Alias captured after task() is defined; call_subagent's `task` parameter
+# would otherwise shadow the module-level function at call time.
+_TASK_TOOL_DELEGATE = task
 

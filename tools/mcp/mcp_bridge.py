@@ -39,6 +39,18 @@ _HR = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
 
+#: Execution scopes are agent display names ("Dev", "General", "Orchestrator");
+#: schema scopes are the canonical lowercase keys from _schemas._SCOPE_MAP
+#: ("developer", "general", "orchestrator"). Normalize both sides so a server
+#: tagged "developer" is callable when Dev executes (and vice versa).
+_SCOPE_ALIASES = {"dev": "developer"}
+
+
+def _canonical_scope(scope: str) -> str:
+    s = str(scope or "").strip().lower()
+    return _SCOPE_ALIASES.get(s, s)
+
+
 def _config_path() -> str:
     d = os.path.join(_HR, ".deep_agents")
     try:
@@ -479,8 +491,8 @@ class McpManager:
 
     # queries (called by _schemas hooks during LLM tool building) ──
     def _scope_matches(self, client: _McpClient, scope: str) -> bool:
-        scopes = [str(s).lower() for s in client.cfg.get("scopes", [])]
-        return not scopes or (not scope or scope.lower() in scopes)
+        scopes = {_canonical_scope(s) for s in client.cfg.get("scopes", [])}
+        return not scopes or (not scope or _canonical_scope(scope) in scopes)
 
     def tool_defs_for_scope(self, scope: str = "") -> list[dict]:
         self.ensure_started()

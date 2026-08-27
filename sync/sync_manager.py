@@ -48,7 +48,7 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
             # re-evaluate it, not trust the old completion) — skip the plan block
             # or the orchestrator may skip delegation entirely.
             if task_data and task_data.get("plan") and task_data.get("status") != "completed":
-                plan_block = build_plan_progress_block(task_data)
+                plan_block = build_plan_progress_block(task_data, "orchestrator")
                 if plan_block and "=== CURRENT PLAN" not in resolved_request:
                     resolved_request = resolved_request + "\n\n" + plan_block
                     print(f"[SYNC] Appended plan block ({len(task_data.get('plan', {}))} scope(s))")

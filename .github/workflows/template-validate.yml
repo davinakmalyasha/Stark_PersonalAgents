@@ -12,7 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Render every template with sample vars
+      - name: Render every template with sample vars (+ YAML-validate workflows)
         run: |
-          pip install --quiet jinja2
+          pip install --quiet jinja2 pyyaml
           python scripts/validate_templates.py
+      - name: Test suite (renderer, apply_template, branch levels, gate installer, push matrix, tier contracts)
+        run: |
+          pip install --quiet jinja2 pyyaml
+          python tests/run_all.py

@@ -1,0 +1,11 @@
+# Taste
+- Prefers least-privilege architecture for orchestrator/boss agents — minimal tool scope (delegation/planning/project tools only), explicitly excluding direct execution tools like run_command even when convenient. Confidence: 0.92
+- Prefers strict information isolation / scoped context injection — each agent only receives its own plan/state to prevent stale cross-agent leakage. Confidence: 0.90
+- Prefers orchestrator as pure delegator (Stark pattern): never does hands-on work, splits requests into independent jobs and fans out in one parallel delegate call, tracks to completion and reports plainly. Confidence: 0.92
+- Prefers durable, bounded job ledger for cross-restart observability — append-only JSON lines with truncation/keep-window, surfaced via recent-jobs block in volatile prompt zone. Confidence: 0.88
+- Prefers live job tracking via full-replacement plan updates (newest-wins semantics) — one step per job at spawn, marked completed/failed on results, with delegation_status as the source of truth for outstanding work. Confidence: 0.89
+- Prefers plain-language boss communication: zero jargon unless boss used it first, one status line per job (✓ done / ⏳ working / ✗ problem + one-clause why), failures first, never bluff, details live in job's own chat. Confidence: 0.91
+- Prefers explicit chat and delegation policies — new job → new chat, follow-up/bug → continue via chat_id, registered projects via resume_project; every delegated job must be complete/self-contained, never redo/double-handle returned results, flag risky changes for deeper verification. Confidence: 0.86
+- Prefers designing for stateless memory — only recent chat history survives between wakes, so anything that matters must be said in replies, not kept in tool-call internals. Confidence: 0.87
+- Prefers rigorous verification discipline before closing — targeted regression/roundtrip/truncation/injection/template tests, then full suite + targeted lint (ruff), with live smoke staged separately. Confidence: 0.85
+- Prefers structured Config Pass execution plans — numbered P1..Pn each with file, exact change, effect, and explicit risk flag before implementation. Confidence: 0.84

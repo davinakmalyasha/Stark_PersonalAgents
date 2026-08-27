@@ -166,6 +166,11 @@ export default function SidebarProjectList({
                         key={chat.id}
                         role="button"
                         tabIndex={0}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData('text/plain', `${ws.id}:${chat.id}`);
+                          e.dataTransfer.effectAllowed = 'move';
+                        }}
                         onClick={() => handleSelectChat(ws, chat.id)}
                         onKeyDown={(e) => { if (e.key === 'Enter') handleSelectChat(ws, chat.id); }}
                         className={`chat-row flex items-center gap-1.5 w-full text-[12px] rounded-r-md transition-colors text-left group cursor-pointer ${

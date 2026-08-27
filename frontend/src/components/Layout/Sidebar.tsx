@@ -218,11 +218,12 @@ export default function Sidebar({
             <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity"><button onClick={() => generalWs && handleCreateChat(generalWs)} className="p-1 text-zinc-500 hover:text-zinc-200" title="New chat"><Plus size={15}/></button><button onClick={onToggleCollapse} className="p-1 text-zinc-500 hover:text-zinc-200" title="Close Sidebar"><PanelLeftClose size={15}/></button></div>
           </div>
 
-          {/* General item */}
+          {/* General item — bounded height so 1000 chats scroll instead of pushing the layout */}
           {generalWs && (
             <div className={`sidebar-section-collapse ${chatsOpen ? 'is-open' : ''}`}>
-            <div className="mx-2 mb-4">
-              <div className="mt-1">
+            <div>
+              <div className="mx-2 mb-4 max-h-[45vh] overflow-y-auto house-thread min-h-0">
+                <div className="mt-1">
                 {chatMap['_general']?.length === 0 && (
                   <div
                     className="text-[11px] text-zinc-600 italic cursor-pointer hover:text-zinc-400 transition-colors"
@@ -235,15 +236,20 @@ export default function Sidebar({
                 {chatMap['_general']?.map((chat) => {
                   const isChatActive = chat.id === activeChatId && activeWorkspaceId === '_general';
                   const isEditing = editingGeneralChatId === chat.id;
-                  return (
-                    <div
-                      key={chat.id}
-                      onClick={() => handleSelectChat(generalWs, chat.id)}
-                      className={`chat-row relative flex items-center gap-1.5 w-full text-[12px] rounded-md transition-colors cursor-pointer group ${
-                        isChatActive ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-200'
-                      }`}
-                      style={{ padding: '8px 9px' }}
-                    >
+                    return (
+                      <div
+                        key={chat.id}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData('text/plain', `${generalWs.id}:${chat.id}`);
+                          e.dataTransfer.effectAllowed = 'move';
+                        }}
+                        onClick={() => handleSelectChat(generalWs, chat.id)}
+                        className={`chat-row relative flex items-center gap-1.5 w-full text-[12px] rounded-md transition-colors cursor-pointer group ${
+                          isChatActive ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-200'
+                        }`}
+                        style={{ padding: '8px 9px' }}
+                      >
                       <MessageSquare size={11} className="flex-shrink-0 text-zinc-600" />
                       {isEditing ? <input value={generalChatName} autoFocus onClick={(event) => event.stopPropagation()} onChange={(event) => setGeneralChatName(event.target.value)} onBlur={() => saveGeneralChatName(chat)} onKeyDown={(event) => { if (event.key === 'Enter') saveGeneralChatName(chat); if (event.key === 'Escape') setEditingGeneralChatId(null); }} className="min-w-0 flex-1 rounded border border-zinc-600 bg-zinc-900 px-1 py-0.5 text-[11px] text-zinc-100 outline-none" /> : <span className="truncate flex-1">{chat.title || 'Untitled'}</span>}
                       {!isEditing && <><span className="text-[10px] text-zinc-600 flex-shrink-0 ml-1 tabular-nums group-hover:opacity-0">{relativeTime(chat.updatedAt)}</span><div className="absolute right-1 hidden items-center gap-0.5 rounded bg-zinc-800 group-hover:flex"><button onClick={(event) => { event.stopPropagation(); setGeneralChatName(chat.title || ''); setEditingGeneralChatId(chat.id); }} className="p-1 text-zinc-400 hover:text-white" title="Rename"><Pencil size={11}/></button><button onClick={(event) => handleDeleteChat(event, generalWs, chat.id)} className="p-1 text-zinc-400 hover:text-white" title="Delete"><Trash2 size={11}/></button></div></>}
@@ -251,6 +257,7 @@ export default function Sidebar({
                   );
                 })}
               </div>
+            </div>
             </div></div>
           )}
 

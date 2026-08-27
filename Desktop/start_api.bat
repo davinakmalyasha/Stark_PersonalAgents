@@ -15,7 +15,7 @@ REM Start the API server with venv312 (has Moonshine + Kokoro).
 REM api_server.py re-execs itself with venv312 even if launched otherwise.
 REM Logs go to .deep_agents\api_out.log / api_err.log for debugging.
 echo   Starting api_server.py (logs in .deep_agents\api_out.log) ...
-start "Stark-API" cmd /c "cd /d D:\MyProject\LangChain && D:\MyProject\LangChain\venv312\Scripts\python.exe api_server.py >> D:\MyProject\LangChain\.deep_agents\api_out.log 2>> D:\MyProject\LangChain\.deep_agents\api_err.log"
+start "Stark-API" cmd /c "cd /d D:\MyProject\LangChain && D:\MyProject\LangChain\venv312\Scripts\python.exe server\api_server.py >> D:\MyProject\LangChain\.deep_agents\api_out.log 2>> D:\MyProject\LangChain\.deep_agents\api_err.log"
 
 echo   Done. Check http://127.0.0.1:8000/api/health for engine status.
 echo   (Frontend changes: just refresh the browser / reopen the voice overlay)

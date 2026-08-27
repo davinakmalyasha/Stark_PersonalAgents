@@ -191,9 +191,32 @@ export interface ChatAttachment {
   isImage: boolean;
 }
 
+/** A child session spawned by an agent (drill-in subagent view). */
+export interface SubagentInfo {
+  child_id: string;
+  name: string;
+  label: string;
+  status: 'idle' | 'running' | string;
+  created: number;
+  parent_session?: string | null;
+}
+
+export interface SubagentSessionEntry {
+  kind: 'user' | 'assistant' | 'tool';
+  content: string;
+  toolName?: string;
+  isError?: boolean;
+  ts: number;
+}
+
+export interface SubagentSession {
+  info: SubagentInfo & { parent_chat_id?: string; session_file?: string };
+  entries: SubagentSessionEntry[];
+}
+
 export type TaskMode = 'immediate' | 'saved' | 'scheduled';
 export type TaskStatus = 'ready' | 'scheduled' | 'running' | 'completed' | 'failed';
-export type TaskRecurrence = 'none' | 'daily' | 'weekly' | 'monthly';
+export type TaskRecurrence = 'none' | 'daily' | 'weekly' | 'monthly' | `interval-${number}`;
 
 export interface TaskSchedule {
   nextRunAt?: string;
@@ -226,4 +249,39 @@ export interface UserProfile {
 export interface WorkspaceRules {
   stack: Record<string, string[]>;
   workspace_rules: string[];
+}
+
+// ── Session tabs (main workspace top bar) ───────────────────────────────────
+
+export type SessionTabType = 'chat' | 'coding';
+
+/** One top-bar tab = one real backend chat session. */
+export interface SessionTab {
+  id: string; // `${workspaceId}:${chatId}`
+  type: SessionTabType;
+  title: string;
+  workspaceId: string;
+  workspaceName: string;
+  workspacePath: string;
+  chatId: string;
+  updatedAt: string;
+}
+
+/** Live pipeline status from GET /api/runs/active. */
+export interface ActiveRun {
+  running: boolean;
+  workspace_path: string;
+  chat_id: string;
+  started_at: string;
+}
+
+/** Chat source filter for the sidebar list (Codex-style dropdown). */
+export type ChatsFilter = 'general' | 'coding' | 'house' | 'personal';
+
+/** Persisted UI layout (open tabs, active tab, chat management), stored via /api/ui/state. */
+export interface UiState {
+  open_tabs?: string[];
+  active_tab?: string | null;
+  pinned_chats?: string[];
+  chats_filter?: ChatsFilter;
 }

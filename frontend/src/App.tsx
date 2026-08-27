@@ -7,7 +7,7 @@ import TokenStatsModal from './components/Layout/TokenStatsModal';
 import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 import { usePipeline } from './hooks/usePipeline';
-import { fetchModels, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus } from './services/api';
+import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus, steerRun } from './services/api';
 import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment, AgentTask } from './types';
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
 
@@ -21,7 +21,7 @@ const WELCOME_MESSAGES: ChatMessage[] = [
 ];
 
 export default function App() {
-  const { run, cancel, state: pipeState, isRunning, error, streaming } = usePipeline();
+  const { run, cancel, state: pipeState, isRunning, error, streaming, runMode, attachMirror } = usePipeline();
   const state: AppState | null = pipeState;
 
   const [messages, setMessages] = useState<ChatMessage[]>(WELCOME_MESSAGES);
@@ -46,35 +46,101 @@ export default function App() {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
 
+  // ── Top-bar tabs (opencode-style) for the legacy coding workspace ──
+  // Persisted separately from the main-workspace ui_state (cw_ prefix avoids collision).
+  const CW_TABS_KEY = 'cw_open_tabs';
+  const CW_ACTIVE_KEY = 'cw_active_tab';
+  type CwTab = { workspaceId: string; chatId: string; title: string; workspaceName: string };
+  const tabKey = (wsId: string, cId: string) => `${wsId}:${cId}`;
+  const [cwTabs, setCwTabs] = useState<CwTab[]>(() => {
+    try { const raw = localStorage.getItem(CW_TABS_KEY); return raw ? JSON.parse(raw) : []; } catch { return []; }
+  });
+  const [cwActiveKey, setCwActiveKey] = useState<string | null>(() => {
+    try { return localStorage.getItem(CW_ACTIVE_KEY); } catch { return null; }
+  });
+  useEffect(() => { try { localStorage.setItem(CW_TABS_KEY, JSON.stringify(cwTabs)); } catch { void 0; } }, [cwTabs]);
+  useEffect(() => { try { if (cwActiveKey) localStorage.setItem(CW_ACTIVE_KEY, cwActiveKey); else localStorage.removeItem(CW_ACTIVE_KEY); } catch { void 0; } }, [cwActiveKey]);
+
+  const upsertCwTab = useCallback((wsId: string, chatId: string, title: string, wsName: string) => {
+    const key = tabKey(wsId, chatId);
+    setCwTabs((prev) => {
+      const exists = prev.find((t) => t.workspaceId === wsId && t.chatId === chatId);
+      if (exists) {
+        return prev.map((t) => (t.workspaceId === wsId && t.chatId === chatId ? { ...t, title, workspaceName: wsName } : t));
+      }
+      return [...prev, { workspaceId: wsId, chatId, title, workspaceName: wsName }];
+    });
+    setCwActiveKey(key);
+  }, []);
+
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
   const activeTaskRef = useRef<string | null>(null);
+  // Live mirroring (mobile/remote): remember which run instance we already
+  // attached to so the poll doesn't re-attach to a finished run.
+  const mirroredRunStart = useRef('');
 
-  // Init: fetch models + workspaces on mount
+  // Init: fetch models + workspaces on mount.
+  // `#/coding?ws=<id>&chat=<id>` (from the main workspace's "open in Coding
+  // Workspace" button) selects that exact workspace + chat after boot.
   useEffect(() => {
+    const hashQuery = window.location.hash.split('?')[1] ?? '';
+    const params = new URLSearchParams(hashQuery);
+    let targetWsId: string | null = params.get('ws');
+    let targetChatId: string | null = params.get('chat');
+    // Restore last tab if no deep-link is present
+    if (!targetWsId && !targetChatId && cwActiveKey) {
+      const sep = cwActiveKey.indexOf(':');
+      if (sep > 0) {
+        targetWsId = cwActiveKey.slice(0, sep);
+        targetChatId = cwActiveKey.slice(sep + 1);
+      }
+    }
+
     fetchModels().then((m) => { if (m.length) setModels(m); }).catch(() => {});
     fetchWorkspaces().then(async (ws) => {
-      if (ws.length > 0) {
-        const general = ws.find((w) => w.isGeneral);
-        const initialWs = general || ws[0];
-        setActiveWorkspace(initialWs);
-        try {
-          const chats = await fetchChats(initialWs.id);
-          if (chats.length > 0) {
-            const chat = await fetchChat(initialWs.id, chats[0].id);
-            setActiveChat(chat);
-            setMessages(chat.messages.length > 0 ? chat.messages : [{
+      if (ws.length === 0) return;
+      let initialWs = ws.find((w) => w.isGeneral) || ws[0];
+      if (targetWsId) {
+        initialWs = ws.find((w) => w.id === targetWsId) ?? initialWs;
+      }
+      setActiveWorkspace(initialWs);
+      try {
+        const chats = await fetchChats(initialWs.id);
+        const targetChat = chats.find((c) => c.id === targetChatId) ?? null;
+        if (!targetChat && targetChatId) {
+          // The requested chat may exist but be missing from the summary list
+          // (e.g. brand-new) — try fetching it directly before falling back.
+          const direct = await fetchChat(initialWs.id, targetChatId).catch(() => null);
+          if (direct) {
+            setActiveChat(direct);
+            setMessages(direct.messages.length > 0 ? direct.messages : [{
               id: `sys-${Date.now()}`,
               role: 'system',
               content: initialWs.isGeneral ? 'Connected. How can I help you?' : `Chat ready in ${initialWs.name}. What would you like to build?`,
               timestamp: new Date().toISOString(),
             }]);
+            upsertCwTab(initialWs.id, direct.id, direct.title || 'Untitled', initialWs.name);
+            return;
           }
-        } catch (err) {
-          console.error('[App] Failed to auto-load chats:', err);
         }
+        const fallback = targetChat ?? chats[0] ?? null;
+        if (fallback) {
+          const chat = await fetchChat(initialWs.id, fallback.id);
+          setActiveChat(chat);
+          setMessages(chat.messages.length > 0 ? chat.messages : [{
+            id: `sys-${Date.now()}`,
+            role: 'system',
+            content: initialWs.isGeneral ? 'Connected. How can I help you?' : `Chat ready in ${initialWs.name}. What would you like to build?`,
+            timestamp: new Date().toISOString(),
+          }]);
+          upsertCwTab(initialWs.id, chat.id, chat.title || fallback.title || 'Untitled', initialWs.name);
+        }
+      } catch (err) {
+        console.error('[App] Failed to auto-load chats:', err);
       }
     }).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only restore from cwActiveKey + upsert
   }, []);
 
   useEffect(() => {
@@ -92,6 +158,14 @@ export default function App() {
         activeTaskRef.current = null;
       }
       if (activeWorkspace && activeChat) {
+        // Mirrored run: the initiating client persists the trace — just reload.
+        if (runMode === 'mirror') {
+          fetchChat(activeWorkspace.id, activeChat.id).then((c) => {
+            setActiveChat(c);
+            setMessages(c.messages);
+          }).catch(() => {});
+          return;
+        }
         console.log('[App] Pipeline run completed. Saving trace and final response...');
         setIsPersisting(true);
         
@@ -125,10 +199,9 @@ export default function App() {
             const updatedChat = await fetchChat(activeWorkspace.id, activeChat.id);
             setActiveChat(updatedChat);
             setMessages(updatedChat.messages);
-            // P9: a new project workspace was created this run → refresh sidebar
-            if (state?.workspace_created) {
-              setSidebarRefreshTick((t) => t + 1);
-            }
+            // Delegations may have created chats in ANY workspace this run —
+            // refresh the sidebar so they show up without a manual reload.
+            setSidebarRefreshTick((t) => t + 1);
           } catch (err) {
             console.error('[App] Failed to complete run persistence:', err);
           } finally {
@@ -139,7 +212,30 @@ export default function App() {
         saveAndRefresh();
       }
     }
-  }, [isRunning, activeWorkspace, activeChat, state?.live_terminal_log, state?.project_ref, state?.workspace_created, state?.token_usage]);
+  }, [isRunning, activeWorkspace, activeChat, runMode, state?.live_terminal_log, state?.project_ref, state?.workspace_created, state?.token_usage]);
+
+  // ── Live mirroring (mobile/remote feature) ──
+  // While idle, watch /api/runs/active: when a run starts for THIS chat from
+  // another client (phone or second browser), attach to its event stream so
+  // both screens show the identical live session.
+  useEffect(() => {
+    if (isRunning || !activeChat) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const run = await fetchActiveRun();
+        if (cancelled || !run.running) return;
+        if (run.chat_id === activeChat.id && run.started_at && run.started_at !== mirroredRunStart.current) {
+          mirroredRunStart.current = run.started_at;
+          attachMirror(run.chat_id);
+        }
+      } catch { /* backend briefly unavailable */ }
+    };
+    tick();
+    const id = window.setInterval(tick, 2500);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [isRunning, activeChat?.id, attachMirror]);
 
   useEffect(() => {
     if (!error) return;
@@ -262,10 +358,23 @@ export default function App() {
       }
     }
 
+    // ── Mid-run message → steering queue ──
+    // The orchestrator is an event-driven coordinator: while it (or its
+    // delegations) are still working, a new message is delivered as steering
+    // at the next step boundary instead of starting a second pipeline.
+    if (isRunning) {
+      addChatMessage(ws.id, chat.id, 'user', prompt).catch(() => {});
+      const queued = await steerRun(chat.id, prompt).catch(() => false);
+      setNotification(queued
+        ? 'Queued — the agent will pick this up at its next step.'
+        : 'Could not queue the message. Try again when the run finishes.');
+      return;
+    }
+
     console.log('[App.handleSend] calling run...');
     runStartTime.current = Date.now();
     run(prompt, model, temperature, ws.path, chat.id, attachments);
-  }, [run, model, temperature, activeWorkspace, activeChat]);
+  }, [run, model, temperature, activeWorkspace, activeChat, isRunning]);
 
   const handleRunTask = useCallback((task: AgentTask) => {
     if (!activeWorkspace || !activeChat || isRunning) return false;
@@ -399,7 +508,7 @@ export default function App() {
   const handleSelectChat = useCallback((ws: WorkspaceInfo, chat: ChatData) => {
     setActiveWorkspace(ws);
     setActiveChat(chat);
-
+    upsertCwTab(ws.id, chat.id, chat.title || 'Untitled', ws.name);
 
     // Load existing messages from chat
     if (chat.messages && chat.messages.length > 0) {
@@ -417,13 +526,58 @@ export default function App() {
 
     // Sync project_path to the workspace folder
     fetch('/api/session/reset', { method: 'POST' }).catch(() => {});
-  }, []);
+  }, [upsertCwTab]);
 
   const handleChatTitleUpdated = useCallback((chatId: string, newTitle: string) => {
     if (activeChat && activeChat.id === chatId) {
       setActiveChat((c) => c ? { ...c, title: newTitle } : null);
     }
+    // Keep the tab title in sync
+    setCwTabs((prev) => prev.map((t) => t.chatId === chatId ? { ...t, title: newTitle } : t));
   }, [activeChat]);
+
+  const handleCwActivate = useCallback(async (wsId: string, chatId: string) => {
+    try {
+      const wsList = await fetchWorkspaces();
+      const ws = wsList.find((w) => w.id === wsId);
+      if (!ws) return;
+      const chat = await fetchChat(wsId, chatId);
+      handleSelectChat(ws, chat);
+    } catch {}
+  }, [handleSelectChat]);
+
+  const handleCwClose = useCallback((wsId: string, chatId: string) => {
+    const key = tabKey(wsId, chatId);
+    const idx = cwTabs.findIndex((t) => t.workspaceId === wsId && t.chatId === chatId);
+    const next = cwTabs.filter((t) => !(t.workspaceId === wsId && t.chatId === chatId));
+    setCwTabs(next);
+    if (cwActiveKey === key) {
+      const neighbor = next[Math.min(idx, next.length - 1)] ?? next[0] ?? null;
+      if (neighbor) {
+        handleCwActivate(neighbor.workspaceId, neighbor.chatId);
+      } else {
+        setCwActiveKey(null);
+      }
+    }
+  }, [cwTabs, cwActiveKey, handleCwActivate]);
+
+  const handleCwDrop = useCallback(async (data: string) => {
+    // data is "wsId:chatId" from the sidebar drag
+    const sep = data.indexOf(':');
+    if (sep <= 0) return;
+    const wsId = data.slice(0, sep);
+    const chatId = data.slice(sep + 1);
+    await handleCwActivate(wsId, chatId);
+  }, [handleCwActivate]);
+
+  // Keep cwActiveKey in sync when the active chat changes via other paths
+  useEffect(() => {
+    if (activeWorkspace && activeChat) {
+      const key = tabKey(activeWorkspace.id, activeChat.id);
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync persisted active key from external selection
+      if (cwActiveKey !== key) setCwActiveKey(key);
+    }
+  }, [activeWorkspace?.id, activeChat?.id, cwActiveKey]);
 
   // P9: "Open in <project>" — jump from a routed reply card to the project's
   // own chat (where the full Dev reply lives).
@@ -523,6 +677,11 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen w-screen bg-[#0c0c0e] text-zinc-100 overflow-hidden font-sans">
       <TitleBar
+        tabs={cwTabs}
+        activeKey={cwActiveKey}
+        onActivateTab={handleCwActivate}
+        onCloseTab={handleCwClose}
+        onDropTab={handleCwDrop}
       />
       <div className="app-shell flex flex-1 min-h-0" style={{ backgroundColor: '#0c0c0e' }}>
         <Sidebar

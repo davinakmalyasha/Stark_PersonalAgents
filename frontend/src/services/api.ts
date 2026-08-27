@@ -1,6 +1,6 @@
 // ── Antigravity 2.0 API Client ──
 
-import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, UserProfile, WorkspaceRules, ChatAttachment, AgentTask, TaskSchedule, StreamDelta, McpServerConfig } from '../types';
+import type { AppState, ModelOption, WorkspaceInfo, ChatSummary, ChatData, ChatMessage, ChatAttachment, AgentTask, TaskSchedule, StreamDelta, ActiveRun, UiState, SubagentInfo, SubagentSession } from '../types';
 
 const API_BASE = '/api';
 
@@ -16,10 +16,11 @@ async function fetchWithRetry(url: string, options?: RequestInit, maxRetries = 8
         throw new Error(`Proxy error: HTTP ${res.status} (backend not ready)`);
       }
       return res; // real HTTP response (even 404/500) — don't retry
-    } catch (err: any) {
+    } catch (err) {
       if (attempt === maxRetries) throw err;
       const delay = baseDelayMs * Math.pow(2, attempt);
-      console.log(`[api] Retry ${attempt + 1}/${maxRetries} for ${url} — waiting ${delay}ms (${err.message})`);
+      const message = err instanceof Error ? err.message : String(err);
+      console.log(`[api] Retry ${attempt + 1}/${maxRetries} for ${url} — waiting ${delay}ms (${message})`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -46,8 +47,12 @@ export async function fetchModels(): Promise<ModelOption[]> {
   return data.models ?? [];
 }
 
+export type ProviderMode = 'free' | 'deepseek' | 'opencode' | 'command';
+
 export interface ProviderInfo {
-  provider: 'deepseek' | 'opencode';
+  provider: ProviderMode;
+  modes?: ProviderMode[];
+  matrix?: Record<string, { backend?: string; model?: string; iter_effort?: string; think_bias?: boolean }>;
   base_url: string;
   model_flash: string;
   model_pro: string;
@@ -60,7 +65,7 @@ export async function fetchProvider(): Promise<ProviderInfo> {
   return res.json();
 }
 
-export async function setProvider(provider: 'deepseek' | 'opencode'): Promise<ProviderInfo> {
+export async function setProvider(provider: ProviderMode): Promise<ProviderInfo> {
   const res = await fetch(`${API_BASE}/provider`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -130,6 +135,21 @@ export async function deleteChat(workspaceId: string, chatId: string): Promise<v
   await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}`, {
     method: 'DELETE',
   });
+}
+
+/** Children spawned by this chat (cont- continuable + sub- task spawns). */
+export async function fetchChatSubagents(workspaceId: string, chatId: string): Promise<SubagentInfo[]> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/subagents`);
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data.subagents) ? data.subagents : [];
+}
+
+/** Read-only transcript of one spawned subagent session. */
+export async function fetchSubagentSession(workspaceId: string, childId: string): Promise<SubagentSession | null> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/subagents/${encodeURIComponent(childId)}`);
+  if (!res.ok) return null;
+  return res.json();
 }
 
 export async function addChatMessage(
@@ -222,84 +242,8 @@ export async function updateChatTitle(workspaceId: string, chatId: string, title
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Settings & Rules API
+// Chat API
 // ═══════════════════════════════════════════════════════════════════════
-
-export async function fetchProfile(): Promise<UserProfile> {
-  const res = await fetch(`${API_BASE}/settings/profile`);
-  if (!res.ok) throw new Error('Failed to fetch profile');
-  return res.json();
-}
-
-export async function saveProfile(profile: UserProfile): Promise<void> {
-  const res = await fetch(`${API_BASE}/settings/profile`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(profile),
-  });
-  if (!res.ok) throw new Error('Failed to save profile');
-}
-
-export async function fetchWorkspaceRules(workspaceId: string): Promise<WorkspaceRules> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/rules`);
-  if (!res.ok) throw new Error('Failed to fetch workspace rules');
-  return res.json();
-}
-
-export async function saveWorkspaceRules(workspaceId: string, rules: WorkspaceRules): Promise<void> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/rules`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(rules),
-  });
-  if (!res.ok) throw new Error('Failed to save workspace rules');
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// MCP Server API
-// ═══════════════════════════════════════════════════════════════════════
-
-export async function fetchMcpServers(): Promise<McpServerConfig[]> {
-  try {
-    const res = await fetch(`${API_BASE}/mcp/servers`);
-    if (!res.ok) return [];
-    const data = await res.json();
-    return Array.isArray(data?.servers) ? data.servers : [];
-  } catch {
-    return [];
-  }
-}
-
-export async function upsertMcpServer(name: string, config: Omit<McpServerConfig, 'name' | 'status' | 'error' | 'tool_count' | 'transport'>): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(name)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-export async function deleteMcpServer(name: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(name)}`, { method: 'DELETE' });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-export async function restartMcpServer(name: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(name)}/restart`, { method: 'POST' });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Stream the agentic pipeline via SSE.
@@ -369,6 +313,62 @@ export async function fetchWorkspaceFile(workspaceId: string, path: string): Pro
   } catch {
     return null;
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Session tabs & run status API
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Which chat session (if any) currently has a pipeline running. */
+export async function fetchActiveRun(): Promise<ActiveRun> {
+  try {
+    const res = await fetch(`${API_BASE}/runs/active`);
+    if (!res.ok) return { running: false, workspace_path: '', chat_id: '', started_at: '' };
+    return await res.json();
+  } catch {
+    return { running: false, workspace_path: '', chat_id: '', started_at: '' };
+  }
+}
+
+/**
+ * Queue a mid-run message (steering). The live coordinator picks it up at its
+ * next step boundary — this is how new tasks arrive while delegations run.
+ */
+export async function steerRun(chatId: string, message: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/steer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return !!data?.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Load persisted UI layout (open session tabs, active tab). */
+export async function fetchUiState(): Promise<UiState> {
+  try {
+    const res = await fetch(`${API_BASE}/ui/state`);
+    if (!res.ok) return {};
+    return await res.json();
+  } catch {
+    return {};
+  }
+}
+
+/** Persist UI layout. Failures are non-fatal — tabs are a convenience. */
+export async function saveUiState(state: UiState): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/ui/state`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state),
+    });
+  } catch { /* non-fatal */ }
 }
 
 export function streamPipeline(

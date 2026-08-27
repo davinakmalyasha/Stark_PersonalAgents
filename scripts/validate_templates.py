@@ -26,6 +26,11 @@ import tempfile
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 
+try:
+    import yaml  # structural gate: rendered *.yml must parse (CI installs pyyaml)
+except ImportError:
+    yaml = None
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "templates"
 ALLOWED_TYPES = ("string", "int", "bool", "list")
@@ -37,10 +42,14 @@ def _render_env(delims: list | None = None):
     key = tuple(delims or ())
     env = _env_cache.get(key)
     if env is None:
+        # trim_blocks/lstrip_blocks MUST stay False — mirrors
+        # tools/AddOnTool/templateTools.py:_render_env. With them on, block
+        # tags at end-of-line glue YAML lines together and rendered workflows
+        # become invalid while this validator still "passes".
         env = SandboxedEnvironment(
             keep_trailing_newline=True,
-            trim_blocks=True,
-            lstrip_blocks=True,
+            trim_blocks=False,
+            lstrip_blocks=False,
             undefined=StrictUndefined,
             variable_start_string=(delims[0] if delims else "{{"),
             variable_end_string=(delims[1] if delims and len(delims) > 1 else "}}"),
@@ -156,6 +165,16 @@ def validate_template(name: str, variables: dict, visited: set, failures: list) 
             except Exception as e:
                 failures.append(f"{name}: render {fspec['src']}: {e}")
                 continue
+            # ── Structural gate: every rendered workflow must be valid YAML ──
+            # Catches renderer-dialect glue bugs (trim_blocks eating newlines
+            # after block tags) that used to ship invalid workflows green.
+            if yaml is not None and dest_rel.endswith((".yml", ".yaml")):
+                try:
+                    yaml.safe_load(rendered_text)
+                except Exception as e:
+                    failures.append(
+                        f"{name}: INVALID rendered YAML {dest_rel}: {str(e)[:140]}")
+                    continue
             dest_rel = dest_rel.replace("\\", "/")
             if dest_rel.startswith("/") or dest_rel.startswith("../") or "..\\" in dest_rel:
                 failures.append(f"{name}: dest '{dest_rel}' escapes the target dir")

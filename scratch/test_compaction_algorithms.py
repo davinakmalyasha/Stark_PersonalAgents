@@ -115,7 +115,7 @@ class TestSingleCheckpointCompaction(unittest.TestCase):
         self.assertEqual(messages, original)
 
     def test_free_router_prefers_a_fitting_million_token_model(self):
-        from agents.free_agent import _get_models_for_capability
+        from llm.free_providers import _get_models_for_capability
 
         models = _get_models_for_capability(
             "text", min_context_tokens=900_000, prefer_context=True
@@ -145,12 +145,14 @@ class TestSingleCheckpointCompaction(unittest.TestCase):
         self.assertNotIn("_NATIVE_DESCRIPTIONS", help_text)
         self.assertNotIn("```tool", help_text)
 
-        free_names = get_native_tool_names("free_agent")
+        # General: life-work kit — no repo read/edit, no delegation tools
+        general_names = get_native_tool_names("general")
         self.assertEqual(
-            set(free_names),
-            {"run_command", "browser_act", "read_pdf", "create_docx", "create_xlsx"},
+            set(general_names),
+            {"run_command", "read_pdf", "create_docx", "create_xlsx",
+             "ask_user", "update_plan", "browser_act"},
         )
-        self.assertNotIn("browser_navigate", format_compact_tool_help(free_names))
+        self.assertNotIn("browser_navigate", format_compact_tool_help(general_names))
 
 
 if __name__ == "__main__":

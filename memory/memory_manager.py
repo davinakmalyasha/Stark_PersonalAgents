@@ -1,4 +1,4 @@
-"""Stable project identity and generated repository-map cache.
+﻿"""Stable project identity and generated repository-map cache.
 
 This module deliberately does not create or update conversation-derived
 project artifacts or session journals. ``project.md`` is a small identity card
@@ -13,7 +13,7 @@ from datetime import datetime
 MEMORY_DIR = ".agent-memory"
 
 
-# ── Path helpers ─────────────────────────────────────────────────────────────
+# â”€â”€ Path helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -107,6 +107,30 @@ def refresh_code_map_context(
     if not workspace_path or not os.path.isdir(workspace_path):
         return {"kind": "none", "content": "", "changed": False}
     _ensure_dir(_memory_path(workspace_path))
+
+    # Phase 7: watcher dirty-flag fast path â€” when the file watcher already
+    # marked the repo-map state dirty on external change (tools/watcher.py),
+    # skip the topology snapshot entirely for unchanged workspaces. The flag
+    # is cleared on every successful refresh below.
+    map_file = _repository_map_file(workspace_path)
+    existing = _read_file_safe(map_file) or ""
+    state = _load_repository_map_state(workspace_path)
+    legacy_updates_marker = "Updates:" in existing or "projectMap+:" in existing
+    valid_map_marker = (
+        existing.startswith("projectMap:")
+        and existing.count("projectMap:") == 1
+        and not legacy_updates_marker
+    )
+    if (
+        not force_full
+        and valid_map_marker
+        and not state.get("dirty")
+        and isinstance(state.get("topology"), dict)
+    ):
+        if include_cached_full:
+            return {"kind": "full", "content": existing.strip(), "changed": False}
+        return {"kind": "none", "content": "", "changed": False}
+
     try:
         from memory.repo_map_generator import RepoMapGenerator
         generator = RepoMapGenerator(workspace_path)
@@ -115,9 +139,6 @@ def refresh_code_map_context(
         print(f"[MEMORY] Project map snapshot failed: {e}")
         return {"kind": "none", "content": "", "changed": False}
 
-    map_file = _repository_map_file(workspace_path)
-    existing = _read_file_safe(map_file) or ""
-    state = _load_repository_map_state(workspace_path)
     state_topology = state.get("topology")
     has_topology_state = isinstance(state_topology, dict)
     previous_topology = state_topology if has_topology_state else {}
@@ -128,12 +149,6 @@ def refresh_code_map_context(
         full_at = float(state.get("full_at", 0) or 0)
     except (TypeError, ValueError):
         full_at = 0
-    legacy_updates_marker = "Updates:" in existing or "projectMap+:" in existing
-    valid_map_marker = (
-        existing.startswith("projectMap:")
-        and existing.count("projectMap:") == 1
-        and not legacy_updates_marker
-    )
     # A full rebuild is allowed only for an explicit checkpoint/initial
     # refresh, an invalid/missing cache, or a fresh transcript whose cached
     # topology no longer matches the filesystem. There is intentionally no
@@ -176,6 +191,7 @@ def refresh_code_map_context(
             "topology": current_topology,
             "full_at": full_at,
             "last_refresh": now,
+            "dirty": False,
         })
         print(f"[MEMORY] projectMap+ event emitted ({len(delta)} chars)")
         return {
@@ -198,6 +214,7 @@ def refresh_code_map_context(
             "topology": current_topology,
             "full_at": now,
             "last_refresh": now,
+            "dirty": False,
         })
         print(f"[MEMORY] projectMap fully rebuilt ({len(updated)} chars)")
     return {
@@ -225,22 +242,22 @@ def refresh_code_map(workspace_path: str, force_full: bool = False) -> bool:
     return bool(result.get("changed"))
 
 
-# ── Project identity card ────────────────────────────────────────────────────
+# â”€â”€ Project identity card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
 # project.md is the write-once IDENTITY CARD: name / description / purpose /
 # stack / version + a status. It adapts to reality ONLY by APPENDING corrected
 # \stack:\/\ersion:\ lines at the bottom behind an [updated:] marker (same
-# append-only mechanics as the code map) — old lines are never rewritten; the
+# append-only mechanics as the code map) â€” old lines are never rewritten; the
 # last occurrence wins.
 #
-# status: draft → stable (harness-decided, one-way):
-#   * draft   — the project is young; the identity may still change. The card
+# status: draft â†’ stable (harness-decided, one-way):
+#   * draft   â€” the project is young; the identity may still change. The card
 #     is NOT injected anywhere and NO drift appends happen (all early
-#     stack/purpose churn stays invisible to the API — zero cache impact).
-#   * stable  — the project is structurally committed (manifest + ≥5 source
+#     stack/purpose churn stays invisible to the API â€” zero cache impact).
+#   * stable  â€” the project is structurally committed (manifest + â‰¥5 source
 #     files + detectable stack). The card is injected into the CACHED stable
 #     zone of every code-touching agent; reality drift appends below.
-# Agents never decide this — the harness checks the heuristic at each
+# Agents never decide this â€” the harness checks the heuristic at each
 # session; the eval stamps cards stable at creation (a task IS a built
 # project).
 
@@ -255,7 +272,7 @@ _CARD_IGNORED_DIRS = {"node_modules", "vendor", ".git", "venv", ".venv",
 def _project_is_developed(workspace_path: str) -> bool:
     """Deterministic structural-commitment check: a manifest exists AND at
     least 5 real source files exist AND the stack is detectable. This is the
-    'can no longer be re-purposed' line — once crossed, never demoted."""
+    'can no longer be re-purposed' line â€” once crossed, never demoted."""
     try:
         if not any(os.path.isfile(os.path.join(workspace_path, m)) for m in _MANIFEST_NAMES):
             return False
@@ -331,7 +348,7 @@ def ensure_project_identity(workspace_path: str, name: str = "", description: st
     """Create the write-once project identity card. Never touches an existing
     card (one exception: the old rich auto-generated template with a
     timestamp is migrated to the slim card exactly once).
-    status: "draft" (default — dormant, not injected) or "stable" (e.g. the
+    status: "draft" (default â€” dormant, not injected) or "stable" (e.g. the
     eval, where a task workspace IS a built project)."""
     if not workspace_path or not os.path.isdir(workspace_path):
         return False
@@ -416,7 +433,7 @@ def _format_compact_project_identity(content: str, workspace_path: str = "") -> 
 
 def _project_identity_for_injection(workspace_path: str) -> str:
     """The identity card content projected into compact format, ONLY when
-    status is `stable` (draft cards are dormant — never injected).
+    status is `stable` (draft cards are dormant â€” never injected).
     Read-only; creation/promotion happen in ensure_project_identity /
     refresh_project_identity."""
     if not workspace_path or not os.path.isdir(workspace_path):
@@ -436,17 +453,17 @@ def load_cached_project_identity(workspace_path: str) -> str:
 
 
 def refresh_project_identity(workspace_path: str) -> bool:
-    """Adapt the card to reality — APPEND-ONLY, like the code map.
+    """Adapt the card to reality â€” APPEND-ONLY, like the code map.
 
     While `draft` the card is DORMANT: nothing is appended (it is not
     injected anywhere, so drift lines would be invisible churn). When the
     harness heuristic sees a structurally committed project (manifest +
-    ≥5 source files + detectable stack) it appends `[identity stabilized:]`
-    + `status: stable` ONCE — from then on the card is injected into the
+    â‰¥5 source files + detectable stack) it appends `[identity stabilized:]`
+    + `status: stable` ONCE â€” from then on the card is injected into the
     cached stable zone and reality drift appends `[updated:]` corrections
-    at the BOTTOM. Old lines are never rewritten — the prefix stays
+    at the BOTTOM. Old lines are never rewritten â€” the prefix stays
     byte-identical (cache-safe); last occurrence wins.
-    name/description/purpose are identity — never auto-updated.
+    name/description/purpose are identity â€” never auto-updated.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return False
@@ -507,7 +524,7 @@ def ensure_project_cache(workspace_path: str) -> bool:
     return not before_identity
 
 
-# ── Tech detection ───────────────────────────────────────────────────────────
+# â”€â”€ Tech detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _detect_dependencies(workspace_path: str) -> list[str]:
     """Deterministically extract dependencies, npm scripts and entry points from
@@ -724,12 +741,12 @@ def _detect_architecture(workspace_path: str) -> list[str]:
     return arch
 
 
-# ── Reading ──────────────────────────────────────────────────────────────────
+# â”€â”€ Reading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def load_cached_code_map(workspace_path: str) -> str:
     """Return the dedicated repository map, or an empty string.
 
-    Read-only — never generates side effects. Invalid or legacy map files are
+    Read-only â€” never generates side effects. Invalid or legacy map files are
     ignored so they cannot enter a prompt.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
@@ -746,7 +763,7 @@ def load_cached_code_map(workspace_path: str) -> str:
     return content
 
 
-# ── File helpers ─────────────────────────────────────────────────────────────
+# â”€â”€ File helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _read_file_safe(path: str) -> str | None:
     try:
@@ -777,3 +794,4 @@ def is_valid_build_request(text: str) -> bool:
     if stripped.lower() in greetings:
         return False
     return True
+

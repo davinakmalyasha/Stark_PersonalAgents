@@ -74,39 +74,9 @@ def get_compaction_policy(role: str = "developer") -> CompactionPolicy:
     )
 
 
-_LEGACY_TOOL_NAMES = {
-    "read_file", "safe_read_file", "edit_file", "batch_edit", "write_to_file",
-    "replace_file_content", "multi_replace_file_content", "run_command",
-    "exec_command", "search_code", "ask_user",
-    "browser_act", "browser_navigate", "browser_extract", "browser_screenshot",
-    "browser_click", "browser_fill", "browser_close", "template_list",
-    "apply_template", "template_new", "github_apply_gate",
-}
-_LEGACY_TOOL_HEAD = re.compile(r"^\[([a-zA-Z0-9_-]+)\]\s*:", re.IGNORECASE)
-
-
 def _is_tool_result(message) -> bool:
-    """Return whether a message carries a native or legacy tool result.
-
-    Older checkpoints encoded tool output as HumanMessage. Treating every
-    HumanMessage as a tool result would let compaction rewrite tasks, nudges,
-    and summaries, so legacy results are identified by their tool-labelled
-    payload instead.
-    """
-    if isinstance(message, ToolMessage):
-        return True
-    if not isinstance(message, HumanMessage):
-        return False
-    content = _tool_result_content(message).lstrip()
-    match = _LEGACY_TOOL_HEAD.match(content)
-    if not match:
-        return False
-    label = match.group(1).lower()
-    if label in _LEGACY_TOOL_NAMES:
-        return True
-    # Preserve compatibility with future/removed tools when an old merged
-    # result contains an unmistakable tool-output marker.
-    return "TOOL ERROR" in content[:500] or "[FILE]" in content[:500]
+    """Return whether a message carries a native tool result."""
+    return isinstance(message, ToolMessage)
 
 
 def _tool_result_content(message) -> str:

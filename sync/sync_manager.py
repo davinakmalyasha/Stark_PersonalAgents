@@ -15,15 +15,17 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         load_task_tracking, build_plan_progress_block,
     )
 
-    # ── P9: direct-to-Dev routing — messages bound for an existing project's
-    # Dev agent never touch the orchestrator (zero relay tokens). New project
-    # creation is NOT decided here — that stays with the orchestrator LLM.
+    # ── Unified deterministic front-door (routing/router.py) — same as api_server
+    # Dev direct bypass (zero relay tokens); creation still goes to orchestrator LLM.
+    # House/Personal hints are ignored here (Telegram uses workspace_path only).
     try:
-        from agents.project_router import route_request, stream_direct
-        route_kind, project = route_request(client_request, workspace_path, chat_id)
-        if route_kind == "project_dev" and project:
-            yield from stream_direct(project, client_request, workspace_path, chat_id)
+        from routing.router import decide_route
+        decision = decide_route(client_request, workspace_path or "", chat_id or "", "")
+        if decision.get("kind") == "project_dev" and decision.get("project"):
+            from agents.project_router import stream_direct
+            yield from stream_direct(decision["project"], client_request, workspace_path or "", chat_id or "")
             return
+        # For Telegram/sync callers, fallback is orchestrator — house/general via API only
     except Exception as e:
         print(f"[SYNC] Project routing error (falling back to orchestrator): {e}")
 
@@ -31,13 +33,12 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
     # loader was removed (it always returned {}).
     project_path = workspace_path
 
-    # Probe environment once
-    if project_path:
-        try:
-            from workspace_manager import probe_environment
-            probe_environment(project_path)
-        except Exception as e:
-            print(f"[SYNC] Error probing environment for workspace {project_path}: {e}")
+    # NOTE (Phase 8): the per-run probe_environment() call was removed — its
+    # return value was discarded (never fed into agent context or state), and it
+    # spawned 6 CLI subprocesses + 4 socket probes on every run. Environment
+    # introspection still happens at workspace registration and via
+    # get_workspace_rules_and_profile, with a 5-minute cache in
+    # workspace_registry.probe_environment.
 
     # Inject the current plan block if task.json has one (LLM-driven update_plan)
     resolved_request = client_request

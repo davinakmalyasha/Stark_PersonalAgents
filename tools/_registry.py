@@ -24,6 +24,7 @@ from ._schemas import (
     get_compact_tool_docs,
     _TOOL_REQUIRED_ARGS,
 )
+from ._parallel import PARALLEL_SAFE
 
 active_tool_scope: contextvars.ContextVar[str] = contextvars.ContextVar(
     "active_tool_scope", default="default"
@@ -41,6 +42,10 @@ class ToolDefinition:
     timeout_ms: int = 0
     is_concurrency_safe: bool = False
     source: str = ""
+    # Stage 1: optional Pydantic class for strict input validation. When set,
+    # the registry validates `args` against it before any pre-hook runs.
+    # Default is None — tools without a schema behave identically to today.
+    input_schema: Optional[type] = None
 
 
 @dataclass(frozen=True)
@@ -255,6 +260,14 @@ class ToolRegistry:
             "definition": d,
         }
 
+        # Stage 1: opt-in Pydantic input-schema validation. Runs before
+        # pre-hooks so a bad call short-circuits without consulting the cache
+        # or guards. Tools without `input_schema` skip this entirely.
+        if d.input_schema is not None:
+            err = _validate_input_schema(name, ctx["args"], d.input_schema)
+            if err is not None:
+                return err
+
         for hook in self._pre_hooks:
             try:
                 decision = hook(ctx)
@@ -422,6 +435,11 @@ def ensure_tool_registry():
         reg = get_registry()
         compact_docs = get_compact_tool_docs()
         _defs_by_name = {d["name"]: d for d in TOOL_DEFINITIONS}
+        # Stage 1: attach opt-in Pydantic input schemas.
+        try:
+            from tools._tool_schemas import TOOL_INPUT_SCHEMAS as _input_schemas
+        except Exception:
+            _input_schemas = {}
         definitions = []
         for name, fn in tool_map.items():
             defn = _defs_by_name.get(name, {})
@@ -433,21 +451,82 @@ def ensure_tool_registry():
                 parameters=defn.get("parameters") or None,
                 execute=fn,
                 source="tools.TOOL_MAP",
+                input_schema=_input_schemas.get(name),
+                is_concurrency_safe=name in PARALLEL_SAFE,
             ))
         reg.register_many(definitions)
         reg.register_pre_hook(_tool_cache_pre_hook)
         reg.register_post_hook(_tool_result_post_hook)
+
+        # Stage 5: lazy-start the file watcher once we have a workspace.
+        try:
+            from sync.state_sync import safe_get_state
+            _ws = (safe_get_state() or {}).get("project_path") or ""
+            if _ws:
+                from tools.watcher import note as _watcher_note
+                _watcher_note(_ws)
+        except Exception:
+            pass
+
+        # Stage 2: untrusted-content wrap post-hook (opt-in via UNTRUSTED_WRAP=0).
+        try:
+            from tools.safety import untrusted_wrap_post_hook as _untrusted_hook
+            reg.register_post_hook(_untrusted_hook)
+        except Exception as _exc:
+            try:
+                from sync.state_sync import safe_append_live_log
+                safe_append_live_log(f"\n[SAFETY] untrusted-wrap hook failed to register: {_exc}")
+            except Exception:
+                pass
+
+        # Stage 2: opt-in user-defined hooks via .deep_agents/hooks.json.
+        try:
+            from tools.hooks_config import (
+                load_hooks as _load_hooks,
+                pre_hook_from_rules as _pre_hook_from_rules,
+                post_hook_from_rules as _post_hook_from_rules,
+            )
+            _rules = _load_hooks()
+            if _rules:
+                _pre = _pre_hook_from_rules(_rules)
+                _post = _post_hook_from_rules(_rules)
+                if _pre:
+                    reg.register_pre_hook(_pre)
+                if _post:
+                    reg.register_post_hook(_post)
+                try:
+                    from sync.state_sync import safe_append_live_log
+                    safe_append_live_log(
+                        f"\n[HOOKS] loaded {len(_rules)} rule(s) from .deep_agents/hooks.json"
+                    )
+                except Exception:
+                    pass
+        except Exception as _exc:
+            try:
+                from sync.state_sync import safe_append_live_log
+                safe_append_live_log(f"\n[HOOKS] load failed: {_exc}")
+            except Exception:
+                pass
+
+        # Stage 4: plan-mode guard. Vetoes write-class tools when the
+        # current chat is in plan mode. Agent cannot exit plan mode
+        # (only the API server / frontend slash handler can flip it).
+        try:
+            from tools.plan_mode_guard import plan_mode_guard as _plan_guard
+            reg.register_guard(_plan_guard)
+        except Exception as _exc:
+            try:
+                from sync.state_sync import safe_append_live_log
+                safe_append_live_log(f"\n[PLAN-MODE] guard registration failed: {_exc}")
+            except Exception:
+                pass
         _tool_registry = reg
         _facade._tool_registry = reg
         return reg
 
 
 def execute_tool(name: str, args: dict) -> str:
-    try:
-        return ensure_tool_registry().execute(name, args)
-    except Exception:
-        import tools as _facade
-        return _facade._legacy_execute_tool(name, args)
+    return ensure_tool_registry().execute(name, args)
 
 
 _current_scope = contextvars.ContextVar("current_tool_scope", default="agent")
@@ -465,13 +544,7 @@ def execute_tool_detailed(
         try:
             return ensure_tool_registry().execute_detailed(name, args, scope)
         except Exception as exc:
-            try:
-                import tools as _facade
-                result = _facade._legacy_execute_tool(name, args)
-            except Exception as legacy_exc:
-                result = f"Error executing {name}: {legacy_exc}"
-            if not result:
-                result = f"Error executing {name}: {exc}"
+            result = f"Error executing {name}: {exc}"
             return ToolExecutionResult.from_content(name, args, result)
     finally:
         _current_scope.reset(token)
@@ -495,6 +568,21 @@ def pre_validate_tool_args(tool_name: str, args: dict) -> tuple[bool, str]:
             return False, f"Expected number/bool for arg '{key}' in '{tool_name}', got {type(args[key]).__name__}"
 
     return True, ""
+
+
+def _validate_input_schema(tool_name: str, args: dict, schema: type) -> Optional[str]:
+    """Stage 1: validate `args` against a Pydantic `schema`. Returns None on
+    success, or an `[INPUT_INVALID] ...` string on failure. Opt-in: if no
+    schema is attached, this function is never called and the tool runs
+    with today's behavior.
+    """
+    try:
+        schema.model_validate(args)
+        return None
+    except Exception as exc:
+        # Pydantic ValidationError carries .errors() with field details.
+        details = getattr(exc, "errors", lambda: None)() or str(exc)
+        return f"[INPUT_INVALID] {tool_name}: {details}"
 
 
 class _LazyToolMap(dict):
@@ -523,16 +611,4 @@ class _LazyToolMap(dict):
 
 
 TOOL_MAP = _LazyToolMap()
-
-
-def _legacy_execute_tool(name: str, args: dict) -> str:
-    if name not in TOOL_MAP:
-        return f"Error: Unknown tool '{name}'. Available tools: {', '.join(TOOL_MAP.keys())}"
-    try:
-        func = TOOL_MAP.get(name)
-        if func is None:
-            return f"Error: Tool '{name}' has no implementation"
-        return func(**args)
-    except Exception as e:
-        return f"Error executing {name}: {e}"
 

@@ -804,13 +804,34 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                     except Exception:
                         pass
 
-                # Execute tools and collect results
+                # Execute tools and collect results. Independent read-only calls
+                # (PARALLEL_SAFE) run concurrently; results stay in call order so
+                # the provider's call-id → result pairing is preserved.
+                # Out-of-scope tools are filtered BEFORE execution.
                 tool_results = []
                 structured_results = []
+                _sub_exec_scope = name
+                _sub_exec_pool = None
+                _sub_allowed = [c for c in tool_calls if c.get("tool") in tool_names or not tool_names]
+                try:
+                    from tools import run_tool_calls as _run_tool_calls
+                    _sub_exec_pool = _run_tool_calls(
+                        _sub_allowed,
+                        lambda tc: _subagent_execute_one(tc, _sub_exec_scope, tool_names),
+                    )
+                except Exception:
+                    _sub_exec_pool = []
+                _sub_result_by_id = {}
+                if len(_sub_exec_pool) == len(_sub_allowed):
+                    for _tc, _res in zip(_sub_allowed, _sub_exec_pool):
+                        _sub_result_by_id[str(_tc.get("id") or "")] = _res
                 for tc in tool_calls:
                     tool_name = tc.get("tool", "")
                     args = tc.get("args", {})
-                    if tool_name not in tool_names and tool_names:
+                    _cid = str(tc.get("id") or "")
+                    if _cid in _sub_result_by_id:
+                        result = _sub_result_by_id[_cid]
+                    elif tool_name not in tool_names and tool_names:
                         result = f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
                     else:
                         try:
@@ -884,6 +905,22 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # report; the handoff itself stays compact so the orchestrator's context never
     # eats a multi-KB dump.
     return _handoff(content, name)
+
+def _subagent_execute_one(tool_call: dict, scope: str, tool_names: list) -> str:
+    """Thread-pool worker for a subagent's parallel read-only batch. Only
+    PARALLEL_SAFE tools reach this path (enforced by run_tool_calls)."""
+    tool_name = str(tool_call.get("tool", "") or "")
+    args = tool_call.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+    if tool_name not in tool_names and tool_names:
+        return f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
+    try:
+        execution = execute_tool_detailed(tool_name, args, scope=scope)
+        return str(execution.content)
+    except Exception as e:
+        return f"ERROR: {str(e)[:200]}"
+
 
 def _run_subagent_in_thread(task_id: str, name: str, task_desc: str, depth: int) -> None:
     """Run a subagent in a background thread. Sets result/error on _ASYNC_TASKS.

@@ -49,7 +49,7 @@ TOOL_DEFINITIONS = [
                 "timeout": {"type": "integer", "description": "Foreground timeout ms."},
                 "background": {"type": "boolean"},
                 "process_action": {"type": "string", "description": "'list' | 'logs' | 'kill'."},
-                "shell": {"type": "string", "description": "'bash' (default) | 'cmd'."},
+                "shell": {"type": "string", "description": "'bash' only (Git Bash 5.3.15); 'cmd' is removed — use bash."},
                 "workdir": {"type": "string", "description": "Working directory (default project root)."},
                 "expect": {"type": "string", "description": "Regex expected in output; typed pass/fail."}
             },
@@ -298,13 +298,14 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "create_project",
-        "description": "Create a NEW project: creates the folder under D:\\MyProject, registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background.",
+        "description": "Create a NEW project: creates the folder (under D:\\MyProject, or under parent_root if given), registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background. The DFD agent MUST pass parent_root (the client folder under D:\\MyProject\\DFDClientProjects) so client projects always live inside the client root.",
         "parameters": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Project/folder name. 1-64 chars; filesystem-safe — avoid '/', '\\\\', '..', control characters, and leading dots. Use kebab-case or snake_case."},
                 "concept": {"type": "string", "description": "The user's concept/goal for the project; the Dev agent starts from this."},
-                "wait": {"type": "boolean", "default": true, "description": "Wait for the Dev's first turn before returning. Use false for multi-project bursts."}
+                "wait": {"type": "boolean", "default": True, "description": "Wait for the Dev's first turn before returning. Use false for multi-project bursts."},
+                "parent_root": {"type": "string", "description": "Optional parent folder. DFD agent: the client folder under D:\\MyProject\\DFDClientProjects (enforced to stay inside it). Others: leave empty."}
             },
             "required": ["name", "concept"]
         }
@@ -329,7 +330,35 @@ TOOL_DEFINITIONS = [
                             }
                         },
                         "required": ["step", "status"],
-                        "additionalProperties": false
+                        "additionalProperties": False
+                    }
+                }
+            },
+            "required": ["plan"]
+        }
+    },
+    {
+        "name": "propose_plan",
+        "description": "Stage 4: submit a plan proposal to the user. Use ONLY in plan mode when you want the user to review and (manually) press /build to execute. Outside plan mode this tool is a no-op alias for update_plan. The agent CANNOT transition out of plan mode on its own — the user must press /build.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "explanation": {"type": "string", "description": "Short note shown above the plan (e.g. 'Here is the plan to fix the crash'). Keep to one line."},
+                "rationale": {"type": "string", "description": "Why this approach (1-3 sentences). Shown in the plan-review UI."},
+                "plan": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "string", "minLength": 1, "description": "Short, human-readable step. For settled jobs, prefix the reason when not successful."},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": False
                     }
                 }
             },
@@ -357,7 +386,7 @@ TOOL_DEFINITIONS = [
                             "images": {"type": "array", "items": {"type": "string"}, "description": "Absolute file paths of image attachments relevant to THIS item. Missing files are silently dropped, so only attach paths you have verified exist."}
                         },
                         "required": ["agent", "task"],
-                        "additionalProperties": false
+                        "additionalProperties": False
                     },
                     "examples": [
                         {
@@ -410,6 +439,16 @@ TOOL_DEFINITIONS = [
                 "task": {"type": "string", "description": "Goal, targets (files/URL/repo), acceptance check."}
             },
             "required": ["name", "task"]
+        }
+    },
+    {
+        "name": "files_changed",
+        "description": "Stage 5 (advisory): list the most recent external file changes in the active workspace. The agent can call this to notice when the user (or another tool outside this run) edits a file. Does NOT invalidate the read cache or interrupt a running tool. Requires the optional `watchfiles` package; if not installed, returns a friendly 'not available' string.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max events to return (1-50, default 5).", "minimum": 1, "maximum": 50, "default": 5}
+            }
         }
     },
     {
@@ -483,6 +522,42 @@ TOOL_DEFINITIONS = [
             "required": ["device_id"]
         }
     },
+    # -- DFD agency tools (bridge + client scaffolding) --
+    {
+        "name": "dfd_bridge",
+        "description": "Call the DFD Agency API through the agent bridge (NON-MONEY operations only): leads, orders, milestones, order notes, activities, client requests, projects, articles, WhatsApp progress messages. Never use for payments/invoices/contracts/pricing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Named endpoint: lead_list|lead_get|lead_update|order_list|order_get|order_milestones|milestone_create|milestone_update|note_create|note_update|activity_create|request_list|request_get|request_update|project_list|project_get|project_update|article_list|article_create|article_update|whatsapp_send."},
+                "id": {"type": "string", "description": "Record id for get/update endpoints."},
+                "orderId": {"type": "string", "description": "Order id for order-scoped endpoints."},
+                "payload": {"type": "object", "description": "JSON body for create/update endpoints (non-money fields only)."},
+                "path": {"type": "object", "description": "Optional path-param dict for raw url mode."},
+                "method": {"type": "string", "description": "HTTP method for raw url mode (default GET)."},
+                "url": {"type": "string", "description": "Relative URL for raw mode, e.g. '/api/agent/orders'."},
+                "timeout": {"type": "number", "description": "Request timeout seconds (default 30)."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "create_client",
+        "description": "Create a client scaffold under D:\\MyProject\\DFDClientProjects\\<slug>\\ (client.json + progress.md + mem/). REQUIRES explicit owner approval first (approved_by must be set). Never call without approval.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "business_name": {"type": "string", "description": "Client business name (slugified to folder name)."},
+                "vertical": {"type": "string", "description": "One of: fnb, salon, laundry, klinik, gym, bimbel, bengkel, beauty, travel, property, katering, photo."},
+                "features": {"type": "array", "items": {"type": "string"}, "description": "Selected features, e.g. ['online_order','booking','review_qr']."},
+                "whatsapp": {"type": "string", "description": "Client WhatsApp number."},
+                "domain": {"type": "string", "description": "Client domain (optional)."},
+                "approved_by": {"type": "string", "description": "Who approved this scaffold (must be non-empty; the DFD agent sets it after owner approval)."},
+                "order_id": {"type": "string", "description": "DFD order id this client belongs to (optional)."}
+            },
+            "required": ["business_name", "vertical"]
+        }
+    },
 ]
 
 _TOOL_DOCS = {
@@ -506,7 +581,7 @@ _TOOL_DOCS = {
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
     "template_new": "template_new(name, level, description, sample_vars, variables?, files?, uses?, notes?) — Author a new template (write .j2 files first, then metadata; auto-validates render).",
-    "create_project": "create_project(name, concept, wait?) — Create a NEW project: folder under D:\\MyProject + workspace + chat + a durable Dev agent assigned to it. ONLY for genuinely new projects requested by the user. wait=false for multi-project bursts.",
+    "create_project": "create_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
     "resume_project": "resume_project(name, message, timeout?) — One-call resume: find the project's Dev and deliver the message (replaces find_project_dev + send_message).",
     "template": "template(action, template?, category?, query?, target_dir?, variables?, overwrite?, dry_run?, quiet?) — Unified template: list/search/show/apply (replaces apply_template + template_list).",
     "update_plan": "update_plan(explanation?, plan=[{step, status}]) — Maintain the task plan. FULL replacement: always send every step. At most one step in_progress.",
@@ -515,6 +590,8 @@ _TOOL_DOCS = {
     "house_set_device": "house_set_device(device_id, state) — Actuate a device: light {power,brightness,colorTemp}, thermostat {targetTemp,mode}, lock {locked}, plug {power}, blinds {position}, camera {recording}. Sensors read-only.",
     "house_run_scene": "house_run_scene(scene_id) — Activate a scene (applies all actions at once).",
     "house_get_history": "house_get_history(device_id, hours?) — Mock hourly kWh usage series for a device (max 168h).",
+    "dfd_bridge": "dfd_bridge(action?, id?, orderId?, payload?, path?, method?, url?, timeout?) — Call the DFD Agency API bridge (NON-MONEY): leads, orders, milestones, notes, activities, client requests, projects, articles, whatsapp. Named actions (lead_list, order_get, milestone_create, note_create, activity_create, request_update, project_update, article_create, whatsapp_send) or raw method+url.",
+    "create_client": "create_client(business_name, vertical, features?, whatsapp?, domain?, approved_by?, order_id?) — Create client scaffold under D:\\MyProject\\DFDClientProjects\\<slug>\\ (client.json + progress.md + mem/). REQUIRES explicit owner approval (approved_by).",
 }
 
 _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {
@@ -559,7 +636,7 @@ _SCOPE_MAP: dict[str, list[str]] = {
     "developer": [
         "read_file", "edit_file", "run_command", "search_code",
         "template",
-        "ask_user", "update_plan",
+        "ask_user", "update_plan", "propose_plan",
         "call_subagent",
     ],
     "ui": [
@@ -572,21 +649,33 @@ _SCOPE_MAP: dict[str, list[str]] = {
         "create_project", "resume_project",
         "ask_user",
         "delegate", "delegation_status",
-        "update_plan",
+        "update_plan", "propose_plan", "files_changed",
     ],
     # General: non-coding life/work assistant. No read_file/edit_file by
     # design — document access goes through read_pdf/browser/MCP, with
     # run_command as the narrow escape hatch.
     "general": [
         "run_command", "read_pdf", "create_docx", "create_xlsx",
-        "ask_user", "update_plan", "browser_act",
+        "ask_user", "update_plan", "browser_act", "propose_plan",
+        "files_changed",
     ],
     # House: home-control specialist. Owns the house_* actuation surface;
     # read/run tools support inspection and verification. No codebase edits.
     "house": [
         "house_get_state", "house_get_device", "house_set_device",
         "house_run_scene", "house_get_history",
-        "run_command", "browser_act", "ask_user", "update_plan",
+        "run_command", "browser_act", "ask_user", "update_plan", "propose_plan",
+    ],
+    # DFD: agency manager. Bridge to the DFD site (non-money), client
+    # scaffolding (gated on approval), and project creation ONLY inside the
+    # DFD client root. No codebase edits, no money tools, no free-flying
+    # project creation.
+    "dfd": [
+        "dfd_bridge",
+        "create_client",
+        "create_project",
+        "run_command", "ask_user", "update_plan", "propose_plan",
+        "files_changed",
     ],
 }
 

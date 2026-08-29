@@ -82,18 +82,20 @@ def ask_user(questions: list, timeout: int = None) -> str:
         lines.append(f"- {a.id}: {('; '.join(parts)) if parts else '(no answer)'}")
     return "[USER ANSWERS]\n" + "\n".join(lines)
 
-def create_project(name: str, concept: str, wait: bool = True) -> str:
+def create_project(name: str, concept: str, wait: bool = True, parent_root: str = "") -> str:
     """Create a NEW project: folder + workspace + chat + durable Dev agent.
 
-    Orchestrator-only tool. Never call for work on an existing project.
+    Orchestrator/DFD-only tool. Never call for work on an existing project.
     wait=false runs the Dev's first turn in the background — use it when
     creating SEVERAL projects in one burst (they spin up in parallel).
+    parent_root: the DFD agent passes the client folder under
+    D:\\MyProject\\DFDClientProjects so client projects stay inside it.
     """
     from tools import shared_state
     from agents.project_router import create_project as _cp
     chat_id = str(shared_state.get("chat_id") or "")
     try:
-        entry = _cp(name, concept, chat_id, wait=bool(wait))
+        entry = _cp(name, concept, chat_id, wait=bool(wait), parent_root=parent_root or "")
     except Exception as e:
         return f"Error: {e}"
     if entry.get("error"):

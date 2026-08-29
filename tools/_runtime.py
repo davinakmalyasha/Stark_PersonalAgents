@@ -7,6 +7,7 @@ lazily without creating an import cycle.
 import hashlib
 import os
 import json
+import threading
 import time
 from contextvars import ContextVar
 from typing import Optional, Any
@@ -227,6 +228,10 @@ _TOOL_MTIME_MAP: dict[str, float] = {}
 
 _TOOL_CACHE_TTL = 300  # seconds
 
+# Parallel read-only tools run on a thread pool; these dicts are shared across
+# those threads, so every read-modify-write goes through one lock.
+_CACHE_LOCK = threading.RLock()
+
 def _make_tool_cache_key(tool_name: str, args: dict) -> str:
     """Create a deterministic cache key from tool name and sorted args."""
     raw = tool_name + ":" + json.dumps(args, sort_keys=True, default=str)
@@ -239,28 +244,29 @@ def _check_tool_cache(tool_name: str, args: dict) -> Optional[str]:
         return None
     now = time.time()
     key = _make_tool_cache_key(tool_name, args)
-    entry = _TOOL_RESPONSE_CACHE.get(key)
-    if entry is None:
-        return None
-    ts, result = entry
-    if now - ts > _TOOL_CACHE_TTL:
-        del _TOOL_RESPONSE_CACHE[key]
-        _TOOL_MTIME_MAP.pop(key, None)
-        return None
-    # For file-based tools, also check mtime hasn't changed
-    file_path = args.get("file_path") or args.get("path") or ""
-    if file_path:
-        actual_path = _sanitize_path(file_path)
-        if os.path.isfile(actual_path):
-            try:
-                current_mtime = os.path.getmtime(actual_path)
-                cached_mtime = _TOOL_MTIME_MAP.get(key)
-                if cached_mtime is not None and cached_mtime != current_mtime:
-                    del _TOOL_RESPONSE_CACHE[key]
-                    _TOOL_MTIME_MAP.pop(key, None)
-                    return None
-            except Exception:
-                pass
+    with _CACHE_LOCK:
+        entry = _TOOL_RESPONSE_CACHE.get(key)
+        if entry is None:
+            return None
+        ts, result = entry
+        if now - ts > _TOOL_CACHE_TTL:
+            del _TOOL_RESPONSE_CACHE[key]
+            _TOOL_MTIME_MAP.pop(key, None)
+            return None
+        # For file-based tools, also check mtime hasn't changed
+        file_path = args.get("file_path") or args.get("path") or ""
+        if file_path:
+            actual_path = _sanitize_path(file_path)
+            if os.path.isfile(actual_path):
+                try:
+                    current_mtime = os.path.getmtime(actual_path)
+                    cached_mtime = _TOOL_MTIME_MAP.get(key)
+                    if cached_mtime is not None and cached_mtime != current_mtime:
+                        del _TOOL_RESPONSE_CACHE[key]
+                        _TOOL_MTIME_MAP.pop(key, None)
+                        return None
+                except Exception:
+                    pass
     return result
 
 def _set_tool_cache(tool_name: str, args: dict, result: str) -> None:
@@ -269,26 +275,29 @@ def _set_tool_cache(tool_name: str, args: dict, result: str) -> None:
                          "template"):
         return
     key = _make_tool_cache_key(tool_name, args)
-    _TOOL_RESPONSE_CACHE[key] = (time.time(), result)
-    # Store mtime for invalidation
-    file_path = args.get("file_path") or args.get("path") or ""
-    if file_path:
-        actual_path = _sanitize_path(file_path)
-        if os.path.isfile(actual_path):
-            try:
-                _TOOL_MTIME_MAP[key] = os.path.getmtime(actual_path)
-            except Exception:
-                pass
+    with _CACHE_LOCK:
+        _TOOL_RESPONSE_CACHE[key] = (time.time(), result)
+        # Store mtime for invalidation
+        file_path = args.get("file_path") or args.get("path") or ""
+        if file_path:
+            actual_path = _sanitize_path(file_path)
+            if os.path.isfile(actual_path):
+                try:
+                    _TOOL_MTIME_MAP[key] = os.path.getmtime(actual_path)
+                except Exception:
+                    pass
 
 def _invalidate_tool_cache_all() -> None:
     """Clear all tool response cache entries (called on any file write)."""
-    _TOOL_RESPONSE_CACHE.clear()
-    _TOOL_MTIME_MAP.clear()
+    with _CACHE_LOCK:
+        _TOOL_RESPONSE_CACHE.clear()
+        _TOOL_MTIME_MAP.clear()
 
 def _invalidate_file_cache(path: str) -> None:
     """Invalidate cache entry when a file is modified."""
     key = os.path.normpath(path).lower()
-    _FILE_CACHE.pop(key, None)
+    with _CACHE_LOCK:
+        _FILE_CACHE.pop(key, None)
     # Also invalidate tool response cache since file state changed
     _invalidate_tool_cache_all()
 
@@ -350,7 +359,9 @@ def get_vfs_router() -> Any:
     active_ws = os.path.normpath(os.path.abspath(active_ws))
 
     store = active_store.get()
-    store_backend = StoreBackend(store=store) if store is not None else StoreBackend()
+    # deepagents 0.7 requires namespace factory (outside-graph direct use)
+    _mem_ns = lambda _rt: ("memories",)
+    store_backend = StoreBackend(namespace=_mem_ns, store=store) if store is not None else StoreBackend(namespace=_mem_ns)
 
     # Build routes: virtual paths (/workspace/, /memories/, /scratch/) AND
     # the active workspace as a real-filesystem route so absolute paths

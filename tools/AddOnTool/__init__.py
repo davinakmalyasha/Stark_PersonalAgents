@@ -135,6 +135,8 @@ from .delegationTools import (
     delegation_status,
 )
 
+from .dfdBridge import dfd_bridge
+
 __all__ = [
     'browser_navigate',
     '_browser_cmd',
@@ -244,4 +246,5 @@ __all__ = [
     'async_task',
     'delegate',
     'delegation_status',
+    'dfd_bridge',
 ]

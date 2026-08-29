@@ -17,6 +17,12 @@ from typing import Optional, Any
 from contextvars import ContextVar
 
 # 1. Immediate schema and registry exports (before any cross-module imports)
+from ._parallel import (
+    PARALLEL_SAFE,
+    is_parallel_safe,
+    run_tool_calls,
+    parallel_executor,
+)
 from ._schemas import (
     TOOL_DEFINITIONS,
     get_native_tools,
@@ -43,7 +49,6 @@ from ._registry import (
     _tool_cache_pre_hook,
     _tool_result_post_hook,
     validate_tool_definitions,
-    _legacy_execute_tool,
     _current_scope,
     _current_chat,
 )
@@ -63,6 +68,16 @@ from .MainTool import (
     edit_file, _write_file, read_file, search_code, run_command,
     update_plan, get_plan_for_context,
 )
+# Stage 4: propose_plan is the agent-callable plan proposal tool.
+try:
+    from .MainTool.proposePlan import propose_plan
+except Exception:
+    propose_plan = None
+# Stage 5: files_changed is the advisory file-watcher tool.
+try:
+    from .watcher import files_changed
+except Exception:
+    files_changed = None
 from .AddOnTool import (
     browser_navigate,
     _browser_cmd,
@@ -127,6 +142,83 @@ from .AddOnTool import (
     delegate,
     delegation_status,
 )
+from .AddOnTool.dfdBridge import dfd_bridge as _dfd_bridge_impl
+from agents.client_manager import create_client as _create_client_impl
+
+# DFD bridge tool (facade name == import name; registry resolves via TOOL_MAP)
+dfd_bridge = _dfd_bridge_impl
+create_client = _create_client_impl
+
+
+def _create_client_approved(business_name: str, vertical: str, features=None,
+                           whatsapp: str = "", domain: str = "", approved_by: str = "owner",
+                           order_id: str = "") -> str:
+    """DFD-agent-visible create_client: enforces owner approval before the
+    client scaffold is materialized under D:\\MyProject\\DFDClientProjects.
+
+    If ``approved_by`` is already set to a real owner approval marker, the
+    scaffold proceeds directly; otherwise an approval request is raised on
+    the Telegram channel and blocks for the owner's decision.
+    """
+    # Direct approval marker path (used after the owner already answered).
+    if (approved_by or "").strip() and approved_by not in ("owner", ""):
+        res = _create_client_impl(
+            business_name, vertical, features=features, whatsapp=whatsapp,
+            domain=domain, approved_by=approved_by, order_id=order_id,
+        )
+        if res.get("error"):
+            return f"Error: {res['error']}"
+        return (
+            f"[OK] Client scaffold created (approved by {approved_by}).\n"
+            f"Folder: {res.get('path')}\n"
+            f"Slug: {res.get('slug')}\n"
+            f"Vertical: {res.get('vertical')}"
+        )
+
+    # Approval gate: ask the owner (Telegram by default).
+    try:
+        from Telegram.dfd_approvals import request_approval
+    except Exception:
+        try:
+            from dfd_approvals import request_approval
+        except Exception:
+            return "Error: approval channel unavailable (Telegram bot not loaded). Cannot create client without owner approval."
+
+    detail = (
+        f"Business: {business_name}\n"
+        f"Vertical: {vertical}\n"
+        f"Features: {', '.join(features or []) or '(default)'}\n"
+        f"WhatsApp: {whatsapp or '-'}\n"
+        f"Domain: {domain or '-'}\n"
+        f"Order: {order_id or '-'}\n"
+        f"Target: D:\\MyProject\\DFDClientProjects\\{business_name.strip().lower().replace(' ', '-')}"
+    )
+    result = request_approval({
+        "kind": "create_client",
+        "summary": f"Create client scaffold: {business_name}",
+        "detail": detail,
+    }, channel="telegram", timeout=600, blocking=True)
+
+    if not result.get("approved"):
+        return f"Error: client scaffold not created — owner rejected or timed out. ({result.get('status', '')})"
+
+    approved_by = f"telegram:{result.get('request_id')}"
+    res = _create_client_impl(
+        business_name, vertical, features=features, whatsapp=whatsapp,
+        domain=domain, approved_by=approved_by, order_id=order_id,
+    )
+    if res.get("error"):
+        return f"Error: {res['error']}"
+    return (
+        f"[OK] Client scaffold created (approved via Telegram).\n"
+        f"Folder: {res.get('path')}\n"
+        f"Slug: {res.get('slug')}\n"
+        f"Vertical: {res.get('vertical')}"
+    )
+
+
+# Rebind create_client to the approval-gated wrapper once it's defined.
+create_client = _create_client_approved
 
 # Shared state and caching utilities
 from sync.state_sync import shared_state, safe_append_live_log

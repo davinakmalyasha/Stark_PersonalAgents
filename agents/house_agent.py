@@ -28,6 +28,7 @@ from sync.state_sync import safe_update_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
     execute_tool_detailed,
+    run_tool_calls,
     get_native_tools,
     get_native_tool_names,
     get_registry,
@@ -186,6 +187,22 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> t
     return str(response_text or ""), _normalize_calls(native_tool_calls)
 
 
+def _house_execute_one(tool_call: dict) -> str:
+    """Thread-pool worker for House's parallel read-only batch. Only
+    PARALLEL_SAFE tools reach this path (enforced by run_tool_calls). Uses the
+    module-level execute_tool_detailed so patching/mocking works identically to
+    the sequential path."""
+    tname = str(tool_call.get("tool", "") or "")
+    targs = tool_call.get("args") or {}
+    if not isinstance(targs, dict):
+        targs = {}
+    try:
+        execution = execute_tool_detailed(tname, targs, scope=_AGENT_NAME)
+        return str(execution.content)
+    except Exception as e:
+        return f"ERROR: {str(e)[:300]}"
+
+
 # ── Core loop ────────────────────────────────────────────────────────────────
 
 
@@ -202,6 +219,12 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
         get_registry().restrict_scope(_AGENT_NAME, allow=list(valid_tools))
     except Exception:
         pass
+    # Stage 4: tag the current chat for plan-mode enforcement.
+    try:
+        from tools._registry import _current_chat as _house_current_chat
+        _house_chat_token = _house_current_chat.set(chat_id or "")
+    except Exception:
+        _house_chat_token = None
 
     messages = [
         SystemMessage(content=_HOUSE_SYSTEM_TEMPLATE),
@@ -301,6 +324,21 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
             ],
         ))
 
+        # Parallel read-only execution: independent PARALLEL_SAFE calls run on a
+        # thread pool; results return in call order. Out-of-scope tools are
+        # filtered BEFORE execution (they never reach the executor). Everything
+        # else stays sequential (byte-identical to the pre-parallel path).
+        _allowed_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
+        _blocked_calls = [c for c in tool_calls if c.get("tool") not in valid_tool_set]
+        try:
+            batch_results = run_tool_calls(_allowed_calls, _house_execute_one)
+        except Exception:
+            batch_results = []
+        _house_results_by_id = {}
+        if len(batch_results) == len(_allowed_calls):
+            for _tc, _res in zip(_allowed_calls, batch_results):
+                _house_results_by_id[str(_tc.get("id") or "")] = _res
+
         for tc in tool_calls:
             tname = tc["tool"]
             targs = tc.get("args") or {}
@@ -313,6 +351,8 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
                     f"[BLOCKED] Tool '{tname}' is not available to {_AGENT_NAME}. "
                     f"Available: {', '.join(sorted(valid_tool_set))}"
                 )
+            elif str(call_id) in _house_results_by_id:
+                result_str = _house_results_by_id[str(call_id)]
             else:
                 try:
                     execution = execute_tool_detailed(tname, targs, scope=_AGENT_NAME)

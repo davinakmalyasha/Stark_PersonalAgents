@@ -10,6 +10,7 @@ from agents.it_department_nodes_base import ITState
 from tools import (
     ToolExecutionResult,
     execute_tool_detailed,
+    run_tool_calls,
     get_native_tools,
     get_native_tool_names,
     get_registry,
@@ -25,6 +26,24 @@ from memory.context_compaction import (
     get_compaction_policy,
 )
 from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
+
+
+def _execute_one_tool_call(tool_call: dict) -> str:
+    """Thread-pool worker for the parallel read-only batch. Only tools listed in
+    PARALLEL_SAFE reach this path (enforced by run_tool_calls), so it is safe to
+    run concurrently. Returns the raw tool result string; cap/offload happens at
+    the registry boundary (_tool_result_post_hook)."""
+    from tools import execute_tool_detailed
+
+    tool_name = str(tool_call.get("tool", "") or "")
+    tool_args = tool_call.get("args") or {}
+    if not tool_args or not isinstance(tool_args, dict):
+        tool_args = {k: v for k, v in tool_call.items() if k not in ("tool", "args")}
+    try:
+        execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
+        return str(execution.content)
+    except Exception as e:
+        return f"Tool execution error: {e}"
 
 def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
     """Keep a tool result small while preserving a VFS path to the full output."""
@@ -45,11 +64,26 @@ def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
         return result_text
     return auto_offload_result(result_text, tool_name, max_chars=cap)
 
+
+def _execute_one_tool_call(tool_call: dict) -> str:
+    """Thread-pool worker for the parallel read-only batch. Only tools listed in
+    PARALLEL_SAFE reach this path (enforced by run_tool_calls), so it is safe to
+    run concurrently. Returns the raw tool result string; cap/offload happens at
+    the registry boundary (_tool_result_post_hook). Uses the module-level
+    execute_tool_detailed so patching/mocking works identically to the
+    sequential path."""
+    tool_name = str(tool_call.get("tool", "") or "")
+    tool_args = tool_call.get("args") or {}
+    if not tool_args or not isinstance(tool_args, dict):
+        tool_args = {k: v for k, v in tool_call.items() if k not in ("tool", "args")}
+    try:
+        execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
+        return str(execution.content)
+    except Exception as e:
+        return f"Tool execution error: {e}"
+
 # Dev system prompt lives in developer_prompt.py (imported above).
 # Dev system prompt imported from developer_prompt.py
-
-
-
 # Dev system prompt lives in developer_prompt.py (imported above).
 
 def _build_dynamic_context(
@@ -510,6 +544,12 @@ def developer_node(s: ITState) -> dict:
     valid_tool_set = set(valid_tools)
     native_dev_tools = get_native_tools("developer")
     get_registry().restrict_scope("Developer", allow=list(valid_tools))
+    # Stage 4: tag the current chat for plan-mode enforcement.
+    try:
+        from tools._registry import _current_chat as _dev_current_chat
+        _dev_chat_token = _dev_current_chat.set(chat_id or "")
+    except Exception:
+        _dev_chat_token = None
 
     # â”€â”€ Load developer state if resuming from suspension â”€â”€
     developer_state = None
@@ -1047,6 +1087,35 @@ def developer_node(s: ITState) -> dict:
         last_tool_failed = False
         last_test_failed = False
 
+        # ── Parallel read-only execution ──
+        # The provider's tool protocol is parallel: independent read-only calls
+        # (read_file / search_code / github_* reads / web_search / template_list)
+        # run concurrently on a thread pool; results come back in call order.
+        # Out-of-scope tools are filtered BEFORE execution. Everything else
+        # (run_command, edit_file, template, browser, ask_user…) stays
+        # sequential, byte-identical to the pre-parallel path.
+        _unknown_calls = [c for c in tool_calls if c.get("tool") not in valid_tool_set]
+        _known_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
+        try:
+            from tools import run_tool_calls as _run_tool_calls
+            batch_results = _run_tool_calls(_known_calls, _execute_one_tool_call)
+        except Exception:
+            batch_results = []
+        _tool_result_map: dict[str, str] = {}
+        _tool_exec_map: dict[str, ToolExecutionResult] = {}
+        if len(batch_results) == len(_known_calls):
+            for _tc, _res in zip(_known_calls, batch_results):
+                _cid = str(_tc.get("id") or "")
+                _tool_result_map[_cid] = str(_res)
+        if _tool_result_map:
+            _tool_exec_map = {
+                str(tc.get("id") or ""): ToolExecutionResult.from_content(
+                    str(tc.get("tool", "")), tc.get("args") or {}, _tool_result_map[str(tc.get("id") or "")]
+                )
+                for tc in _known_calls
+                if str(tc.get("id") or "") in _tool_result_map
+            }
+
         for tool_call in tool_calls:
             tool_name = tool_call.get("tool", "")
             tool_args = tool_call.get("args", {})
@@ -1058,6 +1127,22 @@ def developer_node(s: ITState) -> dict:
                 tool_result = f"TOOL ERROR: Unknown tool: {tool_name}. Available tools: {', '.join(valid_tools)}"
                 tool_result_payloads.append((tool_call.get("id"), tool_name, tool_result))
                 continue
+
+            call_id = str(tool_call.get("id") or "")
+            if call_id in _tool_result_map:
+                tool_result = _tool_result_map[call_id]
+                execution = _tool_exec_map[call_id]
+            else:
+                try:
+                    execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
+                    tool_result = execution.content
+                except Exception as e:
+                    execution = ToolExecutionResult.from_content(
+                        tool_name,
+                        tool_args,
+                        f"Tool execution error: {e}",
+                    )
+                    tool_result = execution.content
 
             # â”€â”€ LoopGuard Pre-Execution Check â”€â”€
             guard_result = LoopGuard.check_pre_execute(tool_call_log, tool_name, tool_args)
@@ -1097,19 +1182,6 @@ def developer_node(s: ITState) -> dict:
             _log(f"[DEVELOPER] {tool_label}")
             import json
             _log(f"[TOOL_CALL] {tool_name}({json.dumps(tool_args)})")
-
-            try:
-                execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
-                tool_result = _bound_tool_result(tool_name, tool_args, execution.content)
-                _log(f"[TOOL OUTPUT] {tool_name}: {tool_result}")
-            except Exception as e:
-                execution = ToolExecutionResult.from_content(
-                    tool_name,
-                    tool_args,
-                    f"Tool execution error: {e}",
-                )
-                tool_result = execution.content
-                _log(f"[TOOL OUTPUT] {tool_name}: {tool_result}")
 
             # ── Failure tracking for the thinking ladder ──
             # last_tool_failed / last_test_failed are consumed by the NEXT turn's

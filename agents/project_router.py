@@ -26,6 +26,7 @@ from datetime import datetime
 
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_ROOT = r"D:\MyProject"
+DFD_CLIENTS_ROOT = r"D:\MyProject\DFDClientProjects"
 INDEX_PATH = os.path.join(SERVER_DIR, ".deep_agents", "project_agents.json")
 
 #: Creation phrasing that MUST go to the orchestrator LLM (it decides whether
@@ -61,6 +62,11 @@ def _save_index(data: dict) -> None:
         import json
         with open(INDEX_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        try:
+            from routing.cache import invalidate as _cache_invalidate
+            _cache_invalidate()
+        except Exception:
+            pass
     except Exception as e:
         print(f"[PROJECT_ROUTER] Index save error (non-fatal): {e}")
 
@@ -98,16 +104,30 @@ def _discover_from_sessions() -> list[dict]:
 
 
 def list_projects() -> list[dict]:
-    """Index entries merged with on-disk session discovery (deduped by path)."""
-    idx = _load_index()
-    by_path: dict[str, dict] = {}
-    for p in idx.get("projects", []):
-        if p.get("workspace_path"):
-            by_path[os.path.normpath(p["workspace_path"]).lower()] = p
-    for p in _discover_from_sessions():
-        if p.get("workspace_path"):
-            by_path[os.path.normpath(p["workspace_path"]).lower()] = p
-    return sorted(by_path.values(), key=lambda p: p.get("name", "").lower())
+    """Index entries merged with on-disk session discovery (deduped by path). Cached 3s."""
+    try:
+        from routing.cache import get_cached
+        def _load():
+            idx = _load_index()
+            by_path: dict[str, dict] = {}
+            for p in idx.get("projects", []):
+                if p.get("workspace_path"):
+                    by_path[os.path.normpath(p["workspace_path"]).lower()] = p
+            for p in _discover_from_sessions():
+                if p.get("workspace_path"):
+                    by_path[os.path.normpath(p["workspace_path"]).lower()] = p
+            return sorted(by_path.values(), key=lambda p: p.get("name", "").lower())
+        return get_cached(_load)
+    except Exception:
+        idx = _load_index()
+        by_path: dict[str, dict] = {}
+        for p in idx.get("projects", []):
+            if p.get("workspace_path"):
+                by_path[os.path.normpath(p["workspace_path"]).lower()] = p
+        for p in _discover_from_sessions():
+            if p.get("workspace_path"):
+                by_path[os.path.normpath(p["workspace_path"]).lower()] = p
+        return sorted(by_path.values(), key=lambda p: p.get("name", "").lower())
 
 
 def _norm(path: str) -> str:
@@ -210,6 +230,11 @@ def _update_entry_child(workspace_path: str, child_id: str, first_reply: str) ->
                     p["child_id"] = child_id
                     break
             _save_index(idx)
+            try:
+                from routing.cache import invalidate as _cache_invalidate
+                _cache_invalidate()
+            except Exception:
+                pass
     except Exception as e:
         print(f"[PROJECT_ROUTER] Background child persist error (non-fatal): {e}")
     if first_reply:
@@ -243,13 +268,186 @@ def _spawn_first_turn_background(workspace_path: str, chat_id: str, concept: str
     threading.Thread(target=_worker, daemon=True, name="project-first-turn").start()
 
 
-def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True) -> dict:
+# ── Stage 5: create_project scaffold (.gitignore + README) ──────────────────
+
+_GITIGNORE_PYTHON = """# Byte-compiled / optimized / DLLs
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.installed.cfg
+*.egg-info
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright_cache/
+
+# Environments
+.env
+.env.local
+.env.*.local
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints
+"""
+
+_GITIGNORE_NODE = """# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+
+# Environments
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Cache
+.turbo/
+.cache/
+.parcel-cache/
+"""
+
+_GITIGNORE_GENERIC = """# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environments
+.env
+.env.local
+.env.*.local
+"""
+
+_README_TEMPLATE = """# {name}
+
+> {concept}
+
+## Getting started
+
+This project was scaffolded by the LangChain agent harness. Replace this
+README with project-specific setup, usage, and architecture notes.
+"""
+
+
+def _detect_language(path: str) -> str:
+    """Heuristic: scan one level of the new folder for source files and
+    return `python`, `node`, or `generic`. Only looks at common extensions
+    and is deliberately conservative."""
+    try:
+        for entry in os.listdir(path):
+            full = os.path.join(path, entry)
+            if not os.path.isfile(full):
+                continue
+            if entry.endswith((".py", ".pyi")):
+                return "python"
+            if entry.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+                return "node"
+    except OSError:
+        pass
+    return "node"  # default per user direction
+
+
+def _scaffold_gitignore_and_readme(path: str, name: str, concept: str) -> None:
+    """Drop a language-appropriate `.gitignore` and a `README.md`. Skips
+    both files if they already exist (so a user who pre-populated the
+    folder isn't overwritten)."""
+    gitignore_path = os.path.join(path, ".gitignore")
+    if not os.path.isfile(gitignore_path):
+        lang = _detect_language(path)
+        if lang == "python":
+            content = _GITIGNORE_PYTHON
+        elif lang == "node":
+            content = _GITIGNORE_NODE
+        else:
+            content = _GITIGNORE_GENERIC
+        with open(gitignore_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    readme_path = os.path.join(path, "README.md")
+    if not os.path.isfile(readme_path):
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(_README_TEMPLATE.format(name=name, concept=concept or "(no concept provided)"))
+
+
+def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True, parent_root: str = "") -> dict:
     """Create a project folder + workspace + chat + durable Dev child.
 
-    ONLY the orchestrator LLM calls this (via the ``create_project`` tool).
-    ``wait=False`` registers everything and runs the Dev's first turn in the
-    background — use it when creating SEVERAL projects in one burst so they
-    spin up in parallel. Returns an error dict on invalid input.
+    ONLY the orchestrator LLM (or the DFD agent, inside a client root) calls
+    this (via the ``create_project`` tool). ``wait=False`` registers
+    everything and runs the Dev's first turn in the background — use it when
+    creating SEVERAL projects in one burst so they spin up in parallel.
+    Returns an error dict on invalid input.
+
+    ``parent_root`` — if provided, the project folder is created under it
+    instead of the default ``D:\\MyProject`` root. The DFD agent passes the
+    client folder ``D:\\MyProject\\DFDClientProjects\\<slug>\\`` so client
+    projects ALWAYS live inside the fixed client root.
     """
     safe = _sanitize_name(name)
     if not safe:
@@ -257,7 +455,15 @@ def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True
     if safe.lower() in ("general", "_general"):
         return {"error": "'General' is reserved for the general chat workspace."}
 
-    path = os.path.join(PROJECTS_ROOT, safe)
+    # Scope guard: if a parent_root is requested, it MUST be under the DFD
+    # client root. Never create coding workspaces outside it for client work.
+    if parent_root:
+        client_root = os.path.normpath(DFD_CLIENTS_ROOT).lower()
+        norm_parent = os.path.normpath(parent_root).lower()
+        if not norm_parent.startswith(client_root + os.sep):
+            return {"error": f"create_project parent_root must be inside {DFD_CLIENTS_ROOT}; got '{parent_root}'."}
+
+    path = os.path.join(parent_root or PROJECTS_ROOT, safe)
     created_folder = False
     try:
         if os.path.exists(path) and not os.path.isdir(path):
@@ -311,6 +517,15 @@ def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True
         except Exception as e:
             print(f"[PROJECT_ROUTER] git init skipped for {path}: {e}")
 
+        # Stage 5: drop a language-appropriate .gitignore + a README.md.
+        # Detected from the first source-file extension found in the new
+        # folder (default: Node/Next). Fails silently — the user can
+        # always replace them.
+        try:
+            _scaffold_gitignore_and_readme(path, safe, concept)
+        except Exception as e:
+            print(f"[PROJECT_ROUTER] scaffold skipped for {path}: {e}")
+
     if wait:
         try:
             from agents.subagent_manager import start_continuable
@@ -337,6 +552,16 @@ def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True
     else:
         _spawn_first_turn_background(path, chat["id"], concept)
         entry["background"] = True
+
+    # Register the project onto its client index entry when created inside a
+    # DFD client root (best-effort; non-fatal).
+    if parent_root:
+        try:
+            from agents.client_manager import add_project_to_client
+            slug = os.path.basename(os.path.normpath(parent_root))
+            add_project_to_client(slug, safe, path)
+        except Exception:
+            pass
 
     return entry
 

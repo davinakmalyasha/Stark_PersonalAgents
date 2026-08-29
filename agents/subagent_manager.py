@@ -29,7 +29,7 @@ import uuid
 from collections import deque
 from typing import Any, Optional
 
-from session_log import SessionManager, get_session, session_dir_for
+from server.session.log import SessionManager, get_session, session_dir_for
 
 _ACTIVATIONS: dict[str, dict[str, Any]] = {}
 _ACTIVATIONS_LOCK = threading.RLock()
@@ -192,7 +192,7 @@ def _run_turn(
                        active_permissions, _TASK_DEPTH, active_tool_scope,
                        get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents,
                        _current_chat)
-    from session_log import convert_to_llm
+    from server.session.log import convert_to_llm
 
     with act["lock"]:
         act["status"] = "running"
@@ -634,3 +634,4 @@ def reset_manager() -> None:
     """Test helper."""
     with _ACTIVATIONS_LOCK:
         _ACTIVATIONS.clear()
+

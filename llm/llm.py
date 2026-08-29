@@ -1,10 +1,11 @@
-"""
-LLM Invocation — DeepSeek-only with model-level fallback.
+﻿"""
+LLM Invocation â€” DeepSeek-only with model-level fallback.
 Uses the OpenAI-compatible DeepSeek API at https://api.deepseek.com.
 """
 import json
 import os
 import time
+import threading
 from typing import Any, Optional, Type, TypeVar
 
 from dotenv import load_dotenv
@@ -54,7 +55,7 @@ class StrWithMetadata(str):
         return obj
 
 from llm.llm_stats import TokenUsageTracker, update_token_stats
-# rate_limiter removed — no artificial API throttling. The model decides pacing.
+# rate_limiter removed â€” no artificial API throttling. The model decides pacing.
 
 load_dotenv(override=True)
 T = TypeVar("T", bound=BaseModel)
@@ -100,7 +101,7 @@ def log_terminal(msg: str) -> None:
             safe = msg.encode("ascii", errors="replace").decode()
             print(safe, flush=True)
         except OSError:
-            pass  # console is gone — log to shared_state only
+            pass  # console is gone â€” log to shared_state only
     try:
         from sync.state_sync import safe_append_live_log
         safe_append_live_log(msg)
@@ -162,8 +163,6 @@ def _extract_native_tool_calls(res) -> list[dict]:
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Single persisted location: root .deep_agents (shared with every other settings file).
 _LLM_PROVIDER_FILE = os.path.join(_PROJECT_ROOT, ".deep_agents", "llm_provider.json")
-# Pre-unification twin written beside this module by older builds; adopted once, then retired.
-_LEGACY_LLM_PROVIDER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deep_agents", "llm_provider.json")
 
 
 def _load_persisted_provider() -> str:
@@ -173,20 +172,6 @@ def _load_persisted_provider() -> str:
         if os.path.isfile(_LLM_PROVIDER_FILE):
             with open(_LLM_PROVIDER_FILE, encoding="utf-8") as f:
                 return (json.load(f).get("provider") or "").strip().lower()
-    except Exception:
-        pass
-    # Legacy twin: migrate its value forward exactly once.
-    try:
-        if os.path.isfile(_LEGACY_LLM_PROVIDER_FILE):
-            with open(_LEGACY_LLM_PROVIDER_FILE, encoding="utf-8") as f:
-                legacy = (json.load(f).get("provider") or "").strip().lower()
-            if legacy and not os.path.isfile(_LLM_PROVIDER_FILE):
-                _save_persisted_provider(legacy)
-                try:
-                    os.replace(_LEGACY_LLM_PROVIDER_FILE, _LEGACY_LLM_PROVIDER_FILE + ".migrated")
-                except OSError:
-                    pass
-            return legacy
     except Exception:
         pass
     return ""
@@ -204,8 +189,8 @@ def _save_persisted_provider(provider: str) -> None:
 def _resolve_llm_provider() -> dict:
     """Return {base, key, flash, pro} for the active LLM provider.
 
-    Resolution order: shared_state['llm_provider'] (running server / UI) → persisted file
-    (survives subprocesses and restarts) → env default. "opencode" routes paid DeepSeek calls
+    Resolution order: shared_state['llm_provider'] (running server / UI) â†’ persisted file
+    (survives subprocesses and restarts) â†’ env default. "opencode" routes paid DeepSeek calls
     through OpenCode Go (https://opencode.ai/zen/go/v1, OPENCODE_API_KEY); anything else uses the
     direct DeepSeek API (or DEEPSEEK_BASE_URL if set). Pro maps to flash on OpenCode.
     """
@@ -219,7 +204,7 @@ def _resolve_llm_provider() -> dict:
         provider = _load_persisted_provider()
 
     if provider == "command":
-        # Command Code Provider API — OpenAI/Anthropic-compatible gateway.
+        # Command Code Provider API â€” OpenAI/Anthropic-compatible gateway.
         # Official endpoint by default; COMMAND_CODE_BASE_URL can point at any
         # compatible gateway/proxy. Model slots are org-scoped catalog slugs;
         # every one is env-overridable without code changes.
@@ -229,11 +214,12 @@ def _resolve_llm_provider() -> dict:
             "flash": os.getenv("COMMAND_CODE_MODEL_FLASH", "deepseek/deepseek-v4-flash"),
             "pro": os.getenv("COMMAND_CODE_MODEL_PRO", "deepseek/deepseek-v4-pro"),
             "vision": os.getenv("COMMAND_CODE_MODEL_VISION", "deepseek/deepseek-v4-flash-vision-exp"),
-            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "laguna-s-2.1-free"),
+            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "xiaomi/mimo-v2.5"),
             "light": os.getenv("COMMAND_CODE_MODEL_LIGHT", "laguna-s-2.1-free"),
+            "audio": os.getenv("COMMAND_CODE_MODEL_AUDIO", "xiaomi/mimo-v2.5"),
         }
     if provider == "opencode":
-        # Go subscription endpoint — /zen/v1 is the generic/pay-per-use route that has no
+        # Go subscription endpoint â€” /zen/v1 is the generic/pay-per-use route that has no
         # balance for paid models (returns "Insufficient balance" even with an active Go sub).
         return {
             "base": os.getenv("DEEPSEEK_BASE_URL", "https://opencode.ai/zen/go/v1"),
@@ -257,7 +243,7 @@ def _map_model(model: str) -> str:
     cfg = _resolve_llm_provider()
     if "/" in model:
         # Org-scoped slug (e.g. "deepseek/deepseek-v4-flash", "laguna-s-2.1-free")
-        # is already provider-specific — pass through untouched.
+        # is already provider-specific â€” pass through untouched.
         return model
     if model == "deepseek-v4-flash":
         return cfg["flash"]
@@ -267,7 +253,17 @@ def _map_model(model: str) -> str:
         # Per-provider vision slot: same slug on the DeepSeek API and OpenCode
         # Go listings; the command gateway names its own.
         return cfg.get("vision") or DEEPSEEK_MODEL_VISION
+    if model == "deepseek-v4-audio":
+        # Per-provider audio slot (MiMo): only the command gateway defines one.
+        return cfg.get("audio") or "xiaomi/mimo-v2.5"
     return model
+
+
+# ── Prefix-cache thinking pins (Phase 7): first-used thinking config per
+# (role, model) is frozen for the process so DeepSeek's implicit byte-prefix
+# cache is never busted by mid-conversation enabled↔disabled flips.
+_THINKING_PINS: dict = {}
+_THINKING_PINS_LOCK = threading.Lock()
 
 
 def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, response_format: Optional[dict] = None, tools: Optional[list[dict]] = None, reasoning_effort: Optional[str] = None, reasoning_budget: Optional[int] = None, messages: Optional[list] = None) -> BaseChatModel:
@@ -282,7 +278,7 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
             "gateway / COMMAND_CODE_API_KEY for Command Code)."
         )
 
-    # No per-call max_tokens — the model decides how much to output.
+    # No per-call max_tokens â€” the model decides how much to output.
     # The context compaction system handles the window, the LLM handles pacing.
 
     kwargs: dict[str, Any] = {
@@ -341,6 +337,36 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
             kwargs["reasoning_effort"] = "high"
         else:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
+    # ── Prefix-cache freeze (Phase 7): DeepSeek's prefix cache is keyed per
+    # thinking config (developer_agent.py:745). Flipping enabled→disabled mid-
+    # conversation busts the whole cached prefix (-4.7k tokens/turn). Pin the
+    # FIRST thinking config used for each (role, model) for the process lifetime
+    # so a role's per-iteration effort ladders never toggle the extra_body.
+    try:
+        _pin_key = (role or "", model or "")
+        with _THINKING_PINS_LOCK:
+            if _pin_key not in _THINKING_PINS:
+                _THINKING_PINS[_pin_key] = dict(kwargs.get("extra_body") or {})
+            else:
+                pinned = _THINKING_PINS[_pin_key]
+                if pinned:
+                    kwargs["extra_body"] = dict(pinned)
+                # reasoning_effort is a top-level param, not in extra_body:
+                # keep the pin's enabled/disabled decision but drop any budget
+                # drift (budget_tokens only inside extra_body.thinking).
+                cur = dict(kwargs.get("extra_body") or {})
+                thinking_type = (cur.get("thinking") or {}).get("type")
+                pinned_type = (pinned.get("thinking") or {}).get("type")
+                if thinking_type is not None and pinned_type is not None and thinking_type != pinned_type:
+                    kwargs["extra_body"] = dict(pinned)
+                elif pinned.get("thinking") and cur.get("thinking"):
+                    # Same type: merge, keep the pinned budget.
+                    merged = dict(cur)
+                    merged["thinking"] = dict(pinned["thinking"])
+                    kwargs["extra_body"] = merged
+    except Exception:
+        pass
 
     return ChatOpenAI(**kwargs)
 
@@ -422,30 +448,47 @@ def _effective_stream_chat_id() -> str:
 
 
 class ConcurrencyThrottle:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.active_requests = 0
-        self.max_concurrency = 4
-        self.cooldown_until = 0.0
-        
-    def acquire(self):
-        # Spin/wait if active requests exceed limit
-        while True:
-            with self.lock:
-                now = time.time()
-                limit = 1 if now < self.cooldown_until else self.max_concurrency
-                if self.active_requests < limit:
-                    self.active_requests += 1
-                    break
-            time.sleep(0.1)
-            
+    """Async-native concurrency gate (Phase 7): asyncio.Semaphore instead of
+    the spin-lock. Sync callers (deepagents graph, legacy invoke paths) use
+    `.acquire_sync()` which parks the thread on a threading.Event rather than
+    burning CPU with time.sleep(0.1)."""
+    def __init__(self, max_concurrency: int = 4):
+        import asyncio
+        self.max_concurrency = max_concurrency
+        self._sem = asyncio.Semaphore(max_concurrency)
+        self._sync_sem = threading.Semaphore(max_concurrency)
+        self._cooldown_until = 0.0
+        self._cooldown_lock = threading.Lock()
+
+    def _in_cooldown(self) -> bool:
+        with self._cooldown_lock:
+            return time.time() < self._cooldown_until
+
+    async def acquire(self):
+        # Cooldown after a rate-limit: only one request may run for its duration.
+        import asyncio
+        while self._in_cooldown():
+            await asyncio.sleep(0.1)
+        await self._sem.acquire()
+
     def release(self):
-        with self.lock:
-            self.active_requests = max(0, self.active_requests - 1)
-            
+        import asyncio
+        self._sem.release()
+
+    def acquire_sync(self):
+        if self._in_cooldown():
+            # Park the thread briefly instead of a hot spin.
+            import time as _t
+            while self._in_cooldown():
+                _t.sleep(0.1)
+        self._sync_sem.acquire()
+
+    def release_sync(self):
+        self._sync_sem.release()
+
     def trigger_cooldown(self, duration=30):
-        with self.lock:
-            self.cooldown_until = time.time() + duration
+        with self._cooldown_lock:
+            self._cooldown_until = time.time() + duration
 
 _throttle = ConcurrencyThrottle()
 
@@ -512,7 +555,7 @@ def _parse_retry_after(err_str: str) -> int:
 
 
 def _is_context_overflow(err_str: str) -> bool:
-    """Context-window errors can never be fixed by retrying — report and move on."""
+    """Context-window errors can never be fixed by retrying â€” report and move on."""
     low = err_str.lower()
     markers = (
         "context length", "context window", "maximum context", "max context",
@@ -544,7 +587,7 @@ def _is_retryable_http_error(err_str: str) -> bool:
     if _is_context_overflow(err_str):
         return False
     low = err_str.lower()
-    # Permanent client errors — never retry
+    # Permanent client errors â€” never retry
     if any(p in low for p in _NON_RETRYABLE_PATTERNS):
         return False
     import re
@@ -570,10 +613,10 @@ def _log_cache_debug(
     reasoning_effort: Optional[str] = None,
     reasoning_budget: Optional[int] = None,
 ) -> None:
-    """CF3: CACHE_DEBUG=1 → log a payload-content hash + cache tokens per call.
+    """CF3: CACHE_DEBUG=1 â†’ log a payload-content hash + cache tokens per call.
 
     DeepSeek prefix caching is a byte-prefix match. If cache_hit stays 0 across
-    repeated calls with identical prefixes, a silent invalidator is at work —
+    repeated calls with identical prefixes, a silent invalidator is at work â€”
     compare payload_sha between two requests to find the changing bytes.
     """
     if os.environ.get("CACHE_DEBUG", "0") != "1":
@@ -679,14 +722,14 @@ def invoke_with_fallback(
             llm = _get_deepseek_client(model, selected_temp, role, response_format=response_format, messages=messages)
             tracker = TokenUsageTracker()
 
-            _throttle.acquire()
+            _throttle.acquire_sync()
             try:
                 res = llm.invoke(
                     messages,
                     config={"callbacks": [tracker]},
                 )
             finally:
-                _throttle.release()
+                _throttle.release_sync()
             reasoning = res.additional_kwargs.get("reasoning_content") if hasattr(res, "additional_kwargs") else None
             if reasoning:
                 log_terminal(f"\n[{role} THOUGHTS] >> {reasoning}\n")
@@ -714,11 +757,11 @@ def invoke_with_fallback(
                     import re as _re
                     tools_called = _re.findall(r'"tool":\s*"(\w+)"', val_str)
                     if tools_called:
-                        safe_append_live_log(f"  → Tools: {', '.join(tools_called)}")
+                        safe_append_live_log(f"  â†’ Tools: {', '.join(tools_called)}")
                     elif len(val_str) < 200:
                         safe_append_live_log(val_str)
                     else:
-                        safe_append_live_log(f"  → Response: {len(val_str)} chars")
+                        safe_append_live_log(f"  â†’ Response: {len(val_str)} chars")
             except Exception:
                 pass
 
@@ -735,7 +778,7 @@ def invoke_with_fallback(
                 for attempt in range(3):
                     wait = _handle_rate_limit(err_str, attempt)
                     log_terminal(
-                        f"[{model}] Transient error, retrying (attempt {attempt+1}/3) — waiting {wait}s...\n"
+                        f"[{model}] Transient error, retrying (attempt {attempt+1}/3) â€” waiting {wait}s...\n"
                     )
                     time.sleep(wait)
                     try:
@@ -757,14 +800,14 @@ def invoke_with_fallback(
                         ]
                         llm = _get_deepseek_client(model, selected_temp, role, response_format=response_format, messages=retry_msgs)
                         tracker = TokenUsageTracker()
-                        _throttle.acquire()
+                        _throttle.acquire_sync()
                         try:
                             res = llm.invoke(
                                 retry_msgs,
                                 config={"callbacks": [tracker]},
                             )
                         finally:
-                            _throttle.release()
+                            _throttle.release_sync()
                         reasoning = res.additional_kwargs.get("reasoning_content") if hasattr(res, "additional_kwargs") else None
                         if reasoning:
                             log_terminal(f"\n[{role} THOUGHTS] >> {reasoning}\n")
@@ -987,9 +1030,10 @@ def _prepare_llm_call(
                     new_content = str(last_content) + guideline
                 trimmed_messages[-1] = type(last_msg)(content=new_content, **kwargs)
 
-    # ── Vision auto-switch ────────────────────────────────────────────────────
+
+    # â”€â”€ Vision auto-switch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # If any message carries an image part and the queued head model cannot see
-    # images, swap the ENTIRE queue to the vision model for THIS call only —
+    # images, swap the ENTIRE queue to the vision model for THIS call only â€”
     # text models would hard-400 on images, so falling back to them after a
     # vision failure is pointless. Next text-only turn reverts to the normal
     # queue automatically. Single vision model by design (premium/experimental);
@@ -999,9 +1043,10 @@ def _prepare_llm_call(
             vision_model = _map_model(DEEPSEEK_MODEL_VISION)
             if supports_vision(vision_model):
                 queue = [{"provider": "deepseek", "model": vision_model}]
-                log_terminal(f"[LLM] Images present → routed to {vision_model}")
+                log_terminal(f"[LLM] Images present â†’ routed to {vision_model}")
     except Exception:
         pass
+
 
     return queue, trimmed_messages, selected_temp
 
@@ -1011,7 +1056,7 @@ def _stream_emit(chat_id: str, kind: str, text: str, agent: str = "", model: str
     if not text:
         return
     try:
-        from stream_bus import emit as _bus_emit
+        from server.realtime.bus import emit as _bus_emit
         _bus_emit(chat_id, kind, text, agent=agent, model=model)
     except Exception:
         pass
@@ -1031,13 +1076,13 @@ def invoke_messages_with_fallback_stream(
     """Streaming variant of invoke_messages_with_fallback.
 
     Emits text/reasoning deltas into the shared StreamBus (chat-scoped) so the
-    API server can forward them as SSE ``delta`` frames — the frontend shows the
+    API server can forward them as SSE ``delta`` frames â€” the frontend shows the
     reply as it is generated (P10). Returns the EXACT same result shape as the
     non-streaming variant; if streaming fails for any reason, this falls back to
     the non-streaming path for that call (zero behavior change when disabled).
     """
     try:
-        from stream_bus import enabled as _stream_bus_enabled
+        from server.realtime.bus import enabled as _stream_bus_enabled
         if not _stream_bus_enabled():
             return invoke_messages_with_fallback(
                 role, messages, temp=temp, where=where, schema=schema, tools=tools,
@@ -1084,14 +1129,14 @@ def invoke_messages_with_fallback_stream(
             # Ask the provider to include usage in the final streamed chunk.
             llm.stream_usage = True
         except Exception as _usage_e:
-            # stream_usage unsupported on this client — usage falls back to
+            # stream_usage unsupported on this client â€” usage falls back to
             # the token tracker callbacks.
-            print(f"[llm] stream_usage not supported ({_usage_e}) — using callback usage.")
+            print(f"[llm] stream_usage not supported ({_usage_e}) â€” using callback usage.")
         tracker = TokenUsageTracker()
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_chunks: list[dict] = []
-        _throttle.acquire()
+        _throttle.acquire_sync()
         try:
             for chunk in llm.stream(trimmed_messages, config={"callbacks": [tracker]}):
                 delta = getattr(chunk, "content", None)
@@ -1118,7 +1163,7 @@ def invoke_messages_with_fallback_stream(
                     if tc.get("args"):
                         tool_chunks[idx]["args"] += tc["args"]
         finally:
-            _throttle.release()
+            _throttle.release_sync()
         text = "".join(text_parts)
         reasoning = "".join(reasoning_parts) or None
         if not text and reasoning:
@@ -1155,7 +1200,7 @@ def invoke_messages_with_fallback_stream(
                 if native_tool_calls:
                     return (text or "", native_tool_calls, reasoning)
                 elif text:
-                    return (text, [], reasoning)  # Text response, no tool calls — agent is done
+                    return (text, [], reasoning)  # Text response, no tool calls â€” agent is done
                 else:
                     log_terminal(f"[{m}] Empty response, trying next...\n")
             else:
@@ -1179,7 +1224,7 @@ def invoke_messages_with_fallback_stream(
                 for attempt in range(3):
                     wait = _handle_rate_limit(err_str, attempt)
                     log_terminal(
-                        f"[{m}] Transient error, retrying (attempt {attempt+1}/3) — waiting {wait}s...\n"
+                        f"[{m}] Transient error, retrying (attempt {attempt+1}/3) â€” waiting {wait}s...\n"
                     )
                     time.sleep(wait)
                     try:
@@ -1219,10 +1264,10 @@ def invoke_messages_with_fallback_stream(
                         if not _is_retryable_http_error(err_str):
                             break
 
-            # P10: streaming failed (non-transient) — fall back to the plain
+            # P10: streaming failed (non-transient) â€” fall back to the plain
             # non-streaming path for THIS call. If the API is genuinely down,
             # the fallback raises the same exhaustion error.
-            log_terminal(f"[{m}] Streaming failed ({err_str[:120]}) — falling back to non-streaming.")
+            log_terminal(f"[{m}] Streaming failed ({err_str[:120]}) â€” falling back to non-streaming.")
             return invoke_messages_with_fallback(
                 role, messages, temp=temp, where=where, schema=schema, tools=tools,
                 reasoning_effort=reasoning_effort, reasoning_budget=reasoning_budget, model=model,
@@ -1268,11 +1313,11 @@ def invoke_messages_with_fallback(
             response_format = {"type": "json_object"} if schema is not None else None
             llm = _get_deepseek_client(model, selected_temp, role, response_format=response_format, tools=tools, reasoning_effort=reasoning_effort, reasoning_budget=reasoning_budget, messages=trimmed_messages)
             tracker = TokenUsageTracker()
-            _throttle.acquire()
+            _throttle.acquire_sync()
             try:
                 res = llm.invoke(trimmed_messages, config={"callbacks": [tracker]})
             finally:
-                _throttle.release()
+                _throttle.release_sync()
             reasoning = res.additional_kwargs.get("reasoning_content") if hasattr(res, "additional_kwargs") else None
             if reasoning:
                 log_terminal(f"\n[{role} THOUGHTS] >> {reasoning}\n")
@@ -1299,7 +1344,7 @@ def invoke_messages_with_fallback(
                 if native_tool_calls:
                     return (val or "", native_tool_calls, reasoning)
                 elif val:
-                    return (val, [], reasoning)  # Text response, no tool calls — agent is done
+                    return (val, [], reasoning)  # Text response, no tool calls â€” agent is done
                 else:
                     log_terminal(f"[{model}] Empty response, trying next...\n")
             else:
@@ -1323,20 +1368,20 @@ def invoke_messages_with_fallback(
                 for attempt in range(3):
                     wait = _handle_rate_limit(err_str, attempt)
                     log_terminal(
-                        f"[{model}] Transient error, retrying (attempt {attempt+1}/3) — waiting {wait}s...\n"
+                        f"[{model}] Transient error, retrying (attempt {attempt+1}/3) â€” waiting {wait}s...\n"
                     )
                     time.sleep(wait)
                     try:
                         response_format = {"type": "json_object"} if schema is not None else None
                         llm = _get_deepseek_client(model, selected_temp, role, response_format=response_format, tools=tools, reasoning_effort=reasoning_effort, reasoning_budget=reasoning_budget, messages=trimmed_messages)
                         tracker = TokenUsageTracker()
-                        _throttle.acquire()
+                        _throttle.acquire_sync()
                         try:
                             res = llm.invoke(
                                 trimmed_messages, config={"callbacks": [tracker]}
                             )
                         finally:
-                            _throttle.release()
+                            _throttle.release_sync()
                         reasoning = res.additional_kwargs.get("reasoning_content") if hasattr(res, "additional_kwargs") else None
                         if reasoning:
                             log_terminal(f"\n[{role} THOUGHTS] >> {reasoning}\n")
@@ -1382,4 +1427,6 @@ def invoke_messages_with_fallback(
         f"Errors: {detail}. "
         "Check your DEEPSEEK_API_KEY and account balance at https://platform.deepseek.com."
     )
+
+
 

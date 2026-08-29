@@ -48,7 +48,7 @@ MODES = ("free", "deepseek", "opencode", "command")
 _CANONICAL_VISION = "deepseek-v4-flash-vision-exp"
 _CANONICAL_FLASH = "deepseek-v4-flash"
 
-_COMMAND_ORCH_MODEL_DEFAULT = "laguna-s-2.1-free"
+_COMMAND_ORCH_MODEL_DEFAULT = "xiaomi/mimo-v2.5"
 _COMMAND_LIGHT_MODEL_DEFAULT = "laguna-s-2.1-free"
 
 MODE_MATRIX: dict[str, dict[str, dict]] = {
@@ -73,6 +73,7 @@ MODE_MATRIX: dict[str, dict[str, dict]] = {
             "model_env": "COMMAND_CODE_MODEL_ORCH",
             "model": _COMMAND_ORCH_MODEL_DEFAULT,
             "iter_effort": "low",
+            "supports_audio": True,
         },
         "workspace": {"backend": "paid", "model": _CANONICAL_FLASH, "iter_effort": "high"},
         "specialist": {

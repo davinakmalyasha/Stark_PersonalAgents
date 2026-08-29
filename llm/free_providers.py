@@ -1,4 +1,4 @@
-"""
+﻿"""
 free_providers.py --- Multi-provider free LLM transport (zero cost).
 
 Engine extracted from the retired FreeProviders agent: provider configs, rate
@@ -378,7 +378,7 @@ PROVIDER_CONFIGS = {
 
 # Each model entry: {id, provider, name, capabilities[], context, priority}
 MODEL_CATALOG = [
-    # ── OpenRouter ──
+    # â”€â”€ OpenRouter â”€â”€
     {"id": "openrouter/free", "provider": "openrouter", "name": "Free Models Router (auto)",
      "capabilities": ["text", "vision", "coding", "reasoning"], "context": 200000, "priority": 1},
     {"id": "inclusionai/ling-3.0-flash:free", "provider": "openrouter", "name": "Ling 3.0 Flash",
@@ -388,7 +388,7 @@ MODEL_CATALOG = [
     {"id": "cohere/north-mini-code:free", "provider": "openrouter", "name": "North Mini Code",
      "capabilities": ["text", "coding"], "context": 256000, "priority": 8},
 
-    # ── Groq (excluded: allam-2-7b, gemma-3) ──
+    # â”€â”€ Groq (excluded: allam-2-7b, gemma-3) â”€â”€
     {"id": "llama-3.3-70b-versatile", "provider": "groq", "name": "Llama 3.3 70B",
      "capabilities": ["text", "reasoning"], "context": 131072, "priority": 1},
     {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "provider": "groq", "name": "Llama 4 Scout 17B",
@@ -400,13 +400,13 @@ MODEL_CATALOG = [
     {"id": "moonshotai/kimi-k2-instruct", "provider": "groq", "name": "Kimi K2 Instruct",
      "capabilities": ["text", "reasoning"], "context": 131072, "priority": 10},
 
-    # ── Google AI Studio / Gemini (free Flash models only) ──
+    # â”€â”€ Google AI Studio / Gemini (free Flash models only) â”€â”€
     {"id": "gemini-3.6-flash", "provider": "google", "name": "Gemini 3.6 Flash",
      "capabilities": ["text", "vision", "coding"], "context": 1000000, "priority": 1},
     {"id": "gemini-3.5-flash", "provider": "google", "name": "Gemini 3.5 Flash",
      "capabilities": ["text", "vision", "coding"], "context": 1000000, "priority": 2},
 
-    # ── Mistral AI ──
+    # â”€â”€ Mistral AI â”€â”€
     {"id": "mistral-medium-3.5", "provider": "mistral", "name": "Mistral Medium 3.5",
      "capabilities": ["text", "vision", "reasoning"], "context": 256000, "priority": 1},
     {"id": "mistral-large-3-2512", "provider": "mistral", "name": "Mistral Large 3",
@@ -414,7 +414,7 @@ MODEL_CATALOG = [
     {"id": "codestral-2508", "provider": "mistral", "name": "Codestral",
      "capabilities": ["text", "coding"], "context": 256000, "priority": 4},
 
-    # ── NVIDIA NIM (excluded: phi-3-mini) ──
+    # â”€â”€ NVIDIA NIM (excluded: phi-3-mini) â”€â”€
     {"id": "deepseek-ai/deepseek-v4-pro", "provider": "nvidia", "name": "DeepSeek V4 Pro",
      "capabilities": ["text", "coding", "reasoning"], "context": 1000000, "priority": 1},
     {"id": "deepseek-ai/deepseek-v4-flash", "provider": "nvidia", "name": "DeepSeek V4 Flash",
@@ -438,13 +438,13 @@ MODEL_CATALOG = [
     {"id": "nvidia/kimi-k2.6", "provider": "nvidia", "name": "Kimi K2.6",
      "capabilities": ["text", "vision", "coding"], "context": 262144, "priority": 19},
 
-    # ── Z.ai / GLM (free Flash models) ──
+    # â”€â”€ Z.ai / GLM (free Flash models) â”€â”€
     {"id": "GLM-4.7-Flash", "provider": "zhipu", "name": "GLM 4.7 Flash",
      "capabilities": ["text", "coding"], "context": 131072, "priority": 1},
     {"id": "GLM-4.6V-Flash", "provider": "zhipu", "name": "GLM 4.6V Flash",
      "capabilities": ["text", "vision"], "context": 131072, "priority": 3},
 
-    # ── OpenCode (free tier) ──
+    # â”€â”€ OpenCode (free tier) â”€â”€
     {"id": "deepseek-v4-flash-free", "provider": "opencode", "name": "DeepSeek V4 Flash (free)",
      "capabilities": ["text", "coding"], "context": 200000, "priority": 1},
     {"id": "big-pickle", "provider": "opencode", "name": "Big Pickle (stealth / DS V4)",
@@ -456,7 +456,7 @@ MODEL_CATALOG = [
     {"id": "nemotron-3-ultra-free", "provider": "opencode", "name": "Nemotron 3 Ultra (free)",
      "capabilities": ["text", "reasoning"], "context": 200000, "priority": 6},
 
-    # ── Cline (usage-billing, free tier; verified serving deepseek-v4-flash-0731) ──
+    # â”€â”€ Cline (usage-billing, free tier; verified serving deepseek-v4-flash-0731) â”€â”€
     {"id": "deepseek/deepseek-v4-flash", "provider": "cline", "name": "DeepSeek V4 Flash 0731 (free)",
      "capabilities": ["text", "coding"], "context": 1000000, "priority": 1},
     {"id": "stepfun/step-3.7-flash", "provider": "cline", "name": "Step 3.7 Flash (free)",
@@ -464,7 +464,7 @@ MODEL_CATALOG = [
     {"id": "poolside/laguna-s-2.1:free", "provider": "cline", "name": "Laguna S 2.1 (free)",
      "capabilities": ["text", "coding"], "context": 131072, "priority": 3},
 
-    # ── Kilo Gateway (free tier, no API key needed) ──
+    # â”€â”€ Kilo Gateway (free tier, no API key needed) â”€â”€
     {"id": "kilo-auto/free", "provider": "kilo", "name": "Kilo Auto (free router)",
      "capabilities": ["text", "coding", "reasoning"], "context": 256000, "priority": 1},
     {"id": "qwen/qwen3-coder:free", "provider": "kilo", "name": "Qwen3 Coder 480B",
@@ -484,7 +484,7 @@ MODEL_CATALOG = [
     {"id": "stepfun/step-3.7-flash:free", "provider": "kilo", "name": "Step 3.7 Flash 196B",
      "capabilities": ["text", "coding"], "context": 256000, "priority": 10},
 
-    # ── Cloudflare Workers AI (excluded: granite, deepseek-r1, gemma-sea-lion) ──
+    # â”€â”€ Cloudflare Workers AI (excluded: granite, deepseek-r1, gemma-sea-lion) â”€â”€
     {"id": "@cf/meta/llama-4-scout-17b-16e-instruct", "provider": "cloudflare", "name": "Llama 4 Scout 17B",
      "capabilities": ["text", "vision"], "context": 1000000, "priority": 1},
     {"id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "provider": "cloudflare", "name": "Llama 3.3 70B",
@@ -501,11 +501,11 @@ MODEL_CATALOG = [
      "capabilities": ["text"], "context": 131072, "priority": 16},
     {"id": "@cf/glm-5.2", "provider": "cloudflare", "name": "GLM 5.2",
      "capabilities": ["text", "reasoning", "coding"], "context": 131072, "priority": 17},
-    # ── Cerebras (wafer-scale; free tier 5 RPM / 30K TPM / 1M tokens/day) ──
+    # â”€â”€ Cerebras (wafer-scale; free tier 5 RPM / 30K TPM / 1M tokens/day) â”€â”€
     {"id": "gpt-oss-120b", "provider": "cerebras", "name": "GPT-OSS 120B",
      "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 1},
 
-    # ── Vercel AI Gateway (free rotating open models; 60 RPM shared) ──
+    # â”€â”€ Vercel AI Gateway (free rotating open models; 60 RPM shared) â”€â”€
     {"id": "minimax/minimax-m2.7-free", "provider": "vercel_gateway", "name": "MiniMax M2.7 (free)",
      "capabilities": ["text", "coding", "reasoning"], "context": 196608, "priority": 1},
     {"id": "minimax/minimax-m3-free", "provider": "vercel_gateway", "name": "MiniMax M3 (free)",
@@ -513,7 +513,7 @@ MODEL_CATALOG = [
     {"id": "openai/gpt-oss-120b", "provider": "vercel_gateway", "name": "GPT-OSS 120B",
      "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 3},
 
-    # ── LLM7.io (free router; token from token.llm7.io; contexts conservative) ──
+    # â”€â”€ LLM7.io (free router; token from token.llm7.io; contexts conservative) â”€â”€
     {"id": "DeepSeek-V4-Flash-0731", "provider": "llm7", "name": "DeepSeek V4 Flash 0731",
      "capabilities": ["text", "coding"], "context": 131072, "priority": 1},
     {"id": "glm-5.3", "provider": "llm7", "name": "GLM 5.3",
@@ -523,7 +523,7 @@ MODEL_CATALOG = [
     {"id": "minimax-m2.7", "provider": "llm7", "name": "MiniMax M2.7",
      "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 4},
 
-    # ── OpenRouter newest-generation :free slots (verified 2026-08) ──
+    # â”€â”€ OpenRouter newest-generation :free slots (verified 2026-08) â”€â”€
     {"id": "thinkingmachines/inkling:free", "provider": "openrouter", "name": "Thinking Machines Inkling",
      "capabilities": ["text", "vision", "coding", "reasoning"], "context": 1048576, "priority": 9},
     {"id": "thinkingmachines/inkling-small:free", "provider": "openrouter", "name": "Inkling Small",
@@ -535,7 +535,7 @@ MODEL_CATALOG = [
     {"id": "poolside/laguna-s-2.1:free", "provider": "openrouter", "name": "Laguna S 2.1",
      "capabilities": ["text", "coding"], "context": 262144, "priority": 8},
 
-    # ── Vercel AI Gateway newest (laguna -free verified; others metered-unless-rotated) ──
+    # â”€â”€ Vercel AI Gateway newest (laguna -free verified; others metered-unless-rotated) â”€â”€
     {"id": "poolside/laguna-s-2.1-free", "provider": "vercel_gateway", "name": "Laguna S 2.1 (free)",
      "capabilities": ["text", "coding"], "context": 262144, "priority": 4},
     {"id": "moonshotai/kimi-k3", "provider": "vercel_gateway", "name": "Kimi K3",
@@ -547,13 +547,13 @@ MODEL_CATALOG = [
     {"id": "alibaba/qwen3.8-max", "provider": "vercel_gateway", "name": "Qwen 3.8 Max",
      "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 8},
 
-    # ── NVIDIA NIM newest dev-tier additions ──
+    # â”€â”€ NVIDIA NIM newest dev-tier additions â”€â”€
     {"id": "moonshotai/kimi-k3", "provider": "nvidia", "name": "Kimi K3",
      "capabilities": ["text", "coding", "reasoning"], "context": 262144, "priority": 1},
     {"id": "minimaxai/minimax-m3", "provider": "nvidia", "name": "MiniMax M3",
      "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 3},
 
-    # ── Kilo Gateway auto tiers + newest :free ──
+    # â”€â”€ Kilo Gateway auto tiers + newest :free â”€â”€
     {"id": "kilo-auto/frontier", "provider": "kilo", "name": "Kilo Auto Frontier",
      "capabilities": ["text", "coding", "reasoning"], "context": 256000, "priority": 1},
     {"id": "nvidia/nemotron-3.5-lightning:free", "provider": "kilo", "name": "Nemotron 3.5 Lightning (free)",
@@ -676,7 +676,7 @@ class ProviderClient:
         self.auth_dead = False
         self.fail_streak = 0
 
-    # ── key loading ──────────────────────────────────────────────
+    # â”€â”€ key loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _load_keys(self) -> list[str]:
         keys_str = os.getenv(self.cfg["env_key"], "")
@@ -694,7 +694,7 @@ class ProviderClient:
     def _next_key(self) -> str:
         return next(self._key_cycle)
 
-    # ── URL building ─────────────────────────────────────────────
+    # â”€â”€ URL building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_url(self) -> str:
         base = self.cfg["base_url"]
@@ -708,7 +708,7 @@ class ProviderClient:
         base = base.rstrip("/")
         return base + "/chat/completions"
 
-    # ── header / body building ───────────────────────────────────
+    # â”€â”€ header / body building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_headers(self, extra: Optional[dict] = None) -> dict:
         key = self._next_key()
@@ -814,7 +814,7 @@ class ProviderClient:
             body["tool_choice"] = tool_choice
         return body
 
-    # ── HTTP ─────────────────────────────────────────────────────
+    # â”€â”€ HTTP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _post(self, body: dict, timeout: Optional[float] = None) -> dict:
         import urllib.error
@@ -896,7 +896,7 @@ class ProviderClient:
     def _parse_model_used(self, body: dict) -> str:
         return body.get("model", self.default_model)
 
-    # ── public API ───────────────────────────────────────────────
+    # â”€â”€ public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def chat(self, prompt: str, **overrides) -> str:
         """Text-only chat. Returns reply string."""
@@ -1212,7 +1212,7 @@ def _get_models_for_capability(
     reasoning-capable models without overriding provider priority.
     ``max_context_tokens`` hard-caps the selectable window (e.g. ``<1M`` for
     compaction specialists that must avoid 1M-context models)."""
-    # ±30 stays below the provider-priority quantum (100): routing bias
+    # Â±30 stays below the provider-priority quantum (100): routing bias
     # reorders models, never providers.
     reasoning_bias = -30 if prefer_reasoning is True else 30 if prefer_reasoning is False else 0
     matches = []
@@ -1350,7 +1350,7 @@ class FreeProviders:
             remaining = client.rate_limiter._cooldown_until - now
             if 0 < remaining < shortest:
                 shortest = remaining
-        return max(shortest, 2.0)  # at least 2s — fast fallback beats patience
+        return max(shortest, 2.0)  # at least 2s â€” fast fallback beats patience
 
     def chat(
         self,
@@ -1417,7 +1417,7 @@ class FreeProviders:
                 max_context_tokens=max_context_tokens,
             )
 
-            # All providers rate-limited — wait and loop back
+            # All providers rate-limited â€” wait and loop back
             if not routes:
                 if not retry_forever and loop >= max_loops - 1:
                     raise AllProvidersExhaustedError(
@@ -1487,16 +1487,16 @@ class FreeProviders:
                         context_error = e
                         continue
                     if e.status in (401, 403):
-                        # Auth error — this key will not heal; disable the
+                        # Auth error â€” this key will not heal; disable the
                         # provider for the lifetime of the pool.
                         client.auth_dead = True
                         continue
                     elif e.status == 429:
-                        # Rate limited — cooldown and try next
+                        # Rate limited â€” cooldown and try next
                         client.rate_limiter.trigger_cooldown(30)
                         continue
                     elif e.status == 0 or e.status >= 500:
-                        # Transport/server failure — escalate cooldown so
+                        # Transport/server failure â€” escalate cooldown so
                         # repeated dead providers stop costing us seconds.
                         client.fail_streak += 1
                         client.rate_limiter.trigger_cooldown(
@@ -1504,7 +1504,7 @@ class FreeProviders:
                         )
                         continue
                     else:
-                        # Other error — try next
+                        # Other error â€” try next
                         continue
                 except Exception as e:
                     last_error = e
@@ -1522,7 +1522,7 @@ class FreeProviders:
                     status=getattr(context_error, "status", 0),
                 ) from context_error
 
-            # All providers in this round failed — wait, then loop back to start
+            # All providers in this round failed â€” wait, then loop back to start
             if retry_forever or loop < max_loops - 1:
                 wait = self._get_shortest_cooldown()
                 _sleep_with_abort(wait, abort_check)
@@ -1562,7 +1562,7 @@ class FreeProviders:
         abort_check=None,
         **overrides,
     ) -> dict:
-        """Routed streaming turn — same fallback ladder as chat(), but the
+        """Routed streaming turn â€” same fallback ladder as chat(), but the
         winning attempt streams via SSE with live callbacks.
 
         Returns the chat_with_info shape. An empty streamed turn falls through
@@ -1930,7 +1930,7 @@ def _free_turn_emitters(name: str, chat_id: str):
     if not chat_id:
         return None, None
     try:
-        from stream_bus import emit as _bus_emit
+        from server.realtime.bus import emit as _bus_emit
 
         def on_token(t, _c=chat_id, _n=name, _e=_bus_emit):
             try:
@@ -1963,7 +1963,7 @@ def free_native_turn(
     Streams live to the shared chat bus (content + thinking), falls back to a
     single bounded non-streaming attempt on mid-stream failure, and returns the
     canonical ``(text, tool_calls, reasoning)`` triple every agent loop
-    consumes. Raises loudly when the whole pool fails — no silent paid
+    consumes. Raises loudly when the whole pool fails â€” no silent paid
     fallback by design.
     """
     pool = FreeProviders()
@@ -2013,3 +2013,4 @@ def free_native_turn(
                 "id": str(tc.get("id") or f"{name}-free-{index + 1}"),
             })
     return reply, calls, (str(info.get("reasoning", "") or "").strip() or None)
+

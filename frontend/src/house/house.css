@@ -5,10 +5,6 @@
 
 .house-root {
   background: #0a0a0d;
-  background-image:
-    radial-gradient(circle at 50% 42%, rgba(255, 255, 255, 0.045), transparent 42%),
-    radial-gradient(circle at 12% 85%, rgba(255, 255, 255, 0.02), transparent 38%),
-    radial-gradient(circle at 88% 12%, rgba(255, 255, 255, 0.025), transparent 34%);
   color: #fafafa;
 }
 
@@ -160,9 +156,10 @@
 .session-flow-panel { z-index: 60; }
 .session-flow-enter { animation: session-flow-in 0.18s cubic-bezier(0.16, 1, 0.3, 1) both; }
 
-/* ── Main workspace chat card (solid, non-transparent) ── */
+/* ── Main workspace chat card (translucent — shares the premium-surface
+   token with the coding overlay; Phase 8-D removed the opaque fill) ── */
 .house-chat-card {
-  background: #131316;
+  background: rgba(16, 16, 19, 0.55);
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
 }
 

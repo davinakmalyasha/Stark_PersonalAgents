@@ -11,7 +11,7 @@ export interface LiveStream {
 }
 
 interface UsePipelineReturn {
-  run: (prompt: string, model: string, temp: number, workspacePath?: string, chatId?: string, attachments?: ChatAttachment[]) => void;
+  run: (prompt: string, model: string, temp: number, workspacePath?: string, chatId?: string, attachments?: ChatAttachment[], workspaceKind?: string) => void;
   cancel: () => void;
   state: AppState | null;
   isRunning: boolean;
@@ -71,7 +71,7 @@ export function usePipeline(): UsePipelineReturn {
     setStreaming(EMPTY_STREAM);
   }, []);
 
-  const run = useCallback((prompt: string, model: string, temp: number, workspacePath = '', chatId = '', attachments: ChatAttachment[] = []) => {
+  const run = useCallback((prompt: string, model: string, temp: number, workspacePath = '', chatId = '', attachments: ChatAttachment[] = [], workspaceKind = '') => {
     setRunMode('local');
     setIsRunning(true);
     setError(null);
@@ -115,6 +115,7 @@ export function usePipeline(): UsePipelineReturn {
       chatId,
       attachments,
       applyDelta,
+      workspaceKind,
     );
   }, [applyDelta, resetStream]);
 

@@ -1,6 +1,8 @@
-import { FileText, File, Folder, ArrowUpRight, Bot, Check, Loader2 } from 'lucide-react';
+import { useState } from 'react';
+import { FileText, File, Folder, ArrowUpRight, Bot, Check, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 import type { TraceStep } from '../../utils/logParser';
 import SubagentActivityPanel from './SubagentActivityPanel';
+import DiffView from './DiffView';
 
 interface Props {
   step: TraceStep;
@@ -142,6 +144,7 @@ function parseLineCount(content: string): number | null {
 }
 
 export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSession, activeSubagent, allTraceSteps = [], isActive = false, workspaceId = null, chatId = null, onCloseSubagent }: Props) {
+  const [diffOpen, setDiffOpen] = useState(false);
   let fileName = '', cmdDisplay = '', lineRange = '';
 
   if (step.args) {
@@ -197,16 +200,34 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
 
   if (step.toolName === 'edit_file') {
     const diff = step.content ? parseDiffStats(step.content) : null;
+    const hasDiff = !!step.content && step.content.includes('@@');
     return (
-      <div className="flex items-center gap-2 py-0.5 text-zinc-400 font-sans text-[13.5px] leading-relaxed">
-        {getFileIcon(fileName, 'text-yellow-400')}
-        <span className="text-zinc-200 font-mono font-medium">{fileName || 'file'}</span>
-        {diff && (
-          <span className="font-mono text-[12px] font-medium">
-            {diff.added > 0 && <span className="text-emerald-400">+{diff.added}</span>}
-            {diff.added > 0 && diff.removed > 0 && ' '}
-            {diff.removed > 0 && <span className="text-red-400">-{diff.removed}</span>}
-          </span>
+      <div className="flex flex-col py-0.5">
+        <div className="flex items-center gap-2 text-zinc-400 font-sans text-[13.5px] leading-relaxed">
+          {getFileIcon(fileName, 'text-yellow-400')}
+          <span className="text-zinc-200 font-mono font-medium">{fileName || 'file'}</span>
+          {diff && (
+            <span className="font-mono text-[12px] font-medium">
+              {diff.added > 0 && <span className="text-emerald-400">+{diff.added}</span>}
+              {diff.added > 0 && diff.removed > 0 && ' '}
+              {diff.removed > 0 && <span className="text-red-400">-{diff.removed}</span>}
+            </span>
+          )}
+          {hasDiff && (
+            <button
+              type="button"
+              onClick={() => setDiffOpen((o) => !o)}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors cursor-pointer"
+            >
+              {diffOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+              {diffOpen ? 'Hide diff' : 'Diff'}
+            </button>
+          )}
+        </div>
+        {diffOpen && hasDiff && (
+          <div className="mt-1.5 max-h-[420px] overflow-y-auto rounded-lg border border-zinc-800/60">
+            <DiffView diff={step.content} />
+          </div>
         )}
       </div>
     );

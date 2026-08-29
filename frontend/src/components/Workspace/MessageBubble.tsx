@@ -36,6 +36,46 @@ function isToolCall(content: string): boolean {
   return content.startsWith('[TOOL_CALL]');
 }
 
+/**
+ * Phase 8-E1: streaming markdown splitter.
+ * Renders the stable prefix as real Markdown; defers only the trailing
+ * fragment that might be mid-construct (unclosed code fence / ** / ` / table
+ * row). Prevents mid-fence visual breakage while keeping live rendering.
+ */
+function StreamingMarkdown({ content }: { content: string }) {
+  if (!content) return null;
+
+  let split = content.length;
+
+  // Unclosed fenced code block: render everything before the ``` as Markdown,
+  // keep the fence + the rest as plain text.
+  const fences = content.split('```');
+  if (fences.length > 1 && fences.length % 2 === 0) {
+    const openIdx = content.lastIndexOf('```');
+    const lineStart = content.lastIndexOf('\n', openIdx - 1) + 1;
+    // Only treat as "open" if the opening fence isn't followed by a closer.
+    if (openIdx >= 0 && (content.indexOf('```', openIdx + 3) === -1)) {
+      split = lineStart;
+    }
+  }
+
+  // Unclosed inline code / bold — drop the dangling opener so Markdown
+  // doesn't swallow the rest of the message.
+  let trailing = content.slice(split);
+  const dangling = trailing.match(/^.*?(\*\*|`|~~)\s*$/);
+  if (dangling && content.slice(0, split).includes(dangling[1])) {
+    trailing = trailing.replace(/(\*\*|`|~~)\s*$/, '');
+  }
+
+  const stable = content.slice(0, split);
+  return (
+    <span className="whitespace-pre-wrap break-words">
+      {stable ? <Markdown content={stable} /> : null}
+      {trailing}
+    </span>
+  );
+}
+
 function ArtifactSummary({ artifacts }: { artifacts: RunArtifacts }) {
   const [expanded, setExpanded] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -305,10 +345,12 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
           {message.content && message.content !== '(Execution Trace)' && !message.metadata?.project_ref && (
             <div className="agent-message-response text-[15.5px] text-zinc-200 leading-relaxed">
               {streamingActive ? (
-                // P10: while tokens are streaming, render plain text — parsing
-                // Markdown (tables + syntax highlighting) on every delta is
-                // wasteful; the persisted message renders full Markdown.
-                <span className="whitespace-pre-wrap break-words">{message.content}</span>
+                // Phase 8-E1: incremental streaming markdown. Parse the stable
+                // prefix (everything before the last unfinished fence/emphasis)
+                // as Markdown so headings/bullets/links render live, and render
+                // only the trailing incomplete fragment as plain text — no
+                // mid-fence breakage, no per-delta full re-parse.
+                <StreamingMarkdown content={message.content} />
               ) : (
                 <Markdown content={message.content} />
               )}

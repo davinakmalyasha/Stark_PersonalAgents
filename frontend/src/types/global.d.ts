@@ -12,8 +12,12 @@ declare global {
       onVoiceSessionEvent?: (cb: (ev: {
         type: string;
         text?: string;
+        kind?: string;
+        agent?: string;
+        mic?: boolean;
         workspaceId?: string;
         chatId?: string;
+        prompt?: string;
         state?: unknown;
       }) => void) => (() => void) | void;
       /** Fired when the voice overlay window closes.
@@ -25,7 +29,7 @@ declare global {
       offVoiceWindowClosed?: () => void;
       /** Tell the overlay which chat is currently active (so live mode
        *  follows the open chat instead of a fixed one). */
-      setVoiceChat?: (payload: { wsId: string; wsPath: string; chatId: string }) => void;
+      setVoiceChat?: (payload: { wsId: string; wsPath: string; chatId: string; model?: string; temperature?: number }) => void;
     };
     /** Browser File System Access API */
     showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;

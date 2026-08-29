@@ -27,7 +27,9 @@ export default function House() {
   const [exitingIdeTab, setExitingIdeTab] = useState<import('../types').SessionTab | null>(null);
 
   const sessions = useSessions();
-  const chat = useHouseChat({});
+  // Main workspace → General chats only (orchestrator agent). House workspace
+  // is a separate route (#/house) that binds _house; never leak house here.
+  const chat = useHouseChat({ workspaceKind: 'general' });
   const { refreshSessions, newSession, newChatIn, openChat, closeTab } = sessions;
   const {
     activeChatId: generalActiveChatId,

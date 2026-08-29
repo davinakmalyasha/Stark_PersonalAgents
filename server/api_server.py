@@ -1,4 +1,4 @@
-import difflib
+﻿import difflib
 import os
 import sys
 
@@ -12,33 +12,56 @@ _VOICE = os.path.join(_ROOT, "Voice")
 if _VOICE not in sys.path:
     sys.path.insert(0, _VOICE)
 """
-FastAPI server — Bridges the React frontend with the LangGraph multi-agent pipeline.
+FastAPI server â€” Bridges the React frontend with the LangGraph multi-agent pipeline.
 Replaces the Gradio dashboard with SSE streaming endpoints.
 """
 import os
 import sys
 
-# ── Interpreter guard ─────────────────────────────────────────────────────
-# The voice engine (Moonshine + Kokoro) only exists in venv312. No matter how
-# this file is launched (`python api_server.py`, a .bat, Electron, ...) we
-# re-exec ourselves with venv312 so the local ASR/TTS always work.
-def _ensure_venv312() -> None:
+# â”€â”€ Interpreter guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Single venv (Python 3.14) is the primary interpreter. VOICE_PYTHON env var
+# overrides for legacy Moonshine voice (venv312) â€” voice engine is optional on
+# 3.14 and kokoro/misaki/spacy-curated-transformers are not installed there.
+# Order: VOICE_PYTHON > venv (3.14) > .venv > venv312 (legacy fallback).
+def _resolve_preferred_python() -> str | None:
+    for candidate in (
+        os.environ.get("VOICE_PYTHON", "").strip(),
+        os.path.join(_ROOT, "venv", "Scripts", "python.exe"),
+        os.path.join(_ROOT, ".venv", "Scripts", "python.exe"),
+        os.path.join(_ROOT, "venv312", "Scripts", "python.exe"),
+    ):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+def _ensure_venv() -> None:
     try:
-        # venv312 lives at the repo root, one level above server/.
-        venv_py = os.path.join(_ROOT, "venv312", "Scripts", "python.exe")
-        if not os.path.exists(venv_py):
-            print("[api_server] WARNING: venv312 not found — voice engines (Moonshine/Kokoro) unavailable")
+        preferred = _resolve_preferred_python()
+        if not preferred:
+            print("[api_server] WARNING: no venv found â€” running with system interpreter")
             return
-        venv_dir = os.path.normpath(os.path.dirname(venv_py)).lower()
-        if not os.path.normpath(sys.prefix).lower().startswith(os.path.dirname(venv_dir)):
-            print(f"[api_server] Re-executing with {venv_py} (current: {sys.executable})")
-            os.execv(venv_py, [venv_py] + sys.argv)
+        pref_dir = os.path.normpath(os.path.dirname(os.path.dirname(preferred))).lower()
+        cur_prefix = os.path.normpath(sys.prefix).lower()
+        cur_exec = os.path.normpath(sys.executable).lower()
+        # Already running from preferred venv?
+        if cur_prefix.startswith(pref_dir) or cur_exec == os.path.normpath(preferred).lower():
+            return
+        # Only re-exec if preferred is venv (3.14) and we are not already in it.
+        # This makes venv/3.14 the default, venv312 only via VOICE_PYTHON.
+        if "venv312" in preferred.lower() and os.path.exists(os.path.join(_ROOT, "venv", "Scripts", "python.exe")):
+            # Don't auto-downgrade to 3.12 when 3.14 venv exists unless explicitly requested
+            if not os.environ.get("VOICE_PYTHON"):
+                return
+        print(f"[api_server] Re-executing with {preferred} (current: {sys.executable})")
+        os.execv(preferred, [preferred] + sys.argv)
     except Exception as e:
-        print(f"[api_server] Interpreter guard failed ({e}) — continuing")
+        print(f"[api_server] Interpreter guard failed ({e}) â€” continuing")
 
-_ensure_venv312()
+_ensure_venv()
+# Back-compat alias
+_ensure_venv312 = _ensure_venv
 
-# ── Voice module path (audio_engine, voice_services moved to Voice/) ──────────
+# â”€â”€ Voice module path (audio_engine, voice_services moved to Voice/) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _VOICE_DIR = os.path.join(_ROOT, "Voice")
 if _VOICE_DIR not in sys.path:
     sys.path.insert(0, _VOICE_DIR)
@@ -75,6 +98,21 @@ import workspace_manager as wm
 
 load_dotenv(override=True)
 
+# ── Unique port (8123) — avoids clashes with dev servers (8000/5173/etc) ──
+STARK_PORT = int(os.environ.get("STARK_PORT", "8123"))
+
+# ── Single-instance guard ──
+# If another api_server is already listening on the configured port, this
+# process exits QUIETLY (no restart storm, no double model warm-up).
+def _port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+
 # Init default workspace on startup
 wm.init_default_workspace()
 # Clean up orphaned chat directories from previously deleted workspaces
@@ -100,9 +138,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Remote access guard (mobile/remote feature) ─────────────────────────────
+# ── Graceful shutdown: stop mic capture + free PortAudio (fixes CFFI popup + zombie RAM)
+import atexit
+
+def _shutdown_voice():
+    try:
+        import audio_engine
+        try:
+            audio_engine.stop_capture(discard=True)
+        except Exception:
+            pass
+        print("[shutdown] voice capture stopped")
+    except Exception:
+        pass
+
+atexit.register(_shutdown_voice)
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _lifespan(app):
+    yield
+    _shutdown_voice()
+
+# Reassign app with lifespan (FastAPI accepts lifespan=; must be set before
+# routers are included — this runs _shutdown_voice on uvicorn shutdown too).
+app = FastAPI(title="Deep Agents API", version="2.0", lifespan=_lifespan)
+
+# ── Phase 7: domain routers ──
+from server.house.router import router as house_router
+app.include_router(house_router)
+from server.realtime.router import router as realtime_router
+app.include_router(realtime_router)
+from server.routers.health import router as health_router
+app.include_router(health_router)
+from server.routers.ui import router as ui_router
+app.include_router(ui_router)
+from server.routers.mcp import router as mcp_router
+app.include_router(mcp_router)
+from server.routers.ask import router as ask_router
+app.include_router(ask_router)
+from server.routers.snapshots import router as snapshots_router
+app.include_router(snapshots_router)
+from server.routers.workspaces import router as workspaces_router
+app.include_router(workspaces_router)
+from server.routers.chats import router as chats_router
+app.include_router(chats_router)
+from server.routers.tasks import router as tasks_router
+app.include_router(tasks_router)
+from server.routers.runs import router as runs_router
+app.include_router(runs_router)
+from server.routers.voice import router as voice_router
+app.include_router(voice_router)
+
+# â”€â”€ Remote access guard (mobile/remote feature) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Loopback clients (the desktop app on this machine) pass freely. Any other
-# client — e.g. the phone over Tailscale — must present the pairing token.
+# client â€” e.g. the phone over Tailscale â€” must present the pairing token.
 @app.middleware("http")
 async def remote_token_guard(request: Request, call_next):
     from remote_auth import is_loopback, get_pairing_token
@@ -118,7 +209,7 @@ async def remote_token_guard(request: Request, call_next):
 
 @app.get("/api/pairing")
 async def pairing_info(request: Request):
-    """Hand out the pairing token — loopback callers only (desktop Settings)."""
+    """Hand out the pairing token â€” loopback callers only (desktop Settings)."""
     from remote_auth import is_loopback, get_pairing_token
     if not is_loopback(request):
         return JSONResponse(status_code=403, content={"error": "Local only"})
@@ -134,33 +225,7 @@ async def pairing_rotate(request: Request):
     return {"token": reset_pairing_token()}
 
 
-@app.get("/api/health/voice")
-async def voice_health():
-    """Engine status — quick check that Moonshine + Kokoro are loadable."""
-    asr_ok = False
-    tts_ok = False
-    asr_detail = "ok"
-    tts_detail = "ok"
-    try:
-        import audio_engine
-        asr_ok = audio_engine.asr_available()
-        if not asr_ok:
-            asr_detail = "model files missing (run the moonshine download)"
-    except Exception as e:
-        asr_detail = f"unavailable: {e}"
-    try:
-        import kokoro  # noqa: F401
-        tts_ok = True
-    except Exception as e:
-        tts_detail = f"unavailable: {e}"
-    return JSONResponse(content={
-        "interpreter": sys.executable,
-        "asr": {"ok": asr_ok, "detail": asr_detail},
-        "tts": {"ok": tts_ok, "detail": tts_detail},
-    })
-
-
-# ── Models ──────────────────────────────────────────────────────────────────
+# â”€â”€ Models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class RunRequest(BaseModel):
     prompt: str
@@ -169,37 +234,22 @@ class RunRequest(BaseModel):
     workspace_path: str = ""
     chat_id: str = ""
     attachments: list[dict] = []
+    workspace_kind: str = ""  # hint: "" | "house" | "personal" — unified router uses this to select House vs General vs Orchestrator
 
 class ChatRequest(BaseModel):
     prompt: str
 
 
-class TaskRequest(BaseModel):
-    prompt: str = ""
-    attachments: list[dict] = []
-    mode: str = "saved"
-    schedule: dict | None = None
-
-
 class TTSRequest(BaseModel):
     text: str
-    voice: str = "en-US-JennyNeural"
-    engine: str = "auto"  # auto | edge | kokoro
+    voice: str = "jarvis"
+    engine: str = "pocket"  # pocket only (edge/kokoro/moonshine removed)
 
 
 class CleanupRequest(BaseModel):
     text: str
 
 
-class TaskUpdateRequest(BaseModel):
-    status: str | None = None
-    prompt: str | None = None
-    attachments: list[dict] | None = None
-    mode: str | None = None
-    schedule: dict | None = None
-
-
-_task_scheduler_started = False
 _run_contexts: dict[str, dict] = {}
 _run_contexts_lock = threading.Lock()
 
@@ -416,1460 +466,11 @@ def _restore_run_file(context: dict, item: dict) -> tuple[bool, str]:
         return False, str(exc)
 
 
-@app.post("/api/runs/{run_id}/undo")
-async def undo_run(run_id: str):
-    with _run_contexts_lock:
-        context = _run_contexts.get(run_id)
-    if not context or not context.get("artifacts"):
-        return JSONResponse(status_code=404, content={"error": "This run is no longer available for undo."})
-    if context.get("undone"):
-        return JSONResponse(content={"status": "undone", "results": []})
-    results = []
-    conflicts = []
-    for item in context["artifacts"].get("files", []):
-        ok, detail = _restore_run_file(context, item)
-        results.append({"path": item["path"], "ok": ok, "detail": detail})
-        if not ok:
-            conflicts.append(item["path"])
-    context["undone"] = not conflicts
-    return JSONResponse(content={"status": "conflict" if conflicts else "undone", "results": results, "conflicts": conflicts})
-
-_task_scheduler_lock = threading.Lock()
-
-
-# ── SSE Helpers ─────────────────────────────────────────────────────────────
-
-def _format_sse(event: str, data: dict) -> str:
-    """Format a Server-Sent Event."""
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-def _mirror_publish(chat_id: str, event: str, data: dict) -> None:
-    """Fan one SSE frame out to mirroring clients via the live event bus.
-
-    No-op unless someone subscribed to /api/stream/{chat_id} — zero overhead
-    and zero behavior change for the client that initiated the run.
-    """
-    try:
-        from event_bus import publish as _bus_publish
-        _bus_publish(chat_id, event, data)
-    except Exception:
-        pass
-
-
-# ── Routes ──────────────────────────────────────────────────────────────────
-
-@app.get("/api/state")
-async def get_state():
-    """Return the current shared state as JSON."""
-    return JSONResponse(content=json.loads(safe_serialize_state()))
-
-
-# ── Active run tracker ──────────────────────────────────────────────────────
-# The main workspace top bar shows one tab per chat session with a live
-# running/idle dot. The pipeline executes one run at a time (global shared
-# state), so a single tracker is enough to know which session is running.
-
-_active_run: dict = {"running": False, "workspace_path": "", "chat_id": "", "started_at": ""}
-_active_run_lock = threading.Lock()
-
-
-def _set_active_run(workspace_path: str, chat_id: str) -> None:
-    with _active_run_lock:
-        _active_run.update({
-            "running": True,
-            "workspace_path": workspace_path or "",
-            "chat_id": chat_id or "",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        })
-
-
-def _clear_active_run() -> None:
-    with _active_run_lock:
-        _active_run.update({"running": False, "workspace_path": "", "chat_id": "", "started_at": ""})
-
-
-@app.get("/api/runs/active")
-async def get_active_run():
-    """Which chat session (if any) currently has a pipeline running."""
-    with _active_run_lock:
-        return JSONResponse(content=dict(_active_run))
-
-
-# ── UI state persistence (open session tabs, active tab) ───────────────────
-
-def _ui_state_path() -> str:
-    return os.path.join(_ROOT, ".deep_agents", "ui_state.json")
-
-
-@app.get("/api/ui/state")
-async def get_ui_state():
-    try:
-        with open(_ui_state_path(), "r", encoding="utf-8") as f:
-            return JSONResponse(content=json.load(f))
-    except Exception:
-        return JSONResponse(content={})
-
-
-@app.put("/api/ui/state")
-async def put_ui_state(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(content={"error": "invalid json"}, status_code=400)
-    try:
-        os.makedirs(os.path.dirname(_ui_state_path()), exist_ok=True)
-        with open(_ui_state_path(), "w", encoding="utf-8") as f:
-            json.dump(body, f, indent=2)
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-    return JSONResponse(content={"status": "ok"})
-
-
-# ── MCP servers ──────────────────────────────────────────────────────────────
-
-class McpServerUpdate(BaseModel):
-    command: str = ""
-    args: list[str] = []
-    url: str = ""
-    env: dict[str, str] = {}
-    env_vars: list[str] = []
-    cwd: str = ""
-    scopes: list[str] = []
-    enabled_tools: list[str] = []
-    disabled_tools: list[str] = []
-    approval: str = "auto"  # auto | prompt
-    instructions: str = ""
-    startup_timeout_sec: float = 10.0
-    tool_timeout_sec: float = 60.0
-
-
-def _mcp_manager():
-    from tools.mcp.mcp_bridge import get_manager
-    return get_manager()
-
-
-@app.get("/api/mcp/servers")
-async def list_mcp_servers():
-    """List configured servers and their live connection status."""
-    mgr = _mcp_manager()
-    status = {s["name"]: s for s in mgr.status_snapshot()}
-    out = []
-    for name, cfg in mgr.load_config().get("servers", {}).items():
-        merged = dict(cfg)
-        merged["name"] = name
-        merged["status"] = status.get(name, {}).get("status", "stopped")
-        merged["error"] = status.get(name, {}).get("error", "")
-        merged["tool_count"] = status.get(name, {}).get("tool_count", 0)
-        merged["transport"] = "http" if cfg.get("url") else "stdio"
-        out.append(merged)
-    return JSONResponse(content={"servers": out})
-
-
-@app.post("/api/mcp/servers/{server_name}")
-async def upsert_mcp_server(server_name: str, update: McpServerUpdate):
-    """Create or replace a server config; restarts it if configured."""
-    try:
-        snapshot = _mcp_manager().upsert_server(server_name, update.model_dump(exclude_none=True))
-        return JSONResponse(content={"servers": snapshot})
-    except ValueError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=400)
-
-
-@app.delete("/api/mcp/servers/{server_name}")
-async def delete_mcp_server(server_name: str):
-    """Remove a server config and disconnect it."""
-    snapshot = _mcp_manager().remove_server(server_name)
-    return JSONResponse(content={"servers": snapshot})
-
-
-@app.post("/api/mcp/servers/{server_name}/restart")
-async def restart_mcp_server(server_name: str):
-    """Disconnect and reconnect a single server (pick up config changes)."""
-    try:
-        snapshot = _mcp_manager().restart_server(server_name)
-        return JSONResponse(content={"servers": snapshot})
-    except ValueError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=404)
-
-
-def _workspace_path_for_id(workspace_id: str) -> str:
-    if workspace_id == wm.GENERAL_WORKSPACE_ID:
-        return wm.GENERAL_WORKSPACE_ID
-    workspace = wm.get_workspace(workspace_id)
-    if not workspace:
-        raise ValueError("Workspace not found")
-    return workspace.get("path", "")
-
-
-def _task_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _parse_task_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
-def _next_recurring_time(current: datetime, recurrence: str) -> datetime | None:
-    if recurrence == "daily":
-        return current + timedelta(days=1)
-    if recurrence == "weekly":
-        return current + timedelta(days=7)
-    if recurrence == "monthly":
-        month = current.month % 12 + 1
-        year = current.year + (1 if current.month == 12 else 0)
-        day = min(current.day, 28)
-        return current.replace(year=year, month=month, day=day)
-    if recurrence and recurrence.startswith("interval-"):
-        try:
-            minutes = int(recurrence.split("-", 1)[1])
-        except (ValueError, IndexError):
-            return None
-        if minutes <= 0:
-            return None
-        return current + timedelta(minutes=minutes)
-    return None
-
-
-def _update_task(workspace_path: str, chat_id: str, task_id: str, **changes) -> dict | None:
-    tasks = wm.get_chat_tasks(workspace_path, chat_id)
-    for task in tasks:
-        if task.get("id") == task_id:
-            task.update(changes)
-            task["updatedAt"] = _task_now().isoformat()
-            wm.save_chat_tasks(workspace_path, chat_id, tasks)
-            return task
-    return None
-
-
-def _run_task_background(workspace_id: str, workspace_path: str, chat_id: str, task: dict) -> None:
-    task_id = task["id"]
-    _update_task(workspace_path, chat_id, task_id, status="running", lastRunAt=_task_now().isoformat())
-    try:
-        prompt = task.get("prompt", "")
-        attachments = task.get("attachments", [])
-        wm.add_message(workspace_path, chat_id, "user", prompt, {"attachments": attachments, "taskId": task_id} if attachments else {"taskId": task_id})
-        if workspace_path in ("", wm.GENERAL_WORKSPACE_ID):
-            from agents.general_agent import run_general_direct
-            for _ in run_general_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
-                pass
-        else:
-            from verify_helper import run_graph_with_verify
-            for _ in run_graph_with_verify(prompt, workspace_path=workspace_path, chat_id=chat_id):
-                pass
-        report = safe_get_state().get("outputs", {}).get("agent_report", "")
-        if report and chat_id:
-            wm.add_message(workspace_path, chat_id, "agent", report, {"taskId": task_id})
-        recurrence = (task.get("schedule") or {}).get("recurrence", "none")
-        current_next = _parse_task_time((task.get("schedule") or {}).get("nextRunAt")) or _task_now()
-        next_run = _next_recurring_time(current_next, recurrence)
-        if next_run:
-            schedule = {**(task.get("schedule") or {}), "nextRunAt": next_run.isoformat()}
-            _update_task(workspace_path, chat_id, task_id, status="scheduled", schedule=schedule)
-        else:
-            _update_task(workspace_path, chat_id, task_id, status="completed", completedAt=_task_now().isoformat())
-    except Exception as exc:
-        _update_task(workspace_path, chat_id, task_id, status="failed", error=str(exc))
-
-
-def _start_task_scheduler() -> None:
-    global _task_scheduler_started
-    with _task_scheduler_lock:
-        if _task_scheduler_started:
-            return
-        _task_scheduler_started = True
-
-    def loop() -> None:
-        while True:
-            try:
-                for workspace in wm.list_workspaces():
-                    workspace_id = workspace.get("id", "")
-                    workspace_path = _workspace_path_for_id(workspace_id)
-                    for chat in wm.list_chats(workspace_path):
-                        chat_id = chat.get("id", "")
-                        for task in wm.get_chat_tasks(workspace_path, chat_id):
-                            due = _parse_task_time((task.get("schedule") or {}).get("nextRunAt"))
-                            if task.get("status") == "scheduled" and due and due <= _task_now():
-                                threading.Thread(target=_run_task_background, args=(workspace_id, workspace_path, chat_id, task.copy()), daemon=True).start()
-            except Exception as exc:
-                print(f"[TASK SCHEDULER] {exc}")
-            time.sleep(15)
-
-    threading.Thread(target=loop, name="task-scheduler", daemon=True).start()
-
-
-@app.get("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks")
-async def list_tasks(workspace_id: str, chat_id: str):
-    try:
-        return JSONResponse(content=wm.get_chat_tasks(_workspace_path_for_id(workspace_id), chat_id))
-    except ValueError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-
-@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks")
-async def create_task(workspace_id: str, chat_id: str, req: TaskRequest):
-    try:
-        workspace_path = _workspace_path_for_id(workspace_id)
-        if not req.prompt.strip() and not req.attachments:
-            return JSONResponse(status_code=400, content={"error": "A prompt or attachment is required"})
-        now = _task_now()
-        schedule = req.schedule or {}
-        status = "scheduled" if req.mode == "scheduled" else "ready"
-        task = {"id": f"task-{uuid.uuid4().hex[:12]}", "workspaceId": workspace_id, "chatId": chat_id, "prompt": req.prompt, "attachments": req.attachments, "mode": req.mode, "status": status, "schedule": schedule, "createdAt": now.isoformat(), "updatedAt": now.isoformat()}
-        tasks = wm.get_chat_tasks(workspace_path, chat_id)
-        tasks.insert(0, task)
-        if not wm.save_chat_tasks(workspace_path, chat_id, tasks):
-            return JSONResponse(status_code=404, content={"error": "Chat not found"})
-        return JSONResponse(content=task)
-    except ValueError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-
-@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks/{task_id}/start")
-async def start_task(workspace_id: str, chat_id: str, task_id: str):
-    try:
-        workspace_path = _workspace_path_for_id(workspace_id)
-        task = next((item for item in wm.get_chat_tasks(workspace_path, chat_id) if item.get("id") == task_id), None)
-        if not task:
-            return JSONResponse(status_code=404, content={"error": "Task not found"})
-        updated = _update_task(workspace_path, chat_id, task_id, status="running", lastRunAt=_task_now().isoformat()) or {**task, "status": "running"}
-        return JSONResponse(content=updated)
-    except ValueError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-
-@app.patch("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks/{task_id}")
-async def update_task(workspace_id: str, chat_id: str, task_id: str, req: TaskUpdateRequest):
-    try:
-        workspace_path = _workspace_path_for_id(workspace_id)
-        if req.status is not None and req.status not in {"ready", "scheduled", "running", "completed", "failed"}:
-            return JSONResponse(status_code=400, content={"error": "Invalid task status"})
-        changes = req.model_dump(exclude_unset=True, exclude_none=True)
-        if "prompt" in changes and not str(changes["prompt"]).strip() and not changes.get("attachments"):
-            return JSONResponse(status_code=400, content={"error": "A prompt or attachment is required"})
-        if changes.get("mode") not in (None, "saved", "scheduled"):
-            return JSONResponse(status_code=400, content={"error": "Invalid task mode"})
-        if req.status == "completed":
-            changes["completedAt"] = _task_now().isoformat()
-        updated = _update_task(workspace_path, chat_id, task_id, **changes)
-        if not updated:
-            return JSONResponse(status_code=404, content={"error": "Task not found"})
-        return JSONResponse(content=updated)
-    except ValueError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-
-@app.delete("/api/workspaces/{workspace_id}/chats/{chat_id}/tasks/{task_id}")
-async def delete_task(workspace_id: str, chat_id: str, task_id: str):
-    try:
-        workspace_path = _workspace_path_for_id(workspace_id)
-        tasks = wm.get_chat_tasks(workspace_path, chat_id)
-        filtered = [task for task in tasks if task.get("id") != task_id]
-        if len(filtered) == len(tasks):
-            return JSONResponse(status_code=404, content={"error": "Task not found"})
-        wm.save_chat_tasks(workspace_path, chat_id, filtered)
-        return JSONResponse(content={"ok": True})
-    except ValueError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-
-def _save_chat_token_usage(workspace_path: str, chat_id: str):
-    if not chat_id or not workspace_path:
-        return
-    try:
-        chat = wm.get_chat(workspace_path, chat_id, include_traces=False, include_usage=True)
-        if chat:
-            run_stats = safe_get_state().get("token_usage", {})
-            chat_stats = chat.get("token_usage") or {
-                "total_input_tokens": 0,
-                "total_output_tokens": 0,
-                "total_cache_hit_tokens": 0,
-                "total_cache_miss_tokens": 0,
-                "total_cost": 0.0,
-                "calls": []
-            }
-            if "total_cache_hit_tokens" not in chat_stats:
-                chat_stats["total_cache_hit_tokens"] = 0
-            if "total_cache_miss_tokens" not in chat_stats:
-                chat_stats["total_cache_miss_tokens"] = 0
-            chat_stats["total_input_tokens"] += run_stats.get("total_input_tokens", 0)
-            chat_stats["total_output_tokens"] += run_stats.get("total_output_tokens", 0)
-            chat_stats["total_cache_hit_tokens"] += run_stats.get("total_cache_hit_tokens", 0)
-            chat_stats["total_cache_miss_tokens"] += run_stats.get("total_cache_miss_tokens", 0)
-            chat_stats["total_cost"] += run_stats.get("total_cost", 0.0)
-            chat_stats["calls"] = chat_stats.get("calls", []) + run_stats.get("calls", [])
-            chat["token_usage"] = chat_stats
-            wm.save_chat(workspace_path, chat_id, chat)
-    except Exception as e:
-        print(f"Error saving token stats for chat {chat_id}: {e}")
-
-
-@app.post("/api/run")
-async def run_pipeline(req: RunRequest, request: Request):
-    """Run the agentic pipeline with SSE streaming of state updates.
-    No Jarvis Router — goes directly to the main agent."""
-    from workspace_manager import add_message as wm_add_message
-    from memory.chat_memory_manager import resolve_request_text
-
-    # Reset shared state to clear stale data from previous run
-    reset_shared_state()
-
-    # Clear previous failed models and reset current run token usage
-    safe_update_state({
-        "selected_model": req.model,
-        "selected_temp": req.temperature,
-        "is_general": not req.workspace_path,
-        "failed_models": [],
-        "token_usage": {
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
-            "total_cache_hit_tokens": 0,
-            "total_cache_miss_tokens": 0,
-            "total_cost": 0.0,
-            "calls": [],
-        }
-    })
-
-    attachment_note = ""
-    if req.attachments:
-        attachment_note = "\n\nAttached files for this request:\n" + "\n".join(
-            f"- {item.get('name', 'attachment')} ({item.get('path', item.get('url', 'uploaded file'))})"
-            for item in req.attachments
-        )
-        # Vision: stash image paths so the agent's Zone-2 builder can inject
-        # them as real image blocks (visible from turn one). General gets
-        # them directly below; the graph path consumes the shared_state key.
-        try:
-            _img_paths = [item.get("path") for item in req.attachments
-                          if item.get("isImage") and item.get("path")]
-            if _img_paths:
-                safe_update_state({"attachment_image_paths": [str(p) for p in _img_paths]})
-        except Exception:
-            pass
-    prompt_with_attachments = req.prompt + attachment_note
-    wm_add_message(req.workspace_path, req.chat_id, "user", req.prompt, {"attachments": req.attachments} if req.attachments else None)
-    resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
-    run_context = _capture_run_context(req.workspace_path, req.chat_id)
-
-    # P9: baseline workspace ids so the final snapshot can flag newly created
-    # projects (orchestrator create_project tool) for the sidebar refresh.
-    try:
-        _workspace_ids_before_run = {w.get("id") for w in wm.list_workspaces()}
-    except Exception:
-        _workspace_ids_before_run = set()
-
-    # Go directly to the main agent
-    async def build_stream() -> AsyncGenerator[str, None]:
-        """Stream state updates from the LangGraph pipeline via SSE.
-        Yields graph-level events AND periodic intermediate snapshots during
-        Developer tool-using loops so the frontend shows thoughts in real-time."""
-        done = False
-        had_error = False
-        last_log_len = 0
-        cancel_event = threading.Event()
-
-        def run_in_thread():
-            nonlocal done, had_error
-            try:
-                # ── P9: direct-to-Dev routing — messages bound for an existing
-                # project's Dev agent skip the orchestrator entirely. This runs
-                # before the general/workspace split so cross-project routing
-                # works from the General chat too. New project creation is
-                # decided by the orchestrator LLM (create_project tool), never
-                # hardcoded here.
-                # NOTE: when the message comes FROM a project chat we fall
-                # through to run_graph_with_verify — it routes the same way and
-                # still runs the verification gate after the Dev turn.
-                try:
-                    if not req.workspace_path:
-                        from agents.project_router import route_request, stream_direct
-                        route_kind, project = route_request(resolved, "", req.chat_id)
-                        if route_kind == "project_dev" and project:
-                            for state_snapshot in stream_direct(project, resolved, "", req.chat_id):
-                                q.put(state_snapshot)
-                            q.put(None)  # signal completion
-                            return
-                except Exception as e:
-                    print(f"[API] Project routing error (falling back to pipeline): {e}")
-
-                is_general = not req.workspace_path
-                if is_general:
-                    from agents.general_agent import run_general_direct
-                    image_paths = [item.get("path") for item in req.attachments
-                                   if item.get("isImage") and item.get("path")]
-                    for state_snapshot in run_general_direct(resolved, chat_id=req.chat_id, images=image_paths or None):
-                        q.put(state_snapshot)
-                else:
-                    from verify_helper import run_graph_with_verify
-                    for state_snapshot in run_graph_with_verify(resolved, workspace_path=req.workspace_path, chat_id=req.chat_id, cancel_event=cancel_event):
-                        q.put(state_snapshot)
-                q.put(None)  # signal completion
-            except Exception as e:
-                import traceback
-                had_error = True
-                # Read the current shared state so the frontend sees the
-                # live_terminal_log with crash details (added by sync_manager).
-                # A bare {"error": ...} dict lacks live_terminal_log and
-                # would cause the frontend to show "Task complete." instead.
-                try:
-                    err_state = json.loads(safe_serialize_state())
-                except Exception:
-                    err_state = {}
-                err_state["error"] = str(e)
-                err_state["traceback"] = traceback.format_exc()
-                q.put(err_state)
-                q.put(None)
-            finally:
-                done = True
-
-        q: queue.Queue = queue.Queue()
-        thread = threading.Thread(target=run_in_thread, daemon=True)
-        thread.start()
-
-        last_ver = 0
-        last_bus_drain = 0.0
-        while not done or not q.empty():
-            if await request.is_disconnected():
-                cancel_event.set()  # Signal the graph thread to stop
-                break
-
-            # ── P10: forward live token deltas from the StreamBus (text /
-            # reasoning / end) as SSE `delta` frames ──
-            try:
-                from stream_bus import drain as _bus_drain, cleanup as _bus_cleanup
-                deltas = _bus_drain(req.chat_id)
-                if deltas:
-                    for d in deltas:
-                        _mirror_publish(req.chat_id, "delta", d)
-                        yield _format_sse("delta", d)
-                now = time.time()
-                if now - last_bus_drain > 60:
-                    last_bus_drain = now
-                    _bus_cleanup()
-            except Exception:
-                pass
-
-            try:
-                item = q.get(timeout=0.05)
-                if item is None:
-                    break
-                if isinstance(item, dict):
-                    _mirror_publish(req.chat_id, "state", item)
-                    yield _format_sse("state", item)
-                    last_ver = item.get("state_version", 0)
-            except queue.Empty:
-                if not done:
-                    snap = json.loads(safe_serialize_state())
-                    cur_ver = snap.get("state_version", 0)
-                    if cur_ver > last_ver:
-                        last_ver = cur_ver
-                        snap["_intermediate"] = True
-                        _mirror_publish(req.chat_id, "state", snap)
-                        yield _format_sse("state", snap)
-                await asyncio.sleep(0.05)
-
-        # Save token usage for the chat
-        _save_chat_token_usage(req.workspace_path, req.chat_id)
-
-        # The frontend persists one unified trace message containing the final
-        # answer and execution metadata. Do not save a second plain agent
-        # message here, otherwise every response appears twice in the chat.
-        # Final state, including the files changed during this run.
-        final_state = json.loads(safe_serialize_state())
-        final_state["artifacts"] = _collect_run_artifacts(req.workspace_path, run_context)
-
-        # P9: tell the frontend a new project workspace appeared this run
-        # (created via the orchestrator's create_project tool) so the sidebar
-        # can refresh without a manual reload.
-        try:
-            new_ids = {w.get("id") for w in wm.list_workspaces()} - _workspace_ids_before_run
-            if new_ids:
-                final_state["workspace_created"] = True
-                final_state["created_workspace_ids"] = sorted(new_ids)
-        except Exception:
-            pass
-
-        _mirror_publish(req.chat_id, "state", final_state)
-        yield _format_sse("state", final_state)
-        _mirror_publish(req.chat_id, "done", {"status": "error" if had_error else "complete"})
-        yield _format_sse("done", {"status": "error" if had_error else "complete"})
-
-    async def tracked_stream() -> AsyncGenerator[str, None]:
-        """Wrap build_stream so the active-run tracker is cleared no matter
-        how the stream ends (complete, error, or client disconnect)."""
-        try:
-            async for chunk in build_stream():
-                yield chunk
-        finally:
-            _clear_active_run()
-
-    _set_active_run(req.workspace_path, req.chat_id)
-    return StreamingResponse(tracked_stream(), media_type="text/event-stream")
-
-
-class InboxRequest(BaseModel):
-    chat_id: str = ""
-    message: str = ""
-
-
-@app.post("/api/steer")
-async def api_steer(req: InboxRequest):
-    """Queue a steering message: delivered after the current step's tool calls."""
-    from inbox import steer, pending_counts
-    ok = steer(req.chat_id, req.message)
-    return {"ok": ok, "pending": pending_counts(req.chat_id)}
-
-
-@app.post("/api/followup")
-async def api_followup(req: InboxRequest):
-    """Queue a follow-up message: delivered only after the agent is idle."""
-    from inbox import follow_up, pending_counts
-    ok = follow_up(req.chat_id, req.message)
-    return {"ok": ok, "pending": pending_counts(req.chat_id)}
-
-
-@app.post("/api/abort")
-async def api_abort(req: InboxRequest):
-    """Abort the current run; queued steering/follow-up are preserved."""
-    from inbox import abort, pending_counts
-    abort(req.chat_id, keep_inbox=True)
-    return {"ok": True, "pending": pending_counts(req.chat_id)}
-
-
-@app.get("/api/inbox")
-async def api_inbox(chat_id: str = ""):
-    from inbox import pending_counts
-    return pending_counts(chat_id)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Workspace file explorer (P10/Tier-3)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_FILE_SKIP_DIRS = {
-    ".git", ".hg", ".svn", "node_modules", "venv", "venv312", ".venv",
-    "__pycache__", ".pytest_cache", ".ruff_cache", ".agent-memory",
-    ".deep_agents", "dist", "build", ".next", "target", "release",
-}
-_FILE_MAX_SIZE = 5 * 1024 * 1024  # skip files larger than 5 MB in listings
-
-
-@app.get("/api/workspaces/{workspace_id}/files")
-async def list_workspace_files(workspace_id: str, max_depth: int = 8):
-    """Flat listing of a workspace folder tree (dirs then files, depth-capped)."""
-    ws = wm.get_workspace(workspace_id)
-    if not ws or not ws.get("path") or not os.path.isdir(ws["path"]):
-        return JSONResponse(content={"files": [], "error": "Workspace folder not found"}, status_code=404)
-    root = ws["path"]
-    out = []
-
-    def walk(d: str, depth: int, prefix: str) -> None:
-        if depth > max_depth:
-            return
-        try:
-            entries = sorted(os.listdir(d), key=str.lower)
-        except Exception:
-            return
-        for name in entries:
-            if name in _FILE_SKIP_DIRS:
-                continue
-            full = os.path.join(d, name)
-            rel = os.path.join(prefix, name) if prefix else name
-            try:
-                if os.path.isdir(full):
-                    out.append({"type": "dir", "path": rel, "name": name})
-                    walk(full, depth + 1, rel)
-                else:
-                    size = os.path.getsize(full)
-                    if size > _FILE_MAX_SIZE:
-                        continue
-                    out.append({"type": "file", "path": rel, "name": name, "size": size})
-            except Exception:
-                continue
-
-    walk(root, 0, "")
-    return {"files": out, "root": root}
-
-
-@app.get("/api/workspaces/{workspace_id}/file")
-async def get_workspace_file(workspace_id: str, path: str = ""):
-    """Read a file from the workspace (path-traversal safe, 200 KB cap)."""
-    ws = wm.get_workspace(workspace_id)
-    if not ws or not ws.get("path"):
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    root = os.path.realpath(ws["path"])
-    target = os.path.realpath(os.path.join(root, path))
-    if target != root and not target.startswith(root + os.sep):
-        return JSONResponse(content={"error": "Path escapes the workspace"}, status_code=400)
-    if not os.path.isfile(target):
-        return JSONResponse(content={"error": "File not found"}, status_code=404)
-    try:
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(200_000)
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-    return {"path": path, "content": content, "truncated": len(content) >= 200_000}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# House Workspace API (mock smart home; single source of truth = house_manager)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _house_manager():
-    import house_manager as hm
-    return hm
-
-
-@app.get("/api/house/state")
-async def house_state():
-    """Full house state: rooms, devices, scenes, energy, security."""
-    try:
-        return JSONResponse(content=_house_manager().get_house_state())
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.get("/api/house/devices/{device_id}")
-async def house_device(device_id: str):
-    hm = _house_manager()
-    device = hm.get_device(device_id)
-    if device is None:
-        return JSONResponse(content={"error": "Device not found"}, status_code=404)
-    return JSONResponse(content=device)
-
-
-class HouseStatePatch(BaseModel):
-    state: dict = {}
-
-
-@app.patch("/api/house/devices/{device_id}")
-async def house_set_device(device_id: str, req: HouseStatePatch):
-    """Write a state patch to one device (validated + clamped by the manager)."""
-    result = _house_manager().set_device(device_id, req.state)
-    if not result.get("ok"):
-        status = 404 if "Unknown device" in (result.get("error") or "") else 400
-        return JSONResponse(content={"error": result.get("error")}, status_code=status)
-    return JSONResponse(content=result.get("device"))
-
-
-@app.post("/api/house/rooms/{room_id}")
-async def house_set_room(room_id: str, req: HouseStatePatch):
-    """Apply one patch to every device in a room that supports those keys."""
-    result = _house_manager().set_room_state(room_id, req.state)
-    if result.get("error"):
-        return JSONResponse(content={"error": result["error"]}, status_code=404)
-    return JSONResponse(content={"applied": result.get("applied", []),
-                                 "skipped": result.get("skipped", [])})
-
-
-@app.post("/api/house/scenes/{scene_id}/run")
-async def house_run_scene(scene_id: str):
-    """Activate a scene (applies all its device actions)."""
-    result = _house_manager().run_scene(scene_id)
-    if not result.get("ok"):
-        return JSONResponse(content={"error": result.get("error")}, status_code=404)
-    scene = result.get("scene") or {}
-    return JSONResponse(content={
-        "sceneId": scene_id,
-        "name": scene.get("name", ""),
-        "applied": result.get("applied", []),
-        "skipped": result.get("skipped", []),
-    })
-
-
-@app.get("/api/house/history")
-async def house_history(device_id: str = "", hours: int = 24):
-    """Mock usage history for one device (hourly kWh series)."""
-    if not device_id:
-        return JSONResponse(content={"error": "device_id is required"}, status_code=400)
-    return JSONResponse(content=_house_manager().get_device_history(device_id, hours))
-
-
-@app.post("/api/house/reset")
-async def house_reset():
-    """Reseed the mock house state (demo/test helper)."""
-    result = _house_manager().reset_house_state()
-    if not result.get("ok"):
-        return JSONResponse(content={"error": result.get("error")}, status_code=400)
-    return JSONResponse(content=result)
-
-
-class AskAnswerRequest(BaseModel):
-    batch_id: str
-    answers: list[dict] = []
-
-
-@app.get("/api/ask/pending")
-async def api_ask_pending():
-    """Unanswered ask_user batches (frontend polls while an agent blocks)."""
-    from user_questions import pending_batches
-    return {"batches": pending_batches()}
-
-
-@app.post("/api/ask/answer")
-async def api_ask_answer(req: AskAnswerRequest):
-    """Resolve one pending ask_user batch with the human's answers."""
-    from user_questions import resolve_batch
-    ok = resolve_batch(req.batch_id, req.answers)
-    if not ok:
-        return JSONResponse(content={"ok": False, "error": "unknown batch"}, status_code=404)
-    return {"ok": True}
-
-
-
-@app.post("/api/session/reset")
-async def reset_session():
-    """Reset the shared state for a new session."""
-    empty_outputs = {
-        "requirements": "", "tech_spec": "", "code": "",
-        "test_report": "", "devops_config": "", "analytics_report": "",
-        "gherkin": "", "mermaid": "",
-    }
-    safe_update_state({
-        "active_node": "",
-        "next_agent": "",
-        "completed_nodes": [],
-        "thoughts": {
-            "supervisor": "", "developer": "",
-        },
-        "client_request": "",
-        "outputs": empty_outputs,
-        "project_path": "",
-        "agents_plan": "",
-        "deep_agents_log": [],
-        "live_terminal_log": "[SESSION] Reset. Ready for a new request.\n",
-        "token_usage": {
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
-            "total_cache_hit_tokens": 0,
-            "total_cache_miss_tokens": 0,
-            "total_cost": 0.0,
-            "calls": [],
-        },
-    })
-    return JSONResponse(content={"status": "ok"})
-
-
-@app.get("/api/history")
-async def get_history():
-    """Return recent prompt history."""
-    try:
-        from memory.chat_memory_manager import load_chat_memory
-        mem = load_chat_memory()
-        messages = mem.get("current_day_messages", [])
-        user_prompts = [m["text"] for m in messages if m.get("sender") == "user"]
-        seen = set()
-        user_prompts = [x for x in user_prompts if not (x in seen or seen.add(x))]
-        return JSONResponse(content={"prompts": user_prompts[:10] if user_prompts else ["No recent prompts"]})
-    except Exception:
-        return JSONResponse(content={"prompts": ["No recent prompts"]})
-
-
-@app.get("/api/models")
-async def get_models():
-    """Return available model list."""
-    return JSONResponse(content={
-        "models": [
-            {"id": "Automatic Fallback", "name": "Automatic Fallback", "provider": "auto"},
-            {"id": "deepseek-v4-flash-vision-exp", "name": "DeepSeek V4 Flash Vision Exp (Go)", "provider": "opencode"},
-            {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash 0731 (Free)", "provider": "cline"},
-            {"id": "deepseek/deepseek-chat", "name": "DeepSeek Chat", "provider": "openrouter"},
-            {"id": "deepseek/deepseek-r1", "name": "DeepSeek R1", "provider": "openrouter"},
-            {"id": "openrouter/owl-alpha", "name": "Owl Alpha (OpenRouter)", "provider": "openrouter"},
-            {"id": "qwen/qwen3-coder-480b-a35b-07-25:free", "name": "Qwen Coder 480B (Free)", "provider": "openrouter"},
-            {"id": "nvidia/nemotron-3-ultra-550b-a55b:free", "name": "Nemotron Ultra 550B (Free)", "provider": "openrouter"},
-            {"id": "google/gemma-4-31b-it:free", "name": "Gemma 4 31B (Free)", "provider": "openrouter"},
-            {"id": "openai/gpt-oss-120b:free", "name": "GPT-OSS 120B (Free)", "provider": "openrouter"},
-            {"id": "openai/gpt-oss-20b:free", "name": "GPT-OSS 20B (Free)", "provider": "openrouter"},
-            {"id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "name": "Nemotron Nano 30B (Free)", "provider": "openrouter"},
-            {"id": "groq/llama-3.3-70b-versatile", "name": "Llama 3.3 70B (Groq)", "provider": "groq"},
-            {"id": "groq/llama-3.1-8b-instant", "name": "Llama 3.1 8B (Groq)", "provider": "groq"},
-            {"id": "gemini/gemini-2.5-flash", "name": "Gemini 2.5 Flash", "provider": "gemini"},
-            {"id": "gemini/gemini-1.5-pro", "name": "Gemini 1.5 Pro", "provider": "gemini"},
-            {"id": "gemini/gemini-1.5-flash", "name": "Gemini 1.5 Flash", "provider": "gemini"},
-        ]
-    })
-
-
-@app.get("/api/provider")
-async def get_provider():
-    """Return the active LLM provider mode, its resolved config summary, and
-    the per-tier routing matrix (orchestrator / workspace / specialist)."""
-    from llm import _resolve_llm_provider, _load_persisted_provider
-    from llm.provider_modes import MODES, get_role_plan
-
-    provider = safe_get_state().get("llm_provider", "") or _load_persisted_provider() or "deepseek"
-    cfg = _resolve_llm_provider()
-    matrix = {}
-    for role in ("Orchestrator", "Developer", "UI"):
-        plan = get_role_plan(role)
-        tier = plan.get("tier")
-        matrix[tier] = {
-            "backend": plan.get("backend"),
-            "model": plan.get("model"),
-            "iter_effort": plan.get("iter_effort"),
-            "think_bias": plan.get("think_bias"),
-        }
-    return JSONResponse(content={
-        "provider": provider,
-        "modes": list(MODES),
-        "matrix": matrix,
-        "base_url": cfg["base"],
-        "model_flash": cfg["flash"],
-        "model_pro": cfg["pro"],
-        "model_vision": cfg.get("vision", ""),
-        "has_key": bool(cfg["key"]) and not cfg["key"].startswith("your_"),
-    })
-
-
-@app.post("/api/provider")
-async def set_provider(req: Request):
-    """Set the active LLM provider mode for subsequent runs AND persist it."""
-    from llm import _save_persisted_provider
-    from llm.provider_modes import MODES
-
-    body = await req.json()
-    provider = str(body.get("provider", "")).strip().lower()
-    if provider not in MODES:
-        return JSONResponse(
-            content={"error": f"Invalid provider '{provider}'. Use one of: {', '.join(MODES)}."},
-            status_code=400,
-        )
-    safe_update_state({"llm_provider": provider})
-    _save_persisted_provider(provider)
-    return JSONResponse(content={"provider": provider, "ok": True})
-
-
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "service": "Deep Agents API v2.0"}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Workspace & Chat API
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.get("/api/workspaces")
-async def get_workspaces():
-    return JSONResponse(content={"workspaces": wm.list_workspaces()})
-
-
-@app.post("/api/workspaces")
-async def create_workspace(req: Request):
-    body = await req.json()
-    path = body.get("path", "").strip()
-    name = body.get("name", "").strip()
-    if not path:
-        return JSONResponse(content={"error": "Path required"}, status_code=400)
-    try:
-        ws = wm.add_workspace(path, name)
-        return JSONResponse(content=ws)
-    except ValueError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=400)
-
-
-@app.delete("/api/workspaces/{workspace_id}")
-async def delete_workspace(workspace_id: str):
-    ok = wm.remove_workspace(workspace_id)
-    return JSONResponse(content={"status": "ok" if ok else "not found"})
-
-
-@app.get("/api/workspaces/{workspace_id}/chats")
-async def get_chats(workspace_id: str):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    chats = wm.list_chats(ws["path"])
-    return JSONResponse(content={"chats": chats})
-
-
-@app.post("/api/workspaces/{workspace_id}/chats")
-async def create_chat_endpoint(workspace_id: str, req: Request):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    body = await req.json()
-    title = body.get("title", "")
-    model = body.get("model", "Automatic Fallback")
-    chat = wm.create_chat(ws["path"], title, model)
-    return JSONResponse(content=chat)
-
-
-@app.get("/api/workspaces/{workspace_id}/chats/{chat_id}")
-async def get_chat_endpoint(workspace_id: str, chat_id: str):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    chat = wm.get_chat(ws["path"], chat_id)
-    if not chat:
-        return JSONResponse(content={"error": "Chat not found"}, status_code=404)
-    return JSONResponse(content=chat)
-
-
-@app.get("/api/workspaces/{workspace_id}/chats/{chat_id}/subagents")
-async def list_chat_subagents(workspace_id: str, chat_id: str):
-    """Children spawned by this chat (cont- continuable + sub- task spawns)."""
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    try:
-        from agents.subagent_manager import list_agents
-        return JSONResponse(content={"subagents": list_agents(ws["path"], chat_id)})
-    except Exception as e:
-        return JSONResponse(content={"subagents": [], "error": str(e)})
-
-
-@app.get("/api/workspaces/{workspace_id}/subagents/{child_id}")
-async def get_subagent_session(workspace_id: str, child_id: str):
-    """Read-only transcript of one spawned subagent session (drill-in view)."""
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    try:
-        from agents.subagent_manager import read_child_session
-        data = read_child_session(ws["path"], child_id)
-    except Exception:
-        data = None
-    if not data:
-        return JSONResponse(content={"error": "Subagent session not found"}, status_code=404)
-    return JSONResponse(content=data)
-
-
-@app.delete("/api/workspaces/{workspace_id}/chats/{chat_id}")
-async def delete_chat_endpoint(workspace_id: str, chat_id: str):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    ok = wm.delete_chat(ws["path"], chat_id)
-    return JSONResponse(content={"status": "ok" if ok else "not found"})
-
-
-@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/messages")
-async def add_message_endpoint(workspace_id: str, chat_id: str, req: Request):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    body = await req.json()
-    role = body.get("role", "user")
-    content = body.get("content", "")
-    meta = body.get("metadata")
-    msg = wm.add_message(ws["path"], chat_id, role, content, meta)
-    if not msg:
-        return JSONResponse(content={"error": "Chat not found"}, status_code=404)
-    return JSONResponse(content=msg)
-
-
-@app.post("/api/workspaces/{workspace_id}/chats/{chat_id}/attachments")
-async def upload_chat_attachments(workspace_id: str, chat_id: str, files: list[UploadFile] = File(...)):
-    """Store chat attachments outside the workspace and return safe agent-readable paths."""
-    ws = wm.get_workspace(workspace_id)
-    if not ws or not wm.get_chat(ws["path"], chat_id):
-        return JSONResponse(content={"error": "Chat not found"}, status_code=404)
-    if len(files) > 8:
-        return JSONResponse(content={"error": "A maximum of 8 files can be uploaded"}, status_code=400)
-
-    upload_dir = os.path.join(os.path.dirname(__file__), ".deep_agents", "uploads", workspace_id, chat_id)
-    os.makedirs(upload_dir, exist_ok=True)
-    attachments = []
-    for item in files:
-        filename = os.path.basename(item.filename or "attachment")
-        contents = await item.read()
-        if len(contents) > 20 * 1024 * 1024:
-            return JSONResponse(content={"error": f"{filename} is larger than 20 MB"}, status_code=400)
-        stored_name = f"{uuid.uuid4().hex[:8]}-{filename}"
-        target = os.path.join(upload_dir, stored_name)
-        with open(target, "wb") as handle:
-            handle.write(contents)
-        mime = item.content_type or "application/octet-stream"
-        attachments.append({
-            "id": stored_name, "name": filename, "type": mime, "size": len(contents),
-            "path": target, "isImage": mime.startswith("image/"),
-        })
-    return JSONResponse(content={"attachments": attachments})
-
-
-@app.put("/api/workspaces/{workspace_id}/chats/{chat_id}/title")
-async def update_chat_title(workspace_id: str, chat_id: str, req: Request):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    body = await req.json()
-    title = body.get("title", "")
-    ok = wm.update_chat_title(ws["path"], chat_id, title)
-    return JSONResponse(content={"status": "ok" if ok else "not found"})
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Settings & Rules API
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@app.get("/api/settings/general-profile")
-async def get_general_profile():
-    """Get the General mode user profile (instructions + memory)."""
-    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT; profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
-    default = {
-        "user_info": {"name": "", "birthday": "", "education": ""},
-        "instructions": "",
-        "memory": []
-    }
-    if os.path.isfile(profile_path):
-        try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                return JSONResponse(content=json.load(f))
-        except Exception:
-            pass
-    return JSONResponse(content=default)
-
-
-@app.post("/api/settings/general-profile")
-async def save_general_profile(req: Request):
-    """Save the General mode user profile."""
-    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT; profile_path = os.path.join(harness_root, ".deep_agents", "general_profile.json")
-    body = await req.json()
-    try:
-        os.makedirs(os.path.dirname(profile_path), exist_ok=True)
-        with open(profile_path, "w", encoding="utf-8") as f:
-            json.dump(body, f, indent=2)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.get("/api/settings/profile")
-
-async def get_profile():
-    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT
-    profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
-    default_profile = {
-        "user_info": {"name": "Davin Akmal Yasha"},
-        "global_rules": []
-    }
-    if os.path.isfile(profile_path):
-        try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                return JSONResponse(content=json.load(f))
-        except Exception:
-            pass
-    return JSONResponse(content=default_profile)
-
-@app.post("/api/settings/profile")
-async def save_profile(req: Request):
-    harness_root = os.environ.get("HARNESS_ROOT") or _ROOT
-    profile_path = os.path.join(harness_root, ".deep_agents", "user_profile.json")
-    body = await req.json()
-    try:
-        os.makedirs(os.path.dirname(profile_path), exist_ok=True)
-        with open(profile_path, "w", encoding="utf-8") as f:
-            json.dump(body, f, indent=2)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.get("/api/workspaces/{workspace_id}/rules")
-async def get_workspace_rules(workspace_id: str):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or _ROOT, ".deep_agents", "rules", f"{workspace_id}.json")
-    default_rules = {
-        "stack": {},
-        "workspace_rules": []
-    }
-    if os.path.isfile(rules_path):
-        try:
-            with open(rules_path, "r", encoding="utf-8") as f:
-                return JSONResponse(content=json.load(f))
-        except Exception:
-            pass
-    return JSONResponse(content=default_rules)
-
-@app.post("/api/workspaces/{workspace_id}/rules")
-async def save_workspace_rules(workspace_id: str, req: Request):
-    ws = wm.get_workspace(workspace_id)
-    if not ws:
-        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
-    rules_path = os.path.join(os.environ.get("HARNESS_ROOT") or _ROOT, ".deep_agents", "rules", f"{workspace_id}.json")
-    body = await req.json()
-    try:
-        os.makedirs(os.path.dirname(rules_path), exist_ok=True)
-        with open(rules_path, "w", encoding="utf-8") as f:
-            json.dump(body, f, indent=2)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-# ── Voice transcription ────────────────────────────────────────────────────────
-
-@app.post("/api/voice/start")
-async def voice_start():
-    """Start server-side mic capture (sounddevice, 16kHz raw — the pure Moonshine path)."""
-    try:
-        import audio_engine
-        ok = await asyncio.to_thread(audio_engine.start_capture)
-        return JSONResponse(content={"active": ok})
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"error": f"Capture unavailable: {e}"})
-
-
-@app.get("/api/voice/status")
-async def voice_status():
-    try:
-        import audio_engine
-        return JSONResponse(content={"active": audio_engine.capture_active()})
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"error": str(e)})
-
-
-@app.post("/api/voice/stop")
-async def voice_stop(request: Request):
-    """Stop capture and return the final transcript (official streaming flush).
-
-    Body: {"discard": true} stops without transcribing (mic turned off).
-    """
-    discard = False
-    try:
-        body = await request.json()
-        discard = bool(body.get("discard"))
-    except Exception:
-        pass
-    try:
-        import audio_engine
-        text = (await asyncio.to_thread(audio_engine.stop_capture, discard) or "").strip()
-        if discard:
-            return JSONResponse(content={"text": "", "engine": "moonshine", "discarded": True})
-        if not text:
-            return JSONResponse(status_code=422, content={"error": "Moonshine could not transcribe the audio (empty result)"})
-        return JSONResponse(content={"text": text, "engine": "moonshine"})
-    except Exception as e:
-        import traceback
-        print(f"[Voice] stop/transcribe failed: {e}")
-        traceback.print_exc()
-        return JSONResponse(status_code=503, content={"error": f"Moonshine ASR unavailable: {e}"})
-
-
-@app.post("/api/voice/mute")
-async def voice_mute(request: Request):
-    """Mute the capture while Stark speaks (prevents self-transcription)."""
-    muted = False
-    try:
-        body = await request.json()
-        muted = bool(body.get("muted"))
-    except Exception:
-        pass
-    try:
-        import audio_engine
-        await asyncio.to_thread(audio_engine.set_capture_muted, muted)
-        return JSONResponse(content={"muted": muted})
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"error": str(e)})
-
-
-@app.post("/api/voice/peek")
-async def voice_peek():
-    """Latest rolling transcript + live mic level (no model call)."""
-    try:
-        import audio_engine
-        text = audio_engine.live_text()
-        return JSONResponse(content={"text": text, "level": audio_engine.live_peak(), "active": audio_engine.capture_active()})
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"error": str(e)})
-
-
-@app.post("/api/transcribe")
-async def transcribe_audio(file: UploadFile = File(...), language: str = Form("")):
-    """Transcribe audio with the on-device Moonshine engine (free, CPU)."""
-    audio_bytes = await file.read()
-    if not audio_bytes:
-        return JSONResponse(status_code=400, content={"error": "Empty audio file"})
-
-    tmp_path = None
-    try:
-        import audio_engine
-        tmp_path = os.path.join(tempfile.gettempdir(), f"stt_{uuid.uuid4().hex}.webm")
-        with open(tmp_path, "wb") as f:
-            f.write(audio_bytes)
-        print(f"[Transcribe] received {len(audio_bytes)} bytes ({file.filename or 'round.webm'})")
-        text = (await asyncio.to_thread(audio_engine.transcribe_file, tmp_path) or "").strip()
-        if not text:
-            print("[Transcribe] empty transcript from Moonshine")
-            return JSONResponse(status_code=422, content={"error": "Moonshine could not transcribe the audio (empty result)"})
-        print(f"[Transcribe] OK: '{text[:100]}'")
-        return JSONResponse(content={"text": text, "engine": "moonshine"})
-    except Exception as e:
-        import traceback
-        print(f"[Transcribe] Local ASR unavailable: {e}")
-        traceback.print_exc()
-        return JSONResponse(status_code=503, content={"error": f"Moonshine ASR unavailable: {e}"})
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def _is_clean_polish(text: str) -> bool:
-    """Reject free-model outputs that aren't a plain transcript rewrite.
-
-    Free models sometimes role-play ("NextGS: ... User Safety: safe") or
-    echo instructions instead of returning the corrected text only.
-    """
-    t = (text or "").strip()
-    if not t or len(t) > 1200:
-        return False
-    if t.lower().startswith(("[freeagent", "error", "as an ai", "i can't")):
-        return False
-    if "reply with only the corrected text" in t.lower():
-        return False
-    # Speaker labels / role-play patterns
-    if re.search(
-        r"(^|\n)\s*(?:"
-        r"(user|assistant|system|ai|human|bot|model|nextgs?|safety)[a-z]*\s*[:：]"
-        r"|user\s+safety\s*[:：]"
-        r"|\[(?:freeagent|ai|assistant|user)[^\]]*\]"
-        r")",
-        t,
-        re.IGNORECASE | re.MULTILINE,
-    ):
-        return False
-    return True
-
-
-@app.post("/api/cleanup")
-async def cleanup_text(req: CleanupRequest):
-    """Grammar-polish a voice transcript with a free LLM call (Gemini-style fix).
-
-    Fixes grammar/spelling/punctuation for imperfect speech-to-text output while
-    keeping meaning, language (Indonesian/English) and technical terms.
-    Long input (>800 chars) or suspicious model output passes through untouched.
-    """
-    text = (req.text or "").strip()
-    if not text:
-        return JSONResponse(content={"text": ""})
-    if len(text) > 800:
-        return JSONResponse(content={"text": text})
-    try:
-        from llm import free_providers
-        prompt = (
-            "You are a grammar corrector. Fix the grammar, spelling, and punctuation "
-            "of the voice transcript below. Keep the exact meaning, wording, language "
-            "(Indonesian or English), and technical terms. Do NOT answer the question, "
-            "do NOT add labels, do NOT role-play, do NOT add explanations. Reply with "
-            "ONLY the corrected transcript text, nothing else.\n\n"
-            + text
-        )
-        polished = await asyncio.to_thread(free_providers.chat, prompt)
-        polished = (polished or "").strip()
-        if not _is_clean_polish(polished):
-            return JSONResponse(content={"text": text})
-        return JSONResponse(content={"text": polished})
-    except Exception as e:
-        print(f"[Cleanup] Error: {e}")
-        return JSONResponse(content={"text": text})
-
-
-# ── TTS helpers ──────────────────────────────────────────────────────────────
-# (edge-tts removed — voice now runs on the on-device Kokoro engine only)
-
-
-@app.post("/api/tts")
-async def tts(req: TTSRequest):
-    """Synthesize speech with the on-device Kokoro engine (free, CPU).
-
-    Returns an audio/wav stream. Generated once per (voice, text) pair and
-    cached so repeated replies are instant.
-    """
-    text = (req.text or "").strip()
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "Empty text"})
-    voice = req.voice or "am_michael"
-
-    cache_dir = os.path.join(os.path.dirname(__file__), ".deep_agents", "tts_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-
-    # Prune stale cache entries (older than 48h)
-    try:
-        now = time.time()
-        for name in os.listdir(cache_dir):
-            p = os.path.join(cache_dir, name)
-            if os.path.isfile(p) and now - os.path.getmtime(p) > 48 * 3600:
-                os.remove(p)
-    except Exception:
-        pass
-
-    try:
-        import audio_engine
-        tts_key = (voice + '\x00' + text).encode('utf-8')
-        out_path = os.path.join(cache_dir, f"kokoro_{hashlib.md5(tts_key).hexdigest()[:20]}.wav")
-        if not os.path.exists(out_path):
-            ok = await asyncio.to_thread(audio_engine.synthesize_tts, text, out_path, voice)
-            if not ok or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-                return JSONResponse(status_code=502, content={"error": "Kokoro TTS generation failed"})
-        return FileResponse(out_path, media_type="audio/wav")
-    except Exception as e:
-        print(f"[TTS] Kokoro engine unavailable: {e}")
-        return JSONResponse(status_code=503, content={"error": f"Kokoro TTS unavailable: {e}"})
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Live mirror stream (mobile/remote feature) — registered after /api/run so
-# any client can watch a chat's run frames in real time.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.get("/api/stream/{chat_id}")
-async def stream_chat_events(chat_id: str, request: Request):
-    """Subscribe to another client's run frames for one chat (live mirroring).
-
-    Late joiners get the current shared state immediately when a run for this
-    chat is already active, then receive every subsequent frame identically to
-    the initiating client.
-    """
-    from event_bus import subscribe as bus_subscribe, unsubscribe as bus_unsubscribe
-    q = bus_subscribe(chat_id)
-
-    async def mirror_stream() -> AsyncGenerator[str, None]:
-        try:
-            yield _format_sse("hello", {"chat_id": chat_id})
-            with _active_run_lock:
-                running_here = _active_run.get("running") and _active_run.get("chat_id") == chat_id
-            if running_here:
-                # Catch the new viewer up so both screens render the same now.
-                try:
-                    snap = json.loads(safe_serialize_state())
-                    yield _format_sse("state", snap)
-                except Exception:
-                    pass
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    event, data = await asyncio.to_thread(q.get, True, 0.5)
-                    yield _format_sse(event, data)
-                    if event == "done":
-                        break
-                except queue.Empty:
-                    yield ": keepalive\n\n"
-        finally:
-            bus_unsubscribe(chat_id, q)
-
-    return StreamingResponse(mirror_stream(), media_type="text/event-stream")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Static frontend serving (mobile/remote feature)
 # Serves the production Vite build from frontend/dist on the same origin as the
 # API, so the phone only needs http://<laptop>:8000. Registered LAST: every
 # /api/* route above matches first; anything else falls back to the SPA shell.
-# ═══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
 
@@ -1891,33 +492,58 @@ if os.path.isdir(_FRONTEND_DIST):
             return FileResponse(index_path)
         return JSONResponse(status_code=404, content={"error": "Frontend build not found (run npm run build)"})
 else:
-    print("[STARTUP] frontend/dist not found — UI serving disabled (Electron/dev mode unaffected)")
+    print("[STARTUP] frontend/dist not found â€” UI serving disabled (Electron/dev mode unaffected)")
 
 
-# ── Startup ─────────────────────────────────────────────────────────────────
+# â”€â”€ Startup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if __name__ == "__main__":
     import uvicorn
     import sys
-    
+
     reload_mode = "--reload" in sys.argv
 
+    # Single-instance guard: if port already held, exit quietly (no storm, no
+    # duplicate model warm-up). Check BEFORE starting warm threads.
+    if _port_in_use(STARK_PORT):
+        print(f"[API] Port {STARK_PORT} already in use — another api_server is running. Exiting quietly.")
+        sys.exit(0)
+
+    from server.services.task_scheduler import start_task_scheduler as _start_task_scheduler
     _start_task_scheduler()
 
-    # Warm the embedding model in the background (the first semantic search
-    # would otherwise stall the agent loop for seconds-minutes loading ONNX).
-    def _warm_embeddings() -> None:
-        try:
-            from tools import _embedding_model_available
-            if not _embedding_model_available():
-                return
-            from memory.embedding_service import embed
-            embed("warmup")
-            print("[API] Embedding model warmed.")
-        except Exception as e:
-            print(f"[API] Embedding warm-up skipped: {e}")
+    # NOTE: The embedding model (fastembed bge-large ~1.3GB) is deliberately
+    # NOT warmed at boot — it is lazy-loaded on first embed() call in
+    # memory/embedding_service.py, and the only live consumer (template
+    # search's semantic boost) already gates on _embedding_model_warm().
+    # Keeping it cold frees ~1.3GB of resident RAM for the harness.
 
-    threading.Thread(target=_warm_embeddings, daemon=True).start()
+    # NOTE: The Pocket TTS model is deliberately NOT warmed at boot — it is
+    # lazy-loaded when live mode opens (POST /api/voice/warm_tts) and freed
+    # when it closes (POST /api/voice/release_tts), so chat-only usage never
+    # pays for ~1GB of resident TTS. The overlay shows a loading state while
+    # it warms (~10s: torch/onnxruntime imports + model + voice state).
+
+    # Warm the orchestrator LLM client in the background so the first voice
+    # turn doesn't pay the 50-90s cold-call (mimo first request spins up the
+    # provider connection). A trivial invoke primes the HTTP pool.
+    def _warm_llm() -> None:
+        try:
+            from llm.llm import _get_deepseek_client, _map_model
+            from llm.provider_modes import MODE_MATRIX
+            orch = MODE_MATRIX.get("command", {}).get("orchestrator") or {}
+            model = orch.get("model") if isinstance(orch, dict) else "xiaomi/mimo-v2.5"
+            llm = _get_deepseek_client(_map_model(model), 0.3)
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm.invoke([
+                SystemMessage(content="You are a helpful assistant."),
+                HumanMessage(content="Reply with the single word: ready"),
+            ])
+            print(f"[API] Orchestrator LLM warmed ({model}).")
+        except Exception as e:
+            print(f"[API] Orchestrator LLM warm-up skipped: {e}")
+
+    threading.Thread(target=_warm_llm, daemon=True).start()
     
     # Start Telegram bot in background
     try:
@@ -1930,11 +556,15 @@ if __name__ == "__main__":
     if reload_mode:
         # Import-string form (required for reload): resolve as a package module
         # since the file lives in server/, and Electron's cwd is the repo root.
-        uvicorn.run("server.api_server:app", host="127.0.0.1", port=8000, reload=True)
+        uvicorn.run("server.api_server:app", host="127.0.0.1", port=STARK_PORT, reload=True)
     else:
         bind_host = os.environ.get("STARK_BIND", "127.0.0.1")
-        bind_port = int(os.environ.get("STARK_PORT", "8000"))
+        bind_port = int(os.environ.get("STARK_PORT", str(STARK_PORT)))
         if bind_host == "0.0.0.0":
-            print("[API] Remote mode: listening on all interfaces — pairing token required for non-local clients.")
-        print("[API] Running in production mode (reload disabled).")
+            print("[API] Remote mode: listening on all interfaces â€” pairing token required for non-local clients.")
+        print(f"[API] Running in production mode (reload disabled) on port {bind_port}.")
         uvicorn.run(app, host=bind_host, port=bind_port)
+
+
+
+

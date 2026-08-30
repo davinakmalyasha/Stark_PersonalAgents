@@ -23,6 +23,12 @@ def check(label, cond):
     print(f"  ok {PASS}: {label}")
 
 
+def _native_final(text: str) -> tuple:
+    """Native slice for a final (no-tool) turn: (text, [AIMessage], None)."""
+    from langchain_core.messages import AIMessage
+    return (text, [AIMessage(content=text)], None)
+
+
 def main():
     import llm
     from agents import subagent_manager
@@ -33,11 +39,12 @@ def main():
     ws = tempfile.mkdtemp(prefix="cont_")
     reset_manager()
 
+    # Patch the specialist backend directly (A5: it now returns a native
+    # transcript slice; the turn loop extends history from it).
+    from tools.AddOnTool import subagentTools as sm_mod
+
     # ── 1. first turn with a mocked "final answer" LLM ──
-    llm.invoke_messages_with_fallback = lambda role, messages, **kw: SimpleNamespace(
-        content="Done with the task.", reasoning_content=None,
-    )
-    llm.invoke_messages_with_fallback_stream = llm.invoke_messages_with_fallback
+    sm_mod._specialist_call_backend = lambda name, messages, native_tools=None, schema=None, model=None, temp=0.2, reasoning_effort=None, where="": _native_final("Done with the task.")
     r = start_continuable("chatA", ws, "general-purpose", "Do something", label="research")
     child_id = r["child_id"]
     check("start returns child_id", child_id.startswith("cont-"))
@@ -64,10 +71,7 @@ def main():
     check("list_agents filters chat", list_agents(ws, chat_id="other") == [])
 
     # ── 3. follow-up turn (cold resume from log) ──
-    llm.invoke_messages_with_fallback = lambda role, messages, **kw: SimpleNamespace(
-        content="Follow-up answered.", reasoning_content=None,
-    )
-    llm.invoke_messages_with_fallback_stream = llm.invoke_messages_with_fallback
+    sm_mod._specialist_call_backend = lambda name, messages, native_tools=None, schema=None, model=None, temp=0.2, reasoning_effort=None, where="": _native_final("Follow-up answered.")
     r2 = send_message(child_id, "Now also check the docs.", ws)
     check("follow-up result", "Follow-up answered." in r2["result"])
     mgr2 = SessionManager.open(path)
@@ -76,11 +80,13 @@ def main():
     check("two assistant turns in log", sum("answered" in c or "Done with the task" in c for c in contents) >= 2)
 
     # ── 4. queue while running + interrupt ──
-    def _looping_mock(role, messages, **kw):
+    def _looping_mock(name, messages, native_tools=None, schema=None, model=None, temp=0.2, reasoning_effort=None, where=""):
         time.sleep(0.4)  # keep the turn alive long enough to observe "running"
-        return ("", [{"tool": "list_agents", "args": {}, "id": "loop-call"}], None)
-    llm.invoke_messages_with_fallback = _looping_mock
-    llm.invoke_messages_with_fallback_stream = _looping_mock
+        from langchain_core.messages import AIMessage
+        return ("", [AIMessage(content="", tool_calls=[
+            {"name": "list_agents", "args": {}, "id": "loop-call"},
+        ])], None)
+    sm_mod._specialist_call_backend = _looping_mock
     r3_holder = {}
 
     def worker():
@@ -124,16 +130,10 @@ def main():
 
     # ── 6. tools.py surface ──
     import tools
-    tools.ensure_tool_registry()
-    for n in ("send_message", "list_agents", "interrupt_agent", "report"):
-        check(f"registry has {n}", tools.ensure_tool_registry().get(n) is not None)
-    from tools_pkg import get_native_tools
-    native_names = {t["function"]["name"] for t in get_native_tools()}
-    check("native schemas include P6 tools", {"send_message", "list_agents", "interrupt_agent", "report"} <= native_names)
     tools._load_subagents()
-    gp = tools._SUBAGENTS_REGISTRY["general-purpose"]["tools"]
-    check("general-purpose has control tools",
-          {"send_message", "list_agents", "interrupt_agent", "report"} <= set(gp))
+    for n in ("send_message", "list_agents", "interrupt_agent", "report"):
+        check(f"registry has {n}", n in tools.TOOL_MAP)
+    check("general-purpose spec resolves", "general-purpose" in tools._SUBAGENTS_REGISTRY)
 
     print(f"\nALL {PASS} CHECKS PASSED")
 

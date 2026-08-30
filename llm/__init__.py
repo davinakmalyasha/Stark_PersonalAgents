@@ -30,8 +30,6 @@ from .loop_detector import (
     LoopGuard,
 )
 from .llm import (
-    invoke_messages_with_fallback,
-    invoke_messages_with_fallback_stream,
     invoke_with_fallback,
     strip_thinking_from_messages,
     _extract_text,
@@ -53,8 +51,6 @@ __all__ = [
     "update_token_stats",
     "calculate_cost",
     "LoopGuard",
-    "invoke_messages_with_fallback",
-    "invoke_messages_with_fallback_stream",
     "invoke_with_fallback",
     "strip_thinking_from_messages",
     "_extract_text",

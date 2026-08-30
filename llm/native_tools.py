@@ -85,7 +85,8 @@ def _before_tool_execute(
     try:
         from tools.plan_mode_guard import plan_mode_guard
         reason = plan_mode_guard(
-            {"name": call.tool_name, "args": dict(args or {}), "scope": ctx.deps.role}
+            {"name": call.tool_name, "args": dict(args or {}), "scope": ctx.deps.role,
+             "deps": ctx.deps}
         )
         if reason:
             from pydantic_ai.tools import ToolDenied

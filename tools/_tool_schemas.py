@@ -7,7 +7,7 @@ to today.
 
 This module is the *only* place we declare input schemas. When Stage 1 is
 complete and we want to expand coverage, add a class here and a single
-line in `_registry.py::ensure_tool_registry`.
+line in `tools/_registry.py`.
 """
 
 from __future__ import annotations

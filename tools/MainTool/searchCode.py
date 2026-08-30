@@ -10,14 +10,17 @@ import re
 from ._shared import _log_tool
 
 
-def search_code(pattern: str = "", patterns: list = None, path: str = "", glob: str = "", mode: str = "content") -> str:
-    """Search code: 'content' (default) regex-matches file contents; 'files' glob-matches filenames. Supports multi-pattern ranked search via patterns=[...]."""
+def search_code(ctx: object = None, pattern: str = "", patterns: list = None, path: str = "", glob: str = "", mode: str = "content") -> str:
+    """Search code: 'content' (default) regex-matches file contents; 'files' glob-matches filenames. Supports multi-pattern ranked search via patterns=[...].
+    ``ctx`` is the optional typed WorkspaceDeps (registry passes it when the
+    signature starts with ctx/deps/run_ctx); legacy callers omit it.
+    """
     from tools import shared_state, WORKSPACE, enforce_fs_permission, _sanitize_path
     # Normalize patterns: patterns list takes precedence, else single pattern
     if patterns is not None and isinstance(patterns, list) and len([p for p in patterns if isinstance(p, str) and p.strip()]) > 0:
         # Multi-pattern ranked search
         clean_patterns = [str(p).strip() for p in patterns if isinstance(p, str) and str(p).strip()]
-        return _search_multi(clean_patterns, path, glob, mode)
+        return _search_multi(clean_patterns, path, glob, mode, ctx)
     if patterns is not None and isinstance(patterns, str) and patterns.strip():
         # Allow patterns as single string (comma-separated or single)
         return search_code(pattern=patterns.strip(), path=path, glob=glob, mode=mode)
@@ -26,8 +29,13 @@ def search_code(pattern: str = "", patterns: list = None, path: str = "", glob: 
     pattern = str(pattern).strip()
 
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     enforce_fs_permission("read", path if path else active_ws)
-    search_dir = _sanitize_path(path) if path else _sanitize_path(active_ws)
+    search_dir = _sanitize_path(path, ctx) if path else _sanitize_path(active_ws, ctx)
     if not os.path.isdir(search_dir):
         search_dir = _sanitize_path(active_ws)
 
@@ -92,12 +100,17 @@ def search_code(pattern: str = "", patterns: list = None, path: str = "", glob: 
     return output
 
 
-def _search_multi(patterns: list, path: str = "", glob: str = "", mode: str = "content") -> str:
+def _search_multi(patterns: list, path: str = "", glob: str = "", mode: str = "content", ctx: object = None) -> str:
     """Ranked multi-pattern search: returns files ranked by how many patterns hit."""
     from tools import shared_state, WORKSPACE, enforce_fs_permission, _sanitize_path
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     enforce_fs_permission("read", path if path else active_ws)
-    search_dir = _sanitize_path(path) if path else _sanitize_path(active_ws)
+    search_dir = _sanitize_path(path, ctx) if path else _sanitize_path(active_ws, ctx)
     if not os.path.isdir(search_dir):
         search_dir = _sanitize_path(active_ws)
     ignored_dirs = {

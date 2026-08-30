@@ -33,24 +33,12 @@ from ._schemas import (
     _TOOL_REQUIRED_ARGS,
 )
 from ._registry import (
-    ToolDefinition,
     ToolExecutionResult,
-    ToolRegistry,
-    active_tool_scope,
-    get_registry,
-    reset_registry,
-    ensure_tool_registry,
     execute_tool,
     execute_tool_detailed,
     pre_validate_tool_args,
     TOOL_MAP,
-    _tool_registry,
-    _tool_registry_lock,
-    _tool_cache_pre_hook,
-    _tool_result_post_hook,
-    validate_tool_definitions,
-    _current_scope,
-    _current_chat,
+    _ensure_watcher,
 )
 
 # 2. Tool cluster implementations

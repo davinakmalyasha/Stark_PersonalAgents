@@ -20,8 +20,7 @@ import sys
 
 # â”€â”€ Interpreter guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Single venv (Python 3.14) is the primary interpreter. VOICE_PYTHON env var
-# overrides for legacy Moonshine voice (venv312) â€” voice engine is optional on
-# 3.14 and kokoro/misaki/spacy-curated-transformers are not installed there.
+# overrides for legacy Moonshine voice (venv312).
 # Order: VOICE_PYTHON > venv (3.14) > .venv > venv312 (legacy fallback).
 def _resolve_preferred_python() -> str | None:
     for candidate in (
@@ -100,6 +99,23 @@ load_dotenv(override=True)
 
 # ── Unique port (8123) — avoids clashes with dev servers (8000/5173/etc) ──
 STARK_PORT = int(os.environ.get("STARK_PORT", "8123"))
+
+# Force tiny-streaming STT only (no env fallback to medium — user requested).
+os.environ["STT_MODEL"] = "tiny-streaming"
+# Reduce OMP/ONNX thread pressure on the live path (lower burst CPU).
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("ORT_NUM_THREADS", "2")
+
+# ── TurnDetection (portable VAD config — replaces hardcoded voice.html:827) ──
+# Tunable without redeploy; mirrors pydantic_ai TurnDetection(sensitivity).
+TURN_DETECTION = {
+    "sensitivity": os.environ.get("TURN_SENSITIVITY", "medium"),
+    "prefix_padding_ms": int(os.environ.get("TURN_PREFIX_PADDING_MS", "300")),
+    "silence_duration_ms": int(os.environ.get("TURN_SILENCE_MS", "300")),
+    "sound_level": float(os.environ.get("TURN_SOUND_LEVEL", "0.01")),
+    "min_round_ms": int(os.environ.get("TURN_MIN_ROUND_MS", "250")),
+    "max_round_ms": int(os.environ.get("TURN_MAX_ROUND_MS", "30000")),
+}
 
 # ── Single-instance guard ──
 # If another api_server is already listening on the configured port, this
@@ -243,7 +259,7 @@ class ChatRequest(BaseModel):
 class TTSRequest(BaseModel):
     text: str
     voice: str = "jarvis"
-    engine: str = "pocket"  # pocket only (edge/kokoro/moonshine removed)
+    engine: str = "pocket"  # pocket only
 
 
 class CleanupRequest(BaseModel):

@@ -6,9 +6,9 @@
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Boilerplate → template(action="apply") first.
 - **Required args (validated):** file_path
-- **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry)
+- **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema | approval via Hooks.before_tool_execute (plan-mode + core-config veto)
-- **Pipeline:** invalidates tool cache on write | approval gate for core config files
+- **Pipeline:** direct shim call (no hooks)
 
 ## Parameters (JSON Schema)
 
@@ -23,6 +23,6 @@
 1. `tools/_schemas.py` `TOOL_DEFINITIONS` entry (above schema).
 2. `_TOOL_DOCS` one-liner.
 3. Implementation in `tools/MainTool/` or `tools/AddOnTool/`, exported in `tools/__init__.py`.
-4. Optional `input_schema` in `tools/_tool_schemas.py` (opt-in Stage1 validation).
+4. `agents/workspace_registry.py` — agent scope (single source for `_SCOPE_MAP`).
 5. `PARALLEL_SAFE` in `tools/_parallel.py` if read-only concurrency-safe.
-6. Registry auto-derives scope visibility from `_SCOPE_MAP` (runtime `restrict_scope`).
+6. Native path scopes via `FilteredToolset` (pydantic-ai); legacy shim has no runtime scope filter.

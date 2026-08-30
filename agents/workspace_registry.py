@@ -151,6 +151,30 @@ _register(
         delegatable=False,  # reachable via run_dfd_direct / client_manager only
     )
 )
+# Specialist scopes (ui / deploy) mirror the live _SCOPE_MAP ACL so the
+# derived _SCOPE_MAP stays byte-identical. They are not workspace agents.
+_register(
+    WorkspaceSpec(
+        key="ui",
+        display="UI",
+        tools=("browser_act", "read_file", "search_code", "run_command"),
+        tier="specialist",
+        history_ns="_ui",
+        description="UI — browser verification specialist",
+        delegatable=False,
+    )
+)
+_register(
+    WorkspaceSpec(
+        key="deploy",
+        display="Deploy",
+        tools=("github_apply_gate", "template", "run_command", "read_file"),
+        tier="specialist",
+        history_ns="_deploy",
+        description="Deploy — CI gate and deploy specialist",
+        delegatable=False,
+    )
+)
 _register(
     WorkspaceSpec(
         key="orchestrator",
@@ -200,10 +224,14 @@ def all_specs() -> list[WorkspaceSpec]:
     return list(WORKSPACE_REGISTRY.values())
 
 
-# ── Derive _SCOPE_MAP equivalent (step 5 consumes this; today just mirror) ──
+# ── _SCOPE_MAP derivation (single source of truth) ───────────────────────────
 
 def scope_map() -> dict[str, list[str]]:
-    """Map lowercase scope key -> tool names, mirroring tools/_schemas._SCOPE_MAP."""
+    """Map lowercase scope key -> tool names.
+
+    tools/_schemas._SCOPE_MAP is derived from this, so agent → tool ACLs live
+    here only (adding/removing a tool for an agent changes one place).
+    """
     out: dict[str, list[str]] = {}
     for key, spec in WORKSPACE_REGISTRY.items():
         out[key] = list(spec.tools)

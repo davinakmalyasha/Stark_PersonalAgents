@@ -6,9 +6,9 @@
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** run_command(command, timeout?, background?, process_action?, shell?, workdir?, expect?, stream?) — Full POSIX bash (default): pipes, &&, $( ), jq, gh pipelines all work. shell='cmd' for legacy, workdir sets cwd, expect checks output regex, stream for live output.
 - **Required args (validated):** (none)
-- **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry)
+- **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema | redact via Hooks.after_tool_execute | offload via after_tool_execute
-- **Pipeline:** redacted(secrets) | offloaded >80k to /scratch/large_output_*.txt
+- **Pipeline:** direct shim call (no hooks)
 
 ## Parameters (JSON Schema)
 
@@ -25,6 +25,6 @@
 1. `tools/_schemas.py` `TOOL_DEFINITIONS` entry (above schema).
 2. `_TOOL_DOCS` one-liner.
 3. Implementation in `tools/MainTool/` or `tools/AddOnTool/`, exported in `tools/__init__.py`.
-4. Optional `input_schema` in `tools/_tool_schemas.py` (opt-in Stage1 validation).
+4. `agents/workspace_registry.py` — agent scope (single source for `_SCOPE_MAP`).
 5. `PARALLEL_SAFE` in `tools/_parallel.py` if read-only concurrency-safe.
-6. Registry auto-derives scope visibility from `_SCOPE_MAP` (runtime `restrict_scope`).
+6. Native path scopes via `FilteredToolset` (pydantic-ai); legacy shim has no runtime scope filter.

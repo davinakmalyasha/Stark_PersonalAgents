@@ -10,9 +10,9 @@ CHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set 
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** delegate(items=[{agent, task, title?, chat_id?}]) — Spawn Dev/General/House agents IN PARALLEL; each gets its own chat, results arrive as [DELEGATION RESULT] events.
 - **Required args (validated):** items
-- **Deps-migrated:** False (accepts ctx=WorkspaceDeps via registry)
+- **Deps-migrated:** False (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema(TOOL_DEFINITIONS) | Hooks.before/after_tool_execute (cache/guard/redact/offload) | Tool(args_validator, max_retries) | FilteredToolset(allowed_tools)
-- **Pipeline:** standard registry: pre_hooks(cache) -> guards(plan-mode) -> execute -> post_hooks(redact/offload)
+- **Pipeline:** thin registry shim: direct execute -> ToolExecutionResult
 
 ## Parameters (JSON Schema)
 
@@ -23,6 +23,6 @@ CHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set 
 1. `tools/_schemas.py` `TOOL_DEFINITIONS` entry (above schema).
 2. `_TOOL_DOCS` one-liner.
 3. Implementation in `tools/MainTool/` or `tools/AddOnTool/`, exported in `tools/__init__.py`.
-4. Optional `input_schema` in `tools/_tool_schemas.py` (opt-in Stage1 validation).
+4. `agents/workspace_registry.py` — agent scope (single source for `_SCOPE_MAP`).
 5. `PARALLEL_SAFE` in `tools/_parallel.py` if read-only concurrency-safe.
-6. Registry auto-derives scope visibility from `_SCOPE_MAP` (runtime `restrict_scope`).
+6. Native path scopes via `FilteredToolset` (pydantic-ai); legacy shim has no runtime scope filter.

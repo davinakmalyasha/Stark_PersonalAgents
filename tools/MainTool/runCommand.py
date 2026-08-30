@@ -516,7 +516,7 @@ class LocalShellBackend:
                 return f"Error running command: {e}"
 
 
-def run_command(command: str = "", timeout: int = 30000, background: bool = False,
+def run_command(ctx: object = None, command: str = "", timeout: int = 30000, background: bool = False,
                 process_action: str = "", shell: str = "bash", workdir: str = "", expect: str = "", stream: bool = False) -> str:
     """Execute a shell command, manage background processes, or view logs.
 
@@ -525,6 +525,7 @@ def run_command(command: str = "", timeout: int = 30000, background: bool = Fals
     workdir: working directory to run in.
     expect: regex to check in output — adds [EXPECT matched/failed].
     stream: if true, hints to stream output (currently returns full output).
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
     """
     global BACKGROUND_PROCESSES
     import threading
@@ -540,6 +541,11 @@ def run_command(command: str = "", timeout: int = 30000, background: bool = Fals
     _increment_cache_version()
 
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     active_ws = os.path.normpath(os.path.abspath(active_ws))
 
     # Safety validation (C12: BLOCKED_PATTERNS + env-extensible deny list)

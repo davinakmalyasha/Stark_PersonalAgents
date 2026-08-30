@@ -21,7 +21,7 @@ except ImportError:
             self.paths = paths or []
             self.mode = mode
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-from tools import active_tool_scope, get_native_tool_names
+from tools import get_native_tool_names
 
 class SubagentsRegistry(dict):
     def __contains__(self, key):
@@ -481,7 +481,7 @@ def _handoff(content, name: str = "subagent") -> str:
             file_id = uuid.uuid4().hex[:8]
             clean = "".join(c if c.isalnum() else "_" for c in name)[:40] or "subagent"
             vfs_path = f"/scratch/handoff_log_{clean}_{file_id}.txt"
-            _write_file(vfs_path, content)
+            _write_file(file_path=vfs_path, content=content)
         except Exception:
             vfs_path = ""
     return _compact_handoff(content, name, vfs_path)
@@ -506,7 +506,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         _tool_cap,
         active_permissions,
         auto_offload_result,
-        ensure_tool_registry,
         execute_tool_detailed,
         shared_state,
     )
@@ -529,16 +528,8 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # When tools are available, the agent loop handles output naturally.
     schema = spec.get("response_format") if not tool_names else None
 
-    # P4: scope restriction — one visibility for this subagent (prompt,
-    # native schemas, and execution all filter through the registry).
-    try:
-        reg = ensure_tool_registry()
-        reg.restrict_scope(name, allow=list(tool_names))
-    except Exception:
-        pass
-
     # Native function calling for the generic loop. The schemas are filtered to
-    # the registry allow-list; pseudo-tool text is never generated or parsed.
+    # the spec's tool allow-list; pseudo-tool text is never generated or parsed.
     native_tools = None
     if schema is None and tool_names:
         try:
@@ -567,7 +558,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
     depth_token = _TASK_DEPTH.set(depth + 1)
     token = active_permissions.set(perms)
-    scope_token = active_tool_scope.set(name)
     try:
         chat_id = shared_state.get("chat_id", "default_chat")
         if name == "Dev":
@@ -810,14 +800,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                 # Out-of-scope tools are filtered BEFORE execution.
                 tool_results = []
                 structured_results = []
-                _sub_exec_scope = name
                 _sub_exec_pool = None
                 _sub_allowed = [c for c in tool_calls if c.get("tool") in tool_names or not tool_names]
                 try:
                     from tools import run_tool_calls as _run_tool_calls
                     _sub_exec_pool = _run_tool_calls(
                         _sub_allowed,
-                        lambda tc: _subagent_execute_one(tc, _sub_exec_scope, tool_names),
+                        lambda tc: _subagent_execute_one(tc, tool_names),
                     )
                 except Exception:
                     _sub_exec_pool = []
@@ -835,7 +824,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                         result = f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
                     else:
                         try:
-                            execution = execute_tool_detailed(tool_name, args, scope=name)
+                            execution = execute_tool_detailed(tool_name, args)
                             result = execution.content
                         except Exception as e:
                             result = f"ERROR: {str(e)[:200]}"
@@ -892,7 +881,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     finally:
         active_permissions.reset(token)
         _TASK_DEPTH.reset(depth_token)
-        active_tool_scope.reset(scope_token)
 
     # Specialist subagents (kind="subagent"): the final assistant message IS
     # the tool result — verbatim, opencode/Claude-Code style. Only oversized
@@ -906,7 +894,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # eats a multi-KB dump.
     return _handoff(content, name)
 
-def _subagent_execute_one(tool_call: dict, scope: str, tool_names: list) -> str:
+def _subagent_execute_one(tool_call: dict, tool_names: list) -> str:
     """Thread-pool worker for a subagent's parallel read-only batch. Only
     PARALLEL_SAFE tools reach this path (enforced by run_tool_calls)."""
     tool_name = str(tool_call.get("tool", "") or "")
@@ -916,7 +904,7 @@ def _subagent_execute_one(tool_call: dict, scope: str, tool_names: list) -> str:
     if tool_name not in tool_names and tool_names:
         return f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
     try:
-        execution = execute_tool_detailed(tool_name, args, scope=scope)
+        execution = execute_tool_detailed(tool_name, args)
         return str(execution.content)
     except Exception as e:
         return f"ERROR: {str(e)[:200]}"

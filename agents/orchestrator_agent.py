@@ -27,6 +27,7 @@ from tools import (
     get_native_tool_names,
 )
 from llm import invoke_messages_with_fallback_stream
+from llm.deps import WorkspaceDeps
 from llm.loop_detector import LoopGuard
 from memory.context_compaction import (
     compact_history,
@@ -191,20 +192,10 @@ def _orchestrator_loop(s: ITState) -> dict:
     valid_tools = list(get_native_tool_names("orchestrator"))
     native_orchestrator_tools = get_native_tools("orchestrator")
 
-    # â”€â”€ P4: registry scope â€” one visibility for the orchestrator â”€â”€
-    _scope_token = None
-    try:
-        from tools import active_tool_scope, get_registry
-        from tools._registry import _current_chat
-        get_registry().restrict_scope("Orchestrator", allow=valid_tools)
-        _scope_token = active_tool_scope.set("Orchestrator")
-        # Stage 4: tag the current chat for plan-mode enforcement.
-        try:
-            _chat_token = _current_chat.set(chat_id or "")
-        except Exception:
-            _chat_token = None
-    except Exception:
-        pass
+    # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
+    run_deps = WorkspaceDeps.from_shared_state(
+        role="Orchestrator", chat_id=chat_id, project_path=project_path
+    )
 
     # â”€â”€ Zone 1: Frozen system prompt (never changes â†’ cached) â”€â”€
     static_system = _build_orchestrator_prompt()
@@ -559,7 +550,7 @@ def _orchestrator_loop(s: ITState) -> dict:
                 try:
                     import json
                     _log(f"[TOOL_CALL] {tool_name}({json.dumps(args)})")
-                    execution = execute_tool_detailed(tool_name, args, scope="Orchestrator")
+                    execution = execute_tool_detailed(tool_name, args, deps=run_deps)
                     result_str = str(execution.content)
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"
@@ -652,12 +643,6 @@ def _orchestrator_loop(s: ITState) -> dict:
             ))
 
     # â”€â”€ Return â”€â”€
-    if _scope_token is not None:
-        try:
-            from tools import active_tool_scope
-            active_tool_scope.reset(_scope_token)
-        except Exception:
-            pass
     new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
     final_report = _extract_text_response(content) if content else ""
     final_error = ""

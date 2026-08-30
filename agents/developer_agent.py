@@ -13,7 +13,6 @@ from tools import (
     run_tool_calls,
     get_native_tools,
     get_native_tool_names,
-    get_registry,
     get_plan_for_context,
 )
 from llm import invoke_messages_with_fallback_stream
@@ -48,19 +47,18 @@ def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
     return auto_offload_result(result_text, tool_name, max_chars=cap)
 
 
-def _execute_one_tool_call(tool_call: dict) -> str:
+def _execute_one_tool_call(tool_call: dict, deps: object = None) -> str:
     """Thread-pool worker for the parallel read-only batch. Only tools listed in
     PARALLEL_SAFE reach this path (enforced by run_tool_calls), so it is safe to
     run concurrently. Returns the raw tool result string; cap/offload happens at
-    the registry boundary (_tool_result_post_hook). Uses the module-level
-    execute_tool_detailed so patching/mocking works identically to the
-    sequential path."""
+    the tool boundary. Uses the module-level execute_tool_detailed so
+    patching/mocking works identically to the sequential path."""
     tool_name = str(tool_call.get("tool", "") or "")
     tool_args = tool_call.get("args") or {}
     if not tool_args or not isinstance(tool_args, dict):
         tool_args = {k: v for k, v in tool_call.items() if k not in ("tool", "args")}
     try:
-        execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
+        execution = execute_tool_detailed(tool_name, tool_args, deps=deps)
         return str(execution.content)
     except Exception as e:
         return f"Tool execution error: {e}"
@@ -526,13 +524,10 @@ def developer_node(s: ITState) -> dict:
     valid_tools = get_native_tool_names("developer")
     valid_tool_set = set(valid_tools)
     native_dev_tools = get_native_tools("developer")
-    get_registry().restrict_scope("Developer", allow=list(valid_tools))
-    # Stage 4: tag the current chat for plan-mode enforcement.
-    try:
-        from tools._registry import _current_chat as _dev_current_chat
-        _dev_chat_token = _dev_current_chat.set(chat_id or "")
-    except Exception:
-        _dev_chat_token = None
+    # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
+    run_deps = WorkspaceDeps.from_shared_state(
+        role="Developer", chat_id=chat_id, project_path=project_path
+    )
 
     # â”€â”€ Load developer state if resuming from suspension â”€â”€
     developer_state = None
@@ -814,7 +809,6 @@ def developer_node(s: ITState) -> dict:
                     # internally for the WHOLE task; the returned transcript
                     # slice replaces the manual tool loop below.
                     from llm.native_tools import run_native_agent
-                    from llm.deps import WorkspaceDeps
 
                     _native_text, _native_lc, _native_reasoning = run_native_agent(
                         role="Developer",
@@ -824,9 +818,7 @@ def developer_node(s: ITState) -> dict:
                         reasoning_effort=reasoning_effort,
                         reasoning_budget=reasoning_budget,
                         where=where_tag,
-                        deps=WorkspaceDeps.from_shared_state(
-                            role="Developer", chat_id=chat_id, project_path=project_path
-                        ),
+                        deps=run_deps,
                         system_prompt=static_system,
                     )
                     # Rebuild the transcript from the native run's new messages.
@@ -1126,7 +1118,7 @@ def developer_node(s: ITState) -> dict:
         _known_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
         try:
             from tools import run_tool_calls as _run_tool_calls
-            batch_results = _run_tool_calls(_known_calls, _execute_one_tool_call)
+            batch_results = _run_tool_calls(_known_calls, lambda c: _execute_one_tool_call(c, run_deps))
         except Exception:
             batch_results = []
         _tool_result_map: dict[str, str] = {}
@@ -1162,7 +1154,7 @@ def developer_node(s: ITState) -> dict:
                 execution = _tool_exec_map[call_id]
             else:
                 try:
-                    execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
+                    execution = execute_tool_detailed(tool_name, tool_args, deps=run_deps)
                     tool_result = execution.content
                 except Exception as e:
                     execution = ToolExecutionResult.from_content(

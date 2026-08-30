@@ -191,10 +191,12 @@ def apply_unified_diff(content: str, diff: str) -> tuple[str, list[str]]:
     return '\n'.join(new_lines), []
 
 
-def _apply_diff(file_path: str, diff: str) -> str:
-    """Apply a unified diff or search-replace block to a file."""
+def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
+    """Apply a unified diff or search-replace block to a file.
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
+    """
     from tools import _sanitize_path, _invalidate_file_cache
-    path = _sanitize_path(file_path)
+    path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
         return f"Error: File not found: {file_path}"
         
@@ -291,8 +293,10 @@ def _parse_patch_sections(diff: str):
     return sections
 
 
-def _apply_multi_file_patch(diff: str) -> str:
-    """Apply a multi-file patch (opencode-style markers or diff -u headers)."""
+def _apply_multi_file_patch(diff: str = "", ctx: object = None) -> str:
+    """Apply a multi-file patch (opencode-style markers or diff -u headers).
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
+    """
     from tools import enforce_fs_permission, _check_and_request_approval, _sanitize_path, _invalidate_file_cache, _increment_cache_version
     sections = _parse_patch_sections(diff)
     if not sections:
@@ -305,10 +309,10 @@ def _apply_multi_file_patch(diff: str) -> str:
             if kind == "noop":
                 results.append(f"[SKIP] {raw_path}: no hunks in section")
                 continue
-            path = _sanitize_path(raw_path)
+            path = _sanitize_path(raw_path, ctx)
             if kind == "add":
                 enforce_fs_permission("write", path)
-                _check_and_request_approval(path, "write")
+                _check_and_request_approval(path, "write", ctx)
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(body)
@@ -316,7 +320,7 @@ def _apply_multi_file_patch(diff: str) -> str:
                 results.append(f"[OK] Added {raw_path} ({body.count(chr(10)) + 1} lines)")
             elif kind == "delete":
                 enforce_fs_permission("write", path)
-                _check_and_request_approval(path, "edit")
+                _check_and_request_approval(path, "edit", ctx)
                 if not os.path.isfile(path):
                     results.append(f"[ERROR] Delete failed: file not found: {raw_path}")
                     continue
@@ -325,10 +329,10 @@ def _apply_multi_file_patch(diff: str) -> str:
                 results.append(f"[OK] Deleted {raw_path}")
             elif kind == "move":
                 dest_raw, hunk_body = body
-                dest = _sanitize_path(dest_raw)
+                dest = _sanitize_path(dest_raw, ctx)
                 enforce_fs_permission("write", path)
                 enforce_fs_permission("write", dest)
-                _check_and_request_approval(dest, "edit")
+                _check_and_request_approval(dest, "edit", ctx)
                 if not os.path.isfile(path):
                     results.append(f"[ERROR] Move failed: file not found: {raw_path}")
                     continue
@@ -351,7 +355,7 @@ def _apply_multi_file_patch(diff: str) -> str:
                 results.append(f"[OK] Moved {raw_path} -> {dest_raw}")
             else:  # update
                 enforce_fs_permission("write", path)
-                _check_and_request_approval(path, "edit")
+                _check_and_request_approval(path, "edit", ctx)
                 if not os.path.isfile(path):
                     results.append(f"[ERROR] Update failed: file not found: {raw_path}")
                     continue
@@ -376,12 +380,14 @@ def _apply_multi_file_patch(diff: str) -> str:
     return output
 
 
-def _write_file(file_path: str, content: str) -> str:
-    """Write content to a file, creating parent directories if needed."""
+def _write_file(file_path: str = "", content: str = "", ctx: object = None) -> str:
+    """Write content to a file, creating parent directories if needed.
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
+    """
     from tools import enforce_fs_permission, _increment_cache_version, _check_and_request_approval, shared_state, WORKSPACE, get_vfs_router, _sanitize_path, _invalidate_file_cache
     enforce_fs_permission("write", file_path)
     _increment_cache_version()
-    _check_and_request_approval(file_path, "write")
+    _check_and_request_approval(file_path, "write", ctx)
 
     # â”€â”€ Resolve the actual write target â”€â”€
     norm_path = os.path.normpath(os.path.abspath(file_path))
@@ -389,6 +395,11 @@ def _write_file(file_path: str, content: str) -> str:
     # Direct filesystem write for absolute paths within the active workspace.
     # Bypasses VFS routing which strips path prefixes and loses the root directory.
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     if norm_path.lower().startswith(active_ws.lower()):
         os.makedirs(os.path.dirname(norm_path) or ".", exist_ok=True)
@@ -406,7 +417,7 @@ def _write_file(file_path: str, content: str) -> str:
     # â”€â”€ VFS Composite Routing (for virtual paths like /workspace/, /scratch/) â”€â”€
     vfs_path = file_path.replace("\\", "/")
     try:
-        vfs_router = get_vfs_router()
+        vfs_router = get_vfs_router(ctx)
         res = vfs_router.write(vfs_path, content)
         if not res.error:
             lines = content.count("\n") + 1
@@ -416,7 +427,7 @@ def _write_file(file_path: str, content: str) -> str:
     except Exception:
         pass
 
-    path = _sanitize_path(file_path)
+    path = _sanitize_path(file_path, ctx)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -485,19 +496,20 @@ def _run_verify(verify: str, file_path: str, diff: str = None) -> str:
         return f"\n[VERIFY {v} error: {e}]"
 
 
-def edit_file(file_path: str, old_string: str = None, new_string: str = None,
+def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, new_string: str = None,
               diff: str = None, verify: str = None) -> str:
     """Edit via single search/replace, batch SEARCH/REPLACE blocks, unified diff, or multi-file patch.
 
     verify is OPT-IN: pass "py_compile", "tsc", or a shell command to run a
     check after a successful write. Omitted = no verification (the DONE-gate
     nudge and the CI gate own verification).
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
     """
-    from tools import enforce_fs_permission, _increment_cache_version, _check_and_request_approval, WORKSPACE, get_vfs_router, _sanitize_path, _invalidate_file_cache
+    from tools import enforce_fs_permission, _increment_cache_version, _check_and_request_approval, WORKSPACE, get_vfs_router, _sanitize_path, _invalidate_file_cache, shared_state
 
     enforce_fs_permission("write", file_path)
     _increment_cache_version()
-    _check_and_request_approval(file_path, "edit")
+    _check_and_request_approval(file_path, "edit", ctx)
 
     # Stage 3: best-effort pre-write snapshot for chat rewind. Failure
     # is silent and does NOT block the write (the existing git/dirty
@@ -507,7 +519,11 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
         from sync.state_sync import safe_get_state
         _state = safe_get_state() or {}
         _chat_id = _state.get("chat_id", "") or ""
+        if ctx is not None:
+            _chat_id = getattr(ctx, "chat_id", "") or _chat_id
         _ws = _state.get("project_path") or WORKSPACE
+        if ctx is not None:
+            _ws = getattr(ctx, "project_path", None) or _ws
         if _chat_id and file_path:
             _rel = file_path
             try:
@@ -522,11 +538,11 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
     # Route to batch mode if diff is provided
     if diff:
         if _parse_patch_sections(diff):
-            res = _apply_multi_file_patch(diff)
+            res = _apply_multi_file_patch(diff, ctx=ctx)
             if verify and res.startswith("[OK]"):
                 res += _run_verify(verify, file_path, diff)
             return res
-        res = _apply_diff(file_path, diff)
+        res = _apply_diff(file_path, diff, ctx=ctx)
         if verify and res.startswith("[OK]"):
             res += _run_verify(verify, file_path, diff)
         return res
@@ -536,7 +552,7 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
         # Create / full-overwrite mode: old_string omitted, new_string = full content.
         # (Empty-string old_string does NOT count — guards against accidental overwrites.)
         if old_string is None and new_string is not None:
-            res = _write_file(file_path, new_string)
+            res = _write_file(file_path, new_string, ctx=ctx)
             if verify and res.startswith("[OK]"):
                 res += _run_verify(verify, file_path)
             return res
@@ -547,6 +563,11 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
     # â”€â”€ Direct filesystem edit for absolute workspace paths â”€â”€
     norm_path = os.path.normpath(os.path.abspath(file_path))
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     if norm_path.lower().startswith(active_ws.lower()):
         path = norm_path
@@ -554,7 +575,7 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
         # â”€â”€ VFS Composite Routing (for virtual paths) â”€â”€
         vfs_path = file_path.replace("\\", "/")
         try:
-            vfs_router = get_vfs_router()
+            vfs_router = get_vfs_router(ctx)
             res = vfs_router.edit(vfs_path, old_string, new_string)
             if not res.error:
                 output = f"[OK] Edited {file_path} successfully"
@@ -562,7 +583,7 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
                 return output
         except Exception:
             pass
-        path = _sanitize_path(file_path)
+        path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
         return f"Error: File not found: {file_path}"
 

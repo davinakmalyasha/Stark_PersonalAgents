@@ -75,17 +75,27 @@ def _is_destructive_shell(command: str) -> bool:
 
 def plan_mode_guard(ctx: dict) -> str | None:
     """Returns a deny-reason string when the tool call is blocked, or
-    None to allow. The registry converts the non-empty string into
-    `[BLOCKED] <reason>`.
+    None to allow. Callers (native hook / registry guard) convert the
+    non-empty string into `[BLOCKED] <reason>`.
     """
-    # Lazy import to avoid a cycle at registry-build time.
     try:
-        from tools._registry import _current_chat
         from tools.chat_mode import get_mode
     except Exception:
         return None
 
-    chat_id = _current_chat.get() if _current_chat else ""
+    chat_id = ""
+    try:
+        deps = ctx.get("deps")
+        if deps is not None:
+            chat_id = str(getattr(deps, "chat_id", "") or "")
+    except Exception:
+        chat_id = ""
+    if not chat_id:
+        try:
+            from sync.state_sync import safe_get_state
+            chat_id = str((safe_get_state() or {}).get("chat_id") or "")
+        except Exception:
+            chat_id = ""
     if not chat_id or get_mode(chat_id) != "plan":
         return None
 

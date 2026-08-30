@@ -135,16 +135,7 @@ def _child_system_prompt(name: str) -> str:
         if not _SUBAGENTS_REGISTRY:
             _load_subagents()
         spec = _SUBAGENTS_REGISTRY.get(name) or {}
-        sys_prompt = spec.get("system_prompt") or "You are a specialized subagent."
-        tool_names = spec.get("tools", [])
-        if tool_names:
-            try:
-                from tools import ensure_tool_registry
-                reg = ensure_tool_registry()
-                reg.restrict_scope(name, allow=list(tool_names))
-            except Exception:
-                pass
-        return sys_prompt
+        return spec.get("system_prompt") or "You are a specialized subagent."
     except Exception:
         return "You are a specialized subagent."
 
@@ -189,9 +180,8 @@ def _run_turn(
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
     from tools.AddOnTool.subagentTools import _specialist_call_backend
     from tools import (execute_tool_detailed, auto_offload_result, _tool_cap,
-                       active_permissions, _TASK_DEPTH, active_tool_scope,
-                       get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents,
-                       _current_chat)
+                       active_permissions, _TASK_DEPTH,
+                       get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents)
     from server.session.log import convert_to_llm
 
     with act["lock"]:
@@ -199,13 +189,11 @@ def _run_turn(
         act["interrupt"] = False
     act["session_path"] = session.get_session_file()
 
-    # Mirror task()'s context: depth 1, the spec's permissions, tool scope
+    # Mirror task()'s context: depth 1, the spec's permissions.
     _depth_token = _TASK_DEPTH.set(1)
     _perm_token = active_permissions.set(_child_permissions(name))
-    _scope_token = active_tool_scope.set(name)
     _descriptor = _descriptor_of(session) or {}
     _parent_chat = _descriptor.get("parent_chat_id", "") or ""
-    _chat_token = _current_chat.set(_parent_chat)
 
     interrupted = False
 
@@ -318,7 +306,7 @@ def _run_turn(
                     break
                 call_id = tc["id"]
                 try:
-                    execution = execute_tool_detailed(tname, targs, scope=name)
+                    execution = execute_tool_detailed(tname, targs)
                     r = auto_offload_result(execution.content, tname, max_chars=_tool_cap("subagent"))
                     session.append_tool_result(r, tool_call_id=call_id, tool_name=tname)
                 except Exception as e:
@@ -351,8 +339,6 @@ def _run_turn(
     finally:
         active_permissions.reset(_perm_token)
         _TASK_DEPTH.reset(_depth_token)
-        active_tool_scope.reset(_scope_token)
-        _current_chat.reset(_chat_token)
         with act["lock"]:
             act["status"] = "idle"
             act["interrupt"] = False

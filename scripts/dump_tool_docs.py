@@ -23,15 +23,6 @@ from tools._parallel import PARALLEL_SAFE
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "tools")
 
-_PIPELINE_NOTES = {
-    "read_file": "cached (mtime-checked) | redacted(no) | offload(no, read keeps page budget)",
-    "search_code": "cached | redacted(no) | offload(no)",
-    "edit_file": "invalidates tool cache on write | approval gate for core config files",
-    "run_command": "redacted(secrets) | offloaded >80k to /scratch/large_output_*.txt",
-    "template": "cached",
-    "mcp__*": "scope-checked | approval='prompt' may gate | offloaded >6k to /scratch/large_tool_results/",
-}
-
 # Tools migrated to accept typed WorkspaceDeps via the registry (ctx keyword).
 # Registry passes deps only when the signature exposes a ctx/deps/run_ctx param.
 _MIGRATED_TOOLS = {
@@ -87,9 +78,9 @@ def main() -> None:
             f"- **Parallel-safe (PARALLEL_SAFE):** {name in PARALLEL_SAFE}",
             f"- **Compact doc:** {_TOOL_DOCS.get(name, '(none)')}",
             f"- **Required args (validated):** {', '.join(sorted(_TOOL_REQUIRED_ARGS.get(name, []))) or '(none)'}",
-            f"- **Deps-migrated:** {name in _MIGRATED_TOOLS} (accepts ctx=WorkspaceDeps via registry)",
+            f"- **Deps-migrated:** {name in _MIGRATED_TOOLS} (accepts ctx=WorkspaceDeps via registry shim)",
             f"- **Native equivalent (pydantic-ai 2.36):** {_NATIVE_NOTES.get(name, _NATIVE_NOTES['default'])}",
-            f"- **Pipeline:** {_PIPELINE_NOTES.get(name, 'standard registry: pre_hooks(cache) -> guards(plan-mode) -> execute -> post_hooks(redact/offload)')}",
+            f"- **Pipeline:** {'direct shim call (no hooks)' if name in _MIGRATED_TOOLS else 'thin registry shim: direct execute -> ToolExecutionResult'}",
             "",
             "## Parameters (JSON Schema)",
             "",
@@ -100,9 +91,9 @@ def main() -> None:
             "1. `tools/_schemas.py` `TOOL_DEFINITIONS` entry (above schema).",
             "2. `_TOOL_DOCS` one-liner.",
             "3. Implementation in `tools/MainTool/` or `tools/AddOnTool/`, exported in `tools/__init__.py`.",
-            "4. Optional `input_schema` in `tools/_tool_schemas.py` (opt-in Stage1 validation).",
+            "4. `agents/workspace_registry.py` — agent scope (single source for `_SCOPE_MAP`).",
             "5. `PARALLEL_SAFE` in `tools/_parallel.py` if read-only concurrency-safe.",
-            "6. Registry auto-derives scope visibility from `_SCOPE_MAP` (runtime `restrict_scope`).",
+            "6. Native path scopes via `FilteredToolset` (pydantic-ai); legacy shim has no runtime scope filter.",
             "",
         ]
         path = os.path.join(OUT_DIR, f"{name}.md")

@@ -31,7 +31,6 @@ from tools import (
     run_tool_calls,
     get_native_tools,
     get_native_tool_names,
-    get_registry,
 )
 from llm import invoke_messages_with_fallback_stream
 from llm.native_conv import normalize_calls
@@ -194,7 +193,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
     return str(response_text or ""), normalize_calls(native_tool_calls, id_prefix="house"), []
 
 
-def _house_execute_one(tool_call: dict) -> str:
+def _house_execute_one(tool_call: dict, deps: object = None) -> str:
     """Thread-pool worker for House's parallel read-only batch. Only
     PARALLEL_SAFE tools reach this path (enforced by run_tool_calls). Uses the
     module-level execute_tool_detailed so patching/mocking works identically to
@@ -204,7 +203,7 @@ def _house_execute_one(tool_call: dict) -> str:
     if not isinstance(targs, dict):
         targs = {}
     try:
-        execution = execute_tool_detailed(tname, targs, scope=_AGENT_NAME)
+        execution = execute_tool_detailed(tname, targs, deps=deps)
         return str(execution.content)
     except Exception as e:
         return f"ERROR: {str(e)[:300]}"
@@ -222,16 +221,8 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
     valid_tools = get_native_tool_names("house")
     native_tools = get_native_tools("house")
     valid_tool_set = set(valid_tools)
-    try:
-        get_registry().restrict_scope(_AGENT_NAME, allow=list(valid_tools))
-    except Exception:
-        pass
-    # Stage 4: tag the current chat for plan-mode enforcement.
-    try:
-        from tools._registry import _current_chat as _house_current_chat
-        _house_chat_token = _house_current_chat.set(chat_id or "")
-    except Exception:
-        _house_chat_token = None
+    # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
+    run_deps = _native_deps(chat_id)
 
     messages = [
         SystemMessage(content=_HOUSE_SYSTEM_TEMPLATE),
@@ -348,7 +339,7 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
         _allowed_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
         _blocked_calls = [c for c in tool_calls if c.get("tool") not in valid_tool_set]
         try:
-            batch_results = run_tool_calls(_allowed_calls, _house_execute_one)
+            batch_results = run_tool_calls(_allowed_calls, lambda c: _house_execute_one(c, run_deps))
         except Exception:
             batch_results = []
         _house_results_by_id = {}
@@ -372,7 +363,7 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
                 result_str = _house_results_by_id[str(call_id)]
             else:
                 try:
-                    execution = execute_tool_detailed(tname, targs, scope=_AGENT_NAME)
+                    execution = execute_tool_detailed(tname, targs, deps=run_deps)
                     result_str = str(execution.content)
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"

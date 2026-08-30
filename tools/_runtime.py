@@ -28,7 +28,22 @@ active_permissions: ContextVar[Optional[list[FilesystemPermission]]] = ContextVa
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-def to_virtual_path(path: str) -> str:
+
+def _active_workspace(deps: Any = None) -> str:
+    """Return the active workspace root. Prefers the typed per-run deps when
+    provided, else falls back to the legacy global shared_state path.
+    """
+    if deps is not None:
+        try:
+            p = getattr(deps, "project_path", None)
+            if p:
+                return str(p)
+        except Exception:
+            pass
+    return shared_state.get("project_path") or WORKSPACE
+
+
+def to_virtual_path(path: str, deps: Any = None) -> str:
     path_str = path.replace("\\", "/")
     if path_str.startswith(("/workspace/", "/scratch/", "/memories/", "/conversation_history/")):
         return "/" + path_str.lstrip("/")
@@ -36,7 +51,7 @@ def to_virtual_path(path: str) -> str:
         return "/" + path_str.lstrip("/")
 
     # Resolve physical absolute path
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws)).replace("\\", "/").lower()
     
     abs_path = os.path.normpath(os.path.abspath(path)).replace("\\", "/").lower()
@@ -351,11 +366,11 @@ class WorkspaceFallbackBackend:
             res.extend(self._get_backend(p).download_files([p]))
         return res
 
-def get_vfs_router() -> Any:
+def get_vfs_router(deps: Any = None) -> Any:
     from deepagents.backends import CompositeBackend, StateBackend, FilesystemBackend, StoreBackend
     from sync.state_sync import active_store
 
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws))
 
     store = active_store.get()
@@ -386,8 +401,8 @@ def get_vfs_router() -> Any:
         routes=routes,
     )
 
-def _sanitize_path_fallback(path: str) -> str:
-    active_ws = shared_state.get("project_path") or WORKSPACE
+def _sanitize_path_fallback(path: str, deps: Any = None) -> str:
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     path_str = path.replace("\\", "/")
     
@@ -418,11 +433,11 @@ def _sanitize_path_fallback(path: str) -> str:
     real_path = os.path.normpath(os.path.abspath(real_path))
     return real_path
 
-def _sanitize_path(path: str) -> str:
+def _sanitize_path(path: str, deps: Any = None) -> str:
     """Resolve a relative or absolute path within allowed roots, using VFS routing."""
     from deepagents.backends import FilesystemBackend
     
-    vfs_router = get_vfs_router()
+    vfs_router = get_vfs_router(deps)
     resolved_path = None
     try:
         backend, stripped_key = vfs_router._get_backend_and_key(path)
@@ -432,7 +447,7 @@ def _sanitize_path(path: str) -> str:
         pass
         
     if resolved_path is None:
-        resolved_path = _sanitize_path_fallback(path)
+        resolved_path = _sanitize_path_fallback(path, deps)
         
     real_path = os.path.normpath(os.path.abspath(resolved_path))
     
@@ -444,7 +459,7 @@ def _sanitize_path(path: str) -> str:
             raise ValueError("Access to internal metadata folder is restricted.")
         
     # Security: strictly allow only the active workspace, LangChain system directory, scratch, memories, and history
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     allowed_roots = [
         active_ws,
@@ -462,14 +477,14 @@ def _sanitize_path(path: str) -> str:
         
     return real_path
 
-def _check_and_request_approval(file_path: str, action: str):
+def _check_and_request_approval(file_path: str, action: str, deps: Any = None):
     import os
     norm_path = os.path.normpath(file_path).lower()
     base_name = os.path.basename(norm_path)
 
     # Core settings files should only be blocked if they are modified inside the main LangChain codebase folder.
     # Subagents executing inside sandbox workspaces (e.g. TestProjectForAgent) must be allowed to create/edit package.json, etc.
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws_norm = os.path.normpath(active_ws).lower()
     # Harness root — env-overridable, defaults to this repo's directory (portable)
     langchain_root = _HARNESS_ROOT

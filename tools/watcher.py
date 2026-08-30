@@ -104,8 +104,8 @@ def _try_start(workspace_path: str) -> None:
 
 
 def note(workspace_path: str) -> None:
-    """Called from `_registry.py::ensure_tool_registry` to start the
-    observer once we have a workspace to watch."""
+    """Called from `tools/_registry.execute_tool_detailed` (lazy, on first
+    tool execution) to start the observer once we have a workspace to watch."""
     if workspace_path and os.path.isdir(workspace_path):
         _try_start(workspace_path)
 

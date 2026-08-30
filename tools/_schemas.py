@@ -629,55 +629,27 @@ def get_native_tools(scope: Optional[str] = None) -> list[dict]:
         pass
     return sorted(tools, key=lambda t: t["function"]["name"])
 
-_SCOPE_MAP: dict[str, list[str]] = {
-    # Dev keeps the routine coding loop inline; specialist work (browser
-    # verification, CI gate/deploy) is delegated via call_subagent so rare-use
-    # schemas never ride on every Dev turn.
-    "developer": [
-        "read_file", "edit_file", "run_command", "search_code",
-        "template",
-        "ask_user", "update_plan", "propose_plan",
-        "call_subagent",
-    ],
-    "ui": [
-        "browser_act", "read_file", "search_code", "run_command",
-    ],
-    "deploy": [
-        "github_apply_gate", "template", "run_command", "read_file",
-    ],
-    "orchestrator": [
-        "create_project", "resume_project",
-        "ask_user",
-        "delegate", "delegation_status",
-        "update_plan", "propose_plan", "files_changed",
-    ],
-    # General: non-coding life/work assistant. No read_file/edit_file by
-    # design — document access goes through read_pdf/browser/MCP, with
-    # run_command as the narrow escape hatch.
-    "general": [
-        "run_command", "read_pdf", "create_docx", "create_xlsx",
-        "ask_user", "update_plan", "browser_act", "propose_plan",
-        "files_changed",
-    ],
-    # House: home-control specialist. Owns the house_* actuation surface;
-    # read/run tools support inspection and verification. No codebase edits.
-    "house": [
-        "house_get_state", "house_get_device", "house_set_device",
-        "house_run_scene", "house_get_history",
-        "run_command", "browser_act", "ask_user", "update_plan", "propose_plan",
-    ],
-    # DFD: agency manager. Bridge to the DFD site (non-money), client
-    # scaffolding (gated on approval), and project creation ONLY inside the
-    # DFD client root. No codebase edits, no money tools, no free-flying
-    # project creation.
-    "dfd": [
-        "dfd_bridge",
-        "create_client",
-        "create_project",
-        "run_command", "ask_user", "update_plan", "propose_plan",
-        "files_changed",
-    ],
-}
+# Scope ACL — single source of truth is agents/workspace_registry.py.
+# The comments below document WHY each agent has its surface; the tool
+# lists themselves come from WORKSPACE_REGISTRY so one place changes both.
+_SCOPE_MAP: dict[str, list[str]] = {}
+try:
+    from agents.workspace_registry import scope_map as _ws_scope_map
+
+    _SCOPE_MAP = _ws_scope_map()
+except Exception:
+    # Import-order guard (agents import tools at module load). The registry
+    # module is dependency-light; if it is unavailable, fall back to the
+    # preserved literal so tool scoping never silently disappears.
+    _SCOPE_MAP = {
+        "developer": ["read_file", "edit_file", "run_command", "search_code", "template", "ask_user", "update_plan", "propose_plan", "call_subagent"],
+        "ui": ["browser_act", "read_file", "search_code", "run_command"],
+        "deploy": ["github_apply_gate", "template", "run_command", "read_file"],
+        "orchestrator": ["create_project", "resume_project", "ask_user", "delegate", "delegation_status", "update_plan", "propose_plan", "files_changed"],
+        "general": ["run_command", "read_pdf", "create_docx", "create_xlsx", "ask_user", "update_plan", "browser_act", "propose_plan", "files_changed"],
+        "house": ["house_get_state", "house_get_device", "house_set_device", "house_run_scene", "house_get_history", "run_command", "browser_act", "ask_user", "update_plan", "propose_plan"],
+        "dfd": ["dfd_bridge", "create_client", "create_project", "run_command", "ask_user", "update_plan", "propose_plan", "files_changed"],
+    }
 
 
 def get_native_tool_names(scope: Optional[str] = None) -> list[str]:

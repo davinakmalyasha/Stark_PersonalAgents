@@ -36,7 +36,6 @@ from tools import (
     execute_tool_detailed,
     get_native_tools,
     get_native_tool_names,
-    get_registry,
 )
 from llm import invoke_messages_with_fallback_stream
 from llm.native_conv import normalize_calls
@@ -216,17 +215,8 @@ def _dfd_events(task: str, chat_id: str = "", images: list | None = None):
     valid_tools = get_native_tool_names("dfd")
     native_tools = get_native_tools("dfd")
     valid_tool_set = set(valid_tools)
-    try:
-        get_registry().restrict_scope(_AGENT_NAME, allow=list(valid_tools))
-    except Exception:
-        pass
-    # Stage 4: tag the current chat for plan-mode enforcement.
-    try:
-        from tools._registry import _current_chat as _dfd_current_chat
-
-        _dfd_chat_token = _dfd_current_chat.set(chat_id or "")
-    except Exception:
-        _dfd_chat_token = None
+    # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
+    run_deps = _native_deps(chat_id)
 
     messages = [
         SystemMessage(content=_DFD_SYSTEM_TEMPLATE),
@@ -366,7 +356,7 @@ def _dfd_events(task: str, chat_id: str = "", images: list | None = None):
                 )
             else:
                 try:
-                    execution = execute_tool_detailed(tname, targs, scope=_AGENT_NAME)
+                    execution = execute_tool_detailed(tname, targs, deps=run_deps)
                     result_str = str(execution.content)
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"

@@ -301,10 +301,13 @@ def _specialist_call_backend(
 ):
     """One LLM turn for a specialist subagent on its configured backend.
 
-    Returns the same shape the generic loop already consumes: a
-    ``(text, tool_calls, reasoning)`` tuple on the free transport, or the raw
-    invoke_messages_with_fallback_stream result on deepseek. Raises loudly on
-    total free-provider failure — no silent paid fallback by design.
+    A5: the paid path is now a native pydantic-ai full turn — tools are
+    executed internally. Returns ``(text, new_lc, reasoning)`` where
+    ``new_lc`` is the LangChain transcript slice the caller extends its
+    history with (empty for a tool-less final turn is an AIMessage). The
+    ``schema`` (structured-output) path returns the validated pydantic
+    instance (tool-less specialists). The free pool keeps its single-turn
+    ``(text, tool_calls, reasoning)`` triple (caller owns execution).
     """
     if _specialist_backend(name) == "free":
         # Free pool with live streaming to the parent chat bus; one bounded
@@ -321,7 +324,18 @@ def _specialist_call_backend(
             temperature=temp,
         )
 
-    from llm import invoke_messages_with_fallback_stream
+    if schema is not None:
+        # Structured output (tool-less specialist): single validated result.
+        from llm.pai_transport import pai_structured
+
+        return pai_structured(
+            list(messages),
+            schema,
+            temp=temp,
+            where=where,
+        )
+
+    from llm.native_tools import run_native_agent
 
     if not model:
         # Provider modes may pin a concrete specialist model (command mode ->
@@ -333,15 +347,14 @@ def _specialist_call_backend(
         except Exception:
             model = None
 
-    return invoke_messages_with_fallback_stream(
+    return run_native_agent(
         role=name,
         messages=list(messages),
-        schema=schema,
-        temp=temp,
-        model=model,
-        reasoning_effort=reasoning_effort,
         tools=native_tools,
+        temp=temp,
+        reasoning_effort=reasoning_effort,
         where=where,
+        system_prompt=_child_prompt_for(name),
     )
 
 _HANDOFF_MAX_CHARS = 1000  # 1000 chars — compact structured report; oversized text offloads to VFS
@@ -714,6 +727,45 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                 if reasoning:
                     additional_kwargs["reasoning_content"] = reasoning
 
+                # A5: native full turn — pydantic-ai executed the tools already.
+                # The slice (AIMessage tool_calls + ToolMessage results) IS the
+                # execution record; extend history, log to the session, and
+                # finish when the model stopped calling tools.
+                _native_slice = None
+                if isinstance(res, tuple) and len(res) == 3 and _is_native_slice(res[1]):
+                    response_text, _native_slice, reasoning = res
+                    content = str(response_text or "")
+                    if reasoning:
+                        additional_kwargs["reasoning_content"] = reasoning
+                    messages.extend(_native_slice)
+                    _native_calls = [
+                        tc for m in _native_slice
+                        if m.__class__.__name__ == "AIMessage"
+                        for tc in (getattr(m, "tool_calls", None) or [])
+                    ]
+                    if sub_sess is not None:
+                        try:
+                            blocks = [{"type": "text", "text": content}]
+                            if reasoning:
+                                blocks.insert(0, {"type": "thinking", "thinking": reasoning})
+                            stop = "toolUse" if _native_calls else "stop"
+                            sub_sess.append_assistant(blocks, stop_reason=stop)
+                            for tc in _native_calls:
+                                sub_sess.append_tool_result(
+                                    "ok",
+                                    tool_call_id=tc.get("id", ""),
+                                    tool_name=tc.get("name", ""),
+                                    is_error=False,
+                                )
+                        except Exception:
+                            pass
+                    if _native_calls:
+                        # Native turn used tools; continue the loop so a final
+                        # no-tool turn produces the handoff.
+                        _last_tool_name = _native_calls[-1].get("name", "")
+                        continue
+                    break
+
                 if schema and hasattr(res, "model_dump_json"):
                     content = res.model_dump_json()
                     messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
@@ -893,6 +945,21 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # report; the handoff itself stays compact so the orchestrator's context never
     # eats a multi-KB dump.
     return _handoff(content, name)
+
+def _is_native_slice(second: list) -> bool:
+    """True when a backend result's 2nd element is a LangChain transcript
+    slice (native full turn) rather than a list of tool-call dicts (free
+    single-turn triple)."""
+    try:
+        for m in (second or [])[:2]:
+            if hasattr(m, "__class__") and m.__class__.__name__ in ("AIMessage", "ToolMessage"):
+                return True
+            if isinstance(m, dict) and ("tool" in m or "name" in m):
+                return False
+        return False
+    except Exception:
+        return False
+
 
 def _subagent_execute_one(tool_call: dict, tool_names: list) -> str:
     """Thread-pool worker for a subagent's parallel read-only batch. Only

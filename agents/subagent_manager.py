@@ -262,6 +262,45 @@ def _run_turn(
 
             reasoning = getattr(res, "reasoning_content", None)
             native_tool_calls = None
+            # A5: native full turn — pydantic-ai executed the tools internally.
+            # The 3rd element is the LangChain transcript slice (AIMessage with
+            # tool_calls + ToolMessage results); extend history + session log.
+            if isinstance(res, tuple) and len(res) == 3:
+                candidate = res[1]
+                is_slice = False
+                try:
+                    is_slice = any(
+                        hasattr(m, "__class__") and m.__class__.__name__ in ("AIMessage", "ToolMessage")
+                        for m in (candidate or [])[:2]
+                    )
+                except Exception:
+                    is_slice = False
+                if is_slice:
+                    response_text, lc_slice, reasoning = res
+                    messages.extend(lc_slice)
+                    slice_calls = [
+                        tc for m in lc_slice
+                        if m.__class__.__name__ == "AIMessage"
+                        for tc in (getattr(m, "tool_calls", None) or [])
+                    ]
+                    blocks = [{"type": "text", "text": str(response_text)}]
+                    if reasoning:
+                        blocks.insert(0, {"type": "thinking", "thinking": str(reasoning)})
+                    session.append_assistant(
+                        blocks,
+                        stop_reason="toolUse" if slice_calls else "stop",
+                    )
+                    if not slice_calls:
+                        content = str(response_text)
+                        break
+                    for tc in slice_calls:
+                        session.append_tool_result(
+                            "ok",
+                            tool_call_id=tc.get("id", ""),
+                            tool_name=tc.get("name", ""),
+                            is_error=False,
+                        )
+                    continue
             if isinstance(res, tuple):
                 response_text, native_tool_calls = res[0], res[1]
                 reasoning = reasoning or (res[2] if len(res) > 2 else None)

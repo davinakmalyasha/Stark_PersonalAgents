@@ -26,14 +26,64 @@ from tools import (
     get_native_tools,
     get_native_tool_names,
 )
-from llm import invoke_messages_with_fallback_stream
 from llm.deps import WorkspaceDeps
 from llm.loop_detector import LoopGuard
+from llm.native_tools import run_native_agent
 from memory.context_compaction import (
     compact_history,
     get_compaction_policy,
 )
 from inbox import drain_steering, drain_follow_up, consume_abort, render_delivery
+
+
+# A2: the orchestrator's model/tool loop is now a single native pydantic-ai
+# turn (tools executed internally). The outer loop below stays as the
+# event-driven coordination shell: park/wait on delegation results, steering,
+# abort, nudges. The transcript slice the native run returns (AIMessage with
+# tool_calls + ToolMessage results) feeds the session log and drives the
+# park/wait decision.
+
+def _native_slice_tools(new_msgs: list) -> list[dict]:
+    """Extract tool calls from the native run's LangChain transcript slice."""
+    out: list[dict] = []
+    for m in new_msgs or []:
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            out.append({
+                "tool": tc.get("name") or tc.get("tool", ""),
+                "args": tc.get("args") or {},
+                "id": tc.get("id") or "",
+            })
+    return out
+
+
+def _native_slice_delegated(new_msgs: list) -> bool:
+    """True if the native turn spawned delegations (delegate/task/resume/create)."""
+    return any(
+        tc.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
+        for tc in _native_slice_tools(new_msgs)
+    )
+
+
+def _native_slice_failures(new_msgs: list) -> bool:
+    """True if a delegation tool result reported failure (adaptive ladder)."""
+    for m in new_msgs or []:
+        tname = getattr(m, "name", "") or ""
+        content = str(getattr(m, "content", "") or "")
+        low = content.lower()
+        if tname in ("delegate", "task", "async_task", "resume_project"):
+            if content.startswith("ERROR") or any(
+                marker in low
+                for marker in (
+                    "handoff report [failed]", "handoff report [blocked]",
+                    "handoff report [stuck]", "[failed]", "[blocked]",
+                    "timed out",
+                )
+            ):
+                return True
+    return False
 
 
 def _orch_session_log(chat_id: str, project_path: str):
@@ -300,7 +350,11 @@ def _orchestrator_loop(s: ITState) -> dict:
             except Exception as e:
                 _log(f"[ORCHESTRATOR] Compaction error (non-fatal): {e}")
 
-        # â”€â”€ Call LLM â”€â”€
+        # â”€â”€ Call LLM (native full turn — A2) â”€â”€
+        # The pydantic-ai agent executes orchestrator tools internally
+        # (delegate / delegation_status / ask_user / update_plan / ...).
+        # Returns (text, new_lc_messages, reasoning) — the transcript slice
+        # feeds the session log and park/wait decision.
         try:
             # â”€â”€ Adaptive reasoning budget ladder (mode-aware) â”€â”€
             # The provider mode supplies per-rung defaults
@@ -331,80 +385,72 @@ def _orchestrator_loop(s: ITState) -> dict:
                     _orch_iter_default if _oplan.get("mode") == "command" else "disabled"
                 )
                 orch_effort = os.environ.get("REASONING_ORCH_ROUTINE", _orch_routine_default)
+
             if str(_oplan.get("backend")) == "free":
                 from llm.free_providers import free_native_turn
 
-                response = free_native_turn(
+                response_text, native_tool_calls, _reasoning = free_native_turn(
                     "Orchestrator",
                     list(messages),
                     tools=native_orchestrator_tools,
                     capability="text",
                     prefer_reasoning=bool(_oplan.get("think_bias", False)),
                 )
+                native_msgs: list = []
+                reasoning_content: str | None = None
             else:
-                response = invoke_messages_with_fallback_stream(
+                # Native full turn (A2) — tools executed inside pydantic-ai.
+                response_text, native_msgs, reasoning_content = run_native_agent(
                     role="Orchestrator",
                     messages=list(messages),
-                    temp=0.2,
                     tools=native_orchestrator_tools,
-                    model=str(_oplan.get("model") or "") or None,
+                    temp=0.2,
                     reasoning_effort=orch_effort,
                     where=f"Orchestrator iter {iteration}",
+                    deps=run_deps,
+                    system_prompt=static_system,
                 )
+                native_tool_calls = _native_slice_tools(native_msgs)
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
             _log(f"[ORCHESTRATOR] LLM call failed: {e}\n{tb}")
             break
 
-        # Extract content and native API tool calls. Text/XML parsing is
-        # intentionally absent; the coordinator uses the same structured tool
-        # protocol as the Developer.
-        content = ""
-        native_tool_calls = []
-        reasoning_content = None
-        if isinstance(response, tuple):
-            if len(response) >= 3:
-                content, native_tool_calls, reasoning_content = response[:3]
-            elif len(response) == 2:
-                content, native_tool_calls = response
-            else:
-                content = response[0] if response else ""
-        elif hasattr(response, "content"):
-            from llm import _extract_text
-            content = _extract_text(response.content)
-        else:
-            content = str(response)
-
-        if hasattr(response, "additional_kwargs"):
-            reasoning_content = response.additional_kwargs.get("reasoning_content")
-
+        content = str(response_text or "")
         if reasoning_content:
             _log(f"[THINKING] Supervisor: {reasoning_content.strip()}")
 
-        tool_calls = []
-        for call_index, tc in enumerate(native_tool_calls or []):
-            tname = tc.get("tool") or tc.get("name") if isinstance(tc, dict) else ""
-            targs = tc.get("args") if isinstance(tc, dict) else {}
-            if isinstance(targs, str):
-                try:
-                    targs = json.loads(targs)
-                except Exception:
-                    targs = {}
-            if tname:
-                tool_calls.append({
-                    "tool": tname,
-                    "args": targs if isinstance(targs, dict) else {},
-                    "id": (tc.get("id") if isinstance(tc, dict) else None)
-                    or f"orch-call-{iteration}-{call_index}-{uuid.uuid4().hex[:8]}",
-                })
+        # A2: native full turn always appends its transcript slice. The slice
+        # (AIMessage tool_calls + ToolMessage results) IS the tool-execution
+        # record — no manual execute loop, no ToolMessage re-append.
+        if native_msgs:
+            messages.extend(native_msgs)
+            tool_calls: list[dict] = _native_slice_tools(native_msgs)
+        else:
+            # Free-pool path: legacy single-turn protocol (manual execution).
+            tool_calls = []
+            for call_index, tc in enumerate(native_tool_calls or []):
+                tname = tc.get("tool") or tc.get("name") if isinstance(tc, dict) else ""
+                targs = tc.get("args") if isinstance(tc, dict) else {}
+                if isinstance(targs, str):
+                    try:
+                        targs = json.loads(targs)
+                    except Exception:
+                        targs = {}
+                if tname:
+                    tool_calls.append({
+                        "tool": tname,
+                        "args": targs if isinstance(targs, dict) else {},
+                        "id": (tc.get("id") if isinstance(tc, dict) else None)
+                        or f"orch-call-{iteration}-{call_index}-{uuid.uuid4().hex[:8]}",
+                    })
 
         if not tool_calls:
-            # Agent is done --- no more tools to call
-            # No tool call this turn -> reasoning_content is ignored by the API
-            # (DeepSeek docs) and does not need to participate in concatenation,
-            # so do NOT carry it forward as new cache-miss input.
-            messages.append(AIMessage(content=content))
+            # Agent is done --- no more tools to call.
+            # Native path: the final answer is already in `native_msgs`
+            # (the slice we extended into `messages`); just record the session
+            # log and park/exit.
             if orch_sess is not None:
                 try:
                     orch_sess.append_assistant(content, stop_reason="stop")
@@ -496,25 +542,6 @@ def _orchestrator_loop(s: ITState) -> dict:
             _log(f"[ASSISTANT] {clean_response}")
             break
 
-        # â”€â”€ Record AI response â”€â”€
-        ai_msg_id = f"orch-ai-{iteration}-{uuid.uuid4()}"
-        native_history_calls = [
-            {
-                "name": tc.get("tool", ""),
-                "args": tc.get("args") or {},
-                "id": tc.get("id") or f"orch-call-{iteration}-{index}",
-                "type": "tool_call",
-            }
-            for index, tc in enumerate(tool_calls)
-            if tc.get("tool")
-        ]
-        messages.append(AIMessage(
-            content=content,
-            id=ai_msg_id,
-            tool_calls=native_history_calls,
-            additional_kwargs={"reasoning_content": reasoning_content} if reasoning_content else {}
-        ))
-
         # â”€â”€ Session log (P1): record the step's assistant message â”€â”€
         if orch_sess is not None:
             try:
@@ -525,104 +552,108 @@ def _orchestrator_loop(s: ITState) -> dict:
             except Exception:
                 pass
 
-        # â”€â”€ Execute tools â”€â”€
-        # Keep the provider's native assistant -> tool-result protocol intact.
-        # A synthetic HumanMessage containing "Tool results:" breaks call-id
-        # correlation and makes the next model turn reinterpret observations
-        # as user instructions.
-        tool_results = []
-        native_results = []
-        for tc in tool_calls:
-            tool_name = tc.get("tool", "")
-            args = tc.get("args", {})
-            if not args or not isinstance(args, dict):
-                args = {k: v for k, v in tc.items() if k not in ("tool", "args")}
-            call_id = tc.get("id") or f"orch-call-{iteration}-{len(native_results)}"
-            execution = None
+        # â”€â”€ Execute tools (free-pool fallback only) â”€â”€
+        # Native full turns already executed their tools inside pydantic-ai
+        # (their ToolMessage results are in `native_msgs`). Only the free-pool
+        # single-turn protocol needs the manual execute loop below.
+        if not native_msgs:
+            for tc in tool_calls:
+                tool_name = tc.get("tool", "")
+                args = tc.get("args", {})
+                if not args or not isinstance(args, dict):
+                    args = {k: v for k, v in tc.items() if k not in ("tool", "args")}
+                call_id = tc.get("id") or f"orch-call-{iteration}-{len(tool_call_log)}"
+                execution = None
 
-            if tool_name not in valid_tools:
-                result_str = (
-                    f"[BLOCKED] Tool '{tool_name}' is not available to the Orchestrator. "
-                    f"Available: {', '.join(valid_tools)}"
-                )
-                execution = ToolExecutionResult.from_content(tool_name, args, result_str)
-            else:
-                try:
-                    import json
-                    _log(f"[TOOL_CALL] {tool_name}({json.dumps(args)})")
-                    execution = execute_tool_detailed(tool_name, args, deps=run_deps)
-                    result_str = str(execution.content)
-                except Exception as e:
-                    result_str = f"ERROR: {str(e)[:300]}"
-                    orch_think = True  # tool blew up â€” next turn must diagnose
-
-            loop_warning = LoopGuard.check_pre_execute(tool_call_log, tool_name, args)
-            # Truncate long results (teaching note so the model stops producing
-            # giant outputs it will only get clipped).
-            if len(result_str) > 4000:
-                orig_len = len(result_str)
-                result_str = result_str[:2000] + "\n... (truncated middle) ...\n" + result_str[-2000:]
-                try:
-                    from memory.context_compaction import truncation_note
-                    result_str += truncation_note(orig_len, 4000)
-                except Exception:
-                    pass
-            if loop_warning and loop_warning[0] == "WARNING":
-                result_str += "\n" + loop_warning[1]
-
-            native_results.append((call_id, tool_name, result_str))
-            tool_results.append(f"[{tool_name}] {result_str}")
-
-            # Session log (P1): record the same call id used by the native turn.
-            if orch_sess is not None:
-                try:
-                    orch_sess.append_tool_result(
-                        result_str,
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        is_error=bool(execution and execution.is_error),
+                if tool_name not in valid_tools:
+                    result_str = (
+                        f"[BLOCKED] Tool '{tool_name}' is not available to the Orchestrator. "
+                        f"Available: {', '.join(valid_tools)}"
                     )
-                except Exception:
-                    pass
+                    execution = ToolExecutionResult.from_content(tool_name, args, result_str)
+                else:
+                    try:
+                        import json
+                        _log(f"[TOOL_CALL] {tool_name}({json.dumps(args)})")
+                        execution = execute_tool_detailed(tool_name, args, deps=run_deps)
+                        result_str = str(execution.content)
+                    except Exception as e:
+                        result_str = f"ERROR: {str(e)[:300]}"
+                        orch_think = True  # tool blew up â€” next turn must diagnose
 
-            # Adaptive-ladder trigger: a subagent reported FAILURE (handoff
-            # status, not stray words) â†’ the NEXT orchestrator turn diagnoses
-            # with high effort.
-            low = result_str.lower()
-            if tool_name in ("delegate", "task", "async_task", "resume_project"):
-                is_failure = bool(execution and execution.is_error) or any(
-                    marker in low
-                    for marker in (
-                        "handoff report [failed]", "handoff report [blocked]",
-                        "handoff report [stuck]", "[failed]", "[blocked]",
-                        "timed out",
+                loop_warning = LoopGuard.check_pre_execute(tool_call_log, tool_name, args)
+                # Truncate long results (teaching note so the model stops producing
+                # giant outputs it will only get clipped).
+                if len(result_str) > 4000:
+                    orig_len = len(result_str)
+                    result_str = result_str[:2000] + "\n... (truncated middle) ...\n" + result_str[-2000:]
+                    try:
+                        from memory.context_compaction import truncation_note
+                        result_str += truncation_note(orig_len, 4000)
+                    except Exception:
+                        pass
+                if loop_warning and loop_warning[0] == "WARNING":
+                    result_str += "\n" + loop_warning[1]
+
+                # Session log (P1): record the same call id used by the native turn.
+                if orch_sess is not None:
+                    try:
+                        orch_sess.append_tool_result(
+                            result_str,
+                            tool_call_id=call_id,
+                            tool_name=tool_name,
+                            is_error=bool(execution and execution.is_error),
+                        )
+                    except Exception:
+                        pass
+
+                # Adaptive-ladder trigger: a subagent reported FAILURE (handoff
+                # status, not stray words) â†’ the NEXT orchestrator turn diagnoses
+                # with high effort.
+                low = result_str.lower()
+                if tool_name in ("delegate", "task", "async_task", "resume_project"):
+                    is_failure = bool(execution and execution.is_error) or any(
+                        marker in low
+                        for marker in (
+                            "handoff report [failed]", "handoff report [blocked]",
+                            "handoff report [stuck]", "[failed]", "[blocked]",
+                            "timed out",
+                        )
                     )
-                )
-                if is_failure:
-                    orch_think = True
+                    if is_failure:
+                        orch_think = True
 
-            # Log tool output for frontend trace tracking and append the compact
-            # execution record used by the loop guard/checkpoint.
-            _log(f"[TOOL OUTPUT] {tool_name}: {result_str}")
-            tool_call_log.append({
-                "tool": tool_name,
-                "args": args,
-                "iteration": iteration,
-                "status": "error" if (execution and execution.is_error) else "ok",
-                "exit_code": execution.exit_code if execution else None,
-                "timed_out": execution.timed_out if execution else False,
-                "offloaded": execution.offloaded if execution else False,
-            })
-
-        # One native ToolMessage per native call. Never merge observations into
-        # a synthetic user turn; the provider needs the call ids to associate
-        # each result with the assistant tool call.
-        for call_id, tool_name, result_str in native_results:
-            messages.append(ToolMessage(
-                content=result_str,
-                tool_call_id=call_id,
-                name=tool_name or None,
-            ))
+                # Log tool output for frontend trace tracking and append the compact
+                # execution record used by the loop guard/checkpoint.
+                _log(f"[TOOL OUTPUT] {tool_name}: {result_str}")
+                tool_call_log.append({
+                    "tool": tool_name,
+                    "args": args,
+                    "iteration": iteration,
+                    "status": "error" if (execution and execution.is_error) else "ok",
+                    "exit_code": execution.exit_code if execution else None,
+                    "timed_out": execution.timed_out if execution else False,
+                    "offloaded": execution.offloaded if execution else False,
+                })
+                messages.append(ToolMessage(
+                    content=result_str,
+                    tool_call_id=call_id,
+                    name=tool_name or None,
+                ))
+        else:
+            # Native path: feed tool_call_log from the native slice so the
+            # return contract (code_updated) and adaptive ladder see the tools.
+            for tc in tool_calls:
+                tool_name = tc.get("tool", "")
+                args = tc.get("args", {})
+                tool_call_log.append({
+                    "tool": tool_name,
+                    "args": args,
+                    "iteration": iteration,
+                    "status": "ok",
+                })
+            if _native_slice_failures(native_msgs):
+                orch_think = True
 
         # Vision: drain any inline images queued by tools into ONE user message.
         try:

@@ -260,6 +260,69 @@ def test_status_table_renders(fake_env):
 # ── Orchestrator loop integration (mocked LLM) ───────────────────────────────
 
 
+def _native_slice(text: str, tool_calls: list) -> list:
+    """Build the native run_native_agent return slice from a fake turn.
+
+    Mirrors llm.pai_transport._pai_to_lc: AIMessage with tool_calls + one
+    ToolMessage per call. The orchestrator loop reads this slice for
+    _native_slice_tools / _native_slice_failures / the transcript.
+    ``tool_calls`` may be plain dicts (default result content "ok") or dicts
+    with an extra ``_content`` key carrying realistic tool output.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    msgs = []
+    if tool_calls:
+        msgs.append(AIMessage(
+            content=text,
+            tool_calls=[
+                {"name": tc.get("tool") or tc.get("name", ""),
+                 "args": tc.get("args") or {},
+                 "id": tc.get("id", "")}
+                for tc in tool_calls
+            ],
+        ))
+        for tc in tool_calls:
+            msgs.append(ToolMessage(
+                content=tc.pop("_content", "ok"),
+                tool_call_id=tc.get("id", ""),
+                name=tc.get("tool") or tc.get("name", ""),
+            ))
+    else:
+        msgs.append(AIMessage(content=text))
+    return msgs
+
+
+def _native_turn_executor(decide):
+    """Wrap a fake decision fn into a run_native_agent-compatible fake.
+
+    ``decide(messages) -> (text, tool_calls)`` picks the fake turn's text and
+    the tool calls it would emit. The wrapper executes those tools for real
+    (via execute_tool_detailed) so delegations actually spawn and park_wait
+    receives events — preserving the test's coordination intent under the
+    native loop (which executes tools internally).
+    """
+    from tools import execute_tool_detailed
+
+    def fake(role, messages, temp=0.7, tools=None, **kw):
+        text, tool_calls = decide(messages)
+        out_calls = []
+        for tc in tool_calls:
+            cid = tc.get("id", "c")
+            try:
+                exec_res = execute_tool_detailed(
+                    tc["tool"], tc.get("args") or {}, scope="Orchestrator"
+                )
+                content = str(exec_res.content)
+            except Exception as e:
+                content = f"ERROR: {e}"
+            out_calls.append({"tool": tc["tool"], "args": tc.get("args") or {},
+                              "id": cid, "_content": content})
+        return (text, _native_slice(text, out_calls), None)
+
+    return fake
+
+
 def test_orchestrator_spawns_parks_forwards_finishes(fake_env, monkeypatch):
     import agents.orchestrator_agent as orch
     from agents import delegation
@@ -274,28 +337,25 @@ def test_orchestrator_spawns_parks_forwards_finishes(fake_env, monkeypatch):
 
     saw_spawn = {"v": False}
 
-    def fake_invoke(role, messages, temp=0.7, tools=None, **kw):
+    def decide(messages):
         turn["n"] += 1
         ctx = "\n".join(getattr(m, "content", "") for m in messages)
         if not saw_spawn["v"]:
             saw_spawn["v"] = True
-            return (
-                "Spawning your requests.",
-                [{"tool": "delegate", "args": {"items": [
-                    {"agent": "Dev", "task": "game project", "title": "Game"},
-                    {"agent": "House", "task": "lamp off", "title": "Lamp"},
-                ]}, "id": "c1"}],
-                None,
-            )
+            return ("Spawning your requests.", [{"tool": "delegate", "args": {"items": [
+                {"agent": "Dev", "task": "game project", "title": "Game"},
+                {"agent": "House", "task": "lamp off", "title": "Lamp"},
+            ]}, "id": "c1"}])
         # Payload sentinel (\nstatus: DONE exists only in real result events,
         # never in the prompt or the [SPAWNED] tool output).
         if "\nstatus: DONE" in ctx:
-            return ("All done — check the chats for detail.", [], None)
+            return ("All done — check the chats for detail.", [])
         # No events yet: a no-tool turn. With children still running this must
         # PARK (not exit); with them done, the follow-up drain continues.
-        return ("✓ waiting on agents.", [], None)
+        return ("✓ waiting on agents.", [])
 
-    monkeypatch.setattr(orch, "invoke_messages_with_fallback_stream", fake_invoke)
+    fake_invoke = _native_turn_executor(decide)
+    monkeypatch.setattr(orch, "run_native_agent", fake_invoke)
     monkeypatch.setenv("ORCH_WAIT_TIMEOUT", "15")
 
     state = {
@@ -464,8 +524,7 @@ def test_orchestrator_handles_steering_mid_park(fake_env, monkeypatch):
     saw_spawn = {"v": False}
     saw_note = {"v": False}
 
-    def fake_invoke(role, messages, temp=0.7, tools=None, **kw):
-        turn["n"] += 1
+    def decide(messages):
         ctx = "\n".join(getattr(m, "content", "") for m in messages)
         if not saw_spawn["v"]:
             # The child is HELD open so the park is definitely active when the
@@ -475,19 +534,20 @@ def test_orchestrator_handles_steering_mid_park(fake_env, monkeypatch):
             saw_spawn["v"] = True
             return ("Spawning.", [{"tool": "delegate", "args": {"items": [
                 {"agent": "House", "task": "lamp off"},
-            ]}, "id": "c1"}], None)
+            ]}, "id": "c1"}])
         # Payload sentinels — the prompt/tool-output also mention the LABELS
         # ([DELEGATION RESULT]/[STEERING]), so match actual payloads instead.
         if "also note today i ate pasta" in ctx and not saw_note["v"]:
             saw_note["v"] = True
             return ("On it.", [{"tool": "delegate", "args": {"items": [
                 {"agent": "General", "task": "note today i ate pasta"},
-            ]}, "id": "c2"}], None)
+            ]}, "id": "c2"}])
         if saw_note["v"] and "\nstatus: DONE" in ctx:
-            return ("Everything handled — see chats.", [], None)
-        return ("Waiting on agents.", [], None)
+            return ("Everything handled — see chats.", [])
+        return ("Waiting on agents.", [])
 
-    monkeypatch.setattr(orch, "invoke_messages_with_fallback_stream", fake_invoke)
+    fake_invoke = _native_turn_executor(decide)
+    monkeypatch.setattr(orch, "run_native_agent", fake_invoke)
 
     res = orch.orchestrator_node({
         "client_request": "turn off the lamp",
@@ -525,23 +585,26 @@ def test_orchestrator_timeout_partial_report(fake_env, monkeypatch):
     monkeypatch.setattr(ha, "house_node", blocked_house)
 
     saw_timeout = {"armed": False}
+    partial_sent = {"v": False}
     turn = {"n": 0}
 
-    def fake_invoke(role, messages, temp=0.7, tools=None, **kw):
-        turn["n"] += 1
+    def decide(messages):
         ctx = "\n".join(getattr(m, "content", "") for m in messages)
-        if turn["n"] == 1:
+        if not saw_timeout["armed"]:
+            # First turn: spawn. The child (blocked_house) is held by the gate.
+            saw_timeout["armed"] = True
             return ("Delegating.", [{"tool": "delegate", "args": {"items": [
                 {"agent": "House", "task": "slow lamp"},
-            ]}, "id": "c1"}], None)
-        if "STILL RUNNING" in ctx and not saw_timeout["armed"]:
-            saw_timeout["armed"] = True
+            ]}, "id": "c1"}])
+        if "STILL RUNNING" in ctx and not partial_sent["v"]:
             # Let the child finish shortly after the partial-report demand.
+            partial_sent["v"] = True
             threading.Timer(0.3, gate.set).start()
-            return ("Partial: lamp agent still running.", [], None)
-        return ("Lamp off now — done.", [], None)
+            return ("Partial: lamp agent still running.", [])
+        return ("Lamp off now — done.", [])
 
-    monkeypatch.setattr(orch, "invoke_messages_with_fallback_stream", fake_invoke)
+    fake_invoke = _native_turn_executor(decide)
+    monkeypatch.setattr(orch, "run_native_agent", fake_invoke)
     monkeypatch.setenv("ORCH_WAIT_TIMEOUT", "0.2")
 
     res = orch.orchestrator_node({
@@ -605,19 +668,20 @@ def test_double_delegate_in_one_turn(fake_env, monkeypatch):
 
     saw_spawn = {"v": False}
 
-    def fake_invoke(role, messages, temp=0.7, tools=None, **kw):
+    def decide(messages):
         ctx = "\n".join(getattr(m, "content", "") for m in messages)
         if not saw_spawn["v"]:
             saw_spawn["v"] = True
             return ("Two at once.", [
                 {"tool": "delegate", "args": {"items": [{"agent": "General", "task": "a"}]}, "id": "c1"},
                 {"tool": "delegate", "args": {"items": [{"agent": "House", "task": "b"}]}, "id": "c2"},
-            ], None)
+            ])
         if ctx.count("\nstatus: DONE") >= 2:
-            return ("Both done.", [], None)
-        return ("Waiting.", [], None)
+            return ("Both done.", [])
+        return ("Waiting.", [])
 
-    monkeypatch.setattr(orch, "invoke_messages_with_fallback_stream", fake_invoke)
+    fake_invoke = _native_turn_executor(decide)
+    monkeypatch.setattr(orch, "run_native_agent", fake_invoke)
 
     res = orch.orchestrator_node({
         "client_request": "two things",

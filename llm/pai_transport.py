@@ -478,10 +478,54 @@ def pai_native_turn(
 ) -> tuple[str, list[dict], str | None]:
     """One model turn. Returns ``(text, tool_calls, reasoning_content)``.
 
+    Sync facade over :func:`apai_native_turn`. Raises on provider failure so
+    the caller's model-fallback queue can decide. ``base_url``/``api_key``
+    override the resolved gateway (test/alt-provider use). ``deps`` carries the
+    typed per-run workspace context; when None the caller retains the legacy
+    global-shared_state path (pre-migration compatibility).
+
+    Async callers (server loop) MUST use :func:`apai_native_turn` — this sync
+    facade spins its own event loop and blocks the server.
+    """
+    import asyncio
+
+    return asyncio.run(
+        apai_native_turn(
+            role=role,
+            messages=messages,
+            tools=tools,
+            model=model,
+            temp=temp,
+            reasoning_effort=reasoning_effort,
+            reasoning_budget=reasoning_budget,
+            where=where,
+            stream_emit=stream_emit,
+            base_url=base_url,
+            api_key=api_key,
+            deps=deps,
+        )
+    )
+
+
+async def apai_native_turn(
+    role: str,
+    messages: list,
+    tools: list[dict] | None = None,
+    model: str = "deepseek:v4-flash",
+    temp: float = 0.2,
+    reasoning_effort: str | None = None,
+    reasoning_budget: int | None = None,
+    where: str | None = None,
+    stream_emit: bool = True,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    deps: WorkspaceDeps | None = None,
+    cancellation_token: Any = None,
+) -> tuple[str, list[dict], str | None]:
+    """Async one model turn (A1). Returns ``(text, tool_calls, reasoning_content)``.
+
     Raises on provider failure so the caller's model-fallback queue can decide.
-    ``base_url``/``api_key`` override the resolved gateway (test/alt-provider use).
-    ``deps`` carries the typed per-run workspace context; when None the caller
-    retains the legacy global-shared_state path (pre-migration compatibility).
+    ``cancellation_token`` (A8) propagates to the underlying run.
     """
     # Dropdown-aware resolution: prefer typed deps when provided.
     if base_url is None or api_key is None:
@@ -576,6 +620,7 @@ def pai_native_turn(
                         message_history=msg_history,
                         usage_limits=DEFAULT_USAGE_LIMITS,
                         deps=deps or WorkspaceDeps.from_shared_state(role=role),
+                        cancellation_token=cancellation_token,
                     ) as sres:
                         text_acc: list[str] = []
                         reasoning_acc: list[str] = []
@@ -596,8 +641,7 @@ def pai_native_turn(
                                 prev_text = cur_text
                         return sres, text_acc, reasoning_acc
 
-                import asyncio
-                sres, text_acc, reasoning_acc = asyncio.run(_run())
+                sres, text_acc, reasoning_acc = await _run()
                 reasoning = "".join(reasoning_acc).strip() or None
                 text = "".join(text_acc).strip()
                 try:
@@ -747,8 +791,7 @@ def pai_native_turn(
                             _emit_stream(role, "text", content, where or "")
                     return text_acc, reasoning_acc, call_parts_acc
 
-            import asyncio
-            text_acc, reasoning_acc, call_parts = asyncio.run(_stream())
+            text_acc, reasoning_acc, call_parts = await _stream()
             text = "".join(text_acc).strip()
             reasoning = "".join(reasoning_acc).strip() or None
             usage = None
@@ -778,12 +821,41 @@ def pai_structured(
 ):
     """Single-shot structured output. Returns the validated result instance.
 
-    ``result_type`` may be a pydantic model/TypeDict OR a raw JSON-schema dict
-    (specialist ``response_format`` configs). Raises on failure (caller keeps
-    its existing fallback behavior). ``base_url``/``api_key`` override the
-    resolved gateway (test/alt-provider use). ``deps`` carries the typed
-    per-run workspace context (fallback: legacy global path).
+    Sync facade over :func:`apai_structured`. ``result_type`` may be a pydantic
+    model/TypeDict OR a raw JSON-schema dict (specialist ``response_format``
+    configs). Raises on failure (caller keeps its existing fallback behavior).
+    ``base_url``/``api_key`` override the resolved gateway (test/alt-provider
+    use). ``deps`` carries the typed per-run workspace context (fallback:
+    legacy global path).
     """
+    import asyncio
+
+    return asyncio.run(
+        apai_structured(
+            messages=messages,
+            result_type=result_type,
+            model=model,
+            temp=temp,
+            where=where,
+            base_url=base_url,
+            api_key=api_key,
+            deps=deps,
+        )
+    )
+
+
+async def apai_structured(
+    messages: list,
+    result_type: type,
+    model: str = "deepseek:v4-flash",
+    temp: float = 0.2,
+    where: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    deps: WorkspaceDeps | None = None,
+    cancellation_token: Any = None,
+):
+    """Async single-shot structured output (A1). Returns the validated result."""
     from pydantic import TypeAdapter
     from pydantic_ai import Agent
 
@@ -819,6 +891,8 @@ def pai_structured(
 
     msg_history = _lc_messages_to_pai(messages)
     user_prompt, msg_history = _split_user_prompt(msg_history)
-    res = agent.run_sync(user_prompt, message_history=msg_history)
+    res = await agent.run(
+        user_prompt, message_history=msg_history, cancellation_token=cancellation_token
+    )
     _pai_usage_to_stats("Structured", model_id, res.usage, where, None, None)
     return res.output

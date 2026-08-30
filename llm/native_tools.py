@@ -318,7 +318,7 @@ def build_agent(
     return agent
 
 
-def run_native_agent(
+async def arun_native_agent(
     role: str,
     messages: list,
     tools: Optional[list[dict]] = None,
@@ -332,8 +332,9 @@ def run_native_agent(
     stream_emit: bool = True,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    cancellation_token: Optional[Any] = None,
 ) -> tuple[str, list, Optional[str]]:
-    """Run a full pydantic-ai Agent turn with REAL tool execution.
+    """Async full pydantic-ai Agent turn with REAL tool execution (A1).
 
     The agent executes tools internally (parallel by default, retry on invalid
     args). Returns ``(text, new_lc_messages, reasoning)`` where
@@ -342,7 +343,8 @@ def run_native_agent(
     its history/compaction/session machinery.
 
     ``model`` may be an OpenAIChatModel instance (provider already resolved)
-    or None (resolved from deps like pai_native_turn).
+    or None (resolved from deps like pai_native_turn). ``cancellation_token``
+    is a pydantic-ai ``CancellationToken`` (A8) propagated to the run.
     """
     from pydantic_ai import Agent
     from pydantic_ai.exceptions import UnexpectedModelBehavior
@@ -366,15 +368,10 @@ def run_native_agent(
         else:
             model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
 
-    agent = build_agent(role=role, model=model, tools=tools, deps=deps, system_prompt=system_prompt)
-
     # Convert LangChain transcript -> pydantic-ai history (reuse transport).
     from llm.pai_transport import _lc_messages_to_pai, _split_user_prompt
     full = _lc_messages_to_pai(messages)
-    # Keep the FULL history for the model; the prompt is embedded in system_prompt.
-    from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart
-    # Drop the trailing UserPromptPart we'd otherwise re-add: pydantic-ai needs
-    # a user prompt; pull the first one out like the transport does.
+    from pydantic_ai.messages import ModelResponse
     user_prompt, history = _split_user_prompt(full)
 
     events_log: list[dict] = []
@@ -426,9 +423,7 @@ def run_native_agent(
         extra_capabilities=[hooks],
     )
 
-    import asyncio
     from llm.native_tools import DEFAULT_USAGE_LIMITS
-    from pydantic_ai.messages import ModelResponse
 
     async def _run():
         # Use run_stream (streaming wire) like the transport — gateways expect
@@ -438,13 +433,13 @@ def run_native_agent(
             message_history=history,
             deps=deps,
             usage_limits=DEFAULT_USAGE_LIMITS,
+            cancellation_token=cancellation_token,
         ) as sres:
             async for _resp in sres.stream_response(debounce_by=None):
                 pass
             return sres
 
-    sres = asyncio.run(_run())
-    result = sres
+    result = await _run()
     all_msgs = list(result.all_messages())
     text = "".join(
         p.content
@@ -464,6 +459,54 @@ def run_native_agent(
     from llm.pai_transport import _pai_to_lc
     new_lc = _pai_to_lc(all_msgs, history)
     return text, new_lc, reasoning
+
+
+def run_native_agent(
+    role: str,
+    messages: list,
+    tools: Optional[list[dict]] = None,
+    model: Any = None,
+    temp: float = 0.2,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+    where: Optional[str] = None,
+    deps: Optional[WorkspaceDeps] = None,
+    system_prompt: str = "",
+    stream_emit: bool = True,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[str, list, Optional[str]]:
+    """Sync facade over :func:`arun_native_agent` (A1).
+
+    The agent executes tools internally (parallel by default, retry on invalid
+    args). Returns ``(text, new_lc_messages, reasoning)`` where
+    ``new_lc_messages`` is the LangChain conversation slice added by this run
+    (assistant text/tool-calls + tool results) so the caller's loop can keep
+    its history/compaction/session machinery.
+
+    Callers that already run inside an async context (server loop) MUST use
+    :func:`arun_native_agent` instead — this sync facade spins its own event
+    loop and blocks the server.
+    """
+    import asyncio
+
+    return asyncio.run(
+        arun_native_agent(
+            role=role,
+            messages=messages,
+            tools=tools,
+            model=model,
+            temp=temp,
+            reasoning_effort=reasoning_effort,
+            reasoning_budget=reasoning_budget,
+            where=where,
+            deps=deps,
+            system_prompt=system_prompt,
+            stream_emit=stream_emit,
+            base_url=base_url,
+            api_key=api_key,
+        )
+    )
 
 
 DEFAULT_USAGE_LIMITS = UsageLimits(request_limit=200, tool_calls_limit=200)

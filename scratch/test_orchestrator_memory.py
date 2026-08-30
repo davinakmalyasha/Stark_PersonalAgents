@@ -26,7 +26,7 @@ class TestOrchestratorMemory(unittest.TestCase):
             except Exception:
                 pass
 
-    @patch("orchestrator_agent.invoke_messages_with_fallback")
+    @patch("agents.orchestrator_agent.run_native_agent")
     def test_orchestrator_receives_chat_history(self, mock_invoke):
         # Create a new chat
         chat = wm.create_chat(self.temp_ws_path, "Test Chat")
@@ -46,14 +46,14 @@ class TestOrchestratorMemory(unittest.TestCase):
         }
 
         # Mock LLM to return a simple response so the orchestrator completes
-        mock_response = MagicMock()
-        mock_response.content = "Your name is Davin."
-        mock_invoke.return_value = mock_response
+        from langchain_core.messages import AIMessage
+
+        mock_invoke.return_value = ("Your name is Davin.", [AIMessage(content="Your name is Davin.")], None)
 
         # Execute orchestrator_node
         res = orchestrator_node(state)
 
-        # Retrieve the messages passed to invoke_messages_with_fallback
+        # Retrieve the messages passed to run_native_agent
         self.assertTrue(mock_invoke.called)
         called_args, called_kwargs = mock_invoke.call_args
         messages = called_kwargs.get("messages") if "messages" in called_kwargs else called_args[0]
@@ -62,12 +62,12 @@ class TestOrchestratorMemory(unittest.TestCase):
         self.assertTrue(len(messages) >= 2)
         task_msg = messages[1]
         self.assertIsInstance(task_msg, HumanMessage)
-        
+
         # Verify the content has recent chat history and user request
         content = task_msg.content
         self.assertIn("## Recent Chat History", content)
         self.assertIn("[USER]: my name is Davin", content)
-        self.assertIn("[AGENT]: Nice to meet you, Davin!", content)
+        self.assertIn("Nice to meet you, Davin!", content)
         self.assertIn("## User Request", content)
         self.assertIn("whats my name?", content)
 

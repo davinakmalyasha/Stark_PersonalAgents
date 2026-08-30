@@ -137,8 +137,9 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
     if not effort_override:
         effort_override = str(plan.get("iter_effort") or "disabled")
 
-    # Native agent (Track B): pydantic-ai executes tools internally.
-    if os.environ.get("PAI_NATIVE_TOOLS") == "1":
+    # Native agent (Track B): pydantic-ai executes tools internally (default).
+    # PAI_NATIVE_TOOLS=0 opts back into the single-turn registry path.
+    if os.environ.get("PAI_NATIVE_TOOLS", "1") != "0":
         from llm.native_tools import run_native_agent
 
         text, new_lc, reasoning = run_native_agent(

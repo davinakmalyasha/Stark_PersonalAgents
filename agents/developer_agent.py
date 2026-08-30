@@ -15,7 +15,6 @@ from tools import (
     get_native_tool_names,
     get_plan_for_context,
 )
-from llm import invoke_messages_with_fallback_stream
 
 # Local helper imports moved to top level
 from llm.loop_detector import LoopGuard
@@ -804,10 +803,10 @@ def developer_node(s: ITState) -> dict:
                         capability="coding",
                         prefer_reasoning=bool(_dev_plan.get("think_bias", True)),
                     )
-                elif os.environ.get("PAI_NATIVE_TOOLS") == "1":
+                else:
                     # Native agent (Track B): pydantic-ai executes tools
                     # internally for the WHOLE task; the returned transcript
-                    # slice replaces the manual tool loop below.
+                    # slice replaces the manual tool loop below (default).
                     from llm.native_tools import run_native_agent
 
                     _native_text, _native_lc, _native_reasoning = run_native_agent(
@@ -840,15 +839,6 @@ def developer_node(s: ITState) -> dict:
                                 })
                     # Mark finish: force the loop to the final-report path.
                     _native_finish = True
-                else:
-                    llm_result = invoke_messages_with_fallback_stream(
-                        role="Developer",
-                        messages=run_messages,
-                        tools=native_dev_tools,
-                        where=where_tag,
-                        reasoning_effort=reasoning_effort,
-                        reasoning_budget=reasoning_budget,
-                    )
 
                 # Unpack the provider result. Native calls are kept as
                 # structured metadata; text-only results simply finish.

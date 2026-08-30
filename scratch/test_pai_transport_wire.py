@@ -74,18 +74,24 @@ msgs = [
     HumanMessage(content="Weather in Jakarta?"),
 ]
 
-# Capture stream-flag + tools + messages in the request
-text, calls, reasoning = pai_native_turn(
-    role="Mock",
-    messages=msgs,
-    tools=TOOLS,
-    model="mock-model",
-    temp=0.2,
-    reasoning_effort="disabled",
-    where="mock",
-    base_url=BASE,
-    api_key="test-key",
-)
+# Capture stream-flag + tools + messages in the request.
+# PAI_NATIVE_TOOLS=0 pins the single-turn wire path (raw request, no agent
+# loop) — that is the wire format this gate asserts on.
+os.environ["PAI_NATIVE_TOOLS"] = "0"
+try:
+    text, calls, reasoning = pai_native_turn(
+        role="Mock",
+        messages=msgs,
+        tools=TOOLS,
+        model="mock-model",
+        temp=0.2,
+        reasoning_effort="disabled",
+        where="mock",
+        base_url=BASE,
+        api_key="test-key",
+    )
+finally:
+    os.environ.pop("PAI_NATIVE_TOOLS", None)
 print("\ntext:", repr(text))
 print("calls:", calls)
 print("reasoning:", repr(reasoning))

@@ -113,6 +113,15 @@ def note(workspace_path: str) -> None:
 def files_changed(limit: int = 5) -> str:
     """Tool body. Returns the most recent external file changes as text."""
     if not _STARTED:
+        # Lazy self-start: first tool call begins observing the workspace.
+        try:
+            from sync.state_sync import safe_get_state
+            ws = (safe_get_state() or {}).get("project_path") or ""
+            if ws:
+                note(ws)
+        except Exception:
+            pass
+    if not _STARTED:
         return ("[file-watcher] not started. Set up a workspace first "
                 "or install the `watchfiles` package for live external-change tracking.")
     with _LOCK:

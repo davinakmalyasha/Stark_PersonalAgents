@@ -16,24 +16,15 @@ What survives here is only what the remaining non-native callers need:
   migrated tools.
 - :class:`_LazyToolMap` + ``TOOL_MAP`` — the lazy facade used by
   ``native_tools._tool_map()``.
-- :func:`pre_validate_tool_args` — cheap required-args pre-check.
 """
 from __future__ import annotations
 
 import inspect
 import re
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from ._schemas import get_native_tool_names, _TOOL_REQUIRED_ARGS
-
-#: Watcher lazy-start: the legacy registry bootstrap started the file
-#: observer once a workspace existed. The shim keeps that behavior on first
-#: execution (best-effort, idempotent inside tools.watcher).
-_watcher_tried = False
-_watcher_lock = threading.Lock()
-
+from ._schemas import get_native_tool_names
 
 @dataclass(frozen=True)
 class ToolExecutionResult:
@@ -129,22 +120,6 @@ def _ctx_param_name(func: Callable) -> Optional[str]:
     return None
 
 
-def _ensure_watcher() -> None:
-    global _watcher_tried
-    with _watcher_lock:
-        if _watcher_tried:
-            return
-        _watcher_tried = True
-    try:
-        from sync.state_sync import safe_get_state
-        _ws = (safe_get_state() or {}).get("project_path") or ""
-        if _ws:
-            from tools.watcher import note as _watcher_note
-            _watcher_note(_ws)
-    except Exception:
-        pass
-
-
 def execute_tool_detailed(
     name: str,
     args: dict,
@@ -166,7 +141,6 @@ def execute_tool_detailed(
         )
 
     norm_args = _normalize_args(name, impl, dict(args or {}))
-    _ensure_watcher()
     try:
         ctx_param = _ctx_param_name(impl)
         if ctx_param is not None:
@@ -185,26 +159,6 @@ def execute_tool_detailed(
 def execute_tool(name: str, args: dict, deps: Any = None) -> str:
     """Legacy string-returning entry point (thin wrapper over the shim)."""
     return execute_tool_detailed(name, args, deps=deps).content
-
-
-def pre_validate_tool_args(tool_name: str, args: dict) -> tuple[bool, str]:
-    if tool_name not in _TOOL_REQUIRED_ARGS:
-        return True, ""
-
-    required = _TOOL_REQUIRED_ARGS[tool_name]
-    missing = required - set(args.keys())
-    if missing:
-        return False, f"Missing required args for '{tool_name}': {', '.join(sorted(missing))}"
-
-    for key in ("file_path", "path", "pattern", "command", "content", "diff"):
-        if key in args and not isinstance(args[key], str):
-            return False, f"Expected string for arg '{key}' in '{tool_name}', got {type(args[key]).__name__}"
-
-    for key in ("timeout", "offset", "limit", "background"):
-        if key in args and args[key] is not None and not isinstance(args[key], (int, float, bool)):
-            return False, f"Expected number/bool for arg '{key}' in '{tool_name}', got {type(args[key]).__name__}"
-
-    return True, ""
 
 
 class _LazyToolMap(dict):

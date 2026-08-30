@@ -538,11 +538,11 @@ def pai_native_turn(
                 }
             )
     if tool_defs:
-        # Track B: explicit opt-in via PAI_NATIVE_TOOLS=1. When off (default),
-        # the transport stays the schema-only single-turn path the loops use
-        # today (raw model request, no agent loop — the caller's loop owns
-        # tool execution).
-        use_native = os.environ.get("PAI_NATIVE_TOOLS") == "1"
+        # Track B: pydantic-ai native agent is the default execution path.
+        # PAI_NATIVE_TOOLS=0 opts back into the schema-only single-turn path
+        # (raw model request, no agent loop — the caller's loop owns tool
+        # execution). Any other value (unset / "1" / "true") = native.
+        use_native = os.environ.get("PAI_NATIVE_TOOLS", "1") != "0"
         if use_native:
             from llm.native_tools import build_agent
             agent = build_agent(

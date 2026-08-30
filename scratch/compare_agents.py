@@ -105,10 +105,14 @@ def main() -> int:
     pt._emit_stream = lambda r, k, t, w: captured.append((k, t))
 
     # 1) Registry (noop) path — single turn, tool call surfaced, not executed.
-    text1, calls1, reasoning1 = pai_native_turn(
-        "Developer", msgs, tools=tools, model="deepseek:v4-flash", temp=0.2,
-        where="cmp-registry", deps=deps, base_url=base, api_key="k",
-    )
+    os.environ["PAI_NATIVE_TOOLS"] = "0"
+    try:
+        text1, calls1, reasoning1 = pai_native_turn(
+            "Developer", msgs, tools=tools, model="deepseek:v4-flash", temp=0.2,
+            where="cmp-registry", deps=deps, base_url=base, api_key="k",
+        )
+    finally:
+        os.environ.pop("PAI_NATIVE_TOOLS", None)
     print("REGISTRY path: text=%r calls=%s" % (text1, calls1))
     assert len(calls1) == 1 and calls1[0]["tool"] == "get_weather", calls1
 

@@ -36,9 +36,7 @@ from ._registry import (
     ToolExecutionResult,
     execute_tool,
     execute_tool_detailed,
-    pre_validate_tool_args,
     TOOL_MAP,
-    _ensure_watcher,
 )
 
 # 2. Tool cluster implementations

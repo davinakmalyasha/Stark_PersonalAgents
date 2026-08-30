@@ -32,16 +32,14 @@ from tools import (
     get_native_tools,
     get_native_tool_names,
 )
-from llm import invoke_messages_with_fallback_stream
-from llm.native_conv import normalize_calls
 from llm.loop_detector import LoopGuard
+from llm.native_tools import run_native_agent
 from memory.context_compaction import (
     compact_history,
     get_compaction_policy,
 )
 from agents.house_prompt import _HOUSE_SYSTEM_TEMPLATE
 
-_GENERAL_MODEL = "deepseek:v4-flash"
 _AGENT_NAME = "House"
 
 
@@ -145,53 +143,22 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
         return text, calls, []
 
     # Native agent (Track B): pydantic-ai executes tools internally (default).
-    # PAI_NATIVE_TOOLS=0 opts back into the single-turn registry path.
-    if os.environ.get("PAI_NATIVE_TOOLS", "1") != "0":
-        from llm.native_tools import run_native_agent
-
-        text, new_lc, reasoning = run_native_agent(
-            role=_AGENT_NAME,
-            messages=list(messages),
-            tools=native_tools,
-            temp=0.2,
-            reasoning_effort=(
-                os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
-                or str(plan.get("iter_effort") or "disabled")
-            ),
-            where=where_tag,
-            deps=deps,
-            system_prompt=system_prompt,
-        )
-        return str(text or ""), [], new_lc
-
-    res = invoke_messages_with_fallback_stream(
+    # A4: the legacy single-turn registry path (PAI_NATIVE_TOOLS=0) is removed;
+    # the native full-turn agent is the only paid execution path.
+    text, new_lc, reasoning = run_native_agent(
         role=_AGENT_NAME,
         messages=list(messages),
-        temp=0.2,
         tools=native_tools,
-        model=_GENERAL_MODEL,
+        temp=0.2,
         reasoning_effort=(
             os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
             or str(plan.get("iter_effort") or "disabled")
         ),
         where=where_tag,
+        deps=deps,
+        system_prompt=system_prompt,
     )
-    native_tool_calls: list = []
-    if isinstance(res, tuple):
-        if len(res) >= 3:
-            response_text, native_tool_calls = res[0], res[1]
-        elif len(res) == 2:
-            response_text, native_tool_calls = res
-        else:
-            response_text = res[0] if res else ""
-    elif hasattr(res, "content"):
-        from llm import _extract_text
-
-        response_text = _extract_text(res.content)
-    else:
-        response_text = str(res)
-
-    return str(response_text or ""), normalize_calls(native_tool_calls, id_prefix="house"), []
+    return str(text or ""), [], new_lc
 
 
 def _house_execute_one(tool_call: dict, deps: object = None) -> str:

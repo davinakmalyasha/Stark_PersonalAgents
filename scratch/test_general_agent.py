@@ -7,14 +7,38 @@ from unittest.mock import patch
 
 
 def _fake_llm_factory(turns):
-    """Build a fake deepseek backend: list of (text, tool_calls) per turn."""
+    """Build a fake native backend: list of (text, tool_calls) per turn.
+
+    Returns the run_native_agent shape (text, new_lc, reasoning) where new_lc
+    is the LangChain transcript slice (AIMessage + ToolMessage per call).
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
     calls = {"n": 0}
 
     def fake_llm(**kwargs):
         idx = min(calls["n"], len(turns) - 1)
         calls["n"] += 1
         text, tcs = turns[idx]
-        return (text, tcs, None)
+        msgs = []
+        if tcs:
+            msgs.append(AIMessage(
+                content=text,
+                tool_calls=[
+                    {"name": tc.get("tool", ""), "args": tc.get("args") or {},
+                     "id": tc.get("id", "")}
+                    for tc in tcs
+                ],
+            ))
+            for tc in tcs:
+                msgs.append(ToolMessage(
+                    content="ok",
+                    tool_call_id=tc.get("id", ""),
+                    name=tc.get("tool", ""),
+                ))
+        else:
+            msgs.append(AIMessage(content=text))
+        return (text, msgs, None)
 
     return fake_llm, calls
 
@@ -40,7 +64,7 @@ class TestGeneralRegistry(unittest.TestCase):
         self.assertEqual(
             names,
             {"run_command", "read_pdf", "create_docx", "create_xlsx",
-             "ask_user", "update_plan", "browser_act"},
+             "ask_user", "update_plan", "browser_act", "propose_plan", "files_changed"},
         )
         # No code-repo access, no delegation leakage
         self.assertNotIn("read_file", names)
@@ -75,7 +99,6 @@ class TestGeneralLoop(unittest.TestCase):
 
     def test_loop_executes_tool_then_reports(self):
         fake_llm, calls = _fake_llm_factory([
-            ("", [{"tool": "read_pdf", "args": {"file_path": "x.pdf"}, "id": "c1"}]),
             ("Report: PDF says hello.", []),
         ])
         exec_calls = []
@@ -85,15 +108,17 @@ class TestGeneralLoop(unittest.TestCase):
             return SimpleNamespace(content="PDF TEXT", is_error=False, exit_code=0,
                                    timed_out=False, offloaded=False)
 
-        with patch("agents.general_agent.invoke_messages_with_fallback_stream", fake_llm), \
+        with patch("agents.general_agent.run_native_agent", fake_llm), \
              patch("agents.general_agent.execute_tool_detailed", fake_exec):
             from agents.general_agent import general_loop
 
             report = general_loop("summarize x.pdf")
 
+        # A4: the native agent executes tools internally — the loop finishes in
+        # one call and never drives execute_tool_detailed itself.
         self.assertEqual(report, "Report: PDF says hello.")
-        self.assertEqual(exec_calls, [("read_pdf", {"file_path": "x.pdf"}, "General")])
-        self.assertEqual(calls["n"], 2)
+        self.assertEqual(exec_calls, [])
+        self.assertEqual(calls["n"], 1)
 
     def test_out_of_scope_tool_is_blocked_not_executed(self):
         fake_llm, _ = _fake_llm_factory([
@@ -107,7 +132,7 @@ class TestGeneralLoop(unittest.TestCase):
             return SimpleNamespace(content="", is_error=False, exit_code=0,
                                    timed_out=False, offloaded=False)
 
-        with patch("agents.general_agent.invoke_messages_with_fallback_stream", fake_llm), \
+        with patch("agents.general_agent.run_native_agent", fake_llm), \
              patch("agents.general_agent.execute_tool_detailed", fake_exec):
             from agents.general_agent import general_loop
 
@@ -154,7 +179,7 @@ class TestGeneralLoop(unittest.TestCase):
     def test_direct_generator_yields_snapshots_and_final_report(self):
         fake_llm, _ = _fake_llm_factory([("all done early", [])])
 
-        with patch("agents.general_agent.invoke_messages_with_fallback_stream", fake_llm), \
+        with patch("agents.general_agent.run_native_agent", fake_llm), \
              patch("agents.general_agent._open_session", lambda *a, **k: None):
             from agents.general_agent import run_general_direct
 

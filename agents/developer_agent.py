@@ -1019,15 +1019,6 @@ def developer_node(s: ITState) -> dict:
                 print(f"[DEVELOPER] Error updating task tracking: {e}")
             # ── END ──
 
-            if is_error:
-                return make_return({
-                    "code": f"// ERROR: {clean_response[:1000]}",
-                    "agent_report": _build_dev_report(clean_response, True),
-                    "test_report": f"STATUS: FAIL\nDeveloper reported error: {clean_response[:300]}",
-                    "project_path": project_path,
-                    "code_updated": True,
-                    "tech_spec_updated": False,
-                })
             # Build exit report with validation -- bare "Completed." is useless
             def _build_dev_report(raw: str, is_err: bool) -> str:
                 import re as _re

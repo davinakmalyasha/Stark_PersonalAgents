@@ -475,6 +475,7 @@ def run_native_agent(
     stream_emit: bool = True,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    cancellation_token: Optional[Any] = None,
 ) -> tuple[str, list, Optional[str]]:
     """Sync facade over :func:`arun_native_agent` (A1).
 
@@ -505,8 +506,53 @@ def run_native_agent(
             stream_emit=stream_emit,
             base_url=base_url,
             api_key=api_key,
+            cancellation_token=cancellation_token,
         )
     )
 
 
 DEFAULT_USAGE_LIMITS = UsageLimits(request_limit=200, tool_calls_limit=200)
+
+import threading as _threading
+
+_WATCH_STOP = _threading.Event()
+
+
+def chat_cancellation_token(chat_id: str) -> tuple[Any, Any]:
+    """Build a pydantic-ai CancellationToken wired to the chat's abort flag (A8).
+
+    Returns ``(token, stop_watcher)``. ``stop_watcher()`` stops the background
+    abort watcher (call in a ``finally``). When the user aborts the chat
+    (``server.realtime.inbox.abort``), the watcher calls ``token.cancel()``,
+    which makes the in-flight native run raise ``RunCancelled`` — the loop
+    catches it and exits cleanly (history preserved for resume).
+    """
+    from pydantic_ai import CancellationToken
+
+    token = CancellationToken()
+    _WATCH_STOP.clear()
+
+    def _watch() -> None:
+        import time
+
+        try:
+            from server.realtime.inbox import pending_counts
+        except Exception:
+            return
+        while not _WATCH_STOP.is_set():
+            try:
+                counts = pending_counts(chat_id)
+                if counts.get("abort_pending"):
+                    token.cancel()
+                    return
+            except Exception:
+                return
+            time.sleep(0.25)
+
+    t = _threading.Thread(target=_watch, daemon=True)
+    t.start()
+
+    def _stop() -> None:
+        _WATCH_STOP.set()
+
+    return token, _stop

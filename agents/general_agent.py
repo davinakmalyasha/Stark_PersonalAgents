@@ -147,7 +147,7 @@ def _clean_text(text: str) -> str:
 # â”€â”€ LLM backends â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
-def _call_backend(messages: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None) -> tuple[str, list[dict], list]:
+def _call_backend(messages: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None, cancellation_token: object = None) -> tuple[str, list[dict], list]:
     """One LLM turn on the configured backend.
 
     Returns ``(text, tool_calls, native_msgs)``. ``native_msgs`` is non-empty
@@ -199,6 +199,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
         where=where_tag,
         deps=deps,
         system_prompt=system_prompt,
+        cancellation_token=cancellation_token,
     )
     return str(text or ""), [], new_lc
 
@@ -283,6 +284,18 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
     sess = _open_session(chat_id, task)
 
+    # A8: wire the chat abort flag to a pydantic-ai CancellationToken so a
+    # user abort cancels the in-flight native run cooperatively (RunCancelled).
+    _cancel_token = None
+    _cancel_stop = None
+    try:
+        if chat_id:
+            from llm.native_tools import chat_cancellation_token
+
+            _cancel_token, _cancel_stop = chat_cancellation_token(chat_id)
+    except Exception:
+        _cancel_token = _cancel_stop = None
+
     compaction_policy = get_compaction_policy("general")
     tool_call_log: list[dict] = []
     existing_ids = {m.id for m in messages if getattr(m, "id", None)}
@@ -337,8 +350,15 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                 messages, native_tools, where_tag,
                 system_prompt=_GENERAL_SYSTEM_TEMPLATE,
                 deps=_native_deps(chat_id),
+                cancellation_token=_cancel_token,
             )
         except Exception as e:
+            # A8: user abort -> the native run raised RunCancelled; end cleanly.
+            from pydantic_ai.exceptions import RunCancelled
+            if isinstance(e, RunCancelled) or "RunCancelled" in type(e).__name__:
+                yield "status", f"[{_AGENT_NAME.upper()}] Cancelled by user request."
+                final_text = final_text or "Cancelled by user."
+                break
             _log(f"[{_AGENT_NAME.upper()}] LLM error after all fallbacks: {e}")
             raise
 
@@ -482,6 +502,12 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                     ))
             except Exception:
                 pass
+
+    if _cancel_stop is not None:
+        try:
+            _cancel_stop()
+        except Exception:
+            pass
 
     new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
     yield "messages", new_msgs

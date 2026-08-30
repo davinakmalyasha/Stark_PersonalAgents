@@ -28,23 +28,6 @@ from memory.context_compaction import (
 from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
 
 
-def _execute_one_tool_call(tool_call: dict) -> str:
-    """Thread-pool worker for the parallel read-only batch. Only tools listed in
-    PARALLEL_SAFE reach this path (enforced by run_tool_calls), so it is safe to
-    run concurrently. Returns the raw tool result string; cap/offload happens at
-    the registry boundary (_tool_result_post_hook)."""
-    from tools import execute_tool_detailed
-
-    tool_name = str(tool_call.get("tool", "") or "")
-    tool_args = tool_call.get("args") or {}
-    if not tool_args or not isinstance(tool_args, dict):
-        tool_args = {k: v for k, v in tool_call.items() if k not in ("tool", "args")}
-    try:
-        execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
-        return str(execution.content)
-    except Exception as e:
-        return f"Tool execution error: {e}"
-
 def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
     """Keep a tool result small while preserving a VFS path to the full output."""
     # Lazy import avoids the tools -> AddOnTool -> agents -> developer_agent
@@ -677,6 +660,7 @@ def developer_node(s: ITState) -> dict:
     last_tool_failed = False  # previous turn: a tool errored or command exited non-zero
     last_test_failed = False  # previous turn: a test/verify command failed
     pending_guidance: list[str] = []  # transient next-call steering; never durable history
+    _native_finish = False  # native agent ran the whole task; skip manual loop
 
     while True:
         iteration += 1
@@ -825,6 +809,45 @@ def developer_node(s: ITState) -> dict:
                         capability="coding",
                         prefer_reasoning=bool(_dev_plan.get("think_bias", True)),
                     )
+                elif os.environ.get("PAI_NATIVE_TOOLS") == "1":
+                    # Native agent (Track B): pydantic-ai executes tools
+                    # internally for the WHOLE task; the returned transcript
+                    # slice replaces the manual tool loop below.
+                    from llm.native_tools import run_native_agent
+                    from llm.deps import WorkspaceDeps
+
+                    _native_text, _native_lc, _native_reasoning = run_native_agent(
+                        role="Developer",
+                        messages=run_messages,
+                        tools=native_dev_tools,
+                        temp=0.2,
+                        reasoning_effort=reasoning_effort,
+                        reasoning_budget=reasoning_budget,
+                        where=where_tag,
+                        deps=WorkspaceDeps.from_shared_state(
+                            role="Developer", chat_id=chat_id, project_path=project_path
+                        ),
+                        system_prompt=static_system,
+                    )
+                    # Rebuild the transcript from the native run's new messages.
+                    messages.extend(_native_lc)
+                    response_text = _native_text
+                    native_tool_calls = []
+                    reasoning_content = _native_reasoning
+                    # Track which tools ran via the tool calls in new_lc.
+                    for _m in _native_lc:
+                        if _m.__class__.__name__ == "AIMessage" and getattr(_m, "tool_calls", None):
+                            for _tc in _m.tool_calls:
+                                tool_call_log.append({
+                                    "tool": _tc.get("name", ""),
+                                    "args": _tc.get("args") or {},
+                                    "id": _tc.get("id", ""),
+                                    "iteration": iteration,
+                                    "status": "executed",
+                                    "result_preview": "",
+                                })
+                    # Mark finish: force the loop to the final-report path.
+                    _native_finish = True
                 else:
                     llm_result = invoke_messages_with_fallback_stream(
                         role="Developer",
@@ -908,6 +931,11 @@ def developer_node(s: ITState) -> dict:
                         "args": targs,
                         "id": tc.get("id") or f"dev-call-{iteration}-{call_index}-{uuid.uuid4().hex[:8]}",
                     })
+        if _native_finish:
+            # Native agent already executed tools + verification internally;
+            # the tool_call_log above reflects them. Skip the DONE-gate nudge
+            # (native agent self-verified) and go straight to finish.
+            _log(f"[DEVELOPER] Native agent finished after {iteration} iteration(s)")
         if not tool_calls:
             # Tier0 DONE-gate: if real files were touched but NO verification
             # command ever ran, force one verify turn before finishing.
@@ -920,7 +948,7 @@ def developer_node(s: ITState) -> dict:
                               json.dumps(tc.get("args", {}), default=str), re.IGNORECASE)
                 for tc in tool_call_log
             )
-            if modified_any and not ran_verification and not verification_nudged:
+            if not _native_finish and modified_any and not ran_verification and not verification_nudged:
                 verification_nudged = True
                 _log("[DEVELOPER] Verification nudge — files were modified but no test/check ran. Forcing one verify turn.")
                 messages.append(HumanMessage(

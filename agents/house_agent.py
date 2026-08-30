@@ -34,6 +34,7 @@ from tools import (
     get_registry,
 )
 from llm import invoke_messages_with_fallback_stream
+from llm.native_conv import normalize_calls
 from llm.loop_detector import LoopGuard
 from memory.context_compaction import (
     compact_history,
@@ -43,6 +44,13 @@ from agents.house_prompt import _HOUSE_SYSTEM_TEMPLATE
 
 _GENERAL_MODEL = "deepseek:v4-flash"
 _AGENT_NAME = "House"
+
+
+def _native_deps(chat_id: str):
+    """Build the typed WorkspaceDeps for this run (lazy import, cheap)."""
+    from llm.deps import WorkspaceDeps
+
+    return WorkspaceDeps.from_shared_state(role=_AGENT_NAME, chat_id=chat_id)
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
@@ -107,31 +115,11 @@ def _clean_text(text: str) -> str:
 # ── LLM backend ──────────────────────────────────────────────────────────────
 
 
-def _normalize_calls(raw_calls) -> list[dict]:
-    calls: list[dict] = []
-    for index, tc in enumerate(raw_calls or []):
-        if not isinstance(tc, dict):
-            continue
-        name = tc.get("tool") or tc.get("name", "")
-        args = tc.get("args") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except Exception:
-                continue
-        if name and isinstance(args, dict):
-            calls.append(
-                {
-                    "tool": name,
-                    "args": args,
-                    "id": tc.get("id") or f"house-{index + 1}",
-                }
-            )
-    return calls
-
-
-def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> tuple[str, list[dict]]:
-    """One LLM turn. Returns ``(text, tool_calls)``. Raises on total failure.
+def _call_backend(messages: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None) -> tuple[str, list[dict], list]:
+    """One LLM turn. Returns ``(text, tool_calls, native_msgs)``. ``native_msgs``
+    is non-empty when the native agent ran the full turn (tools executed
+    internally); the caller appends them instead of executing tool_calls.
+    Raises on total failure.
 
     Backend resolution follows the active provider mode's workspace-tier plan
     (free pool or the paid gateway path); REASONING_SUBAGENT_ROUTINE env still
@@ -155,7 +143,26 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> t
             capability="text",
             prefer_reasoning=bool(plan.get("think_bias", True)),
         )
-        return text, calls
+        return text, calls, []
+
+    # Native agent (Track B): pydantic-ai executes tools internally.
+    if os.environ.get("PAI_NATIVE_TOOLS") == "1":
+        from llm.native_tools import run_native_agent
+
+        text, new_lc, reasoning = run_native_agent(
+            role=_AGENT_NAME,
+            messages=list(messages),
+            tools=native_tools,
+            temp=0.2,
+            reasoning_effort=(
+                os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
+                or str(plan.get("iter_effort") or "disabled")
+            ),
+            where=where_tag,
+            deps=deps,
+            system_prompt=system_prompt,
+        )
+        return str(text or ""), [], new_lc
 
     res = invoke_messages_with_fallback_stream(
         role=_AGENT_NAME,
@@ -184,7 +191,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> t
     else:
         response_text = str(res)
 
-    return str(response_text or ""), _normalize_calls(native_tool_calls)
+    return str(response_text or ""), normalize_calls(native_tool_calls, id_prefix="house"), []
 
 
 def _house_execute_one(tool_call: dict) -> str:
@@ -295,10 +302,20 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
         )
 
         try:
-            response_text, tool_calls = _call_backend(messages, native_tools, where_tag)
+            response_text, tool_calls, native_msgs = _call_backend(
+                messages, native_tools, where_tag,
+                system_prompt=_HOUSE_SYSTEM_TEMPLATE,
+                deps=_native_deps(chat_id),
+            )
         except Exception as e:
             _log(f"[{_AGENT_NAME.upper()}] LLM error after all fallbacks: {e}")
             raise
+
+        # Native agent ran the whole turn (tools executed internally).
+        if native_msgs:
+            messages.extend(native_msgs)
+            final_text = _clean_text(response_text)
+            break
 
         if not response_text.strip() and not tool_calls:
             messages.append(HumanMessage(

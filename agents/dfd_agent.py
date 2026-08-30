@@ -39,6 +39,7 @@ from tools import (
     get_registry,
 )
 from llm import invoke_messages_with_fallback_stream
+from llm.native_conv import normalize_calls
 from llm.loop_detector import LoopGuard
 from memory.context_compaction import (
     compact_history,
@@ -48,6 +49,13 @@ from agents.dfd_prompt import _DFD_SYSTEM_TEMPLATE
 
 _DFD_MODEL = "deepseek:v4-flash"
 _AGENT_NAME = "DFD"
+
+
+def _native_deps(chat_id: str):
+    """Build the typed WorkspaceDeps for this run (lazy import, cheap)."""
+    from llm.deps import WorkspaceDeps
+
+    return WorkspaceDeps.from_shared_state(role=_AGENT_NAME, chat_id=chat_id)
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
@@ -92,72 +100,11 @@ def _clean_text(text: str) -> str:
 # ── LLM backends ────────────────────────────────────────────────────────────
 
 
-def _lc_to_native(messages: list) -> list[dict]:
-    """LangChain transcript -> OpenAI-native dicts (free-provider transport)."""
-    out: list[dict] = []
-    for m in messages:
-        kind = type(m).__name__
-        content = getattr(m, "content", "")
-        if kind == "SystemMessage":
-            out.append({"role": "system", "content": content})
-        elif kind == "HumanMessage":
-            out.append({"role": "user", "content": content})
-        elif kind == "AIMessage":
-            entry: dict = {"role": "assistant", "content": content or ""}
-            tcs = getattr(m, "tool_calls", None) or []
-            if tcs:
-                entry["tool_calls"] = [
-                    {
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name") or tc.get("tool", ""),
-                            "arguments": json.dumps(
-                                tc.get("args") or {}, separators=(",", ":")
-                            ),
-                        },
-                    }
-                    for tc in tcs
-                    if isinstance(tc, dict)
-                ]
-            out.append(entry)
-        elif kind == "ToolMessage":
-            out.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
-                    "name": getattr(m, "name", "") or "",
-                    "content": str(content),
-                }
-            )
-    return out
-
-
-def _normalize_calls(raw_calls) -> list[dict]:
-    calls: list[dict] = []
-    for index, tc in enumerate(raw_calls or []):
-        if not isinstance(tc, dict):
-            continue
-        name = tc.get("tool") or tc.get("name", "")
-        args = tc.get("args") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except Exception:
-                continue
-        if name and isinstance(args, dict):
-            calls.append(
-                {
-                    "tool": name,
-                    "args": args,
-                    "id": tc.get("id") or f"dfd-{index + 1}",
-                }
-            )
-    return calls
-
-
-def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> tuple[str, list[dict]]:
+def _call_backend(messages: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None) -> tuple[str, list[dict], list]:
     """One LLM turn on the configured backend.
+
+    Returns ``(text, tool_calls, native_msgs)``. ``native_msgs`` is non-empty
+    when the native agent ran the full turn (tools executed internally).
 
     Backend resolution: DFD_MODEL_BACKEND env wins; otherwise the active
     provider mode's workspace-tier plan decides (see llm/provider_modes.py).
@@ -184,12 +131,28 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> t
             capability="text",
             prefer_reasoning=bool(plan.get("think_bias", True)),
         )
-        return reply, calls
+        return reply, calls, []
 
     # Paid path (direct DeepSeek / OpenCode Go / Command Code gateway).
     effort_override = os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
     if not effort_override:
         effort_override = str(plan.get("iter_effort") or "disabled")
+
+    # Native agent (Track B): pydantic-ai executes tools internally.
+    if os.environ.get("PAI_NATIVE_TOOLS") == "1":
+        from llm.native_tools import run_native_agent
+
+        text, new_lc, reasoning = run_native_agent(
+            role=_AGENT_NAME,
+            messages=list(messages),
+            tools=native_tools,
+            temp=0.2,
+            reasoning_effort=effort_override,
+            where=where_tag,
+            deps=deps,
+            system_prompt=system_prompt,
+        )
+        return str(text or ""), [], new_lc
 
     res = invoke_messages_with_fallback_stream(
         role=_AGENT_NAME,
@@ -215,7 +178,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> t
     else:
         response_text = str(res)
 
-    return str(response_text or ""), _normalize_calls(native_tool_calls)
+    return str(response_text or ""), normalize_calls(native_tool_calls, id_prefix="dfd"), []
 
 
 # ── Session log (best-effort) ───────────────────────────────────────────────
@@ -339,10 +302,20 @@ def _dfd_events(task: str, chat_id: str = "", images: list | None = None):
         )
 
         try:
-            response_text, tool_calls = _call_backend(messages, native_tools, where_tag)
+            response_text, tool_calls, native_msgs = _call_backend(
+                messages, native_tools, where_tag,
+                system_prompt=_DFD_SYSTEM_TEMPLATE,
+                deps=_native_deps(chat_id),
+            )
         except Exception as e:
             _log(f"[DFD] LLM error after all fallbacks: {e}")
             raise
+
+        # Native agent ran the whole turn (tools executed internally).
+        if native_msgs:
+            messages.extend(native_msgs)
+            final_text = _clean_text(response_text)
+            break
 
         if not response_text.strip() and not tool_calls:
             messages.append(HumanMessage(

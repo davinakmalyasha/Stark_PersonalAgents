@@ -33,7 +33,21 @@ from llm.deps import WorkspaceDeps
 def _tool_map() -> dict[str, Any]:
     """Map tool name -> implementation callable (lazy, avoids import cycle)."""
     import tools as _facade
-    return dict(_facade.TOOL_MAP.items()) if hasattr(_facade, "TOOL_MAP") else {}
+    out: dict[str, Any] = {}
+    if hasattr(_facade, "TOOL_MAP"):
+        try:
+            out.update(dict(_facade.TOOL_MAP.items()))
+        except Exception:
+            pass
+    # LazyToolMap.items() only covers registered names; pick up module attrs
+    # too (test/external tools defined directly on the facade).
+    for name in dir(_facade):
+        if name.startswith("_") or name in out:
+            continue
+        attr = getattr(_facade, name)
+        if callable(attr):
+            out[name] = attr
+    return out
 
 
 def _schemas_by_name() -> dict[str, dict]:
@@ -81,7 +95,7 @@ def _before_tool_execute(
     return dict(args or {})
 
 
-def _wrap_tool_execute(
+async def _wrap_tool_execute(
     ctx: RunContext[WorkspaceDeps],
     *,
     call: ToolCallPart,
@@ -97,7 +111,7 @@ def _wrap_tool_execute(
             return cached
     except Exception:
         pass
-    return handler(args)
+    return await handler(args)
 
 
 def _after_tool_execute(
@@ -146,6 +160,8 @@ def build_agent(
     tools: Optional[list[dict]] = None,
     deps: Optional[WorkspaceDeps] = None,
     output_type: Optional[type] = None,
+    system_prompt: str = "",
+    extra_capabilities: Optional[list] = None,
 ) -> Agent:
     """Build a pydantic-ai Agent for one role from preserved schemas.
 
@@ -180,6 +196,7 @@ def build_agent(
             params = fn.get("parameters") or {"type": "object", "properties": {}}
         if not description:
             description = fn.get("description", "")
+
 
         try:
             sig = inspect.signature(impl)
@@ -238,6 +255,7 @@ def build_agent(
             )
         else:
             def _plain(**kw):
+
                 _validate(**kw)
                 return impl(**kw)
 
@@ -251,7 +269,21 @@ def build_agent(
             )
 
     # Scope via FilteredToolset (native replacement for restrict_scope).
-    allowed = deps.allowed_tools or _allowed_for(role)
+    # The caller already pre-scopes via get_native_tools(role); the registry
+    # allowlist is a SECOND gate. A tool runs only if it's in BOTH the passed
+    # tools and the scope allowlist. When the intersection is empty (unknown
+    # role / external/test tool not in registry), fall back to the passed
+    # tool names so nothing is hidden.
+    passed_names = set()
+    for t in (tools or []):
+        fn = t.get("function", t) if isinstance(t, dict) else t
+        n = fn.get("name", "") if isinstance(fn, dict) else ""
+        if n:
+            passed_names.add(n)
+    scope_allowed = set(deps.allowed_tools or _allowed_for(role))
+    allowed = scope_allowed & passed_names if scope_allowed else set()
+    if not allowed and passed_names:
+        allowed = passed_names
     function_toolset = FunctionToolset(tool_objs, max_retries=3)
     if allowed:
         toolset = FilteredToolset(
@@ -266,18 +298,171 @@ def build_agent(
         tool_execute=_wrap_tool_execute,
         after_tool_execute=_after_tool_execute,
     )
+    capabilities: list = [hooks]
+    if extra_capabilities:
+        capabilities.extend(extra_capabilities)
 
     kwargs: dict[str, Any] = {}
     if output_type is not None:
         kwargs["output_type"] = output_type
+    if system_prompt:
+        kwargs["system_prompt"] = system_prompt
     agent = Agent(
         model=model,
         toolsets=[toolset],
-        capabilities=[hooks],
+        capabilities=capabilities,
         deps_type=WorkspaceDeps,
         **kwargs,
     )
     return agent
+
+
+def run_native_agent(
+    role: str,
+    messages: list,
+    tools: Optional[list[dict]] = None,
+    model: Any = None,
+    temp: float = 0.2,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+    where: Optional[str] = None,
+    deps: Optional[WorkspaceDeps] = None,
+    system_prompt: str = "",
+    stream_emit: bool = True,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[str, list, Optional[str]]:
+    """Run a full pydantic-ai Agent turn with REAL tool execution.
+
+    The agent executes tools internally (parallel by default, retry on invalid
+    args). Returns ``(text, new_lc_messages, reasoning)`` where
+    ``new_lc_messages`` is the LangChain conversation slice added by this run
+    (assistant text/tool-calls + tool results) so the caller's loop can keep
+    its history/compaction/session machinery.
+
+    ``model`` may be an OpenAIChatModel instance (provider already resolved)
+    or None (resolved from deps like pai_native_turn).
+    """
+    from pydantic_ai import Agent
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+    from llm.pai_transport import _resolve_provider_cfg, _model_name, _emit_stream
+    from llm.pai_transport import _build_model_settings, _model_profile_for
+
+    deps = deps or WorkspaceDeps.from_shared_state(role=role)
+
+    if model is None:
+        cfg = deps.llm_provider or _resolve_provider_cfg()
+        base_url = base_url or str(cfg.get("base") or "")
+        api_key = api_key or str(cfg.get("key") or "")
+        model_id = _model_name("deepseek:v4-flash")
+        settings = _build_model_settings(role, model_id, temp, reasoning_effort, reasoning_budget)
+        profile = _model_profile_for(model_id)
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+        provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+        if profile:
+            model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings, profile=profile)
+        else:
+            model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
+
+    agent = build_agent(role=role, model=model, tools=tools, deps=deps, system_prompt=system_prompt)
+
+    # Convert LangChain transcript -> pydantic-ai history (reuse transport).
+    from llm.pai_transport import _lc_messages_to_pai, _split_user_prompt
+    full = _lc_messages_to_pai(messages)
+    # Keep the FULL history for the model; the prompt is embedded in system_prompt.
+    from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart
+    # Drop the trailing UserPromptPart we'd otherwise re-add: pydantic-ai needs
+    # a user prompt; pull the first one out like the transport does.
+    user_prompt, history = _split_user_prompt(full)
+
+    events_log: list[dict] = []
+
+    def _on_event(ctx, event):
+        from pydantic_ai.messages import (
+            PartStartEvent, PartDeltaEvent, TextPart, ThinkingPart,
+            TextPartDelta, ThinkingPartDelta,
+        )
+        try:
+            if isinstance(event, PartStartEvent):
+                if isinstance(event.part, ThinkingPart):
+                    c = event.part.content or ""
+                    if c:
+                        events_log.append({"kind": "reasoning", "text": c})
+                        if stream_emit:
+                            _emit_stream(role, "reasoning", c, where or "")
+                elif isinstance(event.part, TextPart):
+                    c = event.part.content or ""
+                    if c:
+                        events_log.append({"kind": "text", "text": c})
+                        if stream_emit:
+                            _emit_stream(role, "text", c, where or "")
+            elif isinstance(event, PartDeltaEvent):
+                d = event.delta
+                if isinstance(d, TextPartDelta):
+                    c = d.content_delta or ""
+                    if c:
+                        events_log.append({"kind": "text", "text": c})
+                        if stream_emit:
+                            _emit_stream(role, "text", c, where or "")
+                elif isinstance(d, ThinkingPartDelta):
+                    c = d.content_delta or ""
+                    if c:
+                        events_log.append({"kind": "reasoning", "text": c})
+                        if stream_emit:
+                            _emit_stream(role, "reasoning", c, where or "")
+        except Exception:
+            pass
+        return event
+
+    hooks = Hooks(event=_on_event)
+    agent = build_agent(
+        role=role,
+        model=model,
+        tools=tools,
+        deps=deps,
+        system_prompt=system_prompt,
+        extra_capabilities=[hooks],
+    )
+
+    import asyncio
+    from llm.native_tools import DEFAULT_USAGE_LIMITS
+    from pydantic_ai.messages import ModelResponse
+
+    async def _run():
+        # Use run_stream (streaming wire) like the transport — gateways expect
+        # stream=true for tool-calling; drain responses via stream_response.
+        async with agent.run_stream(
+            user_prompt,
+            message_history=history,
+            deps=deps,
+            usage_limits=DEFAULT_USAGE_LIMITS,
+        ) as sres:
+            async for _resp in sres.stream_response(debounce_by=None):
+                pass
+            return sres
+
+    sres = asyncio.run(_run())
+    result = sres
+    all_msgs = list(result.all_messages())
+    text = "".join(
+        p.content
+        for m in all_msgs
+        if isinstance(m, ModelResponse)
+        for p in m.parts
+        if getattr(p, "part_kind", "") == "text"
+    ).strip()
+    if not text:
+        # Fall back to the run result output.
+        text = str(result.output if isinstance(result.output, str) else (result.output or ""))
+    reasoning = "".join(
+        e["text"] for e in events_log if e["kind"] == "reasoning"
+    ).strip() or None
+
+    # Reverse-convert the pydantic-ai messages this run added -> LangChain.
+    from llm.pai_transport import _pai_to_lc
+    new_lc = _pai_to_lc(all_msgs, history)
+    return text, new_lc, reasoning
 
 
 DEFAULT_USAGE_LIMITS = UsageLimits(request_limit=200, tool_calls_limit=200)

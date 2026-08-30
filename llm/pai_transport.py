@@ -323,6 +323,63 @@ def _split_user_prompt(history: list[ModelMessage]) -> tuple[Any, list[ModelMess
     return "", history
 
 
+def _pai_to_lc(all_messages: list, prior: list) -> list:
+    """Convert the pydantic-ai messages ADDED by a run back to LangChain.
+
+    ``prior`` is the history we passed in; everything after it in
+    ``all_messages`` is new (assistant text/tool-calls + tool results).
+    Returns LangChain messages (AIMessage with tool_calls, ToolMessage).
+    """
+    from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
+
+    prior_ids = {id(m) for m in prior}
+    added = [m for m in all_messages if id(m) not in prior_ids]
+    out: list = []
+    for m in added:
+        if isinstance(m, ModelResponse):
+            text_parts = []
+            reasoning = ""
+            calls = []
+            for p in m.parts:
+                kind = getattr(p, "part_kind", "")
+                if kind == "text":
+                    text_parts.append(str(p.content))
+                elif kind == "thinking":
+                    reasoning += str(p.content or "")
+                elif kind == "tool-call":
+                    args = p.args
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args or "{}")
+                        except Exception:
+                            args = {}
+                    calls.append(
+                        {
+                            "name": p.tool_name,
+                            "args": args if isinstance(args, dict) else {},
+                            "id": getattr(p, "tool_call_id", "") or "",
+                        }
+                    )
+            kwargs: dict = {}
+            if calls:
+                kwargs["tool_calls"] = calls
+            if reasoning:
+                kwargs["additional_kwargs"] = {"reasoning_content": reasoning}
+            out.append(AIMessage(content="".join(text_parts), **kwargs))
+        elif isinstance(m, ModelRequest):
+            for p in m.parts:
+                from pydantic_ai.messages import ToolReturnPart
+                if isinstance(p, ToolReturnPart):
+                    out.append(
+                        ToolMessage(
+                            content=str(p.content),
+                            name=str(p.tool_name or ""),
+                            tool_call_id=str(p.tool_call_id or ""),
+                        )
+                    )
+    return out
+
+
 def _result_to_native(
     parts: list,
     response: ModelResponse,

@@ -112,6 +112,8 @@ def abort(chat_id: str, keep_inbox: bool = True) -> None:
     """Request cancellation of the current turn.
 
     ``keep_inbox=True`` preserves queued steering/follow-up for a later turn.
+    Also cancels any registered pydantic-ai CancellationToken (P1-2) for
+    immediate delivery.
     """
     ib = _inbox(chat_id)
     with ib.lock:
@@ -119,6 +121,13 @@ def abort(chat_id: str, keep_inbox: bool = True) -> None:
         if not keep_inbox:
             ib.steering.clear()
             ib.follow_up.clear()
+    # P1-2: immediate token cancel (no 0.25s poll latency)
+    try:
+        from llm.cancellation import cancel as _cancel_token
+
+        _cancel_token(chat_id)
+    except Exception:
+        pass
 
 
 def consume_abort(chat_id: str) -> bool:

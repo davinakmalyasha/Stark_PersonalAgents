@@ -132,33 +132,36 @@ def _build_model_settings(
     reasoning_effort: str | None,
     reasoning_budget: int | None,
 ) -> dict:
-    """Build OpenAIChatModel settings mirroring llm.py:_get_deepseek_client thinking logic."""
-    settings: dict[str, Any] = {"temperature": temp}
-    extra_body: dict | None = None
-    effort: str | None = None
+    """Build portable ModelSettings — uses `thinking` not hand-rolled extra_body.
 
-    # Explicit caller intent
+    Unified `thinking` (ThinkingLevel) maps automatically to provider fields
+    (openai_reasoning_effort / anthropic_thinking / google_thinking). Budget
+    tokens are forwarded via extra_body only when explicitly requested. The
+    legacy _THINKING_PINS prefix-cache freeze is removed — portable thinking
+    eliminates the enabled<->disabled flip that busted the cache.
+    """
+    settings: dict[str, Any] = {"temperature": temp, "parallel_tool_calls": True}
+    thinking: Any = None
+
     if reasoning_effort is not None:
         e = str(reasoning_effort).strip().lower()
         if e in ("disabled", "none", ""):
-            extra_body = {"thinking": {"type": "disabled"}}
-            effort = None
-        else:
-            budget_override = reasoning_budget
-            if e == "max":
-                e = "high"
-                if budget_override is None:
-                    try:
-                        budget_override = int(os.getenv("REASONING_MAX_BUDGET", "32768"))
-                    except Exception:
-                        budget_override = 32768
-            extra_body = {"thinking": {"type": "enabled"}}
-            effort = e
-            if budget_override is not None:
+            thinking = False
+        elif e == "max":
+            thinking = "high"
+            if reasoning_budget is None:
                 try:
-                    extra_body["thinking"]["budget_tokens"] = int(budget_override)
+                    reasoning_budget = int(os.getenv("REASONING_MAX_BUDGET", "32768"))
                 except Exception:
-                    pass
+                    reasoning_budget = 32768
+        elif e in ("minimal", "low", "medium", "high", "xhigh"):
+            thinking = e
+        elif e in ("true", "1", "enabled"):
+            thinking = True
+        elif e == "false" or e == "0":
+            thinking = False
+        else:
+            thinking = "high"
     elif _is_reasoning_model(model):
         is_orchestrator = (
             role in ["Developer", "DeveloperFixing"]
@@ -168,52 +171,29 @@ def _build_model_settings(
             role in ["Supervisor", "sa", "Coder"]
             or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"]))
         )
-        if is_orchestrator or is_heavy:
-            extra_body = {"thinking": {"type": "enabled"}}
-            effort = "high"
-        else:
-            extra_body = {"thinking": {"type": "disabled"}}
+        thinking = "high" if (is_orchestrator or is_heavy) else False
+    else:
+        thinking = False
 
-    # Prefix-cache pin (same global as llm.py)
-    if extra_body is not None:
+    # Only set thinking when we have a decision; omit to leave provider default.
+    if thinking is not None:
+        settings["thinking"] = thinking  # type: ignore[typeddict-item]
+
+    # Budget override — forwarded as extra_body only when explicitly set.
+    if reasoning_budget is not None:
         try:
-            from llm.llm import _THINKING_PINS, _THINKING_PINS_LOCK  # type: ignore
-            pin_key = (role or "", model or "")
-            with _THINKING_PINS_LOCK:
-                if pin_key not in _THINKING_PINS:
-                    _THINKING_PINS[pin_key] = dict(extra_body or {})
-                else:
-                    pinned = _THINKING_PINS[pin_key]
-                    if pinned:
-                        extra_body = dict(pinned)
-                    cur = dict(extra_body or {})
-                    # handle type mismatch same as llm.py
-                    try:
-                        thinking_type = (cur.get("thinking") or {}).get("type")
-                        pinned_type = (pinned.get("thinking") or {}).get("type")
-                        if thinking_type is not None and pinned_type is not None and thinking_type != pinned_type:
-                            extra_body = dict(pinned)
-                        elif pinned.get("thinking") and cur.get("thinking"):
-                            merged = dict(cur)
-                            merged["thinking"] = dict(pinned["thinking"])
-                            extra_body = merged
-                    except Exception:
-                        pass
-                    # keep effort consistent with pinned type: if pinned disabled, drop effort
-                    try:
-                        pinned_type = (extra_body.get("thinking") or {}).get("type") if isinstance(extra_body, dict) else None
-                        if pinned_type == "disabled":
-                            effort = None
-                    except Exception:
-                        pass
+            settings["extra_body"] = {"thinking": {"budget_tokens": int(reasoning_budget)}}
         except Exception:
             pass
 
-    if extra_body is not None:
-        settings["extra_body"] = extra_body
-    if effort is not None:
-        # pydantic-ai OpenAI field
-        settings["openai_reasoning_effort"] = effort
+    # Keep openai_reasoning_effort for gateways that still require it alongside thinking.
+    if isinstance(thinking, str) and thinking not in (False,):
+        # ThinkingLevel string doubles as OpenAI reasoning_effort for compat.
+        try:
+            if thinking in ("minimal", "low", "medium", "high", "xhigh"):
+                settings["openai_reasoning_effort"] = thinking
+        except Exception:
+            pass
     return settings
 
 
@@ -618,55 +598,101 @@ async def apai_native_turn(
     if native_agent:
         with agent.override(model=llm):
             if stream_emit:
-                # Native agent: live stream via snapshot diffing (P1).
-                async def _run():
-                    from llm.native_tools import DEFAULT_USAGE_LIMITS
+                from pydantic_ai.capabilities.hooks import Hooks
+                from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPart, ThinkingPart, TextPartDelta, ThinkingPartDelta
+
+                _evt_acc: list[dict] = []
+
+                def _on_event(ctx, event):
+                    try:
+                        if isinstance(event, PartStartEvent):
+                            if isinstance(event.part, ThinkingPart):
+                                c = event.part.content or ""
+                                if c:
+                                    _evt_acc.append({"kind": "reasoning", "text": c})
+                                    _emit_stream(role, "reasoning", c, where or "")
+                            elif isinstance(event.part, TextPart):
+                                c = event.part.content or ""
+                                if c:
+                                    _evt_acc.append({"kind": "text", "text": c})
+                                    _emit_stream(role, "text", c, where or "")
+                        elif isinstance(event, PartDeltaEvent):
+                            d = event.delta
+                            if isinstance(d, TextPartDelta):
+                                c = d.content_delta or ""
+                                if c:
+                                    _evt_acc.append({"kind": "text", "text": c})
+                                    _emit_stream(role, "text", c, where or "")
+                            elif isinstance(d, ThinkingPartDelta):
+                                c = d.content_delta or ""
+                                if c:
+                                    _evt_acc.append({"kind": "reasoning", "text": c})
+                                    _emit_stream(role, "reasoning", c, where or "")
+                    except Exception:
+                        pass
+                    return event
+
+                _hooks = Hooks(event=_on_event)
+                from llm.native_tools import DEFAULT_USAGE_LIMITS
+
+                use_iter = os.getenv("PAI_USE_ITER", "1") != "0"
+                resp = None
+                usage = None
+                if use_iter:
+                    try:
+                        from pydantic_ai.messages import ModelResponse as _MR2
+
+                        async with agent.iter(
+                            user_prompt,
+                            message_history=msg_history,
+                            deps=deps or WorkspaceDeps.from_shared_state(role=role),
+                            usage_limits=DEFAULT_USAGE_LIMITS,
+                            cancellation_token=cancellation_token,
+                            capabilities=[_hooks],
+                        ) as run:
+                            async for _node in run:
+                                pass
+                            _res = run.result
+                            usage = getattr(_res, "usage", None)
+                            # Find last ModelResponse in all_messages for extraction
+                            try:
+                                _all = list(_res.all_messages())
+                                for _m in reversed(_all):
+                                    if isinstance(_m, _MR2):
+                                        resp = _m
+                                        break
+                                if resp is None and _all:
+                                    # Fallback: construct from output if no ModelResponse
+                                    resp = _all[-1] if isinstance(_all[-1], _MR2) else None
+                            except Exception:
+                                resp = None
+                    except Exception as _iter_err:
+                        try:
+                            from llm.llm import log_terminal
+
+                            log_terminal(f"[apai_native_turn] iter fallback: {_iter_err}")
+                        except Exception:
+                            pass
+                        resp = None
+                if resp is None:
                     async with agent.run_stream(
                         user_prompt,
                         message_history=msg_history,
                         usage_limits=DEFAULT_USAGE_LIMITS,
                         deps=deps or WorkspaceDeps.from_shared_state(role=role),
                         cancellation_token=cancellation_token,
+                        capabilities=[_hooks],
                     ) as sres:
-                        text_acc: list[str] = []
-                        reasoning_acc: list[str] = []
-                        prev_text = ""
-                        prev_reasoning = ""
-                        async for resp in sres.stream_response(debounce_by=None):
-                            cur_text = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "text")
-                            cur_reasoning = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "thinking")
-                            if len(cur_reasoning) > len(prev_reasoning):
-                                delta = cur_reasoning[len(prev_reasoning):]
-                                reasoning_acc.append(delta)
-                                _emit_stream(role, "reasoning", delta, where or "")
-                                prev_reasoning = cur_reasoning
-                            if len(cur_text) > len(prev_text):
-                                delta = cur_text[len(prev_text):]
-                                text_acc.append(delta)
-                                _emit_stream(role, "text", delta, where or "")
-                                prev_text = cur_text
-                        return sres, text_acc, reasoning_acc
-
-                sres, text_acc, reasoning_acc = await _run()
-                reasoning = "".join(reasoning_acc).strip() or None
-                text = "".join(text_acc).strip()
-                try:
-                    resp = sres.response
-                    final_text = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "text").strip()
-                    final_reasoning = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "thinking").strip() or None
-                    if final_text and len(final_text) > len(text):
-                        _emit_stream(role, "text", final_text[len(text):], where or "")
-                        text = final_text
-                    if final_reasoning and not reasoning:
-                        reasoning = final_reasoning
-                        _emit_stream(role, "reasoning", reasoning, where or "")
-                    elif final_reasoning and reasoning and len(final_reasoning) > len(reasoning):
-                        _emit_stream(role, "reasoning", final_reasoning[len(reasoning):], where or "")
-                        reasoning = final_reasoning
-                except Exception:
-                    resp = sres.response
-                usage = sres.usage
-                resp = sres.response
+                        async for _ in sres.stream_response(debounce_by=None):
+                            pass
+                        resp = sres.response
+                        usage = sres.usage
+                text = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "text").strip()
+                reasoning = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "thinking").strip() or None
+                if not text:
+                    text = "".join(e["text"] for e in _evt_acc if e["kind"] == "text").strip()
+                if not reasoning:
+                    reasoning = "".join(e["text"] for e in _evt_acc if e["kind"] == "reasoning").strip() or None
                 call_parts: list[dict] = []
                 for part in resp.parts:
                     if getattr(part, "part_kind", "") == "tool-call":

@@ -20,6 +20,8 @@ import inspect
 import os
 from typing import Any, Optional
 
+from decimal import Decimal
+
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities.hooks import Hooks
 from pydantic_ai.messages import ToolCallPart
@@ -28,6 +30,20 @@ from pydantic_ai.toolsets import FilteredToolset, FunctionToolset
 from pydantic_ai.usage import UsageLimits
 
 from llm.deps import WorkspaceDeps
+
+# P1-3: native concurrency limiter (replaces hot-spin ConcurrencyThrottle for agents)
+try:
+    from pydantic_ai.concurrency import ConcurrencyLimiter
+
+    _max = int(os.getenv("PAI_MAX_CONCURRENCY", "4"))
+    _queued = os.getenv("PAI_MAX_QUEUED", "20")
+    try:
+        _queued_v = int(_queued) if _queued.strip() not in ("", "none", "None") else None
+    except Exception:
+        _queued_v = 20
+    _NATIVE_LIMITER = ConcurrencyLimiter(max_running=max(1, _max), max_queued=_queued_v, name="native-agent-pool")
+except Exception:
+    _NATIVE_LIMITER = None  # type: ignore
 
 
 def _tool_map() -> dict[str, Any]:
@@ -104,15 +120,33 @@ async def _wrap_tool_execute(
     args: dict,
     handler: Any,
 ) -> Any:
-    """Cache hit short-circuit: return cached result without calling the tool."""
+    """Cache hit via SkipToolExecution + error-as-ToolFailed mapping (P0-4)."""
+    from pydantic_ai.exceptions import SkipToolExecution, ToolFailed
+
     try:
         from tools import _check_tool_cache
+
         cached = _check_tool_cache(call.tool_name, dict(args or {}))
         if cached is not None:
-            return cached
+            raise SkipToolExecution(result=cached)
+    except SkipToolExecution:
+        raise
     except Exception:
         pass
-    return await handler(args)
+    result = await handler(args)
+    # Map legacy "Error..." strings to ToolFailed so the model sees is_error=True
+    # and retry budget is not consumed (terminal failure).
+    try:
+        text = result if isinstance(result, str) else str(result or "")
+        if text.startswith("Error") or text.startswith("[Error") or "Traceback" in text[:500]:
+            # Only for deterministic tool failures, not model retryable args errors
+            # (those are already ModelRetry via args_validator).
+            raise ToolFailed(text)
+    except ToolFailed:
+        raise
+    except Exception:
+        pass
+    return result
 
 
 def _after_tool_execute(
@@ -151,6 +185,75 @@ def _after_tool_execute(
         except Exception:
             pass
     return text
+
+
+def _prepare_tools(ctx: RunContext[WorkspaceDeps], tool_defs: list) -> list:
+    """P0-5: native prepare_tools — hide write tools in plan mode before model sees them."""
+    try:
+        from tools.chat_mode import get_mode
+
+        chat_id = str(getattr(ctx.deps, "chat_id", "") or "")
+        if chat_id and get_mode(chat_id) == "plan":
+            from tools.plan_mode_guard import WRITE_CLASS_TOOLS
+
+            filtered = [td for td in tool_defs if getattr(td, "name", "") not in WRITE_CLASS_TOOLS]
+            return filtered
+    except Exception:
+        pass
+    return tool_defs
+
+
+def _before_tool_validate(
+    ctx: RunContext[WorkspaceDeps],
+    *,
+    call: ToolCallPart,
+    tool_def: Any,
+    args: Any,
+) -> Any:
+    """P0-5: veto earlier than before_tool_execute — at validation stage. P2-3: ApprovalRequired when PAI_DEFERRED=1."""
+    try:
+        from tools.plan_mode_guard import plan_mode_guard
+
+        _args_dict = dict(args) if isinstance(args, dict) else {}
+        reason = plan_mode_guard(
+            {"name": call.tool_name, "args": _args_dict, "scope": ctx.deps.role, "deps": ctx.deps}
+        )
+        if reason:
+            if os.getenv("PAI_DEFERRED", "0") == "1":
+                try:
+                    from pydantic_ai.exceptions import ApprovalRequired
+
+                    raise ApprovalRequired(metadata={"reason": reason, "tool": call.tool_name, "chat_id": getattr(ctx.deps, "chat_id", "")})
+                except Exception:
+                    pass
+            from pydantic_ai.tools import ToolDenied
+
+            raise ToolDenied(reason)
+    except Exception as e:
+        if e.__class__.__name__ in ("ToolDenied", "ApprovalRequired"):
+            raise
+    return args
+
+
+def _on_model_request_error(ctx: RunContext[WorkspaceDeps], *, request_context: Any, error: Exception) -> Any:
+    """P0-5: surface 429/retry_after for logging; let tenacity/HTTPX handle retry."""
+    try:
+        from llm.llm import _is_retryable_http_error, _parse_retry_after
+
+        err_str = str(error) or str(getattr(error, "body", "") or "")
+        if _is_retryable_http_error(err_str):
+            retry_after = _parse_retry_after(err_str)
+            # Log for observability; actual backoff is in provider transport (P1-3).
+            try:
+                from llm.llm import log_terminal
+
+                log_terminal(f"[model_request_error:{ctx.deps.role}] retryable={err_str[:200]} retry_after={retry_after}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Returning None lets the framework propagate the error (no recovery).
+    return None
 
 
 # ── Agent builder ────────────────────────────────────────────────────────────
@@ -286,7 +389,6 @@ def build_agent(
                 json_schema=params,
                 args_validator=_validate,
             )
-            _tool.prepare = _plan_mode_prepare
             tool_objs.append(_tool)
         else:
             def _plain(**kw):
@@ -299,7 +401,6 @@ def build_agent(
                 json_schema=params,
                 args_validator=_validate,
             )
-            _tool.prepare = _plan_mode_prepare
             tool_objs.append(_tool)
 
     # Scope via FilteredToolset (native replacement for restrict_scope).
@@ -318,7 +419,9 @@ def build_agent(
     allowed = scope_allowed & passed_names if scope_allowed else set()
     if not allowed and passed_names:
         allowed = passed_names
-    function_toolset = FunctionToolset(tool_objs, max_retries=3)
+    # P0-4: per-tool retry 1, agent-level budget controls total retries.
+    # ModelRetry (args_validator) consumes tool budget; ToolFailed is terminal.
+    function_toolset = FunctionToolset(tool_objs, max_retries=1)
     if allowed:
         toolset = FilteredToolset(
             function_toolset,
@@ -328,11 +431,38 @@ def build_agent(
         toolset = function_toolset
 
     hooks = Hooks(
+        prepare_tools=_prepare_tools,
+        before_tool_validate=_before_tool_validate,
         before_tool_execute=_before_tool_execute,
         tool_execute=_wrap_tool_execute,
         after_tool_execute=_after_tool_execute,
+        model_request_error=_on_model_request_error,
     )
     capabilities: list = [hooks]
+    # P0-3: Instrumentation — OTel gen_ai spans (version 3). Enabled by default,
+    # disable with PAI_INSTRUMENT=0. Provides agent_run/model_request/tool spans
+    # without manual token-stats double counting.
+    if os.getenv("PAI_INSTRUMENT", "1") != "0":
+        try:
+            from pydantic_ai.capabilities import Instrumentation
+            from pydantic_ai.models.instrumented import InstrumentationSettings
+
+            capabilities.append(Instrumentation(InstrumentationSettings(version=5)))
+        except Exception:
+            pass
+    # P0-1: portable thinking via ModelSettings now in _build_model_settings.
+    # Thinking capability kept opt-in for env PAI_THINKING_CAP=1 (static role
+    # default) — per-call ladder still via ModelSettings to avoid override.
+    if os.getenv("PAI_THINKING_CAP", "0") == "1":
+        try:
+            from pydantic_ai.capabilities.thinking import Thinking
+
+            _is_orch = role in ["Developer", "DeveloperFixing"] or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
+            _is_heavy = _is_orch or (role in ["Supervisor", "sa", "Coder"] or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"])))
+            _thinking_effort = "high" if _is_heavy else False  # type: ignore[assignment]
+            capabilities.append(Thinking(effort=_thinking_effort))  # type: ignore[arg-type]
+        except Exception:
+            pass
     # A7: native compaction via ProcessHistory (before each model request)
     try:
         from llm.compaction_native import get_process_history_capability
@@ -342,6 +472,54 @@ def build_agent(
             capabilities.append(_ph)
     except Exception:
         pass
+    # P2-2: WebSearch + MCP native capabilities (env-gated)
+    if os.getenv("PAI_WEB_SEARCH", "0") == "1":
+        try:
+            from pydantic_ai.capabilities.web_search import WebSearch
+
+            capabilities.append(WebSearch(max_uses=5))
+        except Exception:
+            pass
+    _mcp_url = os.getenv("PAI_MCP_URL", "").strip()
+    if _mcp_url:
+        try:
+            from pydantic_ai.capabilities.mcp import MCP
+
+            capabilities.append(MCP(url=_mcp_url, native=True))
+        except Exception:
+            try:
+                from pydantic_ai.mcp import MCPToolset
+
+                # Fallback: local MCPToolset if native fails
+                capabilities.append(MCPToolset(_mcp_url))
+            except Exception:
+                pass
+    # P2-3: deferred/approval handling — when PAI_DEFERRED=1, auto-handle ApprovalRequired
+    if os.getenv("PAI_DEFERRED", "0") == "1":
+        try:
+            from pydantic_ai.capabilities.deferred_tool_handler import HandleDeferredToolCalls
+
+            async def _defer_handler(ctx: RunContext[WorkspaceDeps], reqs):
+                # For now, auto-deny plan-mode writes with a clear message;
+                # future: route to UI for human approval via inbox.
+                try:
+                    from pydantic_ai.tools import DeferredToolResults
+
+                    results = []
+                    for req in getattr(reqs, "requests", []) or []:
+                        # req is DeferredToolRequest with call
+                        call = getattr(req, "call", None) or getattr(req, "tool_call", None)
+                        name = getattr(call, "tool_name", "unknown") if call else "unknown"
+                        results.append(req.create_result(f"[DEFERRED] Approval required for {name} in plan mode — denied by policy"))
+                    if results:
+                        return DeferredToolResults(results=results)
+                except Exception:
+                    pass
+                return None
+
+            capabilities.append(HandleDeferredToolCalls(handler=_defer_handler))
+        except Exception:
+            pass
     if extra_capabilities:
         capabilities.extend(extra_capabilities)
 
@@ -350,11 +528,23 @@ def build_agent(
         kwargs["output_type"] = output_type
     if system_prompt:
         kwargs["system_prompt"] = system_prompt
+    # P0-4: agent-level retry budgets (env-overridable).
+    try:
+        _tool_retries = int(os.getenv("PAI_TOOL_RETRIES", "3"))
+    except Exception:
+        _tool_retries = 3
+    try:
+        _output_retries = int(os.getenv("PAI_OUTPUT_RETRIES", "1"))
+    except Exception:
+        _output_retries = 1
+    if _NATIVE_LIMITER is not None and os.getenv("PAI_USE_CONCURRENCY", "1") != "0":
+        kwargs["max_concurrency"] = _NATIVE_LIMITER
     agent = Agent(
         model=model,
         toolsets=[toolset],
         capabilities=capabilities,
         deps_type=WorkspaceDeps,
+        retries={"tools": _tool_retries, "output": _output_retries},
         **kwargs,
     )
     return agent
@@ -475,22 +665,59 @@ async def arun_native_agent(
 
     from llm.native_tools import DEFAULT_USAGE_LIMITS
 
-    async def _run():
-        # Use run_stream (streaming wire) like the transport — gateways expect
-        # stream=true for tool-calling; drain responses via stream_response.
-        async with agent.run_stream(
-            user_prompt,
-            message_history=history,
-            deps=deps,
-            usage_limits=DEFAULT_USAGE_LIMITS,
-            cancellation_token=cancellation_token,
-        ) as sres:
-            async for _resp in sres.stream_response(debounce_by=None):
-                pass
-            return sres
+    # P1-1: prefer Agent.iter (single AgentRun, correct usage/cancellation,
+    # no per-turn Agent rebuild). Falls back to run_stream on error.
+    use_iter = os.getenv("PAI_USE_ITER", "1") != "0"
+    all_msgs: list = []
+    result_output: Any = None
+    result_usage: Any = None
+    if use_iter:
+        try:
+            async with agent.iter(
+                user_prompt,
+                message_history=history,
+                deps=deps,
+                usage_limits=DEFAULT_USAGE_LIMITS,
+                cancellation_token=cancellation_token,
+            ) as run:
+                async for node in run:
+                    # Hooks(event=) already streams deltas; node loop keeps
+                    # usage/cancellation correct and drains CallToolsNode properly.
+                    # For ModelRequestNode we could stream, but event handler covers it.
+                    pass
+                # run.result is AgentRunResult
+                _res = run.result
+                all_msgs = list(_res.all_messages())
+                result_output = _res.output
+                result_usage = getattr(_res, "usage", None)
+        except Exception as _iter_err:
+            # Fallback will use run_stream; log for diagnostics.
+            try:
+                from llm.llm import log_terminal
 
-    result = await _run()
-    all_msgs = list(result.all_messages())
+                log_terminal(f"[arun_native_agent] iter failed, fallback to run_stream: {_iter_err}")
+            except Exception:
+                pass
+            all_msgs = []
+
+    if not all_msgs:
+        async def _run():
+            async with agent.run_stream(
+                user_prompt,
+                message_history=history,
+                deps=deps,
+                usage_limits=DEFAULT_USAGE_LIMITS,
+                cancellation_token=cancellation_token,
+            ) as sres:
+                async for _resp in sres.stream_response(debounce_by=None):
+                    pass
+                return sres
+
+        _sres = await _run()
+        all_msgs = list(_sres.all_messages())
+        result_output = _sres.output if hasattr(_sres, "output") else None
+        result_usage = getattr(_sres, "usage", None)
+
     text = "".join(
         p.content
         for m in all_msgs
@@ -499,11 +726,24 @@ async def arun_native_agent(
         if getattr(p, "part_kind", "") == "text"
     ).strip()
     if not text:
-        # Fall back to the run result output.
-        text = str(result.output if isinstance(result.output, str) else (result.output or ""))
+        text = str(result_output if isinstance(result_output, str) else (result_output or ""))
     reasoning = "".join(
         e["text"] for e in events_log if e["kind"] == "reasoning"
     ).strip() or None
+    # Fallback: if event log empty but response has thinking parts, use those.
+    if not reasoning:
+        try:
+            _thinking = "".join(
+                p.content
+                for m in all_msgs
+                if isinstance(m, ModelResponse)
+                for p in m.parts
+                if getattr(p, "part_kind", "") == "thinking"
+            ).strip()
+            if _thinking:
+                reasoning = _thinking
+        except Exception:
+            pass
 
     # A6b: return native ModelMessage slice when input was native, else
     # reverse-convert to LangChain for backward compat.
@@ -566,7 +806,43 @@ def run_native_agent(
     )
 
 
-DEFAULT_USAGE_LIMITS = UsageLimits(request_limit=200, tool_calls_limit=200)
+def _default_usage_limits() -> UsageLimits:
+    """P0-3: cost/per-request guards. Env-overridable for A/B."""
+    try:
+        cost_val = os.getenv("PAI_COST_LIMIT", "2.00").strip()
+        cost = Decimal(cost_val) if cost_val else None
+    except Exception:
+        cost = Decimal("2.00")
+    try:
+        per_req = int(os.getenv("PAI_PER_REQUEST_INPUT_LIMIT", "80000"))
+    except Exception:
+        per_req = 80000
+    try:
+        total = int(os.getenv("PAI_TOTAL_TOKENS_LIMIT", "600000"))
+    except Exception:
+        total = 600000
+    try:
+        req_lim = int(os.getenv("PAI_REQUEST_LIMIT", "200"))
+    except Exception:
+        req_lim = 200
+    try:
+        tool_lim = int(os.getenv("PAI_TOOL_CALLS_LIMIT", "200"))
+    except Exception:
+        tool_lim = 200
+    # count_tokens_before_request requires model.count_tokens support; enable
+    # only when PAI_COUNT_BEFORE=1 (opt-in) to avoid extra latency by default.
+    count_before = os.getenv("PAI_COUNT_BEFORE", "0") == "1"
+    return UsageLimits(
+        request_limit=req_lim,
+        tool_calls_limit=tool_lim,
+        per_request_input_tokens_limit=per_req,
+        total_tokens_limit=total,
+        cost_limit=cost,
+        count_tokens_before_request=count_before,
+    )
+
+
+DEFAULT_USAGE_LIMITS = _default_usage_limits()
 
 import threading as _threading
 
@@ -574,18 +850,22 @@ _WATCH_STOP = _threading.Event()
 
 
 def chat_cancellation_token(chat_id: str) -> tuple[Any, Any]:
-    """Build a pydantic-ai CancellationToken wired to the chat's abort flag (A8).
+    """Build a pydantic-ai CancellationToken wired to the chat's abort flag (A8+P1-2).
 
-    Returns ``(token, stop_watcher)``. ``stop_watcher()`` stops the background
-    abort watcher (call in a ``finally``). When the user aborts the chat
-    (``server.realtime.inbox.abort``), the watcher calls ``token.cancel()``,
-    which makes the in-flight native run raise ``RunCancelled`` — the loop
-    catches it and exits cleanly (history preserved for resume).
+    Returns ``(token, stop_watcher)``. ``stop_watcher()`` unregisters and stops
+    the watcher. Abort now cancels via registry ``llm.cancellation.cancel`` for
+    immediate (<10ms) delivery, with 0.25s poll as fallback for legacy callers.
     """
     from pydantic_ai import CancellationToken
 
     token = CancellationToken()
     _WATCH_STOP.clear()
+    try:
+        from llm.cancellation import register, unregister
+
+        register(chat_id, token)
+    except Exception:
+        pass
 
     def _watch() -> None:
         import time
@@ -598,16 +878,59 @@ def chat_cancellation_token(chat_id: str) -> tuple[Any, Any]:
             try:
                 counts = pending_counts(chat_id)
                 if counts.get("abort_pending"):
-                    token.cancel()
+                    try:
+                        token.cancel()
+                    except Exception:
+                        pass
                     return
             except Exception:
                 return
             time.sleep(0.25)
 
-    t = _threading.Thread(target=_watch, daemon=True)
-    t.start()
+    # Prefer asyncio watcher if loop is running (no thread), else thread.
+    _async_task = None
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        if loop and loop.is_running():
+            async def _awatch():
+                try:
+                    from server.realtime.inbox import pending_counts as _pc
+                except Exception:
+                    return
+                while not _WATCH_STOP.is_set():
+                    try:
+                        if _pc(chat_id).get("abort_pending"):
+                            try:
+                                token.cancel()
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        return
+                    await asyncio.sleep(0.25)
+
+            _async_task = loop.create_task(_awatch())
+        else:
+            raise RuntimeError("no running loop")
+    except Exception:
+        t = _threading.Thread(target=_watch, daemon=True)
+        t.start()
+        _async_task = None
 
     def _stop() -> None:
         _WATCH_STOP.set()
+        try:
+            from llm.cancellation import unregister as _unreg
+
+            _unreg(chat_id)
+        except Exception:
+            pass
+        if _async_task is not None:
+            try:
+                _async_task.cancel()
+            except Exception:
+                pass
 
     return token, _stop

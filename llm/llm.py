@@ -226,31 +226,35 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
         # Pass tools via model_kwargs for DeepSeek native function calling
         kwargs.setdefault("model_kwargs", {})["tools"] = tools
 
-    # Configure native thinking mode dynamically by role/model.
-    # Only send thinking parameters if the model supports it or is a fallback model.
+    # Portable thinking config — mirrors pai_transport._build_model_settings.
+    # LangChain path kept for invoke_with_fallback legacy queue; uses same
+    # thinking semantics as the native path but without the prefix-cache pin.
     is_reasoning_model = any(x in model.lower() for x in ["r1", "pro", "o1", "o3", "reasoning", "thinking", "fallback", "automatic", "flash"])
-
+    thinking_effort: str | None = None
+    thinking_disabled = False
     if reasoning_effort is not None:
-        # Explicit caller intent always wins and is always sent — the
-        # mode-aware ladders know the target model better than this heuristic.
         effort = str(reasoning_effort).strip().lower()
         if effort in ("disabled", "none", ""):
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            thinking_disabled = True
         else:
             budget_override = reasoning_budget
             if effort == "max":
-                # Portable ceiling: effort tops out at "high" plus an explicit
-                # token budget the vendor can honor (REASONING_MAX_BUDGET).
                 effort = "high"
                 if budget_override is None:
-                    budget_override = int(os.getenv("REASONING_MAX_BUDGET", "32768"))
+                    try:
+                        budget_override = int(os.getenv("REASONING_MAX_BUDGET", "32768"))
+                    except Exception:
+                        budget_override = 32768
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
             kwargs["reasoning_effort"] = effort
+            thinking_effort = effort
             if budget_override is not None:
-                kwargs["extra_body"]["thinking"]["budget_tokens"] = int(budget_override)
+                try:
+                    kwargs["extra_body"]["thinking"]["budget_tokens"] = int(budget_override)
+                except Exception:
+                    pass
     elif is_reasoning_model:
-        # No explicit effort: role-based defaults. Developer-like/heavy roles
-        # think at high; everyone else runs with thinking disabled.
         is_orchestrator = (
             role in ["Developer", "DeveloperFixing"]
             or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
@@ -259,45 +263,17 @@ def _get_deepseek_client(model: str, temp: float, role: Optional[str] = None, re
             role in ["Supervisor", "sa", "Coder"]
             or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"]))
         )
-
-        if is_orchestrator:
+        if is_orchestrator or is_heavy:
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
             kwargs["reasoning_effort"] = "high"
-        elif is_heavy:
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            kwargs["reasoning_effort"] = "high"
+            thinking_effort = "high"
         else:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            thinking_disabled = True
 
-    # ── Prefix-cache freeze (Phase 7): DeepSeek's prefix cache is keyed per
-    # thinking config (developer_agent.py:745). Flipping enabled→disabled mid-
-    # conversation busts the whole cached prefix (-4.7k tokens/turn). Pin the
-    # FIRST thinking config used for each (role, model) for the process lifetime
-    # so a role's per-iteration effort ladders never toggle the extra_body.
-    try:
-        _pin_key = (role or "", model or "")
-        with _THINKING_PINS_LOCK:
-            if _pin_key not in _THINKING_PINS:
-                _THINKING_PINS[_pin_key] = dict(kwargs.get("extra_body") or {})
-            else:
-                pinned = _THINKING_PINS[_pin_key]
-                if pinned:
-                    kwargs["extra_body"] = dict(pinned)
-                # reasoning_effort is a top-level param, not in extra_body:
-                # keep the pin's enabled/disabled decision but drop any budget
-                # drift (budget_tokens only inside extra_body.thinking).
-                cur = dict(kwargs.get("extra_body") or {})
-                thinking_type = (cur.get("thinking") or {}).get("type")
-                pinned_type = (pinned.get("thinking") or {}).get("type")
-                if thinking_type is not None and pinned_type is not None and thinking_type != pinned_type:
-                    kwargs["extra_body"] = dict(pinned)
-                elif pinned.get("thinking") and cur.get("thinking"):
-                    # Same type: merge, keep the pinned budget.
-                    merged = dict(cur)
-                    merged["thinking"] = dict(pinned["thinking"])
-                    kwargs["extra_body"] = merged
-    except Exception:
-        pass
+    # NOTE: _THINKING_PINS prefix-cache freeze removed (P0-1). Portable
+    # thinking=False vs "high" via isinstance(thinking) eliminates the
+    # enabled↔disabled flip that busted DeepSeek byte-prefix cache.
 
     return ChatOpenAI(**kwargs)
 

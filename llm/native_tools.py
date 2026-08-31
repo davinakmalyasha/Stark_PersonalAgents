@@ -203,6 +203,20 @@ def build_agent(
         if not name:
             continue
         impl = impl_map.get(name)
+        # C2: MCP tools (mcp__server__tool) have no Python impl in TOOL_MAP —
+        # wire them to the MCP bridge so they are real tools on the native
+        # path (previously silently skipped).
+        is_mcp = name.startswith("mcp__")
+        if impl is None and is_mcp:
+            try:
+                from tools.mcp.mcp_bridge import mcp_execute
+
+                def _mcp_impl(**kw):
+                    return mcp_execute(name, dict(kw), scope=deps.role)
+
+                impl = _mcp_impl
+            except Exception:
+                impl = None
         if impl is None:
             continue
         # Preserved schema (your refined compact definition) wins; fall back to

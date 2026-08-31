@@ -401,10 +401,18 @@ async def arun_native_agent(
         else:
             model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
 
-    # Convert LangChain transcript -> pydantic-ai history (reuse transport).
+    # A6b: accept both LangChain messages and native ModelMessage history.
+    # Detect native history by checking for ModelRequest/ModelResponse instances.
+    from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
     from llm.pai_transport import _lc_messages_to_pai, _split_user_prompt
-    full = _lc_messages_to_pai(messages)
-    from pydantic_ai.messages import ModelResponse
+
+    is_native = False
+    if messages and isinstance(messages[0], (ModelRequest, ModelResponse)):
+        # Already native ModelMessage list — use directly (A6b path)
+        full: list[ModelMessage] = list(messages)  # type: ignore
+        is_native = True
+    else:
+        full = _lc_messages_to_pai(messages)
     user_prompt, history = _split_user_prompt(full)
 
     events_log: list[dict] = []
@@ -488,7 +496,12 @@ async def arun_native_agent(
         e["text"] for e in events_log if e["kind"] == "reasoning"
     ).strip() or None
 
-    # Reverse-convert the pydantic-ai messages this run added -> LangChain.
+    # A6b: return native ModelMessage slice when input was native, else
+    # reverse-convert to LangChain for backward compat.
+    if is_native:
+        prior_ids = {id(m) for m in history}
+        new_msgs = [m for m in all_msgs if id(m) not in prior_ids]
+        return text, new_msgs, reasoning
     from llm.pai_transport import _pai_to_lc
     new_lc = _pai_to_lc(all_msgs, history)
     return text, new_lc, reasoning

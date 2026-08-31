@@ -603,7 +603,13 @@ async def apai_native_turn(
         agent = None
         native_agent = False
 
-    msg_history_full = _lc_messages_to_pai(messages)
+    # A6b: accept native ModelMessage history directly.
+    from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MResp
+
+    if messages and isinstance(messages[0], (_MR, _MResp)):
+        msg_history_full: list[ModelMessage] = list(messages)  # type: ignore
+    else:
+        msg_history_full = _lc_messages_to_pai(messages)
     # pydantic-ai appends `user_prompt` as a user message when not None, so an
     # empty "" would hit gateways that reject empty content. Extract the FIRST
     # user part from the history as the prompt (matching pydantic-ai's own
@@ -889,8 +895,12 @@ async def apai_structured(
         llm = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
     agent = Agent(model=llm, output_type=result_type)
 
-    msg_history = _lc_messages_to_pai(messages)
-    user_prompt, msg_history = _split_user_prompt(msg_history)
+    # A6b: accept native ModelMessage history.
+    if messages and isinstance(messages[0], (ModelRequest, ModelResponse)):
+        _full: list[ModelMessage] = list(messages)  # type: ignore
+    else:
+        _full = _lc_messages_to_pai(messages)
+    user_prompt, msg_history = _split_user_prompt(_full)
     res = await agent.run(
         user_prompt, message_history=msg_history, cancellation_token=cancellation_token
     )

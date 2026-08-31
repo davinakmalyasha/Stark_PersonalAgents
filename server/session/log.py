@@ -840,6 +840,86 @@ def _entry_text_with_tool_blocks(content: Union[str, list[ContentBlock]]) -> str
     return "\n".join(parts)
 
 
+def convert_to_model_messages(
+    entries: list[SessionEntry],
+    *,
+    include_thinking: bool = False,
+    include_custom_messages: bool = True,
+) -> list[Any]:
+    """Convert session entries into pydantic-ai ModelMessage history (A6b).
+
+    Native counterpart to :func:`convert_to_llm` — produces List[ModelMessage]
+    (ModelRequest | ModelResponse) for direct use with Agent.run(message_history=).
+
+    - user / custom_message -> ModelRequest(UserPromptPart)
+    - assistant -> ModelResponse(TextPart + ThinkingPart + ToolCallPart)
+    - toolResult -> ModelRequest(ToolReturnPart)
+    - compaction -> ModelRequest summary + retainedTail messages
+    - branch_summary -> ModelRequest summary
+    """
+    from pydantic_ai.messages import (
+        ModelMessage,
+        ModelRequest,
+        ModelResponse,
+        SystemPromptPart,
+        TextPart,
+        ThinkingPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+
+    out: list[ModelMessage] = []
+    for e in entries:
+        if isinstance(e, CompactionEntry):
+            if e.summary:
+                out.append(ModelRequest(parts=[UserPromptPart(content=f"[Context summary]\n{e.summary}")]))
+            if e.retained_tail:
+                out.extend(convert_to_model_messages(
+                    e.retained_tail,
+                    include_thinking=include_thinking,
+                    include_custom_messages=include_custom_messages,
+                ))
+            continue
+        if isinstance(e, BranchSummaryEntry):
+            if e.summary:
+                out.append(ModelRequest(parts=[UserPromptPart(content=f"[Abandoned branch summary]\n{e.summary}")]))
+            continue
+        if isinstance(e, MessageEntry):
+            if e.role == "user":
+                out.append(ModelRequest(parts=[UserPromptPart(content=_entry_text(e.content, include_thinking))]))
+            elif e.role == "custom_message":
+                if include_custom_messages:
+                    out.append(ModelRequest(parts=[UserPromptPart(content=_entry_text(e.content, include_thinking))]))
+            elif e.role == "assistant":
+                if e.stop_reason == "error" and not _entry_text(e.content, include_thinking):
+                    continue
+                parts: list[Any] = []
+                text = _entry_text(e.content, include_thinking)
+                if text:
+                    parts.append(TextPart(content=text))
+                # thinking blocks if requested
+                if include_thinking and isinstance(e.content, list):
+                    for block in e.content:
+                        if getattr(block, "type", "") == "thinking":
+                            parts.append(ThinkingPart(content=block.thinking))
+                # tool calls
+                for block in (e.content if isinstance(e.content, list) else []):
+                    if getattr(block, "type", "") == "toolCall":
+                        parts.append(ToolCallPart(tool_name=block.name, args=block.arguments, tool_call_id=block.id))
+                if parts:
+                    out.append(ModelResponse(parts=parts))
+            elif e.role == "toolResult":
+                if not e.tool_call_id:
+                    continue
+                out.append(ModelRequest(parts=[ToolReturnPart(
+                    tool_name=e.tool_name or "",
+                    content=_entry_text(e.content, include_thinking),
+                    tool_call_id=e.tool_call_id,
+                )]))
+    return out
+
+
 def convert_to_llm(
     entries: list[SessionEntry],
     *,

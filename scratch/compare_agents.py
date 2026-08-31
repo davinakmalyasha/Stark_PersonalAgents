@@ -134,8 +134,9 @@ def main() -> int:
             assert "Weather: hot" in text2, text2
             assert SEEN_TOOL_CALL["made"], "native agent must have executed get_weather"
 
-            # 3) arun_native_agent full-turn — transcript slice (AIMessage +
-            # ToolMessage + final AIMessage) so caller loops keep history.
+            # 3) arun_native_agent full-turn — native transcript slice
+            # (ModelResponse tool-calls + ModelRequest tool results) so caller
+            # loops keep history (P0-LLM: always ModelMessage now).
             from llm.native_tools import arun_native_agent
             SEEN_TOOL_CALL["made"] = False
             text3, new_lc, reasoning3 = await arun_native_agent(
@@ -146,7 +147,7 @@ def main() -> int:
             kinds = [type(m).__name__ for m in new_lc]
             print("RNA path: text=%r lc=%s" % (text3, kinds))
             assert "Weather: hot" in text3, text3
-            assert "AIMessage" in kinds and "ToolMessage" in kinds, kinds
+            assert "ModelResponse" in kinds and "ModelRequest" in kinds, kinds
             assert SEEN_TOOL_CALL["made"], "run_native_agent must execute the tool"
         finally:
             os.environ.pop("PAI_NATIVE_TOOLS", None)

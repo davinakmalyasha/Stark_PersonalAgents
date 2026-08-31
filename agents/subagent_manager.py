@@ -168,7 +168,7 @@ def _child_permissions(name: str) -> list:
 def _is_native_slice(second: list) -> bool:
     """True when a backend result's 2nd element is a transcript slice.
 
-    Handles both legacy LC (AIMessage/ToolMessage) and native
+    Handles both legacy LC (AIMessage/ToolMessage — test compat) and native
     ModelMessage (ModelResponse/ModelRequest) slices. Used by the
     continuable turn loop to decide whether the backend already executed
     tools (native full turn) or returned raw tool-call dicts.
@@ -213,7 +213,7 @@ def _run_turn(
     is called with ``history`` (ModelMessage).  A native slice
     (``ModelResponse``/``ModelRequest``) is detected via ``_is_native_slice``
     and extended directly; legacy LC ``AIMessage``/``ToolMessage`` slices are
-    kept for test compat via ``isinstance`` + ``_lc_messages_to_pai`` fallback.
+    kept for test compat via ``isinstance`` + ``_messages_to_pai`` fallback.
 
     Appends every step to the child session log. Cooperative with
     ``act["interrupt"]`` (checked per iteration). Returns the final text.
@@ -384,19 +384,19 @@ def _run_turn(
                                             "args": args if isinstance(args, dict) else {},
                                         })
                     else:
-                        # Legacy LC slice — convert to native for history, keep LC for session pairing
+                        # Legacy LC slice (test compat) — convert to native for history
                         try:
-                            from llm.pai_transport import _lc_messages_to_pai
-                            _converted = _lc_messages_to_pai(slice_msgs)  # type: ignore
+                            from llm.pai_transport import _messages_to_pai
+                            _converted = _messages_to_pai(slice_msgs)  # type: ignore
                             history.extend(_converted)
                         except Exception:
-                            # Fallback: keep raw if conversion unavailable (test compat)
                             try:
                                 history.extend(slice_msgs)  # type: ignore
                             except Exception:
                                 pass
                         slice_calls = [
-                            tc for m in slice_msgs
+                            {"id": tc.get("id", ""), "name": tc.get("name", ""), "args": tc.get("args") or {}}
+                            for m in slice_msgs
                             if m.__class__.__name__ == "AIMessage"
                             for tc in (getattr(m, "tool_calls", None) or [])
                         ]

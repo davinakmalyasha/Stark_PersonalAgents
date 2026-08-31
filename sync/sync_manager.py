@@ -157,10 +157,3 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         # Inject error into live_terminal_log so the frontend shows it
         safe_append_live_log(f"\n[SYNC CRASH] {e}\n[ASSISTANT] ERROR: {e}")
         raise e
-
-    # Clear the lazy hydration store to prevent unbounded memory growth across runs
-    try:
-        from memory.context_compaction import clear_lazy_store
-        clear_lazy_store()
-    except Exception:
-        pass

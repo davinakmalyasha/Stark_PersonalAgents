@@ -17,7 +17,7 @@ import os
 import re
 import json
 import uuid
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
 from sync.state_sync import shared_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
@@ -30,10 +30,7 @@ from llm.deps import WorkspaceDeps
 from llm.loop_detector import LoopGuard
 from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
-from memory.context_compaction import (
-    compact_history,
-    get_compaction_policy,
-)
+from memory.context_compaction import get_compaction_policy
 from inbox import drain_steering, drain_follow_up, consume_abort, render_delivery
 from pydantic_ai.messages import (
     ModelMessage,
@@ -74,17 +71,6 @@ def _native_slice_tools(new_msgs: list) -> list[dict]:
                         "args": args if isinstance(args, dict) else {},
                         "id": p.tool_call_id or "",
                     })
-            continue
-        # Legacy LC AIMessage path
-        tcs = getattr(m, "tool_calls", None) or []
-        for tc in tcs:
-            if not isinstance(tc, dict):
-                continue
-            out.append({
-                "tool": tc.get("name") or tc.get("tool", ""),
-                "args": tc.get("args") or {},
-                "id": tc.get("id") or "",
-            })
     return out
 
 
@@ -116,21 +102,6 @@ def _native_slice_failures(new_msgs: list) -> bool:
                             )
                         ):
                             return True
-            continue
-        # Legacy LC ToolMessage path
-        tname = getattr(m, "name", "") or ""
-        content = str(getattr(m, "content", "") or "")
-        low = content.lower()
-        if tname in ("delegate", "task", "async_task", "resume_project"):
-            if content.startswith("ERROR") or any(
-                marker in low
-                for marker in (
-                    "handoff report [failed]", "handoff report [blocked]",
-                    "handoff report [stuck]", "[failed]", "[blocked]",
-                    "timed out",
-                )
-            ):
-                return True
     return False
 
 
@@ -461,17 +432,15 @@ def _orchestrator_loop(s: ITState) -> dict:
 
         # A2: native full turn always appends its transcript slice (ModelMessage)
         if native_msgs:
-            # Handle both native ModelMessage and legacy LC slice (test compat)
+            # Native full turn always returns ModelMessage slice (P0-LLM).
             if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
                 history.extend(native_msgs)
             else:
                 try:
-                    from llm.pai_transport import _lc_messages_to_pai
-                    # Convert LC AIMessage/ToolMessage slice to ModelMessage for native history
-                    _converted = _lc_messages_to_pai(native_msgs)  # type: ignore
-                    # _lc_messages_to_pai returns full list; for slice it is already ModelResponse/ModelRequest
+                    from llm.pai_transport import _messages_to_pai
+                    _converted = _messages_to_pai(native_msgs)  # type: ignore
                     history.extend(_converted)
-                    native_msgs = _converted  # for _native_slice_tools to work with ModelMessage path
+                    native_msgs = _converted
                 except Exception:
                     history.extend(native_msgs)  # fallback, keep as-is
             tool_calls: list[dict] = _native_slice_tools(native_msgs)

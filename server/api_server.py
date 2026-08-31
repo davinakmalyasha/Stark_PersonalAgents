@@ -545,16 +545,17 @@ if __name__ == "__main__":
     # provider connection). A trivial invoke primes the HTTP pool.
     def _warm_llm() -> None:
         try:
-            from llm.llm import _get_deepseek_client, _map_model
+            from llm.pai_transport import pai_native_turn
             from llm.provider_modes import MODE_MATRIX
             orch = MODE_MATRIX.get("command", {}).get("orchestrator") or {}
             model = orch.get("model") if isinstance(orch, dict) else "xiaomi/mimo-v2.5"
-            llm = _get_deepseek_client(_map_model(model), 0.3)
-            from langchain_core.messages import SystemMessage, HumanMessage
-            llm.invoke([
-                SystemMessage(content="You are a helpful assistant."),
-                HumanMessage(content="Reply with the single word: ready"),
-            ])
+            pai_native_turn(
+                role="Orchestrator",
+                messages=[{"role": "user", "content": "Reply with the single word: ready"}],
+                model=model,
+                temp=0.3,
+                stream_emit=False,
+            )
             print(f"[API] Orchestrator LLM warmed ({model}).")
         except Exception as e:
             print(f"[API] Orchestrator LLM warm-up skipped: {e}")

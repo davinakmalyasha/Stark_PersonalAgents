@@ -103,64 +103,6 @@ def drain_images(ctx=None) -> list[dict]:
     return q
 
 
-def build_image_message(images: list[dict], header: str = "[Inline image(s) from tool result]") -> list:
-    """Build ONE HumanMessage whose content carries a short text part plus the
-    queued image blocks. Returns [message] or [] — safe to splat into messages."""
-    if not images:
-        return []
-    from langchain_core.messages import HumanMessage
-    parts = [{"type": "text", "text": header}]
-    for img in images:
-        if img.get("note"):
-            parts[0]["text"] += f"\n- {img['note']}"
-        parts.append({"type": "image_url", "image_url": {"url": img["url"]}})
-    try:
-        return [HumanMessage(content=parts)]
-    except Exception:
-        return []
-
-
-def drain_into_messages(messages: list, header: str = "[Inline image(s) from tool result]", ctx=None) -> int:
-    """Convenience for agent loops: drain the queue and append the synthetic
-    user message. Returns the number of images injected."""
-    imgs = drain_images(ctx=ctx)
-    if not imgs:
-        return 0
-    msgs = build_image_message(imgs, header)
-    if msgs:
-        messages.extend(msgs)
-        return len(imgs)
-    return 0
-
-
-def drain_attachment_images(messages: list, cap: int = 4, ctx=None) -> int:
-    """Zone-2 builder helper: take image paths stashed by the API layer under
-    shared_state['attachment_image_paths'] and inject them as ONE user message
-    BEFORE the first LLM call, so user-uploaded pictures are visible from turn
-    one. Consumes-and-clears exactly once (first agent to build Zone-2 wins —
-    the pre-router sends a run to either Orchestrator or Dev, never both).
-
-    The shared_state stash is a one-time consumption channel (the API router
-    writes it); the images themselves land in the deps channel when ``ctx`` is
-    provided, else the legacy ContextVar.
-    """
-    try:
-        from sync.state_sync import safe_get_state, safe_update_state
-        paths = safe_get_state().get("attachment_image_paths") or []
-        if not paths:
-            return 0
-        safe_update_state({"attachment_image_paths": []})
-        injected = 0
-        for p in paths[:max(0, int(cap))]:
-            if queue_image_file(p, note="user attachment", ctx=ctx):
-                injected += 1
-        if injected:
-            return drain_into_messages(messages, header="[User attached image(s)]", ctx=ctx)
-    except Exception:
-        pass
-    return 0
-
-
 # ── Native ModelMessage helpers (A6b) ─────────────────────────────────────
 
 def build_image_message_native(images: list[dict], header: str = "[Inline image(s) from tool result]") -> list:

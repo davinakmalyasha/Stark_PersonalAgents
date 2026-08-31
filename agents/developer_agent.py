@@ -4,7 +4,6 @@ import re
 import subprocess
 import uuid
 from datetime import datetime
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, RemoveMessage
 from sync.state_sync import safe_update_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
@@ -405,89 +404,33 @@ def _log(msg: str) -> None:
     safe_append_live_log(msg)
 
 def serialize_messages(messages: list) -> list[dict]:
-    """Legacy serializer kept for backward compatibility (now wraps dump_history)."""
+    """Serialize history to JSON-compatible dicts (native ModelMessage dump).
+
+    P0-LLM: always uses ``dump_history_python`` (ModelMessagesTypeAdapter) —
+    the LangChain serializer is deleted.
+    """
     try:
-        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS
-        if messages and isinstance(messages[0], (_MR, _MS)):
-            return dump_history_python(messages)  # type: ignore
+        return dump_history_python(messages)  # type: ignore
     except Exception:
-        pass
-    serialized = []
-    for m in messages:
-        try:
-            content = getattr(m, "content", "")
-        except Exception:
-            content = ""
-        msg_dict = {"type": type(m).__name__, "content": content}
-        if hasattr(m, "id") and getattr(m, "id", None):
-            msg_dict["id"] = getattr(m, "id")
-        if hasattr(m, "name") and getattr(m, "name", None):
-            msg_dict["name"] = getattr(m, "name")
-        if hasattr(m, "tool_calls") and getattr(m, "tool_calls", None):
-            msg_dict["tool_calls"] = getattr(m, "tool_calls")
-        if hasattr(m, "tool_call_id") and getattr(m, "tool_call_id", None):
-            msg_dict["tool_call_id"] = getattr(m, "tool_call_id")
-        if hasattr(m, "status") and getattr(m, "status", None):
-            msg_dict["status"] = getattr(m, "status")
-        if hasattr(m, "additional_kwargs") and getattr(m, "additional_kwargs", None):
-            msg_dict["additional_kwargs"] = getattr(m, "additional_kwargs")
-        serialized.append(msg_dict)
-    return serialized
+        return []
+
 
 def deserialize_messages(serialized_msgs: list[dict]) -> list:
-    """Legacy deserializer kept for backward compatibility."""
+    """Deserialize persisted history back to List[ModelMessage].
+
+    Accepts both native ``{...parts...}`` dicts (ModelMessagesTypeAdapter) and
+    legacy ``{type: SystemMessage|...}`` dicts (converted via _messages_to_pai).
+    """
     try:
         if serialized_msgs and isinstance(serialized_msgs[0], dict) and "parts" in serialized_msgs[0]:
             return load_history_python(serialized_msgs)
     except Exception:
         pass
-    messages = []
-    for msg_data in serialized_msgs:
-        m_type = msg_data.get("type")
-        content = msg_data.get("content", "")
-        m_id = msg_data.get("id")
-        name = msg_data.get("name")
-        kwargs = {}
-        if m_id:
-            kwargs["id"] = m_id
-        if name:
-            kwargs["name"] = name
-        add_kwargs = msg_data.get("additional_kwargs")
-        if add_kwargs:
-            kwargs["additional_kwargs"] = add_kwargs
-            
-        if m_type == "SystemMessage":
-            msg = SystemMessage(content=content, **kwargs)
-        elif m_type == "HumanMessage":
-            msg = HumanMessage(content=content, **kwargs)
-        elif m_type == "AIMessage":
-            tool_calls = msg_data.get("tool_calls")
-            if tool_calls:
-                normalized_calls = []
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    normalized_calls.append({
-                        "name": tc.get("name") or tc.get("tool", ""),
-                        "args": tc.get("args") or {},
-                        "id": tc.get("id") or f"legacy-call-{len(normalized_calls)}",
-                        "type": "tool_call",
-                    })
-                if normalized_calls:
-                    kwargs["tool_calls"] = normalized_calls
-            msg = AIMessage(content=content, **kwargs)
-        elif m_type == "ToolMessage":
-            tool_call_id = msg_data.get("tool_call_id") or m_id or f"legacy-tool-{len(messages)}"
-            if msg_data.get("status"):
-                kwargs["status"] = msg_data["status"]
-            kwargs["tool_call_id"] = tool_call_id
-            msg = ToolMessage(content=content, **kwargs)
-        elif m_type == "RemoveMessage":
-            msg = RemoveMessage(**kwargs)
-        else:
-            msg = HumanMessage(content=content, **kwargs)
-        messages.append(msg)
-    return messages
+    try:
+        from llm.pai_transport import _messages_to_pai
+        return _messages_to_pai(serialized_msgs)
+    except Exception:
+        return []
 
 def _native_slice_tools(new_msgs: list) -> list[dict]:
     """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
@@ -547,9 +490,7 @@ def _load_history_from_state(raw) -> list[ModelMessage]:
                 return []
         if isinstance(first, dict) and "type" in first and first.get("type") in ("SystemMessage","HumanMessage","AIMessage","ToolMessage","RemoveMessage"):
             try:
-                legacy = deserialize_messages(raw)
-                from llm.pai_transport import _lc_messages_to_pai
-                return _lc_messages_to_pai(legacy)
+                return deserialize_messages(raw)
             except Exception:
                 return []
         return []
@@ -710,8 +651,8 @@ def developer_node(s: ITState) -> dict:
                 history = list(_graph_msgs)
             else:
                 try:
-                    from llm.pai_transport import _lc_messages_to_pai
-                    history = _lc_messages_to_pai(_graph_msgs)
+                    from llm.pai_transport import _messages_to_pai
+                    history = _messages_to_pai(_graph_msgs)
                 except Exception:
                     history = list(_graph_msgs)  # type: ignore
             _log(f"[DEVELOPER] Loaded {len(history)} messages natively from Graph State.")
@@ -721,15 +662,6 @@ def developer_node(s: ITState) -> dict:
         # Refresh only the stable system prefix. Never rewrite an old task or tool result
         if history and isinstance(history[0], ModelRequest) and any(isinstance(p, SystemPromptPart) for p in getattr(history[0], "parts", []) or []):
             history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
-        elif history and isinstance(history[0], SystemMessage):
-            old_id = getattr(history[0], "id", None)
-            _legacy_sys = SystemMessage(content=static_system, id=old_id) if old_id else SystemMessage(content=static_system)
-            try:
-                from llm.pai_transport import _lc_messages_to_pai
-                history = _lc_messages_to_pai([_legacy_sys] + list(history[1:]))
-                history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
-            except Exception:
-                history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
         else:
             history.insert(0, ModelRequest(parts=[SystemPromptPart(content=static_system)]))
 
@@ -997,8 +929,8 @@ def developer_node(s: ITState) -> dict:
                         history.extend(_native_lc)
                     else:
                         try:
-                            from llm.pai_transport import _lc_messages_to_pai
-                            _converted = _lc_messages_to_pai(_native_lc)  # type: ignore
+                            from llm.pai_transport import _messages_to_pai
+                            _converted = _messages_to_pai(_native_lc)  # type: ignore
                             history.extend(_converted)
                             _native_lc = _converted
                         except Exception:
@@ -1019,16 +951,6 @@ def developer_node(s: ITState) -> dict:
                                         "status": "executed",
                                         "result_preview": "",
                                     })
-                        elif _m.__class__.__name__ == "AIMessage" and getattr(_m, "tool_calls", None):
-                            for _tc in _m.tool_calls:
-                                tool_call_log.append({
-                                    "tool": _tc.get("name", ""),
-                                    "args": _tc.get("args") or {},
-                                    "id": _tc.get("id", ""),
-                                    "iteration": iteration,
-                                    "status": "executed",
-                                    "result_preview": "",
-                                })
                     # Mark finish: force the loop to the final-report path.
                     _native_finish = True
 

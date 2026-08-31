@@ -46,12 +46,7 @@ from .context_budget import (
 from .context_compaction import (
     CompactionPolicy,
     get_compaction_policy,
-    compact_history,
-    checkpoint_compact,
-    CheckpointCompactionError,
-    build_structured_resume_summary,
     truncation_note,
-    strip_thinking,
 )
 from .repo_map_generator import (
     RepoMapGenerator,
@@ -94,12 +89,7 @@ __all__ = [
     "estimate_messages",
     "CompactionPolicy",
     "get_compaction_policy",
-    "compact_history",
-    "checkpoint_compact",
-    "CheckpointCompactionError",
-    "build_structured_resume_summary",
     "truncation_note",
-    "strip_thinking",
     "embed",
     "embed_cached",
     "embed_batch",

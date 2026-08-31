@@ -587,15 +587,14 @@ async def arun_native_agent(
     # A6b: accept both LangChain messages and native ModelMessage history.
     # Detect native history by checking for ModelRequest/ModelResponse instances.
     from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
-    from llm.pai_transport import _lc_messages_to_pai, _split_user_prompt
+    from llm.pai_transport import _messages_to_pai, _split_user_prompt
 
-    is_native = False
+    full: list[ModelMessage]
     if messages and isinstance(messages[0], (ModelRequest, ModelResponse)):
         # Already native ModelMessage list — use directly (A6b path)
-        full: list[ModelMessage] = list(messages)  # type: ignore
-        is_native = True
+        full = list(messages)  # type: ignore
     else:
-        full = _lc_messages_to_pai(messages)
+        full = _messages_to_pai(messages)
     user_prompt, history = _split_user_prompt(full)
 
     events_log: list[dict] = []
@@ -729,15 +728,11 @@ async def arun_native_agent(
         except Exception:
             pass
 
-    # A6b: return native ModelMessage slice when input was native, else
-    # reverse-convert to LangChain for backward compat.
-    if is_native:
-        prior_ids = {id(m) for m in history}
-        new_msgs = [m for m in all_msgs if id(m) not in prior_ids]
-        return text, new_msgs, reasoning
-    from llm.pai_transport import _pai_to_lc
-    new_lc = _pai_to_lc(all_msgs, history)
-    return text, new_lc, reasoning
+    # A6b: always return the native ModelMessage slice (P0-LLM — the LC
+    # reverse-convert path _pai_to_lc is deleted).
+    prior_ids = {id(m) for m in history}
+    new_msgs = [m for m in all_msgs if id(m) not in prior_ids]
+    return text, new_msgs, reasoning
 
 
 def run_native_agent(

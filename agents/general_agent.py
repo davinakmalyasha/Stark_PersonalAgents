@@ -28,8 +28,6 @@ import os
 import re
 import uuid
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
 from sync.state_sync import safe_update_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
@@ -171,17 +169,6 @@ def _native_slice_tools(new_msgs: list) -> list[dict]:
                         "args": args if isinstance(args, dict) else {},
                         "id": p.tool_call_id or "",
                     })
-            continue
-        # Legacy LC AIMessage path
-        tcs = getattr(m, "tool_calls", None) or []
-        for tc in tcs:
-            if not isinstance(tc, dict):
-                continue
-            out.append({
-                "tool": tc.get("name") or tc.get("tool", ""),
-                "args": tc.get("args") or {},
-                "id": tc.get("id") or "",
-            })
     return out
 
 
@@ -408,13 +395,13 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
         # append its transcript slice and finish — the loop's compaction and
         # session logging still see the full history.
         if native_msgs:
-            # Handle both native ModelMessage and legacy LC slice (test compat)
+            # Native full turn always returns ModelMessage slice (P0-LLM).
             if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
                 history.extend(native_msgs)
             else:
                 try:
-                    from llm.pai_transport import _lc_messages_to_pai
-                    _converted = _lc_messages_to_pai(native_msgs)  # type: ignore
+                    from llm.pai_transport import _messages_to_pai
+                    _converted = _messages_to_pai(native_msgs)  # type: ignore
                     history.extend(_converted)
                     native_msgs = _converted
                 except Exception:

@@ -200,22 +200,29 @@ def _model_profile_for(model: str) -> dict | None:
     return None
 
 
-# ── Transcript conversion (LangChain messages -> pydantic-ai ModelMessage) ──
+# ── Transcript conversion (legacy objects / OpenAI dicts -> pydantic-ai) ──
 
 
-def _lc_messages_to_pai(messages: list) -> list[ModelMessage]:
-    """Convert a LangChain transcript into pydantic-ai ModelMessages.
+def _messages_to_pai(messages: list) -> list[ModelMessage]:
+    """Convert legacy transcripts into pydantic-ai ModelMessages.
 
-    Lossless for everything the agent loops store: system/user/assistant
-    (with tool_calls + reasoning_content) / tool results. Image content-block
-    lists pass through as-is inside user parts.
+    Accepts three input shapes:
+    - ``list[ModelMessage]`` — identity (already native).
+    - OpenAI-style dicts ``[{"role": "system|user|assistant|tool", "content": ...}]``
+      (the old ``invoke_with_fallback`` prompt format).
+    - LangChain message objects (kept for scratch-test compat only).
 
-    Empty-content user turns (agent loops emit a bare HumanMessage("") as a
-    continuation marker after tool calls) are dropped — some gateways
-    (command-code) reject ``content: ""``.
+    Image content-block lists pass through as-is inside user parts. Empty
+    content is dropped (some gateways reject ``content: ""``).
     """
     out: list[ModelMessage] = []
     for m in messages or []:
+        if isinstance(m, (ModelRequest, ModelResponse)):
+            out.append(m)
+            continue
+        if isinstance(m, dict):
+            _append_openai_dict(out, m)
+            continue
         kind = type(m).__name__
         content = m.content if hasattr(m, "content") else ""
         if kind == "SystemMessage":
@@ -266,6 +273,50 @@ def _lc_messages_to_pai(messages: list) -> list[ModelMessage]:
     return out
 
 
+def _append_openai_dict(out: list[ModelMessage], m: dict) -> None:
+    """Append one OpenAI-style ``{role, content}`` dict to native history."""
+    role = str(m.get("role") or "").strip().lower()
+    content = m.get("content", "")
+    if role == "system":
+        out.append(ModelRequest(parts=[SystemPromptPart(content=str(content or ""))]))
+    elif role == "assistant":
+        parts: list = []
+        text = str(content or "")
+        if text:
+            parts.append(TextPart(content=text))
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            args = tc.get("args") or {}
+            parts.append(
+                ToolCallPart(
+                    tool_name=str(tc.get("name") or tc.get("tool", "") or ""),
+                    args=args if isinstance(args, (str, dict)) else str(args),
+                    tool_call_id=str(tc.get("id") or f"call-{uuid.uuid4().hex[:8]}"),
+                )
+            )
+        if parts:
+            out.append(ModelResponse(parts=parts))
+    elif role == "tool":
+        out.append(
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name=str(m.get("name") or ""),
+                        content=str(content or ""),
+                        tool_call_id=str(m.get("tool_call_id") or "call-0"),
+                    )
+                ]
+            )
+        )
+    else:  # user (and anything unknown)
+        if content is None:
+            return
+        if isinstance(content, str) and not str(content).strip():
+            return
+        out.append(ModelRequest(parts=[UserPromptPart(content=_as_user_content(content))]))
+
+
 def _as_user_content(content: Any):
     """Keep image content-block lists intact; stringify everything else."""
     if isinstance(content, str):
@@ -292,63 +343,6 @@ def _split_user_prompt(history: list[ModelMessage]) -> tuple[Any, list[ModelMess
                     remaining.pop(i)
                     return p.content, remaining
     return "", history
-
-
-def _pai_to_lc(all_messages: list, prior: list) -> list:
-    """Convert the pydantic-ai messages ADDED by a run back to LangChain.
-
-    ``prior`` is the history we passed in; everything after it in
-    ``all_messages`` is new (assistant text/tool-calls + tool results).
-    Returns LangChain messages (AIMessage with tool_calls, ToolMessage).
-    """
-    from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
-
-    prior_ids = {id(m) for m in prior}
-    added = [m for m in all_messages if id(m) not in prior_ids]
-    out: list = []
-    for m in added:
-        if isinstance(m, ModelResponse):
-            text_parts = []
-            reasoning = ""
-            calls = []
-            for p in m.parts:
-                kind = getattr(p, "part_kind", "")
-                if kind == "text":
-                    text_parts.append(str(p.content))
-                elif kind == "thinking":
-                    reasoning += str(p.content or "")
-                elif kind == "tool-call":
-                    args = p.args
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args or "{}")
-                        except Exception:
-                            args = {}
-                    calls.append(
-                        {
-                            "name": p.tool_name,
-                            "args": args if isinstance(args, dict) else {},
-                            "id": getattr(p, "tool_call_id", "") or "",
-                        }
-                    )
-            kwargs: dict = {}
-            if calls:
-                kwargs["tool_calls"] = calls
-            if reasoning:
-                kwargs["additional_kwargs"] = {"reasoning_content": reasoning}
-            out.append(AIMessage(content="".join(text_parts), **kwargs))
-        elif isinstance(m, ModelRequest):
-            for p in m.parts:
-                from pydantic_ai.messages import ToolReturnPart
-                if isinstance(p, ToolReturnPart):
-                    out.append(
-                        ToolMessage(
-                            content=str(p.content),
-                            name=str(p.tool_name or ""),
-                            tool_call_id=str(p.tool_call_id or ""),
-                        )
-                    )
-    return out
 
 
 def _result_to_native(
@@ -580,7 +574,7 @@ async def apai_native_turn(
     if messages and isinstance(messages[0], (_MR, _MResp)):
         msg_history_full: list[ModelMessage] = list(messages)  # type: ignore
     else:
-        msg_history_full = _lc_messages_to_pai(messages)
+        msg_history_full = _messages_to_pai(messages)
     # pydantic-ai appends `user_prompt` as a user message when not None, so an
     # empty "" would hit gateways that reject empty content. Extract the FIRST
     # user part from the history as the prompt (matching pydantic-ai's own
@@ -916,7 +910,7 @@ async def apai_structured(
     if messages and isinstance(messages[0], (ModelRequest, ModelResponse)):
         _full: list[ModelMessage] = list(messages)  # type: ignore
     else:
-        _full = _lc_messages_to_pai(messages)
+        _full = _messages_to_pai(messages)
     user_prompt, msg_history = _split_user_prompt(_full)
     res = await agent.run(
         user_prompt, message_history=msg_history, cancellation_token=cancellation_token

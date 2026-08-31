@@ -8,8 +8,8 @@ Design per fixed-concept.md A6b:
 - History is List[ModelMessage] (ModelRequest | ModelResponse)
 - Persistence via ModelMessagesTypeAdapter (JSON round-trip)
 - No LangChain SystemMessage/HumanMessage/AIMessage/ToolMessage in new paths
-- Converters _lc_messages_to_pai / _pai_to_lc remain for backward compat
-  but new code builds ModelMessage directly.
+- Legacy LC / OpenAI-dict transcripts convert at the boundary via
+  ``pai_transport._messages_to_pai`` (P0-LLM).
 
 Usage:
   from llm.model_history import dump_history, load_history, build_initial_history

@@ -20,7 +20,6 @@ except ImportError:
             self.operations = operations or []
             self.paths = paths or []
             self.mode = mode
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from tools import get_native_tool_names
 
 class SubagentsRegistry(dict):
@@ -276,7 +275,7 @@ def _specialist_backend(name: str) -> str:
     Precedence: SUBAGENT_MODEL_BACKEND env > active provider mode's
     specialist entry > agents/specialists/*.json spec "backend" > "deepseek".
     Only "free" dispatches to the free pool; every other value rides the paid
-    llm.py path (which itself resolves deepseek | opencode | command).
+    native pydantic-ai path (which itself resolves deepseek | opencode | command).
     """
     if not _SUBAGENTS_REGISTRY:
         _load_subagents()
@@ -648,17 +647,28 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         # All other subagents use the same native loop with a fresh transcript.
         resolved_task = task
 
-        messages = [
-            SystemMessage(content=full_sys_prompt),
-            HumanMessage(content=resolved_task),
-        ]
+        # P0-LLM: native List[ModelMessage] history (no LangChain messages).
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            SystemPromptPart,
+            TextPart,
+            ThinkingPart,
+            ToolCallPart,
+            ToolReturnPart,
+            UserPromptPart,
+        )
+        messages: list = []
+        if full_sys_prompt:
+            messages.append(ModelRequest(parts=[SystemPromptPart(content=full_sys_prompt)]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content=resolved_task)]))
 
         # Vision: inject user-attached images stashed by the API layer.
         try:
             from llm.deps import WorkspaceDeps
             _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
-            from tools.vision_channel import drain_attachment_images
-            drain_attachment_images(messages, ctx=_sub_deps)
+            from tools.vision_channel import drain_attachment_images_native
+            drain_attachment_images_native(messages, ctx=_sub_deps)
         except Exception:
             pass
 
@@ -667,7 +677,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         sub_sess = None
         try:
             from uuid import uuid4
-            from session_log import get_session, find_recent_session
+            from server.session.log import get_session, find_recent_session
             ws = shared_state.get("project_path") or _HARNESS_ROOT
             parent_path = find_recent_session(chat_id, ws) if chat_id else None
             sub_sess = get_session(
@@ -723,8 +733,8 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                     additional_kwargs["reasoning_content"] = reasoning
 
                 # A5: native full turn — pydantic-ai executed the tools already.
-                # The slice (AIMessage tool_calls + ToolMessage results) IS the
-                # execution record; extend history, log to the session, and
+                # The slice (ModelResponse tool-calls + ModelRequest tool results)
+                # IS the execution record; extend history, log to the session, and
                 # finish when the model stopped calling tools.
                 _native_slice = None
                 if isinstance(res, tuple) and len(res) == 3 and _is_native_slice(res[1]):
@@ -734,9 +744,11 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                         additional_kwargs["reasoning_content"] = reasoning
                     messages.extend(_native_slice)
                     _native_calls = [
-                        tc for m in _native_slice
-                        if m.__class__.__name__ == "AIMessage"
-                        for tc in (getattr(m, "tool_calls", None) or [])
+                        {"id": p.tool_call_id or "", "name": p.tool_name or ""}
+                        for m in _native_slice
+                        if isinstance(m, ModelResponse)
+                        for p in getattr(m, "parts", []) or []
+                        if isinstance(p, ToolCallPart)
                     ]
                     if sub_sess is not None:
                         try:
@@ -763,7 +775,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
                 if schema and hasattr(res, "model_dump_json"):
                     content = res.model_dump_json()
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                    messages.append(ModelResponse(parts=[TextPart(content=content)]))
                     if sub_sess is not None:
                         try:
                             sub_sess.append_assistant(content, stop_reason="stop")
@@ -772,7 +784,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                     break  # Structured output â†’ done
                 elif schema and hasattr(res, "json"):
                     content = res.json()
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                    messages.append(ModelResponse(parts=[TextPart(content=content)]))
                     if sub_sess is not None:
                         try:
                             sub_sess.append_assistant(content, stop_reason="stop")
@@ -808,7 +820,11 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
                 if not tool_calls:
                     # No native tool calls: the subagent chose its final response.
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                    parts: list = []
+                    if additional_kwargs.get("reasoning_content"):
+                        parts.append(ThinkingPart(content=additional_kwargs["reasoning_content"]))
+                    parts.append(TextPart(content=content))
+                    messages.append(ModelResponse(parts=parts))
                     if sub_sess is not None:
                         try:
                             blocks = [{"type": "text", "text": content}]
@@ -820,16 +836,19 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                             pass
                     break
 
-                # Record the AI response (native: carry tool_calls for the API round-trip)
-                if native_tool_calls and tool_calls:
-                    messages.append(AIMessage(
-                        content=content,
-                        tool_calls=[{"name": tc["tool"], "args": tc.get("args") or {},
-                                     "id": tc.get("id", "")} for tc in tool_calls],
-                        additional_kwargs=additional_kwargs,
+                # Record the AI response (native: carry tool-call parts)
+                parts: list = []
+                if additional_kwargs.get("reasoning_content"):
+                    parts.append(ThinkingPart(content=additional_kwargs["reasoning_content"]))
+                if content:
+                    parts.append(TextPart(content=content))
+                for tc in tool_calls:
+                    parts.append(ToolCallPart(
+                        tool_name=tc["tool"],
+                        args=tc.get("args") or {},
+                        tool_call_id=tc.get("id", ""),
                     ))
-                else:
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                messages.append(ModelResponse(parts=parts))
 
                 # Child session log (P1): record the step's assistant message
                 if sub_sess is not None:
@@ -903,18 +922,18 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                                          "traceback", "timeout", "not found", "cannot find module")):
                     _sub_trouble = True
                 for tc, result in structured_results:
-                    messages.append(ToolMessage(
+                    messages.append(ModelRequest(parts=[ToolReturnPart(
+                        tool_name=str(tc.get("tool", "")),
                         content=str(result),
-                        tool_call_id=tc["id"],
-                        name=tc.get("tool", ""),
-                    ))
+                        tool_call_id=str(tc["id"]),
+                    )]))
 
                 # Vision: drain tool-queued inline images into ONE user message.
                 try:
                     from llm.deps import WorkspaceDeps
                     _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
-                    from tools.vision_channel import drain_into_messages
-                    drain_into_messages(messages, header="[Inline image(s) from tool result]", ctx=_sub_deps)
+                    from tools.vision_channel import drain_into_messages_native
+                    drain_into_messages_native(messages, header="[Inline image(s) from tool result]", ctx=_sub_deps)
                 except Exception:
                     pass
 
@@ -944,12 +963,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     return _handoff(content, name)
 
 def _is_native_slice(second: list) -> bool:
-    """True when a backend result's 2nd element is a LangChain transcript
-    slice (native full turn) rather than a list of tool-call dicts (free
+    """True when a backend result's 2nd element is a transcript slice
+    (native full turn) rather than a list of tool-call dicts (free
     single-turn triple)."""
     try:
+        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS
         for m in (second or [])[:2]:
-            if hasattr(m, "__class__") and m.__class__.__name__ in ("AIMessage", "ToolMessage"):
+            if isinstance(m, (_MR, _MS)):
                 return True
             if isinstance(m, dict) and ("tool" in m or "name" in m):
                 return False
@@ -984,7 +1004,7 @@ def _run_subagent_in_thread(task_id: str, name: str, task_desc: str, depth: int)
     try:
         _TASK_DEPTH.set(depth)
         from agents.subagent_manager import start_continuable
-        from session_log import find_recent_session
+        from server.session.log import find_recent_session
         from sync.state_sync import shared_state as _ss
         ws = _ss.get("project_path") or _HARNESS_ROOT
         chat_id = str(_ss.get("chat_id") or "")

@@ -22,8 +22,6 @@ import json
 import os
 import uuid
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
 from sync.state_sync import safe_update_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
@@ -312,13 +310,13 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
 
         # Native agent ran the whole turn (tools executed internally).
         if native_msgs:
-            # Handle both native ModelMessage and legacy LC slice (test compat)
+            # Native full turn always returns ModelMessage slice (P0-LLM).
             if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
                 history.extend(native_msgs)
             else:
                 try:
-                    from llm.pai_transport import _lc_messages_to_pai
-                    _converted = _lc_messages_to_pai(native_msgs)  # type: ignore
+                    from llm.pai_transport import _messages_to_pai
+                    _converted = _messages_to_pai(native_msgs)  # type: ignore
                     history.extend(_converted)
                     native_msgs = _converted
                 except Exception:

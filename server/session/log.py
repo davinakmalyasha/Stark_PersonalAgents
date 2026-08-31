@@ -736,27 +736,12 @@ class SessionManager:
     def build_session_context(self, native: bool = False) -> tuple[list[Any], Optional[str], Optional[str]]:
         """(messages, model, thinking_level) for the current leaf.
 
-        When ``native`` is False (default) messages are LangChain
-        ``BaseMessage`` objects via :func:`convert_to_llm` (legacy, kept for
-        test compat).  When ``native`` is True the primary path is used:
-        ``List[ModelMessage]`` via :func:`convert_to_model_messages`.
+        ``native=True`` (primary) returns ``List[ModelMessage]`` via
+        :func:`convert_to_model_messages`. P0-LLM: the legacy LangChain
+        projection is deleted — ``native=False`` falls back to the same
+        native conversion for callers that never passed the flag.
         """
-        if native:
-            return self.build_session_context_native()
-        entries = self.build_context_entries()
-        from langchain_core.messages import BaseMessage
-
-        messages: list[BaseMessage] = []
-        model: Optional[str] = None
-        thinking_level: Optional[str] = None
-        for e in entries:
-            if isinstance(e, ModelChangeEntry):
-                model = e.model_id or model
-            elif isinstance(e, ThinkingLevelChangeEntry):
-                thinking_level = e.thinking_level
-        converted = convert_to_llm(entries)
-        messages.extend(converted)
-        return messages, model, thinking_level
+        return self.build_session_context_native()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -981,79 +966,6 @@ def convert_to_model_messages(
                     content=_entry_text(e.content, include_thinking),
                     tool_call_id=e.tool_call_id,
                 )]))
-    return out
-
-
-def convert_to_llm(
-    entries: list[SessionEntry],
-    *,
-    include_thinking: bool = False,
-    native_tool_calls: bool = True,
-    include_custom_messages: bool = True,
-) -> list[Any]:
-    """Convert session entries into LangChain messages (the single projection).
-
-    - user / custom_message -> ``HumanMessage``
-    - assistant -> ``AIMessage`` (thinking stripped unless ``include_thinking``;
-      toolCall blocks become native ``tool_calls`` when ``native_tool_calls``,
-      otherwise rendered as ```tool text blocks so legacy parsers work)
-    - toolResult -> ``ToolMessage`` (paired via ``tool_call_id``)
-    - compaction -> ``HumanMessage`` summary + its ``retainedTail`` messages
-    - branch_summary -> ``HumanMessage`` summary
-    - everything else -> skipped
-    """
-    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-
-    out: list[Any] = []
-    for e in entries:
-        if isinstance(e, CompactionEntry):
-            if e.summary:
-                out.append(HumanMessage(
-                    content=f"[Context summary]\n{e.summary}",
-                    additional_kwargs={"role": "compaction"},
-                ))
-            if e.retained_tail:
-                out.extend(convert_to_llm(
-                    e.retained_tail,
-                    include_thinking=include_thinking,
-                    native_tool_calls=native_tool_calls,
-                    include_custom_messages=include_custom_messages,
-                ))
-            continue
-        if isinstance(e, BranchSummaryEntry):
-            if e.summary:
-                out.append(HumanMessage(
-                    content=f"[Abandoned branch summary]\n{e.summary}",
-                    additional_kwargs={"role": "branch_summary"},
-                ))
-            continue
-        if isinstance(e, MessageEntry):
-            if e.role == "user":
-                out.append(HumanMessage(content=_entry_text(e.content, include_thinking)))
-            elif e.role == "custom_message":
-                if include_custom_messages:
-                    out.append(HumanMessage(content=_entry_text(e.content, include_thinking)))
-            elif e.role == "assistant":
-                if e.stop_reason == "error" and not _entry_text(e.content, include_thinking):
-                    continue
-                tool_calls = _entry_tool_calls(e.content)
-                text = _entry_text(e.content, include_thinking)
-                if tool_calls and native_tool_calls:
-                    out.append(AIMessage(content=text, tool_calls=tool_calls))
-                else:
-                    rendered = _entry_text_with_tool_blocks(e.content) if tool_calls else text
-                    out.append(AIMessage(content=rendered))
-            elif e.role == "toolResult":
-                if not e.tool_call_id:
-                    continue
-                out.append(ToolMessage(
-                    content=_entry_text(e.content, include_thinking),
-                    tool_call_id=e.tool_call_id,
-                    additional_kwargs={
-                        "tool_name": e.tool_name or "",
-                        "is_error": e.is_error,
-                    },
-                ))
     return out
 
 

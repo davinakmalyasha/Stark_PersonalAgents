@@ -17,7 +17,7 @@ from langchain_core.messages import (
 )
 
 from llm.pai_transport import (
-    _lc_messages_to_pai,
+    _messages_to_pai,
     _result_to_native,
     _as_user_content,
 )
@@ -33,7 +33,7 @@ msgs = [
     ),
     ToolMessage(content="30C", tool_call_id="c1", name="get_weather"),
 ]
-pai = _lc_messages_to_pai(msgs)
+pai = _messages_to_pai(msgs)
 print("converted messages:", len(pai))
 assert len(pai) == 4, f"expected 4, got {len(pai)}"
 
@@ -93,7 +93,7 @@ img_content = [
     {"type": "text", "text": "look at this"},
 ]
 hm = HumanMessage(content=img_content)
-up = _lc_messages_to_pai([hm])[0].parts[0]
+up = _messages_to_pai([hm])[0].parts[0]
 assert isinstance(up.content, list) and up.content[0]["type"] == "image_url"
 assert up.content[1]["text"] == "look at this"
 print("OK: image content passthrough")

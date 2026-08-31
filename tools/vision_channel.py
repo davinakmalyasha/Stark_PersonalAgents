@@ -125,3 +125,73 @@ def drain_attachment_images(messages: list, cap: int = 4) -> int:
     except Exception:
         pass
     return 0
+
+
+# ── Native ModelMessage helpers (A6b) ─────────────────────────────────────
+
+def build_image_message_native(images: list[dict], header: str = "[Inline image(s) from tool result]") -> list:
+    """Build ONE ModelRequest whose UserPromptPart carries text + images (A6b).
+
+    Returns [ModelRequest] or [] — safe to extend onto history: list[ModelMessage].
+    Uses BinaryContent.from_data_uri for data: URLs and ImageUrl for https.
+    """
+    if not images:
+        return []
+    try:
+        from pydantic_ai.messages import BinaryContent, ImageUrl, ModelRequest, UserPromptPart
+        text = header
+        for img in images:
+            if img.get("note"):
+                text += f"\n- {img['note']}"
+        content: list = [text]
+        for img in images:
+            url = img.get("url") or ""
+            if url.startswith("data:"):
+                try:
+                    content.append(BinaryContent.from_data_uri(url))
+                except Exception:
+                    content.append(url)
+            elif url.startswith("http"):
+                try:
+                    content.append(ImageUrl(url=url))
+                except Exception:
+                    content.append(url)
+            else:
+                content.append(url)
+        # If only text + no images parsed, keep text-only
+        if len(content) == 1:
+            return [ModelRequest(parts=[UserPromptPart(content=text)])]
+        return [ModelRequest(parts=[UserPromptPart(content=content)])]
+    except Exception:
+        return []
+
+
+def drain_into_messages_native(history: list, header: str = "[Inline image(s) from tool result]") -> int:
+    """Drain queued images into native history (ModelMessage). Returns count."""
+    imgs = drain_images()
+    if not imgs:
+        return 0
+    msgs = build_image_message_native(imgs, header)
+    if msgs:
+        history.extend(msgs)
+        return len(imgs)
+    return 0
+
+
+def drain_attachment_images_native(history: list, cap: int = 4) -> int:
+    """Native variant of drain_attachment_images for ModelMessage history."""
+    try:
+        from sync.state_sync import safe_get_state, safe_update_state
+        paths = safe_get_state().get("attachment_image_paths") or []
+        if not paths:
+            return 0
+        safe_update_state({"attachment_image_paths": []})
+        injected = 0
+        for p in paths[:max(0, int(cap))]:
+            if queue_image_file(p, note="user attachment"):
+                injected += 1
+        if injected:
+            return drain_into_messages_native(history, header="[User attached image(s)]")
+    except Exception:
+        pass
+    return 0

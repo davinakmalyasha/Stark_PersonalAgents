@@ -1805,43 +1805,9 @@ def stream_complete(messages=None, prompt="", tools=None, tool_choice=None,
 def to_native_messages(messages: list) -> list[dict]:
     """LangChain transcript -> OpenAI-native dicts (free transport).
     Image content-block lists pass through untouched."""
-    out: list[dict] = []
-    for m in messages:
-        kind = type(m).__name__
-        content = getattr(m, "content", "")
-        if kind == "SystemMessage":
-            out.append({"role": "system", "content": content})
-        elif kind == "HumanMessage":
-            out.append({"role": "user", "content": content})
-        elif kind == "AIMessage":
-            entry = {"role": "assistant", "content": content or ""}
-            tcs = getattr(m, "tool_calls", None) or []
-            if tcs:
-                entry["tool_calls"] = [
-                    {
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name") or tc.get("tool", ""),
-                            "arguments": json.dumps(
-                                tc.get("args") or {}, separators=(",", ":")
-                            ),
-                        },
-                    }
-                    for tc in tcs
-                    if isinstance(tc, dict)
-                ]
-            out.append(entry)
-        elif kind == "ToolMessage":
-            out.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
-                    "name": getattr(m, "name", "") or "",
-                    "content": str(content),
-                }
-            )
-    return out
+    from llm.native_conv import lc_to_native
+
+    return lc_to_native(messages)
 
 
 def list_remote_models(provider: str, timeout: float = 15.0) -> list[dict]:
@@ -1949,6 +1915,93 @@ def _free_turn_emitters(name: str, chat_id: str):
         return None, None
 
 
+def _model_messages_to_native(history: list) -> list[dict]:
+    """ModelMessage -> OpenAI-native dicts for free pool (A6b)."""
+    out: list[dict] = []
+    try:
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            SystemPromptPart,
+            ToolCallPart,
+            ToolReturnPart,
+            UserPromptPart,
+            TextPart,
+            ThinkingPart,
+            BinaryContent,
+            ImageUrl,
+        )
+    except Exception:
+        return out
+    for m in history or []:
+        try:
+            if isinstance(m, ModelRequest):
+                for p in getattr(m, "parts", []) or []:
+                    if isinstance(p, SystemPromptPart):
+                        out.append({"role": "system", "content": p.content})
+                    elif isinstance(p, UserPromptPart):
+                        c = p.content
+                        if isinstance(c, str):
+                            out.append({"role": "user", "content": c})
+                        elif isinstance(c, list):
+                            text_parts: list[str] = []
+                            image_parts: list[dict] = []
+                            for item in c:
+                                if isinstance(item, str):
+                                    text_parts.append(item)
+                                elif isinstance(item, BinaryContent):
+                                    try:
+                                        import base64
+                                        b64 = base64.b64encode(item.data).decode("ascii")
+                                        mime = getattr(item, "media_type", "image/png") or "image/png"
+                                        url = f"data:{mime};base64,{b64}"
+                                        image_parts.append({"type": "image_url", "image_url": {"url": url}})
+                                    except Exception:
+                                        text_parts.append(str(item))
+                                elif isinstance(item, ImageUrl):
+                                    try:
+                                        image_parts.append({"type": "image_url", "image_url": {"url": item.url}})
+                                    except Exception:
+                                        text_parts.append(str(item))
+                                else:
+                                    text_parts.append(str(item))
+                            if text_parts and image_parts:
+                                out.append({"role": "user", "content": [{"type": "text", "text": "\n".join(text_parts)}] + image_parts})
+                            elif image_parts:
+                                out.append({"role": "user", "content": image_parts})
+                            elif text_parts:
+                                out.append({"role": "user", "content": "\n".join(text_parts)})
+                            else:
+                                out.append({"role": "user", "content": ""})
+                        else:
+                            out.append({"role": "user", "content": str(c)})
+                    elif isinstance(p, ToolReturnPart):
+                        out.append({"role": "tool", "tool_call_id": p.tool_call_id or "", "name": p.tool_name or "", "content": str(p.content or "")})
+            elif isinstance(m, ModelResponse):
+                text = ""
+                tool_calls: list[dict] = []
+                for p in getattr(m, "parts", []) or []:
+                    if isinstance(p, TextPart):
+                        text += p.content or ""
+                    elif isinstance(p, ToolCallPart):
+                        args = p.args if isinstance(p.args, dict) else {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        tool_calls.append({"id": p.tool_call_id or "", "type": "function", "function": {"name": p.tool_name or "", "arguments": json.dumps(args, separators=(",", ":"))}})
+                    elif isinstance(p, ThinkingPart):
+                        pass
+                entry: dict = {"role": "assistant", "content": text or ""}
+                if tool_calls:
+                    entry["tool_calls"] = tool_calls
+                out.append(entry)
+        except Exception:
+            continue
+    return out
+
+
 def free_native_turn(
     name: str,
     messages: list,
@@ -1967,9 +2020,19 @@ def free_native_turn(
     fallback by design.
     """
     pool = FreeProviders()
-    native_msgs = messages if (
-        messages and isinstance(messages[0], dict)
-    ) else to_native_messages(messages or [])
+    # A6b: native ModelMessage support
+    if messages and isinstance(messages[0], dict):
+        native_msgs = messages
+    else:
+        try:
+            from pydantic_ai.messages import ModelRequest, ModelResponse
+
+            if messages and isinstance(messages[0], (ModelRequest, ModelResponse)):
+                native_msgs = _model_messages_to_native(messages)
+            else:
+                native_msgs = to_native_messages(messages or [])
+        except Exception:
+            native_msgs = to_native_messages(messages or [])
     on_token, on_reasoning = _free_turn_emitters(name, "")
     extra = {}
     if max_context_tokens is not None:

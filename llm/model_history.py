@@ -133,3 +133,102 @@ def history_to_debug_text(history: list[ModelMessage]) -> str:
                 elif isinstance(p, ToolCallPart):
                     lines.append(f"[CALL {p.tool_name} {p.tool_call_id}] {str(p.args)[:300]}")
     return "\n".join(lines)
+
+
+# ── Native compaction helpers (A6b/A7) ────────────────────────────────────
+
+def _estimate_single(msg: ModelMessage) -> int:
+    """Token estimate for one ModelMessage (4 chars/token)."""
+    total = 0
+    for p in getattr(msg, "parts", []) or []:
+        c = getattr(p, "content", "") or ""
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, (list, dict)):
+            total += len(json.dumps(c))
+        args = getattr(p, "args", None)
+        if isinstance(args, dict):
+            total += len(json.dumps(args))
+        elif isinstance(args, str):
+            total += len(args)
+        # ToolReturnPart.content may be large
+        if isinstance(p, ToolReturnPart):
+            total += len(str(p.content or ""))
+    return max(1, total // 4)
+
+
+def select_tail_history(
+    history: list[ModelMessage],
+    budget_tokens: int = 20000,
+    keep_recent_turns: int = 2,
+    min_keep_messages: int = 3,
+) -> list[int]:
+    """Select tail indices for native history (mirrors context_compaction.select_tail_indices).
+
+    Never includes index 0 (system). Keeps whole messages as atomic units
+    (ModelMessage already groups ToolCall/ToolReturn correctly).
+    """
+    if len(history) <= 2:
+        return list(range(len(history)))
+    # Exclude system prompt at 0
+    body_start = 1
+    if len(history) <= body_start:
+        return list(range(len(history)))
+    # Greedy from end while budget allows
+    selected: list[int] = []
+    total = 0
+    for idx in range(len(history) - 1, body_start - 1, -1):
+        est = _estimate_single(history[idx])
+        if total + est <= budget_tokens or len(selected) < min_keep_messages:
+            selected.append(idx)
+            total += est
+            if len(selected) >= keep_recent_turns and total >= budget_tokens:
+                break
+        elif total + est > budget_tokens and len(selected) >= min_keep_messages:
+            break
+        else:
+            selected.append(idx)
+            total += est
+    selected.sort()
+    # Ensure at least min_keep_messages if possible
+    if len(selected) < min_keep_messages and len(history) > 1:
+        selected = list(range(max(1, len(history) - min_keep_messages), len(history)))
+    return selected
+
+
+def compact_history_native(
+    history: list[ModelMessage],
+    *,
+    policy=None,
+    full_project_map: str | None = None,
+    summary_text: str | None = None,
+) -> list[ModelMessage]:
+    """Native counterpart to checkpoint_compact for ModelMessage history.
+
+    Rebuilds [System, <current-context>fullMap?, summary, tail] when history
+    exceeds policy tail budget. Used by ProcessHistory or manual compaction.
+    """
+    if len(history) <= 2:
+        return history
+    # Resolve policy
+    try:
+        from memory.context_compaction import get_compaction_policy
+        pol = policy or get_compaction_policy("developer")
+    except Exception:
+        pol = None
+    tail_budget = getattr(pol, "tail_budget_tokens", 20000) if pol else 20000
+    tail_indices = select_tail_history(history, budget_tokens=tail_budget)
+    # Tail messages (exclude system + project map)
+    tail = [history[i] for i in tail_indices if i != 0]
+    # System prompt (preserve)
+    system_msg = history[0] if history and isinstance(history[0], ModelRequest) else None
+    compacted: list[ModelMessage] = []
+    if system_msg is not None:
+        compacted.append(system_msg)
+    if full_project_map:
+        compacted.append(ModelRequest(parts=[UserPromptPart(content=f"<current-context>\n{full_project_map}\n</current-context>")]))
+    # Summary
+    summary = summary_text or "[Conversation truncated for length — earlier turns summarized]"
+    compacted.append(ModelRequest(parts=[UserPromptPart(content=f"[COMPACTION SUMMARY]\n{summary}")]))
+    compacted.extend(tail)
+    return compacted

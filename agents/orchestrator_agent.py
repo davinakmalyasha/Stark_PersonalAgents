@@ -28,12 +28,23 @@ from tools import (
 )
 from llm.deps import WorkspaceDeps
 from llm.loop_detector import LoopGuard
+from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
 from memory.context_compaction import (
     compact_history,
     get_compaction_policy,
 )
 from inbox import drain_steering, drain_follow_up, consume_abort, render_delivery
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 
 # A2: the orchestrator's model/tool loop is now a single native pydantic-ai
@@ -44,9 +55,27 @@ from inbox import drain_steering, drain_follow_up, consume_abort, render_deliver
 # park/wait decision.
 
 def _native_slice_tools(new_msgs: list) -> list[dict]:
-    """Extract tool calls from the native run's LangChain transcript slice."""
+    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
     out: list[dict] = []
     for m in new_msgs or []:
+        # Native ModelMessage path: ModelResponse with ToolCallPart
+        if isinstance(m, ModelResponse):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolCallPart):
+                    args = p.args if isinstance(p.args, dict) else {}
+                    if isinstance(args, str):
+                        try:
+                            import json
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    out.append({
+                        "tool": p.tool_name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": p.tool_call_id or "",
+                    })
+            continue
+        # Legacy LC AIMessage path
         tcs = getattr(m, "tool_calls", None) or []
         for tc in tcs:
             if not isinstance(tc, dict):
@@ -70,6 +99,25 @@ def _native_slice_delegated(new_msgs: list) -> bool:
 def _native_slice_failures(new_msgs: list) -> bool:
     """True if a delegation tool result reported failure (adaptive ladder)."""
     for m in new_msgs or []:
+        # Native path: ModelRequest with ToolReturnPart
+        if isinstance(m, ModelRequest):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolReturnPart):
+                    tname = p.tool_name or ""
+                    content = str(p.content or "")
+                    low = content.lower()
+                    if tname in ("delegate", "task", "async_task", "resume_project"):
+                        if content.startswith("ERROR") or any(
+                            marker in low
+                            for marker in (
+                                "handoff report [failed]", "handoff report [blocked]",
+                                "handoff report [stuck]", "[failed]", "[blocked]",
+                                "timed out",
+                            )
+                        ):
+                            return True
+            continue
+        # Legacy LC ToolMessage path
         tname = getattr(m, "name", "") or ""
         content = str(getattr(m, "content", "") or "")
         low = content.lower()
@@ -280,16 +328,13 @@ def _orchestrator_loop(s: ITState) -> dict:
     except Exception:
         pass
 
-    messages = [
-        SystemMessage(content=static_system),
-        HumanMessage(content=task_message),
-    ]
+    # A6b: native ModelMessage history
+    history: list[ModelMessage] = build_initial_history(static_system, task_message)
 
-    # Vision: inject user-attached images (from the API stash) before the first
-    # LLM call so they are visible from turn one.
+    # Vision: inject user-attached images before first LLM call (native)
     try:
-        from tools.vision_channel import drain_attachment_images
-        if drain_attachment_images(messages):
+        from tools.vision_channel import drain_attachment_images_native
+        if drain_attachment_images_native(history):
             _log("[VISION] Orchestrator: user attachment image(s) injected")
     except Exception:
         pass
@@ -303,7 +348,7 @@ def _orchestrator_loop(s: ITState) -> dict:
             pass
 
     content = ""  # Initialize --- set during loop
-    existing_ids = {m.id for m in messages if getattr(m, "id", None)}
+    existing_len = len(history)
     iteration = 0
     park_timeouts = 0  # consecutive wait windows expired with children alive
     nudge_count = 0    # exit-too-short nudges issued this run (capped)
@@ -330,25 +375,28 @@ def _orchestrator_loop(s: ITState) -> dict:
             _log("[ORCHESTRATOR] Aborted by user request.")
             break
 
-        # Append below the shared threshold; at the threshold the same single
-        # checkpoint operation used by Dev compacts the replaceable transcript.
+        # A6b/A7: native compaction — estimate_history_tokens + compact_history_native
         if iteration > 1:
             try:
-                messages, compaction_info = compact_history(
-                    messages,
-                    tool_call_log=tool_call_log,
-                    policy=compaction_policy,
-                    chat_id=chat_id,
-                )
-                if compaction_info.get("checkpoint"):
+                est = estimate_history_tokens(history)
+                if est >= compaction_policy.checkpoint_trigger:
+                    from llm.model_history import compact_history_native
+
+                    before = est
+                    history = compact_history_native(
+                        history,
+                        policy=compaction_policy,
+                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                    )
+                    after = estimate_history_tokens(history)
                     _log(
-                        f"[ORCHESTRATOR] Single {compaction_info.get('trigger')} checkpoint "
-                        f"({compaction_info['before']:,} -> {compaction_info['after']:,} est. tokens; "
+                        f"[ORCHESTRATOR] Native checkpoint "
+                        f"({before:,} -> {after:,} est. tokens; "
                         f"tail={compaction_policy.tail_budget_tokens:,})"
                     )
                     orch_think = True  # rebuilt context -> one careful re-orientation turn
             except Exception as e:
-                _log(f"[ORCHESTRATOR] Compaction error (non-fatal): {e}")
+                _log(f"[ORCHESTRATOR] Native compaction error (non-fatal): {e}")
 
         # â”€â”€ Call LLM (native full turn — A2) â”€â”€
         # The pydantic-ai agent executes orchestrator tools internally
@@ -391,7 +439,7 @@ def _orchestrator_loop(s: ITState) -> dict:
 
                 response_text, native_tool_calls, _reasoning = free_native_turn(
                     "Orchestrator",
-                    list(messages),
+                    list(history),
                     tools=native_orchestrator_tools,
                     capability="text",
                     prefer_reasoning=bool(_oplan.get("think_bias", False)),
@@ -402,7 +450,7 @@ def _orchestrator_loop(s: ITState) -> dict:
                 # Native full turn (A2) — tools executed inside pydantic-ai.
                 response_text, native_msgs, reasoning_content = run_native_agent(
                     role="Orchestrator",
-                    messages=list(messages),
+                    messages=list(history),
                     tools=native_orchestrator_tools,
                     temp=0.2,
                     reasoning_effort=orch_effort,
@@ -421,14 +469,24 @@ def _orchestrator_loop(s: ITState) -> dict:
         if reasoning_content:
             _log(f"[THINKING] Supervisor: {reasoning_content.strip()}")
 
-        # A2: native full turn always appends its transcript slice. The slice
-        # (AIMessage tool_calls + ToolMessage results) IS the tool-execution
-        # record — no manual execute loop, no ToolMessage re-append.
+        # A2: native full turn always appends its transcript slice (ModelMessage)
         if native_msgs:
-            messages.extend(native_msgs)
+            # Handle both native ModelMessage and legacy LC slice (test compat)
+            if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
+                history.extend(native_msgs)
+            else:
+                try:
+                    from llm.pai_transport import _lc_messages_to_pai
+                    # Convert LC AIMessage/ToolMessage slice to ModelMessage for native history
+                    _converted = _lc_messages_to_pai(native_msgs)  # type: ignore
+                    # _lc_messages_to_pai returns full list; for slice it is already ModelResponse/ModelRequest
+                    history.extend(_converted)
+                    native_msgs = _converted  # for _native_slice_tools to work with ModelMessage path
+                except Exception:
+                    history.extend(native_msgs)  # fallback, keep as-is
             tool_calls: list[dict] = _native_slice_tools(native_msgs)
         else:
-            # Free-pool path: legacy single-turn protocol (manual execution).
+            # Free-pool path: single-turn protocol — build ModelMessage slice
             tool_calls = []
             for call_index, tc in enumerate(native_tool_calls or []):
                 tname = tc.get("tool") or tc.get("name") if isinstance(tc, dict) else ""
@@ -445,6 +503,16 @@ def _orchestrator_loop(s: ITState) -> dict:
                         "id": (tc.get("id") if isinstance(tc, dict) else None)
                         or f"orch-call-{iteration}-{call_index}-{uuid.uuid4().hex[:8]}",
                     })
+            # Keep history native even for free pool: materialize a ModelResponse
+            if response_text or tool_calls:
+                from pydantic_ai.messages import TextPart as _TPart, ToolCallPart as _TCPart, ModelResponse as _MResp
+                _parts = []
+                if response_text:
+                    _parts.append(_TPart(content=response_text))
+                for tc in tool_calls:
+                    _parts.append(_TCPart(tool_name=tc["tool"], args=tc["args"], tool_call_id=tc["id"]))
+                if _parts:
+                    history.append(_MResp(parts=_parts))
 
         if not tool_calls:
             # Agent is done --- no more tools to call.
@@ -491,23 +559,17 @@ def _orchestrator_loop(s: ITState) -> dict:
                 if payload_parts:
                     _log(f"[ORCHESTRATOR] Woke with {len(wait['events'])} result(s), "
                          f"{len(wait['steering'])} steering â€” new coordination turn")
-                    messages.append(HumanMessage(
-                        content="\n\n".join(payload_parts),
-                        id=f"orch-park-{iteration}-{uuid.uuid4()}",
-                    ))
+                    history.append(ModelRequest(parts=[UserPromptPart(content="\n\n".join(payload_parts))]))
                     continue
                 if wait["timed_out"] and _dlg.running_count(chat_id) > 0:
                     park_timeouts += 1
                     if park_timeouts >= 3:
                         _log("[ORCHESTRATOR] Wait timeout x3 with children alive â€” reporting partial.")
-                        messages.append(HumanMessage(
-                            content=render_delivery("SYSTEM", [
+                        history.append(ModelRequest(parts=[UserPromptPart(content=render_delivery("SYSTEM", [
                                 "Delegations exceeded the maximum wait window and are STILL RUNNING. "
                                 "Give the user a partial report now: what finished, what is outstanding, "
                                 f"and which chats to check. Do NOT spawn duplicates.",
-                            ]),
-                            id=f"orch-park-timeout-{iteration}-{uuid.uuid4()}",
-                        ))
+                            ]))]))
                         park_timeouts = 0  # allow one final summary turn, then exit below via no-children rule
                         continue
                     _log(f"[ORCHESTRATOR] Wait timeout #{park_timeouts} â€” re-parking (children alive)")
@@ -522,20 +584,14 @@ def _orchestrator_loop(s: ITState) -> dict:
             if is_too_short and delegated_work and nudge_count < 2:
                 nudge_count += 1
                 _log(f"[ORCHESTRATOR] Exit too short â€” nudging ({nudge_count}/2).")
-                messages.append(HumanMessage(
-                    content="[NUDGE] That response was too brief. Summarize what was accomplished and offer a next step the user might want.",
-                    id=f"orch-exit-nudge-{iteration}-{uuid.uuid4()}"
-                ))
+                history.append(ModelRequest(parts=[UserPromptPart(content="[NUDGE] That response was too brief. Summarize what was accomplished and offer a next step the user might want.")]))
                 continue  # Back to LLM loop for corrected summary
 
             # â”€â”€ Inbox (P2): follow-up work queued while running â†’ keep going â”€â”€
             follow_msgs = drain_follow_up(chat_id)
             if follow_msgs:
-                _log(f"[ORCHESTRATOR] Follow-up queued ({len(follow_msgs)}) â€” continuing")
-                messages.append(HumanMessage(
-                    content=render_delivery("FOLLOW-UP", follow_msgs),
-                    id=f"orch-followup-{iteration}-{uuid.uuid4()}",
-                ))
+                _log(f"[ORCHESTRATOR] Follow-up queued ({len(follow_msgs)}) — continuing")
+                history.append(ModelRequest(parts=[UserPromptPart(content=render_delivery("FOLLOW-UP", follow_msgs))]))
                 continue
 
             _log(f"\n[ORCHESTRATOR] Agent finished after {iteration} iterations")
@@ -635,11 +691,7 @@ def _orchestrator_loop(s: ITState) -> dict:
                     "timed_out": execution.timed_out if execution else False,
                     "offloaded": execution.offloaded if execution else False,
                 })
-                messages.append(ToolMessage(
-                    content=result_str,
-                    tool_call_id=call_id,
-                    name=tool_name or None,
-                ))
+                history.append(ModelRequest(parts=[ToolReturnPart(tool_name=tool_name or "tool", content=result_str, tool_call_id=call_id)]))
         else:
             # Native path: feed tool_call_log from the native slice so the
             # return contract (code_updated) and adaptive ladder see the tools.
@@ -655,10 +707,10 @@ def _orchestrator_loop(s: ITState) -> dict:
             if _native_slice_failures(native_msgs):
                 orch_think = True
 
-        # Vision: drain any inline images queued by tools into ONE user message.
+        # Vision: drain any inline images queued by tools into ONE user message (native).
         try:
-            from tools.vision_channel import drain_into_messages
-            if drain_into_messages(messages, header="[Inline image(s) from tool result]"):
+            from tools.vision_channel import drain_into_messages_native
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
                 _log(f"[VISION] Orchestrator iter {iteration}: inline image(s) injected")
         except Exception:
             pass
@@ -667,14 +719,12 @@ def _orchestrator_loop(s: ITState) -> dict:
         # step's tool calls) â€” the model sees it on the next iteration â”€â”€
         steer_msgs = drain_steering(chat_id)
         if steer_msgs:
-            _log(f"[ORCHESTRATOR] Steering queued ({len(steer_msgs)}) â€” injecting")
-            messages.append(HumanMessage(
-                content=render_delivery("STEERING", steer_msgs),
-                id=f"orch-steer-{iteration}-{uuid.uuid4()}",
-            ))
+            _log(f"[ORCHESTRATOR] Steering queued ({len(steer_msgs)}) — injecting")
+            history.append(ModelRequest(parts=[UserPromptPart(content=render_delivery("STEERING", steer_msgs))]))
 
     # â”€â”€ Return â”€â”€
-    new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
+    # A6b: native slice
+    new_msgs = history[existing_len:]
     final_report = _extract_text_response(content) if content else ""
     final_error = ""
     if not final_report:

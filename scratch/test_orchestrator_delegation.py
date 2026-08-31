@@ -293,6 +293,53 @@ def _native_slice(text: str, tool_calls: list) -> list:
     return msgs
 
 
+def _extract_ctx(messages) -> str:
+    """Extract text content from either LC or ModelMessage history (A6b)."""
+    parts = []
+    for m in messages or []:
+        # Native ModelMessage
+        try:
+            from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart, SystemPromptPart, ToolReturnPart, ToolCallPart
+            if isinstance(m, (ModelRequest, ModelResponse)):
+                for p in getattr(m, "parts", []) or []:
+                    if isinstance(p, (UserPromptPart, SystemPromptPart)):
+                        c = p.content
+                        if isinstance(c, str):
+                            parts.append(c)
+                        elif isinstance(c, list):
+                            for item in c:
+                                if isinstance(item, str):
+                                    parts.append(item)
+                                else:
+                                    try:
+                                        parts.append(str(item))
+                                    except Exception:
+                                        pass
+                        else:
+                            parts.append(str(c))
+                    elif isinstance(p, TextPart):
+                        parts.append(p.content or "")
+                    elif isinstance(p, ToolReturnPart):
+                        parts.append(str(p.content or ""))
+                    elif isinstance(p, ToolCallPart):
+                        # tool calls not part of ctx sentinel check, but include
+                        parts.append(str(p.args))
+                continue
+        except Exception:
+            pass
+        # LC fallback
+        c = getattr(m, "content", "") or ""
+        if isinstance(c, list):
+            for item in c:
+                if isinstance(item, dict) and "text" in item:
+                    parts.append(item["text"])
+                else:
+                    parts.append(str(item))
+        else:
+            parts.append(str(c))
+    return "\n".join(parts)
+
+
 def _native_turn_executor(decide):
     """Wrap a fake decision fn into a run_native_agent-compatible fake.
 
@@ -339,7 +386,7 @@ def test_orchestrator_spawns_parks_forwards_finishes(fake_env, monkeypatch):
 
     def decide(messages):
         turn["n"] += 1
-        ctx = "\n".join(getattr(m, "content", "") for m in messages)
+        ctx = _extract_ctx(messages)
         if not saw_spawn["v"]:
             saw_spawn["v"] = True
             return ("Spawning your requests.", [{"tool": "delegate", "args": {"items": [
@@ -525,7 +572,7 @@ def test_orchestrator_handles_steering_mid_park(fake_env, monkeypatch):
     saw_note = {"v": False}
 
     def decide(messages):
-        ctx = "\n".join(getattr(m, "content", "") for m in messages)
+        ctx = _extract_ctx(messages)
         if not saw_spawn["v"]:
             # The child is HELD open so the park is definitely active when the
             # new user task arrives mid-run.
@@ -589,7 +636,7 @@ def test_orchestrator_timeout_partial_report(fake_env, monkeypatch):
     turn = {"n": 0}
 
     def decide(messages):
-        ctx = "\n".join(getattr(m, "content", "") for m in messages)
+        ctx = _extract_ctx(messages)
         if not saw_timeout["armed"]:
             # First turn: spawn. The child (blocked_house) is held by the gate.
             saw_timeout["armed"] = True
@@ -669,7 +716,7 @@ def test_double_delegate_in_one_turn(fake_env, monkeypatch):
     saw_spawn = {"v": False}
 
     def decide(messages):
-        ctx = "\n".join(getattr(m, "content", "") for m in messages)
+        ctx = _extract_ctx(messages)
         if not saw_spawn["v"]:
             saw_spawn["v"] = True
             return ("Two at once.", [

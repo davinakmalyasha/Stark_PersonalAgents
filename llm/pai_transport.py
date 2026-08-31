@@ -134,11 +134,9 @@ def _build_model_settings(
 ) -> dict:
     """Build portable ModelSettings — uses `thinking` not hand-rolled extra_body.
 
-    Unified `thinking` (ThinkingLevel) maps automatically to provider fields
-    (openai_reasoning_effort / anthropic_thinking / google_thinking). Budget
-    tokens are forwarded via extra_body only when explicitly requested. The
-    legacy _THINKING_PINS prefix-cache freeze is removed — portable thinking
-    eliminates the enabled<->disabled flip that busted the cache.
+    Golden rule (per maintainer): no ladder. Static per-role mapping:
+      developer/dfd = high, orchestrator/general/house = low.
+    Explicit `reasoning_effort` still overrides (disabled/low/medium/high).
     """
     settings: dict[str, Any] = {"temperature": temp, "parallel_tool_calls": True}
     thinking: Any = None
@@ -147,48 +145,41 @@ def _build_model_settings(
         e = str(reasoning_effort).strip().lower()
         if e in ("disabled", "none", ""):
             thinking = False
-        elif e == "max":
-            thinking = "high"
-            if reasoning_budget is None:
-                try:
-                    reasoning_budget = int(os.getenv("REASONING_MAX_BUDGET", "32768"))
-                except Exception:
-                    reasoning_budget = 32768
         elif e in ("minimal", "low", "medium", "high", "xhigh"):
             thinking = e
         elif e in ("true", "1", "enabled"):
             thinking = True
-        elif e == "false" or e == "0":
+        elif e in ("false", "0"):
             thinking = False
+        elif e == "max":
+            thinking = "high"
         else:
             thinking = "high"
     elif _is_reasoning_model(model):
-        is_orchestrator = (
-            role in ["Developer", "DeveloperFixing"]
-            or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
-        )
-        is_heavy = is_orchestrator or (
-            role in ["Supervisor", "sa", "Coder"]
-            or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"]))
-        )
-        thinking = "high" if (is_orchestrator or is_heavy) else False
+        # Static per-role mapping — no iteration ladder, no heavy heuristic.
+        r = (role or "").lower()
+        if "developer" in r or r in ("dfd", "designer", "design"):
+            thinking = "high"
+        elif r == "dfd" or "dfd" in r:
+            thinking = "high"
+        elif r == "orchestrator":
+            thinking = "low"
+        else:
+            # general, house, supervisor, coder, others → low
+            thinking = "low"
     else:
         thinking = False
 
-    # Only set thinking when we have a decision; omit to leave provider default.
     if thinking is not None:
         settings["thinking"] = thinking  # type: ignore[typeddict-item]
 
-    # Budget override — forwarded as extra_body only when explicitly set.
     if reasoning_budget is not None:
         try:
             settings["extra_body"] = {"thinking": {"budget_tokens": int(reasoning_budget)}}
         except Exception:
             pass
 
-    # Keep openai_reasoning_effort for gateways that still require it alongside thinking.
     if isinstance(thinking, str) and thinking not in (False,):
-        # ThinkingLevel string doubles as OpenAI reasoning_effort for compat.
         try:
             if thinking in ("minimal", "low", "medium", "high", "xhigh"):
                 settings["openai_reasoning_effort"] = thinking

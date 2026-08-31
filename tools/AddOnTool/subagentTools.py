@@ -352,7 +352,7 @@ def _specialist_call_backend(
         messages=list(messages),
         tools=native_tools,
         temp=temp,
-        reasoning_effort=reasoning_effort,
+        reasoning_effort=reasoning_effort,  # static per-role mapping applies downstream
         where=where,
         system_prompt=_child_prompt_for(name),
     )
@@ -655,8 +655,10 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
         # Vision: inject user-attached images stashed by the API layer.
         try:
+            from llm.deps import WorkspaceDeps
+            _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
             from tools.vision_channel import drain_attachment_images
-            drain_attachment_images(messages)
+            drain_attachment_images(messages, ctx=_sub_deps)
         except Exception:
             pass
 
@@ -683,34 +685,27 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         except Exception:
             sub_sess = None
 
-        from llm import invoke_messages_with_fallback, invoke_messages_with_fallback_stream
+        # Subagent loop below calls _specialist_call_backend per turn (native);
+        # the legacy invoke_messages_with_fallback path is retired (P0-LLM).
 
-        # Orchestrator dial overrides the registry default for this delegation
-        # (registry keeps the spec effort when no override is given).
-        subagent_effort = reasoning_effort or spec.get("reasoning_effort")
+        # Static per-role thinking: subagents get no explicit override; the
+        # role mapping in _build_model_settings decides (dev/coder=high, rest=low).
+        subagent_effort = reasoning_effort  # registry effort no longer drives a ladder
 
         # ── Subagent loop: LLM → tools → observe → repeat ──
         # There is no turn ceiling. Cancellation, provider failure, a final
         # response, or an explicit structured-output request are the lifecycle
         # boundaries; context checkpoints handle long transcripts.
         content = ""
-        # Adaptive reasoning ladder (same pattern as Dev/Orchestrator):
-        # iter-1 (diagnosis) uses the spec effort; routine turns run disabled;
-        # a trouble signal (tool error / failure markers) flips the NEXT turn
-        # back to the spec effort for diagnosis.
+        # No adaptive reasoning ladder — static per-role thinking only.
         _sub_trouble = False
-        _routine_effort = os.environ.get("REASONING_SUBAGENT_ROUTINE", "disabled")
         _last_tool_name = ""
         try:
             sub_iter = 0
             while True:
                 sub_iter += 1
                 # Call LLM
-                if sub_iter == 1 or _sub_trouble:
-                    _effort = subagent_effort
-                    _sub_trouble = False
-                else:
-                    _effort = _routine_effort
+                _effort = subagent_effort
                 res = _specialist_call_backend(
                     name,
                     list(messages),
@@ -916,8 +911,10 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
                 # Vision: drain tool-queued inline images into ONE user message.
                 try:
+                    from llm.deps import WorkspaceDeps
+                    _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
                     from tools.vision_channel import drain_into_messages
-                    drain_into_messages(messages, header="[Inline image(s) from tool result]")
+                    drain_into_messages(messages, header="[Inline image(s) from tool result]", ctx=_sub_deps)
                 except Exception:
                     pass
 

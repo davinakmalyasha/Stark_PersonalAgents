@@ -48,10 +48,20 @@ _ACTIVE: dict[str, float] = {}
 _MAX_ENTRIES = 2000
 
 def enabled() -> bool:
+    """Stream bus on/off.
+
+    Single flag PAI_INSTRUMENT (default on) controls both native
+    instrumentation and the token-delta stream bus. Legacy TOKEN_STREAMING /
+    BSA_TOKEN_STREAMING env vars are honored as overrides when set, so
+    existing deployments keep working; new deployments use PAI_INSTRUMENT.
+    """
     val = os.environ.get("TOKEN_STREAMING")
     if val is None:
-        val = os.environ.get("BSA_TOKEN_STREAMING", "1")
-    return val.lower() not in ("0", "false", "no", "off")
+        val = os.environ.get("BSA_TOKEN_STREAMING")
+    if val is not None:
+        return val.lower() not in ("0", "false", "no", "off")
+    instr = os.environ.get("PAI_INSTRUMENT", "1")
+    return instr.lower() not in ("0", "false", "no", "off")
 
 def emit(chat_id: str, kind: str, text: str, agent: str = "", model: str = "") -> None:
     if not enabled() or not chat_id or not text:

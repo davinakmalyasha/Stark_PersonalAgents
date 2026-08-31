@@ -173,10 +173,8 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         )
         return reply, calls, []
 
-    # Paid path (direct DeepSeek / OpenCode Go / Command Code gateway).
-    effort_override = os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
-    if not effort_override:
-        effort_override = str(plan.get("iter_effort") or "disabled")
+    # Paid path — static per-role thinking: DFD=high (no ladder).
+    effort_override = "high"
 
     # Native agent (Track B): pydantic-ai executes tools internally (default).
     # A4: the legacy single-turn registry path (PAI_NATIVE_TOOLS=0) is removed;
@@ -235,18 +233,19 @@ def _dfd_events(task: str, chat_id: str = "", images: list | None = None):
     history: list[ModelMessage] = build_initial_history(_DFD_SYSTEM_TEMPLATE, _build_zone2(task, chat_id))
 
     # User-attached images: explicit paths first, then the API stash channel.
+    # Golden standard: images land in run_deps.pending_images (typed channel).
     if images:
         try:
             from tools.vision_channel import queue_image_file
 
             for p in images:
-                queue_image_file(p, note="user attachment")
+                queue_image_file(p, note="user attachment", ctx=run_deps)
         except Exception:
             pass
     try:
         from tools.vision_channel import drain_attachment_images_native
 
-        if drain_attachment_images_native(history):
+        if drain_attachment_images_native(history, ctx=run_deps):
             _log("[VISION] DFD: user attachment image(s) injected")
     except Exception:
         pass
@@ -422,7 +421,7 @@ def _dfd_events(task: str, chat_id: str = "", images: list | None = None):
         try:
             from tools.vision_channel import drain_into_messages_native
 
-            drain_into_messages_native(history, header="[Inline image(s) from tool result]")
+            drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=run_deps)
         except Exception:
             pass
 

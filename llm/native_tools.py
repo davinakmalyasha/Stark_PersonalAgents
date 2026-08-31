@@ -258,26 +258,6 @@ def _on_model_request_error(ctx: RunContext[WorkspaceDeps], *, request_context: 
 
 # ── Agent builder ────────────────────────────────────────────────────────────
 
-def _plan_mode_prepare(ctx, tool_def) -> Any:
-    """B2: hide write-class tools entirely in plan mode (Tool.prepare).
-
-    The model never sees (or wastes turns proposing) tools that plan mode
-    would veto; the before_tool_execute deny stays as a backstop. Read-only
-    tools pass through unchanged.
-    """
-    try:
-        from tools.chat_mode import get_mode
-        chat_id = str(getattr(ctx.deps, "chat_id", "") or "")
-        if chat_id and get_mode(chat_id) == "plan":
-            from tools.plan_mode_guard import WRITE_CLASS_TOOLS
-            name = getattr(tool_def, "name", "")
-            if name in WRITE_CLASS_TOOLS:
-                return None
-    except Exception:
-        pass
-    return tool_def
-
-
 def build_agent(
     role: str,
     model: Any,
@@ -450,16 +430,20 @@ def build_agent(
             capabilities.append(Instrumentation(InstrumentationSettings(version=5)))
         except Exception:
             pass
-    # P0-1: portable thinking via ModelSettings now in _build_model_settings.
-    # Thinking capability kept opt-in for env PAI_THINKING_CAP=1 (static role
-    # default) — per-call ladder still via ModelSettings to avoid override.
+    # P0-1: portable thinking via ModelSettings is primary; Thinking capability
+    # kept opt-in for env PAI_THINKING_CAP=1 with static per-role mapping:
+    # developer/dfd=high, orchestrator/general/house=low (no ladder).
     if os.getenv("PAI_THINKING_CAP", "0") == "1":
         try:
             from pydantic_ai.capabilities.thinking import Thinking
 
-            _is_orch = role in ["Developer", "DeveloperFixing"] or (role and any(x in role.lower() for x in ["developer", "orchestrator", "designer"]))
-            _is_heavy = _is_orch or (role in ["Supervisor", "sa", "Coder"] or (role and any(x in role.lower() for x in ["fixing", "coder", "architect", "complex"])))
-            _thinking_effort = "high" if _is_heavy else False  # type: ignore[assignment]
+            _r = (role or "").lower()
+            if "developer" in _r or _r in ("dfd", "designer", "design") or "dfd" in _r:
+                _thinking_effort = "high"  # type: ignore[assignment]
+            elif _r == "orchestrator":
+                _thinking_effort = "low"  # type: ignore[assignment]
+            else:
+                _thinking_effort = "low"  # general/house/supervisor → low
             capabilities.append(Thinking(effort=_thinking_effort))  # type: ignore[arg-type]
         except Exception:
             pass

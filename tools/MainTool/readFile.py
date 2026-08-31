@@ -96,7 +96,7 @@ def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list
             real_img = _sanitize_path(file_path)
             if os.path.isfile(real_img):
                 from tools.vision_channel import queue_image_file
-                if queue_image_file(real_img, note=f"read_file({file_path})"):
+                if queue_image_file(real_img, note=f"read_file({file_path})", ctx=ctx):
                     _log_tool("read_file", {"file_path": file_path, "image": True},
                               f"[IMAGE] {file_path}")
                     return (f"[IMAGE] {file_path} — attached inline below (vision). "

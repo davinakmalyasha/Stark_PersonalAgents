@@ -804,9 +804,10 @@ def developer_node(s: ITState) -> dict:
     # Vision: inject user-attached images (from the API stash) before the loop
     # starts — applies to both fresh starts and repair/resume cycles (a new
     # task tail with attachments is exactly when they arrive).
+    # Golden standard: images land in run_deps.pending_images (typed channel).
     try:
         from tools.vision_channel import drain_attachment_images_native
-        if drain_attachment_images_native(history):
+        if drain_attachment_images_native(history, ctx=run_deps):
             safe_append_live_log("[VISION] Developer: user attachment image(s) injected")
     except Exception:
         pass
@@ -957,22 +958,9 @@ def developer_node(s: ITState) -> dict:
                     _dev_plan = get_role_plan("Developer")
                 except Exception:
                     _dev_plan = {}
-                iter1_effort = os.environ.get(
-                    "REASONING_ITER1", str(_dev_plan.get("iter_effort") or "high")
-                )
-                routine_effort = os.environ.get("REASONING_ROUTINE", "disabled")
-                flip_on_test_only = os.environ.get("FLIP_ON_TEST_ONLY", "1") == "1"
-                think_hard = (
-                    iteration <= 1
-                    or last_test_failed
-                    or (not flip_on_test_only and last_tool_failed)
-                )
-                if think_hard:
-                    reasoning_effort = iter1_effort
-                    reasoning_budget = None  # planning/diagnosis: full effort, no cap
-                else:
-                    reasoning_effort = routine_effort
-                    reasoning_budget = None
+                # Static per-role thinking: Developer=high (no ladder, per maintainer)
+                reasoning_effort = "high"
+                reasoning_budget = None
 
                 if str(_dev_plan.get("backend")) == "free":
                     # Free-provider mode: full tool loop rides the free pool
@@ -1496,7 +1484,7 @@ def developer_node(s: ITState) -> dict:
         # the API accepts images in user messages only.
         try:
             from tools.vision_channel import drain_into_messages_native
-            if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=run_deps):
                 safe_append_live_log(f"[VISION] Dev iter {iteration}: inline image(s) injected")
         except Exception:
             pass

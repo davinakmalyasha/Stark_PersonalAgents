@@ -300,8 +300,10 @@ def _run_turn(
 
         # Vision: inject user-attached images stashed by the API layer — native
         try:
+            from llm.deps import WorkspaceDeps
+            _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=_parent_chat)
             from tools.vision_channel import drain_attachment_images_native
-            if drain_attachment_images_native(history):
+            if drain_attachment_images_native(history, ctx=_sub_deps):
                 session.append_message("system", "[VISION] user attachment image(s) injected")
         except Exception:
             pass
@@ -332,7 +334,7 @@ def _run_turn(
                     name,
                     list(history),
                     native_tools=native_tools or None,
-                    reasoning_effort=os.environ.get("REASONING_SUBAGENT_ROUTINE", "disabled"),
+                    reasoning_effort=None,  # static per-role mapping in _build_model_settings
                     where=f"{name} continuable iter {i}",
                 )
             except Exception:
@@ -499,8 +501,10 @@ def _run_turn(
 
             # Vision: drain tool-queued inline images into ONE user message — native
             try:
+                from llm.deps import WorkspaceDeps
+                _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=_parent_chat)
                 from tools.vision_channel import drain_into_messages_native
-                if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
+                if drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=_sub_deps):
                     session.append_message("system", "[VISION] inline image(s) injected")
             except Exception:
                 pass

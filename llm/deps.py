@@ -43,6 +43,7 @@ class WorkspaceDeps:
     allowed_tools: Optional[list[str]] = None
     mcp_scopes: Optional[list[str]] = None
     caps: Optional[dict] = None
+    pending_images: Optional[list] = None
 
     def __post_init__(self) -> None:
         if not self.project_path:

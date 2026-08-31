@@ -191,10 +191,7 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         messages=list(history),
         tools=native_tools,
         temp=0.2,
-        reasoning_effort=(
-            os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
-            or str(plan.get("iter_effort") or "disabled")
-        ),
+        reasoning_effort="low",  # static per-role: house=low (no ladder)
         where=where_tag,
         deps=deps,
         system_prompt=system_prompt,
@@ -240,13 +237,13 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
             from tools.vision_channel import queue_image_file
 
             for p in images:
-                queue_image_file(p, note="user attachment")
+                queue_image_file(p, note="user attachment", ctx=run_deps)
         except Exception:
             pass
     try:
         from tools.vision_channel import drain_attachment_images_native
 
-        if drain_attachment_images_native(history):
+        if drain_attachment_images_native(history, ctx=run_deps):
             _log(f"[VISION] {_AGENT_NAME}: user attachment image(s) injected")
     except Exception:
         pass
@@ -413,7 +410,7 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
         try:
             from tools.vision_channel import drain_into_messages_native
 
-            if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=run_deps):
                 _log(f"[VISION] {_AGENT_NAME} iter {iteration}: inline image(s) injected")
         except Exception:
             pass

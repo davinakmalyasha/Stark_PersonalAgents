@@ -331,10 +331,11 @@ def _orchestrator_loop(s: ITState) -> dict:
     # A6b: native ModelMessage history
     history: list[ModelMessage] = build_initial_history(static_system, task_message)
 
-    # Vision: inject user-attached images before first LLM call (native)
+    # Vision: inject user-attached images before first LLM call (native).
+    # Golden standard: images land in run_deps.pending_images (typed channel).
     try:
         from tools.vision_channel import drain_attachment_images_native
-        if drain_attachment_images_native(history):
+        if drain_attachment_images_native(history, ctx=run_deps):
             _log("[VISION] Orchestrator: user attachment image(s) injected")
     except Exception:
         pass
@@ -419,20 +420,9 @@ def _orchestrator_loop(s: ITState) -> dict:
                 _oplan = get_role_plan("Orchestrator")
             except Exception:
                 _oplan = {}
-            _orch_iter_default = str(_oplan.get("iter_effort") or "disabled")
-            if orch_think:
-                orch_effort = "high"
-                orch_think = False
-            elif iteration <= 1:
-                orch_effort = os.environ.get(
-                    "ORCH_REASONING_ITER1",
-                    os.environ.get("REASONING_ITER1", _orch_iter_default),
-                )
-            else:
-                _orch_routine_default = (
-                    _orch_iter_default if _oplan.get("mode") == "command" else "disabled"
-                )
-                orch_effort = os.environ.get("REASONING_ORCH_ROUTINE", _orch_routine_default)
+            # Static per-role thinking: Orchestrator=low (no ladder)
+            orch_effort = "low"
+            orch_think = False  # no longer flips to high
 
             if str(_oplan.get("backend")) == "free":
                 from llm.free_providers import free_native_turn
@@ -710,7 +700,7 @@ def _orchestrator_loop(s: ITState) -> dict:
         # Vision: drain any inline images queued by tools into ONE user message (native).
         try:
             from tools.vision_channel import drain_into_messages_native
-            if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=run_deps):
                 _log(f"[VISION] Orchestrator iter {iteration}: inline image(s) injected")
         except Exception:
             pass

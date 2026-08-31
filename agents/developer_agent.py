@@ -18,12 +18,31 @@ from tools import (
 
 # Local helper imports moved to top level
 from llm.loop_detector import LoopGuard
+from llm.deps import WorkspaceDeps
 from sync.sync_helpers import load_task_tracking, save_task_tracking
-from memory.context_compaction import (
-    compact_history,
-    get_compaction_policy,
+from memory.context_compaction import get_compaction_policy
+from llm.model_history import (
+    build_initial_history,
+    estimate_history_tokens,
+    dump_history,
+    load_history,
+    load_history_python,
+    dump_history_python,
+    compact_history_native,
+    append_user_history,
 )
 from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    UserPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+    TextPart,
+    ThinkingPart,
+)
 
 
 def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
@@ -197,10 +216,61 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     return static_system, current_suffix
 
 
+def _get_message_text(message) -> str:
+    """Extract textual content from either ModelMessage or legacy LC message."""
+    try:
+        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS, SystemPromptPart as _SP, UserPromptPart as _UP, ToolReturnPart as _TR, TextPart as _TP, ThinkingPart as _TH
+        if isinstance(message, _MR):
+            for p in getattr(message, "parts", []) or []:
+                if isinstance(p, _SP):
+                    return str(p.content or "")
+                if isinstance(p, _UP):
+                    c = p.content
+                    if isinstance(c, str):
+                        return c
+                    if isinstance(c, list):
+                        texts = []
+                        for item in c:
+                            if isinstance(item, str):
+                                texts.append(item)
+                            elif hasattr(item, "content"):
+                                try:
+                                    texts.append(str(getattr(item, "content", "")))
+                                except Exception:
+                                    texts.append(str(item))
+                            else:
+                                texts.append(str(item))
+                        return "\n".join(texts)
+                    return str(c or "")
+                if isinstance(p, _TR):
+                    return str(p.content or "")
+            return ""
+        if isinstance(message, _MS):
+            texts = []
+            for p in getattr(message, "parts", []) or []:
+                if isinstance(p, _TP):
+                    texts.append(str(p.content or ""))
+                elif isinstance(p, _TH):
+                    texts.append(str(p.content or ""))
+            return "\n".join(texts)
+    except Exception:
+        pass
+    c = getattr(message, "content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        try:
+            texts = [part.get("text", "") for part in c if isinstance(part, dict) and part.get("type") == "text"]
+            return "\n".join(texts) if texts else str(c)
+        except Exception:
+            return str(c)
+    return str(c or "")
+
+
 def _latest_current_context(messages: list) -> str:
     """Return the newest injected map block already present in the transcript."""
     for message in reversed(messages[1:] if len(messages) > 1 else []):
-        content = getattr(message, "content", "")
+        content = _get_message_text(message)
         if not isinstance(content, str) or not content.startswith("<current-context>"):
             continue
         end = content.find("</current-context>")
@@ -212,7 +282,7 @@ def _latest_current_context(messages: list) -> str:
 def _has_full_project_map(messages: list) -> bool:
     """Return whether the transcript still contains a full map anchor."""
     for message in messages[1:] if len(messages) > 1 else []:
-        content = getattr(message, "content", "")
+        content = _get_message_text(message)
         if not isinstance(content, str):
             continue
         if re.search(r"(?m)^projectMap:\s*$", content):
@@ -240,7 +310,7 @@ def _task_tail_parts(
     """
     parts = []
     if current_context and (
-        messages is None or _latest_current_context(messages) != current_context
+        messages is None or _latest_current_context(history) != current_context
     ):
         parts.append(current_context)
     parts.append(f"## Task\n{task}")
@@ -260,7 +330,7 @@ _PLAN_BLOCK_PREFIX = "=== CURRENT PLAN "
 
 
 def _is_plan_message(message) -> bool:
-    content = getattr(message, "content", "")
+    content = _get_message_text(message)
     return isinstance(content, str) and content.startswith(_PLAN_BLOCK_PREFIX)
 
 
@@ -299,7 +369,7 @@ def _apply_plan_reinjection(messages: list, plan_block: str) -> None:
       * identical to latest block → skip entirely (zero cache impact);
       * revised plan              → strip old copies, append newest;
       * fully-completed plan      → strip blocks, append nothing (the model
-        declared done via update_plan; a finished checklist steers nobody);
+         declared done via update_plan; a finished checklist steers nobody);
       * empty store               → strip stale blocks if any.
     """
     if not plan_block:
@@ -310,10 +380,10 @@ def _apply_plan_reinjection(messages: list, plan_block: str) -> None:
         _strip_plan_messages(messages)
         return
     latest = _latest_plan_message_index(messages)
-    if latest is not None and getattr(messages[latest], "content", "") == plan_block:
+    if latest is not None and _get_message_text(messages[latest]) == plan_block:
         return
     _strip_plan_messages(messages)
-    messages.append(HumanMessage(content=plan_block))
+    messages.append(ModelRequest(parts=[UserPromptPart(content=plan_block)]))
 
 def _extract_text_response(text: str) -> str:
     """Extract the user-facing text from a final native-tool response."""
@@ -335,27 +405,42 @@ def _log(msg: str) -> None:
     safe_append_live_log(msg)
 
 def serialize_messages(messages: list) -> list[dict]:
-    """Serialize the ordered transcript without flattening tool-call pairs."""
+    """Legacy serializer kept for backward compatibility (now wraps dump_history)."""
+    try:
+        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS
+        if messages and isinstance(messages[0], (_MR, _MS)):
+            return dump_history_python(messages)  # type: ignore
+    except Exception:
+        pass
     serialized = []
     for m in messages:
-        msg_dict = {"type": type(m).__name__, "content": m.content}
-        if hasattr(m, "id") and m.id:
-            msg_dict["id"] = m.id
-        if hasattr(m, "name") and m.name:
-            msg_dict["name"] = m.name
-        if hasattr(m, "tool_calls") and m.tool_calls:
-            msg_dict["tool_calls"] = m.tool_calls
-        if hasattr(m, "tool_call_id") and m.tool_call_id:
-            msg_dict["tool_call_id"] = m.tool_call_id
-        if hasattr(m, "status") and m.status:
-            msg_dict["status"] = m.status
-        if hasattr(m, "additional_kwargs") and m.additional_kwargs:
-            msg_dict["additional_kwargs"] = m.additional_kwargs
+        try:
+            content = getattr(m, "content", "")
+        except Exception:
+            content = ""
+        msg_dict = {"type": type(m).__name__, "content": content}
+        if hasattr(m, "id") and getattr(m, "id", None):
+            msg_dict["id"] = getattr(m, "id")
+        if hasattr(m, "name") and getattr(m, "name", None):
+            msg_dict["name"] = getattr(m, "name")
+        if hasattr(m, "tool_calls") and getattr(m, "tool_calls", None):
+            msg_dict["tool_calls"] = getattr(m, "tool_calls")
+        if hasattr(m, "tool_call_id") and getattr(m, "tool_call_id", None):
+            msg_dict["tool_call_id"] = getattr(m, "tool_call_id")
+        if hasattr(m, "status") and getattr(m, "status", None):
+            msg_dict["status"] = getattr(m, "status")
+        if hasattr(m, "additional_kwargs") and getattr(m, "additional_kwargs", None):
+            msg_dict["additional_kwargs"] = getattr(m, "additional_kwargs")
         serialized.append(msg_dict)
     return serialized
 
 def deserialize_messages(serialized_msgs: list[dict]) -> list:
-    """Helper to deserialize messages back to LangChain message objects."""
+    """Legacy deserializer kept for backward compatibility."""
+    try:
+        if serialized_msgs and isinstance(serialized_msgs[0], dict) and "parts" in serialized_msgs[0]:
+            return load_history_python(serialized_msgs)
+    except Exception:
+        pass
     messages = []
     for msg_data in serialized_msgs:
         m_type = msg_data.get("type")
@@ -404,18 +489,84 @@ def deserialize_messages(serialized_msgs: list[dict]) -> list:
         messages.append(msg)
     return messages
 
+def _native_slice_tools(new_msgs: list) -> list[dict]:
+    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
+    out: list[dict] = []
+    for m in new_msgs or []:
+        if isinstance(m, ModelResponse):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolCallPart):
+                    args = p.args if isinstance(p.args, dict) else {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    out.append({
+                        "tool": p.tool_name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": p.tool_call_id or "",
+                    })
+            continue
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            out.append({
+                "tool": tc.get("name") or tc.get("tool", ""),
+                "args": tc.get("args") or {},
+                "id": tc.get("id") or "",
+            })
+    return out
+
+def _load_history_from_state(raw) -> list[ModelMessage]:
+    """Load ModelMessage history from persisted developer_state messages (handles legacy)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            return load_history(raw)
+        except Exception:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return load_history_python(data)
+            except Exception:
+                pass
+            return []
+    if isinstance(raw, list):
+        if not raw:
+            return []
+        first = raw[0]
+        if isinstance(first, dict) and "parts" in first:
+            try:
+                return load_history_python(raw)
+            except Exception:
+                return []
+        if isinstance(first, dict) and "type" in first and first.get("type") in ("SystemMessage","HumanMessage","AIMessage","ToolMessage","RemoveMessage"):
+            try:
+                legacy = deserialize_messages(raw)
+                from llm.pai_transport import _lc_messages_to_pai
+                return _lc_messages_to_pai(legacy)
+            except Exception:
+                return []
+        return []
+    return []
+
 def developer_node(s: ITState) -> dict:
     """
     Tool-using Developer agent.
     Loops: LLM decides tool â†’ execute tool â†’ feed result â†’ repeat until done.
 
-    Uses proper LangChain message types for multi-turn conversations.
+    Uses native List[ModelMessage] history (pydantic-ai) for multi-turn conversations.
     """
     # Initialize run-specific state variables to avoid thread-unsafe function attributes
-    messages = []
+    history: list[ModelMessage] = []
 
     def make_return(res_dict: dict) -> dict:
-        new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
+        new_msgs = history[existing_len:]
         res_dict["messages"] = new_msgs
         
         # Capture final git diff and append to messages / task artifacts
@@ -465,9 +616,12 @@ def developer_node(s: ITState) -> dict:
                     is_completed = True
                 
                 if not is_completed:
-                    serialized_msgs = serialize_messages(messages)
+                    try:
+                        dumped_history = dump_history(history)
+                    except Exception:
+                        dumped_history = json.dumps(dump_history_python(history))
                     task_data["developer_state"] = {
-                        "messages": serialized_msgs,
+                        "messages": dumped_history,
                         "iteration": iteration,
                         "tool_call_log": tool_call_log,
                         "step_tool_calls": step_tool_calls,
@@ -547,27 +701,42 @@ def developer_node(s: ITState) -> dict:
     )
 
     if developer_state:
-        _log(f"[DEVELOPER] ðŸ”„ Resuming from suspended execution state (iteration {developer_state['iteration']})...")
+        _log(f"[DEVELOPER] 🔄 Resuming from suspended execution state (iteration {developer_state['iteration']})...")
         if developer_state.get("messages"):
-            messages = deserialize_messages(developer_state["messages"])
+            history = _load_history_from_state(developer_state["messages"])
         elif hasattr(s, "get") and s.get("messages") and len(s.get("messages")) > 0:
-            messages = list(s.get("messages"))
-            _log(f"[DEVELOPER] Loaded {len(messages)} messages natively from Graph State.")
+            _graph_msgs = list(s.get("messages"))
+            if _graph_msgs and isinstance(_graph_msgs[0], (ModelRequest, ModelResponse)):
+                history = list(_graph_msgs)
+            else:
+                try:
+                    from llm.pai_transport import _lc_messages_to_pai
+                    history = _lc_messages_to_pai(_graph_msgs)
+                except Exception:
+                    history = list(_graph_msgs)  # type: ignore
+            _log(f"[DEVELOPER] Loaded {len(history)} messages natively from Graph State.")
         else:
-            messages = []
+            history = []
 
-        # Refresh only the stable system prefix. Never rewrite an old task or
-        # tool result: doing so would invalidate every cached history token.
-        if messages and isinstance(messages[0], SystemMessage):
-            old_id = getattr(messages[0], "id", None)
-            messages[0] = SystemMessage(content=static_system, id=old_id) if old_id else SystemMessage(content=static_system)
+        # Refresh only the stable system prefix. Never rewrite an old task or tool result
+        if history and isinstance(history[0], ModelRequest) and any(isinstance(p, SystemPromptPart) for p in getattr(history[0], "parts", []) or []):
+            history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
+        elif history and isinstance(history[0], SystemMessage):
+            old_id = getattr(history[0], "id", None)
+            _legacy_sys = SystemMessage(content=static_system, id=old_id) if old_id else SystemMessage(content=static_system)
+            try:
+                from llm.pai_transport import _lc_messages_to_pai
+                history = _lc_messages_to_pai([_legacy_sys] + list(history[1:]))
+                history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
+            except Exception:
+                history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
         else:
-            messages.insert(0, SystemMessage(content=static_system))
+            history.insert(0, ModelRequest(parts=[SystemPromptPart(content=static_system)]))
 
         # A checkpoint may have compacted the old map anchor. Re-establish one
         # full current snapshot before applying a delta; otherwise the model
         # would receive an update without the base it is meant to modify.
-        if not _has_full_project_map(messages):
+        if not _has_full_project_map(history):
             try:
                 from memory.memory_manager import load_cached_code_map
                 cached_map = load_cached_code_map(project_path).strip()
@@ -587,15 +756,15 @@ def developer_node(s: ITState) -> dict:
             # The task is already in the transcript, but the refreshed map is
             # new context for this invocation. Append it at the tail so the
             # stable prefix and all prior history remain cacheable.
-            if current_context and _latest_current_context(messages) != current_context:
-                messages.append(HumanMessage(content=current_context))
+            if current_context and _latest_current_context(history) != current_context:
+                history.append(ModelRequest(parts=[UserPromptPart(content=current_context)]))
         else:
             iteration = 0  # start a fresh repair cycle while retaining durable history
             step_tool_calls = 0
             # Append the new task traceback / client request as a human message to the end of history
-            messages.extend(
-                HumanMessage(content=part)
-                for part in _task_tail_parts(current_context, task_message, messages)
+            history.extend(
+                ModelRequest(parts=[UserPromptPart(content=part)])
+                for part in _task_tail_parts(current_context, task_message, history)
             )
             _log("[DEVELOPER] ðŸ”„ Starting a new repair/implement cycle and appending the new task description.")
 
@@ -613,17 +782,17 @@ def developer_node(s: ITState) -> dict:
         except Exception as e:
             plan_block = ""
             print(f"[DEVELOPER] Error restoring plan block: {e}")
-        _apply_plan_reinjection(messages, plan_block)
+        _apply_plan_reinjection(history, plan_block)
         
     else:
         # Stable system prefix followed by a separate full-map anchor and task
         # tail. Keeping these as separate messages lets compaction preserve the
         # map without pinning the task that originally followed it.
-        messages = [SystemMessage(content=static_system)]
-        messages.extend(
-            HumanMessage(content=part)
-            for part in _task_tail_parts(current_context, task_message)
-        )
+        # A6b: native ModelMessage history
+        history = build_initial_history(static_system, "")
+        _init_parts = _task_tail_parts(current_context, task_message)
+        for part in _init_parts:
+            history.append(ModelRequest(parts=[UserPromptPart(content=part)]))
         iteration = 0
         tool_call_log = []
         last_response_text = ""
@@ -636,13 +805,13 @@ def developer_node(s: ITState) -> dict:
     # starts — applies to both fresh starts and repair/resume cycles (a new
     # task tail with attachments is exactly when they arrive).
     try:
-        from tools.vision_channel import drain_attachment_images
-        if drain_attachment_images(messages):
+        from tools.vision_channel import drain_attachment_images_native
+        if drain_attachment_images_native(history):
             safe_append_live_log("[VISION] Developer: user attachment image(s) injected")
     except Exception:
         pass
 
-    existing_ids = {m.id for m in messages if getattr(m, "id", None)}
+    existing_len = len(history)
 
     # One shared append-only/checkpoint policy. There are no intermediate
     # history rewrites or per-run tier counters to restore.
@@ -669,23 +838,44 @@ def developer_node(s: ITState) -> dict:
             map_content = str(map_event.get("content") or "").strip()
             if map_content:
                 map_suffix = _format_current_context(map_content)
-                if map_suffix and _latest_current_context(messages) != map_suffix:
-                    messages.append(HumanMessage(content=map_suffix))
+                if map_suffix and _latest_current_context(history) != map_suffix:
+                    history.append(ModelRequest(parts=[UserPromptPart(content=map_suffix)]))
         except Exception as e:
             _log(f"[DEVELOPER] Project map delta check skipped: {e}")
 
         # Append-only below the single checkpoint threshold. At the threshold,
-        # refresh the full map and commit one transcript rebuild atomically.
+        # refresh the full map and commit one native transcript rebuild atomically.
+        # A6b: native compaction — estimate_history_tokens + compact_history_native
+        compaction_info: dict = {"checkpoint": False}
         try:
-            messages, compaction_info = compact_history(
-                messages,
-                tool_call_log=tool_call_log,
-                created=tracked_files_created,
-                modified=tracked_files_modified,
-                policy=compaction_policy,
-                workspace_path=project_path,
-                chat_id=chat_id,
-            )
+            est = estimate_history_tokens(history)
+            if est >= compaction_policy.checkpoint_trigger:
+                before = est
+                full_map = None
+                try:
+                    from memory.memory_manager import load_cached_code_map
+                    full_map = load_cached_code_map(project_path).strip() or None
+                except Exception:
+                    full_map = None
+                history = compact_history_native(
+                    history,
+                    policy=compaction_policy,
+                    full_project_map=full_map,
+                    summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                )
+                after = estimate_history_tokens(history)
+                compaction_info = {
+                    "checkpoint": True,
+                    "trigger": "checkpoint" if before < compaction_policy.hard_limit else "hard_guard",
+                    "before": before,
+                    "after": after,
+                    "map_refreshed": bool(full_map),
+                }
+                _log(
+                    f"[DEVELOPER] Native checkpoint "
+                    f"({before:,} -> {after:,} est. tokens; "
+                    f"tail={compaction_policy.tail_budget_tokens:,}; map_refreshed={bool(full_map)})"
+                )
         except Exception as e:
             _log(f"[DEVELOPER] Context checkpoint unavailable: {e}")
             safe_update_state({"thoughts": {"developer": f"Context checkpoint unavailable: {e}"}})
@@ -698,18 +888,11 @@ def developer_node(s: ITState) -> dict:
                 "tech_spec_updated": False,
                 "error_count": err_count + 1,
             })
-        if compaction_info.get("checkpoint"):
-            _log(
-                f"[DEVELOPER] Single {compaction_info.get('trigger')} checkpoint "
-                f"({compaction_info['before']:,} -> {compaction_info['after']:,} est. tokens; "
-                f"tail={compaction_policy.tail_budget_tokens:,}; map_refreshed="
-                f"{compaction_info.get('map_refreshed', False)})"
-            )
 
-        run_messages = list(messages)
+        run_messages = list(history)
         if pending_guidance:
             # Steering is useful for the next decision but is not task history.
-            run_messages.append(HumanMessage(content="\n\n".join(pending_guidance)))
+            run_messages.append(ModelRequest(parts=[UserPromptPart(content="\n\n".join(pending_guidance))]))
             pending_guidance = []
         response_text = None  # Initialize â€” will be set by LLM
 
@@ -811,7 +994,7 @@ def developer_node(s: ITState) -> dict:
 
                     _native_text, _native_lc, _native_reasoning = run_native_agent(
                         role="Developer",
-                        messages=run_messages,
+                        messages=list(run_messages),
                         tools=native_dev_tools,
                         temp=0.2,
                         reasoning_effort=reasoning_effort,
@@ -821,13 +1004,34 @@ def developer_node(s: ITState) -> dict:
                         system_prompt=static_system,
                     )
                     # Rebuild the transcript from the native run's new messages.
-                    messages.extend(_native_lc)
+                    # Handle both native ModelMessage and legacy LC slice (test compat)
+                    if _native_lc and isinstance(_native_lc[0], (ModelRequest, ModelResponse)):
+                        history.extend(_native_lc)
+                    else:
+                        try:
+                            from llm.pai_transport import _lc_messages_to_pai
+                            _converted = _lc_messages_to_pai(_native_lc)  # type: ignore
+                            history.extend(_converted)
+                            _native_lc = _converted
+                        except Exception:
+                            history.extend(_native_lc)  # type: ignore
                     response_text = _native_text
                     native_tool_calls = []
                     reasoning_content = _native_reasoning
-                    # Track which tools ran via the tool calls in new_lc.
+                    # Track which tools ran via the tool calls in new_lc (native + LC)
                     for _m in _native_lc:
-                        if _m.__class__.__name__ == "AIMessage" and getattr(_m, "tool_calls", None):
+                        if isinstance(_m, ModelResponse):
+                            for _p in getattr(_m, "parts", []) or []:
+                                if isinstance(_p, ToolCallPart):
+                                    tool_call_log.append({
+                                        "tool": _p.tool_name or "",
+                                        "args": _p.args if isinstance(_p.args, dict) else {},
+                                        "id": _p.tool_call_id or "",
+                                        "iteration": iteration,
+                                        "status": "executed",
+                                        "result_preview": "",
+                                    })
+                        elif _m.__class__.__name__ == "AIMessage" and getattr(_m, "tool_calls", None):
                             for _tc in _m.tool_calls:
                                 tool_call_log.append({
                                     "tool": _tc.get("name", ""),
@@ -842,17 +1046,23 @@ def developer_node(s: ITState) -> dict:
 
                 # Unpack the provider result. Native calls are kept as
                 # structured metadata; text-only results simply finish.
-                if isinstance(llm_result, tuple):
+                if _native_finish:
+                    response_text = response_text or ""
+                elif 'llm_result' in locals() and isinstance(llm_result, tuple):
                     if len(llm_result) == 3:
                         response_text, native_tool_calls, reasoning_content = llm_result
                     else:
                         response_text, native_tool_calls = llm_result
                         reasoning_content = None
-                else:
-                    response_text = llm_result
+                    response_text = response_text or ""
+                elif 'llm_result' in locals():
+                    response_text = llm_result or ""  # type: ignore
                     native_tool_calls = []
                     reasoning_content = None
-                response_text = response_text or ""
+                else:
+                    response_text = response_text or ""
+                    native_tool_calls = []
+                    reasoning_content = reasoning_content if 'reasoning_content' in locals() else None
 
                 # â”€â”€ Store successful code generation in cache â”€â”€
             except Exception as e:
@@ -870,15 +1080,10 @@ def developer_node(s: ITState) -> dict:
 
         # Handle empty response (only nudge if both text and native tool calls are empty)
         if (not response_text or not response_text.strip()) and not native_tool_calls:
-            _log("[DEVELOPER] âš ï¸ Empty LLM response â€” retrying with explicit nudge")
-            ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
-            human_msg_id = f"dev-human-{iteration}-{uuid.uuid4()}"
-            messages.append(AIMessage(content="(empty response)", id=ai_msg_id))
-            messages.append(HumanMessage(
-                content="You responded with nothing. Please continue working on the task. "
-                        "Use a tool to make progress, or if done, explain what you accomplished.",
-                id=human_msg_id
-            ))
+            _log("[DEVELOPER] ⚠️ Empty LLM response — retrying with explicit nudge")
+            history.append(ModelResponse(parts=[TextPart(content="(empty response)")]))
+            history.append(ModelRequest(parts=[UserPromptPart(content="You responded with nothing. Please continue working on the task. "
+                        "Use a tool to make progress, or if done, explain what you accomplished.")]))
             continue
 
         last_response_text = response_text
@@ -933,15 +1138,12 @@ def developer_node(s: ITState) -> dict:
             if not _native_finish and modified_any and not ran_verification and not verification_nudged:
                 verification_nudged = True
                 _log("[DEVELOPER] Verification nudge — files were modified but no test/check ran. Forcing one verify turn.")
-                messages.append(HumanMessage(
-                    content=(
+                history.append(ModelRequest(parts=[UserPromptPart(content=(
                         f"[NUDGE] You modified {len(tracked_files_modified) + len(tracked_files_created)} file(s) "
                         "but never ran a verification command (tests / lint / checks). "
                         "Run the project's test suite and relevant checks now via run_command, then report the results. "
                         "If a check fails, fix or honestly report the failure — do not claim success."
-                    ),
-                    id=f"dev-verify-nudge-{iteration}-{uuid.uuid4()}",
-                ))
+                    ))]))
                 continue
 
             # No native tool call — the model has chosen to finish.
@@ -1264,50 +1466,37 @@ def developer_node(s: ITState) -> dict:
             response_text = response_text[:last_tool_idx + 3]
 
         history_text = re.sub(r'<thinking>.*?</thinking>', '', response_text, flags=re.DOTALL).strip()
-        ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
-        additional_kwargs = {}
-        # Only pass reasoning_content back when THIS turn made a tool call.
-        # DeepSeek docs: if the model did NOT perform a tool call, the intermediate
-        # reasoning_content does not need to participate in context concatenation
-        # (and if passed it is IGNORED) — so skipping it on text-only turns is both
-        # allowed and saves re-embedding those tokens as cache-miss input.
+        _resp_parts: list = []
+        if history_text:
+            _resp_parts.append(TextPart(content=history_text))
         if reasoning_content and tool_calls:
-            additional_kwargs["reasoning_content"] = reasoning_content
-        native_history_calls = [
-            {
-                "name": tc.get("tool", ""),
-                "args": tc.get("args", {}) if isinstance(tc.get("args", {}), dict) else {},
-                "id": tc.get("id") or f"dev-call-{iteration}-{idx}",
-                "type": "tool_call",
-            }
-            for idx, tc in enumerate(tool_calls)
-            if tc.get("tool")
-        ]
-        messages.append(AIMessage(
-            content=history_text,
-            id=ai_msg_id,
-            tool_calls=native_history_calls,
-            additional_kwargs=additional_kwargs,
-        ))
+            _resp_parts.append(ThinkingPart(content=str(reasoning_content)))
+        for idx, tc in enumerate(tool_calls):
+            if tc.get("tool"):
+                _resp_parts.append(ToolCallPart(
+                    tool_name=str(tc.get("tool", "")),
+                    args=tc.get("args", {}) if isinstance(tc.get("args", {}), dict) else {},
+                    tool_call_id=str(tc.get("id") or f"dev-call-{iteration}-{idx}-{uuid.uuid4().hex[:8]}"),
+                ))
+        if _resp_parts:
+            history.append(ModelResponse(parts=_resp_parts))
 
         # Preserve the provider's required assistant-tool-result protocol. A
         # separate result message per call is smaller and more recoverable than
         # merging every result into one anonymous HumanMessage.
         for result_index, (call_id, tool_name, payload) in enumerate(tool_result_payloads):
-            result_id = f"dev-tool-{iteration}-{result_index}-{uuid.uuid4().hex[:8]}"
-            messages.append(ToolMessage(
+            history.append(ModelRequest(parts=[ToolReturnPart(
+                tool_name=str(tool_name or "tool"),
                 content=f"[{tool_name}]:\n{payload}",
-                tool_call_id=call_id or f"dev-call-{iteration}-{result_index}",
-                name=tool_name or None,
-                id=result_id,
-            ))
+                tool_call_id=str(call_id or f"dev-call-{iteration}-{result_index}"),
+            )]))
 
         # Vision: tools (browser_screenshot / read_file on images) queue inline
         # pixels; inject them as ONE user message right after the ToolMessages —
         # the API accepts images in user messages only.
         try:
-            from tools.vision_channel import drain_into_messages
-            if drain_into_messages(messages, header="[Inline image(s) from tool result]"):
+            from tools.vision_channel import drain_into_messages_native
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
                 safe_append_live_log(f"[VISION] Dev iter {iteration}: inline image(s) injected")
         except Exception:
             pass

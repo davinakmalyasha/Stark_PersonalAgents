@@ -1,22 +1,59 @@
 """Delegation tools — the Orchestrator's parallel fan-out surface."""
 
-def delegate(items: list) -> str:
+def delegate(*args, **kwargs) -> str:
     """Spawn one or more workspace agents (Dev/General/House) IN PARALLEL.
 
     Each item: {agent, task, title?, chat_id?, workspace?}. A new visible chat
     is created per item unless chat_id continues an existing conversation.
     Final replies arrive later as [DELEGATION RESULT] events.
+
+    Native path (C1): when called inside a pydantic-ai run, the first arg is
+    RunContext[WorkspaceDeps] and deps.chat_id/project_path are used instead of
+    shared_state. Completion delivery prefers RunContext.enqueue when available.
     """
-    from tools import shared_state
+    # C1: detect RunContext as first arg (native tool call with ctx)
+    ctx = None
+    items = None
+    if args and hasattr(args[0], "deps"):
+        # Native call: delegate(ctx, items)
+        ctx = args[0]
+        items = args[1] if len(args) > 1 else kwargs.get("items")
+    elif "ctx" in kwargs and hasattr(kwargs["ctx"], "deps"):
+        ctx = kwargs.pop("ctx")
+        items = kwargs.get("items", args[0] if args else None)
+    else:
+        # Legacy call: delegate(items)
+        items = args[0] if args else kwargs.get("items")
+
+    # Also support items passed as kwargs
+    if items is None and "items" in kwargs:
+        items = kwargs["items"]
+
     from agents.delegation import start_delegations
 
-    if isinstance(items, dict):
-        items = [items]
-    if not items or not isinstance(items, list):
-        return "Error: delegate requires 'items' — a list of {agent, task, title?} objects."
-
-    parent_chat = str(shared_state.get("chat_id") or "")
-    fallback_ws = shared_state.get("project_path") or ""
+    # Resolve parent chat / workspace from ctx when available (C1)
+    parent_chat = ""
+    fallback_ws = ""
+    if ctx is not None:
+        try:
+            parent_chat = str(getattr(ctx.deps, "chat_id", "") or "")
+            fallback_ws = str(getattr(ctx.deps, "project_path", "") or "")
+            # Register enqueue bridge for this chat so child completions can
+            # use ctx.enqueue instead of inbox.follow_up when the run is active
+            try:
+                from server.realtime.enqueue_bridge import register_active_ctx
+                register_active_ctx(parent_chat, ctx)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if not parent_chat:
+        try:
+            from tools import shared_state
+            parent_chat = str(shared_state.get("chat_id") or "")
+            fallback_ws = str(shared_state.get("project_path") or "")
+        except Exception:
+            pass
     try:
         summaries = start_delegations(items, parent_chat, fallback_ws)
     except Exception as e:

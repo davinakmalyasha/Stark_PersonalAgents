@@ -208,13 +208,17 @@ def _run_item(del_id: str, item: dict, parent_chat_id: str) -> None:
     except Exception as e:
         _log(f"[DELEGATE] Chat mirror skipped for {del_id}: {e}")
 
-    # Deliver the completion event to the parked orchestrator.
+    # Deliver the completion event to the parked orchestrator (C1: enqueue if active).
     if parent_chat_id:
         try:
-            from inbox import follow_up
-            follow_up(parent_chat_id, _result_block(snapshot))
-        except Exception as e:
-            _log(f"[DELEGATE] Completion delivery skipped for {del_id}: {e}")
+            from server.realtime.enqueue_bridge import enqueue_or_follow_up
+            enqueue_or_follow_up(parent_chat_id, _result_block(snapshot))
+        except Exception:
+            try:
+                from inbox import follow_up
+                follow_up(parent_chat_id, _result_block(snapshot))
+            except Exception as e:
+                _log(f"[DELEGATE] Completion delivery skipped for {del_id}: {e}")
 
     with _LOCK:
         entry["status"] = local_status

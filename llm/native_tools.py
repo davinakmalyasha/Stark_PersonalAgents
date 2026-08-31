@@ -333,6 +333,15 @@ def build_agent(
         after_tool_execute=_after_tool_execute,
     )
     capabilities: list = [hooks]
+    # A7: native compaction via ProcessHistory (before each model request)
+    try:
+        from llm.compaction_native import get_process_history_capability
+
+        _ph = get_process_history_capability()
+        if _ph is not None:
+            capabilities.append(_ph)
+    except Exception:
+        pass
     if extra_capabilities:
         capabilities.extend(extra_capabilities)
 

@@ -6,10 +6,13 @@ Every entry is a typed, JSON-serializable record with an ``id`` and a
 ``parentId``, forming a tree inside a single file (in-place branching).
 
 The LLM message history is DERIVED from the log via
-:meth:`SessionManager.build_context_entries` + :func:`convert_to_llm` —
-never stored separately. Compaction writes a ``compaction`` entry whose
-``retainedTail`` is a self-contained checkpoint, so context rebuilds skip
-the older entries entirely.
+:meth:`SessionManager.build_context_entries` + :func:`convert_to_model_messages`
+(primary, A6b) / :func:`convert_to_llm` (legacy) — never stored separately.
+Compaction writes a ``compaction`` entry whose ``retainedTail`` is a
+self-contained checkpoint, so context rebuilds skip the older entries
+entirely.  Native ``List[ModelMessage]`` history can be persisted via
+``ModelMessagesTypeAdapter`` JSON when needed (see
+:meth:`SessionManager.dump_native_history_json`).
 
 Entry vocabulary (adapted from the Pi session format):
   session            — header line (metadata only, no id/parentId)
@@ -36,6 +39,13 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, TypeAdapter, field_validator
+
+# Native ModelMessage helpers — lazy-import pydantic_ai inside functions to
+# keep this module dependency-light; typing only.
+try:
+    from pydantic_ai.messages import ModelMessage as _ModelMessage  # type: ignore
+except Exception:  # pragma: no cover - import-time fallback for offline tests
+    _ModelMessage = Any  # type: ignore
 
 # ────────────────────────────────────────────────────────────────────────────
 # Content blocks
@@ -674,11 +684,65 @@ class SessionManager:
         out.extend(path[last_comp_idx + 1:])
         return out
 
-    def build_session_context(self) -> tuple[list[Any], Optional[str], Optional[str]]:
+    def build_session_context_native(self) -> tuple[list[Any], Optional[str], Optional[str]]:
+        """(messages, model, thinking_level) for the current leaf — native path.
+
+        Primary implementation: returns ``List[ModelMessage]`` via
+        :func:`convert_to_model_messages` for direct use with
+        ``Agent.run(message_history=)``.  This is the preferred path (A6b);
+        :meth:`build_session_context` delegates here when ``native=True``.
+        """
+        entries = self.build_context_entries()
+        model: Optional[str] = None
+        thinking_level: Optional[str] = None
+        for e in entries:
+            if isinstance(e, ModelChangeEntry):
+                model = e.model_id or model
+            elif isinstance(e, ThinkingLevelChangeEntry):
+                thinking_level = e.thinking_level
+        messages = convert_to_model_messages(entries)
+        return messages, model, thinking_level
+
+    def dump_native_history_json(self) -> str:
+        """Serialize the current native history to JSON via ModelMessagesTypeAdapter.
+
+        Convenience for callers that want to persist History outside JSONL
+        (e.g. task.json).  Returns a JSON string; use
+        :func:`llm.model_history.load_history` or
+        ``ModelMessagesTypeAdapter.validate_json`` to restore.
+        """
+        try:
+            from llm.model_history import dump_history
+            msgs, _, _ = self.build_session_context_native()
+            return dump_history(msgs)  # type: ignore[arg-type]
+        except Exception:
+            # Fallback to direct adapter if llm.model_history unavailable
+            from pydantic_ai import ModelMessagesTypeAdapter
+            msgs, _, _ = self.build_session_context_native()
+            return ModelMessagesTypeAdapter.dump_json(msgs).decode("utf-8")  # type: ignore[arg-type]
+
+    @staticmethod
+    def load_native_history_json(json_str: str) -> list[Any]:
+        """Deserialize a native history JSON string back to List[ModelMessage]."""
+        if not json_str:
+            return []
+        try:
+            from llm.model_history import load_history
+            return load_history(json_str)
+        except Exception:
+            from pydantic_ai import ModelMessagesTypeAdapter
+            return ModelMessagesTypeAdapter.validate_json(json_str)  # type: ignore
+
+    def build_session_context(self, native: bool = False) -> tuple[list[Any], Optional[str], Optional[str]]:
         """(messages, model, thinking_level) for the current leaf.
 
-        Messages are LangChain ``BaseMessage`` objects via :func:`convert_to_llm`.
+        When ``native`` is False (default) messages are LangChain
+        ``BaseMessage`` objects via :func:`convert_to_llm` (legacy, kept for
+        test compat).  When ``native`` is True the primary path is used:
+        ``List[ModelMessage]`` via :func:`convert_to_model_messages`.
         """
+        if native:
+            return self.build_session_context_native()
         entries = self.build_context_entries()
         from langchain_core.messages import BaseMessage
 
@@ -991,3 +1055,31 @@ def convert_to_llm(
                     },
                 ))
     return out
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Native helpers (primary) — build_session_context_native
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def build_session_context_native(
+    entries: list[SessionEntry],
+    *,
+    include_thinking: bool = False,
+    include_custom_messages: bool = True,
+) -> list[Any]:
+    """Module-level helper — primary path: returns List[ModelMessage].
+
+    Thin wrapper over :func:`convert_to_model_messages` for callers that
+    build history from a pre-fetched ``build_context_entries()`` list without
+    going through :meth:`SessionManager.build_session_context_native`.
+
+    ``convert_to_model_messages`` is the primary projection (A6b); this helper
+    makes that explicit and keeps call-sites uniform with
+    ``SessionManager.build_session_context(native=True)``.
+    """
+    return convert_to_model_messages(
+        entries,
+        include_thinking=include_thinking,
+        include_custom_messages=include_custom_messages,
+    )

@@ -39,12 +39,20 @@ from tools import (
     get_native_tool_names,
 )
 from llm.loop_detector import LoopGuard
+from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
-from memory.context_compaction import (
-    compact_history,
-    get_compaction_policy,
-)
+from memory.context_compaction import get_compaction_policy
 from agents.general_prompt import _GENERAL_SYSTEM_TEMPLATE
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 _AGENT_NAME = "General"
 
@@ -74,7 +82,7 @@ def _profile_path() -> str:
     return os.path.join(root, ".deep_agents", "general_profile.json")
 
 
-# â”€â”€ Context builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Context builders ───────────────────────────────────────────────────────
 
 
 def _load_general_profile() -> str:
@@ -144,10 +152,43 @@ def _clean_text(text: str) -> str:
     return cleaned.strip()
 
 
-# â”€â”€ LLM backends â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def _native_slice_tools(new_msgs: list) -> list[dict]:
+    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
+    out: list[dict] = []
+    for m in new_msgs or []:
+        # Native ModelMessage path: ModelResponse with ToolCallPart
+        if isinstance(m, ModelResponse):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolCallPart):
+                    args = p.args if isinstance(p.args, dict) else {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    out.append({
+                        "tool": p.tool_name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": p.tool_call_id or "",
+                    })
+            continue
+        # Legacy LC AIMessage path
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            out.append({
+                "tool": tc.get("name") or tc.get("tool", ""),
+                "args": tc.get("args") or {},
+                "id": tc.get("id") or "",
+            })
+    return out
 
 
-def _call_backend(messages: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None, cancellation_token: object = None) -> tuple[str, list[dict], list]:
+# ── LLM backends ───────────────────────────────────────────────────────────
+
+
+def _call_backend(history: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None, cancellation_token: object = None) -> tuple[str, list[dict], list]:
     """One LLM turn on the configured backend.
 
     Returns ``(text, tool_calls, native_msgs)``. ``native_msgs`` is non-empty
@@ -175,7 +216,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
 
         reply, calls, _reasoning = free_native_turn(
             _AGENT_NAME,
-            messages,
+            list(history),
             tools=native_tools,
             capability="text",
             prefer_reasoning=bool(plan.get("think_bias", True)),
@@ -192,7 +233,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
     # the native full-turn agent is the only paid execution path.
     text, new_lc, reasoning = run_native_agent(
         role=_AGENT_NAME,
-        messages=list(messages),
+        messages=list(history),
         tools=native_tools,
         temp=0.2,
         reasoning_effort=effort_override,
@@ -204,7 +245,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
     return str(text or ""), [], new_lc
 
 
-# â”€â”€ Session log (P1, best-effort) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Session log (P1, best-effort) ───────────────────────────────────────────
 
 
 def _open_session(chat_id: str, task: str):
@@ -227,7 +268,7 @@ def _open_session(chat_id: str, task: str):
         return None
 
 
-# â”€â”€ Core loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Core loop ───────────────────────────────────────────────────────────────
 
 
 def _general_execute_one(tool_call: dict, deps: object = None) -> str:
@@ -260,10 +301,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
     # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
     run_deps = _native_deps(chat_id)
 
-    messages = [
-        SystemMessage(content=_GENERAL_SYSTEM_TEMPLATE),
-        HumanMessage(content=_build_zone2(task, chat_id)),
-    ]
+    history: list[ModelMessage] = build_initial_history(_GENERAL_SYSTEM_TEMPLATE, _build_zone2(task, chat_id))
 
     # User-attached images: explicit paths first, then the API stash channel.
     if images:
@@ -275,9 +313,9 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
         except Exception:
             pass
     try:
-        from tools.vision_channel import drain_attachment_images
+        from tools.vision_channel import drain_attachment_images_native
 
-        if drain_attachment_images(messages):
+        if drain_attachment_images_native(history):
             _log(f"[VISION] {_AGENT_NAME}: user attachment image(s) injected")
     except Exception:
         pass
@@ -298,7 +336,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
     compaction_policy = get_compaction_policy("general")
     tool_call_log: list[dict] = []
-    existing_ids = {m.id for m in messages if getattr(m, "id", None)}
+    existing_len = len(history)
     iteration = 0
     final_text = ""
 
@@ -320,19 +358,24 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
             except Exception:
                 pass
 
-        # Append-only compaction below threshold; single checkpoint at it.
+        # A6b/A7: native compaction — estimate_history_tokens + compact_history_native
         if iteration > 1:
             try:
-                messages, compaction_info = compact_history(
-                    messages,
-                    tool_call_log=tool_call_log,
-                    policy=compaction_policy,
-                    chat_id=chat_id,
-                )
-                if compaction_info.get("checkpoint"):
+                est = estimate_history_tokens(history)
+                if est >= compaction_policy.checkpoint_trigger:
+                    from llm.model_history import compact_history_native
+
+                    before = est
+                    history = compact_history_native(
+                        history,
+                        policy=compaction_policy,
+                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                    )
+                    after = estimate_history_tokens(history)
                     _log(
-                        f"[{_AGENT_NAME.upper()}] {compaction_info.get('trigger')} checkpoint "
-                        f"({compaction_info['before']:,} -> {compaction_info['after']:,} est. tokens)"
+                        f"[{_AGENT_NAME.upper()}] Native checkpoint "
+                        f"({before:,} -> {after:,} est. tokens; "
+                        f"tail={compaction_policy.tail_budget_tokens:,})"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")
@@ -347,7 +390,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
         try:
             response_text, tool_calls, native_msgs = _call_backend(
-                messages, native_tools, where_tag,
+                history, native_tools, where_tag,
                 system_prompt=_GENERAL_SYSTEM_TEMPLATE,
                 deps=_native_deps(chat_id),
                 cancellation_token=_cancel_token,
@@ -366,7 +409,17 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
         # append its transcript slice and finish — the loop's compaction and
         # session logging still see the full history.
         if native_msgs:
-            messages.extend(native_msgs)
+            # Handle both native ModelMessage and legacy LC slice (test compat)
+            if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
+                history.extend(native_msgs)
+            else:
+                try:
+                    from llm.pai_transport import _lc_messages_to_pai
+                    _converted = _lc_messages_to_pai(native_msgs)  # type: ignore
+                    history.extend(_converted)
+                    native_msgs = _converted
+                except Exception:
+                    history.extend(native_msgs)  # fallback, keep as-is
             final_text = _clean_text(response_text)
             if sess is not None:
                 try:
@@ -376,18 +429,15 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
             break
 
         if not response_text.strip() and not tool_calls:
-            messages.append(HumanMessage(
-                content=(
-                    "[NUDGE] You responded with nothing. Continue the request with a tool, "
-                    "or if finished, summarize what you accomplished.",
-                ),
-                id=f"gen-nudge-{iteration}-{uuid.uuid4().hex[:8]}",
-            ))
+            history.append(ModelRequest(parts=[UserPromptPart(content=(
+                "[NUDGE] You responded with nothing. Continue the request with a tool, "
+                "or if finished, summarize what you accomplished."
+            ))]))
             continue
 
         if not tool_calls:
             final_text = _clean_text(response_text)
-            messages.append(AIMessage(content=response_text))
+            history.append(ModelResponse(parts=[TextPart(content=response_text)]))
             if sess is not None:
                 try:
                     sess.append_assistant(final_text, stop_reason="stop")
@@ -395,15 +445,18 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                     pass
             break
 
-        ai_msg = AIMessage(
-            content=response_text,
-            id=f"gen-ai-{iteration}-{uuid.uuid4().hex[:8]}",
-            tool_calls=[
-                {"name": tc["tool"], "args": tc.get("args") or {}, "id": tc.get("id", "")}
-                for tc in tool_calls
-            ],
-        )
-        messages.append(ai_msg)
+        # Free-pool / tool-calling path: materialize ModelResponse with ToolCallParts
+        _parts: list = []
+        if response_text:
+            _parts.append(TextPart(content=response_text))
+        for tc in tool_calls:
+            _parts.append(ToolCallPart(
+                tool_name=tc["tool"],
+                args=tc.get("args") or {},
+                tool_call_id=tc.get("id") or f"gen-call-{iteration}-{uuid.uuid4().hex[:8]}",
+            ))
+        if _parts:
+            history.append(ModelResponse(parts=_parts))
         if sess is not None:
             try:
                 sess.append_assistant(response_text, stop_reason="toolUse")
@@ -465,11 +518,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                 "iteration": iteration,
                 "status": "error" if result_str.startswith(("ERROR:", "[BLOCKED]")) else "ok",
             })
-            messages.append(ToolMessage(
-                content=result_str,
-                tool_call_id=call_id,
-                name=tname,
-            ))
+            history.append(ModelRequest(parts=[ToolReturnPart(tool_name=tname, content=result_str, tool_call_id=call_id)]))
             if sess is not None:
                 try:
                     sess.append_tool_result(
@@ -483,9 +532,9 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
         # Inline images queued by tools land as ONE synthetic user message.
         try:
-            from tools.vision_channel import drain_into_messages
+            from tools.vision_channel import drain_into_messages_native
 
-            drain_into_messages(messages, header="[Inline image(s) from tool result]")
+            drain_into_messages_native(history, header="[Inline image(s) from tool result]")
         except Exception:
             pass
 
@@ -496,10 +545,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
                 steer = drain_steering(chat_id)
                 if steer:
-                    messages.append(HumanMessage(
-                        content=render_delivery("STEERING", steer),
-                        id=f"gen-steer-{iteration}-{uuid.uuid4().hex[:8]}",
-                    ))
+                    history.append(ModelRequest(parts=[UserPromptPart(content=render_delivery("STEERING", steer))]))
             except Exception:
                 pass
 
@@ -509,7 +555,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
         except Exception:
             pass
 
-    new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
+    new_msgs = history[existing_len:]
     yield "messages", new_msgs
     yield "done", final_text or "No final response produced."
 
@@ -592,7 +638,7 @@ def run_general_direct(prompt: str, chat_id: str = "", images: list | None = Non
         yield json.loads(safe_serialize_state())
 
 
-# â”€â”€ Entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Entry points ───────────────────────────────────────────────────────────
 
 
 def general_node(s: ITState) -> dict:
@@ -636,4 +682,3 @@ def general_node(s: ITState) -> dict:
             "next_agent": "finish",
             "error": str(e),
         }
-

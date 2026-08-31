@@ -33,12 +33,22 @@ from tools import (
     get_native_tool_names,
 )
 from llm.loop_detector import LoopGuard
+from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
 from memory.context_compaction import (
-    compact_history,
     get_compaction_policy,
 )
 from agents.house_prompt import _HOUSE_SYSTEM_TEMPLATE
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 _AGENT_NAME = "House"
 
@@ -109,10 +119,41 @@ def _clean_text(text: str) -> str:
     return re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
 
 
+def _native_slice_tools(new_msgs: list) -> list[dict]:
+    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
+    out: list[dict] = []
+    for m in new_msgs or []:
+        if isinstance(m, ModelResponse):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolCallPart):
+                    args = p.args if isinstance(p.args, dict) else {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    out.append({
+                        "tool": p.tool_name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": p.tool_call_id or "",
+                    })
+            continue
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            out.append({
+                "tool": tc.get("name") or tc.get("tool", ""),
+                "args": tc.get("args") or {},
+                "id": tc.get("id") or "",
+            })
+    return out
+
+
 # ── LLM backend ──────────────────────────────────────────────────────────────
 
 
-def _call_backend(messages: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None) -> tuple[str, list[dict], list]:
+def _call_backend(history: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None) -> tuple[str, list[dict], list]:
     """One LLM turn. Returns ``(text, tool_calls, native_msgs)``. ``native_msgs``
     is non-empty when the native agent ran the full turn (tools executed
     internally); the caller appends them instead of executing tool_calls.
@@ -135,7 +176,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
 
         text, calls, _reasoning = free_native_turn(
             _AGENT_NAME,
-            messages,
+            list(history),
             tools=native_tools,
             capability="text",
             prefer_reasoning=bool(plan.get("think_bias", True)),
@@ -147,7 +188,7 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str, syst
     # the native full-turn agent is the only paid execution path.
     text, new_lc, reasoning = run_native_agent(
         role=_AGENT_NAME,
-        messages=list(messages),
+        messages=list(history),
         tools=native_tools,
         temp=0.2,
         reasoning_effort=(
@@ -192,10 +233,7 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
     # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
     run_deps = _native_deps(chat_id)
 
-    messages = [
-        SystemMessage(content=_HOUSE_SYSTEM_TEMPLATE),
-        HumanMessage(content=_build_zone2(task, chat_id)),
-    ]
+    history: list[ModelMessage] = build_initial_history(_HOUSE_SYSTEM_TEMPLATE, _build_zone2(task, chat_id))
 
     if images:
         try:
@@ -206,16 +244,16 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
         except Exception:
             pass
     try:
-        from tools.vision_channel import drain_attachment_images
+        from tools.vision_channel import drain_attachment_images_native
 
-        if drain_attachment_images(messages):
+        if drain_attachment_images_native(history):
             _log(f"[VISION] {_AGENT_NAME}: user attachment image(s) injected")
     except Exception:
         pass
 
     compaction_policy = get_compaction_policy("house")
     tool_call_log: list[dict] = []
-    existing_ids = {m.id for m in messages if getattr(m, "id", None)}
+    existing_len = len(history)
     iteration = 0
     final_text = ""
 
@@ -238,16 +276,21 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
 
         if iteration > 1:
             try:
-                messages, compaction_info = compact_history(
-                    messages,
-                    tool_call_log=tool_call_log,
-                    policy=compaction_policy,
-                    chat_id=chat_id,
-                )
-                if compaction_info.get("checkpoint"):
+                est = estimate_history_tokens(history)
+                if est >= compaction_policy.checkpoint_trigger:
+                    from llm.model_history import compact_history_native
+
+                    before = est
+                    history = compact_history_native(
+                        history,
+                        policy=compaction_policy,
+                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                    )
+                    after = estimate_history_tokens(history)
                     _log(
-                        f"[{_AGENT_NAME.upper()}] {compaction_info.get('trigger')} checkpoint "
-                        f"({compaction_info['before']:,} -> {compaction_info['after']:,} est. tokens)"
+                        f"[{_AGENT_NAME.upper()}] Native checkpoint "
+                        f"({before:,} -> {after:,} est. tokens; "
+                        f"tail={compaction_policy.tail_budget_tokens:,})"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")
@@ -262,7 +305,7 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
 
         try:
             response_text, tool_calls, native_msgs = _call_backend(
-                messages, native_tools, where_tag,
+                history, native_tools, where_tag,
                 system_prompt=_HOUSE_SYSTEM_TEMPLATE,
                 deps=_native_deps(chat_id),
             )
@@ -272,33 +315,43 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
 
         # Native agent ran the whole turn (tools executed internally).
         if native_msgs:
-            messages.extend(native_msgs)
+            # Handle both native ModelMessage and legacy LC slice (test compat)
+            if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
+                history.extend(native_msgs)
+            else:
+                try:
+                    from llm.pai_transport import _lc_messages_to_pai
+                    _converted = _lc_messages_to_pai(native_msgs)  # type: ignore
+                    history.extend(_converted)
+                    native_msgs = _converted
+                except Exception:
+                    history.extend(native_msgs)  # fallback, keep as-is
             final_text = _clean_text(response_text)
             break
 
         if not response_text.strip() and not tool_calls:
-            messages.append(HumanMessage(
-                content=(
+            history.append(ModelRequest(parts=[UserPromptPart(content=(
                     "[NUDGE] You responded with nothing. Continue the request with a tool, "
                     "or if finished, summarize what you changed.",
-                ),
-                id=f"house-nudge-{iteration}-{uuid.uuid4().hex[:8]}",
-            ))
+                ))]))
             continue
 
         if not tool_calls:
             final_text = _clean_text(response_text)
-            messages.append(AIMessage(content=response_text))
+            history.append(ModelResponse(parts=[TextPart(content=response_text)]))
             break
 
-        messages.append(AIMessage(
-            content=response_text,
-            id=f"house-ai-{iteration}-{uuid.uuid4().hex[:8]}",
-            tool_calls=[
-                {"name": tc["tool"], "args": tc.get("args") or {}, "id": tc.get("id", "")}
-                for tc in tool_calls
-            ],
-        ))
+        _parts: list = []
+        if response_text:
+            _parts.append(TextPart(content=response_text))
+        for tc in tool_calls:
+            _parts.append(ToolCallPart(
+                tool_name=tc["tool"],
+                args=tc.get("args") or {},
+                tool_call_id=tc.get("id") or f"house-call-{iteration}-{uuid.uuid4().hex[:8]}",
+            ))
+        if _parts:
+            history.append(ModelResponse(parts=_parts))
 
         # Parallel read-only execution: independent PARALLEL_SAFE calls run on a
         # thread pool; results return in call order. Out-of-scope tools are
@@ -354,11 +407,16 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
                 "iteration": iteration,
                 "status": "error" if result_str.startswith(("ERROR:", "[BLOCKED]")) else "ok",
             })
-            messages.append(ToolMessage(
-                content=result_str,
-                tool_call_id=call_id,
-                name=tname,
-            ))
+            history.append(ModelRequest(parts=[ToolReturnPart(tool_name=tname, content=result_str, tool_call_id=call_id)]))
+
+        # Inline images queued by tools land as ONE synthetic user message (native).
+        try:
+            from tools.vision_channel import drain_into_messages_native
+
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]"):
+                _log(f"[VISION] {_AGENT_NAME} iter {iteration}: inline image(s) injected")
+        except Exception:
+            pass
 
         if chat_id:
             try:
@@ -366,14 +424,11 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
 
                 steer = drain_steering(chat_id)
                 if steer:
-                    messages.append(HumanMessage(
-                        content=render_delivery("STEERING", steer),
-                        id=f"house-steer-{iteration}-{uuid.uuid4().hex[:8]}",
-                    ))
+                    history.append(ModelRequest(parts=[UserPromptPart(content=render_delivery("STEERING", steer))]))
             except Exception:
                 pass
 
-    new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
+    new_msgs = history[existing_len:]
     yield "messages", new_msgs
     yield "done", final_text or "No final response produced."
 

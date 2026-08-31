@@ -155,6 +155,26 @@ def _after_tool_execute(
 
 # ── Agent builder ────────────────────────────────────────────────────────────
 
+def _plan_mode_prepare(ctx, tool_def) -> Any:
+    """B2: hide write-class tools entirely in plan mode (Tool.prepare).
+
+    The model never sees (or wastes turns proposing) tools that plan mode
+    would veto; the before_tool_execute deny stays as a backstop. Read-only
+    tools pass through unchanged.
+    """
+    try:
+        from tools.chat_mode import get_mode
+        chat_id = str(getattr(ctx.deps, "chat_id", "") or "")
+        if chat_id and get_mode(chat_id) == "plan":
+            from tools.plan_mode_guard import WRITE_CLASS_TOOLS
+            name = getattr(tool_def, "name", "")
+            if name in WRITE_CLASS_TOOLS:
+                return None
+    except Exception:
+        pass
+    return tool_def
+
+
 def build_agent(
     role: str,
     model: Any,
@@ -245,28 +265,28 @@ def build_agent(
             def _bound(**kw):
                 return impl(**kw, **{ctx_name: deps})
 
-            tool_objs.append(
-                Tool.from_schema(
-                    _bound,
-                    name=name,
-                    description=description,
-                    json_schema=params,
-                    args_validator=_validate,
-                )
+            _tool = Tool.from_schema(
+                _bound,
+                name=name,
+                description=description,
+                json_schema=params,
+                args_validator=_validate,
             )
+            _tool.prepare = _plan_mode_prepare
+            tool_objs.append(_tool)
         else:
             def _plain(**kw):
                 return impl(**kw)
 
-            tool_objs.append(
-                Tool.from_schema(
-                    _plain,
-                    name=name,
-                    description=description,
-                    json_schema=params,
-                    args_validator=_validate,
-                )
+            _tool = Tool.from_schema(
+                _plain,
+                name=name,
+                description=description,
+                json_schema=params,
+                args_validator=_validate,
             )
+            _tool.prepare = _plan_mode_prepare
+            tool_objs.append(_tool)
 
     # Scope via FilteredToolset (native replacement for restrict_scope).
     # The caller already pre-scopes via get_native_tools(role); the registry

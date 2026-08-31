@@ -198,7 +198,6 @@ def build_agent(
         if not description:
             description = fn.get("description", "")
 
-
         try:
             sig = inspect.signature(impl)
             ctx_params = [
@@ -207,15 +206,16 @@ def build_agent(
         except Exception:
             ctx_params = []
 
-        # from_schema skips schema validation — we validate in the bound
-        # wrapper and raise ModelRetry on invalid args so the model retries
-        # (native Tool.max_retries). The preserved schema stays the model-facing
+        # B1: native args_validator replaces the hand-rolled _validate closure.
+        # from_schema skips schema validation; args_validator re-checks the
+        # preserved schema and raises ModelRetry so the model retries (native
+        # Tool.max_retries). The preserved schema stays the model-facing
         # contract; nothing about it changes.
         from pydantic_ai.exceptions import ModelRetry
         schema_props = (params or {}).get("properties", {}) or {}
         schema_required = set((params or {}).get("required", []) or [])
 
-        def _validate(**args) -> None:
+        def _validate(ctx, **args) -> None:
             missing = schema_required - set(args.keys())
             if missing:
                 raise ModelRetry(
@@ -243,7 +243,6 @@ def build_agent(
             ctx_name = ctx_params[0]
 
             def _bound(**kw):
-                _validate(**kw)
                 return impl(**kw, **{ctx_name: deps})
 
             tool_objs.append(
@@ -252,12 +251,11 @@ def build_agent(
                     name=name,
                     description=description,
                     json_schema=params,
+                    args_validator=_validate,
                 )
             )
         else:
             def _plain(**kw):
-
-                _validate(**kw)
                 return impl(**kw)
 
             tool_objs.append(
@@ -266,6 +264,7 @@ def build_agent(
                     name=name,
                     description=description,
                     json_schema=params,
+                    args_validator=_validate,
                 )
             )
 

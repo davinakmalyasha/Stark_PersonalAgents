@@ -630,26 +630,24 @@ def get_native_tools(scope: Optional[str] = None) -> list[dict]:
     return sorted(tools, key=lambda t: t["function"]["name"])
 
 # Scope ACL — single source of truth is agents/workspace_registry.py.
-# The comments below document WHY each agent has its surface; the tool
-# lists themselves come from WORKSPACE_REGISTRY so one place changes both.
-_SCOPE_MAP: dict[str, list[str]] = {}
-try:
-    from agents.workspace_registry import scope_map as _ws_scope_map
+# B1: the hand-copied literal fallback is removed. The registry module is
+# loaded by file path (bypassing agents/__init__ so the tools<->agents cycle
+# cannot trigger during bootstrap). A scope-map failure fails loud.
+def _load_registry_scope() -> dict[str, list[str]]:
+    import importlib.util
+    import os
+    import sys as _sys
 
-    _SCOPE_MAP = _ws_scope_map()
-except Exception:
-    # Import-order guard (agents import tools at module load). The registry
-    # module is dependency-light; if it is unavailable, fall back to the
-    # preserved literal so tool scoping never silently disappears.
-    _SCOPE_MAP = {
-        "developer": ["read_file", "edit_file", "run_command", "search_code", "template", "ask_user", "update_plan", "propose_plan", "call_subagent"],
-        "ui": ["browser_act", "read_file", "search_code", "run_command"],
-        "deploy": ["github_apply_gate", "template", "run_command", "read_file"],
-        "orchestrator": ["create_project", "resume_project", "ask_user", "delegate", "delegation_status", "update_plan", "propose_plan", "files_changed"],
-        "general": ["run_command", "read_pdf", "create_docx", "create_xlsx", "ask_user", "update_plan", "browser_act", "propose_plan", "files_changed"],
-        "house": ["house_get_state", "house_get_device", "house_set_device", "house_run_scene", "house_get_history", "run_command", "browser_act", "ask_user", "update_plan", "propose_plan"],
-        "dfd": ["dfd_bridge", "create_client", "create_project", "run_command", "ask_user", "update_plan", "propose_plan", "files_changed"],
-    }
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _reg_path = os.path.join(_here, "..", "agents", "workspace_registry.py")
+    _spec = importlib.util.spec_from_file_location("_workspace_registry", _reg_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _sys.modules["_workspace_registry"] = _mod
+    _spec.loader.exec_module(_mod)
+    return dict(_mod.scope_map())
+
+
+_SCOPE_MAP: dict[str, list[str]] = _load_registry_scope()
 
 
 def get_native_tool_names(scope: Optional[str] = None) -> list[str]:

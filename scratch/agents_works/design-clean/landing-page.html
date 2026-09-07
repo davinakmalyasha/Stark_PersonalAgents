@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>North Roast - Coffee Subscription</title>
+    <style>
+        :root {
+            --primary: #533afd;
+            --primary-deep: #4434d4;
+            --primary-press: #2e2b8c;
+            --primary-soft: #665efd;
+            --primary-bg-subdued-hover: #b9b9f9;
+            --brand-dark-900: #1c1e54;
+            --ink: #0d253d;
+            --ink-secondary: #273951;
+            --ink-mute: #64748d;
+            --ink-mute-2: #61718a;
+            --on-primary: #ffffff;
+            --canvas: #ffffff;
+            --canvas-soft: #f6f9fc;
+            --canvas-cream: #f5e9d4;
+            --hairline: #e3e8ee;
+            --hairline-input: #a8c3de;
+            --ruby: #ea2261;
+            --magenta: #f96bee;
+            --lemon: #9b6829;
+            --shadow-blue: #003770;
+        }
+
+        body {
+            font-family: 'sohne-var', 'SF Pro Display', system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--canvas);
+            color: var(--ink);
+        }
+
+        .hero {
+            text-align: center;
+            padding: 2rem;
+            background-color: var(--canvas-soft);
+        }
+
+        .hero h1 {
+            font-size: 56px;
+            font-weight: 300;
+            line-height: 1.03;
+            letter-spacing: -1.4px;
+            font-feature-settings: "ss01";
+        }
+
+        .hero p {
+            font-size: 20px;
+            font-weight: 300;
+            line-height: 1.4;
+            letter-spacing: -0.2px;
+            font-feature-settings: "ss01";
+        }
+
+        .pricing {
+            display: flex;
+            justify-content: space-around;
+            padding: 2rem;
+        }
+
+        .pricing-card {
+            border: 1px solid var(--hairline);
+            border-radius: 8px;
+            padding: 2rem;
+            width: 30%;
+            text-align: center;
+            background-color: var(--canvas);
+        }
+
+        .pricing-card h2 {
+            font-size: 26px;
+            font-weight: 300;
+            line-height: 1.12;
+            letter-spacing: -0.26px;
+            font-feature-settings: "ss01";
+        }
+
+        .pricing-card p {
+            font-size: 16px;
+            font-weight: 300;
+            line-height: 1.4;
+            letter-spacing: 0;
+            font-feature-settings: "ss01";
+        }
+
+        .pricing-card .price {
+            font-size: 32px;
+            font-weight: 300;
+            line-height: 1.1;
+            letter-spacing: -0.64px;
+            font-feature-settings: "ss01";
+        }
+
+        .footer {
+            text-align: center;
+            padding: 2rem;
+            background-color: var(--canvas-soft);
+        }
+    </style>
+</head>
+<body>
+    <div class="hero">
+        <h1>North Roast</h1>
+        <p>Discover the best coffee subscription service</p>
+    </div>
+    <div class="pricing">
+        <div class="pricing-card">
+            <h2>Basic</h2>
+            <p class="price">$10/month</p>
+            <p>2 bags of coffee per month</p>
+        </div>
+        <div class="pricing-card">
+            <h2>Standard</h2>
+            <p class="price">$20/month</p>
+            <p>4 bags of coffee per month</p>
+        </div>
+        <div class="pricing-card">
+            <h2>Premium</h2>
+            <p class="price">$30/month</p>
+            <p>6 bags of coffee per month</p>
+        </div>
+    </div>
+    <div class="footer">
+        <p>&copy; 2023 North Roast. All rights reserved.</p>
+    </div>
+</body>
+</html>

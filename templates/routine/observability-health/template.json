@@ -1,0 +1,16 @@
+{
+  "_comment": "Runtime observability scaffold (health/ready + JSON logging + dormant Sentry). Installed by github_apply_observability — NOT an agent-facing template; warehouse-only.",
+  "name": "observability-health",
+  "description": "Runtime observability scaffold: /health + /ready probes, JSON-line logging, DSN-dormant Sentry. Give T2/T3 live-smoke a real /ready to verify.",
+  "category": "routine",
+  "variables": [
+    {"name": "package", "type": "string", "required": true, "description": "Python package dir name, e.g. 'app'"}
+  ],
+  "files": [
+    {"src": "routers/health.py.j2", "dest": "{{ package }}/routers/health.py"},
+    {"src": "core/logging.py.j2", "dest": "{{ package }}/core/logging.py"},
+    {"src": "core/sentry.py.j2", "dest": "{{ package }}/core/sentry.py"}
+  ],
+  "notes": "Wiring (agent/human): 1) app.include_router(health.router) — /health + /ready; 2) setup_logging() in main.py lifespan; 3) init_sentry() in lifespan; 4) optional SENTRY_DSN in .env activates error capture; 5) container healthcheck points at /ready. Files are inert until wired — safe to install early.",
+  "sample_vars": {"package": "app"}
+}

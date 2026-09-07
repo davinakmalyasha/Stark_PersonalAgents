@@ -1,0 +1,35 @@
+"""Health probes — liveness + readiness for orchestrators (k8s/LB/docker healthcheck).
+
+GET /health -> {"status":"ok"}                      (process alive; no deps)
+GET /ready  -> {"status":"ready","db":"ok"}         503 when DB unreachable
+
+Register in the app:
+    from {{ package }}.routers import health
+    app.include_router(health.router)
+
+Then point the container healthcheck (and T2 staging live-smoke) at /ready.
+"""
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+
+router = APIRouter(tags=["ops"])
+
+
+@router.get("/health")
+def liveness():
+    return {"status": "ok"}
+
+
+@router.get("/ready")
+def readiness(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "ready", "db": "ok"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "not_ready", "db": str(e)},
+        )

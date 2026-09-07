@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import {
-  Plus, MessageSquare, Pencil, Trash2, Check, Code2, Home, User, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, ChevronUp,
+  Plus, MessageSquare, Pencil, Trash2, Check, Code2, Home, ShieldCheck, User, ChevronRight,
+  ChevronDown, Search, Pin, PinOff, ChevronUp, Palette,
 } from 'lucide-react';
 import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
@@ -32,6 +32,9 @@ interface Props {
   onLaunchPersonal: () => void;
   onLaunchCoding: () => void;
   onLaunchHouse: () => void;
+  onLaunchAdmin: () => void;
+  /** Optional: design-module launcher (Main workspace only — rooms omit it). */
+  onLaunchDesign?: () => void;
 }
 
 interface RowChat extends ChatSummary {
@@ -70,7 +73,7 @@ export default function HouseSidebar({
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
   onOpenSession, onNewChat, onNewProject, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
-  onLaunchPersonal, onLaunchCoding, onLaunchHouse,
+  onLaunchPersonal, onLaunchCoding, onLaunchHouse, onLaunchAdmin, onLaunchDesign,
 }: Props) {
   const [editing, setEditing] = useState<{ sid: string; title: string } | null>(null);
   const [confirmDeleteSid, setConfirmDeleteSid] = useState<string | null>(null);
@@ -455,6 +458,41 @@ export default function HouseSidebar({
             </div>
             <ChevronRight size={13} className="text-zinc-600" />
           </div>
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={onLaunchAdmin}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchAdmin(); } }}
+            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
+          >
+            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
+              <ShieldCheck size={15} />
+            </span>
+            <div className="flex-1 min-w-0">
+              <div className="text-[12.5px] font-medium text-zinc-200">Agents Admin</div>
+              <div className="text-[10px] text-zinc-500">Proxy fleet — super-operator only</div>
+            </div>
+            <ChevronRight size={13} className="text-zinc-600" />
+          </div>
+          {onLaunchDesign && (
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={onLaunchDesign}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchDesign(); } }}
+              className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
+              title="OpenDesign — agent-led UI design iteration for a workspace (straight to the UI subagent loop)"
+            >
+              <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
+                <Palette size={15} />
+              </span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[12.5px] font-medium text-zinc-200">OpenDesign Module</div>
+                <div className="text-[10px] text-zinc-500">Agent-led UI design iteration</div>
+              </div>
+              <ChevronRight size={13} className="text-zinc-600" />
+            </div>
+          )}
         </div>
       </aside>
     </>

@@ -16,9 +16,12 @@ interface Props {
   onCloseSubagent?: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
+  /** Override the empty-state copy (defaults to the coding-workspace hint). */
+  emptyTitle?: string;
+  emptyHint?: string;
 }
 
-export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
+export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, emptyTitle = 'VinCode Supervisor', emptyHint }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
@@ -131,9 +134,9 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
             <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-zinc-900 border border-zinc-800 mb-4 flex-shrink-0">
               <Zap size={22} className="text-yellow-400" />
             </div>
-            <h2 className="text-md font-bold text-zinc-200 mb-1">VinCode Supervisor</h2>
+            <h2 className="text-md font-bold text-zinc-200 mb-1">{emptyTitle}</h2>
             <p className="text-[12.5px] text-zinc-400 leading-relaxed mb-4">
-              Supervisor + Developer multi-agent pipeline.
+              {emptyHint ?? 'Supervisor + Developer multi-agent pipeline.'}
             </p>
             <div className="flex flex-col gap-1.5 text-left text-[11px] text-zinc-500 max-w-xs">
               <div>• Start typing below to consult the Supervisor</div>

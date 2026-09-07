@@ -4,27 +4,45 @@ import re
 import subprocess
 import uuid
 from datetime import datetime
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, RemoveMessage
 from sync.state_sync import safe_update_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
     ToolExecutionResult,
     execute_tool_detailed,
+    run_tool_calls,
     get_native_tools,
     get_native_tool_names,
-    get_registry,
     get_plan_for_context,
 )
-from llm import invoke_messages_with_fallback_stream
 
 # Local helper imports moved to top level
 from llm.loop_detector import LoopGuard
+from llm.deps import WorkspaceDeps
 from sync.sync_helpers import load_task_tracking, save_task_tracking
-from memory.context_compaction import (
-    compact_history,
-    get_compaction_policy,
+from memory.context_compaction import get_compaction_policy
+from llm.model_history import (
+    build_initial_history,
+    estimate_history_tokens,
+    dump_history,
+    load_history,
+    load_history_python,
+    dump_history_python,
+    compact_history_native,
+    append_user_history,
 )
 from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    UserPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+    TextPart,
+    ThinkingPart,
+)
+
 
 def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
     """Keep a tool result small while preserving a VFS path to the full output."""
@@ -45,11 +63,25 @@ def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
         return result_text
     return auto_offload_result(result_text, tool_name, max_chars=cap)
 
+
+def _execute_one_tool_call(tool_call: dict, deps: object = None) -> str:
+    """Thread-pool worker for the parallel read-only batch. Only tools listed in
+    PARALLEL_SAFE reach this path (enforced by run_tool_calls), so it is safe to
+    run concurrently. Returns the raw tool result string; cap/offload happens at
+    the tool boundary. Uses the module-level execute_tool_detailed so
+    patching/mocking works identically to the sequential path."""
+    tool_name = str(tool_call.get("tool", "") or "")
+    tool_args = tool_call.get("args") or {}
+    if not tool_args or not isinstance(tool_args, dict):
+        tool_args = {k: v for k, v in tool_call.items() if k not in ("tool", "args")}
+    try:
+        execution = execute_tool_detailed(tool_name, tool_args, deps=deps)
+        return str(execution.content)
+    except Exception as e:
+        return f"Tool execution error: {e}"
+
 # Dev system prompt lives in developer_prompt.py (imported above).
 # Dev system prompt imported from developer_prompt.py
-
-
-
 # Dev system prompt lives in developer_prompt.py (imported above).
 
 def _build_dynamic_context(
@@ -77,16 +109,6 @@ def _build_dynamic_context(
 
     stable_parts = [f"## Workspace Root\n{workspace_root}"]
     current_parts = []
-
-    # The template map is a fixed capability pointer. The live catalog and
-    # rendered contents stay behind template_list/apply_template.
-    try:
-        from tools import build_template_map
-        template_map = build_template_map()
-        if template_map:
-            stable_parts.append(template_map)
-    except Exception as e:
-        print(f"Error loading template map: {e}")
 
     # project.md is a small, stable identity card. It is intentionally kept in
     # the cached prefix; code navigation belongs in the current tail below.
@@ -126,8 +148,7 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     """
     Build the system prompt with a cache-friendly message layout.
 
-    Stable SystemMessage: base prompt, workspace root, identity, and the fixed
-    template pointer.
+    Stable SystemMessage: base prompt, workspace root, and project identity.
     Append-only history: prior task/tool turns remain byte-stable.
     Current tail: the first full projectMap or a later projectMap+ delta and
     the current request are appended after history, so only the tail is new
@@ -183,10 +204,61 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     return static_system, current_suffix
 
 
+def _get_message_text(message) -> str:
+    """Extract textual content from either ModelMessage or legacy LC message."""
+    try:
+        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS, SystemPromptPart as _SP, UserPromptPart as _UP, ToolReturnPart as _TR, TextPart as _TP, ThinkingPart as _TH
+        if isinstance(message, _MR):
+            for p in getattr(message, "parts", []) or []:
+                if isinstance(p, _SP):
+                    return str(p.content or "")
+                if isinstance(p, _UP):
+                    c = p.content
+                    if isinstance(c, str):
+                        return c
+                    if isinstance(c, list):
+                        texts = []
+                        for item in c:
+                            if isinstance(item, str):
+                                texts.append(item)
+                            elif hasattr(item, "content"):
+                                try:
+                                    texts.append(str(getattr(item, "content", "")))
+                                except Exception:
+                                    texts.append(str(item))
+                            else:
+                                texts.append(str(item))
+                        return "\n".join(texts)
+                    return str(c or "")
+                if isinstance(p, _TR):
+                    return str(p.content or "")
+            return ""
+        if isinstance(message, _MS):
+            texts = []
+            for p in getattr(message, "parts", []) or []:
+                if isinstance(p, _TP):
+                    texts.append(str(p.content or ""))
+                elif isinstance(p, _TH):
+                    texts.append(str(p.content or ""))
+            return "\n".join(texts)
+    except Exception:
+        pass
+    c = getattr(message, "content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        try:
+            texts = [part.get("text", "") for part in c if isinstance(part, dict) and part.get("type") == "text"]
+            return "\n".join(texts) if texts else str(c)
+        except Exception:
+            return str(c)
+    return str(c or "")
+
+
 def _latest_current_context(messages: list) -> str:
     """Return the newest injected map block already present in the transcript."""
     for message in reversed(messages[1:] if len(messages) > 1 else []):
-        content = getattr(message, "content", "")
+        content = _get_message_text(message)
         if not isinstance(content, str) or not content.startswith("<current-context>"):
             continue
         end = content.find("</current-context>")
@@ -198,7 +270,7 @@ def _latest_current_context(messages: list) -> str:
 def _has_full_project_map(messages: list) -> bool:
     """Return whether the transcript still contains a full map anchor."""
     for message in messages[1:] if len(messages) > 1 else []:
-        content = getattr(message, "content", "")
+        content = _get_message_text(message)
         if not isinstance(content, str):
             continue
         if re.search(r"(?m)^projectMap:\s*$", content):
@@ -226,7 +298,7 @@ def _task_tail_parts(
     """
     parts = []
     if current_context and (
-        messages is None or _latest_current_context(messages) != current_context
+        messages is None or _latest_current_context(history) != current_context
     ):
         parts.append(current_context)
     parts.append(f"## Task\n{task}")
@@ -246,7 +318,7 @@ _PLAN_BLOCK_PREFIX = "=== CURRENT PLAN "
 
 
 def _is_plan_message(message) -> bool:
-    content = getattr(message, "content", "")
+    content = _get_message_text(message)
     return isinstance(content, str) and content.startswith(_PLAN_BLOCK_PREFIX)
 
 
@@ -285,7 +357,7 @@ def _apply_plan_reinjection(messages: list, plan_block: str) -> None:
       * identical to latest block → skip entirely (zero cache impact);
       * revised plan              → strip old copies, append newest;
       * fully-completed plan      → strip blocks, append nothing (the model
-        declared done via update_plan; a finished checklist steers nobody);
+         declared done via update_plan; a finished checklist steers nobody);
       * empty store               → strip stale blocks if any.
     """
     if not plan_block:
@@ -296,10 +368,10 @@ def _apply_plan_reinjection(messages: list, plan_block: str) -> None:
         _strip_plan_messages(messages)
         return
     latest = _latest_plan_message_index(messages)
-    if latest is not None and getattr(messages[latest], "content", "") == plan_block:
+    if latest is not None and _get_message_text(messages[latest]) == plan_block:
         return
     _strip_plan_messages(messages)
-    messages.append(HumanMessage(content=plan_block))
+    messages.append(ModelRequest(parts=[UserPromptPart(content=plan_block)]))
 
 def _extract_text_response(text: str) -> str:
     """Extract the user-facing text from a final native-tool response."""
@@ -321,87 +393,110 @@ def _log(msg: str) -> None:
     safe_append_live_log(msg)
 
 def serialize_messages(messages: list) -> list[dict]:
-    """Serialize the ordered transcript without flattening tool-call pairs."""
-    serialized = []
-    for m in messages:
-        msg_dict = {"type": type(m).__name__, "content": m.content}
-        if hasattr(m, "id") and m.id:
-            msg_dict["id"] = m.id
-        if hasattr(m, "name") and m.name:
-            msg_dict["name"] = m.name
-        if hasattr(m, "tool_calls") and m.tool_calls:
-            msg_dict["tool_calls"] = m.tool_calls
-        if hasattr(m, "tool_call_id") and m.tool_call_id:
-            msg_dict["tool_call_id"] = m.tool_call_id
-        if hasattr(m, "status") and m.status:
-            msg_dict["status"] = m.status
-        if hasattr(m, "additional_kwargs") and m.additional_kwargs:
-            msg_dict["additional_kwargs"] = m.additional_kwargs
-        serialized.append(msg_dict)
-    return serialized
+    """Serialize history to JSON-compatible dicts (native ModelMessage dump).
+
+    P0-LLM: always uses ``dump_history_python`` (ModelMessagesTypeAdapter) —
+    the LangChain serializer is deleted.
+    """
+    try:
+        return dump_history_python(messages)  # type: ignore
+    except Exception:
+        return []
+
 
 def deserialize_messages(serialized_msgs: list[dict]) -> list:
-    """Helper to deserialize messages back to LangChain message objects."""
-    messages = []
-    for msg_data in serialized_msgs:
-        m_type = msg_data.get("type")
-        content = msg_data.get("content", "")
-        m_id = msg_data.get("id")
-        name = msg_data.get("name")
-        kwargs = {}
-        if m_id:
-            kwargs["id"] = m_id
-        if name:
-            kwargs["name"] = name
-        add_kwargs = msg_data.get("additional_kwargs")
-        if add_kwargs:
-            kwargs["additional_kwargs"] = add_kwargs
-            
-        if m_type == "SystemMessage":
-            msg = SystemMessage(content=content, **kwargs)
-        elif m_type == "HumanMessage":
-            msg = HumanMessage(content=content, **kwargs)
-        elif m_type == "AIMessage":
-            tool_calls = msg_data.get("tool_calls")
-            if tool_calls:
-                normalized_calls = []
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    normalized_calls.append({
-                        "name": tc.get("name") or tc.get("tool", ""),
-                        "args": tc.get("args") or {},
-                        "id": tc.get("id") or f"legacy-call-{len(normalized_calls)}",
-                        "type": "tool_call",
+    """Deserialize persisted history back to List[ModelMessage].
+
+    Accepts both native ``{...parts...}`` dicts (ModelMessagesTypeAdapter) and
+    legacy ``{type: SystemMessage|...}`` dicts (converted via _messages_to_pai).
+    """
+    try:
+        if serialized_msgs and isinstance(serialized_msgs[0], dict) and "parts" in serialized_msgs[0]:
+            return load_history_python(serialized_msgs)
+    except Exception:
+        pass
+    try:
+        from llm.pai_transport import _messages_to_pai
+        return _messages_to_pai(serialized_msgs)
+    except Exception:
+        return []
+
+def _native_slice_tools(new_msgs: list) -> list[dict]:
+    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
+    out: list[dict] = []
+    for m in new_msgs or []:
+        if isinstance(m, ModelResponse):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolCallPart):
+                    args = p.args if isinstance(p.args, dict) else {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    out.append({
+                        "tool": p.tool_name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": p.tool_call_id or "",
                     })
-                if normalized_calls:
-                    kwargs["tool_calls"] = normalized_calls
-            msg = AIMessage(content=content, **kwargs)
-        elif m_type == "ToolMessage":
-            tool_call_id = msg_data.get("tool_call_id") or m_id or f"legacy-tool-{len(messages)}"
-            if msg_data.get("status"):
-                kwargs["status"] = msg_data["status"]
-            kwargs["tool_call_id"] = tool_call_id
-            msg = ToolMessage(content=content, **kwargs)
-        elif m_type == "RemoveMessage":
-            msg = RemoveMessage(**kwargs)
-        else:
-            msg = HumanMessage(content=content, **kwargs)
-        messages.append(msg)
-    return messages
+            continue
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            out.append({
+                "tool": tc.get("name") or tc.get("tool", ""),
+                "args": tc.get("args") or {},
+                "id": tc.get("id") or "",
+            })
+    return out
+
+def _load_history_from_state(raw) -> list[ModelMessage]:
+    """Load ModelMessage history from persisted developer_state messages (handles legacy)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            return load_history(raw)
+        except Exception:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return load_history_python(data)
+            except Exception:
+                pass
+            return []
+    if isinstance(raw, list):
+        if not raw:
+            return []
+        first = raw[0]
+        if isinstance(first, dict) and "parts" in first:
+            try:
+                return load_history_python(raw)
+            except Exception:
+                return []
+        if isinstance(first, dict) and "type" in first and first.get("type") in ("SystemMessage","HumanMessage","AIMessage","ToolMessage","RemoveMessage"):
+            try:
+                return deserialize_messages(raw)
+            except Exception:
+                return []
+        return []
+    return []
 
 def developer_node(s: ITState) -> dict:
     """
     Tool-using Developer agent.
     Loops: LLM decides tool â†’ execute tool â†’ feed result â†’ repeat until done.
 
-    Uses proper LangChain message types for multi-turn conversations.
+    Uses native List[ModelMessage] history (pydantic-ai) for multi-turn conversations.
     """
     # Initialize run-specific state variables to avoid thread-unsafe function attributes
-    messages = []
+    history: list[ModelMessage] = []
 
     def make_return(res_dict: dict) -> dict:
-        new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
+        new_msgs = history[existing_len:]
         res_dict["messages"] = new_msgs
         
         # Capture final git diff and append to messages / task artifacts
@@ -451,9 +546,12 @@ def developer_node(s: ITState) -> dict:
                     is_completed = True
                 
                 if not is_completed:
-                    serialized_msgs = serialize_messages(messages)
+                    try:
+                        dumped_history = dump_history(history)
+                    except Exception:
+                        dumped_history = json.dumps(dump_history_python(history))
                     task_data["developer_state"] = {
-                        "messages": serialized_msgs,
+                        "messages": dumped_history,
                         "iteration": iteration,
                         "tool_call_log": tool_call_log,
                         "step_tool_calls": step_tool_calls,
@@ -509,7 +607,10 @@ def developer_node(s: ITState) -> dict:
     valid_tools = get_native_tool_names("developer")
     valid_tool_set = set(valid_tools)
     native_dev_tools = get_native_tools("developer")
-    get_registry().restrict_scope("Developer", allow=list(valid_tools))
+    # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
+    run_deps = WorkspaceDeps.from_shared_state(
+        role="Developer", chat_id=chat_id, project_path=project_path
+    )
 
     # â”€â”€ Load developer state if resuming from suspension â”€â”€
     developer_state = None
@@ -530,27 +631,33 @@ def developer_node(s: ITState) -> dict:
     )
 
     if developer_state:
-        _log(f"[DEVELOPER] ðŸ”„ Resuming from suspended execution state (iteration {developer_state['iteration']})...")
+        _log(f"[DEVELOPER] 🔄 Resuming from suspended execution state (iteration {developer_state['iteration']})...")
         if developer_state.get("messages"):
-            messages = deserialize_messages(developer_state["messages"])
+            history = _load_history_from_state(developer_state["messages"])
         elif hasattr(s, "get") and s.get("messages") and len(s.get("messages")) > 0:
-            messages = list(s.get("messages"))
-            _log(f"[DEVELOPER] Loaded {len(messages)} messages natively from Graph State.")
+            _graph_msgs = list(s.get("messages"))
+            if _graph_msgs and isinstance(_graph_msgs[0], (ModelRequest, ModelResponse)):
+                history = list(_graph_msgs)
+            else:
+                try:
+                    from llm.pai_transport import _messages_to_pai
+                    history = _messages_to_pai(_graph_msgs)
+                except Exception:
+                    history = list(_graph_msgs)  # type: ignore
+            _log(f"[DEVELOPER] Loaded {len(history)} messages natively from Graph State.")
         else:
-            messages = []
+            history = []
 
-        # Refresh only the stable system prefix. Never rewrite an old task or
-        # tool result: doing so would invalidate every cached history token.
-        if messages and isinstance(messages[0], SystemMessage):
-            old_id = getattr(messages[0], "id", None)
-            messages[0] = SystemMessage(content=static_system, id=old_id) if old_id else SystemMessage(content=static_system)
+        # Refresh only the stable system prefix. Never rewrite an old task or tool result
+        if history and isinstance(history[0], ModelRequest) and any(isinstance(p, SystemPromptPart) for p in getattr(history[0], "parts", []) or []):
+            history[0] = ModelRequest(parts=[SystemPromptPart(content=static_system)])
         else:
-            messages.insert(0, SystemMessage(content=static_system))
+            history.insert(0, ModelRequest(parts=[SystemPromptPart(content=static_system)]))
 
         # A checkpoint may have compacted the old map anchor. Re-establish one
         # full current snapshot before applying a delta; otherwise the model
         # would receive an update without the base it is meant to modify.
-        if not _has_full_project_map(messages):
+        if not _has_full_project_map(history):
             try:
                 from memory.memory_manager import load_cached_code_map
                 cached_map = load_cached_code_map(project_path).strip()
@@ -570,15 +677,15 @@ def developer_node(s: ITState) -> dict:
             # The task is already in the transcript, but the refreshed map is
             # new context for this invocation. Append it at the tail so the
             # stable prefix and all prior history remain cacheable.
-            if current_context and _latest_current_context(messages) != current_context:
-                messages.append(HumanMessage(content=current_context))
+            if current_context and _latest_current_context(history) != current_context:
+                history.append(ModelRequest(parts=[UserPromptPart(content=current_context)]))
         else:
             iteration = 0  # start a fresh repair cycle while retaining durable history
             step_tool_calls = 0
             # Append the new task traceback / client request as a human message to the end of history
-            messages.extend(
-                HumanMessage(content=part)
-                for part in _task_tail_parts(current_context, task_message, messages)
+            history.extend(
+                ModelRequest(parts=[UserPromptPart(content=part)])
+                for part in _task_tail_parts(current_context, task_message, history)
             )
             _log("[DEVELOPER] ðŸ”„ Starting a new repair/implement cycle and appending the new task description.")
 
@@ -596,17 +703,17 @@ def developer_node(s: ITState) -> dict:
         except Exception as e:
             plan_block = ""
             print(f"[DEVELOPER] Error restoring plan block: {e}")
-        _apply_plan_reinjection(messages, plan_block)
+        _apply_plan_reinjection(history, plan_block)
         
     else:
         # Stable system prefix followed by a separate full-map anchor and task
         # tail. Keeping these as separate messages lets compaction preserve the
         # map without pinning the task that originally followed it.
-        messages = [SystemMessage(content=static_system)]
-        messages.extend(
-            HumanMessage(content=part)
-            for part in _task_tail_parts(current_context, task_message)
-        )
+        # A6b: native ModelMessage history
+        history = build_initial_history(static_system, "")
+        _init_parts = _task_tail_parts(current_context, task_message)
+        for part in _init_parts:
+            history.append(ModelRequest(parts=[UserPromptPart(content=part)]))
         iteration = 0
         tool_call_log = []
         last_response_text = ""
@@ -618,14 +725,15 @@ def developer_node(s: ITState) -> dict:
     # Vision: inject user-attached images (from the API stash) before the loop
     # starts — applies to both fresh starts and repair/resume cycles (a new
     # task tail with attachments is exactly when they arrive).
+    # Golden standard: images land in run_deps.pending_images (typed channel).
     try:
-        from tools.vision_channel import drain_attachment_images
-        if drain_attachment_images(messages):
+        from tools.vision_channel import drain_attachment_images_native
+        if drain_attachment_images_native(history, ctx=run_deps):
             safe_append_live_log("[VISION] Developer: user attachment image(s) injected")
     except Exception:
         pass
 
-    existing_ids = {m.id for m in messages if getattr(m, "id", None)}
+    existing_len = len(history)
 
     # One shared append-only/checkpoint policy. There are no intermediate
     # history rewrites or per-run tier counters to restore.
@@ -633,10 +741,8 @@ def developer_node(s: ITState) -> dict:
 
     _log(f"\n{'='*60}\n[DEVELOPER] Starting tool-using agentic loop\n{'='*60}")
 
-    # Reset per-run counters
-    last_tool_failed = False  # previous turn: a tool errored or command exited non-zero
-    last_test_failed = False  # previous turn: a test/verify command failed
-    pending_guidance: list[str] = []  # transient next-call steering; never durable history
+    pending_guidance: list[str] = []
+    _native_finish = False
 
     while True:
         iteration += 1
@@ -651,23 +757,44 @@ def developer_node(s: ITState) -> dict:
             map_content = str(map_event.get("content") or "").strip()
             if map_content:
                 map_suffix = _format_current_context(map_content)
-                if map_suffix and _latest_current_context(messages) != map_suffix:
-                    messages.append(HumanMessage(content=map_suffix))
+                if map_suffix and _latest_current_context(history) != map_suffix:
+                    history.append(ModelRequest(parts=[UserPromptPart(content=map_suffix)]))
         except Exception as e:
             _log(f"[DEVELOPER] Project map delta check skipped: {e}")
 
         # Append-only below the single checkpoint threshold. At the threshold,
-        # refresh the full map and commit one transcript rebuild atomically.
+        # refresh the full map and commit one native transcript rebuild atomically.
+        # A6b: native compaction — estimate_history_tokens + compact_history_native
+        compaction_info: dict = {"checkpoint": False}
         try:
-            messages, compaction_info = compact_history(
-                messages,
-                tool_call_log=tool_call_log,
-                created=tracked_files_created,
-                modified=tracked_files_modified,
-                policy=compaction_policy,
-                workspace_path=project_path,
-                chat_id=chat_id,
-            )
+            est = estimate_history_tokens(history)
+            if est >= compaction_policy.checkpoint_trigger:
+                before = est
+                full_map = None
+                try:
+                    from memory.memory_manager import load_cached_code_map
+                    full_map = load_cached_code_map(project_path).strip() or None
+                except Exception:
+                    full_map = None
+                history = compact_history_native(
+                    history,
+                    policy=compaction_policy,
+                    full_project_map=full_map,
+                    summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                )
+                after = estimate_history_tokens(history)
+                compaction_info = {
+                    "checkpoint": True,
+                    "trigger": "checkpoint" if before < compaction_policy.hard_limit else "hard_guard",
+                    "before": before,
+                    "after": after,
+                    "map_refreshed": bool(full_map),
+                }
+                _log(
+                    f"[DEVELOPER] Native checkpoint "
+                    f"({before:,} -> {after:,} est. tokens; "
+                    f"tail={compaction_policy.tail_budget_tokens:,}; map_refreshed={bool(full_map)})"
+                )
         except Exception as e:
             _log(f"[DEVELOPER] Context checkpoint unavailable: {e}")
             safe_update_state({"thoughts": {"developer": f"Context checkpoint unavailable: {e}"}})
@@ -680,18 +807,11 @@ def developer_node(s: ITState) -> dict:
                 "tech_spec_updated": False,
                 "error_count": err_count + 1,
             })
-        if compaction_info.get("checkpoint"):
-            _log(
-                f"[DEVELOPER] Single {compaction_info.get('trigger')} checkpoint "
-                f"({compaction_info['before']:,} -> {compaction_info['after']:,} est. tokens; "
-                f"tail={compaction_policy.tail_budget_tokens:,}; map_refreshed="
-                f"{compaction_info.get('map_refreshed', False)})"
-            )
 
-        run_messages = list(messages)
+        run_messages = list(history)
         if pending_guidance:
             # Steering is useful for the next decision but is not task history.
-            run_messages.append(HumanMessage(content="\n\n".join(pending_guidance)))
+            run_messages.append(ModelRequest(parts=[UserPromptPart(content="\n\n".join(pending_guidance))]))
             pending_guidance = []
         response_text = None  # Initialize â€” will be set by LLM
 
@@ -725,53 +845,14 @@ def developer_node(s: ITState) -> dict:
                 else:
                     where_tag = f"Iter {iteration}/unbounded"
 
-                # ── Native Function Calling ──
-                # Pass tool schemas via the API tools parameter so the model
-                # returns structured tool_calls instead of text we must parse.
-                # ── Adaptive reasoning budget ladder ──
-                # The reasoning budget adapts to the TURN TYPE, not a fixed level:
-                #   iter-1 planning ............ high (plan & diagnose)
-                #   failure/repair-triggered ... high (the previous turn failed:
-                #     tool error, non-zero exit, failing test, failed edit)
-                #   search/discovery ............ low (decide what to search next
-                # ── Reasoning ladder (CACHE-AWARE): iter-1 planning uses "high";
-                # everything else runs "disabled". Deliberately NO intermediate
-                # rung: DeepSeek's prefix cache is keyed per thinking config, so
-                # EVERY effort transition (high→low→disabled) re-misses the whole
-                # per-project prefix (~4.7k tokens) once per task. The old "low"
-                # discovery rung cost that miss while producing ~0 reasoning.
-                # Trouble signals flip the NEXT turn back to "high" (cheap: the
-                # high-config request is already cached from iter-1).
-                # Knobs: REASONING_ITER1 (planning depth, mode default "high"),
-                #        REASONING_ROUTINE (routine depth, "disabled"),
-                #        FLIP_ON_TEST_ONLY=1 (default) → flip to high only
-                #        on real TEST failures; tool errors don't flip. With
-                #        Dev self-verification off there are no mid-session
-                #        test failures → the session is config-stable
-                #        (iter-1 high, everything else disabled, zero flips).
                 _dev_plan: dict = {}
                 try:
                     from llm.provider_modes import get_role_plan
-
                     _dev_plan = get_role_plan("Developer")
                 except Exception:
                     _dev_plan = {}
-                iter1_effort = os.environ.get(
-                    "REASONING_ITER1", str(_dev_plan.get("iter_effort") or "high")
-                )
-                routine_effort = os.environ.get("REASONING_ROUTINE", "disabled")
-                flip_on_test_only = os.environ.get("FLIP_ON_TEST_ONLY", "1") == "1"
-                think_hard = (
-                    iteration <= 1
-                    or last_test_failed
-                    or (not flip_on_test_only and last_tool_failed)
-                )
-                if think_hard:
-                    reasoning_effort = iter1_effort
-                    reasoning_budget = None  # planning/diagnosis: full effort, no cap
-                else:
-                    reasoning_effort = routine_effort
-                    reasoning_budget = None
+                reasoning_effort = "high"
+                reasoning_budget = None
 
                 if str(_dev_plan.get("backend")) == "free":
                     # Free-provider mode: full tool loop rides the free pool
@@ -786,28 +867,81 @@ def developer_node(s: ITState) -> dict:
                         prefer_reasoning=bool(_dev_plan.get("think_bias", True)),
                     )
                 else:
-                    llm_result = invoke_messages_with_fallback_stream(
+                    # Native agent (Track B): pydantic-ai executes tools
+                    # internally for the WHOLE task; the returned transcript
+                    # slice replaces the manual tool loop below (default).
+                    from llm.native_tools import run_native_agent
+
+                    _native_text, _native_lc, _native_reasoning = run_native_agent(
                         role="Developer",
-                        messages=run_messages,
+                        messages=list(run_messages),
                         tools=native_dev_tools,
-                        where=where_tag,
+                        temp=0.2,
                         reasoning_effort=reasoning_effort,
                         reasoning_budget=reasoning_budget,
+                        where=where_tag,
+                        deps=run_deps,
+                        system_prompt=static_system,
                     )
+                    # Rebuild the transcript from the native run's new messages.
+                    # Handle both native ModelMessage and legacy LC slice (test compat)
+                    if _native_lc and isinstance(_native_lc[0], (ModelRequest, ModelResponse)):
+                        history.extend(_native_lc)
+                    else:
+                        try:
+                            from llm.pai_transport import _messages_to_pai
+                            _converted = _messages_to_pai(_native_lc)  # type: ignore
+                            history.extend(_converted)
+                            _native_lc = _converted
+                        except Exception:
+                            history.extend(_native_lc)  # type: ignore
+                    response_text = _native_text
+                    native_tool_calls = []
+                    reasoning_content = _native_reasoning
+                    # Track which tools ran via the tool calls in new_lc (native + LC)
+                    for _m in _native_lc:
+                        if isinstance(_m, ModelResponse):
+                            for _p in getattr(_m, "parts", []) or []:
+                                if isinstance(_p, ToolCallPart):
+                                    tool_call_log.append({
+                                        "tool": _p.tool_name or "",
+                                        "args": _p.args if isinstance(_p.args, dict) else {},
+                                        "id": _p.tool_call_id or "",
+                                        "iteration": iteration,
+                                        "status": "executed",
+                                        "result_preview": "",
+                                    })
+                    # Stall nudge: byte-identical >5× consecutively → pending_guidance (no max_turns)
+                    try:
+                        from llm.loop_detector import LoopGuard as _LG
+                        _stall = _LG.has_byte_identical_stall(tool_call_log, threshold=6)
+                        if _stall:
+                            _log(f"[DEVELOPER] {_stall}")
+                            pending_guidance.append(_stall)
+                    except Exception:
+                        pass
+                    # Mark finish: force the loop to the final-report path.
+                    _native_finish = True
 
                 # Unpack the provider result. Native calls are kept as
                 # structured metadata; text-only results simply finish.
-                if isinstance(llm_result, tuple):
+                if _native_finish:
+                    response_text = response_text or ""
+                elif 'llm_result' in locals() and isinstance(llm_result, tuple):
                     if len(llm_result) == 3:
                         response_text, native_tool_calls, reasoning_content = llm_result
                     else:
                         response_text, native_tool_calls = llm_result
                         reasoning_content = None
-                else:
-                    response_text = llm_result
+                    response_text = response_text or ""
+                elif 'llm_result' in locals():
+                    response_text = llm_result or ""  # type: ignore
                     native_tool_calls = []
                     reasoning_content = None
-                response_text = response_text or ""
+                else:
+                    response_text = response_text or ""
+                    native_tool_calls = []
+                    reasoning_content = reasoning_content if 'reasoning_content' in locals() else None
 
                 # â”€â”€ Store successful code generation in cache â”€â”€
             except Exception as e:
@@ -825,15 +959,10 @@ def developer_node(s: ITState) -> dict:
 
         # Handle empty response (only nudge if both text and native tool calls are empty)
         if (not response_text or not response_text.strip()) and not native_tool_calls:
-            _log("[DEVELOPER] âš ï¸ Empty LLM response â€” retrying with explicit nudge")
-            ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
-            human_msg_id = f"dev-human-{iteration}-{uuid.uuid4()}"
-            messages.append(AIMessage(content="(empty response)", id=ai_msg_id))
-            messages.append(HumanMessage(
-                content="You responded with nothing. Please continue working on the task. "
-                        "Use a tool to make progress, or if done, explain what you accomplished.",
-                id=human_msg_id
-            ))
+            _log("[DEVELOPER] ⚠️ Empty LLM response — retrying with explicit nudge")
+            history.append(ModelResponse(parts=[TextPart(content="(empty response)")]))
+            history.append(ModelRequest(parts=[UserPromptPart(content="You responded with nothing. Please continue working on the task. "
+                        "Use a tool to make progress, or if done, explain what you accomplished.")]))
             continue
 
         last_response_text = response_text
@@ -868,6 +997,11 @@ def developer_node(s: ITState) -> dict:
                         "args": targs,
                         "id": tc.get("id") or f"dev-call-{iteration}-{call_index}-{uuid.uuid4().hex[:8]}",
                     })
+        if _native_finish:
+            # Native agent already executed tools + verification internally;
+            # the tool_call_log above reflects them. Skip the DONE-gate nudge
+            # (native agent self-verified) and go straight to finish.
+            _log(f"[DEVELOPER] Native agent finished after {iteration} iteration(s)")
         if not tool_calls:
             # Tier0 DONE-gate: if real files were touched but NO verification
             # command ever ran, force one verify turn before finishing.
@@ -880,18 +1014,15 @@ def developer_node(s: ITState) -> dict:
                               json.dumps(tc.get("args", {}), default=str), re.IGNORECASE)
                 for tc in tool_call_log
             )
-            if modified_any and not ran_verification and not verification_nudged:
+            if not _native_finish and modified_any and not ran_verification and not verification_nudged:
                 verification_nudged = True
                 _log("[DEVELOPER] Verification nudge — files were modified but no test/check ran. Forcing one verify turn.")
-                messages.append(HumanMessage(
-                    content=(
+                history.append(ModelRequest(parts=[UserPromptPart(content=(
                         f"[NUDGE] You modified {len(tracked_files_modified) + len(tracked_files_created)} file(s) "
                         "but never ran a verification command (tests / lint / checks). "
                         "Run the project's test suite and relevant checks now via run_command, then report the results. "
                         "If a check fails, fix or honestly report the failure — do not claim success."
-                    ),
-                    id=f"dev-verify-nudge-{iteration}-{uuid.uuid4()}",
-                ))
+                    ))]))
                 continue
 
             # No native tool call — the model has chosen to finish.
@@ -969,15 +1100,6 @@ def developer_node(s: ITState) -> dict:
                 print(f"[DEVELOPER] Error updating task tracking: {e}")
             # ── END ──
 
-            if is_error:
-                return make_return({
-                    "code": f"// ERROR: {clean_response[:1000]}",
-                    "agent_report": _build_dev_report(clean_response, True),
-                    "test_report": f"STATUS: FAIL\nDeveloper reported error: {clean_response[:300]}",
-                    "project_path": project_path,
-                    "code_updated": True,
-                    "tech_spec_updated": False,
-                })
             # Build exit report with validation -- bare "Completed." is useless
             def _build_dev_report(raw: str, is_err: bool) -> str:
                 import re as _re
@@ -1041,11 +1163,35 @@ def developer_node(s: ITState) -> dict:
                 })
 
         tool_result_payloads = []
-        # Failure flags reflect ONLY the previous turn's tool results: they were set
-        # by last iteration's tool loop and consumed by this turn's effort selection
-        # (think_hard) above. Reset now so THIS turn's results set them fresh.
-        last_tool_failed = False
-        last_test_failed = False
+
+        # ── Parallel read-only execution ──
+        # The provider's tool protocol is parallel: independent read-only calls
+        # (read_file / search_code / github_* reads / web_search)
+        # run concurrently on a thread pool; results come back in call order.
+        # Out-of-scope tools are filtered BEFORE execution. Everything else
+        # (run_command, edit_file, browser, ask_user…) stays
+        # sequential, byte-identical to the pre-parallel path.
+        _unknown_calls = [c for c in tool_calls if c.get("tool") not in valid_tool_set]
+        _known_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
+        try:
+            from tools import run_tool_calls as _run_tool_calls
+            batch_results = _run_tool_calls(_known_calls, lambda c: _execute_one_tool_call(c, run_deps))
+        except Exception:
+            batch_results = []
+        _tool_result_map: dict[str, str] = {}
+        _tool_exec_map: dict[str, ToolExecutionResult] = {}
+        if len(batch_results) == len(_known_calls):
+            for _tc, _res in zip(_known_calls, batch_results):
+                _cid = str(_tc.get("id") or "")
+                _tool_result_map[_cid] = str(_res)
+        if _tool_result_map:
+            _tool_exec_map = {
+                str(tc.get("id") or ""): ToolExecutionResult.from_content(
+                    str(tc.get("tool", "")), tc.get("args") or {}, _tool_result_map[str(tc.get("id") or "")]
+                )
+                for tc in _known_calls
+                if str(tc.get("id") or "") in _tool_result_map
+            }
 
         for tool_call in tool_calls:
             tool_name = tool_call.get("tool", "")
@@ -1058,6 +1204,22 @@ def developer_node(s: ITState) -> dict:
                 tool_result = f"TOOL ERROR: Unknown tool: {tool_name}. Available tools: {', '.join(valid_tools)}"
                 tool_result_payloads.append((tool_call.get("id"), tool_name, tool_result))
                 continue
+
+            call_id = str(tool_call.get("id") or "")
+            if call_id in _tool_result_map:
+                tool_result = _tool_result_map[call_id]
+                execution = _tool_exec_map[call_id]
+            else:
+                try:
+                    execution = execute_tool_detailed(tool_name, tool_args, deps=run_deps)
+                    tool_result = execution.content
+                except Exception as e:
+                    execution = ToolExecutionResult.from_content(
+                        tool_name,
+                        tool_args,
+                        f"Tool execution error: {e}",
+                    )
+                    tool_result = execution.content
 
             # â”€â”€ LoopGuard Pre-Execution Check â”€â”€
             guard_result = LoopGuard.check_pre_execute(tool_call_log, tool_name, tool_args)
@@ -1095,33 +1257,8 @@ def developer_node(s: ITState) -> dict:
 
             safe_update_state({"thoughts": {"developer": f"Using {tool_name}..."}})
             _log(f"[DEVELOPER] {tool_label}")
-            import json
             _log(f"[TOOL_CALL] {tool_name}({json.dumps(tool_args)})")
 
-            try:
-                execution = execute_tool_detailed(tool_name, tool_args, scope="Developer")
-                tool_result = _bound_tool_result(tool_name, tool_args, execution.content)
-                _log(f"[TOOL OUTPUT] {tool_name}: {tool_result}")
-            except Exception as e:
-                execution = ToolExecutionResult.from_content(
-                    tool_name,
-                    tool_args,
-                    f"Tool execution error: {e}",
-                )
-                tool_result = execution.content
-                _log(f"[TOOL OUTPUT] {tool_name}: {tool_result}")
-
-            # ── Failure tracking for the thinking ladder ──
-            # last_tool_failed / last_test_failed are consumed by the NEXT turn's
-            # reasoning-effort selection (think_hard) so a failed action forces a
-            # high-effort diagnosis turn.
-            if execution.is_error:
-                last_tool_failed = True
-                cmd_low = str(tool_args.get("command", "")).lower()
-                if tool_name == "run_command" and any(
-                    k in cmd_low for k in ("test", "verify", "pytest", "jest", "check", "lint")
-                ):
-                    last_test_failed = True
 
             # â”€â”€ Build detail string for the where_tag (shown in next LLM invocation) â”€â”€
             tool_detail = ""
@@ -1153,10 +1290,6 @@ def developer_node(s: ITState) -> dict:
                 "result_preview": str(tool_result)[:200],
                 "detail": tool_detail,  # for where_tag enrichment
             })
-            # Remember the last executed tool — the NEXT turn's reasoning ladder
-            # uses it to detect the discovery phase (search/list/read → low+cap).
-            last_tool = tool_name
-
             if warning_msg:
                 tool_result = str(tool_result) + warning_msg
 
@@ -1166,21 +1299,6 @@ def developer_node(s: ITState) -> dict:
                 fpath = tool_args.get("file_path", "")
                 if fpath and fpath not in tracked_files_modified:
                     tracked_files_modified.append(fpath)
-            elif tool_name == "template":
-                # template(action="apply") writes files outside edit_file — parse
-                # the created-file list from the result so task.json artifacts
-                # and the handoff report don't under-report template output.
-                t_action = str(tool_args.get("action", "")).strip().lower()
-                if t_action in ("apply", "use", "render", "create") and not tool_args.get("dry_run"):
-                    import re as _re
-                    for line in str(tool_result).splitlines():
-                        s = line.strip()
-                        if not s or s.startswith(("~", "!", "[", "Composed", "TODO")):
-                            continue
-                        if _re.match(r"^[\w./\\ -]+\.[A-Za-z0-9]{1,6}$", s):
-                            norm = s.replace("\\", "/").lstrip("/")
-                            if norm not in tracked_files_created:
-                                tracked_files_created.append(norm)
 
             # Format output for this tool
             tool_result_payloads.append((tool_call.get("id"), tool_name, str(tool_result)))
@@ -1191,50 +1309,37 @@ def developer_node(s: ITState) -> dict:
             response_text = response_text[:last_tool_idx + 3]
 
         history_text = re.sub(r'<thinking>.*?</thinking>', '', response_text, flags=re.DOTALL).strip()
-        ai_msg_id = f"dev-ai-{iteration}-{uuid.uuid4()}"
-        additional_kwargs = {}
-        # Only pass reasoning_content back when THIS turn made a tool call.
-        # DeepSeek docs: if the model did NOT perform a tool call, the intermediate
-        # reasoning_content does not need to participate in context concatenation
-        # (and if passed it is IGNORED) — so skipping it on text-only turns is both
-        # allowed and saves re-embedding those tokens as cache-miss input.
+        _resp_parts: list = []
+        if history_text:
+            _resp_parts.append(TextPart(content=history_text))
         if reasoning_content and tool_calls:
-            additional_kwargs["reasoning_content"] = reasoning_content
-        native_history_calls = [
-            {
-                "name": tc.get("tool", ""),
-                "args": tc.get("args", {}) if isinstance(tc.get("args", {}), dict) else {},
-                "id": tc.get("id") or f"dev-call-{iteration}-{idx}",
-                "type": "tool_call",
-            }
-            for idx, tc in enumerate(tool_calls)
-            if tc.get("tool")
-        ]
-        messages.append(AIMessage(
-            content=history_text,
-            id=ai_msg_id,
-            tool_calls=native_history_calls,
-            additional_kwargs=additional_kwargs,
-        ))
+            _resp_parts.append(ThinkingPart(content=str(reasoning_content)))
+        for idx, tc in enumerate(tool_calls):
+            if tc.get("tool"):
+                _resp_parts.append(ToolCallPart(
+                    tool_name=str(tc.get("tool", "")),
+                    args=tc.get("args", {}) if isinstance(tc.get("args", {}), dict) else {},
+                    tool_call_id=str(tc.get("id") or f"dev-call-{iteration}-{idx}-{uuid.uuid4().hex[:8]}"),
+                ))
+        if _resp_parts:
+            history.append(ModelResponse(parts=_resp_parts))
 
         # Preserve the provider's required assistant-tool-result protocol. A
         # separate result message per call is smaller and more recoverable than
         # merging every result into one anonymous HumanMessage.
         for result_index, (call_id, tool_name, payload) in enumerate(tool_result_payloads):
-            result_id = f"dev-tool-{iteration}-{result_index}-{uuid.uuid4().hex[:8]}"
-            messages.append(ToolMessage(
+            history.append(ModelRequest(parts=[ToolReturnPart(
+                tool_name=str(tool_name or "tool"),
                 content=f"[{tool_name}]:\n{payload}",
-                tool_call_id=call_id or f"dev-call-{iteration}-{result_index}",
-                name=tool_name or None,
-                id=result_id,
-            ))
+                tool_call_id=str(call_id or f"dev-call-{iteration}-{result_index}"),
+            )]))
 
         # Vision: tools (browser_screenshot / read_file on images) queue inline
         # pixels; inject them as ONE user message right after the ToolMessages —
         # the API accepts images in user messages only.
         try:
-            from tools.vision_channel import drain_into_messages
-            if drain_into_messages(messages, header="[Inline image(s) from tool result]"):
+            from tools.vision_channel import drain_into_messages_native
+            if drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=run_deps):
                 safe_append_live_log(f"[VISION] Dev iter {iteration}: inline image(s) injected")
         except Exception:
             pass

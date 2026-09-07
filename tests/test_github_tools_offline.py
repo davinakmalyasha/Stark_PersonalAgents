@@ -196,9 +196,9 @@ def test_resolve_fallback_defaults():
     assert set(lv["prod"]) == {"main", "master"}
 
 
-def test_resolve_ignores_kill_switch():
+def test_resolve_returns_levels():
     _install(FakeGH(heads=("main",)))
-    with clean_ci_env(CI_GATE_BRANCH="off"):
+    with clean_ci_env():
         lv = gt._resolve_branch_levels(REPO)
     assert lv is not None and lv["dev"] == "development"
 
@@ -284,7 +284,6 @@ def test_seed_gate_fresh_repo_seeds_everything():
     assert cfg["branches"]["dev"] == "development"
     assert cfg["branches"]["staging"] == "staging"
     assert "main" in cfg["branches"]["prod"] and "master" in cfg["branches"]["prod"]
-    assert cfg["harness"]["auto_push"] is True
 
 
 def test_seed_gate_existing_files_kept_by_default():
@@ -394,8 +393,7 @@ def test_apply_gate_rerun_protects_prod_not_dev():
     fake.refs["development"] = "7" * 40
     fake.seed_file(".harness-ci.json", json.dumps(
         {"branches": {"dev": "development", "staging": "staging",
-                      "prod": ["main", "master"]},
-         "harness": {"auto_push": True}}))
+                      "prod": ["main", "master"]}}))
     fake.seed_file(".github/workflows/fast-checks.yml",
                    "jobs:\n  a:\n  b:\n  c:\n")
     fake.seed_file(".github/workflows/staging.yml", "jobs:\n  s1:\n")

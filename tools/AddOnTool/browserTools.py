@@ -70,7 +70,7 @@ def browser_extract(what: str = "text", selector: str = "") -> str:
         return _browser_cmd(["get", what, selector], timeout_sec=15)
     return _browser_cmd(["get", what, "body"], timeout_sec=15)
 
-def browser_screenshot(path: str = "") -> str:
+def browser_screenshot(path: str = "", ctx=None) -> str:
     """Take a screenshot of the current browser page.
 
     Saves the PNG to disk AND queues it for inline vision injection: the agent
@@ -79,6 +79,8 @@ def browser_screenshot(path: str = "") -> str:
 
     Args:
         path: Optional file path to save the screenshot. Auto-named if empty.
+        ctx: Optional WorkspaceDeps (native agent passes it; images land in the
+            typed per-run channel).
     """
     import os
     if not path:
@@ -91,7 +93,7 @@ def browser_screenshot(path: str = "") -> str:
         size = os.path.getsize(path)
         try:
             from tools.vision_channel import queue_image_file
-            queued = queue_image_file(path, note=f"Browser screenshot ({size} bytes)")
+            queued = queue_image_file(path, note=f"Browser screenshot ({size} bytes)", ctx=ctx)
         except Exception:
             queued = False
         inline = " — image attached inline (vision)" if queued else ""

@@ -17,4 +17,10 @@ echo.
 echo   Starting server on all interfaces (pairing token required for phones)...
 cd /d D:\MyProject\LangChain
 set STARK_BIND=0.0.0.0
-D:\MyProject\LangChain\venv312\Scripts\python.exe server\api_server.py
+if defined VOICE_PYTHON (
+  %VOICE_PYTHON% server\api_server.py
+) else if exist "D:\MyProject\LangChain\venv\Scripts\python.exe" (
+  D:\MyProject\LangChain\venv\Scripts\python.exe server\api_server.py
+) else (
+  D:\MyProject\LangChain\venv312\Scripts\python.exe server\api_server.py
+)

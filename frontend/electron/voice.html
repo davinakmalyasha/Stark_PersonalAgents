@@ -131,6 +131,23 @@ body.state-speaking .orb-ripple.r2 { animation-delay: 1s; }
 body.state-listening .orb-ripple { animation: rippleOut 2.8s ease-out infinite; }
 @keyframes rippleOut { 0% { transform: scale(1); opacity: 0.4; } 100% { transform: scale(1.9); opacity: 0; } }
 
+/* ── TTS warm-up loading (mic button only — clean black spinner line) ── */
+.bars-btn.loading { pointer-events: none; }
+.bars-btn.loading::after {
+  content: '';
+  position: absolute;
+  inset: 11px;
+  border-radius: 50%;
+  border: 2.5px solid transparent;
+  border-top-color: #0f172a;
+  animation: spin 0.9s linear infinite;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+.bars-btn.loading::before { display: none; }
+.bars-btn.loading .bars { opacity: 0; transition: opacity 0.35s ease; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
 /* ── Info column ── */
 .info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .status-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
@@ -575,7 +592,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 (function () {
   'use strict';
 
-  const API = 'http://127.0.0.1:8000';
+  const API = 'http://127.0.0.1:' + ((window.voiceBridge && window.voiceBridge.getStarkPort) ? window.voiceBridge.getStarkPort() : '8123');
   const $ = (id) => document.getElementById(id);
   const dot = $('dot'), label = $('label'), textEl = $('voice-text');
   const micBtn = $('mic-btn');
@@ -603,11 +620,14 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 
   const VOICES = [
     { id: 'jarvis', name: 'JARVIS — cloned', lang: 'en' },
-    { id: 'am_michael', name: 'Michael — male', lang: 'en' },
-    { id: 'af_heart', name: 'Heart — female', lang: 'en' },
+    { id: 'alba', name: 'Alba — female', lang: 'en' },
+    { id: 'anna', name: 'Anna — female', lang: 'en' },
+    { id: 'vera', name: 'Vera — female', lang: 'en' },
+    { id: 'michael', name: 'Michael — male', lang: 'en' },
+    { id: 'charles', name: 'Charles — male', lang: 'en' },
   ];
-  let voice = localStorage.getItem('voice.voice') || 'en-US-JennyNeural';
-  let voiceId = localStorage.getItem('voice.idVoice') || 'id-ID-GadisNeural';
+  let voice = localStorage.getItem('voice.voice') || 'jarvis';
+  let voiceId = localStorage.getItem('voice.idVoice') || 'jarvis';
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // Rough Indonesian vs English detection (Indonesian stopwords)
@@ -630,6 +650,8 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 
   let micOn = false;
   let speaking = false;
+  let incrementalTtsBuffer = '';  // Phase 8-V6: accumulated reply → one gapless speakStreamed
+  let ttsHeldUntil = 0;         // Phase 8-V1: sentence-settle debounce timestamp
   let thinking = false;
   let accumulated = '';
   let lastReply = '';
@@ -763,7 +785,15 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         wctx.fill();
       }
     }
-    animId = requestAnimationFrame(drawWave);
+    // Phase 8-V6: idle CPU guard — pause the animation loop when nothing is
+    // listening/speaking/thinking so the renderer doesn't burn CPU on
+    // requestAnimationFrame repaints (was 60fps even idle → competed with
+    // TTS decode → choppy).
+    if (micOn || speaking || thinking || waveMode === 'listening' || waveMode === 'speaking' || waveMode === 'thinking') {
+      animId = requestAnimationFrame(drawWave);
+    } else {
+      animId = null;
+    }
   }
 
   function setStatus(s, extraText) {
@@ -801,11 +831,31 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     return '';
   }
 
-  // ── Capture config (mirrors scratch/pure_moonshine_test.py) ──
-  const SEND_SILENCE_MS = 2500;  // quiet for this long → end the round + transcribe
-  const MAX_ROUND_MS = 30000;    // hard cap for continuous talking
-  const MIN_ROUND_MS = 800;      // ignore sub-second blips
-  const SOUND_LEVEL = 0.01;      // anything above this counts as "sound"
+  // ── Capture config — TurnDetection (portable, mirrors pydantic TurnDetection) ──
+  // Backend is source of truth at /api/turn_detection; defaults below are fallbacks.
+  let turnDetection = {
+    sensitivity: 'medium',
+    prefix_padding_ms: 300,
+    silence_duration_ms: 300,
+    sound_level: 0.01,
+    min_round_ms: 250,
+    max_round_ms: 30000,
+  };
+  // Convenience aliases (kept for existing code paths).
+  let SEND_SILENCE_MS = turnDetection.silence_duration_ms;
+  let MAX_ROUND_MS = turnDetection.max_round_ms;
+  const RUN_TIMEOUT_MS = 300000; // Phase 8-V5: run watchdog raised to 5min — long agent runs must not be killed early
+  let MIN_ROUND_MS = turnDetection.min_round_ms;
+  let SOUND_LEVEL = turnDetection.sound_level;
+  fetch(API + '/api/turn_detection').then((r) => r.json()).then((cfg) => {
+    if (cfg && typeof cfg.silence_duration_ms === 'number') {
+      turnDetection = cfg;
+      SEND_SILENCE_MS = cfg.silence_duration_ms;
+      MIN_ROUND_MS = cfg.min_round_ms;
+      MAX_ROUND_MS = cfg.max_round_ms;
+      SOUND_LEVEL = cfg.sound_level;
+    }
+  }).catch(() => {});
 
   // Whisper's classic silence/noise hallucinations — never send these
   const HALLUCINATIONS = [
@@ -831,33 +881,28 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     return false;
   }
 
-  // Polish (free-LLM grammar fix) then send to the pipeline
+  // Local rule-based transcript cleanup — replaces the free-LLM /api/cleanup
+  // round trip (which cost 3-15s per voice turn). Pure JS, zero network.
+  const FILLER_RE = /\b(um+|uh+|uhh+|hmm+|erm+|er+|like)\b/gi;
+  const REPEAT_RE = /\b(\w+)(\s+\1){2,}\b/gi;
+  function cleanTranscript(raw) {
+    let t = (raw || '').trim();
+    if (!t) return t;
+    t = t.replace(FILLER_RE, ' ').replace(REPEAT_RE, '$1').replace(/\s{2,}/g, ' ').trim();
+    t = t.replace(/([.!?…])\s*([a-z])/g, (_, p, c) => p + ' ' + c.toUpperCase());
+    t = t.replace(/^\s*([a-z])/, (c) => c.toUpperCase());
+    return t;
+  }
+
+  // Polish (rule-based) then send to the pipeline
   async function sendText(raw) {
-    const text = (raw || '').trim();
+    const text = cleanTranscript(raw);
     if (!text || sending) return;
     sending = true;
     try {
       setStatus('thinking');
-      textEl.textContent = 'Polishing…';
-      let final = text;
-      try {
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), 15000);
-        const resp = await fetch(API + '/api/cleanup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: text.slice(0, 800) }),
-          signal: ac.signal,
-        });
-        clearTimeout(timer);
-        const data = await resp.json();
-        if (data && typeof data.text === 'string' && data.text.trim() && !data.error) {
-          final = data.text.trim();
-        }
-      } catch (e) {
-        console.error('[Voice] polish failed', e);
-      }
-      if (final !== text) {
+      const final = text;
+      if (final !== raw) {
         textEl.textContent = final;
         send('transcript', { text: final });
       }
@@ -882,13 +927,11 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     }
   }
 
-  // ── Capture: getUserMedia + MediaRecorder ───────────────────────────────
-  // The SAME capture method other apps use (and the one that provably hears
-  // this machine's user). The FULL recording goes to /api/transcribe, which
-  // calls Moonshine with the exact code path of scratch/pure_moonshine_test.py
-  // (transcribe_without_streaming). No trimming, no gates, no hints.
-  let recorder = null;
-  let recChunks = [];
+  // ── Capture: server-side streaming STT (no MediaRecorder, no webm, no ffmpeg)
+  // The browser keeps the mic ONLY for VAD/barge-in (analyser); actual audio
+  // goes through /api/voice/start → Moonshine streaming → /api/voice/peek
+  // (live transcript while talking) → /api/voice/send (final + wav for MiMo).
+  let recTimer = null;
 
   function startRound() {
     if (!micOn || roundRunning) return;
@@ -901,20 +944,14 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       });
   }
 
-  function endRecorder() {
-    if (recorder && recorder.state !== 'inactive') {
-      try { recorder.stop(); } catch (_e) { /* already stopped */ }
-    }
-  }
-
   async function transcribeBlob(blob) {
+    // Fallback path kept for non-audio modes when server capture fails.
     try {
       const fd = new FormData();
       fd.append('file', blob, 'round.webm');
       const resp = await fetch(API + '/api/transcribe', { method: 'POST', body: fd });
       const data = await resp.json();
       if (!resp.ok || (data && data.error)) {
-        // Empty transcript (422) = no speech heard — ignore silently
         if (resp.status !== 422) {
           setStatus('error', String((data && data.error) || ('HTTP ' + resp.status)).slice(0, 400));
           await sleep(1500);
@@ -930,20 +967,38 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 
   async function oneRound() {
     if (!stream || !micOn) return;
-    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus' : 'audio/webm';
-    recorder = new MediaRecorder(stream, { mimeType: mime });
-    recChunks = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) recChunks.push(e.data);
-    };
-    const stopped = new Promise((res) => { recorder.onstop = () => res(); });
-    recorder.start(250);
-
     const buf = analyser ? new Uint8Array(analyser.fftSize) : null;
     roundHasSpeech = false;
     let lastSoundAt = Date.now();
     const startedAt = Date.now();
+    let lastPeekText = '';
+
+    // Live transcript: poll /api/voice/peek so the user sees words appear
+    // as they speak (the "streaming input" feel).
+    let captureSelfHealAt = 0;
+    const peekTimer = setInterval(async () => {
+      try {
+        const r = await fetch(API + '/api/voice/peek');
+        const d = await r.json();
+        if (d && d.active === false) {
+          // Server capture died (server restarted / watchdog stopped it) —
+          // restart it so live input keeps working. Self-heal max 1x/2s.
+          const now = Date.now();
+          if (now > captureSelfHealAt) {
+            captureSelfHealAt = now + 2000;
+            fetch(API + '/api/voice/start', { method: 'POST' }).catch(() => {});
+            console.log('[Voice] capture inactive — restarting');
+          }
+        }
+        if (d && d.text && d.text !== lastPeekText) {
+          lastPeekText = d.text;
+          accumulated = d.text;
+          setStatus('listening', d.text);
+          send('transcript', { text: d.text });
+          showHint();
+        }
+      } catch (_e) { /* ignore */ }
+    }, 300);
 
     const monitor = setInterval(() => {
       let level = 0;
@@ -957,65 +1012,86 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         lastSoundAt = Date.now();
         lastSpeechAt = Date.now();
         roundHasSpeech = true;
-        // Barge-in: user talks while we answer → stop our voice and capture
+        // Barge-in ChatGPT-style: voice while TTS speaking stops audio immediately
         if (speaking) {
           stopSpeaking();
           setStatus('listening', accumulated || 'Listening');
         }
+        // Note: while LLM is thinking, don't abort on VAD — new speech will be
+        // steered as incremental context (see finishRound steering). Hard
+        // interrupt (abort) only when TTS is speaking.
       }
       const elapsed = Date.now() - startedAt;
       // End the round after 2.5s of quiet, or after the hard cap
       if (elapsed >= MAX_ROUND_MS || (elapsed >= MIN_ROUND_MS && Date.now() - lastSoundAt >= SEND_SILENCE_MS)) {
         clearInterval(monitor);
-        if (recorder.state !== 'inactive') recorder.stop();
+        clearInterval(peekTimer);
+        finishRound();
       }
-    }, 100);
+    }, 200);
 
-    await stopped;
-    await sleep(40);
-
-    recorder = null;
-    // Pure silence — nothing to transcribe
-    if (!roundHasSpeech || recChunks.length === 0) return;
-
-    // PURE: send the FULL recording — the first chunk always carries the
-    // WebM header; the server uses the pure Moonshine call (loudnorm + retry)
-    const blob = new Blob(recChunks, { type: mime });
-    recChunks = [];
-    let t = await transcribeBlob(blob);
-    if (isGarbage(t)) t = '';
-    if (t) {
-      // Barge-in only after STT confirms actual speech. A noisy recording
-      // can still produce a 422/empty transcript; cancelling the active run
-      // for that case leaves live mode listening without ever answering.
-      if (thinking) {
-        if (abortRef) { abortRef.abort(); abortRef = null; }
-        thinking = false;
+    async function finishRound() {
+      // No speech detected by browser VAD → still flush server capture
+      // (it may have heard something the browser meter missed).
+      let t = '';
+      try {
+        const r = await fetch(API + '/api/voice/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const d = await r.json();
+        if (!r.ok || (d && d.error)) {
+          if (r.status !== 422) setStatus('error', String((d && d.error) || ('HTTP ' + r.status)).slice(0, 400));
+        } else {
+          t = d.text || '';
+        }
+      } catch (e) {
+        console.error('[Voice] send failed', e);
       }
-      accumulated = t;
-      lastLang = detectLanguage(accumulated);
-      setStatus('listening', accumulated);
-      showHint();
-      send('transcript', { text: accumulated });
-    }
+      if (isGarbage(t)) t = '';
 
-    // Mute pressed during this speech round → send now
-    if (mutePendingSend) {
-      mutePendingSend = false;
-      const text = accumulated.trim();
-      if (text) { accumulated = ''; hideHint(); sendText(text); }
-      return;
-    }
+      if (t) {
+        accumulated = t;
+        lastLang = detectLanguage(accumulated);
+        setStatus('listening', accumulated);
+        showHint();
+        send('transcript', { text: accumulated });
+      }
 
-    // Hands-free auto-send after the round settles
-    const pending = accumulated.trim();
-    if (pending && !sending && !thinking) {
-      await sleep(400);
-      const text2 = accumulated.trim();
-      if (text2 && !sending && !thinking) {
-        accumulated = '';
-        hideHint();
-        sendText(text2);
+      // Mute pressed during this speech round → send now
+      if (mutePendingSend) {
+        mutePendingSend = false;
+        const text = accumulated.trim();
+        if (text) { accumulated = ''; hideHint(); sendText(text); }
+        return;
+      }
+
+      // Hands-free auto-send: if idle, start new LLM run; if LLM already
+      // thinking, stream as steering (ChatGPT live) so breath+continue works.
+      const pending = accumulated.trim();
+      if (pending && !sending) {
+        if (thinking) {
+          // Stream incremental words to the running LLM + show immediately in chat
+          const delta = pending;
+          accumulated = '';
+          hideHint();
+          // Show in chat bubble immediately (transcript already did, but ensure)
+          send('transcript', { text: delta });
+          // Steer the running run — LLM will see it next iteration
+          if (chatId) {
+            fetch(API + '/api/steer', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ chat_id: chatId, message: delta })}).catch(()=>{});
+          }
+        } else {
+          // No active run — wait tiny debounce then start one (0.3s silence already, so 100ms extra is enough)
+          await sleep(100);
+          const text2 = accumulated.trim();
+          if (text2 && !sending && !thinking) {
+            accumulated = '';
+            hideHint();
+            sendText(text2);
+          }
+        }
       }
     }
   }
@@ -1026,6 +1102,9 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   let voiceWsId = localStorage.getItem('voice.wsId') || '';
   let voiceWsPath = localStorage.getItem('voice.wsPath');
   let wsResolvedBy = ''; // 'ipc' | 'fallback' | ''
+  // Phase 8-V5: use the app's selected model/temperature for voice runs.
+  let voiceModel = 'Automatic Fallback';
+  let voiceTemp = 0.7;
 
   if (bridge && bridge.onSetChat) {
     bridge.onSetChat((info) => {
@@ -1035,6 +1114,8 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         chatId = info.chatId;
         chatLock = null;
         wsResolvedBy = 'ipc';
+        if (info.model) voiceModel = info.model;
+        if (typeof info.temperature === 'number') voiceTemp = info.temperature;
         localStorage.setItem('voice.wsId', voiceWsId);
         localStorage.setItem('voice.wsPath', voiceWsPath);
         localStorage.setItem('voice.chatId', chatId);
@@ -1053,11 +1134,16 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
           if (check.ok) return chatId;
         } catch (_e) { /* fall through */ }
       }
-      // 2) Fresh resolution: General workspace + its first chat (what the
-      //    house shows). Creates 'Voice Chat' when there are none.
+      // 2) Fresh resolution: the ACTIVE workspace synced from the main window
+      //    (voiceWsId already set by onSetChat) or the General workspace.
+      //    NEVER pick _house for a general chat — that leaks the house agent.
+      let ws = null;
       const wsRes = await fetch(API + '/api/workspaces');
       const wsData = await wsRes.json();
-      const ws = (wsData.workspaces || []).find((w) => w.isGeneral) || (wsData.workspaces || [])[0];
+      const all = wsData.workspaces || [];
+      if (voiceWsId) ws = all.find((w) => w.id === voiceWsId) || null;
+      if (!ws) ws = all.find((w) => w.isGeneral) || null;
+      if (!ws) ws = all[0] || null;
       if (!ws) throw new Error('No workspace available');
       voiceWsId = ws.id;
       voiceWsPath = ws.path || '';
@@ -1094,6 +1180,11 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     } catch (e) {
       console.error('[Voice] failed to persist reply', e);
     }
+    // Phase 8-V2 fix: ALWAYS tell the main window the reply landed — the
+    // chat must refresh in real time (navigating away/back was the only
+    // way to see it before because the per-sentence TTS path never sent
+    // the `reply` event).
+    send('reply', { text: reply.slice(0, 500) });
   }
 
   function progressFromState(s) {
@@ -1227,6 +1318,202 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     feedStatus.textContent = kind === 'error' ? 'error' : '…';
   }
 
+  // Shared SSE consumption for /api/run — used by the text path
+  // (sendToPipeline). Handles state
+  // frames, live feed, progress, pipeline-done, reply, TTS speaking, errors.
+  // Returns true when the reply was spoken / handled; false on transport error.
+  async function consumeRunStream(resp, chat, userText) {
+    let lastState = null;
+    let failed = false;
+    let failReason = '';
+    let streamReplyText = '';
+    let spokenUpTo = 0;
+    let incrementalMuted = false;
+    // Helper for true streaming: accumulate completed sentences into a single
+    // gapless buffer spoken once at the end (harness-style single stream).
+    // Phase 8-V6: one /api/tts/stream call per reply — no concurrent TTS.
+    // scheduled back-to-back), so the user hears the FIRST sentence while the
+    // agent is still working on the rest — no more "silence until done".
+    function maybeSpeakIncremental(forceFlush = false) {
+      if (!streamReplyText || spokenUpTo >= streamReplyText.length) return;
+      const now = Date.now();
+      const unsent = streamReplyText.slice(spokenUpTo);
+      // Find sentence boundary: ". ", "! ", "? " or end
+      let boundary = -1;
+      const m = unsent.match(/[.!?]\s/);
+      if (m && m.index !== undefined) boundary = m.index + 1; // include punctuation
+      else if (forceFlush && unsent.trim().length > 0) boundary = unsent.length;
+      else if (unsent.length > 180) {
+        const sp = unsent.lastIndexOf(' ', 150);
+        boundary = sp > 40 ? sp : 150;
+      }
+      // Hold the boundary briefly so mid-sentence pauses don't split a word.
+      if (boundary !== -1 && !forceFlush) {
+        const hold = 350; // ms — enough for normal inter-word pauses, short enough to feel live
+        if (now - ttsHeldUntil > 0 && boundary < unsent.length - 2) {
+          // Only speak if the sentence is "settled" — we haven't seen new text
+          // for `hold` ms OR the boundary is followed by substantial content.
+          ttsHeldUntil = now;
+        }
+      }
+      if (boundary === -1) return;
+      const sentence = unsent.slice(0, boundary).trim();
+      if (!sentence) { spokenUpTo += boundary + 1; return; }
+      const clean = cleanForTTS(sentence);
+      if (!clean || clean.length < 3) { spokenUpTo += boundary + 1; return; }
+      if (isGarbage(clean)) { spokenUpTo += boundary + 1; return; }
+      spokenUpTo += boundary + 1;
+      while (spokenUpTo < streamReplyText.length && streamReplyText[spokenUpTo] === ' ') spokenUpTo++;
+      if (!incrementalMuted) {
+        incrementalMuted = true;
+        const ctx = ensureTtsCtx();
+        if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
+        speaking = true;
+        setStatus('speaking', clean.slice(0,120));
+      }
+      // Phase 8-V6: ONE stream per reply — accumulate all sentences, then
+      // speak them through a single speakStreamed call (harness-style gapless
+      // single buffer). No per-sentence HTTP → no concurrent TTS calls on the
+      // (non-thread-safe) model, no choppiness, no CPU spikes.
+      if (!incrementalTtsBuffer) incrementalTtsBuffer = '';
+      incrementalTtsBuffer += ' ' + clean;
+    }
+    try {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let pendingEvent = '';
+      let evDone = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            pendingEvent = line.slice(7).trim();
+            continue;
+          }
+          if (!line.startsWith('data: ')) { continue; }
+          const evName = pendingEvent;
+          pendingEvent = '';
+          try {
+            const parsed = JSON.parse(line.slice(6).trim());
+            if (evName === 'delta') {
+              // Live token deltas — docs: bus emits kind "text" vs "reasoning"
+              if (parsed && typeof parsed.text === 'string' && parsed.text) {
+                if (parsed.kind === 'reasoning') {
+                  // Don't speak reasoning, just show as progress
+                  textEl.textContent = ('… ' + parsed.text.slice(-100)).slice(-120);
+                  requestAnimationFrame(refreshMarquee);
+                } else {
+                  streamReplyText += parsed.text;
+                  textEl.textContent = streamReplyText.slice(-120);
+                  requestAnimationFrame(refreshMarquee);
+                  send('progress', { text: streamReplyText.slice(-120) });
+                  maybeSpeakIncremental(false);
+                }
+                // Phase 8-V2: forward every delta to the main window so the
+                // canonical chat overlay streams tokens live during voice runs.
+                send('delta', { kind: parsed.kind || 'text', text: parsed.text, agent: parsed.agent || '' });
+              }
+              continue;
+            }
+            if (evName === 'done') {
+              if (parsed.error) { failed = true; failReason = String(parsed.error); }
+              evDone = true;
+              break;
+            }
+            if (parsed.error) { failed = true; failReason = String(parsed.error); }
+            if (parsed.active_node || parsed.live_terminal_log) {
+              lastState = parsed;
+              send('pipeline-state', { workspaceId: voiceWsId, chatId: chat, state: parsed });
+              appendFeedFromState(parsed);
+              if (!failed) {
+                const prog = progressFromState(parsed);
+                if (prog) { textEl.textContent = prog; requestAnimationFrame(refreshMarquee); send('progress', { text: prog }); }
+              }
+            }
+          } catch (_e) { /* skip malformed lines */ }
+        }
+        if (evDone) break;
+      }
+      thinking = false;
+      send('pipeline-done', {
+        workspaceId: voiceWsId,
+        chatId: chat,
+        state: lastState,
+        status: failed ? 'error' : 'complete',
+        error: failReason || undefined,
+      });
+      const reply = ((lastState && lastState.outputs && lastState.outputs.agent_report) || '').trim();
+      if (reply) {
+        if (feedStatus) feedStatus.textContent = 'answering';
+        feedMsg('Assistant: ' + reply.slice(0, 200), 'agent');
+        await persistReply(chat, reply);
+        if (incrementalMuted || spokenUpTo < streamReplyText.length || incrementalTtsBuffer) {
+          // Phase 8-V6: flush the accumulated reply through ONE gapless
+          // speakStreamed call (single stream, no concurrent TTS), then wait
+          // for it to finish before returning to listening.
+          maybeSpeakIncremental(true);
+          if (incrementalTtsBuffer && incrementalTtsBuffer.trim()) {
+            const buf = incrementalTtsBuffer.trim();
+            incrementalTtsBuffer = '';
+            const useVoice = voiceForLanguage(detectLanguage(buf));
+            const ok = await speakStreamed(buf, useVoice);
+            if (!ok) {
+              const resp = await fetch(API + '/api/tts', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: buf, voice: useVoice, engine: 'pocket' }) });
+              if (resp.ok) {
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                audio.src = url;
+                await audio.play();
+                await new Promise((res) => { audio.onended = res; audio.onpause = () => { if (!speaking) res(); }; });
+              }
+            }
+          }
+          speaking = false;
+          incrementalMuted = false;
+          if (micOn) setStatus('listening', accumulated || 'Listening');
+          return true;
+        } else {
+          // No incremental text was spoken (reply arrived instantly) — full reply
+          setStatus('processing', 'Preparing voice…');
+          await speak(reply);
+          return true;
+        }
+      }
+      if (failed) {
+        setStatus('error', extractRunError(lastState, failReason));
+        if (feedStatus) feedStatus.textContent = 'error';
+        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
+      } else if (lastState) {
+        setStatus('error', 'No reply received — check api_out.log');
+        if (feedStatus) feedStatus.textContent = 'error';
+        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
+      } else {
+        setStatus('error', 'Run returned nothing — check api_out.log');
+        if (feedStatus) feedStatus.textContent = 'error';
+        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
+      }
+      return false;
+    } catch (e) {
+      thinking = false;
+      if (e.name === 'AbortError') {
+        setStatus('listening', accumulated || 'Listening');
+        if (feedStatus) feedStatus.textContent = 'stopped';
+        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'aborted' });
+      } else {
+        console.error('[Voice] run failed', e);
+        setStatus('error', 'Run failed');
+        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'error', error: String(e) });
+      }
+      return false;
+    }
+  }
+
   async function sendToPipeline(text) {
     thinking = true;
     setStatus('thinking');
@@ -1246,88 +1533,43 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     }
     send('pipeline-start', { workspaceId: voiceWsId, chatId: chat, prompt: text });
     abortRef = new AbortController();
-    let lastState = null;
-    let failed = false;
-    let failReason = '';
+    // Watchdog: if the run stalls (no done frame within RUN_TIMEOUT_MS), bail
+    // out of the thinking state so the overlay never hangs forever.
+    let runSettled = false;
+    const watchdog = setTimeout(() => {
+      if (runSettled) return;
+      runSettled = true;
+      console.error('[Voice] run watchdog timeout — aborting');
+      thinking = false;
+      if (abortRef) { try { abortRef.abort(); } catch (_e) {} abortRef = null; }
+      setStatus('error', 'Run timed out');
+      send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: null, status: 'timeout', error: 'Run timed out' });
+      setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
+    }, RUN_TIMEOUT_MS);
     try {
       const resp = await fetch(API + '/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text, model: 'Automatic Fallback', temperature: 0.7, workspace_path: (voiceWsPath !== null && voiceWsPath !== undefined) ? voiceWsPath : '', chat_id: chat, attachments: [] }),
+        body: JSON.stringify({
+          prompt: text,
+          model: voiceModel,
+          temperature: voiceTemp,
+          workspace_path: (voiceWsPath !== null && voiceWsPath !== undefined) ? voiceWsPath : '',
+          chat_id: chat,
+          attachments: [],
+          workspace_kind: voiceWsId === '_house' ? 'house' : (voiceWsId === '_personal' ? 'personal' : 'general'),
+        }),
         signal: abortRef.signal,
       });
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const parsed = JSON.parse(line.slice(6).trim());
-            if (parsed.error) { failed = true; failReason = String(parsed.error); }
-            if (parsed.active_node || parsed.live_terminal_log) {
-              lastState = parsed;
-              send('pipeline-state', { workspaceId: voiceWsId, chatId: chat, state: parsed });
-              appendFeedFromState(parsed);
-              if (!failed) {
-                const prog = progressFromState(parsed);
-                if (prog) { textEl.textContent = prog; requestAnimationFrame(refreshMarquee); send('progress', { text: prog }); }
-              }
-            }
-          } catch (_e) { /* skip malformed lines */ }
-        }
-      }
-      thinking = false;
-      send('pipeline-done', {
-        workspaceId: voiceWsId,
-        chatId: chat,
-        state: lastState,
-        status: failed ? 'error' : 'complete',
-        error: failReason || undefined,
-      });
-      const reply = ((lastState && lastState.outputs && lastState.outputs.agent_report) || '').trim();
-      if (reply) {
-        if (feedStatus) feedStatus.textContent = 'answering';
-        feedMsg('Assistant: ' + reply.slice(0, 200), 'agent');
-        setStatus('processing', 'Preparing voice…');
-        await persistReply(chat, reply);
-        await speak(reply);
-      } else if (failed) {
-        setStatus('error', extractRunError(lastState, failReason));
-        if (feedStatus) feedStatus.textContent = 'error';
-        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
-      } else if (lastState) {
-        setStatus('error', 'No reply received — check api_out.log');
-        if (feedStatus) feedStatus.textContent = 'error';
-        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
-      } else {
-        setStatus('error', 'Run returned nothing — check api_out.log');
-        if (feedStatus) feedStatus.textContent = 'error';
-        setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 3000);
-      }
-    } catch (e) {
-      thinking = false;
-      if (e.name === 'AbortError') {
-        setStatus('listening', accumulated || 'Listening');
-        if (feedStatus) feedStatus.textContent = 'stopped';
-        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'aborted' });
-      } else {
-        console.error('[Voice] run failed', e);
-        setStatus('error', 'Run failed');
-        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'error', error: String(e) });
-      }
+      await consumeRunStream(resp, chat, text);
     } finally {
+      runSettled = true;
+      clearTimeout(watchdog);
       abortRef = null;
     }
   }
 
-  // ── Speech playback (TTS via backend edge-tts) ──
+  // ── Speech playback (TTS via backend Pocket TTS engine) ──
   function cleanForTTS(t) {
     return t
       .replace(/```[\s\S]*?```/g, ' ')
@@ -1339,12 +1581,56 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       .slice(0, 800);
   }
 
+  // Gapless TTS state — Web Audio scheduling + barge-in truncation
+  let ttsCtx = null;
+  let ttsNextTime = 0;
+  const ttsSources = new Set();
+  let _ttsStartAt = 0; // AudioContext time when current utterance started (for played_ms)
+
+  function ensureTtsCtx() {
+    if (!ttsCtx || ttsCtx.state === 'closed') {
+      try { ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 }); }
+      catch (_e) { ttsCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+      ttsNextTime = ttsCtx.currentTime;
+    }
+    if (ttsCtx.state === 'suspended') ttsCtx.resume().catch(() => {});
+    return ttsCtx;
+  }
+
+  function _ttsPlayedMs() {
+    try {
+      if (!_ttsStartAt || !ttsCtx) return 0;
+      const ms = Math.max(0, (ttsCtx.currentTime - _ttsStartAt) * 1000);
+      return Math.round(ms);
+    } catch (_e) { return 0; }
+  }
+
   function stopSpeaking() {
+    const wasSpeaking = speaking && ttsSources.size > 0;
+    let playedMs = 0;
+    if (wasSpeaking) playedMs = _ttsPlayedMs();
     speaking = false;
+    incrementalTtsBuffer = '';
+    // Stop Web Audio scheduled sources
+    for (const s of [...ttsSources]) {
+      try { s.stop(); s.disconnect(); } catch (_e) {}
+    }
+    ttsSources.clear();
+    ttsNextTime = 0;
+    _ttsStartAt = 0;
+    if (ttsCtx && ttsCtx.state === 'suspended') ttsCtx.resume().catch(()=>{});
     audio.pause();
-    if (audio.src) { URL.revokeObjectURL(audio.src); }
+    if (audio.src) { try { URL.revokeObjectURL(audio.src); } catch(_e){} }
     audio.removeAttribute('src');
-    audio.load();
+    try { audio.load(); } catch(_e){}
+    // Report truncation to backend so history can carry interrupted_at_ms
+    if (wasSpeaking && playedMs > 0) {
+      fetch(API + '/api/voice/interrupt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ played_ms: playedMs }),
+      }).catch(() => {});
+    }
   }
 
   async function speak(text) {
@@ -1352,36 +1638,143 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     if (!clean) return;
     lastReply = clean;
     speaking = true;
+    _ttsStartAt = ensureTtsCtx().currentTime;
     setStatus('processing', 'Preparing voice…');
-    send('reply', { text: clean.slice(0, 500) });
     const useVoice = voiceForLanguage(detectLanguage(clean));
-    // Don't transcribe our own voice: pause the recorder while speaking
-    if (recorder && recorder.state === 'recording') { try { recorder.pause(); } catch (_e) {} }
+    // Phase 8-V3: full duplex — the browser mic has AEC on (echoCancellation/
+    // noiseSuppression/autoGainControl), so no server mute-while-speaking. The
+    // user can talk over the reply and the next round starts instantly.
     try {
-      const resp = await fetch(API + '/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: clean, voice: useVoice, engine: 'kokoro' }),
-      });
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      audio.src = url;
-      await audio.play();
-      setStatus('speaking', clean.slice(0, 120) + (clean.length > 120 ? '…' : ''));
-      await new Promise((res) => {
-        audio.onended = res;
-        audio.onpause = () => { if (!speaking) res(); };
-      });
+      const ok = await speakStreamed(clean, useVoice);
+      if (!ok) {
+        // fall back to non-streamed (full wav) if streaming fails
+        const resp = await fetch(API + '/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: clean, voice: useVoice, engine: 'pocket' }),
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        audio.src = url;
+        await audio.play();
+        setStatus('speaking', clean.slice(0, 120) + (clean.length > 120 ? '…' : ''));
+        await new Promise((res) => {
+          audio.onended = res;
+          audio.onpause = () => { if (!speaking) res(); };
+        });
+      }
     } catch (e) {
       console.error('[Voice] TTS failed', e);
       setStatus('error', 'TTS failed');
       setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
     } finally {
       speaking = false;
-      if (recorder && recorder.state === 'paused') { try { recorder.resume(); } catch (_e) {} }
+      fetch(API + '/api/voice/mute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ muted: false }) }).catch(() => {});
       if (micOn) setStatus('listening', accumulated || 'Listening');
     }
+  }
+
+  // Stream TTS chunks (SSE /api/tts/stream) gapless via Web Audio.
+  // First audio ~0.2-0.5s; chunks concat without gaps unlike HTMLAudio per-chunk.
+  // Pre-buffer lead: schedule first chunk slightly ahead so subsequent chunks
+  // have time to decode — eliminates jitter gaps that cause "choppy".
+  function speakStreamed(text, useVoice) {
+    return new Promise((resolve) => {
+      let done = false;
+      let streamFailed = false;
+      let pendingDecodes = 0;
+      let startedScheduling = false;
+      const ctx = ensureTtsCtx();
+      ttsNextTime = Math.max(ttsNextTime, ctx.currentTime) || ctx.currentTime;
+      setStatus('speaking', text.slice(0, 120) + (text.length > 120 ? '…' : ''));
+      if (!_ttsStartAt) _ttsStartAt = ctx.currentTime;
+
+      function checkDone() {
+        if (done && pendingDecodes === 0 && ttsSources.size === 0) {
+          resolve(!streamFailed);
+        }
+      }
+
+      function scheduleWavBytes(bytes) {
+        // bytes is complete WAV (header+PCM) per SSE chunk — decode gaplessly
+        const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        pendingDecodes++;
+        // decodeAudioData is async; keep speaking flag so barge-in can cancel
+        const p = ctx.decodeAudioData ? ctx.decodeAudioData(ab) : Promise.reject(new Error('no decodeAudioData'));
+        p.then((buffer) => {
+          pendingDecodes--;
+          if (!speaking) { checkDone(); return; }
+          const src = ctx.createBufferSource();
+          src.buffer = buffer;
+          src.connect(ctx.destination);
+          // Pre-buffer lead: first chunk +0.15s (was +0.02s) so decode of chunk 2
+          // finishes before chunk 1 ends → gapless. Subsequent chunks back-to-back.
+          const lead = startedScheduling ? 0.0 : 0.15;
+          startedScheduling = true;
+          const startAt = Math.max(ttsNextTime, ctx.currentTime + lead);
+          try { src.start(startAt); } catch (_e) { try { src.start(); } catch(__e){} }
+          ttsNextTime = startAt + buffer.duration;
+          ttsSources.add(src);
+          src.onended = () => {
+            ttsSources.delete(src);
+            try { src.disconnect(); } catch(_e){}
+            checkDone();
+          };
+        }).catch((e) => {
+          pendingDecodes--;
+          console.warn('[Voice] decode failed', e);
+          // Fallback: play via <audio> for this chunk (still gapless-ish fallback)
+          try {
+            const blob = new Blob([bytes], { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
+            const a = new Audio(url);
+            a.onended = () => { URL.revokeObjectURL(url); checkDone(); };
+            a.play().catch(()=>{ URL.revokeObjectURL(url); checkDone(); });
+          } catch(__e){ checkDone(); }
+        });
+      }
+
+      fetch(API + '/api/tts/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice: useVoice, engine: 'pocket' }),
+      })
+        .then(async (resp) => {
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          while (true) {
+            const { done: rd, value } = await reader.read();
+            if (rd) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              let ev;
+              try { ev = JSON.parse(line.slice(6).trim()); } catch (_e) { continue; }
+              if (ev.error) { streamFailed = true; done = true; checkDone(); return; }
+              if (ev.done) { done = true; checkDone(); return; }
+              if (ev.chunk) {
+                const bytes = Uint8Array.from(atob(ev.chunk), (c) => c.charCodeAt(0));
+                scheduleWavBytes(bytes);
+              }
+            }
+          }
+          done = true;
+          checkDone();
+          // If stream finished but no audio scheduled at all, resolve false to trigger fallback
+          setTimeout(() => { if (done && pendingDecodes===0 && ttsSources.size===0 && ttsNextTime === ctx.currentTime) { streamFailed = true; checkDone(); } }, 800);
+        })
+        .catch((e) => {
+          console.error('[Voice] TTS stream failed', e);
+          streamFailed = true;
+          done = true;
+          checkDone();
+        });
+    });
   }
 
   // Replay the last reply (click the transcript / waveform area)
@@ -1435,7 +1828,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     fetch(API + '/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: sample, voice: vId, engine: 'kokoro' }),
+      body: JSON.stringify({ text: sample, voice: vId, engine: 'pocket' }),
     })
       .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
       .then((blob) => {
@@ -1450,7 +1843,17 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   // ── Mic on/off ──
   function startListening() {
     if (micOn) return;
-    navigator.mediaDevices.getUserMedia({ audio: true })
+    // Start server-side streaming capture FIRST (Moonshine hears us live).
+    fetch(API + '/api/voice/start', { method: 'POST' })
+      .then((r) => r.json().catch(() => ({})))
+      .then((d) => {
+        if (d && d.active === false) {
+          console.error('[Voice] server capture failed to start:', d.error || 'unknown');
+          setStatus('error', 'Capture failed — check API logs');
+        }
+      })
+      .catch(() => {});
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
       .then((s) => {
         stream = s;
         audioCtx = new AudioContext();
@@ -1483,6 +1886,8 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         console.error('[Voice] mic denied', e);
         micOn = false;
         localStorage.setItem('voice.micOn', '0');
+        // stop server capture since we won't listen
+        fetch(API + '/api/voice/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ discard: true }) }).catch(() => {});
         updateMicBtn();
         setStatus('error', 'Mic denied');
         send('mic', { mic: false });
@@ -1493,7 +1898,8 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     micOn = false;
     localStorage.setItem('voice.micOn', '0');
     clearTimeout(roundTimer);
-    endRecorder();
+    // Stop server-side capture (discard — mic off, no transcribe).
+    fetch(API + '/api/voice/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ discard: true }) }).catch(() => {});
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
     if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; analyser = null; freqBuf = null; levelBuf = null; }
     stopSpeaking();
@@ -1545,12 +1951,65 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   // Resume AudioContext on first interaction (needed if it started suspended)
   window.addEventListener('pointerdown', () => { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
 
+  // ── WS relay stub (pydantic WS relay pattern — local tiny+jarvis, no provider) ──
+  // Browser ↔ backend PCM16 bridge: keeps same Agent, removes poll when wired.
+  let _voiceWs = null;
+  function openVoiceWs() {
+    try {
+      const wsUrl = API.replace(/^http/, 'ws') + '/api/voice/ws';
+      const ws = new WebSocket(wsUrl);
+      _voiceWs = ws;
+      ws.onopen = () => {
+        try { ws.send(JSON.stringify({ type: 'ping' })); } catch(_e) {}
+      };
+      ws.onmessage = (ev) => {
+        // Placeholder: when wired, binary frames are PCM16 audio; json is transcript.
+      };
+      ws.onclose = () => { _voiceWs = null; };
+      ws.onerror = () => { _voiceWs = null; };
+    } catch(_e) {}
+  }
+  // Opportunistically open (handshake verified, no impact on HTTP path).
+  try { openVoiceWs(); } catch(_e) {}
+
   // Init
   updateMicBtn();
   setStatus('idle', 'Ctrl+G to toggle');
   // Normalize the native window after the HTML first paints so the initial
   // orb is the same compact size as it is after closing the menu.
   resizeOverlay();
+
+  // ── Lazy TTS: warm on open (loading spinner on mic btn), free on close ──
+  let ttsWarm = false;
+  let ttsPollTimer = null;
+  function startTtsLoading() {
+    if (ttsWarm) return;
+    micBtn.classList.add('loading');
+    // Kick the warm-up (idempotent on the server).
+    fetch(API + '/api/voice/warm_tts', { method: 'POST' }).catch(() => {});
+    ttsPollTimer = setInterval(async () => {
+      try {
+        const r = await fetch(API + '/api/voice/tts_status');
+        const d = await r.json().catch(() => ({}));
+        if (d && d.tts_warm) {
+          ttsWarm = true;
+          clearInterval(ttsPollTimer);
+          ttsPollTimer = null;
+          micBtn.classList.remove('loading');
+          updateMicBtn();
+        }
+      } catch (_e) {}
+    }, 500);
+  }
+  function releaseTts() {
+    if (ttsPollTimer) { clearInterval(ttsPollTimer); ttsPollTimer = null; }
+    // Best-effort free (fire-and-forget) — close-triggered only.
+    fetch(API + '/api/voice/release_tts', { method: 'POST' }).catch(() => {});
+  }
+  startTtsLoading();
+  window.addEventListener('beforeunload', releaseTts);
+  if (bridge && bridge.onClose) bridge.onClose(releaseTts);
+
   if (localStorage.getItem('voice.micOn') === '1') {
     setTimeout(startListening, 400);
   }

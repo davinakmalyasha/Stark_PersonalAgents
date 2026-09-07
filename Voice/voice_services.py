@@ -21,19 +21,19 @@ def transcribe_audio(file_path: str) -> str:
         return f"Error transcribing audio: {e}"
 
 
-def generate_tts_sync(text: str, output_path: str, voice="en-US-ChristopherNeural"):
+def generate_tts_sync(text: str, output_path: str, voice="alba"):
     """
-    Generates TTS with the on-device Kokoro engine (JARVIS clone when the
-    reference audio exists, otherwise the male am_michael voice).
+    Generates TTS with the on-device Pocket TTS engine (Kyutai).
+    'jarvis' clones .deep_agents/tts_ref/jarvis.mp3 (requires HF_TOKEN +
+    accepted gated-model terms); other names are catalog voices (alba, anna,
+    michael, ...) or local audio/safetensors paths.
     """
     try:
         import audio_engine
-        local_voice = "jarvis" if os.path.exists(os.path.join(_ROOT, ".deep_agents", "tts_ref", "jarvis.wav")) else "am_michael"
-        wav_path = os.path.splitext(output_path)[0] + ".wav"
-        if audio_engine.synthesize_tts(text, wav_path, voice=local_voice):
-            return wav_path
-        print("[voice_services] Kokoro TTS failed")
+        if audio_engine.synthesize_tts(text, output_path, voice=voice):
+            return output_path
+        print("[voice_services] Pocket TTS failed")
         return None
     except Exception as e:
-        print("[voice_services] Kokoro TTS unavailable:", e)
+        print("[voice_services] Pocket TTS unavailable:", e)
         return None

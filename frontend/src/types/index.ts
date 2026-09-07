@@ -141,6 +141,7 @@ export interface ModelOption {
 
 // ── Chat / Workspace types ──
 
+export type WorkspaceKind = 'general' | 'house' | 'personal' | 'project';
 export interface WorkspaceInfo {
   id: string;
   name: string;
@@ -149,7 +150,21 @@ export interface WorkspaceInfo {
   chatCount: number;
   addedAt: string;
   updatedAt?: string;
+  /** @deprecated use workspaceKind */
   isGeneral?: boolean;
+  /** @deprecated use workspaceKind */
+  isHouse?: boolean;
+  /** @deprecated use workspaceKind */
+  isPersonal?: boolean;
+  workspaceKind?: WorkspaceKind;
+}
+
+export function getWorkspaceKind(ws: WorkspaceInfo): WorkspaceKind {
+  if ((ws as any).workspaceKind) return (ws as any).workspaceKind;
+  if (ws.isGeneral) return 'general';
+  if ((ws as any).isHouse) return 'house';
+  if ((ws as any).isPersonal) return 'personal';
+  return 'project';
 }
 
 export interface ChatSummary {

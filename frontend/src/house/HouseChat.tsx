@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import type { MutableRefObject } from 'react';
 import { ChevronDown, ChevronUp, ExternalLink, X } from 'lucide-react';
-import HouseChatMessages from './HouseChatMessages';
 import PromptDock from '../components/Workspace/PromptDock';
+import MessageStream from '../components/Workspace/MessageStream';
 import type { ChatMessage } from '../types';
 import '../house/house.css';
 
@@ -106,14 +106,27 @@ export default function HouseChat({
       }}
       aria-hidden={minimized}
     >
-      <HouseChatMessages
-        threadRef={threadRef}
-        isLoading={isLoading}
-        messages={messages}
-        onOpenSubagent={onOpenSubagent}
-        workspaceId={workspaceId}
-        chatId={chatId}
-      />
+      <div ref={threadRef} className="flex-1 min-h-[160px] overflow-y-auto">
+        {isLoading ? (
+          <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-500 py-6">
+            <div className="flex gap-1.5">
+              <span className="house-typing-dot" />
+              <span className="house-typing-dot" />
+              <span className="house-typing-dot" />
+            </div>
+            <span className="text-[12px]">Connecting...</span>
+          </div>
+        ) : (
+          <MessageStream
+            messages={messages}
+            hasActiveChat={messages.length > 0}
+            onOpenSubagent={() => {}}
+            onOpenSubagentSession={onOpenSubagent}
+            workspaceId={workspaceId}
+            chatId={chatId}
+          />
+        )}
+      </div>
     </div>
   );
 
@@ -144,7 +157,7 @@ export default function HouseChat({
 
   if (variant === 'ide') {
     return (
-      <div className="absolute bottom-3 right-3 z-30 w-[min(600px,calc(100vw-360px))] flex flex-col rounded-2xl border house-hairline bg-[#101014]/[0.92] backdrop-blur-xl shadow-2xl px-3 pt-2.5 pb-1 ide-panel-enter">
+      <div className="absolute bottom-3 right-3 z-30 w-[min(600px,calc(100vw-360px))] flex flex-col rounded-2xl border house-hairline premium-surface backdrop-blur-md shadow-2xl px-3 pt-2.5 pb-1 ide-panel-enter">
         {header}
         {messagesArea}
         {notificationBar}

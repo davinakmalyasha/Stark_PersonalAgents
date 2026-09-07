@@ -7,6 +7,7 @@ lazily without creating an import cycle.
 import hashlib
 import os
 import json
+import threading
 import time
 from contextvars import ContextVar
 from typing import Optional, Any
@@ -27,7 +28,22 @@ active_permissions: ContextVar[Optional[list[FilesystemPermission]]] = ContextVa
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-def to_virtual_path(path: str) -> str:
+
+def _active_workspace(deps: Any = None) -> str:
+    """Return the active workspace root. Prefers the typed per-run deps when
+    provided, else falls back to the legacy global shared_state path.
+    """
+    if deps is not None:
+        try:
+            p = getattr(deps, "project_path", None)
+            if p:
+                return str(p)
+        except Exception:
+            pass
+    return shared_state.get("project_path") or WORKSPACE
+
+
+def to_virtual_path(path: str, deps: Any = None) -> str:
     path_str = path.replace("\\", "/")
     if path_str.startswith(("/workspace/", "/scratch/", "/memories/", "/conversation_history/")):
         return "/" + path_str.lstrip("/")
@@ -35,7 +51,7 @@ def to_virtual_path(path: str) -> str:
         return "/" + path_str.lstrip("/")
 
     # Resolve physical absolute path
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws)).replace("\\", "/").lower()
     
     abs_path = os.path.normpath(os.path.abspath(path)).replace("\\", "/").lower()
@@ -114,10 +130,6 @@ _TOOL_CAP_DEFAULTS = {
     "browser_act": 6000,
     "ask_user": 2500,
     "github_apply_gate": 6000,
-    "apply_template": 5000,
-    "template_list": 5000,
-    "template": 5000,
-    "template_new": 4000,
     "update_plan": 500,           # tiny fixed-size result: status counts only
     "subagent": 6000,             # subagent internal tool results: enough for the NEXT decision, not a dump
     "mcp": 6000,                  # MCP tool results: bounded, offloadable like run_command
@@ -227,6 +239,10 @@ _TOOL_MTIME_MAP: dict[str, float] = {}
 
 _TOOL_CACHE_TTL = 300  # seconds
 
+# Parallel read-only tools run on a thread pool; these dicts are shared across
+# those threads, so every read-modify-write goes through one lock.
+_CACHE_LOCK = threading.RLock()
+
 def _make_tool_cache_key(tool_name: str, args: dict) -> str:
     """Create a deterministic cache key from tool name and sorted args."""
     raw = tool_name + ":" + json.dumps(args, sort_keys=True, default=str)
@@ -234,61 +250,63 @@ def _make_tool_cache_key(tool_name: str, args: dict) -> str:
 
 def _check_tool_cache(tool_name: str, args: dict) -> Optional[str]:
     """Check if a read-only tool call has a fresh cached result. Returns None on miss."""
-    if tool_name not in ("read_file", "search_code",
-                         "template"):
+    if tool_name not in ("read_file", "search_code"):
         return None
     now = time.time()
     key = _make_tool_cache_key(tool_name, args)
-    entry = _TOOL_RESPONSE_CACHE.get(key)
-    if entry is None:
-        return None
-    ts, result = entry
-    if now - ts > _TOOL_CACHE_TTL:
-        del _TOOL_RESPONSE_CACHE[key]
-        _TOOL_MTIME_MAP.pop(key, None)
-        return None
-    # For file-based tools, also check mtime hasn't changed
-    file_path = args.get("file_path") or args.get("path") or ""
-    if file_path:
-        actual_path = _sanitize_path(file_path)
-        if os.path.isfile(actual_path):
-            try:
-                current_mtime = os.path.getmtime(actual_path)
-                cached_mtime = _TOOL_MTIME_MAP.get(key)
-                if cached_mtime is not None and cached_mtime != current_mtime:
-                    del _TOOL_RESPONSE_CACHE[key]
-                    _TOOL_MTIME_MAP.pop(key, None)
-                    return None
-            except Exception:
-                pass
+    with _CACHE_LOCK:
+        entry = _TOOL_RESPONSE_CACHE.get(key)
+        if entry is None:
+            return None
+        ts, result = entry
+        if now - ts > _TOOL_CACHE_TTL:
+            del _TOOL_RESPONSE_CACHE[key]
+            _TOOL_MTIME_MAP.pop(key, None)
+            return None
+        # For file-based tools, also check mtime hasn't changed
+        file_path = args.get("file_path") or args.get("path") or ""
+        if file_path:
+            actual_path = _sanitize_path(file_path)
+            if os.path.isfile(actual_path):
+                try:
+                    current_mtime = os.path.getmtime(actual_path)
+                    cached_mtime = _TOOL_MTIME_MAP.get(key)
+                    if cached_mtime is not None and cached_mtime != current_mtime:
+                        del _TOOL_RESPONSE_CACHE[key]
+                        _TOOL_MTIME_MAP.pop(key, None)
+                        return None
+                except Exception:
+                    pass
     return result
 
 def _set_tool_cache(tool_name: str, args: dict, result: str) -> None:
     """Store a read-only tool result in the response cache."""
-    if tool_name not in ("read_file", "search_code",
-                         "template"):
+    if tool_name not in ("read_file", "search_code"):
         return
     key = _make_tool_cache_key(tool_name, args)
-    _TOOL_RESPONSE_CACHE[key] = (time.time(), result)
-    # Store mtime for invalidation
-    file_path = args.get("file_path") or args.get("path") or ""
-    if file_path:
-        actual_path = _sanitize_path(file_path)
-        if os.path.isfile(actual_path):
-            try:
-                _TOOL_MTIME_MAP[key] = os.path.getmtime(actual_path)
-            except Exception:
-                pass
+    with _CACHE_LOCK:
+        _TOOL_RESPONSE_CACHE[key] = (time.time(), result)
+        # Store mtime for invalidation
+        file_path = args.get("file_path") or args.get("path") or ""
+        if file_path:
+            actual_path = _sanitize_path(file_path)
+            if os.path.isfile(actual_path):
+                try:
+                    _TOOL_MTIME_MAP[key] = os.path.getmtime(actual_path)
+                except Exception:
+                    pass
 
 def _invalidate_tool_cache_all() -> None:
     """Clear all tool response cache entries (called on any file write)."""
-    _TOOL_RESPONSE_CACHE.clear()
-    _TOOL_MTIME_MAP.clear()
+    with _CACHE_LOCK:
+        _TOOL_RESPONSE_CACHE.clear()
+        _TOOL_MTIME_MAP.clear()
 
 def _invalidate_file_cache(path: str) -> None:
     """Invalidate cache entry when a file is modified."""
     key = os.path.normpath(path).lower()
-    _FILE_CACHE.pop(key, None)
+    with _CACHE_LOCK:
+        _FILE_CACHE.pop(key, None)
     # Also invalidate tool response cache since file state changed
     _invalidate_tool_cache_all()
 
@@ -342,15 +360,17 @@ class WorkspaceFallbackBackend:
             res.extend(self._get_backend(p).download_files([p]))
         return res
 
-def get_vfs_router() -> Any:
+def get_vfs_router(deps: Any = None) -> Any:
     from deepagents.backends import CompositeBackend, StateBackend, FilesystemBackend, StoreBackend
     from sync.state_sync import active_store
 
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws))
 
     store = active_store.get()
-    store_backend = StoreBackend(store=store) if store is not None else StoreBackend()
+    # deepagents 0.7 requires namespace factory (outside-graph direct use)
+    _mem_ns = lambda _rt: ("memories",)
+    store_backend = StoreBackend(namespace=_mem_ns, store=store) if store is not None else StoreBackend(namespace=_mem_ns)
 
     # Build routes: virtual paths (/workspace/, /memories/, /scratch/) AND
     # the active workspace as a real-filesystem route so absolute paths
@@ -375,8 +395,8 @@ def get_vfs_router() -> Any:
         routes=routes,
     )
 
-def _sanitize_path_fallback(path: str) -> str:
-    active_ws = shared_state.get("project_path") or WORKSPACE
+def _sanitize_path_fallback(path: str, deps: Any = None) -> str:
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     path_str = path.replace("\\", "/")
     
@@ -407,11 +427,11 @@ def _sanitize_path_fallback(path: str) -> str:
     real_path = os.path.normpath(os.path.abspath(real_path))
     return real_path
 
-def _sanitize_path(path: str) -> str:
+def _sanitize_path(path: str, deps: Any = None) -> str:
     """Resolve a relative or absolute path within allowed roots, using VFS routing."""
     from deepagents.backends import FilesystemBackend
     
-    vfs_router = get_vfs_router()
+    vfs_router = get_vfs_router(deps)
     resolved_path = None
     try:
         backend, stripped_key = vfs_router._get_backend_and_key(path)
@@ -421,7 +441,7 @@ def _sanitize_path(path: str) -> str:
         pass
         
     if resolved_path is None:
-        resolved_path = _sanitize_path_fallback(path)
+        resolved_path = _sanitize_path_fallback(path, deps)
         
     real_path = os.path.normpath(os.path.abspath(resolved_path))
     
@@ -433,7 +453,7 @@ def _sanitize_path(path: str) -> str:
             raise ValueError("Access to internal metadata folder is restricted.")
         
     # Security: strictly allow only the active workspace, LangChain system directory, scratch, memories, and history
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     allowed_roots = [
         active_ws,
@@ -451,14 +471,14 @@ def _sanitize_path(path: str) -> str:
         
     return real_path
 
-def _check_and_request_approval(file_path: str, action: str):
+def _check_and_request_approval(file_path: str, action: str, deps: Any = None):
     import os
     norm_path = os.path.normpath(file_path).lower()
     base_name = os.path.basename(norm_path)
 
     # Core settings files should only be blocked if they are modified inside the main LangChain codebase folder.
     # Subagents executing inside sandbox workspaces (e.g. TestProjectForAgent) must be allowed to create/edit package.json, etc.
-    active_ws = shared_state.get("project_path") or WORKSPACE
+    active_ws = _active_workspace(deps)
     active_ws_norm = os.path.normpath(active_ws).lower()
     # Harness root — env-overridable, defaults to this repo's directory (portable)
     langchain_root = _HARNESS_ROOT

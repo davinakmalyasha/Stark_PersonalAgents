@@ -1,0 +1,70 @@
+"""Structured JSON-line logging for {{ package }} — one JSON object per line.
+
+Wire in main.py lifespan:
+    from {{ package }}.core.logging import setup_logging
+    setup_logging()
+
+Then log with stdlib loggers — records are emitted as JSON lines so the
+log viewer / Loki / file tail can filter them. request_id lets you trace one
+request across services; attach it in middleware via log_structured("request", ...).
+"""
+import json
+import logging
+import sys
+import time
+import uuid
+from typing import Any
+
+try:
+    from pythonjsonlogger import jsonlogger
+except Exception:  # fallback: stdlib JSON formatter below
+    jsonlogger = None  # type: ignore
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        data: dict[str, Any] = {
+            "ts": time.time(),
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in getattr(record, "extra_fields", {}).items():
+            data[key] = value
+        if record.exc_info:
+            data["exc"] = self.formatException(record.exc_info)
+        return json.dumps(data, default=str, ensure_ascii=False)
+
+
+def setup_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    if jsonlogger is not None:
+        formatter = jsonlogger.JsonFormatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s",
+            rename_fields={"asctime": "ts", "levelname": "level"},
+        )
+    else:
+        formatter = _JsonFormatter()
+    handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(level.upper())
+
+
+def log_structured(logger_name: str, level: str, message: str, **fields: Any) -> None:
+    """Emit one structured JSON line: log_structured("app", "info", "request", path=..., status=200)."""
+    record = logging.LogRecord(
+        name=logger_name,
+        level=getattr(logging, level.upper(), logging.INFO),
+        pathname="",
+        lineno=0,
+        msg=message,
+        args=(),
+        exc_info=None,
+    )
+    record.extra_fields = fields  # type: ignore[attr-defined]
+    logging.getLogger(logger_name).handle(record)
+
+
+def request_id() -> str:
+    return uuid.uuid4().hex[:12]

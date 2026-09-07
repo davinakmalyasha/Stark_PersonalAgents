@@ -45,6 +45,13 @@ html, body, #root {
   text-rendering: optimizeLegibility;
 }
 
+/* Phase 8-D: single shared chat-surface token — no per-overlay opaque
+   backdrops. The timeline/tool steps carry the visual weight instead of a
+   filled card, so all chat routes feel like one surface. */
+.premium-surface {
+  background: rgba(16, 16, 19, 0.55);
+}
+
 /* ── Scrollbar (minimal dark theme) ── */
 ::-webkit-scrollbar {
   width: 5px;

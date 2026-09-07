@@ -17,6 +17,7 @@ interface Props {
   state: AppState | null;
   hasActiveChat: boolean;
   notification: string | null;
+  chatMode?: 'plan' | 'build';
   onSend: (message: string, files?: File[]) => void;
   onRunTask: (task: AgentTask) => boolean;
   onCancel: () => void;

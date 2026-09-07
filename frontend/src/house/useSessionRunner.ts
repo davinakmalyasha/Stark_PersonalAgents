@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { AppState, ChatMessage, ChatAttachment, SessionTab, TokenUsage } from '../types';
+import type { AppState, ChatMessage, ChatAttachment, SessionTab, TokenUsage, StreamDelta } from '../types';
 import { addChatMessage, fetchChat, uploadChatAttachments } from '../services/api';
 import { startHousePipeline } from './houseChatService';
 import { parseLogToSteps } from '../utils/logParser';
@@ -30,6 +30,43 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
   const startedAtRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const currentKeyRef = useRef('');
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+  const streamRef = useRef({ text: '', reasoning: '', agent: '' });
+  const rateRef = useRef({ lastTs: 0, lastChars: 0, ema: 0 });
+
+  const applyDelta = useCallback((delta: StreamDelta) => {
+    const now = performance.now();
+    if (delta.kind === 'reasoning') {
+      streamRef.current.reasoning += delta.text;
+    } else if (delta.kind === 'text') {
+      const chars = delta.text.length;
+      const r = rateRef.current;
+      if (r.lastTs > 0) {
+        const dt = Math.max(16, now - r.lastTs) / 1000;
+        const rate = (chars / 4) / dt;
+        r.ema = r.ema === 0 ? rate : r.ema * 0.8 + rate * 0.2;
+      }
+      r.lastTs = now;
+      r.lastChars = chars;
+      streamRef.current.text += delta.text;
+    } else if (delta.kind === 'end') {
+      rateRef.current.ema = 0;
+    }
+    if (delta.agent) streamRef.current.agent = delta.agent;
+    setStreaming({
+      text: streamRef.current.text,
+      reasoning: streamRef.current.reasoning,
+      agent: streamRef.current.agent,
+      active: true,
+      rate: Math.round(rateRef.current.ema),
+    });
+  }, []);
+
+  const resetStream = useCallback(() => {
+    streamRef.current = { text: '', reasoning: '', agent: '' };
+    rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
+    setStreaming({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+  }, []);
 
   const finishedRef = useRef(onFinished);
   useEffect(() => { finishedRef.current = onFinished; }, [onFinished]);
@@ -56,18 +93,25 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
   const displayMessages = useMemo<ChatMessage[]>(() => {
     if (!isRunning || !sessionKey) return persistedMessages;
     const liveSteps = liveParsed.steps.length > 0 ? liveParsed.steps : [];
+    const liveText = streaming.active && streaming.text ? streaming.text : (liveParsed.assistantResponse || '');
     return [
       ...persistedMessages,
       {
         id: 'session-live',
         role: 'agent',
-        content: liveParsed.assistantResponse || '',
+        agentName: streaming.agent || undefined,
+        content: liveText,
         timestamp: new Date().toISOString(),
         duration: 'active',
-        metadata: { isTrace: true, duration: 'active', steps: liveSteps },
+        metadata: {
+          isTrace: true, duration: 'active', steps: liveSteps,
+          isStreaming: streaming.active,
+          streamingReasoning: streaming.reasoning,
+          streamRate: streaming.rate,
+        },
       },
     ];
-  }, [isRunning, sessionKey, persistedMessages, liveParsed]);
+  }, [isRunning, sessionKey, persistedMessages, liveParsed, streaming]);
 
   // ── Load (and lightly poll) the session's chat history ──
   // Diff-gated: avoid the 5s tick that was recreating House + the whole
@@ -136,6 +180,7 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
     startedAtRef.current = Date.now();
     setIsRunning(true);
     setLiveState(null);
+    resetStream();
 
     const stillCurrent = () => currentKeyRef.current === runKey;
 
@@ -172,6 +217,7 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
             setUsageState({ key: runKey, value: chat.token_usage ?? null });
           }
         } catch { /* keep the live message visible if persistence fails */ }
+        resetStream();
         runningRef.current = false;
         setIsRunning(false);
         if (stillCurrent()) setLiveState(null);
@@ -182,12 +228,15 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
           setNotification(typeof err === 'string' ? err : 'Error occurred.');
           setLiveState(null);
         }
+        resetStream();
         runningRef.current = false;
         setIsRunning(false);
         finishedRef.current?.();
       },
+      undefined,
+      applyDelta,
     );
-  }, []);
+  }, [applyDelta, resetStream]);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();

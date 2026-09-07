@@ -23,6 +23,12 @@ DEEPSEEK_MODEL_PRO = os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4-pro")
 #   - point DEEPSEEK_MODEL_VISION at the GA slug.
 # Routing, guards, and the tool image plumbing all key off supports_vision().
 DEEPSEEK_MODEL_VISION = os.getenv("DEEPSEEK_MODEL_VISION", "deepseek-v4-flash-vision-exp")
+
+#: Per-provider audio-capable model (canonical name mapped in llm.py).
+DEEPSEEK_MODEL_AUDIO = os.getenv("DEEPSEEK_MODEL_AUDIO", "deepseek-v4-audio")
+
+#: Models that accept audio input parts (OpenAI input_audio).
+AUDIO_MODELS = os.getenv("AUDIO_MODELS", "mimo-v2.5,deepseek-v4-audio").lower().split(",")
 VISION_MODELS = {DEEPSEEK_MODEL_VISION}
 
 
@@ -33,6 +39,12 @@ def supports_vision(model: str) -> bool:
     edits; exact ids live in VISION_MODELS."""
     m = (model or "").lower()
     return m in {v.lower() for v in VISION_MODELS} or ("vision" in m)
+
+
+def supports_audio(model: str) -> bool:
+    """True if the model accepts audio input (OpenAI input_audio parts)."""
+    m = (model or "").lower()
+    return any(a and a in m for a in AUDIO_MODELS) or m in {v.lower() for v in AUDIO_MODELS}
 
 
 TASK_CATEGORIES = {

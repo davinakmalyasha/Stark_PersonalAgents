@@ -191,12 +191,15 @@ def apply_unified_diff(content: str, diff: str) -> tuple[str, list[str]]:
     return '\n'.join(new_lines), []
 
 
-def _apply_diff(file_path: str, diff: str) -> str:
-    """Apply a unified diff or search-replace block to a file."""
+def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
+    """Apply a unified diff or search-replace block to a file.
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
+    """
     from tools import _sanitize_path, _invalidate_file_cache
-    path = _sanitize_path(file_path)
+    path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
-        return f"Error: File not found: {file_path}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error: File not found: {file_path}")
         
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -208,7 +211,8 @@ def _apply_diff(file_path: str, diff: str) -> str:
             new_content, errors = apply_unified_diff(content, diff)
             
         if errors:
-            return f"Error: Failed to apply diff to {file_path}:\n" + "\n".join(errors)
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed(f"Error: Failed to apply diff to {file_path}:\n" + "\n".join(errors))
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
@@ -219,8 +223,11 @@ def _apply_diff(file_path: str, diff: str) -> str:
             
         _log_tool("apply_diff", {"file_path": file_path, "diff": diff}, output)
         return output
+    except ToolFailed:
+        raise
     except Exception as e:
-        return f"Error applying diff to {file_path}: {e}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error applying diff to {file_path}: {e}")
 
 
 _PATCH_MARKER_RE = re.compile(r'^\*\*\* (Add File|Update File|Delete File|Move to): (.*?)\s*$')
@@ -291,8 +298,10 @@ def _parse_patch_sections(diff: str):
     return sections
 
 
-def _apply_multi_file_patch(diff: str) -> str:
-    """Apply a multi-file patch (opencode-style markers or diff -u headers)."""
+def _apply_multi_file_patch(diff: str = "", ctx: object = None) -> str:
+    """Apply a multi-file patch (opencode-style markers or diff -u headers).
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
+    """
     from tools import enforce_fs_permission, _check_and_request_approval, _sanitize_path, _invalidate_file_cache, _increment_cache_version
     sections = _parse_patch_sections(diff)
     if not sections:
@@ -305,10 +314,10 @@ def _apply_multi_file_patch(diff: str) -> str:
             if kind == "noop":
                 results.append(f"[SKIP] {raw_path}: no hunks in section")
                 continue
-            path = _sanitize_path(raw_path)
+            path = _sanitize_path(raw_path, ctx)
             if kind == "add":
                 enforce_fs_permission("write", path)
-                _check_and_request_approval(path, "write")
+                _check_and_request_approval(path, "write", ctx)
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(body)
@@ -316,7 +325,7 @@ def _apply_multi_file_patch(diff: str) -> str:
                 results.append(f"[OK] Added {raw_path} ({body.count(chr(10)) + 1} lines)")
             elif kind == "delete":
                 enforce_fs_permission("write", path)
-                _check_and_request_approval(path, "edit")
+                _check_and_request_approval(path, "edit", ctx)
                 if not os.path.isfile(path):
                     results.append(f"[ERROR] Delete failed: file not found: {raw_path}")
                     continue
@@ -325,10 +334,10 @@ def _apply_multi_file_patch(diff: str) -> str:
                 results.append(f"[OK] Deleted {raw_path}")
             elif kind == "move":
                 dest_raw, hunk_body = body
-                dest = _sanitize_path(dest_raw)
+                dest = _sanitize_path(dest_raw, ctx)
                 enforce_fs_permission("write", path)
                 enforce_fs_permission("write", dest)
-                _check_and_request_approval(dest, "edit")
+                _check_and_request_approval(dest, "edit", ctx)
                 if not os.path.isfile(path):
                     results.append(f"[ERROR] Move failed: file not found: {raw_path}")
                     continue
@@ -351,7 +360,7 @@ def _apply_multi_file_patch(diff: str) -> str:
                 results.append(f"[OK] Moved {raw_path} -> {dest_raw}")
             else:  # update
                 enforce_fs_permission("write", path)
-                _check_and_request_approval(path, "edit")
+                _check_and_request_approval(path, "edit", ctx)
                 if not os.path.isfile(path):
                     results.append(f"[ERROR] Update failed: file not found: {raw_path}")
                     continue
@@ -376,12 +385,14 @@ def _apply_multi_file_patch(diff: str) -> str:
     return output
 
 
-def _write_file(file_path: str, content: str) -> str:
-    """Write content to a file, creating parent directories if needed."""
+def _write_file(file_path: str = "", content: str = "", ctx: object = None) -> str:
+    """Write content to a file, creating parent directories if needed.
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
+    """
     from tools import enforce_fs_permission, _increment_cache_version, _check_and_request_approval, shared_state, WORKSPACE, get_vfs_router, _sanitize_path, _invalidate_file_cache
     enforce_fs_permission("write", file_path)
     _increment_cache_version()
-    _check_and_request_approval(file_path, "write")
+    _check_and_request_approval(file_path, "write", ctx)
 
     # â”€â”€ Resolve the actual write target â”€â”€
     norm_path = os.path.normpath(os.path.abspath(file_path))
@@ -389,6 +400,11 @@ def _write_file(file_path: str, content: str) -> str:
     # Direct filesystem write for absolute paths within the active workspace.
     # Bypasses VFS routing which strips path prefixes and loses the root directory.
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     if norm_path.lower().startswith(active_ws.lower()):
         os.makedirs(os.path.dirname(norm_path) or ".", exist_ok=True)
@@ -406,7 +422,7 @@ def _write_file(file_path: str, content: str) -> str:
     # â”€â”€ VFS Composite Routing (for virtual paths like /workspace/, /scratch/) â”€â”€
     vfs_path = file_path.replace("\\", "/")
     try:
-        vfs_router = get_vfs_router()
+        vfs_router = get_vfs_router(ctx)
         res = vfs_router.write(vfs_path, content)
         if not res.error:
             lines = content.count("\n") + 1
@@ -416,7 +432,7 @@ def _write_file(file_path: str, content: str) -> str:
     except Exception:
         pass
 
-    path = _sanitize_path(file_path)
+    path = _sanitize_path(file_path, ctx)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -485,28 +501,53 @@ def _run_verify(verify: str, file_path: str, diff: str = None) -> str:
         return f"\n[VERIFY {v} error: {e}]"
 
 
-def edit_file(file_path: str, old_string: str = None, new_string: str = None,
+def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, new_string: str = None,
               diff: str = None, verify: str = None) -> str:
     """Edit via single search/replace, batch SEARCH/REPLACE blocks, unified diff, or multi-file patch.
 
     verify is OPT-IN: pass "py_compile", "tsc", or a shell command to run a
     check after a successful write. Omitted = no verification (the DONE-gate
     nudge and the CI gate own verification).
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
     """
-    from tools import enforce_fs_permission, _increment_cache_version, _check_and_request_approval, shared_state, WORKSPACE, get_vfs_router, _sanitize_path, _invalidate_file_cache
+    from tools import enforce_fs_permission, _increment_cache_version, _check_and_request_approval, WORKSPACE, get_vfs_router, _sanitize_path, _invalidate_file_cache, shared_state
 
     enforce_fs_permission("write", file_path)
     _increment_cache_version()
-    _check_and_request_approval(file_path, "edit")
-    
+    _check_and_request_approval(file_path, "edit", ctx)
+
+    # Stage 3: best-effort pre-write snapshot for chat rewind. Failure
+    # is silent and does NOT block the write (the existing git/dirty
+    # path is the fallback for users who haven't enabled snapshots).
+    try:
+        from tools.checkpoints import pre_write_snapshot
+        from sync.state_sync import safe_get_state
+        _state = safe_get_state() or {}
+        _chat_id = _state.get("chat_id", "") or ""
+        if ctx is not None:
+            _chat_id = getattr(ctx, "chat_id", "") or _chat_id
+        _ws = _state.get("project_path") or WORKSPACE
+        if ctx is not None:
+            _ws = getattr(ctx, "project_path", None) or _ws
+        if _chat_id and file_path:
+            _rel = file_path
+            try:
+                if os.path.isabs(file_path) and _ws and str(file_path).startswith(str(_ws)):
+                    _rel = os.path.relpath(file_path, _ws)
+            except (OSError, ValueError):
+                _rel = file_path
+            pre_write_snapshot(_chat_id, _ws, _rel)
+    except Exception:
+        pass
+
     # Route to batch mode if diff is provided
     if diff:
         if _parse_patch_sections(diff):
-            res = _apply_multi_file_patch(diff)
+            res = _apply_multi_file_patch(diff, ctx=ctx)
             if verify and res.startswith("[OK]"):
                 res += _run_verify(verify, file_path, diff)
             return res
-        res = _apply_diff(file_path, diff)
+        res = _apply_diff(file_path, diff, ctx=ctx)
         if verify and res.startswith("[OK]"):
             res += _run_verify(verify, file_path, diff)
         return res
@@ -516,17 +557,23 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
         # Create / full-overwrite mode: old_string omitted, new_string = full content.
         # (Empty-string old_string does NOT count — guards against accidental overwrites.)
         if old_string is None and new_string is not None:
-            res = _write_file(file_path, new_string)
+            res = _write_file(file_path, new_string, ctx=ctx)
             if verify and res.startswith("[OK]"):
                 res += _run_verify(verify, file_path)
             return res
         return "Error: edit_file requires (old_string + new_string) for single edit, (diff) for batch SEARCH/REPLACE blocks, or (new_string only) to create/overwrite a file."
     if old_string == new_string:
-        return "Error: old_string and new_string are identical."
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed("Error: old_string and new_string are identical.")
 
     # â”€â”€ Direct filesystem edit for absolute workspace paths â”€â”€
     norm_path = os.path.normpath(os.path.abspath(file_path))
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     active_ws = os.path.normpath(os.path.abspath(active_ws))
     if norm_path.lower().startswith(active_ws.lower()):
         path = norm_path
@@ -534,7 +581,7 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
         # â”€â”€ VFS Composite Routing (for virtual paths) â”€â”€
         vfs_path = file_path.replace("\\", "/")
         try:
-            vfs_router = get_vfs_router()
+            vfs_router = get_vfs_router(ctx)
             res = vfs_router.edit(vfs_path, old_string, new_string)
             if not res.error:
                 output = f"[OK] Edited {file_path} successfully"
@@ -542,9 +589,10 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
                 return output
         except Exception:
             pass
-        path = _sanitize_path(file_path)
+        path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
-        return f"Error: File not found: {file_path}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error: File not found: {file_path}")
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -603,7 +651,8 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
                     new_content = new_content.replace('\n', '\r\n')
             else:
                 if match_count > 1:
-                    return f"Error: Fuzzy match found multiple matches ({match_count}) in {file_path}. Make old_string more specific."
+                    from pydantic_ai.exceptions import ToolFailed
+                    raise ToolFailed(f"Error: Fuzzy match found multiple matches ({match_count}) in {file_path}. Make old_string more specific.")
                 else:
                     # M1 edit-failure contract: give the model a precise on-disk
                     # anchor (line range + nearest snippet) so it can retry blind
@@ -618,7 +667,8 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
                         anchor_line_number = 1
                         anchor_line = 0
                     anchor_snippet = "\n".join(content_lines_all[anchor_line:anchor_line + 5])[:400]
-                    return (
+                    from pydantic_ai.exceptions import ToolFailed
+                    raise ToolFailed(
                         f"Error: old_string not found in {file_path}. The text must match exactly.\n"
                         f"[HINT] File has {total_lines} lines. Nearest anchor: line {anchor_line_number}. "
                         f"On-disk content around line {anchor_line_number}:\n"
@@ -628,10 +678,12 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
                     )
         else:
             if old_string == new_string:
-                return f"Error: old_string and new_string are identical."
+                from pydantic_ai.exceptions import ToolFailed
+                raise ToolFailed(f"Error: old_string and new_string are identical.")
             count = content.count(old_string)
             if count > 1:
-                return f"Error: old_string matches {count} times in {file_path}. To prevent unintended edits, please include more surrounding context lines in old_string to make it unique."
+                from pydantic_ai.exceptions import ToolFailed
+                raise ToolFailed(f"Error: old_string matches {count} times in {file_path}. To prevent unintended edits, please include more surrounding context lines in old_string to make it unique.")
             new_content = content.replace(old_string, new_string, 1)  # Replace first occurrence only
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
@@ -647,4 +699,5 @@ def edit_file(file_path: str, old_string: str = None, new_string: str = None,
         _log_tool("edit_file", {"file_path": file_path, "old_string": old_string, "new_string": new_string}, output)
         return output
     except Exception as e:
-        return f"Error editing {file_path}: {e}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error editing {file_path}: {e}")

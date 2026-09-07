@@ -1,9 +1,10 @@
 """
 Delegation runtime — parallel fan-out from the Orchestrator to workspace agents.
 
-One ``delegate(...)`` tool call fans out N items through a ThreadPoolExecutor.
-Every item routes through the CANONICAL node runner (developer_node /
-general_node / house_node) — never the degraded generic subagent loop.
+One ``delegate(...)`` tool call fans out N items through the pydantic-graph
+map+join path (parallel). Every item routes through the CANONICAL node runner
+(developer_node / general_node / house_node) — never the degraded generic
+subagent loop.
 
 Isolation per item:
   * own visible chat (created here, or continued when ``chat_id`` is given)
@@ -24,7 +25,6 @@ import json
 import os
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 #: Canonical delegatable agents (workspace tier). Specialists (UI/Deploy)
@@ -34,8 +34,6 @@ DELEGATABLE_AGENTS = ("dev", "general", "house")
 _AGENT_DISPLAY = {"dev": "Dev", "general": "General", "house": "House"}
 
 _REPLY_CAP = 1200
-
-_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="delegate")
 
 _LOCK = threading.RLock()
 
@@ -79,6 +77,24 @@ def _resolve_workspace(item: dict, agent_key: str, fallback_ws: str) -> str:
     if ws:
         return ws
     return _default_workspace(agent_key, fallback_ws)
+
+
+def _ensure_workspace_dir(ws: str) -> str:
+    """Ensure the delegation workspace folder exists (create-before-delegate).
+
+    If ``ws`` is a real path (e.g. ``D:\\MyProject\\TodoList``) that doesn't
+    exist yet, create it so the child Dev chat has a real home instead of a
+    phantom path. Returns the (possibly created) workspace path.
+    """
+    if not ws:
+        return ws
+    try:
+        if os.path.isabs(ws) and not os.path.isdir(ws):
+            os.makedirs(ws, exist_ok=True)
+            _log(f"[DELEGATE] Created missing workspace folder: {ws}")
+    except Exception as e:
+        _log(f"[DELEGATE] Could not create workspace '{ws}': {e}")
+    return ws
 
 
 def _result_block(entry: dict) -> str:
@@ -208,13 +224,17 @@ def _run_item(del_id: str, item: dict, parent_chat_id: str) -> None:
     except Exception as e:
         _log(f"[DELEGATE] Chat mirror skipped for {del_id}: {e}")
 
-    # Deliver the completion event to the parked orchestrator.
+    # Deliver the completion event to the parked orchestrator (C1: enqueue if active).
     if parent_chat_id:
         try:
-            from inbox import follow_up
-            follow_up(parent_chat_id, _result_block(snapshot))
-        except Exception as e:
-            _log(f"[DELEGATE] Completion delivery skipped for {del_id}: {e}")
+            from server.realtime.enqueue_bridge import enqueue_or_follow_up
+            enqueue_or_follow_up(parent_chat_id, _result_block(snapshot))
+        except Exception:
+            try:
+                from inbox import follow_up
+                follow_up(parent_chat_id, _result_block(snapshot))
+            except Exception as e:
+                _log(f"[DELEGATE] Completion delivery skipped for {del_id}: {e}")
 
     with _LOCK:
         entry["status"] = local_status
@@ -232,13 +252,18 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> lis
     """Validate + register + launch every item. Returns spawn summaries.
 
     Without a parent chat id the call degrades to BLOCKING sequential runs so
-    results can be returned directly (no inbox to park on).
+    results can be returned directly (no inbox to park on). With a parent chat
+    id the items run in PARALLEL through the pydantic-graph map+join path
+    (``map_run_delegations``); this sync facade is the fallback for callers
+    that cannot await (e.g. legacy tools).
     """
     summaries: list[dict] = []
+    graph_items: list[dict] = []
+    blocking = not parent_chat_id
 
     for raw in items or []:
         if not isinstance(raw, dict):
-            summaries.append({"ok": False, "error": "item must be an object"})
+            summaries.append({"ok": False, "error": "item must be object"})
             continue
         agent_key = _norm_agent(raw.get("agent") or raw.get("name"))
         task_text = str(raw.get("task") or "").strip()
@@ -251,7 +276,7 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> lis
 
         title = str(raw.get("title") or "").strip() or " ".join(task_text.split())[:40]
         display = _AGENT_DISPLAY[agent_key]
-        workspace = _resolve_workspace(raw, agent_key, fallback_ws)
+        workspace = _ensure_workspace_dir(_resolve_workspace(raw, agent_key, fallback_ws))
 
         # Images: keep only paths that exist right now (the model hallucinates
         # paths now and then; a missing attachment must not crash the child).
@@ -317,19 +342,39 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> lis
             "chat_id": chat_id,
             "continued": continued,
         })
+        graph_items.append({"del_id": del_id, "raw": dict(raw), "parent_chat_id": parent_chat_id or ""})
 
-        if parent_chat_id:
-            _EXECUTOR.submit(_run_item, del_id, dict(raw), parent_chat_id)
-        else:
-            # Degenerate mode: no inbox to park on — run BLOCKING and surface
-            # the outcome directly in the summary.
-            _run_item(del_id, dict(raw), "")
+    if not graph_items:
+        return summaries
+
+    if blocking:
+        # Degenerate mode: no inbox to park on — run BLOCKING and surface
+        # the outcome directly in the summary.
+        for gi in graph_items:
+            _run_item(gi["del_id"], gi["raw"], "")
             with _LOCK:
-                e = _DELEGATIONS[del_id]
-                summaries[-1]["status"] = e["status"]
-                summaries[-1]["result"] = (e.get("result") or e.get("error") or "")[:_REPLY_CAP]
+                e = _DELEGATIONS[gi["del_id"]]
+                s = next((x for x in summaries if x.get("id") == gi["del_id"]), None)
+                if s:
+                    s["status"] = e["status"]
+                    s["result"] = (e.get("result") or e.get("error") or "")[:_REPLY_CAP]
+        return summaries
 
-    return summaries
+    # Parallel path (parent chat present): run through the graph map+join.
+    try:
+        import asyncio
+        return asyncio.run(map_run_delegations(items, parent_chat_id, fallback_ws))
+    except Exception as e:
+        _log(f"[DELEGATE] parallel fallback failed ({e}); running blocking")
+        for gi in graph_items:
+            _run_item(gi["del_id"], gi["raw"], "")
+            with _LOCK:
+                e_ = _DELEGATIONS[gi["del_id"]]
+                s = next((x for x in summaries if x.get("id") == gi["del_id"]), None)
+                if s:
+                    s["status"] = e_["status"]
+                    s["result"] = (e_.get("result") or e_.get("error") or "")[:_REPLY_CAP]
+        return summaries
 
 
 def running_count(parent_chat_id: str) -> int:
@@ -498,6 +543,176 @@ def recent_jobs_block(n: int = 10) -> str:
             f"({rec.get('workspace','')}/{rec.get('chat_id','')}) — {rec.get('result','')[:120]}"
         )
     return "\n".join(out) if len(out) > 1 else ""
+
+
+# ── Graph-driven parallel delegation (map + join) ────────────────────────────
+#
+# Each delegation item is a parallel step in a pydantic-graph ``GraphBuilder``
+# map+join; results are collected via a join node into one list. Preserves
+# per-item chat isolation + inbox delivery (the _run_item body is unchanged;
+# only the scheduling mechanism differs).
+
+_DEL_GRAPH: object | None = None
+_DEL_GRAPH_LOCK = threading.Lock()
+
+
+def _build_del_graph():
+    """Build (once) the delegation map+join graph.
+
+    ``map_run_delegations`` receives a list of (del_id, raw, parent_chat_id)
+    tuples; each is executed in its own parallel step, results are collected
+    by a join into a list of per-item summaries.
+    """
+    from pydantic_graph import GraphBuilder, StepContext, reduce_list_append
+
+    g = GraphBuilder(input_type=list, output_type=list)
+
+    @g.step
+    async def run_item(ctx: StepContext[None, None, dict]) -> dict:
+        item = ctx.inputs  # {"del_id":..., "raw":..., "parent_chat_id":...}
+        del_id = item["del_id"]
+        raw = item["raw"]
+        parent = item["parent_chat_id"]
+        _run_item(del_id, raw, parent)
+        entry = _DELEGATIONS.get(del_id) or {}
+        return {
+            "id": del_id,
+            "agent": entry.get("agent_display", ""),
+            "title": entry.get("title", ""),
+            "status": entry.get("status", "failed"),
+            "result": (entry.get("result") or entry.get("error") or "")[:_REPLY_CAP],
+        }
+
+    collect = g.join(reduce_list_append, initial_factory=list)
+
+    g.add(
+        g.edge_from(g.start_node).map().to(run_item),
+        g.edge_from(run_item).to(collect),
+        g.edge_from(collect).to(g.end_node),
+    )
+    return g.build()
+
+
+def get_del_graph():
+    global _DEL_GRAPH
+    if _DEL_GRAPH is None:
+        with _DEL_GRAPH_LOCK:
+            if _DEL_GRAPH is None:
+                _DEL_GRAPH = _build_del_graph()
+    return _DEL_GRAPH
+
+
+async def map_run_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> list[dict]:
+    """Async parallel fan-out via the graph map+join path.
+
+    ``items``: list of raw delegation dicts (same shape as ``start_delegations``).
+    Returns the same per-item summaries as ``start_delegations``, but the items
+    execute concurrently through the graph's map+join. Order of the returned
+    list matches input order.
+    """
+    # Validation mirrors start_delegations; produce summaries for the invalid ones.
+    summaries: list[dict] = []
+    graph_items: list[dict] = []
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            summaries.append({"ok": False, "error": "item must be an object"})
+            continue
+        agent_key = _norm_agent(raw.get("agent") or raw.get("name"))
+        task_text = str(raw.get("task") or "").strip()
+        if agent_key not in DELEGATABLE_AGENTS:
+            summaries.append({"ok": False, "error": f"unknown agent '{raw.get('agent')}' (use Dev/General/House)"})
+            continue
+        if not task_text:
+            summaries.append({"ok": False, "error": "task text is required"})
+            continue
+
+        title = str(raw.get("title") or "").strip() or " ".join(task_text.split())[:40]
+        display = _AGENT_DISPLAY[agent_key]
+        workspace = _ensure_workspace_dir(_resolve_workspace(raw, agent_key, fallback_ws))
+        images: list[str] = []
+        for p in (raw.get("images") or []):
+            sp = str(p).strip()
+            if sp and os.path.isfile(sp):
+                images.append(sp)
+        chat_id = str(raw.get("chat_id") or "").strip()
+        continued = bool(chat_id)
+        try:
+            import workspace_manager as wm
+            if continued and not wm.get_chat(workspace, chat_id, include_traces=False):
+                continued = False
+            if not continued:
+                chat = wm.create_chat(workspace, title=f"{title} · {display}")
+                chat_id = chat.get("id", "")
+        except Exception as e:
+            summaries.append({"ok": False, "error": f"chat setup failed: {e}"})
+            continue
+
+        del_id = f"del-{uuid.uuid4().hex[:8]}"
+        entry = {
+            "id": del_id,
+            "agent_key": agent_key,
+            "agent_display": display,
+            "title": title,
+            "task": task_text,
+            "workspace": workspace,
+            "chat_id": chat_id,
+            "continued": continued,
+            "parent": parent_chat_id or "",
+            "status": "running",
+            "result": "",
+            "error": "",
+            "images": images,
+            "started": datetime.now().isoformat(timespec="seconds"),
+        }
+        with _LOCK:
+            _DELEGATIONS[del_id] = entry
+        try:
+            import workspace_manager as wm
+            wm.add_message(workspace, chat_id, "user", task_text, {
+                "delegated": True,
+                "del_id": del_id,
+                "by": "orchestrator",
+            })
+        except Exception as e:
+            _log(f"[DELEGATE] Task seed skipped for {del_id}: {e}")
+        _log(f"[SUBAGENT] child={chat_id} name={display} label={title} del={del_id}")
+        summaries.append({
+            "ok": True,
+            "id": del_id,
+            "agent": display,
+            "title": title,
+            "workspace": workspace,
+            "chat_id": chat_id,
+            "continued": continued,
+        })
+        graph_items.append({"del_id": del_id, "raw": dict(raw), "parent_chat_id": parent_chat_id or ""})
+
+    if not graph_items:
+        return summaries
+
+    # Run via graph map+join (parallel). If the graph path fails, degrade to
+    # blocking sequential runs so delegations never block on graph infra.
+    try:
+        import asyncio
+        graph = get_del_graph()
+        results = await graph.run(inputs=graph_items)
+        by_id = {r.get("id"): r for r in (results or []) if isinstance(r, dict)}
+        for s in summaries:
+            if s.get("ok") and s.get("id") in by_id:
+                s["status"] = by_id[s["id"]].get("status")
+                s["result"] = by_id[s["id"]].get("result", "")
+        return summaries
+    except Exception as e:
+        _log(f"[DELEGATE] graph fan-out failed ({e}); running blocking sequential")
+        for gi in graph_items:
+            _run_item(gi["del_id"], gi["raw"], "")
+            with _LOCK:
+                e_ = _DELEGATIONS[gi["del_id"]]
+                s = next((x for x in summaries if x.get("id") == gi["del_id"]), None)
+                if s:
+                    s["status"] = e_["status"]
+                    s["result"] = (e_.get("result") or e_.get("error") or "")[:_REPLY_CAP]
+        return summaries
 
 
 def reset_delegations() -> None:

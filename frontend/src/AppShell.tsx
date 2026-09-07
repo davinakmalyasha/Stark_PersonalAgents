@@ -1,21 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
-import { Code2, House as HouseIcon, User } from 'lucide-react';
+import { Code2, House as HouseIcon, Palette, ShieldCheck, User } from 'lucide-react';
 import App from './App';
 import House from './house/House';
 import HomeOrb from './house/HomeOrb';
 import HousePortal from './house/HousePortal';
 import HouseWorkspace from './house-workspace/HouseWorkspace';
 import PersonalWorkspace from './personal-workspace/PersonalWorkspace';
+import AgentsAdminWorkspace from './agentsadmin/AgentsAdminWorkspace';
+import DesignWorkspace from './modules/design-workspace/DesignWorkspace';
 import PairingGate from './components/Layout/PairingGate';
 import { onAuthRejected } from './services/remoteAuth';
 
-type Route = 'home' | 'coding' | 'house' | 'personal'
+type Route = 'home' | 'coding' | 'house' | 'personal' | 'admin' | 'design'
 
 function getRoute(): Route {
   const hash = window.location.hash
   if (hash.startsWith('#/coding')) return 'coding'
   if (hash.startsWith('#/house')) return 'house'
   if (hash.startsWith('#/personal')) return 'personal'
+  if (hash.startsWith('#/admin')) return 'admin'
+  if (hash.startsWith('#/design')) return 'design'
   return 'home'
 }
 
@@ -24,8 +28,9 @@ function getRoute(): Route {
  * The Coding Workspace (the existing app, untouched) is a room
  * entered via `#/coding`. The House Workspace (smart home control)
  * is a room entered via `#/house`. The Personal Workspace is a room
- * entered via `#/personal` (reserved shell). Entering shows the white
- * portal ring transition while the workspace boots.
+ * entered via `#/personal` (reserved shell). The Design module
+ * (OpenDesign room, UI design iteration) is entered via `#/design`.
+ * Entering shows the white portal ring transition while the workspace boots.
  */
 export default function AppShell() {
   const [route, setRoute] = useState<Route>(getRoute)
@@ -100,6 +105,35 @@ export default function AppShell() {
           <HousePortal
             label="Entering Personal Workspace"
             icon={<User size={22} />}
+            leaving={portalLeaving}
+          />
+        )}
+      </>
+    )
+  }
+  if (route === 'admin') {
+    return (
+      <>
+        <AgentsAdminWorkspace />
+        {portalVisible && (
+          <HousePortal
+            label="Entering Agents Admin"
+            icon={<ShieldCheck size={22} />}
+            leaving={portalLeaving}
+          />
+        )}
+      </>
+    )
+  }
+  if (route === 'design') {
+    return (
+      <>
+        <DesignWorkspace />
+        <HomeOrb />
+        {portalVisible && (
+          <HousePortal
+            label="Entering Design Module"
+            icon={<Palette size={22} />}
             leaving={portalLeaving}
           />
         )}

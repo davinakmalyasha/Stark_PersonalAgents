@@ -2,5 +2,6 @@
   "repo": "davinakmalyasha/agent-templates",
   "ref": "main",
   "commit": "68eb7b7edbd99e0da3baf2737c0d44bd913457a5",
-  "files": 144
+  "note": "Scope trimmed to config/routine/project gate templates only (feature/stack/component/spec removed from this checkout). template_pull/push are internal; the agent template tool surface is removed.",
+  "files": 17
 }

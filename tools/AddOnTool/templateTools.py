@@ -2,6 +2,10 @@
 
 Template state is local to this module. Workspace, cache, and GitHub helpers
 are imported lazily inside functions through the tools.py facade.
+
+Scope: only the CI/deploy gate templates remain (config/routine/project) —
+the feature/stack/component/spec catalog was removed. github_apply_gate is
+the sole consumer of this renderer.
 """
 import json
 import os
@@ -17,8 +21,7 @@ _TEMPLATES_DIR = os.path.join(
 
 _SYNC_STAMP = ".sync.json"
 
-_TEMPLATE_CATEGORIES = ("stack", "feature", "component", "snippet", "project",
-                        "config", "routine", "spec")
+_TEMPLATE_CATEGORIES = ("config", "routine", "project")
 
 def _template_dir(name: str) -> Optional[str]:
     """Locate a template folder (one level deep: templates/<level>/<name>/)."""
@@ -197,9 +200,9 @@ def _infer_project_variables(template: str, target_dir: str, variables: dict) ->
     return inferred, warns
 
 
-def apply_template(template: str, target_dir: str = "", variables: dict = None,
+def apply_template(template: str = "", target_dir: str = "", variables: dict = None,
                    overwrite: bool = False, dry_run: bool = False,
-                   quiet: bool = True) -> str:
+                   quiet: bool = True, ctx: object = None) -> str:
     """Render a template into target_dir (default: current workspace).
 
     Stacks (templates with "uses") recursively apply their referenced
@@ -218,10 +221,16 @@ def apply_template(template: str, target_dir: str = "", variables: dict = None,
 
     Returns a compact summary: composed templates, files written/skipped,
     TODO markers, conventions notes.
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
     """
     from tools import _HARNESS_ROOT, enforce_fs_permission, shared_state
     if not target_dir:
         target_dir = str(shared_state.get("project_path") or _HARNESS_ROOT)
+        if ctx is not None:
+            try:
+                target_dir = getattr(ctx, "project_path", None) or target_dir
+            except Exception:
+                pass
     target_dir = os.path.normpath(str(target_dir))
     if not os.path.isdir(target_dir):
         return f"Error: target_dir '{target_dir}' does not exist."
@@ -872,7 +881,7 @@ def build_template_map() -> str:
     )
 
 
-def template(action: str, template: str = "", category: str = "", query: str = "",
+def template(action: str, ctx: object = None, template: str = "", category: str = "", query: str = "",
              target_dir: str = "", variables: dict = None, overwrite: bool = False,
              dry_run=None, quiet: bool = True) -> str:
     """Unified template manager — flexible single tool for developer.
@@ -887,6 +896,8 @@ def template(action: str, template: str = "", category: str = "", query: str = "
     writing; explicit dry_run=true/false always wins.
 
     Replaces apply_template + template_list. Old tools stay for compat.
+    ``ctx`` is the optional typed WorkspaceDeps (registry passes it when the
+    signature starts with ctx/deps/run_ctx); legacy callers omit it.
     """
     a = (action or "").strip().lower()
     if a in ("list", "ls", "catalog"):

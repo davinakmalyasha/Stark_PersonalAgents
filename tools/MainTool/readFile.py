@@ -62,12 +62,15 @@ def _log_offload_read(file_path: str) -> None:
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
-def read_file(file_path: str = "", file_paths: Optional[list] = None, offset: int = 0, limit: Optional[int] = None) -> str:
+def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list] = None, offset: int = 0, limit: Optional[int] = None) -> str:
     """Read a file with optional offset and limit. Uses session cache (#9).
     Supports multi-file read via file_paths=[paths] — returns per-file sections.
 
     Image files (.png/.jpg/.jpeg/.gif/.webp) are returned as an inline vision
-    image instead of binary garbage — requires a vision-capable model."""
+    image instead of binary garbage — requires a vision-capable model.
+    ``ctx`` is the optional typed WorkspaceDeps (registry passes it when the
+    signature starts with ctx/deps/run_ctx); legacy callers omit it.
+    """
     from tools import enforce_fs_permission, get_vfs_router, _sanitize_path, _FILE_CACHE
     # Multi-file dispatch
     if file_paths is not None:
@@ -93,7 +96,7 @@ def read_file(file_path: str = "", file_paths: Optional[list] = None, offset: in
             real_img = _sanitize_path(file_path)
             if os.path.isfile(real_img):
                 from tools.vision_channel import queue_image_file
-                if queue_image_file(real_img, note=f"read_file({file_path})"):
+                if queue_image_file(real_img, note=f"read_file({file_path})", ctx=ctx):
                     _log_tool("read_file", {"file_path": file_path, "image": True},
                               f"[IMAGE] {file_path}")
                     return (f"[IMAGE] {file_path} — attached inline below (vision). "
@@ -106,14 +109,14 @@ def read_file(file_path: str = "", file_paths: Optional[list] = None, offset: in
     # â”€â”€ VFS Composite Routing â”€â”€
     vfs_path = file_path.replace("\\", "/")
     try:
-        vfs_router = get_vfs_router()
+        vfs_router = get_vfs_router(ctx)
         line_offset = max(0, offset - 1) if offset > 0 else 0
         # True total lines from disk for an accurate header (VFS returns at most
         # `limit` lines; the header must report the real file size).
         _real_total = 0
         if offset == 0 and limit is None:
             try:
-                _real_path = _sanitize_path(file_path)
+                _real_path = _sanitize_path(file_path, ctx)
                 if os.path.isfile(_real_path):
                     with open(_real_path, "r", encoding="utf-8", errors="replace") as _rf:
                         _real_total = len(_rf.readlines())
@@ -162,9 +165,10 @@ def read_file(file_path: str = "", file_paths: Optional[list] = None, offset: in
     except Exception:
         pass
 
-    path = _sanitize_path(file_path)
+    path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
-        return f"Error: File not found: {file_path}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error: File not found: {file_path}")
     try:
         # Check session cache (#9) â€” skip if offset/limit specified (partial read)
         cache_key = os.path.normpath(path).lower()
@@ -221,4 +225,5 @@ def read_file(file_path: str = "", file_paths: Optional[list] = None, offset: in
         _log_tool("read_file", {"file_path": file_path, "offset": offset, "limit": limit}, output[:300])
         return output
     except Exception as e:
-        return f"Error reading {file_path}: {e}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error reading {file_path}: {e}")

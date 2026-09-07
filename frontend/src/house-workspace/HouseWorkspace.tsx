@@ -10,9 +10,9 @@ import EnergyChart from './EnergyChart';
 import type { HouseState, HouseDevice, DeviceState } from './house.types';
 import { fetchHouseState, setDeviceState, runScene } from './houseApi';
 import { useHouseChat } from '../house/useHouseChat';
-import HouseChatMessages from '../house/HouseChatMessages';
 import HouseSidebar from '../house/HouseSidebar';
 import { useSessions, tabId } from '../house/useSessions';
+import MessageStream from '../components/Workspace/MessageStream';
 import PromptDock from '../components/Workspace/PromptDock';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import { updateChatTitle, deleteChat } from '../services/api';
@@ -74,9 +74,8 @@ export default function HouseWorkspace() {
     go(`#/?ws=${encodeURIComponent(workspaceId)}&chat=${encodeURIComponent(chatId)}`);
   }, [go]);
 
-  // Dedicated "House" conversation — separate from the House home chat list,
-  // same house agent (General subagent + assistant persona) on the backend.
-  const chat = useHouseChat({ pinnedChatTitle: HOUSE_CHAT_TITLE });
+  // Dedicated "House" conversation — bound to the _house workspace + house agent.
+  const chat = useHouseChat({ pinnedChatTitle: HOUSE_CHAT_TITLE, workspaceKind: 'house' });
   const assistantName = getAssistantName();
 
   useEffect(() => {
@@ -162,7 +161,7 @@ export default function HouseWorkspace() {
         <div className="text-center px-6">
           <House size={28} className="mx-auto text-zinc-600 mb-3" />
           <p className="text-[13px] text-zinc-400">{error}</p>
-          <p className="text-[11px] text-zinc-600 mt-1">Is the API server running on port 8000?</p>
+          <p className="text-[11px] text-zinc-600 mt-1">Is the API server running on port 8123?</p>
           <button
             type="button"
             onClick={load}
@@ -361,11 +360,27 @@ export default function HouseWorkspace() {
 
                 {chatOpen && (
                   <div className="h-[clamp(140px,22vh,230px)] min-h-0 flex flex-col px-2">
-                    <HouseChatMessages
-                      threadRef={chat.threadRef}
-                      isLoading={chat.isLoading}
-                      messages={chat.displayMessages}
-                    />
+                    <div ref={chat.threadRef} className="flex-1 min-h-0 overflow-y-auto">
+                      {chat.isLoading ? (
+                        <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-500 py-6">
+                          <div className="flex gap-1.5">
+                            <span className="house-typing-dot" />
+                            <span className="house-typing-dot" />
+                            <span className="house-typing-dot" />
+                          </div>
+                          <span className="text-[12px]">Connecting...</span>
+                        </div>
+                      ) : (
+                        <MessageStream
+                          messages={chat.displayMessages}
+                          hasActiveChat={chat.displayMessages.length > 0}
+                          onOpenSubagent={() => {}}
+                          onOpenSubagentSession={undefined}
+                          workspaceId={chat.workspaceId}
+                          chatId={chat.activeChatId}
+                        />
+                      )}
+                    </div>
                   </div>
                 )}
 
@@ -414,6 +429,7 @@ export default function HouseWorkspace() {
         onLaunchPersonal={() => go('#/personal')}
         onLaunchCoding={() => go('#/coding')}
         onLaunchHouse={() => go('#/house')}
+        onLaunchAdmin={() => go('#/admin')}
       />
 
       {/* Toast */}

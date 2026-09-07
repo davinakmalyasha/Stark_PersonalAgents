@@ -20,8 +20,7 @@ except ImportError:
             self.operations = operations or []
             self.paths = paths or []
             self.mode = mode
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-from tools import active_tool_scope, get_native_tool_names
+from tools import get_native_tool_names
 
 class SubagentsRegistry(dict):
     def __contains__(self, key):
@@ -276,7 +275,7 @@ def _specialist_backend(name: str) -> str:
     Precedence: SUBAGENT_MODEL_BACKEND env > active provider mode's
     specialist entry > agents/specialists/*.json spec "backend" > "deepseek".
     Only "free" dispatches to the free pool; every other value rides the paid
-    llm.py path (which itself resolves deepseek | opencode | command).
+    native pydantic-ai path (which itself resolves deepseek | opencode | command).
     """
     if not _SUBAGENTS_REGISTRY:
         _load_subagents()
@@ -301,10 +300,13 @@ def _specialist_call_backend(
 ):
     """One LLM turn for a specialist subagent on its configured backend.
 
-    Returns the same shape the generic loop already consumes: a
-    ``(text, tool_calls, reasoning)`` tuple on the free transport, or the raw
-    invoke_messages_with_fallback_stream result on deepseek. Raises loudly on
-    total free-provider failure — no silent paid fallback by design.
+    A5: the paid path is now a native pydantic-ai full turn — tools are
+    executed internally. Returns ``(text, new_lc, reasoning)`` where
+    ``new_lc`` is the LangChain transcript slice the caller extends its
+    history with (empty for a tool-less final turn is an AIMessage). The
+    ``schema`` (structured-output) path returns the validated pydantic
+    instance (tool-less specialists). The free pool keeps its single-turn
+    ``(text, tool_calls, reasoning)`` triple (caller owns execution).
     """
     if _specialist_backend(name) == "free":
         # Free pool with live streaming to the parent chat bus; one bounded
@@ -321,7 +323,18 @@ def _specialist_call_backend(
             temperature=temp,
         )
 
-    from llm import invoke_messages_with_fallback_stream
+    if schema is not None:
+        # Structured output (tool-less specialist): single validated result.
+        from llm.pai_transport import pai_structured
+
+        return pai_structured(
+            list(messages),
+            schema,
+            temp=temp,
+            where=where,
+        )
+
+    from llm.native_tools import run_native_agent
 
     if not model:
         # Provider modes may pin a concrete specialist model (command mode ->
@@ -333,15 +346,28 @@ def _specialist_call_backend(
         except Exception:
             model = None
 
-    return invoke_messages_with_fallback_stream(
+    # NOTE (rewiring fix): _child_prompt_for() never existed — the call
+    # raised NameError on every paid-path turn (swallowed upstream as an
+    # instant empty turn). Resolve the spec prompt from this module's own
+    # registry instead (mirrors agents/subagent_manager._child_system_prompt;
+    # local lookup avoids a circular import).
+    _spec_sys = None
+    try:
+        if not _SUBAGENTS_REGISTRY:
+            _load_subagents()
+        _spec_sys = (_SUBAGENTS_REGISTRY.get(name) or {}).get("system_prompt")
+    except Exception:
+        _spec_sys = None
+    if isinstance(_spec_sys, list):
+        _spec_sys = "\n".join(str(s) for s in _spec_sys)
+    return run_native_agent(
         role=name,
         messages=list(messages),
-        schema=schema,
-        temp=temp,
-        model=model,
-        reasoning_effort=reasoning_effort,
         tools=native_tools,
+        temp=temp,
+        reasoning_effort=reasoning_effort,  # static per-role mapping applies downstream
         where=where,
+        system_prompt=_spec_sys or "You are a specialized subagent.",
     )
 
 _HANDOFF_MAX_CHARS = 1000  # 1000 chars — compact structured report; oversized text offloads to VFS
@@ -481,7 +507,7 @@ def _handoff(content, name: str = "subagent") -> str:
             file_id = uuid.uuid4().hex[:8]
             clean = "".join(c if c.isalnum() else "_" for c in name)[:40] or "subagent"
             vfs_path = f"/scratch/handoff_log_{clean}_{file_id}.txt"
-            _write_file(vfs_path, content)
+            _write_file(file_path=vfs_path, content=content)
         except Exception:
             vfs_path = ""
     return _compact_handoff(content, name, vfs_path)
@@ -506,7 +532,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         _tool_cap,
         active_permissions,
         auto_offload_result,
-        ensure_tool_registry,
         execute_tool_detailed,
         shared_state,
     )
@@ -529,16 +554,8 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # When tools are available, the agent loop handles output naturally.
     schema = spec.get("response_format") if not tool_names else None
 
-    # P4: scope restriction — one visibility for this subagent (prompt,
-    # native schemas, and execution all filter through the registry).
-    try:
-        reg = ensure_tool_registry()
-        reg.restrict_scope(name, allow=list(tool_names))
-    except Exception:
-        pass
-
     # Native function calling for the generic loop. The schemas are filtered to
-    # the registry allow-list; pseudo-tool text is never generated or parsed.
+    # the spec's tool allow-list; pseudo-tool text is never generated or parsed.
     native_tools = None
     if schema is None and tool_names:
         try:
@@ -567,7 +584,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
     depth_token = _TASK_DEPTH.set(depth + 1)
     token = active_permissions.set(perms)
-    scope_token = active_tool_scope.set(name)
     try:
         chat_id = shared_state.get("chat_id", "default_chat")
         if name == "Dev":
@@ -645,15 +661,28 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         # All other subagents use the same native loop with a fresh transcript.
         resolved_task = task
 
-        messages = [
-            SystemMessage(content=full_sys_prompt),
-            HumanMessage(content=resolved_task),
-        ]
+        # P0-LLM: native List[ModelMessage] history (no LangChain messages).
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            SystemPromptPart,
+            TextPart,
+            ThinkingPart,
+            ToolCallPart,
+            ToolReturnPart,
+            UserPromptPart,
+        )
+        messages: list = []
+        if full_sys_prompt:
+            messages.append(ModelRequest(parts=[SystemPromptPart(content=full_sys_prompt)]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content=resolved_task)]))
 
         # Vision: inject user-attached images stashed by the API layer.
         try:
-            from tools.vision_channel import drain_attachment_images
-            drain_attachment_images(messages)
+            from llm.deps import WorkspaceDeps
+            _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
+            from tools.vision_channel import drain_attachment_images_native
+            drain_attachment_images_native(messages, ctx=_sub_deps)
         except Exception:
             pass
 
@@ -662,7 +691,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         sub_sess = None
         try:
             from uuid import uuid4
-            from session_log import get_session, find_recent_session
+            from server.session.log import get_session, find_recent_session
             ws = shared_state.get("project_path") or _HARNESS_ROOT
             parent_path = find_recent_session(chat_id, ws) if chat_id else None
             sub_sess = get_session(
@@ -680,34 +709,26 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         except Exception:
             sub_sess = None
 
-        from llm import invoke_messages_with_fallback, invoke_messages_with_fallback_stream
+        # Subagent loop below calls _specialist_call_backend per turn (native);
+        # the legacy invoke_messages_with_fallback path is retired (P0-LLM).
 
-        # Orchestrator dial overrides the registry default for this delegation
-        # (registry keeps the spec effort when no override is given).
-        subagent_effort = reasoning_effort or spec.get("reasoning_effort")
+        # Static per-role thinking: subagents get no explicit override; the
+        # role mapping in _build_model_settings decides (dev/coder=high, rest=low).
+        subagent_effort = reasoning_effort
 
         # ── Subagent loop: LLM → tools → observe → repeat ──
         # There is no turn ceiling. Cancellation, provider failure, a final
         # response, or an explicit structured-output request are the lifecycle
         # boundaries; context checkpoints handle long transcripts.
         content = ""
-        # Adaptive reasoning ladder (same pattern as Dev/Orchestrator):
-        # iter-1 (diagnosis) uses the spec effort; routine turns run disabled;
-        # a trouble signal (tool error / failure markers) flips the NEXT turn
-        # back to the spec effort for diagnosis.
         _sub_trouble = False
-        _routine_effort = os.environ.get("REASONING_SUBAGENT_ROUTINE", "disabled")
         _last_tool_name = ""
         try:
             sub_iter = 0
             while True:
                 sub_iter += 1
                 # Call LLM
-                if sub_iter == 1 or _sub_trouble:
-                    _effort = subagent_effort
-                    _sub_trouble = False
-                else:
-                    _effort = _routine_effort
+                _effort = subagent_effort
                 res = _specialist_call_backend(
                     name,
                     list(messages),
@@ -724,9 +745,50 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                 if reasoning:
                     additional_kwargs["reasoning_content"] = reasoning
 
+                # A5: native full turn — pydantic-ai executed the tools already.
+                # The slice (ModelResponse tool-calls + ModelRequest tool results)
+                # IS the execution record; extend history, log to the session, and
+                # finish when the model stopped calling tools.
+                _native_slice = None
+                if isinstance(res, tuple) and len(res) == 3 and _is_native_slice(res[1]):
+                    response_text, _native_slice, reasoning = res
+                    content = str(response_text or "")
+                    if reasoning:
+                        additional_kwargs["reasoning_content"] = reasoning
+                    messages.extend(_native_slice)
+                    _native_calls = [
+                        {"id": p.tool_call_id or "", "name": p.tool_name or ""}
+                        for m in _native_slice
+                        if isinstance(m, ModelResponse)
+                        for p in getattr(m, "parts", []) or []
+                        if isinstance(p, ToolCallPart)
+                    ]
+                    if sub_sess is not None:
+                        try:
+                            blocks = [{"type": "text", "text": content}]
+                            if reasoning:
+                                blocks.insert(0, {"type": "thinking", "thinking": reasoning})
+                            stop = "toolUse" if _native_calls else "stop"
+                            sub_sess.append_assistant(blocks, stop_reason=stop)
+                            for tc in _native_calls:
+                                sub_sess.append_tool_result(
+                                    "ok",
+                                    tool_call_id=tc.get("id", ""),
+                                    tool_name=tc.get("name", ""),
+                                    is_error=False,
+                                )
+                        except Exception:
+                            pass
+                    if _native_calls:
+                        # Native turn used tools; continue the loop so a final
+                        # no-tool turn produces the handoff.
+                        _last_tool_name = _native_calls[-1].get("name", "")
+                        continue
+                    break
+
                 if schema and hasattr(res, "model_dump_json"):
                     content = res.model_dump_json()
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                    messages.append(ModelResponse(parts=[TextPart(content=content)]))
                     if sub_sess is not None:
                         try:
                             sub_sess.append_assistant(content, stop_reason="stop")
@@ -735,7 +797,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                     break  # Structured output â†’ done
                 elif schema and hasattr(res, "json"):
                     content = res.json()
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                    messages.append(ModelResponse(parts=[TextPart(content=content)]))
                     if sub_sess is not None:
                         try:
                             sub_sess.append_assistant(content, stop_reason="stop")
@@ -771,7 +833,11 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
                 if not tool_calls:
                     # No native tool calls: the subagent chose its final response.
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                    parts: list = []
+                    if additional_kwargs.get("reasoning_content"):
+                        parts.append(ThinkingPart(content=additional_kwargs["reasoning_content"]))
+                    parts.append(TextPart(content=content))
+                    messages.append(ModelResponse(parts=parts))
                     if sub_sess is not None:
                         try:
                             blocks = [{"type": "text", "text": content}]
@@ -783,16 +849,19 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                             pass
                     break
 
-                # Record the AI response (native: carry tool_calls for the API round-trip)
-                if native_tool_calls and tool_calls:
-                    messages.append(AIMessage(
-                        content=content,
-                        tool_calls=[{"name": tc["tool"], "args": tc.get("args") or {},
-                                     "id": tc.get("id", "")} for tc in tool_calls],
-                        additional_kwargs=additional_kwargs,
+                # Record the AI response (native: carry tool-call parts)
+                parts: list = []
+                if additional_kwargs.get("reasoning_content"):
+                    parts.append(ThinkingPart(content=additional_kwargs["reasoning_content"]))
+                if content:
+                    parts.append(TextPart(content=content))
+                for tc in tool_calls:
+                    parts.append(ToolCallPart(
+                        tool_name=tc["tool"],
+                        args=tc.get("args") or {},
+                        tool_call_id=tc.get("id", ""),
                     ))
-                else:
-                    messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+                messages.append(ModelResponse(parts=parts))
 
                 # Child session log (P1): record the step's assistant message
                 if sub_sess is not None:
@@ -804,17 +873,37 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                     except Exception:
                         pass
 
-                # Execute tools and collect results
+                # Execute tools and collect results. Independent read-only calls
+                # (PARALLEL_SAFE) run concurrently; results stay in call order so
+                # the provider's call-id → result pairing is preserved.
+                # Out-of-scope tools are filtered BEFORE execution.
                 tool_results = []
                 structured_results = []
+                _sub_exec_pool = None
+                _sub_allowed = [c for c in tool_calls if c.get("tool") in tool_names or not tool_names]
+                try:
+                    from tools import run_tool_calls as _run_tool_calls
+                    _sub_exec_pool = _run_tool_calls(
+                        _sub_allowed,
+                        lambda tc: _subagent_execute_one(tc, tool_names),
+                    )
+                except Exception:
+                    _sub_exec_pool = []
+                _sub_result_by_id = {}
+                if len(_sub_exec_pool) == len(_sub_allowed):
+                    for _tc, _res in zip(_sub_allowed, _sub_exec_pool):
+                        _sub_result_by_id[str(_tc.get("id") or "")] = _res
                 for tc in tool_calls:
                     tool_name = tc.get("tool", "")
                     args = tc.get("args", {})
-                    if tool_name not in tool_names and tool_names:
+                    _cid = str(tc.get("id") or "")
+                    if _cid in _sub_result_by_id:
+                        result = _sub_result_by_id[_cid]
+                    elif tool_name not in tool_names and tool_names:
                         result = f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
                     else:
                         try:
-                            execution = execute_tool_detailed(tool_name, args, scope=name)
+                            execution = execute_tool_detailed(tool_name, args)
                             result = execution.content
                         except Exception as e:
                             result = f"ERROR: {str(e)[:200]}"
@@ -846,16 +935,18 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
                                          "traceback", "timeout", "not found", "cannot find module")):
                     _sub_trouble = True
                 for tc, result in structured_results:
-                    messages.append(ToolMessage(
+                    messages.append(ModelRequest(parts=[ToolReturnPart(
+                        tool_name=str(tc.get("tool", "")),
                         content=str(result),
-                        tool_call_id=tc["id"],
-                        name=tc.get("tool", ""),
-                    ))
+                        tool_call_id=str(tc["id"]),
+                    )]))
 
                 # Vision: drain tool-queued inline images into ONE user message.
                 try:
-                    from tools.vision_channel import drain_into_messages
-                    drain_into_messages(messages, header="[Inline image(s) from tool result]")
+                    from llm.deps import WorkspaceDeps
+                    _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
+                    from tools.vision_channel import drain_into_messages_native
+                    drain_into_messages_native(messages, header="[Inline image(s) from tool result]", ctx=_sub_deps)
                 except Exception:
                     pass
 
@@ -871,7 +962,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     finally:
         active_permissions.reset(token)
         _TASK_DEPTH.reset(depth_token)
-        active_tool_scope.reset(scope_token)
 
     # Specialist subagents (kind="subagent"): the final assistant message IS
     # the tool result — verbatim, opencode/Claude-Code style. Only oversized
@@ -885,6 +975,38 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # eats a multi-KB dump.
     return _handoff(content, name)
 
+def _is_native_slice(second: list) -> bool:
+    """True when a backend result's 2nd element is a transcript slice
+    (native full turn) rather than a list of tool-call dicts (free
+    single-turn triple)."""
+    try:
+        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS
+        for m in (second or [])[:2]:
+            if isinstance(m, (_MR, _MS)):
+                return True
+            if isinstance(m, dict) and ("tool" in m or "name" in m):
+                return False
+        return False
+    except Exception:
+        return False
+
+
+def _subagent_execute_one(tool_call: dict, tool_names: list) -> str:
+    """Thread-pool worker for a subagent's parallel read-only batch. Only
+    PARALLEL_SAFE tools reach this path (enforced by run_tool_calls)."""
+    tool_name = str(tool_call.get("tool", "") or "")
+    args = tool_call.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+    if tool_name not in tool_names and tool_names:
+        return f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
+    try:
+        execution = execute_tool_detailed(tool_name, args)
+        return str(execution.content)
+    except Exception as e:
+        return f"ERROR: {str(e)[:200]}"
+
+
 def _run_subagent_in_thread(task_id: str, name: str, task_desc: str, depth: int) -> None:
     """Run a subagent in a background thread. Sets result/error on _ASYNC_TASKS.
 
@@ -895,7 +1017,7 @@ def _run_subagent_in_thread(task_id: str, name: str, task_desc: str, depth: int)
     try:
         _TASK_DEPTH.set(depth)
         from agents.subagent_manager import start_continuable
-        from session_log import find_recent_session
+        from server.session.log import find_recent_session
         from sync.state_sync import shared_state as _ss
         ws = _ss.get("project_path") or _HARNESS_ROOT
         chat_id = str(_ss.get("chat_id") or "")

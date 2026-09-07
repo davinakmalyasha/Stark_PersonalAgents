@@ -25,45 +25,65 @@ function sendToMain(channel, payload) {
 
 function killPort(port) {
   // Kill whatever holds the port so the API server can always bind fresh.
+  // Uses taskkill /F /T to kill the full tree (python.exe spawned via cmd /c
+  // from start_api.bat leaves a detached handle that process.kill alone misses).
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve();
     exec(`netstat -ano | findstr ":${port}" | findstr "LISTENING"`, (err, stdout) => {
       if (!stdout) return resolve();
+      const pids = new Set();
       for (const line of stdout.trim().split('\n')) {
         const parts = line.trim().split(/\s+/);
         const pid = parts[parts.length - 1];
-        if (pid && /^\d+$/.test(pid) && Number(pid) !== process.pid) {
-          try { process.kill(Number(pid)); console.log(`[API] killed stale server PID ${pid}`); } catch (_e) { /* gone */ }
-        }
+        if (pid && /^\d+$/.test(pid) && Number(pid) !== process.pid) pids.add(pid);
       }
-      resolve();
+      if (!pids.size) return resolve();
+      let pending = pids.size;
+      for (const pid of pids) {
+        exec(`taskkill /F /T /PID ${pid}`, () => {
+          console.log(`[API] killed stale server PID ${pid}`);
+          if (--pending === 0) setTimeout(resolve, 800);
+        });
+      }
     });
   });
 }
 
 function startApiServer() {
-  const venv312Python = path.join(__dirname, '..', '..', 'venv312', 'Scripts', 'python.exe');
+  const voicePython = process.env.VOICE_PYTHON && fs.existsSync(process.env.VOICE_PYTHON) ? process.env.VOICE_PYTHON : null;
   const venvPython = path.join(__dirname, '..', '..', 'venv', 'Scripts', 'python.exe');
+  const venvDotPython = path.join(__dirname, '..', '..', '.venv', 'Scripts', 'python.exe');
+  const venv312Python = path.join(__dirname, '..', '..', 'venv312', 'Scripts', 'python.exe');
   
   let pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-  if (fs.existsSync(venv312Python) && fs.existsSync(path.join(__dirname, '..', '..', 'venv312', 'pyvenv.cfg'))) {
-    pythonCmd = venv312Python;
+  if (voicePython) {
+    pythonCmd = voicePython;
   } else if (fs.existsSync(venvPython) && fs.existsSync(path.join(__dirname, '..', '..', 'venv', 'pyvenv.cfg'))) {
     pythonCmd = venvPython;
+  } else if (fs.existsSync(venvDotPython) && fs.existsSync(path.join(__dirname, '..', '..', '.venv', 'pyvenv.cfg'))) {
+    pythonCmd = venvDotPython;
+  } else if (fs.existsSync(venv312Python) && fs.existsSync(path.join(__dirname, '..', '..', 'venv312', 'pyvenv.cfg'))) {
+    pythonCmd = venv312Python;
   }
   const apiPath = path.join(__dirname, '..', '..', 'server', 'api_server.py');
+  const STARK_PORT = process.env.STARK_PORT || '8123';
 
-  killPort(8000).then(() => {
-    const args = [apiPath];
-    if (isDev) {
-      args.push('--reload');
-    }
+  killStaleApiServers().then(() => {
+    killPort(Number(STARK_PORT)).then(() => {
+      // NOTE: never pass --reload here. Electron already self-heals the API
+      // process on exit (restart in 3s below), so uvicorn's reloader adds a
+      // second/third python process (it can resolve to a DIFFERENT interpreter
+      // from PATH, e.g. C:\...\Python314\python.exe instead of venv) that
+      // double-binds port 8000 and kills the app's health checks (ECONNREFUSED
+      // + slow chat load). A single venv process with reload disabled is the
+      // reliable configuration for the desktop app.
+      const args = [apiPath];
 
-    apiProcess = spawn(pythonCmd, args, {
-      cwd: path.join(__dirname, '..', '..'),
-      env: { ...process.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+      apiProcess = spawn(pythonCmd, args, {
+        cwd: path.join(__dirname, '..', '..'),
+        env: { ...process.env, STARK_PORT },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
 
     apiProcess.stdout.on('data', (data) => {
       console.log(`[API] ${data.toString().trim()}`);
@@ -83,6 +103,35 @@ function startApiServer() {
       if (mainWindow && !mainWindow.isDestroyed() && !isQuitting) {
         console.log('[API] restarting in 3s...');
         setTimeout(() => startApiServer(), 3000);
+      }
+    });
+    });
+  });
+}
+
+// Kill EVERY python running api_server.py (not just the port holder) so a
+// second Electron / leftover start_api.bat can't leave a duplicate model
+// resident — the root cause of the 2×RAM/CPU + choppy TTS + red-log storm.
+function killStaleApiServers() {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve();
+    exec('wmic process where "name=\'python.exe\'" get processid,commandline', (err, stdout) => {
+      if (err || !stdout) return resolve();
+      const pids = new Set();
+      for (const line of stdout.split('\n')) {
+        if (line.toLowerCase().includes('api_server.py')) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parts[parts.length - 1];
+          if (pid && /^\d+$/.test(pid) && Number(pid) !== process.pid) pids.add(pid);
+        }
+      }
+      if (!pids.size) return resolve();
+      let pending = pids.size;
+      for (const pid of pids) {
+        exec(`taskkill /F /T /PID ${pid}`, () => {
+          console.log(`[API] killed stale api_server PID ${pid}`);
+          if (--pending === 0) setTimeout(resolve, 500);
+        });
       }
     });
   });
@@ -291,9 +340,10 @@ function showMainWindow() {
 
 function checkApiRunning() {
   return new Promise((resolve) => {
+    const port = Number(process.env.STARK_PORT || '8123');
     const req = http.request({
       hostname: '127.0.0.1',
-      port: 8000,
+      port,
       path: '/api/health',
       method: 'GET',
       timeout: 1000
@@ -313,17 +363,24 @@ function checkApiRunning() {
 
 function killApiProcess() {
   if (apiProcess && !apiProcess.killed) {
+    const pid = apiProcess.pid;
     if (process.platform === 'win32') {
       try {
-        spawn('taskkill', ['/pid', apiProcess.pid, '/f', '/t']);
-        console.log(`[Electron] API server process tree (PID ${apiProcess.pid}) killed.`);
+        // Sync kill so the Python CFFI stream has time to stop before app exits (fixes zombie 3.5GB + FFI popup)
+        const { spawnSync } = require('child_process');
+        spawnSync('taskkill', ['/pid', pid, '/f', '/t'], { stdio: 'ignore' });
+        console.log(`[Electron] API server process tree (PID ${pid}) killed.`);
       } catch (err) {
         console.error('Failed to kill API server process tree:', err.message);
-        apiProcess.kill();
+        try { apiProcess.kill(); } catch(_e){}
       }
     } else {
-      apiProcess.kill();
+      try { apiProcess.kill('SIGTERM'); } catch(_e){}
+      // Give PortAudio 0.4s to drain like audio_engine.stop()
+      const start = Date.now();
+      while (Date.now() - start < 600) { require('child_process').spawnSync('sleep', ['0.1']); }
     }
+    apiProcess = null;
   }
 }
 
@@ -339,13 +396,16 @@ app.whenReady().then(async () => {
 
   createTray();
 
+  // Always ensure a fresh server — a stale one on :8123 may be old code
+  // (e.g. after `start_api.bat` left a detached handle, or a previous app
+  // run's child survived the window close). Kill it and start fresh.
   const isRunning = await checkApiRunning();
   if (isRunning) {
-    console.log('[Electron] API server is already running on port 8000. Skipping auto-start.');
-  } else {
-    console.log('[Electron] Starting API server...');
-    startApiServer();
+    console.log('[Electron] Stale API server on :8123 — killing and restarting fresh...');
+    await killPort(Number(process.env.STARK_PORT || '8123'));
   }
+  console.log('[Electron] Starting API server...');
+  startApiServer();
   setTimeout(createWindow, 1500);
 });
 

@@ -42,7 +42,8 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        // Unique port 8123 — no clash with dev servers (8000/5173/etc)
+        target: process.env.STARK_PORT ? `http://127.0.0.1:${process.env.STARK_PORT}` : 'http://127.0.0.1:8123',
         changeOrigin: true,
       },
     },

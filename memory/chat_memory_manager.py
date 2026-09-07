@@ -175,15 +175,15 @@ def summarize_previous_day(mem: dict) -> None:
     mem["current_day_messages"] = []
 
 def _call_llm(sys_inst: str, prompt: str) -> str:
-    """Calls Gemini or Groq directly to summarize chat history."""
-    from llm import invoke_with_fallback
+    """Calls the native pydantic-ai structured transport to summarize chat history."""
     try:
-        return invoke_with_fallback(
+        from llm.pai_transport import pai_native_turn
+        text, _calls, _reasoning = pai_native_turn(
             role="ChatSummarizer",
-            sys_inst=sys_inst,
-            prompt=prompt,
-            temp=0.3
+            messages=[{"role": "system", "content": sys_inst}, {"role": "user", "content": prompt}],
+            temp=0.3,
         )
+        return text or "Summary unavailable (no API response)."
     except Exception:
         return "Summary unavailable (no API response)."
 

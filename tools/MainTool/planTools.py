@@ -19,17 +19,37 @@ from sync.sync_helpers import (
 )
 
 
-def _resolve_scope() -> str:
-    """Scope of the caller (Developer / Orchestrator / ...)."""
-    from tools._registry import _current_scope
-    return (_current_scope.get() or "agent").lower()
+def _resolve_scope(ctx: object = None) -> str:
+    """Scope of the caller (Developer / Orchestrator / ...).
+
+    Prefers the typed per-run ``ctx`` (pydantic-ai ``RunContext.deps.role``
+    or the loop-passed WorkspaceDeps); falls back to the legacy scope name.
+    """
+    if ctx is not None:
+        try:
+            role = getattr(ctx, "role", None)
+            if role:
+                return str(role).lower()
+        except Exception:
+            pass
+    return "agent"
 
 
-def _resolve_chat() -> str:
-    """Chat key for the plan store: the active child session's own chat first,
-    else the shared-state chat (developer_node / orchestrator paths)."""
-    from tools._registry import _current_chat
-    return _current_chat.get() or ""
+def _resolve_chat(ctx: object = None) -> str:
+    """Chat key for the plan store: the typed per-run ctx chat first, else
+    the shared-state chat (developer_node / orchestrator paths)."""
+    if ctx is not None:
+        try:
+            cid = getattr(ctx, "chat_id", None)
+            if cid:
+                return str(cid)
+        except Exception:
+            pass
+    try:
+        from sync.state_sync import safe_get_state
+        return str((safe_get_state() or {}).get("chat_id") or "")
+    except Exception:
+        return ""
 
 
 def _normalize_plan(plan) -> tuple[list[dict], list[str]]:
@@ -62,7 +82,7 @@ def _normalize_plan(plan) -> tuple[list[dict], list[str]]:
     return items, errors
 
 
-def update_plan(explanation: str = "", plan: list = None) -> str:
+def update_plan(explanation: str = "", plan: list = None, ctx: object = None) -> str:
     """Update the task plan (codex-style full replacement).
 
     Provide an optional explanation and the entire plan array. At most one step
@@ -71,7 +91,7 @@ def update_plan(explanation: str = "", plan: list = None) -> str:
     from tools import shared_state, WORKSPACE
     from sync.state_sync import safe_update_state, safe_append_live_log
 
-    scope = _resolve_scope()
+    scope = _resolve_scope(ctx)
     items, errors = _normalize_plan(plan)
     if not items:
         return "Error: update_plan requires a non-empty plan" + (
@@ -79,7 +99,7 @@ def update_plan(explanation: str = "", plan: list = None) -> str:
         )
 
     project_path = shared_state.get("project_path") or WORKSPACE
-    chat_id = _resolve_chat() or shared_state.get("chat_id") or ""
+    chat_id = _resolve_chat(ctx) or shared_state.get("chat_id") or ""
     save_plan(items, project_path, chat_id, scope)
 
     completed = sum(1 for it in items if it["status"] == "completed")
@@ -97,18 +117,18 @@ def update_plan(explanation: str = "", plan: list = None) -> str:
     return f"Plan updated ({completed}/{len(items)} completed, {in_progress} in progress){note}"
 
 
-def get_plan_for_context(scope: str = "", chat_id: str = "") -> str:
+def get_plan_for_context(scope: str = "", chat_id: str = "", ctx: object = None) -> str:
     """Return the current plan block for a scope for LLM re-injection, or ''.
 
     ``chat_id`` may be given explicitly (child session's own chat); otherwise
-    the active child chat or shared-state chat is used.
+    the typed ctx chat or shared-state chat is used.
     """
     from tools import shared_state, WORKSPACE
     from sync.sync_helpers import build_plan_progress_block, load_task_tracking
 
     project_path = shared_state.get("project_path") or WORKSPACE
     if not chat_id:
-        chat_id = _resolve_chat() or shared_state.get("chat_id") or ""
+        chat_id = _resolve_chat(ctx) or shared_state.get("chat_id") or ""
     task_data = load_task_tracking(project_path, chat_id)
     if not task_data:
         return ""

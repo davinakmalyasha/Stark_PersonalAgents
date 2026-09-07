@@ -16,16 +16,13 @@ def _clean_terminal_output(text: str) -> str:
     # Strip pytest warnings summary block
     text = re.sub(r'=+ warnings summary =+.*?(?==+ \d+ (?:passed|failed|error|passed|failed|skipped|warnings)|\Z)', '', text, flags=re.DOTALL | re.IGNORECASE)
     
-    # Collapse carriage-return overwrites (keep only final segment) and filter out deprecation/runtime warnings
+    # Collapse carriage-return overwrites (keep only final segment)
     lines = text.split('\n')
     cleaned = []
     for line in lines:
         if '\r' in line:
             parts = line.split('\r')
             line = parts[-1]  # keep only last overwrite
-        # Filter out verbose python warnings to save tokens
-        if "warning" in line.lower() and ("deprecation" in line.lower() or "userwarning" in line.lower() or "runtime" in line.lower() or "importwarning" in line.lower()):
-            continue
         cleaned.append(line.rstrip())
         
     text = '\n'.join(cleaned)

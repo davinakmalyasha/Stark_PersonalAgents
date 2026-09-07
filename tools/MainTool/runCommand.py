@@ -6,6 +6,19 @@ multiline `python -c` rewrite. tools.py state helpers (_HARNESS_ROOT,
 _FILE_CACHE, _increment_cache_version, shared_state, WORKSPACE,
 auto_offload_result, _tool_cap, _RUN_OUTPUT_CACHE) are imported lazily
 inside the functions to avoid an import cycle.
+
+Performance model (per-call hot path):
+  * bash path + venv Scripts dir + GH_TOKEN/.env resolution are discovered
+    ONCE per process and cached — a run_command no longer re-scans the
+    filesystem or re-parses .env on every invocation.
+  * A persistent BASH_ENV file (written once) exports the resolved PATH,
+    tokens, and shell hygiene vars into every `bash -lc` call, so the model's
+    commands inherit the same environment with zero per-call setup cost.
+  * Foreground output is appended to the live log in ~200ms chunks instead of
+    per line — one state_version bump + one string copy per chunk instead of
+    per line (the SSE streamer polls state_version, so batching is invisible
+    to the frontend).
+  * Background spawns do a quick 0.2s liveness probe instead of a 1.5s sleep.
 """
 import collections
 import os
@@ -78,28 +91,180 @@ def _rewrite_multiline_python_c(command: str) -> str:
     return command[: m.start(0)] + f'python "{script}"' + command[m.end(0):]
 
 
+# ── One-time discovery caches ────────────────────────────────────────────────
+# These are resolved once per process and reused across every run_command call.
+# Discovery is pure filesystem probing — no mutable state, so a lock guards the
+# (idempotent) first write and reads are unlocked afterwards.
+
+_BASH_PATH_CACHE: Optional[str] = None
+_BASH_PATH_SOURCE: Optional[str] = None  # env override that produced the cache
+_VENV_CACHE: Optional[str] = None
+_VENV_KEY_CACHE: Optional[str] = None
+_DISCOVERY_LOCK = threading.Lock()
+
+# Base environment: os.environ snapshot + GH_TOKEN/.env resolution + PATH prepend.
+# Built once; per-call env = copy of this + workdir-independent tweaks.
+_BASE_ENV_CACHE: Optional[dict] = None
+_ENV_SOURCE_HASH: Optional[int] = None  # os.environ id() to detect wholesale swaps
+
+# Persistent BASH_ENV file: exports the resolved environment into every bash -lc.
+_BASH_ENV_FILE: Optional[str] = None
+
+
 def _find_bash() -> Optional[str]:
     """Locate a POSIX bash for run_command. Prefers git-bash (ships with Git for
     Windows); rejects the WSL shim (System32\\bash.exe) which only works if WSL
-    is installed."""
+    is installed. Result is cached per process (invalidate when BASH_PATH changes)."""
+    global _BASH_PATH_CACHE, _BASH_PATH_SOURCE
     env_bash = os.environ.get("BASH_PATH", "").strip()
-    if env_bash and os.path.isfile(env_bash):
-        return env_bash
-    candidates = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
-        os.path.join(os.environ.get("LocalAppData", ""), "Programs", "Git", "bin", "bash.exe"),
-    ]
-    for c in candidates:
-        if c and os.path.isfile(c):
-            return c
-    import shutil
-    found = shutil.which("bash")
-    if found:
-        low = found.lower()
-        if "system32" not in low and "syswow64" not in low:
-            return found
+    if env_bash != _BASH_PATH_SOURCE:
+        # Env override changed (or first call): invalidate the cache.
+        _BASH_PATH_CACHE = None
+        _BASH_PATH_SOURCE = env_bash
+    if _BASH_PATH_CACHE is not None:
+        return _BASH_PATH_CACHE
+
+    with _DISCOVERY_LOCK:
+        if _BASH_PATH_CACHE is not None:
+            return _BASH_PATH_CACHE
+        found = None
+        if env_bash and os.path.isfile(env_bash):
+            found = env_bash
+        if found is None:
+            candidates = [
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
+                os.path.join(os.environ.get("LocalAppData", ""), "Programs", "Git", "bin", "bash.exe"),
+            ]
+            for c in candidates:
+                if c and os.path.isfile(c):
+                    found = c
+                    break
+        if found is None:
+            import shutil
+            w = shutil.which("bash")
+            if w:
+                low = w.lower()
+                if "system32" not in low and "syswow64" not in low:
+                    found = w
+        _BASH_PATH_CACHE = found
+        return _BASH_PATH_CACHE
+
+
+def _resolve_venv_scripts(root_dir: str) -> Optional[str]:
+    """Find the active venv Scripts/bin dir once (cached). Order: VOICE_PYTHON,
+    then <root>/venv > .venv > venv312, then harness-root equivalents."""
+    global _VENV_CACHE, _VENV_KEY_CACHE
+    if _VENV_CACHE is not None:
+        return _VENV_CACHE
+    voice_py = os.environ.get("VOICE_PYTHON", "").strip()
+    if voice_py and os.path.isfile(voice_py):
+        return os.path.dirname(voice_py)
+    # The harness root is this repo (tools/MainTool/runCommand.py -> 3 dirnames
+    # up = repo root). tools/__init__.py exports a DIFFERENT _HARNESS_ROOT
+    # (the tools dir), so never import it here — compute from __file__.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    roots = [root_dir, repo_root, os.environ.get("HARNESS_ROOT", "")]
+    seen = set()
+    for base in roots:
+        if not base:
+            continue
+        base = os.path.normpath(base)
+        if base.lower() in seen:
+            continue
+        seen.add(base.lower())
+        for venv_name in ["venv", ".venv", "venv312"]:
+            for folder in ["Scripts", "bin"]:
+                candidate = os.path.join(base, venv_name, folder)
+                if os.path.isdir(candidate):
+                    _VENV_CACHE = candidate
+                    _VENV_KEY_CACHE = "PATH"
+                    return _VENV_CACHE
     return None
+
+
+def _base_env() -> dict:
+    """Build the per-process base environment once: os.environ snapshot +
+    GH_TOKEN from .env (lazy) + venv PATH prepend. Per-call copies are cheap."""
+    global _BASE_ENV_CACHE, _ENV_SOURCE_HASH
+    if _BASE_ENV_CACHE is not None and _ENV_SOURCE_HASH == id(os.environ):
+        return _BASE_ENV_CACHE
+    with _DISCOVERY_LOCK:
+        if _BASE_ENV_CACHE is not None and _ENV_SOURCE_HASH == id(os.environ):
+            return _BASE_ENV_CACHE
+        env = dict(os.environ)
+        # gh CLI reads GH_TOKEN (not GITHUB_TOKEN): expose it so run_command("gh ...")
+        # composes without the typed github tools. .env is parsed ONCE here.
+        if not env.get("GH_TOKEN"):
+            gh_alt = env.get("GITHUB_TOKEN")
+            if not gh_alt:
+                try:
+                    from dotenv import load_dotenv
+                    load_dotenv()
+                    gh_alt = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+                except Exception:
+                    pass
+            if gh_alt:
+                env["GH_TOKEN"] = gh_alt
+        venv = _resolve_venv_scripts(os.environ.get("HARNESS_ROOT") or "")
+        if venv:
+            path_key = "PATH"
+            for k in list(env.keys()):
+                if k.upper() == "PATH":
+                    path_key = k
+                    break
+            existing = env.get(path_key, "")
+            env[path_key] = (venv + os.path.pathsep + existing) if existing else venv
+        _BASE_ENV_CACHE = env
+        _ENV_SOURCE_HASH = id(os.environ)
+        return _BASE_ENV_CACHE
+
+
+def _bash_env_file() -> Optional[str]:
+    """Create (once) the persistent BASH_ENV file. Every `bash -lc` inherits
+    these via BASH_ENV, so the model's shell functions/aliases/hygiene vars
+    persist across calls without per-call setup.
+
+    PATH is intentionally NOT exported here: the real PATH already reaches bash
+    through the Popen env (custom_env), and exporting a Windows `;`-separated
+    PATH inside BASH_ENV breaks Git Bash's /etc/profile setup (mtab/hosts
+    links). BASH_ENV carries only vars that are safe to source early.
+    Disable with AGENT_BASH_ENV=0."""
+    global _BASH_ENV_FILE
+    if _BASH_ENV_FILE is not None:
+        return _BASH_ENV_FILE
+    if os.environ.get("AGENT_BASH_ENV", "1").lower() in ("0", "false", "no"):
+        return None
+    env = _base_env()
+    lines = []
+    for k in ("GH_TOKEN", "GITHUB_TOKEN"):
+        v = env.get(k)
+        if v is None:
+            continue
+        v = str(v).replace("\\", "/").replace("'", "'\\''")
+        lines.append(f"export {k}='{v}'")
+    lines.append("export PYTHONUNBUFFERED=1")
+    lines.append("export PIP_DISABLE_PIP_VERSION_CHECK=1")
+    lines.append("export PYTHONDONTWRITEBYTECODE=1")
+    lines.append("export LC_ALL=C.UTF-8 2>/dev/null || true")
+    try:
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix="agent_bash_env_", suffix=".sh")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        try:
+            os.chmod(path, 0o444)  # read-only: agents can't mutate the env file
+        except Exception:
+            pass
+        _BASH_ENV_FILE = path
+    except Exception:
+        _BASH_ENV_FILE = None
+    return _BASH_ENV_FILE
+
+
+def _per_call_env() -> dict:
+    """Cheap per-call environment: one dict copy of the cached base."""
+    return dict(_base_env())
 
 
 class LocalShellBackend:
@@ -127,62 +292,29 @@ class LocalShellBackend:
             else:
                 effective_dir = os.path.normpath(os.path.join(self.root_dir, wd))
             if not os.path.isdir(effective_dir):
-                return f"Error: workdir '{workdir}' does not exist or is not a directory."
+                from pydantic_ai.exceptions import ToolFailed
+                raise ToolFailed(f"Error: workdir '{workdir}' does not exist or is not a directory.")
 
-        # Construct custom environment with prepended virtual environment PATH
-        custom_env = os.environ.copy()
-        # gh CLI reads GH_TOKEN (not GITHUB_TOKEN): expose it so run_command("gh ...")
-        # composes without the typed github tools.
-        if not custom_env.get("GH_TOKEN"):
-            gh_alt = custom_env.get("GITHUB_TOKEN")
-            if not gh_alt:
-                try:
-                    from dotenv import load_dotenv
-                    load_dotenv()
-                    gh_alt = os.environ.get("GITHUB_TOKEN")
-                except Exception:
-                    pass
-            if gh_alt:
-                custom_env["GH_TOKEN"] = gh_alt
-        venv_scripts = None
-        for venv_name in ["venv312", "venv", ".venv"]:
-            for folder in ["Scripts", "bin"]:
-                candidate = os.path.join(self.root_dir, venv_name, folder)
-                if os.path.isdir(candidate):
-                    venv_scripts = candidate
-                    break
-            if venv_scripts:
-                break
-        if not venv_scripts:
-            project_root = _HARNESS_ROOT
-            for venv_name in ["venv312", "venv", ".venv"]:
-                for folder in ["Scripts", "bin"]:
-                    candidate = os.path.join(project_root, venv_name, folder)
-                    if os.path.isdir(candidate):
-                        venv_scripts = candidate
-                        break
-                if venv_scripts:
-                    break
-        if venv_scripts:
-            path_key = "PATH"
-            for k in list(custom_env.keys()):
-                if k.upper() == "PATH":
-                    path_key = k
-            existing_path = custom_env.get(path_key, "")
-            if existing_path:
-                custom_env[path_key] = venv_scripts + os.path.pathsep + existing_path
-            else:
-                custom_env[path_key] = venv_scripts
+        # Per-call environment: one dict copy of the cached base (PATH venv-prepend,
+        # GH_TOKEN, PYTHONUNBUFFERED...). Discovery happened once at module load.
+        custom_env = _per_call_env()
 
-        # cmd.exe mangles multiline `python -c "..."` on Windows -> rewrite to a temp script
-        # (bash mode handles multiline -c natively, so only rewrite for cmd)
-        use_bash = shell == "bash"
-        bash = _find_bash() if use_bash else None
-        if use_bash and bash is None:
-            use_bash = False
-            shell = "cmd"
-        if not use_bash:
-            command = _rewrite_multiline_python_c(command)
+        # Bash-only: harness uses Git Bash 5.3.15 (ships with Git 2.55.0). No cmd/powershell fallback.
+        if shell != "bash":
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed(f"Error: only shell='bash' is supported (got '{shell}'). All run_command calls must use bash - Git Bash 5.3.15 via _find_bash() :88-95.")
+        bash = _find_bash()
+        if not bash:
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed("Error: bash not found — Git for Windows 2.55+ (bash 5.3.15) required at C:\\Program Files\\Git\\bin\\bash.exe; install from https://git-scm.com/download/win")
+        use_bash = True
+
+        # Persistent env file: BASH_ENV exports PATH/tokens/hygiene vars into every
+        # bash -lc. Commands therefore inherit the same environment and can define
+        # shell functions/aliases that persist across calls (Claude Code/Cursor-style).
+        bash_env = _bash_env_file()
+        if bash_env:
+            custom_env["BASH_ENV"] = bash_env
 
         # Wrap command in Docker container if configured
         use_docker = os.environ.get("DEEP_AGENTS_USE_DOCKER", "false").lower() == "true"
@@ -195,11 +327,7 @@ class LocalShellBackend:
             escaped_command = escaped_command.replace('"', '\\"')
             command = f'docker run --rm -v "{abs_root}:/workspace" -w /workspace {image} sh -c "{escaped_command}"'
 
-        popen_kwargs = {}
-        if use_bash:
-            popen_kwargs = {"args": [bash, "-lc", command], "shell": False}
-        else:
-            popen_kwargs = {"args": command, "shell": True}
+        popen_kwargs = {"args": [bash, "-lc", command], "shell": False}
 
         if background:
             try:
@@ -236,7 +364,10 @@ class LocalShellBackend:
                 with _BACKGROUND_PROCS_LOCK:
                     BACKGROUND_PROCESSES[name] = info
                 
-                time.sleep(1.5)
+                # Quick liveness probe: 0.2s instead of a 1.5s fixed sleep. A slow
+                # compile/install may legitimately produce nothing in that window,
+                # so only an ACTUAL exit (not silence) is treated as a start failure.
+                time.sleep(0.2)
                 if proc.poll() is not None:
                     exit_code = proc.poll()
                     initial_logs = _clean_terminal_output("".join(info["logs"]))
@@ -267,7 +398,13 @@ class LocalShellBackend:
                     errors="replace",
                 )
                 
+                # Chunked live-log flush: 80ms instead of 200ms — reduces SSE lag
+                # 250→~80ms when combined with bus event wake (runs.py). Still
+                # batches per chunk (one state_version bump per flush).
                 q = queue.Queue()
+                out_lines = []
+                pending = []
+                _FLUSH_INTERVAL = 0.08
                 
                 def read_output(stream, q):
                     for line in stream:
@@ -278,19 +415,26 @@ class LocalShellBackend:
                 t.daemon = True
                 t.start()
                 
-                out_lines = []
                 start_time = time.time()
                 max_duration = timeout / 1000.0
                 
+                def _flush_pending() -> None:
+                    if pending:
+                        safe_append_live_log("".join(pending), newline=False)
+                        pending.clear()
+                
                 while True:
+                    drained = 0
                     while not q.empty():
                         try:
                             line = q.get_nowait()
                             out_lines.append(line)
-                            # `line` already carries its trailing newline
-                            safe_append_live_log(line, newline=False)
+                            pending.append(line)
+                            drained += 1
                         except queue.Empty:
                             break
+                    if drained:
+                        _flush_pending()
                     
                     if proc.poll() is not None:
                         t.join(timeout=1.0)
@@ -298,10 +442,10 @@ class LocalShellBackend:
                             try:
                                 line = q.get_nowait()
                                 out_lines.append(line)
-                                # `line` already carries its trailing newline
-                                safe_append_live_log(line, newline=False)
+                                pending.append(line)
                             except queue.Empty:
                                 break
+                        _flush_pending()
                         break
                     
                     if time.time() - start_time > max_duration:
@@ -311,8 +455,10 @@ class LocalShellBackend:
                             try:
                                 line = q.get_nowait()
                                 out_lines.append(line)
+                                pending.append(line)
                             except queue.Empty:
                                 break
+                        _flush_pending()
                         output = "".join(out_lines)
                         cleaned = _clean_terminal_output(output)
                         capped = auto_offload_result(cleaned, command, max_chars=_tool_cap("run_command_timeout"))
@@ -321,7 +467,7 @@ class LocalShellBackend:
                         _log_tool("run_command_timeout", {"command": command}, result_str[:500])
                         return result_str
                     
-                    time.sleep(0.1)
+                    time.sleep(_FLUSH_INTERVAL)
                     
                 exit_code = proc.wait()
                 output = "".join(out_lines)
@@ -371,15 +517,16 @@ class LocalShellBackend:
                 return f"Error running command: {e}"
 
 
-def run_command(command: str = "", timeout: int = 30000, background: bool = False,
+def run_command(ctx: object = None, command: str = "", timeout: int = 30000, background: bool = False,
                 process_action: str = "", shell: str = "bash", workdir: str = "", expect: str = "", stream: bool = False) -> str:
     """Execute a shell command, manage background processes, or view logs.
 
-    shell: 'bash' (default — full POSIX via git-bash: pipes, &&, $(...), jq,
-    gh pipelines) or 'cmd' (Windows command/batch compatibility).
+    shell: 'bash' only — Git Bash 5.3.15 (ships with Git 2.55.0). Pipelines use POSIX semantics (pipes, &&, $(...), jq, gh).
+    Passing shell='cmd' now errors; migrate to bash -lc syntax.
     workdir: working directory to run in.
     expect: regex to check in output — adds [EXPECT matched/failed].
     stream: if true, hints to stream output (currently returns full output).
+    ``ctx`` is the optional typed WorkspaceDeps; legacy callers omit it.
     """
     global BACKGROUND_PROCESSES
     import threading
@@ -390,11 +537,25 @@ def run_command(command: str = "", timeout: int = 30000, background: bool = Fals
     if timeout is not None and timeout < 1000:
         timeout = timeout * 1000
 
-    # Clear local file cache since executing a command can modify files on disk
-    _FILE_CACHE.clear()
-    _increment_cache_version()
+    # Invalidate file/tool caches only for destructive shells — read-only
+    # shells (ls/cat/find/grep/git status) do not mutate the tree and must
+    # not invalidate parallel sibling reads (P1 parallel barrier fix).
+    _should_clear = True
+    try:
+        from tools.plan_mode_guard import _is_destructive_shell as _is_dest
+        _should_clear = _is_dest(str(command or ""))
+    except Exception:
+        _should_clear = True
+    if _should_clear:
+        _FILE_CACHE.clear()
+        _increment_cache_version()
 
     active_ws = shared_state.get("project_path") or WORKSPACE
+    if ctx is not None:
+        try:
+            active_ws = getattr(ctx, "project_path", None) or active_ws
+        except Exception:
+            pass
     active_ws = os.path.normpath(os.path.abspath(active_ws))
 
     # Safety validation (C12: BLOCKED_PATTERNS + env-extensible deny list)
@@ -403,7 +564,8 @@ def run_command(command: str = "", timeout: int = 30000, background: bool = Fals
         deny_patterns = BLOCKED_PATTERNS | _load_extra_deny_patterns()
         if any(p in cmd_lower for p in deny_patterns):
             matched = [p for p in deny_patterns if p in cmd_lower]
-            return f"Error: Command execution blocked for safety. Dangerous pattern detected: {matched[0]}"
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed(f"Error: Command execution blocked for safety. Dangerous pattern detected: {matched[0]}")
 
     # Handle process actions
     if process_action:
@@ -460,7 +622,8 @@ def run_command(command: str = "", timeout: int = 30000, background: bool = Fals
             return f"Error: Invalid process_action '{process_action}'."
             
     if not command:
-        return "Error: command parameter is required."
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed("Error: command parameter is required.")
 
     # Generate a unique key for background process
     name = None

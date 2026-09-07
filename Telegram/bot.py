@@ -25,6 +25,44 @@ if not token:
     raise ValueError("TELEGRAM_BOT_TOKEN not set in .env")
 bot = telebot.TeleBot(token)
 
+# ── P5: expose the running bot for DFD approval requests ──
+try:
+    from telegram_bot_singleton import bot as _shared_bot
+    import telegram_bot_singleton as _singleton
+
+    _singleton.bot = bot
+except Exception as e:
+    print(f"[BOT] Telegram singleton unavailable: {e}")
+
+# ── P5: DFD approval inline-keyboard callbacks ──
+try:
+    from dfd_approvals import resolve_approval
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(("dfd_approve:", "dfd_reject:")))
+    def _dfd_approval_callback(call: telebot.types.CallbackQuery) -> None:
+        try:
+            action, rid = call.data.split(":", 1)
+            approved = action == "dfd_approve"
+            ok = resolve_approval(rid, approved)
+            note = "approved ✅" if approved else "rejected ❌"
+            try:
+                bot.answer_callback_query(call.id, text=f"Request {note}." if ok else "Already resolved.")
+            except Exception:
+                pass
+            try:
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=call.message.text + f"\n\n_{'✅ Approved' if approved else '❌ Rejected'} by owner._",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[BOT] DFD approval callback error: {e}")
+except Exception as e:
+    print(f"[BOT] DFD approval callback unavailable: {e}")
+
 # ── P5: ask_user answers arrive through Telegram inline keyboards ──
 try:
     from user_questions import register_provider, telegram_provider

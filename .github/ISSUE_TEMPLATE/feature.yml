@@ -31,6 +31,6 @@ body:
     id: notes
     attributes:
       label: Implementation notes
-      description: Templates to use (feature-crud, project-fastapi...), files likely touched, constraints.
+      description: Templates to use (feature-crud, stack-admin...), files likely touched, constraints.
     validations:
       required: false

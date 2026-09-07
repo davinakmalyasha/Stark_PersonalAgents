@@ -1,0 +1,40 @@
+"""Error tracking for {{ package }} — Sentry when SENTRY_DSN is set, log-only otherwise.
+
+Call init_sentry() once at startup (main.py lifespan). Without SENTRY_DSN it is
+completely dormant: no network, no dependency failures, only a log line. With
+SENTRY_DSN set it captures exceptions + breadcrumbs. capture_exception(e, **ctx)
+is the manual hook for handlers that would otherwise swallow the error.
+"""
+import logging
+import os
+
+try:
+    import sentry_sdk
+
+    HAS_SENTRY = True
+except Exception:
+    HAS_SENTRY = False
+
+logger = logging.getLogger("{{ package }}.sentry")
+
+
+def init_sentry() -> None:
+    dsn = os.environ.get("SENTRY_DSN", "").strip()
+    if not dsn or not HAS_SENTRY:
+        logger.info("Sentry disabled (no SENTRY_DSN or sdk missing) — log-only error mode")
+        return
+    sentry_sdk.init(
+        dsn=dsn,
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
+    logger.info("Sentry initialized")
+
+
+def capture_exception(exc: Exception, **context) -> None:
+    if HAS_SENTRY and os.environ.get("SENTRY_DSN"):
+        with sentry_sdk.push_scope() as scope:
+            for key, value in context.items():
+                scope.set_extra(key, value)
+            sentry_sdk.capture_exception(exc)
+    logger.error("Exception captured: %s", exc, exc_info=exc)

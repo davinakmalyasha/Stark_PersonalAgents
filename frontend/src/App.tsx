@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { X, FolderGit2 } from 'lucide-react';
+import { X, FolderGit2, Palette } from 'lucide-react';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
@@ -7,7 +7,8 @@ import TokenStatsModal from './components/Layout/TokenStatsModal';
 import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 import { usePipeline } from './hooks/usePipeline';
-import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus, steerRun } from './services/api';
+import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun } from './services/api';
+const API_BASE = '/api';
 import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment, AgentTask } from './types';
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
 
@@ -42,6 +43,7 @@ export default function App() {
   const [temperature] = useState(0.7);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
+  const [chatModeState, setChatModeState] = useState<'plan' | 'build'>('build');
   const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
@@ -222,7 +224,7 @@ export default function App() {
     if (isRunning || !activeChat) return;
     let cancelled = false;
     const tick = async () => {
-      if (cancelled) return;
+      if (cancelled || document.hidden) return;
       try {
         const run = await fetchActiveRun();
         if (cancelled || !run.running) return;
@@ -256,6 +258,58 @@ export default function App() {
     console.log('[App.handleSend] called with prompt=%o activeWorkspace=%o activeChat=%o', prompt, activeWorkspace, activeChat);
     setNotification(null);
 
+    // Stage 4: slash-command pre-dispatch. /plan, /build, /undo, /rewind
+    // are intercepted before the prompt reaches the LLM.
+    const trimmed = (prompt || '').trim();
+    if (trimmed.startsWith('/')) {
+      const ws = activeWorkspace;
+      const chat = activeChat;
+      const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
+      const arg = rest.join(' ');
+      try {
+        if (cmd === 'plan') {
+          if (!ws || !chat) { setNotification('No active chat to put in plan mode.'); return; }
+          await setChatMode(chat.id, 'plan');
+          setChatModeState('plan');
+          setNotification('Plan mode on. The agent can research and propose, but cannot edit. Type /build to leave plan mode.');
+          return;
+        }
+        if (cmd === 'build') {
+          if (!ws || !chat) { setNotification('No active chat to switch to build mode.'); return; }
+          await setChatMode(chat.id, 'build');
+          setChatModeState('build');
+          setNotification('Build mode on. The agent can write, edit, and run commands again.');
+          return;
+        }
+        if (cmd === 'undo') {
+          if (!chat) { setNotification('No active chat to undo.'); return; }
+          const r = await fetch(`${API_BASE}/runs/active`);
+          const active = await r.json().catch(() => null);
+          if (!active || !active.run_id) { setNotification('No active run to undo.'); return; }
+          await undoRun(active.run_id);
+          setNotification('Undo complete.');
+          return;
+        }
+        if (cmd === 'rewind') {
+          if (!ws || !chat) { setNotification('No active chat to rewind.'); return; }
+          const idx = parseInt(arg || '1', 10);
+          if (Number.isNaN(idx) || idx < 1) { setNotification('Usage: /rewind <index>  (1 = most recent snapshot run)'); return; }
+          const groups = await getChatSnapshots(chat.id, ws.id);
+          if (!groups.length) { setNotification('No snapshots available for this chat yet.'); return; }
+          const target = groups[idx - 1];
+          if (!target) { setNotification(`No snapshot at index ${idx} (have ${groups.length}).`); return; }
+          const ok = window.confirm(`Rewind to ${new Date(target.created_at * 1000).toLocaleString()}? This will restore ${target.files.length} file(s).`);
+          if (!ok) return;
+          const result = await restoreRun(chat.id, target.run_id, ws.id);
+          setNotification(result.ok ? 'Rewind complete.' : `Rewind partial: ${result.messages.filter(m => !m.startsWith('restored')).join('; ') || 'see console'}`);
+          return;
+        }
+      } catch (e) {
+        setNotification(`Slash command failed: ${e}`);
+        return;
+      }
+    }
+
     // Resolve workspace — auto-select General or first available
     let ws = activeWorkspace;
 
@@ -275,7 +329,7 @@ export default function App() {
         console.log('[App.handleSend] auto-selected workspace:', ws);
       } catch (err) {
         console.error('[App.handleSend] fetchWorkspaces failed:', err);
-        setNotification('Unable to reach backend. Is the API server running on port 8000?');
+        setNotification('Unable to reach backend. Is the API server running on port 8123?');
         return;
       }
     }
@@ -373,7 +427,10 @@ export default function App() {
 
     console.log('[App.handleSend] calling run...');
     runStartTime.current = Date.now();
-    run(prompt, model, temperature, ws.path, chat.id, attachments);
+    // Pass workspace_kind so the router picks the right agent: project/coding →
+    // orchestrator (or project_dev), general → orchestrator, house → house.
+    const kind = ((ws as any).workspaceKind || '') as string;
+    run(prompt, model, temperature, ws.path, chat.id, attachments, kind);
   }, [run, model, temperature, activeWorkspace, activeChat, isRunning]);
 
   const handleRunTask = useCallback((task: AgentTask) => {
@@ -388,12 +445,15 @@ export default function App() {
     };
     setMessages((prev) => [...prev, userMsg]);
     runStartTime.current = Date.now();
-    run(task.prompt, model, temperature, activeWorkspace.path, activeChat.id, task.attachments);
+    run(task.prompt, model, temperature, activeWorkspace.path, activeChat.id, task.attachments, (activeWorkspace as any).workspaceKind || '');
     return true;
   }, [activeWorkspace, activeChat, isRunning, run, model, temperature]);
   // ── Voice mode: driven by the floating overlay window (voice.html) ──
   const [isVoiceMode, setIsVoiceMode] = useState(false);
-  const [voiceInputText] = useState('');
+  // Phase 8-V2: live STT from the overlay shows in the main window's dock,
+  // and token deltas stream into the voice-live agent bubble.
+  const [voiceInputText, setVoiceInputText] = useState('');
+  const voiceStreamRef = useRef({ text: '', reasoning: '' });
 
   const toggleVoice = useCallback(() => {
     (window as any).antigravity?.voiceToggle?.();
@@ -424,9 +484,11 @@ export default function App() {
         wsId: activeWorkspace.id,
         wsPath: activeWorkspace.path ?? '',
         chatId: activeChat.id,
+        model,
+        temperature,
       });
     }
-  }, [activeWorkspace, activeChat]);
+  }, [activeWorkspace, activeChat, model, temperature]);
 
   useEffect(() => { syncVoiceChat(); }, [syncVoiceChat]);
 
@@ -435,12 +497,16 @@ export default function App() {
     const ag = window.antigravity;
     if (!ag) return;
     const offSession = ag.onVoiceSessionEvent?.((ev) => {
-      if (ev?.type && ev.type !== 'idle' && ev.type !== 'closed') {
+      // Phase 8-V2: `mic` events carry the real mic state (not "voice on").
+      if (ev?.type === 'mic') {
+        setIsVoiceMode(!!ev.mic);
+      } else if (ev?.type && ev.type !== 'idle' && ev.type !== 'closed') {
         setIsVoiceMode(true);
       } else {
         setIsVoiceMode(false);
       }
       if (ev?.type === 'pipeline-start') {
+        voiceStreamRef.current = { text: '', reasoning: '' };
         setVoiceLiveRun({
           state: null,
           active: true,
@@ -462,11 +528,30 @@ export default function App() {
           state: (ev.state as AppState | null) || current.state,
           active: false,
         } : null);
+      } else if (ev?.type === 'delta' && ev.text) {
+        // Phase 8-V2: live tokens from the voice run stream into the overlay.
+        const kind = ev.kind === 'reasoning' ? 'reasoning' : 'text';
+        voiceStreamRef.current[kind] += String(ev.text);
+        setVoiceLiveRun((current) => current ? { ...current, active: true } : current);
       }
       if (ev?.type === 'opened') syncVoiceChat();
       if (ev?.type === 'reply') {
+        voiceStreamRef.current = { text: '', reasoning: '' };
         refreshActiveChat();
         setVoiceLiveRun(null);
+      }
+      // Live input streaming: the overlay streams STT words as they are heard —
+      // append them to the chat in real time (one live user bubble).
+      if (ev?.type === 'transcript' && ev.text) {
+        const t = String(ev.text);
+        setVoiceInputText(t);
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.role === 'user' && last.id === 'voice-live-input') {
+            return [...prev.slice(0, -1), { ...last, content: t }];
+          }
+          return [...prev, { id: 'voice-live-input', role: 'user', content: t, timestamp: new Date().toISOString() }];
+        });
       }
     });
     const offClosed = ag.onVoiceWindowClosed?.(() => {
@@ -479,11 +564,15 @@ export default function App() {
     };
   }, [refreshActiveChat, syncVoiceChat]);
 
-  // Lightweight polling fallback (covers runs finished while window was hidden)
+  // Lightweight polling fallback (covers runs finished while window was hidden).
+  // Phase 8: only polls while a run is in progress (SSE pushes live frames;
+  // this is purely a hidden-window catch-up) and skips when the tab is hidden.
   useEffect(() => {
-    const id = setInterval(refreshActiveChat, 4000);
+    const id = setInterval(() => {
+      if (isRunning && !document.hidden) refreshActiveChat();
+    }, 4000);
     return () => clearInterval(id);
-  }, [refreshActiveChat]);
+  }, [isRunning, refreshActiveChat]);
 
   // ── Keyboard shortcuts: Esc cancels a running pipeline, "?" opens help ──
   useEffect(() => {
@@ -640,17 +729,23 @@ export default function App() {
     const elapsed = voiceLiveRun.active
       ? 'active'
       : Math.round((Date.now() - voiceLiveRun.startedAt) / 1000) + 's';
+    // Phase 8-V2: token deltas from the overlay fill the bubble live (the log
+    // only has a final [ASSISTANT] line — streaming text shows earlier).
+    const vText = voiceStreamRef.current.text || assistantResponse || voiceLiveRun.state.outputs?.agent_report || '';
     displayMessages.push({
       id: 'voice-live-agent-run',
       role: 'agent',
       agentName: 'Assistant',
-      content: assistantResponse || voiceLiveRun.state.outputs?.agent_report || '',
+      content: vText,
       timestamp: new Date().toISOString(),
       duration: elapsed,
       metadata: {
         isTrace: true,
         steps: filterOrchestratorSteps(steps),
         duration: elapsed === 'active' ? undefined : elapsed,
+        isStreaming: voiceLiveRun.active && !!voiceStreamRef.current.text,
+        streamingReasoning: voiceStreamRef.current.reasoning,
+        streamRate: 0,
       },
     });
   }
@@ -705,6 +800,7 @@ export default function App() {
           state={renderState || null}
           hasActiveChat={!!activeWorkspace && !!activeChat}
           notification={notification}
+          chatMode={chatModeState}
           onSend={handleSend}
           onRunTask={handleRunTask}
           onCancel={cancel}
@@ -757,6 +853,20 @@ export default function App() {
       )}
       <QuestionModal visible={isRunning || isPersisting} />
 
+      {/* OpenDesign module launcher — opens the design room bound to this workspace/chat */}
+      <button
+        type="button"
+        onClick={() => {
+          const ws = activeWorkspace?.id ? `?ws=${encodeURIComponent(activeWorkspace.id)}&chat=${encodeURIComponent(activeChat?.id || '')}` : '';
+          window.location.hash = `#/design${ws}`;
+        }}
+        className="fixed left-2 top-1/2 -translate-y-1/2 z-[85] flex flex-col items-center gap-1 px-1.5 py-3 rounded-xl bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shadow-xl"
+        title="OpenDesign — agent-led UI design iteration for this workspace (straight to the UI subagent loop)"
+        style={{ writingMode: 'vertical-rl' }}
+      >
+        <Palette size={15} />
+        <span className="text-[9.5px] font-bold tracking-widest uppercase">Design</span>
+      </button>
       {/* P10/Tier-3: file explorer toggle + panel */}
       <button
         type="button"

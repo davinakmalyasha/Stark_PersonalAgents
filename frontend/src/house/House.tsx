@@ -27,7 +27,9 @@ export default function House() {
   const [exitingIdeTab, setExitingIdeTab] = useState<import('../types').SessionTab | null>(null);
 
   const sessions = useSessions();
-  const chat = useHouseChat({});
+  // Main workspace → General chats only (orchestrator agent). House workspace
+  // is a separate route (#/house) that binds _house; never leak house here.
+  const chat = useHouseChat({ workspaceKind: 'general' });
   const { refreshSessions, newSession, newChatIn, openChat, closeTab } = sessions;
   const {
     activeChatId: generalActiveChatId,
@@ -210,6 +212,15 @@ export default function House() {
     }, 320);
   }, [transitioning]);
 
+  const launchDesign = useCallback(() => {
+    if (transitioning) return;
+    setSidebarOpen(false);
+    setTransitioning(true);
+    setTimeout(() => {
+      window.location.hash = '#/design';
+    }, 320);
+  }, [transitioning]);
+
   const launchPersonal = useCallback(() => {
     if (transitioning) return;
     setSidebarOpen(false);
@@ -225,6 +236,15 @@ export default function House() {
     setTransitioning(true);
     setTimeout(() => {
       window.location.hash = '#/house';
+    }, 320);
+  }, [transitioning]);
+
+  const launchAdmin = useCallback(() => {
+    if (transitioning) return;
+    setSidebarOpen(false);
+    setTransitioning(true);
+    setTimeout(() => {
+      window.location.hash = '#/admin';
     }, 320);
   }, [transitioning]);
 
@@ -370,6 +390,8 @@ export default function House() {
         onLaunchPersonal={launchPersonal}
         onLaunchCoding={launchCoding}
         onLaunchHouse={launchHouse}
+        onLaunchAdmin={launchAdmin}
+        onLaunchDesign={launchDesign}
       />
 
       {projectDialogOpen && (

@@ -17,7 +17,7 @@ Dual LLM backend via ``GENERAL_MODEL_BACKEND``:
 - ``deepseek`` (default): invoke_messages_with_fallback_stream on
   ``deepseek:v4-flash`` with native function calling.
 - ``free``: routes every turn through the multi-provider FreeAgent client
-  (OpenRouter/Groq/Gemini/Mistral/NVIDIA/Cloudflare/...) — zero cost, same
+  (OpenRouter/Groq/Gemini/Mistral/NVIDIA/Cloudflare/...) â€” zero cost, same
   OpenAI-native tool protocol.
 """
 
@@ -28,30 +28,42 @@ import os
 import re
 import uuid
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
 from sync.state_sync import safe_update_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
     execute_tool_detailed,
+    run_tool_calls,
     get_native_tools,
     get_native_tool_names,
-    get_registry,
 )
-from llm import invoke_messages_with_fallback_stream
 from llm.loop_detector import LoopGuard
-from memory.context_compaction import (
-    compact_history,
-    get_compaction_policy,
-)
+from llm.model_history import build_initial_history, estimate_history_tokens
+from llm.native_tools import run_native_agent
+from memory.context_compaction import get_compaction_policy
 from agents.general_prompt import _GENERAL_SYSTEM_TEMPLATE
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
-_GENERAL_MODEL = "deepseek:v4-flash"
 _AGENT_NAME = "General"
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
 )
+
+
+def _native_deps(chat_id: str):
+    """Build the typed WorkspaceDeps for this run (lazy import, cheap)."""
+    from llm.deps import WorkspaceDeps
+
+    return WorkspaceDeps.from_shared_state(role=_AGENT_NAME, chat_id=chat_id)
 
 
 def _log(msg: str) -> None:
@@ -68,7 +80,7 @@ def _profile_path() -> str:
     return os.path.join(root, ".deep_agents", "general_profile.json")
 
 
-# ── Context builders ─────────────────────────────────────────────────────────
+# ── Context builders ───────────────────────────────────────────────────────
 
 
 def _load_general_profile() -> str:
@@ -138,78 +150,38 @@ def _clean_text(text: str) -> str:
     return cleaned.strip()
 
 
-# ── LLM backends ─────────────────────────────────────────────────────────────
-
-
-def _lc_to_native(messages: list) -> list[dict]:
-    """LangChain transcript -> OpenAI-native dicts (free-provider transport).
-    Image content-block lists pass through untouched."""
+def _native_slice_tools(new_msgs: list) -> list[dict]:
+    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
     out: list[dict] = []
-    for m in messages:
-        kind = type(m).__name__
-        content = getattr(m, "content", "")
-        if kind == "SystemMessage":
-            out.append({"role": "system", "content": content})
-        elif kind == "HumanMessage":
-            out.append({"role": "user", "content": content})
-        elif kind == "AIMessage":
-            entry: dict = {"role": "assistant", "content": content or ""}
-            tcs = getattr(m, "tool_calls", None) or []
-            if tcs:
-                entry["tool_calls"] = [
-                    {
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name") or tc.get("tool", ""),
-                            "arguments": json.dumps(
-                                tc.get("args") or {}, separators=(",", ":")
-                            ),
-                        },
-                    }
-                    for tc in tcs
-                    if isinstance(tc, dict)
-                ]
-            out.append(entry)
-        elif kind == "ToolMessage":
-            out.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
-                    "name": getattr(m, "name", "") or "",
-                    "content": str(content),
-                }
-            )
+    for m in new_msgs or []:
+        # Native ModelMessage path: ModelResponse with ToolCallPart
+        if isinstance(m, ModelResponse):
+            for p in getattr(m, "parts", []) or []:
+                if isinstance(p, ToolCallPart):
+                    args = p.args if isinstance(p.args, dict) else {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    out.append({
+                        "tool": p.tool_name,
+                        "args": args if isinstance(args, dict) else {},
+                        "id": p.tool_call_id or "",
+                    })
     return out
 
 
-def _normalize_calls(raw_calls) -> list[dict]:
-    calls: list[dict] = []
-    for index, tc in enumerate(raw_calls or []):
-        if not isinstance(tc, dict):
-            continue
-        name = tc.get("tool") or tc.get("name", "")
-        args = tc.get("args") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except Exception:
-                continue
-        if name and isinstance(args, dict):
-            calls.append(
-                {
-                    "tool": name,
-                    "args": args,
-                    "id": tc.get("id") or f"gen-{index + 1}",
-                }
-            )
-    return calls
+# ── LLM backends ───────────────────────────────────────────────────────────
 
 
-def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> tuple[str, list[dict]]:
+def _call_backend(history: list, native_tools: list[dict], where_tag: str, system_prompt: str = "", deps: object = None, cancellation_token: object = None) -> tuple[str, list[dict], list]:
     """One LLM turn on the configured backend.
 
-    Returns ``(text, tool_calls)``. Raises on total provider failure.
+    Returns ``(text, tool_calls, native_msgs)``. ``native_msgs`` is non-empty
+    when the native pydantic-ai agent ran the full turn (it executes tools
+    internally); the caller appends them to the transcript instead of
+    executing ``tool_calls`` itself. Raises on total provider failure.
 
     Backend resolution: GENERAL_MODEL_BACKEND env wins; otherwise the active
     provider mode's workspace-tier plan decides (see llm/provider_modes.py).
@@ -231,53 +203,41 @@ def _call_backend(messages: list, native_tools: list[dict], where_tag: str) -> t
 
         reply, calls, _reasoning = free_native_turn(
             _AGENT_NAME,
-            messages,
+            list(history),
             tools=native_tools,
             capability="text",
             prefer_reasoning=bool(plan.get("think_bias", True)),
         )
-        return reply, calls
+        return reply, calls, []
 
-    # Paid path (direct DeepSeek / OpenCode Go / Command Code gateway).
-    effort_override = os.environ.get("REASONING_SUBAGENT_ROUTINE", "")
-    if not effort_override:
-        effort_override = str(plan.get("iter_effort") or "disabled")
+    # Paid path — static per-role thinking: General=low.
+    effort_override = "low"
 
-    res = invoke_messages_with_fallback_stream(
+    # Native agent (Track B): pydantic-ai executes tools internally (default).
+    # A4: the legacy single-turn registry path (PAI_NATIVE_TOOLS=0) is removed;
+    # the native full-turn agent is the only paid execution path.
+    text, new_lc, reasoning = run_native_agent(
         role=_AGENT_NAME,
-        messages=list(messages),
-        temp=0.2,
+        messages=list(history),
         tools=native_tools,
-        model=_GENERAL_MODEL,
+        temp=0.2,
         reasoning_effort=effort_override,
         where=where_tag,
+        deps=deps,
+        system_prompt=system_prompt,
+        cancellation_token=cancellation_token,
     )
-    native_tool_calls: list = []
-    if isinstance(res, tuple):
-        if len(res) >= 3:
-            response_text, native_tool_calls = res[0], res[1]
-        elif len(res) == 2:
-            response_text, native_tool_calls = res
-        else:
-            response_text = res[0] if res else ""
-    elif hasattr(res, "content"):
-        from llm import _extract_text
-
-        response_text = _extract_text(res.content)
-    else:
-        response_text = str(res)
-
-    return str(response_text or ""), _normalize_calls(native_tool_calls)
+    return str(text or ""), [], new_lc
 
 
-# ── Session log (P1, best-effort) ────────────────────────────────────────────
+# ── Session log (P1, best-effort) ───────────────────────────────────────────
 
 
 def _open_session(chat_id: str, task: str):
     try:
         from uuid import uuid4
 
-        from session_log import find_recent_session, get_session
+        from server.session.log import find_recent_session, get_session
         from sync.state_sync import shared_state
 
         ws = shared_state.get("project_path") or _HARNESS_ROOT
@@ -293,7 +253,23 @@ def _open_session(chat_id: str, task: str):
         return None
 
 
-# ── Core loop ────────────────────────────────────────────────────────────────
+# ── Core loop ───────────────────────────────────────────────────────────────
+
+
+def _general_execute_one(tool_call: dict, deps: object = None) -> str:
+    """Thread-pool worker for General's parallel read-only batch. Only
+    PARALLEL_SAFE tools reach this path (enforced by run_tool_calls). Uses the
+    module-level execute_tool_detailed so patching/mocking works identically to
+    the sequential path."""
+    tname = str(tool_call.get("tool", "") or "")
+    targs = tool_call.get("args") or {}
+    if not isinstance(targs, dict):
+        targs = {}
+    try:
+        execution = execute_tool_detailed(tname, targs, deps=deps)
+        return str(execution.content)
+    except Exception as e:
+        return f"ERROR: {str(e)[:300]}"
 
 
 def _general_events(task: str, chat_id: str = "", images: list | None = None):
@@ -307,38 +283,46 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
     valid_tools = get_native_tool_names("general")
     native_tools = get_native_tools("general")
     valid_tool_set = set(valid_tools)
-    try:
-        get_registry().restrict_scope(_AGENT_NAME, allow=list(valid_tools))
-    except Exception:
-        pass
+    # Stage 4: typed per-run deps (project/chat/role) for tool ctx injection.
+    run_deps = _native_deps(chat_id)
 
-    messages = [
-        SystemMessage(content=_GENERAL_SYSTEM_TEMPLATE),
-        HumanMessage(content=_build_zone2(task, chat_id)),
-    ]
+    history: list[ModelMessage] = build_initial_history(_GENERAL_SYSTEM_TEMPLATE, _build_zone2(task, chat_id))
 
     # User-attached images: explicit paths first, then the API stash channel.
+    # Golden standard: images land in run_deps.pending_images (typed channel).
     if images:
         try:
             from tools.vision_channel import queue_image_file
 
             for p in images:
-                queue_image_file(p, note="user attachment")
+                queue_image_file(p, note="user attachment", ctx=run_deps)
         except Exception:
             pass
     try:
-        from tools.vision_channel import drain_attachment_images
+        from tools.vision_channel import drain_attachment_images_native
 
-        if drain_attachment_images(messages):
+        if drain_attachment_images_native(history, ctx=run_deps):
             _log(f"[VISION] {_AGENT_NAME}: user attachment image(s) injected")
     except Exception:
         pass
 
     sess = _open_session(chat_id, task)
 
+    # A8: wire the chat abort flag to a pydantic-ai CancellationToken so a
+    # user abort cancels the in-flight native run cooperatively (RunCancelled).
+    _cancel_token = None
+    _cancel_stop = None
+    try:
+        if chat_id:
+            from llm.native_tools import chat_cancellation_token
+
+            _cancel_token, _cancel_stop = chat_cancellation_token(chat_id)
+    except Exception:
+        _cancel_token = _cancel_stop = None
+
     compaction_policy = get_compaction_policy("general")
     tool_call_log: list[dict] = []
-    existing_ids = {m.id for m in messages if getattr(m, "id", None)}
+    existing_len = len(history)
     iteration = 0
     final_text = ""
 
@@ -360,19 +344,24 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
             except Exception:
                 pass
 
-        # Append-only compaction below threshold; single checkpoint at it.
+        # A6b/A7: native compaction — estimate_history_tokens + compact_history_native
         if iteration > 1:
             try:
-                messages, compaction_info = compact_history(
-                    messages,
-                    tool_call_log=tool_call_log,
-                    policy=compaction_policy,
-                    chat_id=chat_id,
-                )
-                if compaction_info.get("checkpoint"):
+                est = estimate_history_tokens(history)
+                if est >= compaction_policy.checkpoint_trigger:
+                    from llm.model_history import compact_history_native
+
+                    before = est
+                    history = compact_history_native(
+                        history,
+                        policy=compaction_policy,
+                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                    )
+                    after = estimate_history_tokens(history)
                     _log(
-                        f"[{_AGENT_NAME.upper()}] {compaction_info.get('trigger')} checkpoint "
-                        f"({compaction_info['before']:,} -> {compaction_info['after']:,} est. tokens)"
+                        f"[{_AGENT_NAME.upper()}] Native checkpoint "
+                        f"({before:,} -> {after:,} est. tokens; "
+                        f"tail={compaction_policy.tail_budget_tokens:,})"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")
@@ -386,24 +375,38 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
         )
 
         try:
-            response_text, tool_calls = _call_backend(messages, native_tools, where_tag)
+            response_text, tool_calls, native_msgs = _call_backend(
+                history, native_tools, where_tag,
+                system_prompt=_GENERAL_SYSTEM_TEMPLATE,
+                deps=_native_deps(chat_id),
+                cancellation_token=_cancel_token,
+            )
         except Exception as e:
+            # A8: user abort -> the native run raised RunCancelled; end cleanly.
+            from pydantic_ai.exceptions import RunCancelled
+            if isinstance(e, RunCancelled) or "RunCancelled" in type(e).__name__:
+                yield "status", f"[{_AGENT_NAME.upper()}] Cancelled by user request."
+                final_text = final_text or "Cancelled by user."
+                break
             _log(f"[{_AGENT_NAME.upper()}] LLM error after all fallbacks: {e}")
             raise
 
-        if not response_text.strip() and not tool_calls:
-            messages.append(HumanMessage(
-                content=(
-                    "[NUDGE] You responded with nothing. Continue the request with a tool, "
-                    "or if finished, summarize what you accomplished.",
-                ),
-                id=f"gen-nudge-{iteration}-{uuid.uuid4().hex[:8]}",
-            ))
-            continue
-
-        if not tool_calls:
+        # Native agent ran the whole turn (tools executed internally):
+        # append its transcript slice and finish — the loop's compaction and
+        # session logging still see the full history.
+        if native_msgs:
+            # Native full turn always returns ModelMessage slice (P0-LLM).
+            if native_msgs and isinstance(native_msgs[0], (ModelRequest, ModelResponse)):
+                history.extend(native_msgs)
+            else:
+                try:
+                    from llm.pai_transport import _messages_to_pai
+                    _converted = _messages_to_pai(native_msgs)  # type: ignore
+                    history.extend(_converted)
+                    native_msgs = _converted
+                except Exception:
+                    history.extend(native_msgs)  # fallback, keep as-is
             final_text = _clean_text(response_text)
-            messages.append(AIMessage(content=response_text))
             if sess is not None:
                 try:
                     sess.append_assistant(final_text, stop_reason="stop")
@@ -411,20 +414,55 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                     pass
             break
 
-        ai_msg = AIMessage(
-            content=response_text,
-            id=f"gen-ai-{iteration}-{uuid.uuid4().hex[:8]}",
-            tool_calls=[
-                {"name": tc["tool"], "args": tc.get("args") or {}, "id": tc.get("id", "")}
-                for tc in tool_calls
-            ],
-        )
-        messages.append(ai_msg)
+        if not response_text.strip() and not tool_calls:
+            history.append(ModelRequest(parts=[UserPromptPart(content=(
+                "[NUDGE] You responded with nothing. Continue the request with a tool, "
+                "or if finished, summarize what you accomplished."
+            ))]))
+            continue
+
+        if not tool_calls:
+            final_text = _clean_text(response_text)
+            history.append(ModelResponse(parts=[TextPart(content=response_text)]))
+            if sess is not None:
+                try:
+                    sess.append_assistant(final_text, stop_reason="stop")
+                except Exception:
+                    pass
+            break
+
+        # Free-pool / tool-calling path: materialize ModelResponse with ToolCallParts
+        _parts: list = []
+        if response_text:
+            _parts.append(TextPart(content=response_text))
+        for tc in tool_calls:
+            _parts.append(ToolCallPart(
+                tool_name=tc["tool"],
+                args=tc.get("args") or {},
+                tool_call_id=tc.get("id") or f"gen-call-{iteration}-{uuid.uuid4().hex[:8]}",
+            ))
+        if _parts:
+            history.append(ModelResponse(parts=_parts))
         if sess is not None:
             try:
                 sess.append_assistant(response_text, stop_reason="toolUse")
             except Exception:
                 pass
+
+        # Parallel read-only execution: independent PARALLEL_SAFE calls run on a
+        # thread pool; results return in call order. Out-of-scope tools are
+        # filtered BEFORE execution (they never reach the executor). Everything
+        # else stays sequential (byte-identical to the pre-parallel path).
+        _allowed_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
+        _blocked_calls = [c for c in tool_calls if c.get("tool") not in valid_tool_set]
+        try:
+            batch_results = run_tool_calls(_allowed_calls, lambda c: _general_execute_one(c, run_deps))
+        except Exception:
+            batch_results = []
+        _gen_results_by_id = {}
+        if len(batch_results) == len(_allowed_calls):
+            for _tc, _res in zip(_allowed_calls, batch_results):
+                _gen_results_by_id[str(_tc.get("id") or "")] = _res
 
         for tc in tool_calls:
             tname = tc["tool"]
@@ -438,9 +476,11 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                     f"[BLOCKED] Tool '{tname}' is not available to {_AGENT_NAME}. "
                     f"Available: {', '.join(sorted(valid_tool_set))}"
                 )
+            elif str(call_id) in _gen_results_by_id:
+                result_str = _gen_results_by_id[str(call_id)]
             else:
                 try:
-                    execution = execute_tool_detailed(tname, targs, scope=_AGENT_NAME)
+                    execution = execute_tool_detailed(tname, targs, deps=run_deps)
                     result_str = str(execution.content)
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"
@@ -464,11 +504,7 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                 "iteration": iteration,
                 "status": "error" if result_str.startswith(("ERROR:", "[BLOCKED]")) else "ok",
             })
-            messages.append(ToolMessage(
-                content=result_str,
-                tool_call_id=call_id,
-                name=tname,
-            ))
+            history.append(ModelRequest(parts=[ToolReturnPart(tool_name=tname, content=result_str, tool_call_id=call_id)]))
             if sess is not None:
                 try:
                     sess.append_tool_result(
@@ -482,9 +518,9 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
         # Inline images queued by tools land as ONE synthetic user message.
         try:
-            from tools.vision_channel import drain_into_messages
+            from tools.vision_channel import drain_into_messages_native
 
-            drain_into_messages(messages, header="[Inline image(s) from tool result]")
+            drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=run_deps)
         except Exception:
             pass
 
@@ -495,14 +531,17 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
                 steer = drain_steering(chat_id)
                 if steer:
-                    messages.append(HumanMessage(
-                        content=render_delivery("STEERING", steer),
-                        id=f"gen-steer-{iteration}-{uuid.uuid4().hex[:8]}",
-                    ))
+                    history.append(ModelRequest(parts=[UserPromptPart(content=render_delivery("STEERING", steer))]))
             except Exception:
                 pass
 
-    new_msgs = [m for m in messages if getattr(m, "id", None) not in existing_ids]
+    if _cancel_stop is not None:
+        try:
+            _cancel_stop()
+        except Exception:
+            pass
+
+    new_msgs = history[existing_len:]
     yield "messages", new_msgs
     yield "done", final_text or "No final response produced."
 
@@ -585,7 +624,7 @@ def run_general_direct(prompt: str, chat_id: str = "", images: list | None = Non
         yield json.loads(safe_serialize_state())
 
 
-# ── Entry points ─────────────────────────────────────────────────────────────
+# ── Entry points ───────────────────────────────────────────────────────────
 
 
 def general_node(s: ITState) -> dict:

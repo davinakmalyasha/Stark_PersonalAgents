@@ -1,4 +1,4 @@
-"""
+﻿"""
 free_providers.py --- Multi-provider free LLM transport (zero cost).
 
 Engine extracted from the retired FreeProviders agent: provider configs, rate
@@ -52,514 +52,36 @@ except ImportError:
     pass
 
 # ----------------------------------------------------------------------
-#  PHASE 1: PROVIDER CONFIGS
+#  PHASE 1+2: PROVIDER CONFIGS + MODEL CATALOG (externalized config)
 # ----------------------------------------------------------------------
+# Single source of truth: config/free_catalog.json — providers, rate limits,
+# priorities, and the model catalog. Edit that file to change what the free
+# pool offers; this module loads it once at import time. If the file is
+# missing or unreadable, the module degrades to an empty catalog (free pool
+# simply routes nothing) rather than crashing import.
 
-# Each provider config includes:
-#   name, base_url, auth_header, env_keys (list of env var names to check),
-#   default_model, rpm, rpd, supports_vision, supports_audio, priority (per capability)
+_FREE_CATALOG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config",
+    "free_catalog.json",
+)
 
-PROVIDER_CONFIGS = {
-    "openrouter": {
-        "name": "OpenRouter",
-        "base_url": "https://openrouter.ai/api/v1",
-        "auth": "Bearer",
-        "env_key": "OPENROUTER_API_KEYS",
-        "env_key_fallback": "OPENROUTER_API_KEY",
-        "default_model": "openrouter/free",
-        "rpm": 20,
-        "rpd": 200,
-        "tpm": 0,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 3,
-            "vision": 2,
-            "coding": 5,
-            "reasoning": 4,
-            "audio": 99,
-        },
-    },
-    "groq": {
-        "name": "Groq",
-        "base_url": "https://api.groq.com/openai/v1",
-        "auth": "Bearer",
-        "env_key": "GROQ_API_KEYS",
-        "env_key_fallback": "GROQ_API_KEY",
-        "default_model": "llama-3.3-70b-versatile",
-        "rpm": 30,
-        "rpd": 1000,
-        "tpm": 12000,
-        "supports_vision": False,
-        "supports_audio": True,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 1,
-            "vision": 99,
-            "coding": 1,
-            "reasoning": 1,
-            "audio": 1,
-        },
-    },
-    "google": {
-        "name": "Google AI Studio",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "auth": "Bearer",
-        "env_key": "GEMINI_API_KEYS",
-        "env_key_fallback": "GEMINI_API_KEY",
-        "default_model": "gemini-3.5-flash",
-        "rpm": 15,
-        "rpd": 1500,
-        "tpm": 1000000,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 2,
-            "vision": 1,
-            "coding": 4,
-            "reasoning": 3,
-            "audio": 99,
-        },
-    },
-    "mistral": {
-        "name": "Mistral AI",
-        "base_url": "https://api.mistral.ai/v1",
-        "auth": "Bearer",
-        "env_key": "MISTRAL_API_KEYS",
-        "env_key_fallback": "MISTRAL_API_KEY",
-        "default_model": "mistral-medium-3.5",
-        "rpm": 60,
-        "rpd": 0,
-        "tpm": 500000,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 5,
-            "vision": 4,
-            "coding": 3,
-            "reasoning": 5,
-            "audio": 99,
-        },
-    },
-    "nvidia": {
-        "name": "NVIDIA NIM",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "auth": "Bearer",
-        "env_key": "NVIDIA_API_KEYS",
-        "env_key_fallback": "NVIDIA_API_KEY",
-        "default_model": "deepseek-ai/deepseek-v4-flash",
-        "rpm": 40,
-        "rpd": 0,
-        "tpm": 0,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 4,
-            "vision": 3,
-            "coding": 2,
-            "reasoning": 2,
-            "audio": 99,
-        },
-    },
-    "cloudflare": {
-        "name": "Cloudflare Workers AI",
-        "base_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
-        "auth": "Bearer",
-        "env_key": "CLOUDFLARE_API_KEYS",
-        "env_key_fallback": "CLOUDFLARE_API_TOKEN",
-        "default_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-        "rpm": 300,
-        "rpd": 0,
-        "tpm": 0,
-        "supports_vision": False,
-        "supports_audio": True,
-        "supports_coding": False,
-        "supports_reasoning": False,
-        "priority": {
-            "text": 6,
-            "vision": 5,
-            "coding": 6,
-            "reasoning": 6,
-            "audio": 2,
-        },
-    },
-    "zhipu": {
-        "name": "Z.ai (GLM)",
-        "base_url": "https://api.z.ai/api/paas/v4",
-        "auth": "Bearer",
-        "env_key": "ZAI_API_KEYS",
-        "env_key_fallback": "ZAI_API_KEY",
-        "default_model": "GLM-4.7-Flash",
-        "rpm": 20,
-        "rpd": 500,
-        "tpm": 0,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": False,
-        "priority": {
-            "text": 7,
-            "vision": 6,
-            "coding": 7,
-            "reasoning": 7,
-            "audio": 99,
-        },
-    },
-    "opencode": {
-        "name": "OpenCode",
-        "base_url": "https://opencode.ai/zen/v1",
-        "auth": "Bearer",
-        "env_key": "OPENCODE_API_KEYS",
-        "env_key_fallback": "OPENCODE_API_KEY",
-        "default_model": "deepseek-v4-flash-free",
-        "rpm": 10,
-        "rpd": 1000,
-        "tpm": 0,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 0,
-            "vision": 7,
-            "coding": 0,
-            "reasoning": 8,
-            "audio": 99,
-        },
-    },
-    "kilo": {
-        "name": "Kilo Gateway",
-        "base_url": "https://api.kilo.ai/api/gateway",
-        "auth": "Bearer",
-        "env_key": "KILO_API_KEYS",
-        "env_key_fallback": "KILO_API_KEY",
-        "default_model": "kilo-auto/free",
-        "rpm": 10,
-        "rpd": 0,
-        "tpm": 0,
-        "api_key_optional": True,
-        "supports_vision": False,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 9,
-            "vision": 99,
-            "coding": 9,
-            "reasoning": 9,
-            "audio": 99,
-        },
-    },
-    "cline": {
-        "name": "Cline (usage-billing)",
-        "base_url": "https://api.cline.bot/api/v1",
-        "auth": "Bearer",
-        "env_key": "CLINE_API_KEYS",
-        "env_key_fallback": "CLINE_API_KEY",
-        "default_model": "deepseek/deepseek-v4-flash",
-        "rpm": 20,
-        "rpd": 0,
-        "tpm": 0,
-        "supports_vision": False,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "response_wrapped": True,
-        "priority": {
-            "text": 0,
-            "vision": 99,
-            "coding": 0,
-            "reasoning": 2,
-            "audio": 99,
-        },
-    },
-    "cerebras": {
-        "name": "Cerebras",
-        "base_url": "https://api.cerebras.ai/v1",
-        "auth": "Bearer",
-        "env_key": "CEREBRAS_API_KEYS",
-        "env_key_fallback": "CEREBRAS_API_KEY",
-        "default_model": "gpt-oss-120b",
-        "rpm": 5,
-        "rpd": 0,
-        "tpm": 30000,
-        "supports_vision": False,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 2,
-            "vision": 99,
-            "coding": 2,
-            "reasoning": 2,
-            "audio": 99,
-        },
-    },
-    "vercel_gateway": {
-        "name": "Vercel AI Gateway",
-        "base_url": "https://ai-gateway.vercel.sh/v1",
-        "auth": "Bearer",
-        "env_key": "VERCEL_AI_GATEWAY_KEYS",
-        "env_key_fallback": "AI_GATEWAY_API_KEY",
-        "default_model": "minimax/minimax-m2.7-free",
-        "rpm": 60,
-        "rpd": 0,
-        "tpm": 0,
-        "supports_vision": True,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 4,
-            "vision": 5,
-            "coding": 5,
-            "reasoning": 5,
-            "audio": 99,
-        },
-    },
-    "llm7": {
-        "name": "LLM7.io",
-        "base_url": "https://api.llm7.io/v1",
-        "auth": "Bearer",
-        "env_key": "LLM7_API_KEYS",
-        "env_key_fallback": "LLM7_API_KEY",
-        "default_model": "DeepSeek-V4-Flash-0731",
-        "rpm": 40,
-        "rpd": 0,
-        "tpm": 0,
-        "supports_vision": False,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 6,
-            "vision": 99,
-            "coding": 6,
-            "reasoning": 6,
-            "audio": 99,
-        },
-    },
-    "glhf": {
-        "name": "GLHF.chat",
-        "base_url": "https://glhf.chat/api/openai/v1",
-        "auth": "Bearer",
-        "env_key": "GLHF_API_KEYS",
-        "env_key_fallback": "GLHF_API_KEY",
-        "default_model": "",
-        "rpm": 20,
-        "rpd": 0,
-        "tpm": 0,
-        "supports_vision": False,
-        "supports_audio": False,
-        "supports_coding": True,
-        "supports_reasoning": True,
-        "priority": {
-            "text": 9,
-            "vision": 99,
-            "coding": 9,
-            "reasoning": 9,
-            "audio": 99,
-        },
-    },
-}
 
-# ----------------------------------------------------------------------
-#  PHASE 2: MODEL CATALOG
-# ----------------------------------------------------------------------
+def _load_free_catalog() -> tuple[dict, list]:
+    """Load {providers, models} from config/free_catalog.json (read-only)."""
+    try:
+        with open(_FREE_CATALOG_PATH, "r", encoding="utf-8") as _f:
+            _data = json.load(_f)
+        _providers = _data.get("providers") or {}
+        _models = _data.get("models") or []
+        if not isinstance(_providers, dict) or not isinstance(_models, list):
+            return {}, []
+        return _providers, _models
+    except Exception:
+        return {}, []
 
-# Each model entry: {id, provider, name, capabilities[], context, priority}
-MODEL_CATALOG = [
-    # ── OpenRouter ──
-    {"id": "openrouter/free", "provider": "openrouter", "name": "Free Models Router (auto)",
-     "capabilities": ["text", "vision", "coding", "reasoning"], "context": 200000, "priority": 1},
-    {"id": "inclusionai/ling-3.0-flash:free", "provider": "openrouter", "name": "Ling 3.0 Flash",
-     "capabilities": ["text", "coding"], "context": 262144, "priority": 6},
-    {"id": "nvidia/nemotron-3-ultra-550b-a55b:free", "provider": "openrouter", "name": "Nemotron 3 Ultra",
-     "capabilities": ["text", "reasoning"], "context": 1000000, "priority": 7},
-    {"id": "cohere/north-mini-code:free", "provider": "openrouter", "name": "North Mini Code",
-     "capabilities": ["text", "coding"], "context": 256000, "priority": 8},
 
-    # ── Groq (excluded: allam-2-7b, gemma-3) ──
-    {"id": "llama-3.3-70b-versatile", "provider": "groq", "name": "Llama 3.3 70B",
-     "capabilities": ["text", "reasoning"], "context": 131072, "priority": 1},
-    {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "provider": "groq", "name": "Llama 4 Scout 17B",
-     "capabilities": ["text", "vision"], "context": 131072, "priority": 2},
-    {"id": "qwen3-32b", "provider": "groq", "name": "Qwen3 32B",
-     "capabilities": ["text", "coding"], "context": 131072, "priority": 5},
-    {"id": "gpt-oss-120b", "provider": "groq", "name": "GPT-OSS 120B",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 8},
-    {"id": "moonshotai/kimi-k2-instruct", "provider": "groq", "name": "Kimi K2 Instruct",
-     "capabilities": ["text", "reasoning"], "context": 131072, "priority": 10},
-
-    # ── Google AI Studio / Gemini (free Flash models only) ──
-    {"id": "gemini-3.6-flash", "provider": "google", "name": "Gemini 3.6 Flash",
-     "capabilities": ["text", "vision", "coding"], "context": 1000000, "priority": 1},
-    {"id": "gemini-3.5-flash", "provider": "google", "name": "Gemini 3.5 Flash",
-     "capabilities": ["text", "vision", "coding"], "context": 1000000, "priority": 2},
-
-    # ── Mistral AI ──
-    {"id": "mistral-medium-3.5", "provider": "mistral", "name": "Mistral Medium 3.5",
-     "capabilities": ["text", "vision", "reasoning"], "context": 256000, "priority": 1},
-    {"id": "mistral-large-3-2512", "provider": "mistral", "name": "Mistral Large 3",
-     "capabilities": ["text", "reasoning"], "context": 256000, "priority": 2},
-    {"id": "codestral-2508", "provider": "mistral", "name": "Codestral",
-     "capabilities": ["text", "coding"], "context": 256000, "priority": 4},
-
-    # ── NVIDIA NIM (excluded: phi-3-mini) ──
-    {"id": "deepseek-ai/deepseek-v4-pro", "provider": "nvidia", "name": "DeepSeek V4 Pro",
-     "capabilities": ["text", "coding", "reasoning"], "context": 1000000, "priority": 1},
-    {"id": "deepseek-ai/deepseek-v4-flash", "provider": "nvidia", "name": "DeepSeek V4 Flash",
-     "capabilities": ["text", "coding"], "context": 1000000, "priority": 2},
-    {"id": "nvidia/nemotron-3-ultra-550b-a55b", "provider": "nvidia", "name": "Nemotron 3 Ultra 550B",
-     "capabilities": ["text", "reasoning"], "context": 1000000, "priority": 3},
-    {"id": "nvidia/nemotron-3-super-120b-a12b", "provider": "nvidia", "name": "Nemotron 3 Super 120B",
-     "capabilities": ["text", "reasoning"], "context": 262144, "priority": 4},
-    {"id": "qwen/qwen3-coder-480b", "provider": "nvidia", "name": "Qwen3 Coder 480B",
-     "capabilities": ["text", "coding"], "context": 131072, "priority": 7},
-    {"id": "nvidia/qwen3.5-397b-a17b", "provider": "nvidia", "name": "Qwen3.5 397B (vision)",
-     "capabilities": ["text", "vision"], "context": 131072, "priority": 8},
-    {"id": "nvidia/qwen3.5-122b-a10b", "provider": "nvidia", "name": "Qwen3.5 122B",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 9},
-        {"id": "nvidia/glm-5.2", "provider": "nvidia", "name": "GLM 5.2",
-     "capabilities": ["text", "reasoning", "coding"], "context": 131072, "priority": 16},
-    {"id": "nvidia/step-3.7-flash", "provider": "nvidia", "name": "Step 3.7 Flash",
-     "capabilities": ["text", "reasoning", "coding"], "context": 131072, "priority": 17},
-    {"id": "nvidia/minimax-m2.7", "provider": "nvidia", "name": "MiniMax M2.7",
-     "capabilities": ["text", "coding", "reasoning"], "context": 196608, "priority": 18},
-    {"id": "nvidia/kimi-k2.6", "provider": "nvidia", "name": "Kimi K2.6",
-     "capabilities": ["text", "vision", "coding"], "context": 262144, "priority": 19},
-
-    # ── Z.ai / GLM (free Flash models) ──
-    {"id": "GLM-4.7-Flash", "provider": "zhipu", "name": "GLM 4.7 Flash",
-     "capabilities": ["text", "coding"], "context": 131072, "priority": 1},
-    {"id": "GLM-4.6V-Flash", "provider": "zhipu", "name": "GLM 4.6V Flash",
-     "capabilities": ["text", "vision"], "context": 131072, "priority": 3},
-
-    # ── OpenCode (free tier) ──
-    {"id": "deepseek-v4-flash-free", "provider": "opencode", "name": "DeepSeek V4 Flash (free)",
-     "capabilities": ["text", "coding"], "context": 200000, "priority": 1},
-    {"id": "big-pickle", "provider": "opencode", "name": "Big Pickle (stealth / DS V4)",
-     "capabilities": ["text", "coding"], "context": 200000, "priority": 2},
-    {"id": "qwen3.6-plus-free", "provider": "opencode", "name": "Qwen 3.6 Plus (free)",
-     "capabilities": ["text", "vision", "coding"], "context": 200000, "priority": 3},
-    {"id": "minimax-m3-free", "provider": "opencode", "name": "MiniMax M3 (free)",
-     "capabilities": ["text", "coding"], "context": 200000, "priority": 5},
-    {"id": "nemotron-3-ultra-free", "provider": "opencode", "name": "Nemotron 3 Ultra (free)",
-     "capabilities": ["text", "reasoning"], "context": 200000, "priority": 6},
-
-    # ── Cline (usage-billing, free tier; verified serving deepseek-v4-flash-0731) ──
-    {"id": "deepseek/deepseek-v4-flash", "provider": "cline", "name": "DeepSeek V4 Flash 0731 (free)",
-     "capabilities": ["text", "coding"], "context": 1000000, "priority": 1},
-    {"id": "stepfun/step-3.7-flash", "provider": "cline", "name": "Step 3.7 Flash (free)",
-     "capabilities": ["text", "coding"], "context": 256000, "priority": 2},
-    {"id": "poolside/laguna-s-2.1:free", "provider": "cline", "name": "Laguna S 2.1 (free)",
-     "capabilities": ["text", "coding"], "context": 131072, "priority": 3},
-
-    # ── Kilo Gateway (free tier, no API key needed) ──
-    {"id": "kilo-auto/free", "provider": "kilo", "name": "Kilo Auto (free router)",
-     "capabilities": ["text", "coding", "reasoning"], "context": 256000, "priority": 1},
-    {"id": "qwen/qwen3-coder:free", "provider": "kilo", "name": "Qwen3 Coder 480B",
-     "capabilities": ["text", "coding"], "context": 262144, "priority": 3},
-    {"id": "z-ai/glm-5:free", "provider": "kilo", "name": "GLM 5",
-     "capabilities": ["text", "coding", "reasoning"], "context": 202000, "priority": 4},
-    {"id": "deepseek/deepseek-r1-0528:free", "provider": "kilo", "name": "DeepSeek R1 (reasoning)",
-     "capabilities": ["text", "reasoning"], "context": 164000, "priority": 5},
-    {"id": "meta-llama/llama-3.3-70b-instruct:free", "provider": "kilo", "name": "Llama 3.3 70B",
-     "capabilities": ["text", "reasoning"], "context": 128000, "priority": 6},
-    {"id": "nvidia/nemotron-3-ultra-550b-a55b:free", "provider": "kilo", "name": "Nemotron 3 Ultra 550B",
-     "capabilities": ["text", "reasoning"], "context": 1000000, "priority": 7},
-    {"id": "openai/gpt-oss-120b:free", "provider": "kilo", "name": "GPT-OSS 120B",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 8},
-    {"id": "minimax/minimax-m2.5:free", "provider": "kilo", "name": "MiniMax M2.5",
-     "capabilities": ["text", "coding"], "context": 205000, "priority": 9},
-    {"id": "stepfun/step-3.7-flash:free", "provider": "kilo", "name": "Step 3.7 Flash 196B",
-     "capabilities": ["text", "coding"], "context": 256000, "priority": 10},
-
-    # ── Cloudflare Workers AI (excluded: granite, deepseek-r1, gemma-sea-lion) ──
-    {"id": "@cf/meta/llama-4-scout-17b-16e-instruct", "provider": "cloudflare", "name": "Llama 4 Scout 17B",
-     "capabilities": ["text", "vision"], "context": 1000000, "priority": 1},
-    {"id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "provider": "cloudflare", "name": "Llama 3.3 70B",
-     "capabilities": ["text"], "context": 131072, "priority": 2},
-    {"id": "@cf/openai/gpt-oss-120b", "provider": "cloudflare", "name": "GPT-OSS 120B",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 5},
-    {"id": "@cf/moonshotai/kimi-k2.6", "provider": "cloudflare", "name": "Kimi K2.6",
-     "capabilities": ["text", "vision"], "context": 131072, "priority": 10},
-    {"id": "@cf/moonshot-ai/kimi-k2.7-code", "provider": "cloudflare", "name": "Kimi K2.7 Code",
-     "capabilities": ["text", "vision", "coding"], "context": 262144, "priority": 11},
-    {"id": "@cf/nvidia/nemotron-3-120b-a12b", "provider": "cloudflare", "name": "Nemotron 3 120B",
-     "capabilities": ["text", "reasoning"], "context": 262144, "priority": 15},
-    {"id": "@cf/zhipu-ai/glm-4.7-flash", "provider": "cloudflare", "name": "GLM 4.7 Flash",
-     "capabilities": ["text"], "context": 131072, "priority": 16},
-    {"id": "@cf/glm-5.2", "provider": "cloudflare", "name": "GLM 5.2",
-     "capabilities": ["text", "reasoning", "coding"], "context": 131072, "priority": 17},
-    # ── Cerebras (wafer-scale; free tier 5 RPM / 30K TPM / 1M tokens/day) ──
-    {"id": "gpt-oss-120b", "provider": "cerebras", "name": "GPT-OSS 120B",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 1},
-
-    # ── Vercel AI Gateway (free rotating open models; 60 RPM shared) ──
-    {"id": "minimax/minimax-m2.7-free", "provider": "vercel_gateway", "name": "MiniMax M2.7 (free)",
-     "capabilities": ["text", "coding", "reasoning"], "context": 196608, "priority": 1},
-    {"id": "minimax/minimax-m3-free", "provider": "vercel_gateway", "name": "MiniMax M3 (free)",
-     "capabilities": ["text", "coding", "reasoning"], "context": 196608, "priority": 2},
-    {"id": "openai/gpt-oss-120b", "provider": "vercel_gateway", "name": "GPT-OSS 120B",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 3},
-
-    # ── LLM7.io (free router; token from token.llm7.io; contexts conservative) ──
-    {"id": "DeepSeek-V4-Flash-0731", "provider": "llm7", "name": "DeepSeek V4 Flash 0731",
-     "capabilities": ["text", "coding"], "context": 131072, "priority": 1},
-    {"id": "glm-5.3", "provider": "llm7", "name": "GLM 5.3",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 2},
-    {"id": "kimi-k2.6", "provider": "llm7", "name": "Kimi K2.6",
-     "capabilities": ["text", "coding"], "context": 131072, "priority": 3},
-    {"id": "minimax-m2.7", "provider": "llm7", "name": "MiniMax M2.7",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 4},
-
-    # ── OpenRouter newest-generation :free slots (verified 2026-08) ──
-    {"id": "thinkingmachines/inkling:free", "provider": "openrouter", "name": "Thinking Machines Inkling",
-     "capabilities": ["text", "vision", "coding", "reasoning"], "context": 1048576, "priority": 9},
-    {"id": "thinkingmachines/inkling-small:free", "provider": "openrouter", "name": "Inkling Small",
-     "capabilities": ["text", "vision", "coding", "reasoning"], "context": 1048576, "priority": 10},
-    {"id": "minimax/minimax-m3:free", "provider": "openrouter", "name": "MiniMax M3",
-     "capabilities": ["text", "coding", "reasoning"], "context": 1048576, "priority": 6},
-    {"id": "nvidia/nemotron-3.5-lightning:free", "provider": "openrouter", "name": "Nemotron 3.5 Lightning",
-     "capabilities": ["text", "reasoning"], "context": 1000000, "priority": 9},
-    {"id": "poolside/laguna-s-2.1:free", "provider": "openrouter", "name": "Laguna S 2.1",
-     "capabilities": ["text", "coding"], "context": 262144, "priority": 8},
-
-    # ── Vercel AI Gateway newest (laguna -free verified; others metered-unless-rotated) ──
-    {"id": "poolside/laguna-s-2.1-free", "provider": "vercel_gateway", "name": "Laguna S 2.1 (free)",
-     "capabilities": ["text", "coding"], "context": 262144, "priority": 4},
-    {"id": "moonshotai/kimi-k3", "provider": "vercel_gateway", "name": "Kimi K3",
-     "capabilities": ["text", "coding", "reasoning"], "context": 262144, "priority": 5},
-    {"id": "zai/glm-5.3", "provider": "vercel_gateway", "name": "GLM 5.3",
-     "capabilities": ["text", "coding", "reasoning"], "context": 202000, "priority": 6},
-    {"id": "deepseek/deepseek-v4-pro-0813", "provider": "vercel_gateway", "name": "DeepSeek V4 Pro 0813",
-     "capabilities": ["text", "coding", "reasoning"], "context": 1000000, "priority": 7},
-    {"id": "alibaba/qwen3.8-max", "provider": "vercel_gateway", "name": "Qwen 3.8 Max",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 8},
-
-    # ── NVIDIA NIM newest dev-tier additions ──
-    {"id": "moonshotai/kimi-k3", "provider": "nvidia", "name": "Kimi K3",
-     "capabilities": ["text", "coding", "reasoning"], "context": 262144, "priority": 1},
-    {"id": "minimaxai/minimax-m3", "provider": "nvidia", "name": "MiniMax M3",
-     "capabilities": ["text", "coding", "reasoning"], "context": 131072, "priority": 3},
-
-    # ── Kilo Gateway auto tiers + newest :free ──
-    {"id": "kilo-auto/frontier", "provider": "kilo", "name": "Kilo Auto Frontier",
-     "capabilities": ["text", "coding", "reasoning"], "context": 256000, "priority": 1},
-    {"id": "nvidia/nemotron-3.5-lightning:free", "provider": "kilo", "name": "Nemotron 3.5 Lightning (free)",
-     "capabilities": ["text", "reasoning"], "context": 1000000, "priority": 2},
-
-]
+PROVIDER_CONFIGS, MODEL_CATALOG = _load_free_catalog()
 # ----------------------------------------------------------------------
 #  PHASE 3: CORE BUILDING BLOCKS
 # ----------------------------------------------------------------------
@@ -676,7 +198,7 @@ class ProviderClient:
         self.auth_dead = False
         self.fail_streak = 0
 
-    # ── key loading ──────────────────────────────────────────────
+    # â”€â”€ key loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _load_keys(self) -> list[str]:
         keys_str = os.getenv(self.cfg["env_key"], "")
@@ -694,7 +216,7 @@ class ProviderClient:
     def _next_key(self) -> str:
         return next(self._key_cycle)
 
-    # ── URL building ─────────────────────────────────────────────
+    # â”€â”€ URL building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_url(self) -> str:
         base = self.cfg["base_url"]
@@ -708,7 +230,7 @@ class ProviderClient:
         base = base.rstrip("/")
         return base + "/chat/completions"
 
-    # ── header / body building ───────────────────────────────────
+    # â”€â”€ header / body building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_headers(self, extra: Optional[dict] = None) -> dict:
         key = self._next_key()
@@ -814,7 +336,7 @@ class ProviderClient:
             body["tool_choice"] = tool_choice
         return body
 
-    # ── HTTP ─────────────────────────────────────────────────────
+    # â”€â”€ HTTP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _post(self, body: dict, timeout: Optional[float] = None) -> dict:
         import urllib.error
@@ -896,7 +418,7 @@ class ProviderClient:
     def _parse_model_used(self, body: dict) -> str:
         return body.get("model", self.default_model)
 
-    # ── public API ───────────────────────────────────────────────
+    # â”€â”€ public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def chat(self, prompt: str, **overrides) -> str:
         """Text-only chat. Returns reply string."""
@@ -1212,7 +734,7 @@ def _get_models_for_capability(
     reasoning-capable models without overriding provider priority.
     ``max_context_tokens`` hard-caps the selectable window (e.g. ``<1M`` for
     compaction specialists that must avoid 1M-context models)."""
-    # ±30 stays below the provider-priority quantum (100): routing bias
+    # Â±30 stays below the provider-priority quantum (100): routing bias
     # reorders models, never providers.
     reasoning_bias = -30 if prefer_reasoning is True else 30 if prefer_reasoning is False else 0
     matches = []
@@ -1350,7 +872,7 @@ class FreeProviders:
             remaining = client.rate_limiter._cooldown_until - now
             if 0 < remaining < shortest:
                 shortest = remaining
-        return max(shortest, 2.0)  # at least 2s — fast fallback beats patience
+        return max(shortest, 2.0)  # at least 2s â€” fast fallback beats patience
 
     def chat(
         self,
@@ -1417,7 +939,7 @@ class FreeProviders:
                 max_context_tokens=max_context_tokens,
             )
 
-            # All providers rate-limited — wait and loop back
+            # All providers rate-limited â€” wait and loop back
             if not routes:
                 if not retry_forever and loop >= max_loops - 1:
                     raise AllProvidersExhaustedError(
@@ -1487,16 +1009,16 @@ class FreeProviders:
                         context_error = e
                         continue
                     if e.status in (401, 403):
-                        # Auth error — this key will not heal; disable the
+                        # Auth error â€” this key will not heal; disable the
                         # provider for the lifetime of the pool.
                         client.auth_dead = True
                         continue
                     elif e.status == 429:
-                        # Rate limited — cooldown and try next
+                        # Rate limited â€” cooldown and try next
                         client.rate_limiter.trigger_cooldown(30)
                         continue
                     elif e.status == 0 or e.status >= 500:
-                        # Transport/server failure — escalate cooldown so
+                        # Transport/server failure â€” escalate cooldown so
                         # repeated dead providers stop costing us seconds.
                         client.fail_streak += 1
                         client.rate_limiter.trigger_cooldown(
@@ -1504,7 +1026,7 @@ class FreeProviders:
                         )
                         continue
                     else:
-                        # Other error — try next
+                        # Other error â€” try next
                         continue
                 except Exception as e:
                     last_error = e
@@ -1522,7 +1044,7 @@ class FreeProviders:
                     status=getattr(context_error, "status", 0),
                 ) from context_error
 
-            # All providers in this round failed — wait, then loop back to start
+            # All providers in this round failed â€” wait, then loop back to start
             if retry_forever or loop < max_loops - 1:
                 wait = self._get_shortest_cooldown()
                 _sleep_with_abort(wait, abort_check)
@@ -1562,7 +1084,7 @@ class FreeProviders:
         abort_check=None,
         **overrides,
     ) -> dict:
-        """Routed streaming turn — same fallback ladder as chat(), but the
+        """Routed streaming turn â€” same fallback ladder as chat(), but the
         winning attempt streams via SSE with live callbacks.
 
         Returns the chat_with_info shape. An empty streamed turn falls through
@@ -1805,43 +1327,9 @@ def stream_complete(messages=None, prompt="", tools=None, tool_choice=None,
 def to_native_messages(messages: list) -> list[dict]:
     """LangChain transcript -> OpenAI-native dicts (free transport).
     Image content-block lists pass through untouched."""
-    out: list[dict] = []
-    for m in messages:
-        kind = type(m).__name__
-        content = getattr(m, "content", "")
-        if kind == "SystemMessage":
-            out.append({"role": "system", "content": content})
-        elif kind == "HumanMessage":
-            out.append({"role": "user", "content": content})
-        elif kind == "AIMessage":
-            entry = {"role": "assistant", "content": content or ""}
-            tcs = getattr(m, "tool_calls", None) or []
-            if tcs:
-                entry["tool_calls"] = [
-                    {
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name") or tc.get("tool", ""),
-                            "arguments": json.dumps(
-                                tc.get("args") or {}, separators=(",", ":")
-                            ),
-                        },
-                    }
-                    for tc in tcs
-                    if isinstance(tc, dict)
-                ]
-            out.append(entry)
-        elif kind == "ToolMessage":
-            out.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
-                    "name": getattr(m, "name", "") or "",
-                    "content": str(content),
-                }
-            )
-    return out
+    from llm.native_conv import lc_to_native
+
+    return lc_to_native(messages)
 
 
 def list_remote_models(provider: str, timeout: float = 15.0) -> list[dict]:
@@ -1930,7 +1418,7 @@ def _free_turn_emitters(name: str, chat_id: str):
     if not chat_id:
         return None, None
     try:
-        from stream_bus import emit as _bus_emit
+        from server.realtime.bus import emit as _bus_emit
 
         def on_token(t, _c=chat_id, _n=name, _e=_bus_emit):
             try:
@@ -1949,6 +1437,93 @@ def _free_turn_emitters(name: str, chat_id: str):
         return None, None
 
 
+def _model_messages_to_native(history: list) -> list[dict]:
+    """ModelMessage -> OpenAI-native dicts for free pool (A6b)."""
+    out: list[dict] = []
+    try:
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            SystemPromptPart,
+            ToolCallPart,
+            ToolReturnPart,
+            UserPromptPart,
+            TextPart,
+            ThinkingPart,
+            BinaryContent,
+            ImageUrl,
+        )
+    except Exception:
+        return out
+    for m in history or []:
+        try:
+            if isinstance(m, ModelRequest):
+                for p in getattr(m, "parts", []) or []:
+                    if isinstance(p, SystemPromptPart):
+                        out.append({"role": "system", "content": p.content})
+                    elif isinstance(p, UserPromptPart):
+                        c = p.content
+                        if isinstance(c, str):
+                            out.append({"role": "user", "content": c})
+                        elif isinstance(c, list):
+                            text_parts: list[str] = []
+                            image_parts: list[dict] = []
+                            for item in c:
+                                if isinstance(item, str):
+                                    text_parts.append(item)
+                                elif isinstance(item, BinaryContent):
+                                    try:
+                                        import base64
+                                        b64 = base64.b64encode(item.data).decode("ascii")
+                                        mime = getattr(item, "media_type", "image/png") or "image/png"
+                                        url = f"data:{mime};base64,{b64}"
+                                        image_parts.append({"type": "image_url", "image_url": {"url": url}})
+                                    except Exception:
+                                        text_parts.append(str(item))
+                                elif isinstance(item, ImageUrl):
+                                    try:
+                                        image_parts.append({"type": "image_url", "image_url": {"url": item.url}})
+                                    except Exception:
+                                        text_parts.append(str(item))
+                                else:
+                                    text_parts.append(str(item))
+                            if text_parts and image_parts:
+                                out.append({"role": "user", "content": [{"type": "text", "text": "\n".join(text_parts)}] + image_parts})
+                            elif image_parts:
+                                out.append({"role": "user", "content": image_parts})
+                            elif text_parts:
+                                out.append({"role": "user", "content": "\n".join(text_parts)})
+                            else:
+                                out.append({"role": "user", "content": ""})
+                        else:
+                            out.append({"role": "user", "content": str(c)})
+                    elif isinstance(p, ToolReturnPart):
+                        out.append({"role": "tool", "tool_call_id": p.tool_call_id or "", "name": p.tool_name or "", "content": str(p.content or "")})
+            elif isinstance(m, ModelResponse):
+                text = ""
+                tool_calls: list[dict] = []
+                for p in getattr(m, "parts", []) or []:
+                    if isinstance(p, TextPart):
+                        text += p.content or ""
+                    elif isinstance(p, ToolCallPart):
+                        args = p.args if isinstance(p.args, dict) else {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        tool_calls.append({"id": p.tool_call_id or "", "type": "function", "function": {"name": p.tool_name or "", "arguments": json.dumps(args, separators=(",", ":"))}})
+                    elif isinstance(p, ThinkingPart):
+                        pass
+                entry: dict = {"role": "assistant", "content": text or ""}
+                if tool_calls:
+                    entry["tool_calls"] = tool_calls
+                out.append(entry)
+        except Exception:
+            continue
+    return out
+
+
 def free_native_turn(
     name: str,
     messages: list,
@@ -1963,13 +1538,23 @@ def free_native_turn(
     Streams live to the shared chat bus (content + thinking), falls back to a
     single bounded non-streaming attempt on mid-stream failure, and returns the
     canonical ``(text, tool_calls, reasoning)`` triple every agent loop
-    consumes. Raises loudly when the whole pool fails — no silent paid
+    consumes. Raises loudly when the whole pool fails â€” no silent paid
     fallback by design.
     """
     pool = FreeProviders()
-    native_msgs = messages if (
-        messages and isinstance(messages[0], dict)
-    ) else to_native_messages(messages or [])
+    # A6b: native ModelMessage support
+    if messages and isinstance(messages[0], dict):
+        native_msgs = messages
+    else:
+        try:
+            from pydantic_ai.messages import ModelRequest, ModelResponse
+
+            if messages and isinstance(messages[0], (ModelRequest, ModelResponse)):
+                native_msgs = _model_messages_to_native(messages)
+            else:
+                native_msgs = to_native_messages(messages or [])
+        except Exception:
+            native_msgs = to_native_messages(messages or [])
     on_token, on_reasoning = _free_turn_emitters(name, "")
     extra = {}
     if max_context_tokens is not None:
@@ -2013,3 +1598,4 @@ def free_native_turn(
                 "id": str(tc.get("id") or f"{name}-free-{index + 1}"),
             })
     return reply, calls, (str(info.get("reasoning", "") or "").strip() or None)
+

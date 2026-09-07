@@ -86,7 +86,7 @@ MODE_MATRIX: dict[str, dict[str, dict]] = {
 
 _TIER_ROLES = {
     "orchestrator": ("orchestrator",),
-    "workspace": ("developer", "developerfixing", "general", "house"),
+    "workspace": ("developer", "developerfixing", "general", "house", "dfd"),
 }
 
 

@@ -831,12 +831,31 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     return '';
   }
 
-  // ── Capture config — 0.3s silence like ChatGPT Advanced Voice (user requested) ──
-  const SEND_SILENCE_MS = 300;   // quiet for this long → end the round + transcribe
-  const MAX_ROUND_MS = 30000;    // hard cap for continuous talking
+  // ── Capture config — TurnDetection (portable, mirrors pydantic TurnDetection) ──
+  // Backend is source of truth at /api/turn_detection; defaults below are fallbacks.
+  let turnDetection = {
+    sensitivity: 'medium',
+    prefix_padding_ms: 300,
+    silence_duration_ms: 300,
+    sound_level: 0.01,
+    min_round_ms: 250,
+    max_round_ms: 30000,
+  };
+  // Convenience aliases (kept for existing code paths).
+  let SEND_SILENCE_MS = turnDetection.silence_duration_ms;
+  let MAX_ROUND_MS = turnDetection.max_round_ms;
   const RUN_TIMEOUT_MS = 300000; // Phase 8-V5: run watchdog raised to 5min — long agent runs must not be killed early
-  const MIN_ROUND_MS = 250;      // allow short breaths to trigger streaming (was 800)
-  const SOUND_LEVEL = 0.01;      // anything above this counts as "sound"
+  let MIN_ROUND_MS = turnDetection.min_round_ms;
+  let SOUND_LEVEL = turnDetection.sound_level;
+  fetch(API + '/api/turn_detection').then((r) => r.json()).then((cfg) => {
+    if (cfg && typeof cfg.silence_duration_ms === 'number') {
+      turnDetection = cfg;
+      SEND_SILENCE_MS = cfg.silence_duration_ms;
+      MIN_ROUND_MS = cfg.min_round_ms;
+      MAX_ROUND_MS = cfg.max_round_ms;
+      SOUND_LEVEL = cfg.sound_level;
+    }
+  }).catch(() => {});
 
   // Whisper's classic silence/noise hallucinations — never send these
   const HALLUCINATIONS = [
@@ -1562,10 +1581,11 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       .slice(0, 800);
   }
 
-  // Gapless TTS state — Web Audio scheduling
+  // Gapless TTS state — Web Audio scheduling + barge-in truncation
   let ttsCtx = null;
   let ttsNextTime = 0;
   const ttsSources = new Set();
+  let _ttsStartAt = 0; // AudioContext time when current utterance started (for played_ms)
 
   function ensureTtsCtx() {
     if (!ttsCtx || ttsCtx.state === 'closed') {
@@ -1577,7 +1597,18 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     return ttsCtx;
   }
 
+  function _ttsPlayedMs() {
+    try {
+      if (!_ttsStartAt || !ttsCtx) return 0;
+      const ms = Math.max(0, (ttsCtx.currentTime - _ttsStartAt) * 1000);
+      return Math.round(ms);
+    } catch (_e) { return 0; }
+  }
+
   function stopSpeaking() {
+    const wasSpeaking = speaking && ttsSources.size > 0;
+    let playedMs = 0;
+    if (wasSpeaking) playedMs = _ttsPlayedMs();
     speaking = false;
     incrementalTtsBuffer = '';
     // Stop Web Audio scheduled sources
@@ -1586,11 +1617,20 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     }
     ttsSources.clear();
     ttsNextTime = 0;
+    _ttsStartAt = 0;
     if (ttsCtx && ttsCtx.state === 'suspended') ttsCtx.resume().catch(()=>{});
     audio.pause();
     if (audio.src) { try { URL.revokeObjectURL(audio.src); } catch(_e){} }
     audio.removeAttribute('src');
     try { audio.load(); } catch(_e){}
+    // Report truncation to backend so history can carry interrupted_at_ms
+    if (wasSpeaking && playedMs > 0) {
+      fetch(API + '/api/voice/interrupt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ played_ms: playedMs }),
+      }).catch(() => {});
+    }
   }
 
   async function speak(text) {
@@ -1598,6 +1638,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     if (!clean) return;
     lastReply = clean;
     speaking = true;
+    _ttsStartAt = ensureTtsCtx().currentTime;
     setStatus('processing', 'Preparing voice…');
     const useVoice = voiceForLanguage(detectLanguage(clean));
     // Phase 8-V3: full duplex — the browser mic has AEC on (echoCancellation/
@@ -1647,6 +1688,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       const ctx = ensureTtsCtx();
       ttsNextTime = Math.max(ttsNextTime, ctx.currentTime) || ctx.currentTime;
       setStatus('speaking', text.slice(0, 120) + (text.length > 120 ? '…' : ''));
+      if (!_ttsStartAt) _ttsStartAt = ctx.currentTime;
 
       function checkDone() {
         if (done && pendingDecodes === 0 && ttsSources.size === 0) {
@@ -1908,6 +1950,27 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 
   // Resume AudioContext on first interaction (needed if it started suspended)
   window.addEventListener('pointerdown', () => { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+
+  // ── WS relay stub (pydantic WS relay pattern — local tiny+jarvis, no provider) ──
+  // Browser ↔ backend PCM16 bridge: keeps same Agent, removes poll when wired.
+  let _voiceWs = null;
+  function openVoiceWs() {
+    try {
+      const wsUrl = API.replace(/^http/, 'ws') + '/api/voice/ws';
+      const ws = new WebSocket(wsUrl);
+      _voiceWs = ws;
+      ws.onopen = () => {
+        try { ws.send(JSON.stringify({ type: 'ping' })); } catch(_e) {}
+      };
+      ws.onmessage = (ev) => {
+        // Placeholder: when wired, binary frames are PCM16 audio; json is transcript.
+      };
+      ws.onclose = () => { _voiceWs = null; };
+      ws.onerror = () => { _voiceWs = null; };
+    } catch(_e) {}
+  }
+  // Opportunistically open (handshake verified, no impact on HTTP path).
+  try { openVoiceWs(); } catch(_e) {}
 
   // Init
   updateMicBtn();

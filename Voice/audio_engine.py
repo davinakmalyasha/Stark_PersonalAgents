@@ -58,27 +58,13 @@ ASR_MODEL_DIR: Path | None = None
 # STT model size — tiny-streaming is the lightest streaming variant
 # (~35MB vs medium ~350MB): faster load, less RAM/CPU, tiny WER tradeoff.
 # Override with STT_MODEL=tiny|base|small|medium|*-streaming.
-STT_MODEL_NAME = os.environ.get("STT_MODEL", "tiny-streaming").strip().lower()
-_STT_ARCH_MAP = {
-    "tiny": "TINY",
-    "base": "BASE",
-    "small": "SMALL",
-    "medium": "MEDIUM",
-    "tiny-streaming": "TINY_STREAMING",
-    "base-streaming": "BASE_STREAMING",
-    "small-streaming": "SMALL_STREAMING",
-    "medium-streaming": "MEDIUM_STREAMING",
-}
+STT_MODEL_NAME = "tiny-streaming"
 
 
 def _asr_arch():
-    """Map STT_MODEL_NAME to a moonshine ModelArch member (defensive)."""
+    """Always tiny-streaming — no env override, no silent fallback to medium."""
     from moonshine_voice.moonshine_api import ModelArch
-    key = _STT_ARCH_MAP.get(STT_MODEL_NAME)
-    arch = getattr(ModelArch, key, None) if key else None
-    if arch is None:
-        arch = getattr(ModelArch, "MEDIUM_STREAMING")
-    return arch
+    return ModelArch.TINY_STREAMING
 
 DEFAULT_TTS_VOICE = os.environ.get("TTS_VOICE", "jarvis" if (REPO_ROOT / ".deep_agents" / "tts_ref" / "jarvis_pocket.safetensors").exists() else "alba")
 
@@ -96,6 +82,7 @@ POCKET_CATALOG_VOICES = {
 }
 
 _lock = threading.Lock()          # legacy global (kept for anything else)
+_tts_load_lock = threading.Lock()  # double-checked lock for model load (OOM guard)
 _asr_lock = threading.Lock()      # Phase 8-V3: ASR-only lock — TTS no longer blocks STT
 _tts_lock = threading.Lock()      # Phase 8-V3: TTS-only lock — full duplex (TTS speaks while STT listens)
 _asr = None
@@ -255,14 +242,21 @@ def tts_available() -> bool:
 
 
 def _load_tts_model():
-    """Load (once) the Pocket TTS model, quantized, kept resident."""
+    """Load (once) the Pocket TTS model, quantized, kept resident.
+
+    Double-checked locking: concurrent callers (warm_up + TTS) used to both
+    see _tts_model is None and load the 1GB model twice → spike to 2GB+.
+    """
     global _tts_model
     if _tts_model is not None:
         return _tts_model
-    from pocket_tts import TTSModel
-    _tts_model = TTSModel.load_model(quantize=True)
-    print(f"[audio_engine] Pocket TTS loaded (device={_tts_model.device}, sr={_tts_model.sample_rate})")
-    return _tts_model
+    with _tts_load_lock:
+        if _tts_model is not None:
+            return _tts_model
+        from pocket_tts import TTSModel
+        _tts_model = TTSModel.load_model(quantize=True)
+        print(f"[audio_engine] Pocket TTS loaded (device={_tts_model.device}, sr={_tts_model.sample_rate})")
+        return _tts_model
 
 
 def _voice_state(voice: str):
@@ -341,7 +335,7 @@ def synthesize_tts_stream(text: str, voice: str = DEFAULT_TTS_VOICE):
 
 def warm_up() -> None:
     """Preload the Pocket TTS model + voice state (live-mode open)."""
-    with _lock:
+    with _tts_lock:
         try:
             _load_tts_model()
             try:

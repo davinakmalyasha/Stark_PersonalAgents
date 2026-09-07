@@ -3,21 +3,29 @@ Voice / TTS router — live-mode endpoints for the Electron voice overlay.
 
 Phase 7: rebuilt from api_server.py after the package split. Serves:
 
+  GET  /api/turn_detection         TurnDetection config (VAD portable)
   POST /api/voice/start            Begin server-side mic capture (Moonshine
                                    MicTranscriber streaming).
   GET  /api/voice/status           {active}
   POST /api/voice/stop             {discard:bool} → final transcript {text}
   POST /api/voice/mute             {muted:bool} — suppress self-transcription
+  POST /api/voice/interrupt        Barge-in with truncation accounting
   GET  /api/voice/peek             {text, level, active} — rolling transcript
   POST /api/voice/send             {} → final {text} (no re-transcribe; the
                                    streaming decoder already flushed it)
   POST /api/transcribe             File upload → Moonshine transcript
   POST /api/tts                    Full wav synthesis (Pocket TTS, cached)
   POST /api/tts/stream             SSE wav chunks (first chunk < 1s warm)
+  WS   /api/voice/ws               PCM16 relay (browser AudioWorklet bridge)
 
 All heavy model calls run through asyncio.to_thread — the Pocket TTS / ASR
 loops are CPU-bound and must never block the event loop.
 """
+import asyncio
+import base64
+import hashlib
+import io
+import json
 import asyncio
 import base64
 import hashlib
@@ -78,11 +86,22 @@ def _ensure_tts_worker() -> None:
 class TTSRequest(BaseModel):
     text: str
     voice: str = "jarvis"
-    engine: str = "pocket"  # pocket only (edge/kokoro/moonshine removed)
+    engine: str = "pocket"  # pocket only
 
 
 class VoiceSendRequest(BaseModel):
-    pass
+    audio: str = ""          # base64 wav (browser AudioWorklet raw PCM, 16k mono)
+    audio_format: str = "wav"
+
+
+# ── TurnDetection ──────────────────────────────────────────────────────
+
+
+@router.get("/api/turn_detection")
+async def turn_detection_config():
+    """Return TurnDetection — single source of truth for VAD (mirrors pydantic TurnDetection)."""
+    from server.api_server import TURN_DETECTION
+    return JSONResponse(content=TURN_DETECTION)
 
 
 # ── Capture lifecycle ──────────────────────────────────────────────────────
@@ -149,6 +168,31 @@ async def voice_mute(request: Request):
         import audio_engine
         await asyncio.to_thread(audio_engine.set_capture_muted, muted)
         return JSONResponse(content={"muted": muted})
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+
+# ── Barge-in with truncation accounting ────────────────────────────────
+
+
+class VoiceInterruptRequest(BaseModel):
+    played_ms: int = 0
+
+
+@router.post("/api/voice/interrupt")
+async def voice_interrupt(req: VoiceInterruptRequest):
+    """Barge-in truncation — record interrupted_at_ms for history.
+
+    Browser has already flushed local audio (stopSpeaking). Played_ms is how
+    many ms were actually heard before the user talked over. Stored on the
+    engine module so handoff to text can add an interruption note.
+    """
+    try:
+        import audio_engine
+        played = max(int(getattr(req, "played_ms", 0) or 0), 0)
+        audio_engine._last_interrupt_ms = played  # type: ignore[attr-defined]
+        audio_engine._last_interrupt_at = __import__("time").time()  # type: ignore[attr-defined]
+        return JSONResponse(content={"interrupted_at_ms": played})
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
 
@@ -266,6 +310,55 @@ async def voice_tts_status():
         return JSONResponse(content={"tts_warm": audio_engine.tts_loaded()})
     except Exception as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
+
+
+# ── WebSocket relay (browser AudioWorklet ↔ backend) ─────────────────
+
+
+@router.websocket("/api/voice/ws")
+async def voice_ws(websocket):
+    """Browser ↔ backend PCM16 relay — voice is just another frontend.
+
+    Browser sends raw 16-bit mono PCM16 @16kHz (100ms chunks) as binary.
+    JSON text frames carry {type:"send"} (flush) or {type:"interrupt",played_ms}.
+    Backend replies with binary PCM16 input transcript? -> text, output PCM16.
+    Keeps local tiny-streaming + jarvis; same Agent tools/history as text chat.
+    """
+    try:
+        from fastapi import WebSocket as _WS  # noqa: F401
+    except Exception:
+        pass
+    await websocket.accept()
+    try:
+        while True:
+            msg = await websocket.receive()
+            # Binary PCM16 frame -> Transcriber (keep-alive pending)
+            if "bytes" in msg and isinstance(msg["bytes"], (bytes, bytearray)):
+                # For now just ack; full Transcriber wiring is next step after
+                # the VAD/drawWave/barging fixes above land. Keeps the relay
+                # handshake verified and polling-free.
+                await websocket.send_bytes(msg["bytes"])
+            elif "text" in msg and msg["text"]:
+                import json as _j
+                try:
+                    data = _j.loads(msg["text"])
+                except Exception:
+                    continue
+                t = data.get("type")
+                if t == "interrupt":
+                    import audio_engine  # type: ignore
+                    pm = int((data.get("played_ms") or 0))
+                    audio_engine._last_interrupt_ms = pm  # type: ignore[attr-defined]  # noqa: SLF001
+                    await websocket.send_text(_j.dumps({"type": "interrupted", "played_ms": pm}))
+                elif t == "ping":
+                    await websocket.send_text(_j.dumps({"type": "pong"}))
+    except Exception:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ── TTS ────────────────────────────────────────────────────────────────────

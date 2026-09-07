@@ -4,7 +4,7 @@
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** developer
 - **Parallel-safe (PARALLEL_SAFE):** False
-- **Compact doc:** edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Boilerplate → template(action="apply") first.
+- **Compact doc:** edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Write every new file by hand — no template tool.
 - **Required args (validated):** file_path
 - **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema | approval via Hooks.before_tool_execute (plan-mode + core-config veto)

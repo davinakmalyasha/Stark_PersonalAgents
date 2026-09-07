@@ -1,6 +1,6 @@
 # propose_plan
 
-- **Description:** Stage 4: submit a plan proposal to the user. Use ONLY in plan mode when you want the user to review and (manually) press /build to execute. Outside plan mode this tool is a no-op alias for update_plan. The agent CANNOT transition out of plan mode on its own — the user must press /build.
+- **Description:** Present the plan for the CURRENT plan-mode review. Plan mode is user-initiated via the prompt dock ONLY — never call this to start planning on your own, never suggest switching modes. Outside plan mode this is a no-op (use update_plan and keep working). The agent CANNOT change plan/build mode in either direction.
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** developer, orchestrator, general, house, dfd
 - **Parallel-safe (PARALLEL_SAFE):** False

@@ -6,7 +6,6 @@
 - edit_file
 - run_command
 - search_code
-- template
 - ask_user
 - update_plan
 - propose_plan
@@ -22,7 +21,6 @@
 ## deploy
 
 - github_apply_gate
-- template
 - run_command
 - read_file
 

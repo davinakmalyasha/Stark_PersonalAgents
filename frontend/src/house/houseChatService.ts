@@ -71,11 +71,12 @@ export function startHousePipeline(
   onState: (state: AppState) => void,
   onComplete: () => Promise<void>,
   onError: (err: unknown) => void,
-  kind: 'general' | 'house' | 'personal' = 'general',
+  kind: 'general' | 'house' | 'personal' | 'design' = 'general',
   onDelta?: (delta: StreamDelta) => void,
 ) {
   // workspaceKind ensures deterministic routing: house→House agent, general→
-  // orchestrator, personal→general/orchestrator. NEVER hardcode 'house'.
+  // orchestrator, personal→general/orchestrator, design→UI design loop
+  // (agents/ui_design_direct). NEVER hardcode 'house'.
   return streamPipeline(
     prompt, MODEL, TEMP,
     (state) => onState(state),

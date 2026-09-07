@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { X, FolderGit2 } from 'lucide-react';
+import { X, FolderGit2, Palette } from 'lucide-react';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
@@ -853,6 +853,20 @@ export default function App() {
       )}
       <QuestionModal visible={isRunning || isPersisting} />
 
+      {/* OpenDesign module launcher — opens the design room bound to this workspace/chat */}
+      <button
+        type="button"
+        onClick={() => {
+          const ws = activeWorkspace?.id ? `?ws=${encodeURIComponent(activeWorkspace.id)}&chat=${encodeURIComponent(activeChat?.id || '')}` : '';
+          window.location.hash = `#/design${ws}`;
+        }}
+        className="fixed left-2 top-1/2 -translate-y-1/2 z-[85] flex flex-col items-center gap-1 px-1.5 py-3 rounded-xl bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shadow-xl"
+        title="OpenDesign — agent-led UI design iteration for this workspace (straight to the UI subagent loop)"
+        style={{ writingMode: 'vertical-rl' }}
+      >
+        <Palette size={15} />
+        <span className="text-[9.5px] font-bold tracking-widest uppercase">Design</span>
+      </button>
       {/* P10/Tier-3: file explorer toggle + panel */}
       <button
         type="button"

@@ -45,7 +45,7 @@ from server.store.workspace_registry import (
     get_workspace_rules_and_profile,
     get_client_name,
 )
-from server.store.mode_store import get_mode, set_mode
+from server.store.mode_store import get_mode
 
 # Legacy aliases
 __all__ = [
@@ -56,5 +56,5 @@ __all__ = [
     "get_workspace_rules_and_profile", "get_client_name",
     "list_chats", "create_chat", "get_chat", "save_chat", "delete_chat", "add_message",
     "update_chat_title", "get_chat_tasks", "save_chat_tasks",
-    "get_mode", "set_mode",
+    "get_mode",
 ]

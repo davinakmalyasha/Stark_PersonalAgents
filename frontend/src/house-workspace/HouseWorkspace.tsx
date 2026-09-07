@@ -429,6 +429,7 @@ export default function HouseWorkspace() {
         onLaunchPersonal={() => go('#/personal')}
         onLaunchCoding={() => go('#/coding')}
         onLaunchHouse={() => go('#/house')}
+        onLaunchAdmin={() => go('#/admin')}
       />
 
       {/* Toast */}

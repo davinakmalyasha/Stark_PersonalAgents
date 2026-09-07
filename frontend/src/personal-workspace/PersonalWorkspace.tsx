@@ -126,6 +126,7 @@ export default function PersonalWorkspace() {
         onLaunchPersonal={() => go('#/personal')}
         onLaunchCoding={() => go('#/coding')}
         onLaunchHouse={() => go('#/house')}
+        onLaunchAdmin={() => go('#/admin')}
       />
     </div>
   );

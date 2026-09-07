@@ -25,10 +25,11 @@ def _project_router():
     return pr
 
 
-# House / Personal / DFD virtual kinds — frontend sends workspace_kind hint
+# House / Personal / DFD / Design virtual kinds — frontend sends workspace_kind hint
 _HOUSE_KINDS = {"house", "house_workspace"}
 _PERSONAL_KINDS = {"personal", "personal_workspace", "general_workspace"}
 _DFD_KINDS = {"dfd", "dfd_workspace"}
+_DESIGN_KINDS = {"design", "design_workspace"}
 
 
 def decide_route(
@@ -47,17 +48,20 @@ def decide_route(
       general      → run_general_direct
       dfd          → run_dfd_direct
       orchestrator → orchestrator_node (LLM)
+      design       → run_ui_design_direct (OpenDesign module: straight to UI loop)
     """
     kind_hint = (workspace_kind or "").strip().lower()
 
-    # ── 1) Explicit workspace_kind hints (house / personal / dfd) take precedence
-    # Frontend HouseWorkspace / PersonalWorkspace / DfdWorkspace will send these.
+    # ── 1) Explicit workspace_kind hints (house / personal / dfd / design) take precedence
+    # Frontend HouseWorkspace / PersonalWorkspace / DfdWorkspace / Design module send these.
     if kind_hint in _HOUSE_KINDS:
         return {"kind": "house", "project": None, "reason": "workspace_kind=house"}
     if kind_hint in _PERSONAL_KINDS:
         return {"kind": "general", "project": None, "reason": f"workspace_kind={kind_hint}"}
     if kind_hint in _DFD_KINDS:
         return {"kind": "dfd", "project": None, "reason": f"workspace_kind={kind_hint}"}
+    if kind_hint in _DESIGN_KINDS:
+        return {"kind": "design", "project": None, "reason": f"workspace_kind={kind_hint}"}
 
     pr = _project_router()
 
@@ -125,6 +129,12 @@ def stream_for_kind(
     if kind == "dfd":
         from agents.dfd_agent import run_dfd_direct
         yield from run_dfd_direct(prompt, chat_id=chat_id or "", images=image_paths or None)
+        return
+
+    if kind == "design":
+        from agents.ui_design_direct import run_ui_design_direct
+        yield from run_ui_design_direct(prompt, workspace_path=workspace_path or "",
+                                        chat_id=chat_id or "", images=image_paths or None)
         return
 
     if kind == "orchestrator":

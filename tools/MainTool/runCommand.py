@@ -292,7 +292,8 @@ class LocalShellBackend:
             else:
                 effective_dir = os.path.normpath(os.path.join(self.root_dir, wd))
             if not os.path.isdir(effective_dir):
-                return f"Error: workdir '{workdir}' does not exist or is not a directory."
+                from pydantic_ai.exceptions import ToolFailed
+                raise ToolFailed(f"Error: workdir '{workdir}' does not exist or is not a directory.")
 
         # Per-call environment: one dict copy of the cached base (PATH venv-prepend,
         # GH_TOKEN, PYTHONUNBUFFERED...). Discovery happened once at module load.
@@ -300,10 +301,12 @@ class LocalShellBackend:
 
         # Bash-only: harness uses Git Bash 5.3.15 (ships with Git 2.55.0). No cmd/powershell fallback.
         if shell != "bash":
-            return f"Error: only shell='bash' is supported (got '{shell}'). All run_command calls must use bash - Git Bash 5.3.15 via _find_bash() :88-95."
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed(f"Error: only shell='bash' is supported (got '{shell}'). All run_command calls must use bash - Git Bash 5.3.15 via _find_bash() :88-95.")
         bash = _find_bash()
         if not bash:
-            return "Error: bash not found — Git for Windows 2.55+ (bash 5.3.15) required at C:\\Program Files\\Git\\bin\\bash.exe; install from https://git-scm.com/download/win"
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed("Error: bash not found — Git for Windows 2.55+ (bash 5.3.15) required at C:\\Program Files\\Git\\bin\\bash.exe; install from https://git-scm.com/download/win")
         use_bash = True
 
         # Persistent env file: BASH_ENV exports PATH/tokens/hygiene vars into every
@@ -395,15 +398,13 @@ class LocalShellBackend:
                     errors="replace",
                 )
                 
-                # Chunked live-log flush: the reader thread drains stdout into a local
-                # buffer; every ~200ms the main loop flushes the accumulated lines to
-                # the live log in ONE append (one state_version bump + one string copy
-                # per chunk instead of per line — the SSE streamer polls state_version,
-                # so batching is invisible to the frontend).
+                # Chunked live-log flush: 80ms instead of 200ms — reduces SSE lag
+                # 250→~80ms when combined with bus event wake (runs.py). Still
+                # batches per chunk (one state_version bump per flush).
                 q = queue.Queue()
                 out_lines = []
                 pending = []
-                _FLUSH_INTERVAL = 0.2
+                _FLUSH_INTERVAL = 0.08
                 
                 def read_output(stream, q):
                     for line in stream:
@@ -536,9 +537,18 @@ def run_command(ctx: object = None, command: str = "", timeout: int = 30000, bac
     if timeout is not None and timeout < 1000:
         timeout = timeout * 1000
 
-    # Clear local file cache since executing a command can modify files on disk
-    _FILE_CACHE.clear()
-    _increment_cache_version()
+    # Invalidate file/tool caches only for destructive shells — read-only
+    # shells (ls/cat/find/grep/git status) do not mutate the tree and must
+    # not invalidate parallel sibling reads (P1 parallel barrier fix).
+    _should_clear = True
+    try:
+        from tools.plan_mode_guard import _is_destructive_shell as _is_dest
+        _should_clear = _is_dest(str(command or ""))
+    except Exception:
+        _should_clear = True
+    if _should_clear:
+        _FILE_CACHE.clear()
+        _increment_cache_version()
 
     active_ws = shared_state.get("project_path") or WORKSPACE
     if ctx is not None:
@@ -554,7 +564,8 @@ def run_command(ctx: object = None, command: str = "", timeout: int = 30000, bac
         deny_patterns = BLOCKED_PATTERNS | _load_extra_deny_patterns()
         if any(p in cmd_lower for p in deny_patterns):
             matched = [p for p in deny_patterns if p in cmd_lower]
-            return f"Error: Command execution blocked for safety. Dangerous pattern detected: {matched[0]}"
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed(f"Error: Command execution blocked for safety. Dangerous pattern detected: {matched[0]}")
 
     # Handle process actions
     if process_action:
@@ -611,7 +622,8 @@ def run_command(ctx: object = None, command: str = "", timeout: int = 30000, bac
             return f"Error: Invalid process_action '{process_action}'."
             
     if not command:
-        return "Error: command parameter is required."
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed("Error: command parameter is required.")
 
     # Generate a unique key for background process
     name = None

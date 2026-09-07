@@ -167,7 +167,8 @@ def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list
 
     path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
-        return f"Error: File not found: {file_path}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error: File not found: {file_path}")
     try:
         # Check session cache (#9) â€” skip if offset/limit specified (partial read)
         cache_key = os.path.normpath(path).lower()
@@ -224,4 +225,5 @@ def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list
         _log_tool("read_file", {"file_path": file_path, "offset": offset, "limit": limit}, output[:300])
         return output
     except Exception as e:
-        return f"Error reading {file_path}: {e}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error reading {file_path}: {e}")

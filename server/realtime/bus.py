@@ -47,6 +47,14 @@ _LOCK = threading.RLock()
 _ACTIVE: dict[str, float] = {}
 _MAX_ENTRIES = 2000
 
+# Async waiters for event-driven wake (emit -> set event so runs.py doesn't poll 50ms)
+_BUS_ASYNC_EVENTS: dict[str, "asyncio.Event"] = {}
+_BUS_ASYNC_LOOPS: dict[str, "asyncio.AbstractEventLoop"] = {}
+try:
+    import asyncio as _asyncio  # noqa: used in get_bus_event / emit
+except Exception:
+    _asyncio = None  # type: ignore
+
 def enabled() -> bool:
     """Stream bus on/off.
 
@@ -63,6 +71,72 @@ def enabled() -> bool:
     instr = os.environ.get("PAI_INSTRUMENT", "1")
     return instr.lower() not in ("0", "false", "no", "off")
 
+def _notify_async_waiters(chat_id: str) -> None:
+    """Wake any async waiter via call_soon_threadsafe (thread-safe emit -> async wait)."""
+    if _asyncio is None:
+        return
+    try:
+        with _LOCK:
+            evt = _BUS_ASYNC_EVENTS.get(chat_id)
+            loop = _BUS_ASYNC_LOOPS.get(chat_id)
+        if evt is not None and loop is not None:
+            try:
+                if loop.is_closed():
+                    return
+                loop.call_soon_threadsafe(evt.set)
+            except Exception:
+                # Fallback direct set if loop call fails (e.g., caller is same thread)
+                try:
+                    evt.set()
+                except Exception:
+                    pass
+        elif evt is not None:
+            try:
+                evt.set()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def get_bus_event(chat_id: str):
+    """Get/create an asyncio.Event for this chat so runs.py can await bus deltas event-driven.
+
+    Must be called from the async context that will await it (captures its loop).
+    """
+    if _asyncio is None:
+        return None
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    with _LOCK:
+        evt = _BUS_ASYNC_EVENTS.get(chat_id)
+        if evt is None:
+            try:
+                evt = _asyncio.Event()
+            except Exception:
+                return None
+            _BUS_ASYNC_EVENTS[chat_id] = evt
+            if loop is not None:
+                _BUS_ASYNC_LOOPS[chat_id] = loop
+        else:
+            # refresh loop if caller now has a running loop
+            if loop is not None:
+                _BUS_ASYNC_LOOPS[chat_id] = loop
+        return evt
+    return evt
+
+
+def clear_bus_event(chat_id: str) -> None:
+    try:
+        with _LOCK:
+            _BUS_ASYNC_EVENTS.pop(chat_id, None)
+            _BUS_ASYNC_LOOPS.pop(chat_id, None)
+    except Exception:
+        pass
+
+
 def emit(chat_id: str, kind: str, text: str, agent: str = "", model: str = "") -> None:
     if not enabled() or not chat_id or not text:
         return
@@ -75,6 +149,7 @@ def emit(chat_id: str, kind: str, text: str, agent: str = "", model: str = "") -
             _ACTIVE[chat_id] = time.time()
     except Exception:
         pass
+    _notify_async_waiters(chat_id)
 
 def drain(chat_id: str, limit: int = 60) -> list[dict]:
     if not enabled() or not chat_id:
@@ -116,5 +191,7 @@ def cleanup(older_than: float = 600.0) -> None:
             for cid in stale:
                 _BUS.pop(cid, None)
                 _ACTIVE.pop(cid, None)
+                _BUS_ASYNC_EVENTS.pop(cid, None)
+                _BUS_ASYNC_LOOPS.pop(cid, None)
     except Exception:
         pass

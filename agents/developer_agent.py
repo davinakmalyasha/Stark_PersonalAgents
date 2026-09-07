@@ -110,16 +110,6 @@ def _build_dynamic_context(
     stable_parts = [f"## Workspace Root\n{workspace_root}"]
     current_parts = []
 
-    # The template map is a fixed capability pointer. The live catalog and
-    # rendered contents stay behind template_list/apply_template.
-    try:
-        from tools import build_template_map
-        template_map = build_template_map()
-        if template_map:
-            stable_parts.append(template_map)
-    except Exception as e:
-        print(f"Error loading template map: {e}")
-
     # project.md is a small, stable identity card. It is intentionally kept in
     # the cached prefix; code navigation belongs in the current tail below.
     try:
@@ -158,8 +148,7 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     """
     Build the system prompt with a cache-friendly message layout.
 
-    Stable SystemMessage: base prompt, workspace root, identity, and the fixed
-    template pointer.
+    Stable SystemMessage: base prompt, workspace root, and project identity.
     Append-only history: prior task/tool turns remain byte-stable.
     Current tail: the first full projectMap or a later projectMap+ delta and
     the current request are appended after history, so only the tail is new
@@ -752,11 +741,8 @@ def developer_node(s: ITState) -> dict:
 
     _log(f"\n{'='*60}\n[DEVELOPER] Starting tool-using agentic loop\n{'='*60}")
 
-    # Reset per-run counters
-    last_tool_failed = False  # previous turn: a tool errored or command exited non-zero
-    last_test_failed = False  # previous turn: a test/verify command failed
-    pending_guidance: list[str] = []  # transient next-call steering; never durable history
-    _native_finish = False  # native agent ran the whole task; skip manual loop
+    pending_guidance: list[str] = []
+    _native_finish = False
 
     while True:
         iteration += 1
@@ -859,38 +845,12 @@ def developer_node(s: ITState) -> dict:
                 else:
                     where_tag = f"Iter {iteration}/unbounded"
 
-                # ── Native Function Calling ──
-                # Pass tool schemas via the API tools parameter so the model
-                # returns structured tool_calls instead of text we must parse.
-                # ── Adaptive reasoning budget ladder ──
-                # The reasoning budget adapts to the TURN TYPE, not a fixed level:
-                #   iter-1 planning ............ high (plan & diagnose)
-                #   failure/repair-triggered ... high (the previous turn failed:
-                #     tool error, non-zero exit, failing test, failed edit)
-                #   search/discovery ............ low (decide what to search next
-                # ── Reasoning ladder (CACHE-AWARE): iter-1 planning uses "high";
-                # everything else runs "disabled". Deliberately NO intermediate
-                # rung: DeepSeek's prefix cache is keyed per thinking config, so
-                # EVERY effort transition (high→low→disabled) re-misses the whole
-                # per-project prefix (~4.7k tokens) once per task. The old "low"
-                # discovery rung cost that miss while producing ~0 reasoning.
-                # Trouble signals flip the NEXT turn back to "high" (cheap: the
-                # high-config request is already cached from iter-1).
-                # Knobs: REASONING_ITER1 (planning depth, mode default "high"),
-                #        REASONING_ROUTINE (routine depth, "disabled"),
-                #        FLIP_ON_TEST_ONLY=1 (default) → flip to high only
-                #        on real TEST failures; tool errors don't flip. With
-                #        Dev self-verification off there are no mid-session
-                #        test failures → the session is config-stable
-                #        (iter-1 high, everything else disabled, zero flips).
                 _dev_plan: dict = {}
                 try:
                     from llm.provider_modes import get_role_plan
-
                     _dev_plan = get_role_plan("Developer")
                 except Exception:
                     _dev_plan = {}
-                # Static per-role thinking: Developer=high (no ladder, per maintainer)
                 reasoning_effort = "high"
                 reasoning_budget = None
 
@@ -951,6 +911,15 @@ def developer_node(s: ITState) -> dict:
                                         "status": "executed",
                                         "result_preview": "",
                                     })
+                    # Stall nudge: byte-identical >5× consecutively → pending_guidance (no max_turns)
+                    try:
+                        from llm.loop_detector import LoopGuard as _LG
+                        _stall = _LG.has_byte_identical_stall(tool_call_log, threshold=6)
+                        if _stall:
+                            _log(f"[DEVELOPER] {_stall}")
+                            pending_guidance.append(_stall)
+                    except Exception:
+                        pass
                     # Mark finish: force the loop to the final-report path.
                     _native_finish = True
 
@@ -1194,18 +1163,13 @@ def developer_node(s: ITState) -> dict:
                 })
 
         tool_result_payloads = []
-        # Failure flags reflect ONLY the previous turn's tool results: they were set
-        # by last iteration's tool loop and consumed by this turn's effort selection
-        # (think_hard) above. Reset now so THIS turn's results set them fresh.
-        last_tool_failed = False
-        last_test_failed = False
 
         # ── Parallel read-only execution ──
         # The provider's tool protocol is parallel: independent read-only calls
-        # (read_file / search_code / github_* reads / web_search / template_list)
+        # (read_file / search_code / github_* reads / web_search)
         # run concurrently on a thread pool; results come back in call order.
         # Out-of-scope tools are filtered BEFORE execution. Everything else
-        # (run_command, edit_file, template, browser, ask_user…) stays
+        # (run_command, edit_file, browser, ask_user…) stays
         # sequential, byte-identical to the pre-parallel path.
         _unknown_calls = [c for c in tool_calls if c.get("tool") not in valid_tool_set]
         _known_calls = [c for c in tool_calls if c.get("tool") in valid_tool_set]
@@ -1293,20 +1257,8 @@ def developer_node(s: ITState) -> dict:
 
             safe_update_state({"thoughts": {"developer": f"Using {tool_name}..."}})
             _log(f"[DEVELOPER] {tool_label}")
-            import json
             _log(f"[TOOL_CALL] {tool_name}({json.dumps(tool_args)})")
 
-            # ── Failure tracking for the thinking ladder ──
-            # last_tool_failed / last_test_failed are consumed by the NEXT turn's
-            # reasoning-effort selection (think_hard) so a failed action forces a
-            # high-effort diagnosis turn.
-            if execution.is_error:
-                last_tool_failed = True
-                cmd_low = str(tool_args.get("command", "")).lower()
-                if tool_name == "run_command" and any(
-                    k in cmd_low for k in ("test", "verify", "pytest", "jest", "check", "lint")
-                ):
-                    last_test_failed = True
 
             # â”€â”€ Build detail string for the where_tag (shown in next LLM invocation) â”€â”€
             tool_detail = ""
@@ -1338,10 +1290,6 @@ def developer_node(s: ITState) -> dict:
                 "result_preview": str(tool_result)[:200],
                 "detail": tool_detail,  # for where_tag enrichment
             })
-            # Remember the last executed tool — the NEXT turn's reasoning ladder
-            # uses it to detect the discovery phase (search/list/read → low+cap).
-            last_tool = tool_name
-
             if warning_msg:
                 tool_result = str(tool_result) + warning_msg
 
@@ -1351,21 +1299,6 @@ def developer_node(s: ITState) -> dict:
                 fpath = tool_args.get("file_path", "")
                 if fpath and fpath not in tracked_files_modified:
                     tracked_files_modified.append(fpath)
-            elif tool_name == "template":
-                # template(action="apply") writes files outside edit_file — parse
-                # the created-file list from the result so task.json artifacts
-                # and the handoff report don't under-report template output.
-                t_action = str(tool_args.get("action", "")).strip().lower()
-                if t_action in ("apply", "use", "render", "create") and not tool_args.get("dry_run"):
-                    import re as _re
-                    for line in str(tool_result).splitlines():
-                        s = line.strip()
-                        if not s or s.startswith(("~", "!", "[", "Composed", "TODO")):
-                            continue
-                        if _re.match(r"^[\w./\\ -]+\.[A-Za-z0-9]{1,6}$", s):
-                            norm = s.replace("\\", "/").lstrip("/")
-                            if norm not in tracked_files_created:
-                                tracked_files_created.append(norm)
 
             # Format output for this tool
             tool_result_payloads.append((tool_call.get("id"), tool_name, str(tool_result)))

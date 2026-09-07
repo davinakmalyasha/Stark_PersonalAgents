@@ -1,14 +1,13 @@
 """branch_levels.py — single source of truth for the 3-level branch map.
 
-Both the harness auto-push (Testing_Log/Testing/ci_gate.py) and the gate
-installer (tools/AddOnTool/githubTools.py) resolve branch levels through this
-module so they can never disagree about reality:
+The gate installer (tools/AddOnTool/githubTools.py) resolves branch levels
+through this module:
 
     dev level      -> Tier 1 (fast-checks)     e.g. development / develop / dev
     staging level  -> Tier 2 (staging)          e.g. staging / qa / uat / test
     prod level     -> Tier 3 (release-heavy)    e.g. main / master / trunk
 
-Resolution precedence (identical everywhere):
+Resolution precedence:
     .harness-ci.json  >  env vars  >  discovery (remote heads scan)  >  defaults
 
 Prod is ALWAYS a set: declared ∪ {main, master} ∪ detected-default.
@@ -41,20 +40,18 @@ def load_repo_config(ws_or_path: str) -> dict:
             "dev": str(br.get("dev") or "").strip(),
             "staging": str(br.get("staging") or "").strip(),
             "prod": [str(x).strip() for x in prods if str(x).strip()],
-            "auto_push": bool((data.get("harness") or {}).get("auto_push", True)),
         }
     except Exception:
         return {}
 
 
 def env_overrides(environ=None) -> dict:
-    """CI_DEV_BRANCH / CI_STAGING_BRANCH / CI_PROD_BRANCHES / CI_GATE_BRANCH."""
+    """CI_DEV_BRANCH / CI_STAGING_BRANCH / CI_PROD_BRANCHES."""
     env = environ if environ is not None else os.environ
     return {
         "dev": str(env.get("CI_DEV_BRANCH") or "").strip(),
         "staging": str(env.get("CI_STAGING_BRANCH") or "").strip(),
         "prod": [p.strip() for p in (env.get("CI_PROD_BRANCHES") or "").split(",") if p.strip()],
-        "kill": str(env.get("CI_GATE_BRANCH") or "").strip().lower(),
     }
 
 
@@ -68,14 +65,8 @@ def discover(heads, default: str) -> tuple[str, str]:
 
 
 def normalize(declared: dict | None, envl: dict | None,
-              heads=None, default: str = "main",
-              respect_kill: bool = True) -> dict | None:
+              heads=None, default: str = "main") -> dict:
     """Merge all signal layers into the canonical levels dict.
-
-    Returns None when auto-push must stay OFF for this repo
-    (declared harness.auto_push=false, or kill switch CI_GATE_BRANCH=off).
-    Callers that don't own pushing (e.g. the gate installer) pass
-    respect_kill=False and ignore the None case for naming purposes.
 
     Prod is ALWAYS a superset of {main, master} ∪ declared prod. The detected
     default branch joins prod too — UNLESS it IS the resolved dev level (fresh
@@ -84,17 +75,12 @@ def normalize(declared: dict | None, envl: dict | None,
     """
     d = declared or {}
     e = envl or {}
-    kill = e.get("kill", "")
-
-    if respect_kill and (kill == "off" or d.get("auto_push") is False):
-        return None
 
     heads = heads or []
     prod = {p for p in ((d.get("prod") or []) + (e.get("prod") or [])) if p}
     prod |= set(HARD_PROD)
 
-    explicit_dev = d.get("dev") or e.get("dev") or \
-        (kill if (respect_kill and kill and kill != "auto") else "")
+    explicit_dev = d.get("dev") or e.get("dev") or ""
     dev = explicit_dev or ""
     staging = d.get("staging") or e.get("staging") or ""
     source = "declared"

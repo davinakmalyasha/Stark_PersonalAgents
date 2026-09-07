@@ -55,7 +55,18 @@ def delegate(*args, **kwargs) -> str:
         except Exception:
             pass
     try:
-        summaries = start_delegations(items, parent_chat, fallback_ws)
+        # Prefer the async graph map+join path when a parent chat exists and we
+        # can await (native tools run in a thread, so asyncio.run is safe).
+        from agents.delegation import map_run_delegations, start_delegations
+        if parent_chat:
+            try:
+                import asyncio
+                summaries = asyncio.run(map_run_delegations(items, parent_chat, fallback_ws))
+            except RuntimeError:
+                # Already inside a running loop (rare) — fall back to sync facade.
+                summaries = start_delegations(items, parent_chat, fallback_ws)
+        else:
+            summaries = start_delegations(items, parent_chat, fallback_ws)
     except Exception as e:
         return f"Error: delegation failed to start: {e}"
 

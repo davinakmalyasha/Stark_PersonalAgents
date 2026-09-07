@@ -132,12 +132,7 @@ def _build_model_settings(
     reasoning_effort: str | None,
     reasoning_budget: int | None,
 ) -> dict:
-    """Build portable ModelSettings — uses `thinking` not hand-rolled extra_body.
-
-    Golden rule (per maintainer): no ladder. Static per-role mapping:
-      developer/dfd = high, orchestrator/general/house = low.
-    Explicit `reasoning_effort` still overrides (disabled/low/medium/high).
-    """
+    """Build portable ModelSettings — uses `thinking` not hand-rolled extra_body."""
     settings: dict[str, Any] = {"temperature": temp, "parallel_tool_calls": True}
     thinking: Any = None
 
@@ -156,7 +151,6 @@ def _build_model_settings(
         else:
             thinking = "high"
     elif _is_reasoning_model(model):
-        # Static per-role mapping — no iteration ladder, no heavy heuristic.
         r = (role or "").lower()
         if "developer" in r or r in ("dfd", "designer", "design"):
             thinking = "high"
@@ -165,7 +159,6 @@ def _build_model_settings(
         elif r == "orchestrator":
             thinking = "low"
         else:
-            # general, house, supervisor, coder, others → low
             thinking = "low"
     else:
         thinking = False
@@ -427,6 +420,28 @@ def _emit_stream(role: str, kind: str, text: str, where: str) -> None:
         pass
 
 
+def _run_coro_blocking(coro):
+    """Sync↔async bridge — see llm/native_tools._run_coro_blocking for rationale.
+
+    Keeps pydantic-ai async (Agent.iter/run_stream) but allows sync callers
+    (tests, legacy loops) to call from either a bare thread or an already-running
+    event loop (FastAPI). If a loop is running we offload to a temporary thread
+    so we don't deadlock the server loop.
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            fut = _ex.submit(asyncio.run, coro)
+            return fut.result()
+    return asyncio.run(coro)
+
+
 def pai_native_turn(
     role: str,
     messages: list,
@@ -449,12 +464,11 @@ def pai_native_turn(
     typed per-run workspace context; when None the caller retains the legacy
     global-shared_state path (pre-migration compatibility).
 
-    Async callers (server loop) MUST use :func:`apai_native_turn` — this sync
-    facade spins its own event loop and blocks the server.
+    Async callers (server loop) should prefer :func:`apai_native_turn`;
+    this facade now bridges via thread when a loop is already running so it
+    never blocks the server. Pure pydantic-ai upgrade.
     """
-    import asyncio
-
-    return asyncio.run(
+    return _run_coro_blocking(
         apai_native_turn(
             role=role,
             messages=messages,
@@ -587,6 +601,9 @@ async def apai_native_turn(
                 from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPart, ThinkingPart, TextPartDelta, ThinkingPartDelta
 
                 _evt_acc: list[dict] = []
+                # For dedup of command-gateway behavior where full text arrives
+                # in PartStartEvent and then deltas are empty or prefix.
+                _text_start_seen: dict[int, str] = {}
 
                 def _on_event(ctx, event):
                     try:
@@ -599,11 +616,19 @@ async def apai_native_turn(
                             elif isinstance(event.part, TextPart):
                                 c = event.part.content or ""
                                 if c:
-                                    _evt_acc.append({"kind": "text", "text": c})
-                                    _emit_stream(role, "text", c, where or "")
+                                    _text_start_seen[event.index] = c
+                                    # Defer emit — if delta arrives this was a prefix; if not, it's the full text.
+                                    _evt_acc.append({"kind": "text_start", "text": c, "index": event.index})
+                                else:
+                                    _text_start_seen[event.index] = ""
                         elif isinstance(event, PartDeltaEvent):
                             d = event.delta
                             if isinstance(d, TextPartDelta):
+                                # Delta is truth — drop any deferred start prefix for this index.
+                                if event.index in _text_start_seen:
+                                    # remove the buffered start text for this index from acc
+                                    _evt_acc[:] = [e for e in _evt_acc if not (e.get("kind") == "text_start" and e.get("index") == event.index)]
+                                    _text_start_seen.pop(event.index, None)
                                 c = d.content_delta or ""
                                 if c:
                                     _evt_acc.append({"kind": "text", "text": c})
@@ -672,6 +697,15 @@ async def apai_native_turn(
                             pass
                         resp = sres.response
                         usage = sres.usage
+                # Flush any deferred start prefixes that never got a delta (full text in start event).
+                for idx, c in list(_text_start_seen.items()):
+                    if c:
+                        _evt_acc.append({"kind": "text", "text": c})
+                        try:
+                            _emit_stream(role, "text", c, where or "")
+                        except Exception:
+                            pass
+                _text_start_seen.clear()
                 text = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "text").strip()
                 reasoning = "".join(p.content for p in resp.parts if getattr(p, "part_kind", "") == "thinking").strip() or None
                 if not text:
@@ -843,11 +877,9 @@ def pai_structured(
     configs). Raises on failure (caller keeps its existing fallback behavior).
     ``base_url``/``api_key`` override the resolved gateway (test/alt-provider
     use). ``deps`` carries the typed per-run workspace context (fallback:
-    legacy global path).
+    legacy global path). Bridges via thread when a loop is running.
     """
-    import asyncio
-
-    return asyncio.run(
+    return _run_coro_blocking(
         apai_structured(
             messages=messages,
             result_type=result_type,

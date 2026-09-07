@@ -670,14 +670,6 @@ def stream_direct(project: dict, message: str, workspace_path: str, chat_id: str
         report = result.get("summary", "")
         pr = _project_ref(project, reply)
 
-    # ── GitHub gate handoff: push delivered code (if any) + watch the gate.
-    # Fire-and-forget; no-op when nothing changed or there is no remote.
-    try:
-        from ci_gate import after_run
-        after_run(project.get("workspace_path", ""), message, project.get("chat_id", ""))
-    except Exception as e:
-        print(f"[PROJECT_ROUTER] ci_gate after_run error (non-fatal): {e}")
-
     safe_append_live_log(f"\n[ASSISTANT] {report}")
     safe_update_state({
         "active_node": "agent",

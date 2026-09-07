@@ -30,7 +30,6 @@ _MIGRATED_TOOLS = {
     "search_code",
     "edit_file",
     "run_command",
-    "template",
 }
 
 # Native pydantic-ai 2.36 equivalent for our registry pipeline (Track B).
@@ -39,7 +38,6 @@ _NATIVE_NOTES = {
     "search_code": "Tool.from_schema | cache via Hooks | FilteredToolset",
     "edit_file": "Tool.from_schema | approval via Hooks.before_tool_execute (plan-mode + core-config veto)",
     "run_command": "Tool.from_schema | redact via Hooks.after_tool_execute | offload via after_tool_execute",
-    "template": "Tool.from_schema | cache via Hooks | FilteredToolset",
     "default": "Tool.from_schema(TOOL_DEFINITIONS) | Hooks.before/after_tool_execute (cache/guard/redact/offload) | Tool(args_validator, max_retries) | FilteredToolset(allowed_tools)",
 }
 

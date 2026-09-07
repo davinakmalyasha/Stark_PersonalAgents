@@ -346,6 +346,20 @@ def _specialist_call_backend(
         except Exception:
             model = None
 
+    # NOTE (rewiring fix): _child_prompt_for() never existed — the call
+    # raised NameError on every paid-path turn (swallowed upstream as an
+    # instant empty turn). Resolve the spec prompt from this module's own
+    # registry instead (mirrors agents/subagent_manager._child_system_prompt;
+    # local lookup avoids a circular import).
+    _spec_sys = None
+    try:
+        if not _SUBAGENTS_REGISTRY:
+            _load_subagents()
+        _spec_sys = (_SUBAGENTS_REGISTRY.get(name) or {}).get("system_prompt")
+    except Exception:
+        _spec_sys = None
+    if isinstance(_spec_sys, list):
+        _spec_sys = "\n".join(str(s) for s in _spec_sys)
     return run_native_agent(
         role=name,
         messages=list(messages),
@@ -353,7 +367,7 @@ def _specialist_call_backend(
         temp=temp,
         reasoning_effort=reasoning_effort,  # static per-role mapping applies downstream
         where=where,
-        system_prompt=_child_prompt_for(name),
+        system_prompt=_spec_sys or "You are a specialized subagent.",
     )
 
 _HANDOFF_MAX_CHARS = 1000  # 1000 chars — compact structured report; oversized text offloads to VFS
@@ -700,14 +714,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
         # Static per-role thinking: subagents get no explicit override; the
         # role mapping in _build_model_settings decides (dev/coder=high, rest=low).
-        subagent_effort = reasoning_effort  # registry effort no longer drives a ladder
+        subagent_effort = reasoning_effort
 
         # ── Subagent loop: LLM → tools → observe → repeat ──
         # There is no turn ceiling. Cancellation, provider failure, a final
         # response, or an explicit structured-output request are the lifecycle
         # boundaries; context checkpoints handle long transcripts.
         content = ""
-        # No adaptive reasoning ladder — static per-role thinking only.
         _sub_trouble = False
         _last_tool_name = ""
         try:

@@ -72,7 +72,7 @@ async def restore_chat_run(chat_id: str, run_id: str, workspace_path: str = ""):
 
 @router.post("/api/chat/{chat_id}/mode")
 async def set_chat_mode(chat_id: str, req: ModeRequest):
-    """Set the chat mode â€” per-chat dropdown (survives restart). Agent can propose plan, only user flips planâ†’build."""
+    """Set the chat mode â€” per-chat dropdown (survives restart). User-only prompt-dock control. Agents have no mode-switch capabilityâ†’build."""
     try:
         from server.store.mode_store import set_mode
         VALID = {"plan", "build"}

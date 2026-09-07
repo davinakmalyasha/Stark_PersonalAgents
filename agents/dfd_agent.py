@@ -160,7 +160,7 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         )
         return reply, calls, []
 
-    # Paid path — static per-role thinking: DFD=high (no ladder).
+    # Paid path — static per-role thinking: DFD=high.
     effort_override = "high"
 
     # Native agent (Track B): pydantic-ai executes tools internally (default).

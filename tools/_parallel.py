@@ -11,14 +11,19 @@ else falls back to the sequential path, byte-for-byte identical to today.
 """
 from __future__ import annotations
 
+import os
+
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from threading import RLock
 from typing import Callable, Iterable
 
 #: Read-only, side-effect-free tools that may run concurrently within one turn.
-#: run_command (even read-only ones) mutates the shared file cache / live log /
-#: background registry, so it stays sequential. edit_file/template are writers.
-#: browser_act takes screenshots + touches the vision channel — sequential.
+#: run_command was historically sequential because it cleared the file cache /
+#: live log even for read-only shells; now only destructive shells clear the
+#: cache (tools/MainTool/runCommand.py) and the native barrier
+#: (llm/native_tools.py) marks run_command non-sequential, so read-only shells
+#: can parallelize. edit_file is a writer. browser_act takes
+#: screenshots + touches the vision channel — sequential.
 #: Only names that exist in the native tool surface (tools.TOOL_MAP) matter;
 #: entries for absent tools are inert.
 PARALLEL_SAFE = frozenset({
@@ -35,7 +40,6 @@ PARALLEL_SAFE = frozenset({
     "github_view_pull_request",
     "github_view_workflow_run",
     "web_search",
-    "template_list",
     "list_async_tasks",
     "check_async_task",
     "update_plan",
@@ -46,11 +50,22 @@ PARALLEL_SAFE = frozenset({
 #: Same names, explicit "always sequential" grouping for the definition flag.
 PARALLEL_SAFE_ALIASES = {"exec_command", "github_apply_gate", "github_init_project"}
 
-_EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix="tools")
-_EXECUTOR_LOCK = RLock()
+def _parallel_max_workers() -> int:
+    """Single source for tool-pool size — mirrors PAI_MAX_CONCURRENCY.
 
-#: Default cap when a caller does not supply one.
-_PARALLEL_MAX_WORKERS = 6
+    Env PAI_MAX_CONCURRENCY defaults to 4 (llm/native_tools.py). Legacy pool
+    was hard-coded 6, causing double-queuing (limiter 4 + pool 6). Now both
+    share the same value so there is one queue.
+    """
+    try:
+        return max(1, int(os.getenv("PAI_MAX_CONCURRENCY", "4")))
+    except Exception:
+        return 4
+
+_PARALLEL_MAX_WORKERS = _parallel_max_workers()
+
+_EXECUTOR = ThreadPoolExecutor(max_workers=_PARALLEL_MAX_WORKERS, thread_name_prefix="tools")
+_EXECUTOR_LOCK = RLock()
 
 #: Cache the future->(idx, item) mapping so results reindex in call order.
 _ORDERED_RESULTS_KEY = "__results_by_idx__"

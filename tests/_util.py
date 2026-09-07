@@ -100,7 +100,7 @@ def attach_real_apply_template():
 
 # ── env isolation ───────────────────────────────────────────────────────────
 
-_CI_ENV_KEYS = ("CI_DEV_BRANCH", "CI_STAGING_BRANCH", "CI_PROD_BRANCHES", "CI_GATE_BRANCH")
+_CI_ENV_KEYS = ("CI_DEV_BRANCH", "CI_STAGING_BRANCH", "CI_PROD_BRANCHES")
 
 
 @contextlib.contextmanager

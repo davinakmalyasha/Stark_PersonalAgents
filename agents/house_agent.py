@@ -189,7 +189,7 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         messages=list(history),
         tools=native_tools,
         temp=0.2,
-        reasoning_effort="low",  # static per-role: house=low (no ladder)
+        reasoning_effort="low",  # static per-role: house=low
         where=where_tag,
         deps=deps,
         system_prompt=system_prompt,

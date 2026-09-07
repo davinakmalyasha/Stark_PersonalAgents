@@ -198,7 +198,8 @@ def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
     from tools import _sanitize_path, _invalidate_file_cache
     path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
-        return f"Error: File not found: {file_path}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error: File not found: {file_path}")
         
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -210,7 +211,8 @@ def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
             new_content, errors = apply_unified_diff(content, diff)
             
         if errors:
-            return f"Error: Failed to apply diff to {file_path}:\n" + "\n".join(errors)
+            from pydantic_ai.exceptions import ToolFailed
+            raise ToolFailed(f"Error: Failed to apply diff to {file_path}:\n" + "\n".join(errors))
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
@@ -221,8 +223,11 @@ def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
             
         _log_tool("apply_diff", {"file_path": file_path, "diff": diff}, output)
         return output
+    except ToolFailed:
+        raise
     except Exception as e:
-        return f"Error applying diff to {file_path}: {e}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error applying diff to {file_path}: {e}")
 
 
 _PATCH_MARKER_RE = re.compile(r'^\*\*\* (Add File|Update File|Delete File|Move to): (.*?)\s*$')
@@ -558,7 +563,8 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
             return res
         return "Error: edit_file requires (old_string + new_string) for single edit, (diff) for batch SEARCH/REPLACE blocks, or (new_string only) to create/overwrite a file."
     if old_string == new_string:
-        return "Error: old_string and new_string are identical."
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed("Error: old_string and new_string are identical.")
 
     # â”€â”€ Direct filesystem edit for absolute workspace paths â”€â”€
     norm_path = os.path.normpath(os.path.abspath(file_path))
@@ -585,7 +591,8 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
             pass
         path = _sanitize_path(file_path, ctx)
     if not os.path.isfile(path):
-        return f"Error: File not found: {file_path}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error: File not found: {file_path}")
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -644,7 +651,8 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
                     new_content = new_content.replace('\n', '\r\n')
             else:
                 if match_count > 1:
-                    return f"Error: Fuzzy match found multiple matches ({match_count}) in {file_path}. Make old_string more specific."
+                    from pydantic_ai.exceptions import ToolFailed
+                    raise ToolFailed(f"Error: Fuzzy match found multiple matches ({match_count}) in {file_path}. Make old_string more specific.")
                 else:
                     # M1 edit-failure contract: give the model a precise on-disk
                     # anchor (line range + nearest snippet) so it can retry blind
@@ -659,7 +667,8 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
                         anchor_line_number = 1
                         anchor_line = 0
                     anchor_snippet = "\n".join(content_lines_all[anchor_line:anchor_line + 5])[:400]
-                    return (
+                    from pydantic_ai.exceptions import ToolFailed
+                    raise ToolFailed(
                         f"Error: old_string not found in {file_path}. The text must match exactly.\n"
                         f"[HINT] File has {total_lines} lines. Nearest anchor: line {anchor_line_number}. "
                         f"On-disk content around line {anchor_line_number}:\n"
@@ -669,10 +678,12 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
                     )
         else:
             if old_string == new_string:
-                return f"Error: old_string and new_string are identical."
+                from pydantic_ai.exceptions import ToolFailed
+                raise ToolFailed(f"Error: old_string and new_string are identical.")
             count = content.count(old_string)
             if count > 1:
-                return f"Error: old_string matches {count} times in {file_path}. To prevent unintended edits, please include more surrounding context lines in old_string to make it unique."
+                from pydantic_ai.exceptions import ToolFailed
+                raise ToolFailed(f"Error: old_string matches {count} times in {file_path}. To prevent unintended edits, please include more surrounding context lines in old_string to make it unique.")
             new_content = content.replace(old_string, new_string, 1)  # Replace first occurrence only
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
@@ -688,4 +699,5 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
         _log_tool("edit_file", {"file_path": file_path, "old_string": old_string, "new_string": new_string}, output)
         return output
     except Exception as e:
-        return f"Error editing {file_path}: {e}"
+        from pydantic_ai.exceptions import ToolFailed
+        raise ToolFailed(f"Error editing {file_path}: {e}")

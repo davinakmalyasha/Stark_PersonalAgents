@@ -279,24 +279,6 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "template_new",
-        "description": "Author a new template: write .j2 files into templates/<level>/<name>/files/ with edit_file first, then call this with metadata to write template.json and validate rendering. Levels: stack, feature, component, snippet, project, config, routine, spec.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Lowercase kebab-case template name, e.g. 'feature-billing'."},
-                "level": {"type": "string", "description": "Category dir: stack, feature, component, snippet, project, config, routine, spec."},
-                "description": {"type": "string", "description": "ONE-line description shown in template_list."},
-                "sample_vars": {"type": "object", "description": "Example variables the CI uses to validate rendering, e.g. {'feature_name': 'User'}."},
-                "variables": {"type": "array", "description": "Optional variable specs: [{'name': ..., 'type': 'string|int|bool|list', 'required': bool, 'default': ..., 'description': ...}] or plain names ['var_a']."},
-                "files": {"type": "array", "description": "Optional file specs [{'src': 'x.py.j2', 'dest': '{{ var }}/x.py'}] — defaults to all *.j2 files in files/ with dest = name minus .j2."},
-                "uses": {"type": "array", "description": "Optional composition recipe (template names or {template, variables} dicts)."},
-                "notes": {"type": "string", "description": "Optional conventions/adaptation notes shown in the detailed view."}
-            },
-            "required": ["name", "level", "description", "sample_vars"]
-        }
-    },
-    {
         "name": "create_project",
         "description": "Create a NEW project: creates the folder (under D:\\MyProject, or under parent_root if given), registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background. The DFD agent MUST pass parent_root (the client folder under D:\\MyProject\\DFDClientProjects) so client projects always live inside the client root.",
         "parameters": {
@@ -339,7 +321,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "propose_plan",
-        "description": "Stage 4: submit a plan proposal to the user. Use ONLY in plan mode when you want the user to review and (manually) press /build to execute. Outside plan mode this tool is a no-op alias for update_plan. The agent CANNOT transition out of plan mode on its own — the user must press /build.",
+        "description": "Present the plan for the CURRENT plan-mode review. Plan mode is user-initiated via the prompt dock ONLY — never call this to start planning on your own, never suggest switching modes. Outside plan mode this is a no-op (use update_plan and keep working). The agent CANNOT change plan/build mode in either direction.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -451,25 +433,6 @@ TOOL_DEFINITIONS = [
             }
         }
     },
-    {
-        "name": "template",
-        "description": "Boilerplate catalog: list, keyword search, show details, apply (renders files; skips existing unless overwrite).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list", "search", "show", "apply"]},
-                "template": {"type": "string", "description": "Name for show/apply."},
-                "category": {"type": "string"},
-                "query": {"type": "string", "description": "Keywords for search/list."},
-                "target_dir": {"type": "string", "description": "Apply destination (default workspace root)."},
-                "variables": {"type": "object", "description": "Template variables."},
-                "overwrite": {"type": "boolean"},
-                "dry_run": {"type": "boolean"},
-                "quiet": {"type": "boolean"}
-            },
-            "required": ["action"]
-        }
-    },
     # -- House tools (mock smart home; single source of truth = house_manager) --
     {
         "name": "house_get_state",
@@ -562,7 +525,7 @@ TOOL_DEFINITIONS = [
 
 _TOOL_DOCS = {
     "read_file": "read_file(file_path?, file_paths?, offset?, limit?) — Read file(s). Single file via file_path; multi-file via file_paths=[paths].",
-    "edit_file": "edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Boilerplate → template(action=\"apply\") first.",
+    "edit_file": "edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Every new file is written by hand with this tool.",
     "run_command": "run_command(command, timeout?, background?, process_action?, shell?, workdir?, expect?, stream?) — Full POSIX bash (default): pipes, &&, $( ), jq, gh pipelines all work. shell='cmd' for legacy, workdir sets cwd, expect checks output regex, stream for live output.",
     "search_code": "search_code(pattern?, patterns?, path?, glob?) — Regex search across files. Multi-pattern via patterns=[...] ranked.",
     "browser_navigate": "browser_navigate(url, wait_ms?) — Open URL in headless Chromium, returns snapshot with @ref selectors.",
@@ -580,10 +543,8 @@ _TOOL_DOCS = {
     "call_subagent": "call_subagent(name, task) — Spawn a specialist subagent (UI, Deploy); blocks and returns its final report.",
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
-    "template_new": "template_new(name, level, description, sample_vars, variables?, files?, uses?, notes?) — Author a new template (write .j2 files first, then metadata; auto-validates render).",
     "create_project": "create_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
     "resume_project": "resume_project(name, message, timeout?) — One-call resume: find the project's Dev and deliver the message (replaces find_project_dev + send_message).",
-    "template": "template(action, template?, category?, query?, target_dir?, variables?, overwrite?, dry_run?, quiet?) — Unified template: list/search/show/apply (replaces apply_template + template_list).",
     "update_plan": "update_plan(explanation?, plan=[{step, status}]) — Maintain the task plan. FULL replacement: always send every step. At most one step in_progress.",
     "house_get_state": "house_get_state() — Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question.",
     "house_get_device": "house_get_device(device_id) — One device's state, capabilities, room, online status.",

@@ -306,12 +306,9 @@ _GATE_CHECKS = {
     "generic": ["sca", "dependency-review", "secrets", "tests", "codeql", "zizmor"],
 }
 
-# Tiered gate mapped to branch levels: T1 fast-checks on dev/feature pushes,
+# Tiered gate per branch levels: T1 fast-checks on dev/feature pushes,
 # T2 staging on the staging-level push, T3 release-heavy on prod pushes + tags.
-# The shim composes T1+T3; staging.yml is seeded alongside so the full ladder
-# exists in every gated repo. Branch names come from .harness-ci.json.
-# Branch-level names resolve via the shared <root>/branch_levels.py policy
-# module — candidates and fallbacks live there, not here.
+# Branch names come from .harness-ci.json via <root>/branch_levels.py.
 _LEVELS_CONFIG = ".harness-ci.json"
 
 _GATE_PROFILE_TEMPLATES = {
@@ -339,8 +336,7 @@ def _repo_default_branch(repo: str) -> str:
     return out.strip()
 
 def _resolve_branch_levels(repo: str) -> dict:
-    """Resolve the repo's 3-level branch map via the SHARED policy module
-    (branch_levels.py) so the installer and the harness auto-push agree.
+    """Resolve the repo's 3-level branch map via branch_levels.py.
 
     Precedence: .harness-ci.json (via API) > env > remote branch scan > defaults.
     Prod always includes main+master+detected default.
@@ -362,7 +358,6 @@ def _resolve_branch_levels(repo: str) -> dict:
                 "staging": str(br.get("staging") or "").strip(),
                 "prod": [str(x).strip() for x in
                          (raw if isinstance(raw, list) else [raw]) if str(x).strip()],
-                "auto_push": bool((data.get("harness") or {}).get("auto_push", True)),
             }
         except Exception:
             declared = {}
@@ -372,10 +367,7 @@ def _resolve_branch_levels(repo: str) -> dict:
         [h.strip() for h in heads_out.split(",") if h.strip()]
     default = _repo_default_branch(repo)
     if bl is not None:
-        # The installer names things; it does not own pushing, so the kill
-        # switch must not blank out resolution here (respect_kill=False).
-        lv = bl.normalize(declared, bl.env_overrides(), heads=heads,
-                          default=default, respect_kill=False)
+        lv = bl.normalize(declared, bl.env_overrides(), heads=heads, default=default)
         return {"dev": lv["dev"], "staging": bl.render_staging_name(lv),
                 "prod": lv["prod"], "declared": bool(declared)}
     # stdlib-only fallback mirroring branch_levels.normalize (legacy runtimes)
@@ -551,18 +543,15 @@ def _seed_gate(repo: str, profile: str = "python", codeql_on: bool = True,
                        variables={"project_name": repo_name})
     except Exception as e:
         return f"Error: gate render failed: {e}"
-    # Persist the branch-level map so the harness auto-push obeys the same names.
     cfg_path = os.path.join(tmp, _LEVELS_CONFIG)
     if not os.path.exists(cfg_path):
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump({
-                "_comment": ("Branch-level map consumed by the agent harness "
-                             "(auto-push) and the gate tooling. Tiers follow the "
-                             "levels: T1=dev/feature pushes, T2=staging push, "
-                             "T3=prod push + tags v*."),
+                "_comment": ("Branch-level map consumed by the gate tooling. "
+                             "Tiers follow the levels: T1=dev/feature pushes, "
+                             "T2=staging push, T3=prod push + tags v*."),
                 "branches": {"dev": lv["dev"], "staging": lv["staging"],
                              "prod": lv["prod"]},
-                "harness": {"auto_push": True},
             }, f, indent=2)
             f.write("\n")
     seeded, kept, errors = [], [], []
@@ -800,9 +789,8 @@ def github_apply_gate(repo: str, stack: str = "auto", codeql_on: bool = True,
     wait = _wait_for_first_run(repo)
 
     # Protection: ONLY the prod/default branch gets required checks. dev-level
-    # and staging-level branches stay OPEN on purpose — the harness auto-pushes
-    # repairs directly to the dev level, and GitHub rejects direct pushes to a
-    # branch with required status checks.
+    # and staging-level branches stay OPEN — direct pushes to a protected
+    # branch are rejected by GitHub when required checks are enforced.
     #
     # Contexts are the REAL Tier 1 job ids parsed from the workflow we just
     # seeded (fetched from the seed ref, not the possibly-switched default).
@@ -833,9 +821,8 @@ def github_apply_gate(repo: str, stack: str = "auto", codeql_on: bool = True,
 
     note = (f"\nNOTES: profile={profile}; branch map dev='{levels['dev']}' "
             f"staging='{levels['staging']}' prod={levels['prod']} "
-            f"(persisted as {_LEVELS_CONFIG}; harness auto-push lands on "
-            f"'{levels['dev']}' → Tier 1 only; dev/staging branches are "
-            "intentionally unprotected so the harness can direct-push). Coverage "
+            f"(persisted as {_LEVELS_CONFIG}; dev/staging branches are "
+            "intentionally unprotected). Coverage "
             "threshold and perf budgets are universal defaults — tune after the "
             "first green run.")
     parts = [created_prefix + seeded, ladder]
@@ -853,3 +840,102 @@ def github_init_project(name: str, private: bool = False, description: str = "",
     return github_apply_gate(name, stack=stack, codeql_on=codeql_on,
                              create=True, private=private, description=description,
                              gate=gate)
+
+
+def github_apply_observability(repo: str, package: str = "app",
+                               ref: str = "", mode: str = "sentry",
+                               confirm: str = "ask") -> str:
+    """Scaffold RUNTIME observability into a repo (health/ready + JSON logging
+    + Sentry). This is the runtime half — the CI gate half is github_apply_gate.
+
+    WAREHOUSE-ONLY: not exposed to any agent scope. Call when the project is
+    going live and needs the app-side pieces that T2/T3 live-smoke verify
+    against (a real /ready endpoint, structured logs, optional error capture).
+
+    - package: python package dir the app lives in (e.g. 'app').
+    - mode: 'sentry' (write DSN-dormant sentry.py — activates when SENTRY_DSN
+      is set later), 'log-only' (skip sentry.py), 'none' (health+logging only).
+    - confirm: 'ask' (human confirm) | 'yes' | 'no'.
+    NON-DESTRUCTIVE: every file is skip-if-exists — never overwrites a file the
+    project already wrote (hand-tuned health.py stays).
+    """
+    from tools import apply_template
+    from base64 import b64encode
+    import tempfile
+    if "/" not in repo:
+        return "Error: repo must be 'owner/name'."
+    want = _ask_gate_choice(repo, "ask" if confirm == "ask" else confirm)
+    if want is not True:
+        return f"{repo} left without the observability scaffold."
+    if not ref:
+        ref = _repo_default_branch(repo)
+    if not package or not package.strip():
+        return "Error: package (python app dir) is required, e.g. package='app'."
+    package = package.strip().strip("/")
+
+    tmp = tempfile.mkdtemp(prefix="obs-")
+    seeded, kept, errors = [], [], []
+    try:
+        r = apply_template("observability-health", target_dir=tmp,
+                           variables={"package": package})
+        if r.startswith("Error"):
+            return r
+        if mode in ("log-only", "none"):
+            p = os.path.join(tmp, package, "core", "sentry.py")
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception as e:
+        return f"Error: observability render failed: {e}"
+
+    def _put_file(p: str, content: bytes, sha_val: str = "") -> str:
+        body = {"message": "observability: add " + p,
+                "content": b64encode(content).decode("ascii")}
+        if sha_val:
+            body["sha"] = sha_val
+        body_path = os.path.join(tmp, ".obs-put-body.json")
+        with open(body_path, "w", encoding="utf-8") as bf:
+            json.dump(body, bf)
+        return _gh_api(["-X", "PUT", f"repos/{repo}/contents/{p}",
+                        "-H", "Content-Type: application/json",
+                        "--input", body_path])
+
+    for root, _dirs, fns in os.walk(tmp):
+        for fn in sorted(fns):
+            p = os.path.relpath(os.path.join(root, fn), tmp).replace("\\", "/")
+            if p in (".obs-put-body.json",):
+                continue
+            try:
+                with open(os.path.join(root, fn), "rb") as f:
+                    content = f.read()
+            except Exception as e:
+                errors.append(f"{p}: {e}")
+                continue
+            sha = _gh_api([f"repos/{repo}/contents/{p}?ref={ref}", "--jq", ".sha"])
+            exists = not sha.startswith("Error") and bool(sha.strip())
+            if exists:
+                kept.append(p)  # skip-if-exists: never overwrite project files
+                continue
+            out = _put_file(p, content, sha_val="")
+            if out.startswith("Error"):
+                errors.append(f"{p}: {str(out)[:120]}")
+            else:
+                seeded.append(p)
+
+    lines = [
+        f"Seeded {len(seeded)} observability file(s) into {repo}@{ref} (package='{package}', mode={mode})."
+    ]
+    if seeded:
+        lines.append("  added: " + ", ".join(seeded))
+    if kept:
+        lines.append("  kept (exists, untouched): " + ", ".join(kept))
+    if errors:
+        lines.append("Errors: " + "; ".join(errors[:5]))
+    lines.append(
+        "NEXT (agent/human wiring): 1) app.include_router(health.router) — /health + /ready; "
+        "2) setup_logging() in lifespan; "
+        + ("3) init_sentry() in lifespan + set SENTRY_DSN in .env to activate error capture. "
+           if mode == "sentry" else "3) log-only mode (no Sentry). ")
+        + "T2 staging live-smoke now verifies a real /ready."
+    )
+    return "\n".join(lines)
+

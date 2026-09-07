@@ -2,6 +2,10 @@
 
 Template state is local to this module. Workspace, cache, and GitHub helpers
 are imported lazily inside functions through the tools.py facade.
+
+Scope: only the CI/deploy gate templates remain (config/routine/project) —
+the feature/stack/component/spec catalog was removed. github_apply_gate is
+the sole consumer of this renderer.
 """
 import json
 import os
@@ -17,8 +21,7 @@ _TEMPLATES_DIR = os.path.join(
 
 _SYNC_STAMP = ".sync.json"
 
-_TEMPLATE_CATEGORIES = ("stack", "feature", "component", "snippet", "project",
-                        "config", "routine", "spec")
+_TEMPLATE_CATEGORIES = ("config", "routine", "project")
 
 def _template_dir(name: str) -> Optional[str]:
     """Locate a template folder (one level deep: templates/<level>/<name>/)."""

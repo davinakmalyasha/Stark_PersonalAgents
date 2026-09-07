@@ -18,7 +18,7 @@ Replaces the Gradio dashboard with SSE streaming endpoints.
 import os
 import sys
 
-# â”€â”€ Interpreter guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#Interpreter guard”
 # Single venv (Python 3.14) is the primary interpreter. VOICE_PYTHON env var
 # overrides for legacy Moonshine voice (venv312).
 # Order: VOICE_PYTHON > venv (3.14) > .venv > venv312 (legacy fallback).
@@ -60,7 +60,7 @@ _ensure_venv()
 # Back-compat alias
 _ensure_venv312 = _ensure_venv
 
-# â”€â”€ Voice module path (audio_engine, voice_services moved to Voice/) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Voice module path (audio_engine, voice_services moved to Voice/)
 _VOICE_DIR = os.path.join(_ROOT, "Voice")
 if _VOICE_DIR not in sys.path:
     sys.path.insert(0, _VOICE_DIR)
@@ -192,6 +192,8 @@ from server.routers.ui import router as ui_router
 app.include_router(ui_router)
 from server.routers.mcp import router as mcp_router
 app.include_router(mcp_router)
+from server.routers.agentsadmin import router as agentsadmin_router
+app.include_router(agentsadmin_router)
 from server.routers.ask import router as ask_router
 app.include_router(ask_router)
 from server.routers.snapshots import router as snapshots_router
@@ -241,7 +243,7 @@ async def pairing_rotate(request: Request):
     return {"token": reset_pairing_token()}
 
 
-# â”€â”€ Models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#”Models”
 
 class RunRequest(BaseModel):
     prompt: str
@@ -517,6 +519,14 @@ if __name__ == "__main__":
     import uvicorn
     import sys
 
+    # Logfire observability (no-op until LOGFIRE_ENABLED=1 + token set).
+    try:
+        from llm.observability import instrument_logfire
+        if instrument_logfire():
+            print("[STARTUP] Logfire instrumentation enabled.")
+    except Exception:
+        pass
+
     reload_mode = "--reload" in sys.argv
 
     # Single-instance guard: if port already held, exit quietly (no storm, no
@@ -529,9 +539,8 @@ if __name__ == "__main__":
     _start_task_scheduler()
 
     # NOTE: The embedding model (fastembed bge-large ~1.3GB) is deliberately
-    # NOT warmed at boot — it is lazy-loaded on first embed() call in
-    # memory/embedding_service.py, and the only live consumer (template
-    # search's semantic boost) already gates on _embedding_model_warm().
+    # NOT warmed at boot - it is lazy-loaded on first embed() call in
+    # memory/embedding_service.py, gated on _embedding_model_warm().
     # Keeping it cold frees ~1.3GB of resident RAM for the harness.
 
     # NOTE: The Pocket TTS model is deliberately NOT warmed at boot — it is

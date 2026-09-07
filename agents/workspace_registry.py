@@ -76,7 +76,6 @@ _register(
             "edit_file",
             "run_command",
             "search_code",
-            "template",
             "ask_user",
             "update_plan",
             "propose_plan",
@@ -168,7 +167,7 @@ _register(
     WorkspaceSpec(
         key="deploy",
         display="Deploy",
-        tools=("github_apply_gate", "template", "run_command", "read_file"),
+        tools=("github_apply_gate", "run_command", "read_file"),
         tier="specialist",
         history_ns="_deploy",
         description="Deploy — CI gate and deploy specialist",

@@ -107,16 +107,24 @@ def _normalize_args(name: str, func: Callable, args: dict) -> dict:
     return args
 
 
+_CTX_PARAM_CACHE: dict[int, Optional[str]] = {}
+
+
 def _ctx_param_name(func: Callable) -> Optional[str]:
     """Name of the first ctx/deps/run_ctx/context param on a migrated tool,
-    or None when the tool takes no typed workspace deps."""
+    or None when the tool takes no typed workspace deps. Cached per-function."""
     try:
+        fid = id(func)
+        if fid in _CTX_PARAM_CACHE:
+            return _CTX_PARAM_CACHE[fid]
         params = list(inspect.signature(func).parameters.keys())
     except Exception:
-        params = []
+        return None
     for p in params:
         if p.lower() in ("ctx", "deps", "run_ctx", "context"):
+            _CTX_PARAM_CACHE[fid] = p
             return p
+    _CTX_PARAM_CACHE[fid] = None
     return None
 
 

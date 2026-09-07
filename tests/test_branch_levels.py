@@ -11,13 +11,11 @@ def test_load_repo_config_full():
         p = os.path.join(d, ".harness-ci.json")
         with open(p, "w", encoding="utf-8") as f:
             json.dump({"branches": {"dev": "develop", "staging": "qa",
-                                    "prod": ["trunk", "release"]},
-                       "harness": {"auto_push": False}}, f)
+                                    "prod": ["trunk", "release"]}}, f)
         cfg = bl.load_repo_config(d)
         assert cfg["dev"] == "develop"
         assert cfg["staging"] == "qa"
         assert cfg["prod"] == ["trunk", "release"]
-        assert cfg["auto_push"] is False
 
 
 def test_load_repo_config_prod_scalar_becomes_list():
@@ -40,13 +38,12 @@ def test_load_repo_config_absent_or_malformed_empty():
 
 
 def test_env_overrides_parsing():
-    env = {"CI_DEV_BRANCH": " dev ", "CI_STAGING_BRANCH": "", 
-           "CI_PROD_BRANCHES": "trunk, release ,", "CI_GATE_BRANCH": "OFF"}
+    env = {"CI_DEV_BRANCH": " dev ", "CI_STAGING_BRANCH": "",
+           "CI_PROD_BRANCHES": "trunk, release ,"}
     o = bl.env_overrides(env)
     assert o["dev"] == "dev"
     assert o["staging"] == ""
     assert o["prod"] == ["trunk", "release"]
-    assert o["kill"] == "off"
 
 
 def test_discover_candidates():
@@ -95,29 +92,10 @@ def test_normalize_declared_beats_env():
     assert lv["dev"] == "decl"
 
 
-def test_kill_switch_disables_auto_push():
-    with clean_ci_env(CI_GATE_BRANCH="off"):
-        assert bl.normalize({}, bl.env_overrides(), heads=[], default="main") is None
-
-
-def test_auto_push_false_disables():
+def test_normalize_always_returns_levels():
     with clean_ci_env():
-        assert bl.normalize({"auto_push": False}, {}, heads=[], default="main") is None
-
-
-def test_respect_kill_false_ignores_kill_switch():
-    """The gate installer names things; it must resolve even under kill switch."""
-    with clean_ci_env(CI_GATE_BRANCH="off"):
-        lv = bl.normalize({}, bl.env_overrides(), heads=[], default="main",
-                          respect_kill=False)
+        lv = bl.normalize({}, {}, heads=[], default="main")
     assert lv is not None and lv["dev"] == "development"
-
-
-def test_kill_branch_names_dev_level():
-    """CI_GATE_BRANCH=<name> (not off/auto) targets that branch as dev level."""
-    with clean_ci_env(CI_GATE_BRANCH="feat-x"):
-        lv = bl.normalize({}, bl.env_overrides(), heads=[], default="main")
-    assert lv["dev"] == "feat-x"
 
 
 def test_collision_flag():
@@ -128,8 +106,7 @@ def test_collision_flag():
 
 def test_default_equal_to_dev_not_counted_prod():
     """Fresh gated repos switch their default branch to the dev level — that
-    default must NOT be unioned into prod, or the collision guard would block
-    auto-push forever (live-smoke finding)."""
+    default must NOT be unioned into prod."""
     with clean_ci_env():
         lv = bl.normalize({}, {}, heads=["development", "main"], default="development")
     assert lv["dev"] == "development"

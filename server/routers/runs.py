@@ -156,7 +156,7 @@ class RunRequest(BaseModel):
     workspace_path: str = ""
     chat_id: str = ""
     attachments: list[dict] = []
-    workspace_kind: str = ""  # hint: "" | "house" | "personal"
+    workspace_kind: str = ""  # hint: "" | "house" | "personal" | "dfd" | "design"
 
 
 @router.post("/api/run")
@@ -269,19 +269,35 @@ async def run_pipeline(req: RunRequest, request: Request):
 
         last_ver = 0
         last_bus_drain = 0.0
+        # Event-driven bus wake: avoid 50ms poll when deltas arrive.
+        try:
+            from server.realtime.bus import (
+                drain as _bus_drain,
+                cleanup as _bus_cleanup,
+                get_bus_event as _get_bus_event,
+            )
+            _bus_event = _get_bus_event(req.chat_id)
+        except Exception:
+            _bus_event = None
+
         while True:
             if await request.is_disconnected():
                 cancel_event.set()
                 break
 
-            # StreamBus token deltas
+            # StreamBus token deltas — drain immediately if any, else wait event-driven.
             try:
-                from server.realtime.bus import drain as _bus_drain, cleanup as _bus_cleanup
                 deltas = _bus_drain(req.chat_id)
                 if deltas:
                     for d in deltas:
                         _mirror_publish(req.chat_id, "delta", d)
                         yield _format_sse("delta", d)
+                    # keep event cleared after drain so next emit wakes us
+                    if _bus_event is not None:
+                        try:
+                            _bus_event.clear()
+                        except Exception:
+                            pass
                 now = time.time()
                 if now - last_bus_drain > 60:
                     last_bus_drain = now
@@ -289,8 +305,30 @@ async def run_pipeline(req: RunRequest, request: Request):
             except Exception:
                 pass
 
+            # Wait for either state snapshot (aq) or bus event, event-driven (20ms) instead of 50+50 polling.
             try:
-                item = await asyncio.wait_for(aq.get(), timeout=0.05)
+                # Prefer bus event wake when idle: wait on both with shorter timeout.
+                if _bus_event is not None and not deltas:
+                    # Brief event wait + aq poll combined — ~20ms idle cadence vs 100ms before.
+                    try:
+                        await asyncio.wait_for(_bus_event.wait(), timeout=0.02)
+                        if _bus_event is not None:
+                            try:
+                                _bus_event.clear()
+                            except Exception:
+                                pass
+                        # drain again after wake
+                        try:
+                            deltas2 = _bus_drain(req.chat_id)
+                            if deltas2:
+                                for d in deltas2:
+                                    _mirror_publish(req.chat_id, "delta", d)
+                                    yield _format_sse("delta", d)
+                        except Exception:
+                            pass
+                    except asyncio.TimeoutError:
+                        pass
+                item = await asyncio.wait_for(aq.get(), timeout=0.02)
                 if item is None:
                     break
                 if isinstance(item, dict):
@@ -306,7 +344,6 @@ async def run_pipeline(req: RunRequest, request: Request):
                         snap["_intermediate"] = True
                         _mirror_publish(req.chat_id, "state", snap)
                         yield _format_sse("state", snap)
-                await asyncio.sleep(0.05)
 
         _save_chat_token_usage(req.workspace_path, req.chat_id)
 

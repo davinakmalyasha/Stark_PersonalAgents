@@ -24,6 +24,7 @@ Dockerfile*
 PromptFor*.txt
 *_Report.txt
 *Requirements.txt
+!requirements.txt
 *TechnicalSpec.txt
 *DevOpsConfig.txt
 *QA_TestReport.txt
@@ -73,6 +74,12 @@ server_port.json
 # Scratch working dirs (browser profile temp junk, never commit)
 scratch/agents_works/design/.tmp-chrome/
 scratch/agents_works/design/.tmp-c2/
+scratch/_sim_*/
+scratch/_review_profile/
+scratch/compaction_reports/
+Testing_Log/Log/
 .commandcode/
 scratch/eval_tmp/
+_house/
+.playwright-mcp/
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 from ._schemas import get_native_tool_names
@@ -50,9 +50,11 @@ class ToolExecutionResult:
         first_line = text.lstrip().splitlines()[0] if text.strip() else ""
 
         exit_code = None
-        match = re.match(r"\[(?:OK|ERR)\]\s+Exit\s+(-?\d+)", first_line, re.IGNORECASE)
+        is_ok = None
+        match = re.match(r"\[(OK|ERR)\]\s+Exit\s+(-?\d+)", first_line, re.IGNORECASE)
         if match:
-            exit_code = int(match.group(1))
+            is_ok = match.group(1).upper() == "OK"
+            exit_code = int(match.group(2))
         else:
             match = re.search(r"Exit\s+code\s+(-?\d+)", first_line, re.IGNORECASE)
             if match:
@@ -68,7 +70,8 @@ class ToolExecutionResult:
             "[BLOCKED]",
             "Tool execution error",
         ))
-        is_error = explicit_error or timed_out or (exit_code is not None and exit_code != 0)
+        # The [OK]/[ERR] tag is authoritative; exit code is only a fallback.
+        is_error = explicit_error or timed_out or (exit_code is not None and is_ok is False)
         return cls(
             name=name,
             args=dict(args or {}),
@@ -128,6 +131,21 @@ def _ctx_param_name(func: Callable) -> Optional[str]:
     return None
 
 
+def _cap_tool_result(res: ToolExecutionResult) -> ToolExecutionResult:
+    """Apply the tool's character cap via the shared offload path.
+
+    This is the single enforcement point for every registry-driven loop
+    (developer, general, house, dfd, orchestrator, subagent_manager,
+    subagentTools). Tools that already self-cap at the same value are no-ops.
+    """
+    from ._runtime import _tool_cap, auto_offload_result
+
+    capped = auto_offload_result(res.content, res.name, max_chars=_tool_cap(res.name))
+    if capped == res.content:
+        return res
+    return replace(res, content=capped, offloaded=True)
+
+
 def execute_tool_detailed(
     name: str,
     args: dict,
@@ -138,11 +156,23 @@ def execute_tool_detailed(
 
     ``scope`` is accepted for backward compatibility and ignored — the caller's
     loop already filtered the call against its own allowlist, and the native
-    path scopes via ``FilteredToolset``. No hooks, no guards.
+    path scopes via ``FilteredToolset``. No hooks, no guards. Results are
+    capped at the tool's character budget (full output is offloaded).
     """
     import tools as _facade
 
     impl = getattr(_facade, name, None)
+    if not callable(impl) and str(name).startswith("mcp__"):
+        # MCP tools have no Python impl in the facade; dispatch to the bridge
+        # (mirrors llm/native_tools.py's native-path wiring) so free-pool and
+        # registry-driven loops can execute scoped MCP tools too.
+        try:
+            from tools.mcp.mcp_bridge import mcp_execute
+
+            result = mcp_execute(str(name), dict(args or {}), scope=scope or "")
+        except Exception as e:
+            result = f"Error executing {name}: {e}"
+        return _cap_tool_result(ToolExecutionResult.from_content(name, dict(args or {}), str(result)))
     if not callable(impl):
         return ToolExecutionResult.from_content(
             name, args, f"Error: Unknown tool '{name}'"
@@ -161,7 +191,7 @@ def execute_tool_detailed(
         result = f"Error executing {name}: {e}"
     if not isinstance(result, str):
         result = str(result)
-    return ToolExecutionResult.from_content(name, norm_args, result)
+    return _cap_tool_result(ToolExecutionResult.from_content(name, norm_args, result))
 
 
 def execute_tool(name: str, args: dict, deps: Any = None) -> str:

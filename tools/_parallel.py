@@ -28,6 +28,7 @@ from typing import Callable, Iterable
 #: entries for absent tools are inert.
 PARALLEL_SAFE = frozenset({
     "read_file",
+    "outline",
     "search_code",
     "read_pdf",
     "github_search_code",
@@ -40,8 +41,6 @@ PARALLEL_SAFE = frozenset({
     "github_view_pull_request",
     "github_view_workflow_run",
     "web_search",
-    "list_async_tasks",
-    "check_async_task",
     "update_plan",
     "delegation_status",
     "files_changed",

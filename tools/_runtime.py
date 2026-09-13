@@ -118,36 +118,48 @@ def _increment_cache_version() -> None:
 WORKSPACE = _HARNESS_ROOT
 
 _TOOL_CAP_DEFAULTS = {
-    # Keep every model-facing result bounded and recoverable. Individual tools
-    # already use these caps where possible; the developer loop also applies
-    # them as a final guard for legacy or third-party implementations.
-    "read_file": 5000,
-    "search_code": 5000,
-    "edit_file": 5000,
-    "run_command": 6000,          # test runs: head+tail preview is enough; install noise offloads
-    "run_command_timeout": 5000,  # hung-process junk: offload sooner
-    "logs": 6000,                 # streaming server logs: poll + page
-    "browser_act": 6000,
-    "ask_user": 2500,
-    "github_apply_gate": 6000,
-    "update_plan": 500,           # tiny fixed-size result: status counts only
-    "subagent": 6000,             # subagent internal tool results: enough for the NEXT decision, not a dump
-    "mcp": 6000,                  # MCP tool results: bounded, offloadable like run_command
+    # Character caps (not bytes), applied centrally in execute_tool_detailed.
+    # Full output past a cap is offloaded to /scratch/large_tool_results/.
+    "read_file": 50000,
+    "outline": 16000,
+    "search_code": 16000,
+    "ast_search": 16000,
+    "edit_file": 10000,
+    "run_command": 30000,
+    "run_command_timeout": 30000,
+    "logs": 30000,
+    "browser_act": 24000,
+    "web_search": 10000,
+    "ask_user": 4000,
+    "github_apply_gate": 4000,
+    "update_plan": 2000,
+    "subagent": 32000,
+    "mcp": 25000,
+}
+
+_CAP_KEY_ALIASES = {
+    "call_subagent": "subagent",
+    "delegate": "subagent",
+    "browser_navigate": "browser_act",
 }
 
 def _tool_cap(site: str) -> int:
-    default = _TOOL_CAP_DEFAULTS.get(site, 9000)
-    env_name = f"CAP_{site.upper()}"
+    key = site.lower()
+    if key.startswith("mcp__") or key.startswith("mcp_"):
+        key = "mcp"
+    key = _CAP_KEY_ALIASES.get(key, key)
+    default = _TOOL_CAP_DEFAULTS.get(key, 16000)
+    env_name = f"CAP_{key.upper()}"
     return int(os.environ.get(env_name, str(default)))
 
-def _create_budgeted_preview(content_str: str, max_chars: int = 2500,
+def _create_budgeted_preview(content_str: str, max_chars: int = 8000,
                              head_ratio: float = 0.25, min_lines: int = 4) -> str:
     """Token-budgeted head+tail preview for offloaded tool output.
 
     Deterministic per-call cost (no 1000-char-line surprise): at most ~max_chars
     chars of preview, split head 25% / tail 75% (errors, tracebacks and last
     assertions live in the tail; the head only needs command context). Individual
-    lines are trimmed to 200 chars. Line-numbered so offset/limit paging stays
+    lines are trimmed to 512 chars. Line-numbered so offset/limit paging stays
     precise. Returns the content unchanged when it fits in the budget.
     """
     if len(content_str) <= max_chars:
@@ -177,26 +189,17 @@ def _create_budgeted_preview(content_str: str, max_chars: int = 2500,
         tail.append(lines[-1 - len(tail)])
     if len(head) + len(tail) > len(lines):
         tail = tail[:max(0, len(lines) - len(head))]
-    head = [ln[:200] for ln in head]
-    tail = [ln[:200] for ln in tail]
+    head = [ln[:512] for ln in head]
+    tail = [ln[:512] for ln in tail]
     omitted = len(lines) - len(head) - len(tail)
     head_sample = format_content_with_line_numbers(head, start_line=1)
     tail_sample = format_content_with_line_numbers(tail, start_line=len(lines) - len(tail) + 1)
     truncation_notice = f"\n... [{omitted} lines truncated] ...\n"
     return head_sample + truncation_notice + tail_sample
 
-def auto_offload_result(content_str: str, tool_name: str, max_chars: int = 15000) -> str:
-    """If output is too large, offloads full content to VFS scratch and returns TOO_LARGE_TOOL_MSG.
-
-    `max_chars` is per-call. Large command/test output is mostly noise (progress bars,
-    npm warnings, directory dumps) â€” the head (command context) and tail (exit code,
-    traceback, last assertion) carry the signal. Offloading early keeps the per-turn
-    cache-miss input small without losing the full output (it is on disk, readable).
-    """
-    if len(content_str) <= max_chars:
-        return content_str
+def _write_offload_file(content_str: str, tool_name: str) -> str:
+    """Persist full tool output under /scratch/large_tool_results/; '' on failure."""
     import uuid
-    from deepagents.middleware._message_eviction import TOO_LARGE_TOOL_MSG
 
     file_id = uuid.uuid4().hex[:8]
     clean_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in tool_name)[:50]
@@ -206,7 +209,7 @@ def auto_offload_result(content_str: str, tool_name: str, max_chars: int = 15000
         res = vfs_router.write(vfs_path, content_str)
         if res and res.error:
             raise RuntimeError(res.error)
-    except Exception as e:
+    except Exception:
         # Fallback to writing directly to physical scratch directory
         try:
             path = _sanitize_path(vfs_path)
@@ -215,16 +218,34 @@ def auto_offload_result(content_str: str, tool_name: str, max_chars: int = 15000
                 f.write(content_str)
         except Exception as e_inner:
             print(f"Error offloading tool message: {e_inner}")
-            return content_str[:max_chars] + f"\n... [TRUNCATED DUE TO ERROR: {e_inner}] ..."
+            return ""
+    return vfs_path
 
-    content_sample = _create_budgeted_preview(content_str)
+
+def auto_offload_result(content_str: str, tool_name: str, max_chars: int = 16000) -> str:
+    """If output is too large, offloads full content to VFS scratch and returns TOO_LARGE_TOOL_MSG.
+
+    `max_chars` is per-call. Large command/test output is mostly noise (progress bars,
+    npm warnings, directory dumps) â€” the head (command context) and tail (exit code,
+    traceback, last assertion) carry the signal. Offloading early keeps the per-turn
+    cache-miss input small without losing the full output (it is on disk, readable).
+    """
+    if len(content_str) <= max_chars:
+        return content_str
+    from deepagents.middleware._message_eviction import TOO_LARGE_TOOL_MSG
+
+    vfs_path = _write_offload_file(content_str, tool_name)
+    if not vfs_path:
+        return content_str[:max_chars] + "\n... [TRUNCATED — offload write failed] ..."
+
+    content_sample = _create_budgeted_preview(content_str, max(1, min(8000, max_chars)))
     try:
         from memory.context_compaction import truncation_note
         content_sample += truncation_note(len(content_str), max_chars)
     except Exception:
         pass
     return TOO_LARGE_TOOL_MSG.format(
-        tool_call_id=f"{clean_name}_{file_id}",
+        tool_call_id=os.path.basename(vfs_path)[:-4],
         file_path=vfs_path,
         content_sample=content_sample
     )
@@ -489,6 +510,16 @@ def _check_and_request_approval(file_path: str, action: str, deps: Any = None):
         or (not norm_path.startswith("c:") and not norm_path.startswith("d:")) # Relative paths are usually inside active project
         and langchain_root in active_ws_norm
     )
+
+    # Eval/benchmark workspaces under <root>/scratch/eval_tmp are throwaway
+    # sandboxes: their config files (config.json, package.json, ...) are the
+    # TASK ITSELF and must be freely editable. The approval gate is for the
+    # real codebase, not benchmark scratch dirs.
+    is_eval_ws = norm_path.startswith(
+        os.path.normpath(os.path.join(langchain_root, "scratch", "eval_tmp")).lower()
+    )
+    if is_eval_ws:
+        in_langchain = False
 
     is_core_config = in_langchain and (
         ".deep_agents" in norm_path

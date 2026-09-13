@@ -1,10 +1,10 @@
 # read_file
 
-- **Description:** Read a file, or several via file_paths (per-file sections).
+- **Description:** Read one file, or several in ONE call via file_paths (each gets its own [FILE] section; offset/limit apply to every file in the batch) — when 2+ files are needed, batch them in a single call to save turns. A full read returns the first page under a [FILE] header (lines x-y of N); when PARTIAL is shown, page onward with offset/limit. A repeat full read of an unchanged file returns a cached stub — use offset/limit to re-read a specific slice.
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** developer, ui, deploy
 - **Parallel-safe (PARALLEL_SAFE):** True
-- **Compact doc:** read_file(file_path?, file_paths?, offset?, limit?) — Read file(s). Single file via file_path; multi-file via file_paths=[paths].
+- **Compact doc:** read_file(file_path?, file_paths?, offset?, limit?) — Read one file, or batch several via file_paths in ONE call ([FILE] sections; offset 1-based, applies per file in a batch). Full read returns first page + header; PARTIAL -> page with offset/limit; unchanged repeat -> cached stub.
 - **Required args (validated):** (none)
 - **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema(TOOL_DEFINITIONS) | cache via Hooks.before_tool_execute | FilteredToolset scope
@@ -12,9 +12,9 @@
 
 ## Parameters (JSON Schema)
 
-  - `file_path` (string, optional): 
-  - `file_paths` (array, optional): 
-  - `offset` (integer, optional): Start line.
+  - `file_path` (string, optional): Single file path.
+  - `file_paths` (array, optional): Batch of file paths to read in one call.
+  - `offset` (integer, optional): Start line (1-based; 0 = first line).
   - `limit` (integer, optional): Max lines.
 
 ## How to recreate

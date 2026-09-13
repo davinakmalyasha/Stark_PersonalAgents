@@ -12,7 +12,6 @@ from ._shared import _log_tool
 
 from sync.sync_helpers import (
     PLAN_STATUSES,
-    MAX_PLAN_STEPS,
     MAX_STEP_CHARS,
     save_plan,
     plan_state,
@@ -68,8 +67,6 @@ def _normalize_plan(plan) -> tuple[list[dict], list[str]]:
             errors.append(f"invalid status '{status}' (must be pending|in_progress|completed)")
             continue
         items.append({"step": step[:MAX_STEP_CHARS], "status": status})
-        if len(items) >= MAX_PLAN_STEPS:
-            break
     if not items:
         return [], errors or ["plan must contain at least one step"]
     in_progress = [i for i in items if i["status"] == "in_progress"]

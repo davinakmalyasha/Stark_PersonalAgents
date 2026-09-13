@@ -16,8 +16,9 @@ from ._shared import _log_tool
 # (not head+tail â€” the middle of a file is usually the important code). When the
 # file is longer, the header carries a PARTIAL view notice pointing at offset/limit
 # paging. Explicit offset/limit reads are always honored as requested.
-_READ_PAGE_LINES = 250
-_READ_PAGE_CHARS = 4000
+_READ_PAGE_LINES = 2000
+_READ_PAGE_CHARS = 50000
+_READ_LINE_CHARS = 2000
 _PARTIAL_NOTICE = (
     "[PARTIAL view: returned lines {start}-{end} of {total}. "
     "Use read_file(offset={next_offset}) to continue, or search_code to locate specific lines.]\n"
@@ -39,6 +40,18 @@ def _apply_read_first_page(lines, total, is_full_read):
         size -= len(dropped)
         capped = True
     return lines, capped or total > len(lines)
+
+
+def _trim_long_lines(lines):
+    """Trim individual lines wider than _READ_LINE_CHARS, preserving line count."""
+    out = []
+    for ln in lines:
+        body = ln.rstrip("\r\n")
+        if len(body) > _READ_LINE_CHARS:
+            ending = ln[len(body):]
+            ln = body[:_READ_LINE_CHARS] + f"... (line truncated to {_READ_LINE_CHARS} chars)" + ending
+        out.append(ln)
+    return out
 
 
 def _log_offload_read(file_path: str) -> None:
@@ -79,10 +92,10 @@ def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list
             for p in file_paths:
                 if not isinstance(p, str) or not p.strip():
                     continue
-                parts.append(read_file(file_path=p.strip()))
+                parts.append(read_file(ctx=ctx, file_path=p.strip(), offset=offset, limit=limit))
             return "\n\n".join(parts) if parts else "Error: file_paths empty or invalid"
         elif isinstance(file_paths, str) and file_paths.strip():
-            return read_file(file_path=file_paths.strip())
+            return read_file(ctx=ctx, file_path=file_paths.strip(), offset=offset, limit=limit)
     if not file_path or not str(file_path).strip():
         return "Error: read_file requires file_path or file_paths"
     file_path = str(file_path).strip()
@@ -132,6 +145,7 @@ def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list
             lines = content.splitlines(keepends=True)
             total = _real_total or len(lines)
             lines, partial = _apply_read_first_page(lines, total, offset == 0 and limit is None)
+            lines = _trim_long_lines(lines)
             result = "".join(lines)
             start_line = line_offset + 1
             end_line = line_offset + len(lines)
@@ -202,6 +216,7 @@ def read_file(ctx: object = None, file_path: str = "", file_paths: Optional[list
             lines = lines[:limit]
         is_full_read = offset == 0 and not limit
         lines, partial = _apply_read_first_page(lines, total, is_full_read)
+        lines = _trim_long_lines(lines)
 
         result = "".join(lines)
         if not result.strip():

@@ -1,3 +1,5 @@
+import os
+
 from typing import Optional
 
 """Central model-facing tool schemas and compact tool documentation.
@@ -9,31 +11,43 @@ tools.TOOL_DEFINITIONS, tools._TOOL_DOCS, and tools._TOOL_REQUIRED_ARGS.
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
-        "description": "Read a file, or several via file_paths (per-file sections).",
+        "description": "Read one file, or several in ONE call via file_paths (each gets its own [FILE] section; offset/limit apply to every file in the batch) — when 2+ files are needed, batch them in a single call to save turns. A full read returns the first page under a [FILE] header (lines x-y of N); when PARTIAL is shown, page onward with offset/limit. A repeat full read of an unchanged file returns a cached stub — use offset/limit to re-read a specific slice.",
         "parameters": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string"},
+                "file_path": {"type": "string", "description": "Single file path."},
                 "file_paths": {
                     "type": "array",
-                    "items": {"type": "string"}
+                    "items": {"type": "string"},
+                    "description": "Batch of file paths to read in one call."
                 },
-                "offset": {"type": "integer", "description": "Start line."},
+                "offset": {"type": "integer", "description": "Start line (1-based; 0 = first line)."},
                 "limit": {"type": "integer", "description": "Max lines."}
             },
             "required": []
         }
     },
     {
+        "name": "outline",
+        "description": "Signature outline of ONE file — every function/class/method with its definition line, bodies omitted (~1/10 the tokens of a full read). Use before read_file: pick the symbol here, then read_file(offset=line, limit=N) for just its body.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "File to outline."}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
         "name": "edit_file",
-        "description": "Edit or create files via exact replacement.",
+        "description": "Edit or create files. Mode A — targeted change: old_string -> new_string (must match exactly and uniquely; identical strings error). Mode B — create or overwrite a WHOLE file: file_path + new_string only. Mode C — batch/multi-file diff: '*** Add File: p' / '*** Update File: p' / '*** Delete File: p' / '*** Move to: p' headers, optionally wrapped in '*** Begin Patch' / '*** End Patch'. Update bodies use @@ hunks: lines prefixed '-' are removed, '+' are added, and ' ' (space) are unchanged context lines that anchor the hunk — line numbers are optional and ignored, so hunks tolerate drift (preferred over SEARCH/REPLACE for multi-hunk and multi-file edits). Applied transactionally with [OK]/[ERROR] summary. verify = 'py_compile' | 'tsc' | shell command, runs after the write.",
         "parameters": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string"},
-                "old_string": {"type": "string", "description": "Exact existing text."},
-                "new_string": {"type": "string", "description": "Replacement; omit old_string to create/overwrite."},
-                "diff": {"type": "string", "description": "Batch mode. (1) SEARCH/REPLACE blocks: <<<<<<< SEARCH\\n[old]\\n=======\\n[new]\\n>>>>>>> REPLACE; (2) unified diff (git @@ hunks, uses file_path); (3) multi-file patch: '*** Add File: path', '*** Update File: path', '*** Delete File: path', '*** Move to: path' headers — applied per-file transactionally with [OK]/[ERROR] summary."},
+                "old_string": {"type": "string", "description": "Exact existing text (Mode A)."},
+                "new_string": {"type": "string", "description": "Replacement (Mode A) or full file content (Mode B: omit old_string)."},
+                "diff": {"type": "string", "description": "Mode C payload: '*** File:' headers (optional *** Begin Patch / *** End Patch envelope) with @@ hunks — '-' removed, '+' added, ' ' context anchors; line numbers optional and ignored. Legacy SEARCH/REPLACE blocks and numbered unified diffs are also accepted."},
                 "verify": {"type": "string", "description": "'py_compile' | 'tsc' | shell command — runs after write."}
             },
             "required": ["file_path"]
@@ -41,17 +55,20 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "run_command",
-        "description": "Run a shell command. Foreground blocks and streams logs; background returns a key managed via process_action.",
+        "description": "Run a shell command (Git Bash, POSIX). Foreground blocks and streams output; server-like commands (npm run dev, vite, uvicorn, python -m http.server...) that exceed the timeout are auto-moved to background. Background runs return a process name managed via process_action. Windows tools work as subprocesses: powershell.exe -NoProfile -Command '...' or cmd.exe /c '...'.",
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command; also names the process for process_action='logs'|'kill'."},
-                "timeout": {"type": "integer", "description": "Foreground timeout ms."},
+                "command": {"type": "string", "description": "Shell command; also names the process for process_action='logs'|'kill'|'wait'."},
+                "timeout": {"type": "integer", "description": "Wall-clock limit in ms (default 120000, max 600000; values <1000 are seconds). Use >=60000 for installs; background=true for servers."},
+                "idle_timeout": {"type": "integer", "description": "Kill after this long with no output and no CPU activity, in ms (default 60000; 0 disables). Server-like/busy commands are backgrounded instead of killed."},
                 "background": {"type": "boolean"},
-                "process_action": {"type": "string", "description": "'list' | 'logs' | 'kill'."},
-                "shell": {"type": "string", "description": "'bash' only (Git Bash 5.3.15); 'cmd' is removed — use bash."},
+                "process_action": {"type": "string", "enum": ["list", "logs", "kill", "wait", "ready", "send", "kill_all"], "description": "'list' | 'logs' | 'kill' | 'wait' | 'ready' | 'send' | 'kill_all' (command carries the process name)."},
                 "workdir": {"type": "string", "description": "Working directory (default project root)."},
-                "expect": {"type": "string", "description": "Regex expected in output; typed pass/fail."}
+                "expect": {"type": "string", "description": "Regex expected in output; typed pass/fail. For background starts it is awaited up to ready_timeout."},
+                "tail_lines": {"type": "integer", "description": "Lines returned by process_action='logs' (default 200)."},
+                "ready_timeout": {"type": "integer", "description": "Background readiness wait in ms (default 15000; 0 = don't wait). Also used by process_action='ready'."},
+                "input": {"type": "string", "description": "process_action='send': text written to the background process stdin."}
             },
             "required": []
         }
@@ -101,17 +118,43 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "search_code",
-        "description": "Regex-search file contents ('content', default) or match path globs ('files'). Multi-pattern results ranked.",
+        "description": "Regex-search file contents ('content', default) or match path globs ('files'). Output styles: lines (default), files (matching paths), count (matches per file). Matching lines are annotated with their enclosing symbol unless annotate=false; snippet='function' returns the enclosing function body instead of single lines. Multi-pattern results ranked via patterns=[...]. Results are workspace-relative; up to max_matches lines shown (default 100; full list saved to /scratch when exceeded). Narrow with path/glob.",
         "parameters": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Regex (content mode) or glob/filename fragment (files mode)."},
-                "patterns": {"type": "array", "items": {"type": "string"}},
-                "path": {"type": "string"},
-                "glob": {"type": "string", "description": "File filter, e.g. '*.py'."},
-                "mode": {"type": "string", "enum": ["content", "files"]}
+                "patterns": {"type": "array", "items": {"type": "string"}, "description": "Multi-pattern ranked search (replaces pattern)."},
+                "path": {"type": "string", "description": "Directory or single file to search (default: workspace root)."},
+                "glob": {"type": "string", "description": "Comma-separated file filters, '!' excludes; e.g. '*.py,*.ts,!*.test.*'."},
+                "mode": {"type": "string", "enum": ["content", "files"], "description": "'content' regex search or 'files' filename search."},
+                "output": {"type": "string", "enum": ["lines", "files", "count"], "description": "Content answer style: matching lines, matching paths, or matches per file."},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive matching."},
+                "smart_case": {"type": "boolean", "description": "Ignore case when the pattern has no uppercase letters."},
+                "word": {"type": "boolean", "description": "Match whole words only."},
+                "fixed_strings": {"type": "boolean", "description": "Treat the pattern as a literal string, not a regex."},
+                "context": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Lines of context around each match (lines output)."},
+                "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Matching lines shown inline (default 100)."},
+                "annotate": {"type": "boolean", "description": "Prefix each match with its enclosing symbol (default true)."},
+                "snippet": {"type": "string", "enum": ["line", "function"], "description": "line (default) or function: show the enclosing function body once per function."}
             },
             "required": []
+        }
+    },
+    {
+        "name": "ast_search",
+        "description": "Structural search over Python files (stdlib AST, no text matching). Warehouse tool: not assigned to any agent scope yet; enable per specialist. Results are workspace-relative and bounded like search_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rule": {"type": "string", "enum": ["call", "import", "class_bases", "decorator", "bare_except", "long_function", "many_params", "no_docstring"], "description": "Structural query. call/import/class_bases/decorator require name; long_function/many_params use min_lines/max_params."},
+                "name": {"type": "string", "description": "Function/method/module/class/decorator name for name-based rules (dotted names allowed)."},
+                "path": {"type": "string", "description": "Directory or single file to search (default: workspace root)."},
+                "glob": {"type": "string", "description": "Comma-separated file filters, '!' excludes. Python files only."},
+                "min_lines": {"type": "integer", "minimum": 1, "description": "long_function threshold in lines (default 60)."},
+                "max_params": {"type": "integer", "minimum": 0, "description": "many_params threshold; functions above it are reported (default 5)."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Matches shown inline (default 100)."}
+            },
+            "required": ["rule"]
         }
     },
     {
@@ -234,6 +277,30 @@ TOOL_DEFINITIONS = [
         }
     },
     {
+        "name": "look_at_screen",
+        "description": "Capture the user's live screen RIGHT NOW and attach it inline (vision). Use when the answer depends on what the user is currently viewing: a highlighted passage, a chart, a page, an error, or when they say 'this'/'here'/'what I'm looking at'. Turns the overlay's screen sharing on if it is off. The frame reaches you as an image before your next reply.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "set_screen_share",
+        "description": "Change the live overlay's screen-sharing mode: 'on' (preview + one fresh frame attached to each voice turn), 'off' (stop sharing), 'continuous' (also refresh the latest frame every few seconds so look_at_screen is near-real-time). Ask the user before turning 'continuous' on; turn it off when the task is done.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["on", "off", "continuous"],
+                    "description": "Desired sharing mode."
+                }
+            },
+            "required": ["mode"]
+        }
+    },
+    {
         "name": "update_feature",
         "description": "Add or update a feature entry in long-term project memory (features.md) after a feature is implemented. file_refs is a list of {\"path\", \"lines\", \"purpose\"} objects.",
         "exposed": False,
@@ -294,7 +361,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "update_plan",
-        "description": "Drive the live job tracker (the dock the boss watches). Call this whenever the set of jobs changes — at spawn, as results land, or when you abort. Each call is a FULL REPLACEMENT: send every step every time, with the current status. At most one step may be in_progress. Use status=completed (not a separate failed value) for any job that has settled — put the reason in the step text when not successful (e.g. 'Build snake game — failed: tests did not pass').",
+        "description": "Maintain the plan dock. Call when jobs change (spawn, progress, abort). FULL REPLACEMENT each call: send every step with its current status; at most one in_progress. Settled jobs use status=completed — put the reason in the step text when not successful.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -361,7 +428,7 @@ TOOL_DEFINITIONS = [
                         "type": "object",
                         "properties": {
                             "agent": {"type": "string", "enum": ["Dev", "General", "House"], "description": "Target workspace agent. Dev builds/fixes software; General handles research, docs, images, personal notes/admin; House controls smart-home devices. Case-insensitive."},
-                            "task": {"type": "string", "description": "Complete, self-contained instruction for this specialist. The agent sees only this text — include the goal, any constraints, relevant paths, and how to verify success."},
+                            "task": {"type": "string", "description": "Complete, self-contained instruction: goal, relevant paths/targets, constraints, and how to verify success. The agent sees only this text. Context, not method — do not prescribe step-by-step process."},
                             "title": {"type": "string", "description": "Short label for the delegation chat (e.g. 'Space game · Dev')."},
                             "chat_id": {"type": "string", "description": "Omit for a new chat. Set ONLY with a chat_id surfaced by an earlier [DELEGATION RESULT] in this session — never guess. Unknown ids silently start a new chat."},
                             "workspace": {"type": "string", "description": "Workspace id, folder path, or name. Omit to use the default: current project for Dev, General workspace for General, House workspace for House."},
@@ -413,14 +480,18 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "call_subagent",
-        "description": "Spawn a specialist subagent (see Subagents list) and block until its final report.",
+        "description": "Specialist subagent lifecycle (see Subagents list). action=run: spawn and block until the final report (default). action=spawn: start it in the background and keep working on other parts, then collect with status. action=status: status + latest result of a spawned child (wait_seconds≤300). action=message: steer a running child (queued) or send a follow-up. action=stop: interrupt a running child. action=list: this session's subagents. Prefer spawn+status for deep/long verification so you are not blocked.",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Subagent type, e.g. UI | Deploy."},
-                "task": {"type": "string", "description": "Goal, targets (files/URL/repo), acceptance check."}
+                "name": {"type": "string", "description": "Subagent type from the Subagents list, e.g. UI | Deploy. Required for run/spawn."},
+                "task": {"type": "string", "description": "Goal + targets (files/URL/repo) + acceptance check + constraints. Context, not method — do not prescribe design direction or step-by-step process. Required for run/spawn."},
+                "action": {"type": "string", "enum": ["run", "spawn", "status", "message", "stop", "list"], "default": "run", "description": "Lifecycle action (default run)."},
+                "child_id": {"type": "string", "description": "Spawned child id (from action=spawn) for status/message/stop."},
+                "message": {"type": "string", "description": "Follow-up/steering message for action=message."},
+                "wait_seconds": {"type": "integer", "description": "For status: poll up to this many seconds (max 300) before returning.", "default": 0}
             },
-            "required": ["name", "task"]
+            "required": []
         }
     },
     {
@@ -524,10 +595,12 @@ TOOL_DEFINITIONS = [
 ]
 
 _TOOL_DOCS = {
-    "read_file": "read_file(file_path?, file_paths?, offset?, limit?) — Read file(s). Single file via file_path; multi-file via file_paths=[paths].",
-    "edit_file": "edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Every new file is written by hand with this tool.",
-    "run_command": "run_command(command, timeout?, background?, process_action?, shell?, workdir?, expect?, stream?) — Full POSIX bash (default): pipes, &&, $( ), jq, gh pipelines all work. shell='cmd' for legacy, workdir sets cwd, expect checks output regex, stream for live output.",
-    "search_code": "search_code(pattern?, patterns?, path?, glob?) — Regex search across files. Multi-pattern via patterns=[...] ranked.",
+    "read_file": "read_file(file_path?, file_paths?, offset?, limit?) — Read one file, or batch several via file_paths in ONE call ([FILE] sections; offset 1-based, applies per file in a batch). Full read returns first page + header; PARTIAL -> page with offset/limit; unchanged repeat -> cached stub.",
+    "outline": "outline(file_path) — Every signature in one file with definition lines, no bodies (~1/10 the tokens). Then read_file(offset=line, limit=N) for one body.",
+    "edit_file": "edit_file(file_path, old_string?, new_string?, diff?, verify?) — A: old_string+new_string = targeted unique replace; B: new_string only = create/overwrite whole file; C: diff = '*** Add/Update/Delete/Move File' headers (optional *** Begin Patch/End Patch) with @@ hunks: '-' removed, '+' added, ' ' context anchors (numbers optional). verify=py_compile|tsc|shell after write.",
+    "run_command": "run_command(command, timeout?, idle_timeout?, background?, process_action?, workdir?, expect?, tail_lines?, ready_timeout?, input?) — Git Bash (POSIX): pipes, &&, $( ), jq, gh. timeout ms (default 120000; <1000 = seconds; max 600000); idle_timeout kills commands idle by output AND CPU (default 60000; 0 = off); server-like/busy commands auto-background on timeout. process_action=list|logs|kill|wait|ready|send|kill_all. background+expect waits for readiness and reports the listening URL. workdir sets cwd, expect checks output regex.",
+    "search_code": "search_code(pattern?, patterns?, path?, glob?, mode?, output?, ignore_case?, smart_case?, word?, fixed_strings?, context?, max_matches?, annotate?, snippet?) — Regex search (content) or filename search. output=lines|files|count; results annotated with enclosing symbol; snippet=function returns the body; up to 100 lines shown (full list in scratch).",
+    "ast_search": "ast_search(rule, name?, path?, glob?, min_lines?, max_params?, max_results?) — Structural search over Python (call/import/class_bases/decorator/bare_except/long_function/many_params/no_docstring).",
     "browser_navigate": "browser_navigate(url, wait_ms?) — Open URL in headless Chromium, returns snapshot with @ref selectors.",
     "browser_act": "browser_act(action, selector?, text?, key?, what?, path?) — click / fill / type / press / extract / screenshot / close.",
     "browser_extract": "browser_extract(what?, selector?) — Extract text/html/value from current browser page.",
@@ -535,12 +608,14 @@ _TOOL_DOCS = {
     "browser_click": "browser_click(selector) — Click an element using CSS selector or snapshot @ref tag.",
     "browser_fill": "browser_fill(selector, text) — Clear and fill an input element.",
     "browser_close": "browser_close() — Close browser session and free resources.",
+    "look_at_screen": "look_at_screen() — Capture the user's live screen now and attach it inline (vision). For 'this'/'here'/highlighted content questions; enables sharing if off.",
+    "set_screen_share": "set_screen_share(mode) — Live screen sharing: on / off / continuous (continuous refreshes every few seconds for near-real-time look_at_screen).",
     "create_docx": "create_docx(file_path, title?, content?) — Create a Word document (.docx).",
     "create_xlsx": "create_xlsx(file_path, headers, rows) — Create an Excel spreadsheet (.xlsx).",
     "read_pdf": "read_pdf(file_path, max_pages?, page_numbers?) — Read text from a PDF file.",
     "delegate": "delegate(items=[{agent, task, title?, chat_id?}]) — Spawn Dev/General/House agents IN PARALLEL; each gets its own chat, results arrive as [DELEGATION RESULT] events.",
     "delegation_status": "delegation_status() — List this session's delegations with live statuses and chats.",
-    "call_subagent": "call_subagent(name, task) — Spawn a specialist subagent (UI, Deploy); blocks and returns its final report.",
+    "call_subagent": "call_subagent(name, task, action?, child_id?, message?, wait_seconds?) — Specialist subagent lifecycle: run (block) / spawn (background) / status / message / stop / list (e.g. UI for browser verification).",
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
     "create_project": "create_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
@@ -561,13 +636,53 @@ _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {
 }
 
 
+def _scope_allowed(scope: Optional[str]) -> set[str] | None:
+    """Scope ACL minus eval-only exclusions.
+
+    Eval/benchmark runs (DEEP_AGENTS_EVAL_RUN=1) exercise the Developer as a
+    headless coding agent: no human dock, no mode-switch, no plan review. The
+    dock/mode tools are removed from the schema so they neither consume
+    context (~1.2k tokens) nor invite ceremony in a single-agent loop.
+    Production is untouched (env is only set by the eval runner).
+    """
+    allowed = None
+    if scope and scope.lower() in _SCOPE_MAP:
+        allowed = set(_SCOPE_MAP[scope.lower()])
+        if os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1" and scope.lower() == "developer":
+            # Headless eval has no human dock: ask_user/propose_plan are always
+            # removed. update_plan is the production planning surface and stays
+            # available in long-horizon mode (BSA_FULL_DEV_TOOLS=1) where the
+            # completion gate keys off the LLM-maintained plan.
+            allowed.difference_update({"ask_user", "propose_plan"})
+            if os.environ.get("BSA_FULL_DEV_TOOLS", "0") != "1":
+                allowed.difference_update({"update_plan"})
+    return allowed
+
+
+_EVAL_BLOCKED_TOOLS = {"ask_user", "propose_plan"}
+
+
+def _eval_blocked(name: str) -> bool:
+    """True for tools no agent may be offered in a headless eval run.
+
+    Specialist subagents (UI/Deploy) carry their own tool allow-lists from
+    agents/specialists/*.json, which bypass the developer-scope exclusion.
+    Without a human connected, an ask_user call would block until its timeout,
+    so the tools are removed for every scope while DEEP_AGENTS_EVAL_RUN=1.
+    Production is untouched (the env is only set by the eval runner).
+    """
+    return os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1" and str(name) in _EVAL_BLOCKED_TOOLS
+
+
 def get_native_tools(scope: Optional[str] = None) -> list[dict]:
     """Return tools as DeepSeek/OpenAI-native function definitions,
     optionally filtered by scope."""
     tools = []
-    allowed = set(_SCOPE_MAP[scope.lower()]) if scope and scope.lower() in _SCOPE_MAP else None
+    allowed = _scope_allowed(scope)
     for d in TOOL_DEFINITIONS:
         if d.get("exposed") is False:
+            continue
+        if _eval_blocked(d["name"]):
             continue
         if allowed is not None and d["name"] not in allowed:
             continue
@@ -613,11 +728,12 @@ _SCOPE_MAP: dict[str, list[str]] = _load_registry_scope()
 
 def get_native_tool_names(scope: Optional[str] = None) -> list[str]:
     """Return tool names, optionally filtered by scope."""
-    if scope and scope.lower() in _SCOPE_MAP:
-        allowed = set(_SCOPE_MAP[scope.lower()])
+    allowed = _scope_allowed(scope)
+    if allowed is not None:
         names = [d["name"] for d in TOOL_DEFINITIONS if d["name"] in allowed and d.get("exposed") is not False]
     else:
         names = [d["name"] for d in TOOL_DEFINITIONS if d.get("exposed") is not False]
+    names = [n for n in names if not _eval_blocked(n)]
     try:
         from tools.mcp.mcp_bridge import mcp_tool_names_for_scope
         names.extend(mcp_tool_names_for_scope(scope or ""))

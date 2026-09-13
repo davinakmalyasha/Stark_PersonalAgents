@@ -8,14 +8,32 @@ from sync.state_sync import safe_append_live_log
 
 
 def _clean_terminal_output(text: str) -> str:
-    """Strip ANSI escape codes, progress bar overwrites, warnings summary, and collapse blank lines.
-    Saves tokens per command output (#5)."""
+    """Strip ANSI escape codes, progress bar overwrites, warnings summary, MSYS
+    install noise, and collapse blank lines. Saves tokens per command output (#5)."""
     # Strip ANSI escape sequences (full pattern: CSI + OSC + other escapes)
     text = re.sub(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
-    
+
     # Strip pytest warnings summary block
     text = re.sub(r'=+ warnings summary =+.*?(?==+ \d+ (?:passed|failed|error|passed|failed|skipped|warnings)|\Z)', '', text, flags=re.DOTALL | re.IGNORECASE)
-    
+
+    # Strip Git-Bash/MSYS post-install permission noise emitted by login shells
+    # on machines where the Git install dir isn't writable. Non-actionable for
+    # agents and identical on every run (also breaks output dedup).
+    _MSYS_NOISE = (
+        "failed to create symbolic link '/etc/mtab'",
+        "cannot create regular file '/etc/",
+        "cannot remove '/etc/post-install/",
+    )
+    if text and ("/etc/" in text):
+        kept = []
+        for line in text.split('\n'):
+            if any(marker in line for marker in _MSYS_NOISE):
+                continue
+            if "-> '/etc/" in line:  # mount-point mapping line
+                continue
+            kept.append(line)
+        text = '\n'.join(kept)
+
     # Collapse carriage-return overwrites (keep only final segment)
     lines = text.split('\n')
     cleaned = []

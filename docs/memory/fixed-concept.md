@@ -1,4 +1,4 @@
-# Fixed Concept — LangChain Workspace Agents
+# Fixed Concept — Workspace Agents
 
 Status: **FIXED CONCEPT — the migration contract.** Everything below is the
 spec that the current refactor must converge on. When in doubt about an
@@ -104,8 +104,9 @@ Tools are stored "in a warehouse" instead of being hand-wired per agent.
    registry (scope ACL), never by hand-listing tools in the agent file.
 4. **Per-run scoping**: `WorkspaceDeps` carries the concrete allowlist for a
    run; pydantic-ai `FilteredToolset` enforces it at tool-build time.
-5. **MCP servers**: scoped per agent via `mcp_scopes` in the spec; MCP tools
-   are first-class tools in the same warehouse model.
+5. **MCP servers**: scoped per agent via `scopes` in
+   `.deep_agents/mcp_servers.json`; MCP tools are first-class tools in the
+   same warehouse model.
 
 ### What "scale" means here
 
@@ -196,7 +197,7 @@ A step is done when:
 ## 7. Known "how it actually works" details to preserve
 
 - **Provider/model resolution**: use the `command` provider for model tests
-  (`https://api.commandcode.ai/provider/v1`, `flash: deepseek/deepseek-v4-flash`),
+  (`https://api.commandcode.ai/provider/v1`, `flash: deepseek/deepseek-v4.1-flash`),
   resolved via `.deep_agents/llm_provider.json` + `_resolve_llm_provider()`.
 - **Parallel tool calls**: pydantic-ai runs tools in parallel by default; the
   read/stuff class of tools (read_file, search_code, browser_act, ...) must
@@ -208,6 +209,14 @@ A step is done when:
 - **Session store**: the server-side session JSONL (`server/session/log.py`)
   is the durable transcript; agent loops append to it; it is NOT the model
   history source.
+- **Authored project memory**: `.agent-memory/project.md` is LLM-authored
+  (CLAUDE.md-style), not generated: `## Identity` (written by Dev on the
+  first task of a project that has none, updated only on a real pivot) and
+  `## Design` (written by the UI specialist on design lock/redesign). The
+  harness only reads/parses/projects it — its own message below the system
+  prompt, re-anchored fresh at every compaction — and the compaction LLM may
+  refresh it within the same single summarize request. No status gate, no
+  drift appends, no auto-detection.
 - **Free-pool providers** (`llm/free_providers.py`) are a separate,
   self-contained feature; if/when ported to a custom `Provider`, behavior
   (rate limits, retries, provider rotation) must be preserved.

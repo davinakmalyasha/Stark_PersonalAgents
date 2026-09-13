@@ -19,11 +19,12 @@ if os.path.isdir(_VOICE) and _VOICE not in sys.path:
 
 from .memory_manager import (
     load_cached_code_map,
-    load_cached_project_identity,
+    load_project_memory,
+    read_project_doc,
+    update_project_memory,
     refresh_code_map,
     refresh_code_map_context,
     ensure_project_cache,
-    ensure_project_identity,
     is_valid_build_request,
 )
 from .chat_memory_manager import (
@@ -35,9 +36,7 @@ from .chat_memory_manager import (
     summarize_previous_day,
     is_continue_command,
 )
-from .chat_context import (
-    build_chat_context,
-)
+from server.context.chat_history import build_chat_context
 from .context_budget import (
     estimate_tokens,
     estimate_message_tokens,
@@ -70,11 +69,12 @@ from .embedding_service import (
 
 __all__ = [
     "load_cached_code_map",
-    "load_cached_project_identity",
+    "load_project_memory",
+    "read_project_doc",
+    "update_project_memory",
     "refresh_code_map",
     "refresh_code_map_context",
     "ensure_project_cache",
-    "ensure_project_identity",
     "is_valid_build_request",
     "load_chat_memory",
     "save_chat_memory",

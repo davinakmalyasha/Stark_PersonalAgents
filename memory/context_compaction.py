@@ -11,23 +11,17 @@ import re
 from dataclasses import dataclass
 
 
-_DEFAULT_TAIL_TOKENS = 20_000
-_MAX_TAIL_TOKENS = 20_000
-
-
 @dataclass(frozen=True)
 class CompactionPolicy:
     """One append-only/checkpoint budget shared by all agents.
 
-    Defaults: trigger 400k / hard gate 440k / tail 20k newest msgs (Codex
-    20k parity) / summary 4096. Env overrides: COMPACTION_* or
-    <ROLE>_COMPACTION_*.
+    Defaults: trigger 400k / hard gate 440k / summary 4096. Env overrides:
+    COMPACTION_* or <ROLE>_COMPACTION_*.
     """
 
     role: str = "developer"
     checkpoint_trigger: int = 400_000
     hard_limit: int = 440_000
-    tail_budget_tokens: int = _DEFAULT_TAIL_TOKENS
     summary_output_tokens: int = 4_096
 
 
@@ -51,14 +45,10 @@ def get_compaction_policy(role: str = "developer") -> CompactionPolicy:
         role_name = f"{role_key}_COMPACTION_{suffix}"
         return _positive_int(role_name, _positive_int(f"COMPACTION_{suffix}", default))
 
-    tail = setting("TAIL_TOKENS", _DEFAULT_TAIL_TOKENS)
-    tail = min(max(tail, 4_000), _MAX_TAIL_TOKENS)
-
     return CompactionPolicy(
         role=role,
         checkpoint_trigger=setting("CHECKPOINT_TOKENS", 400_000),
         hard_limit=setting("HARD_LIMIT", 440_000),
-        tail_budget_tokens=tail,
         summary_output_tokens=setting("SUMMARY_OUTPUT_TOKENS", 4_096),
     )
 

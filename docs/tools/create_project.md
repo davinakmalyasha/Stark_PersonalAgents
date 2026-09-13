@@ -2,7 +2,7 @@
 
 - **Description:** Create a NEW project: creates the folder (under D:\MyProject, or under parent_root if given), registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background. The DFD agent MUST pass parent_root (the client folder under D:\MyProject\DFDClientProjects) so client projects always live inside the client root.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** orchestrator, dfd
+- **Scopes (from _SCOPE_MAP):** dfd, orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** create_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\MyProject\DFDClientProjects.
 - **Required args (validated):** concept, name

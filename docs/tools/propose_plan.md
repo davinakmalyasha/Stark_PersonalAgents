@@ -2,7 +2,7 @@
 
 - **Description:** Present the plan for the CURRENT plan-mode review. Plan mode is user-initiated via the prompt dock ONLY — never call this to start planning on your own, never suggest switching modes. Outside plan mode this is a no-op (use update_plan and keep working). The agent CANNOT change plan/build mode in either direction.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, orchestrator, general, house, dfd
+- **Scopes (from _SCOPE_MAP):** developer, general, house, dfd, orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** (none)
 - **Required args (validated):** plan

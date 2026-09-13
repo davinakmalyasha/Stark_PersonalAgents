@@ -1,8 +1,8 @@
 # update_plan
 
-- **Description:** Drive the live job tracker (the dock the boss watches). Call this whenever the set of jobs changes — at spawn, as results land, or when you abort. Each call is a FULL REPLACEMENT: send every step every time, with the current status. At most one step may be in_progress. Use status=completed (not a separate failed value) for any job that has settled — put the reason in the step text when not successful (e.g. 'Build snake game — failed: tests did not pass').
+- **Description:** Maintain the plan dock. Call when jobs change (spawn, progress, abort). FULL REPLACEMENT each call: send every step with its current status; at most one in_progress. Settled jobs use status=completed — put the reason in the step text when not successful.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, orchestrator, general, house, dfd
+- **Scopes (from _SCOPE_MAP):** developer, general, house, dfd, orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** True
 - **Compact doc:** update_plan(explanation?, plan=[{step, status}]) — Maintain the task plan. FULL replacement: always send every step. At most one step in_progress.
 - **Required args (validated):** plan

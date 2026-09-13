@@ -2,7 +2,7 @@
 
 - **Description:** Browser automation: navigate, click, fill, type, press, extract, screenshot, close. Selector = CSS or @ref from the navigate snapshot. Start servers with run_command(background=true) first.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** ui, general, house
+- **Scopes (from _SCOPE_MAP):** general, house, ui
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** browser_act(action, selector?, text?, key?, what?, path?) — click / fill / type / press / extract / screenshot / close.
 - **Required args (validated):** action

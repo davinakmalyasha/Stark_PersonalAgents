@@ -183,6 +183,15 @@ async def list_workspace_files(workspace_id: str, max_depth: int = 8):
                 continue
 
     walk(root, 0, "")
+    # Authored project memory lives in a skipped metadata dir; expose the one
+    # file the design workspace previews as the brand contract.
+    _pm = os.path.join(root, ".agent-memory", "project.md")
+    if os.path.isfile(_pm):
+        try:
+            out.append({"name": "project.md", "path": ".agent-memory/project.md",
+                        "type": "file", "size": os.path.getsize(_pm)})
+        except Exception:
+            pass
     out.sort(key=lambda f: (f["type"] != "dir", f["path"].lower()))
     return JSONResponse(content={"files": out})
 

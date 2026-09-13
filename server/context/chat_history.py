@@ -1,6 +1,6 @@
 """
 Chat history builder — Lane A extraction from memory/chat_context.py.
-New code should import from server.context.chat_history; old memory.chat_context remains shim.
+New code should import from server.context.chat_history.
 Now reads via hybrid store (server.store.chat_store.get_chat) which hits SQLite+JSONL.
 """
 import re

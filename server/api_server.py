@@ -57,8 +57,6 @@ def _ensure_venv() -> None:
         print(f"[api_server] Interpreter guard failed ({e}) â€” continuing")
 
 _ensure_venv()
-# Back-compat alias
-_ensure_venv312 = _ensure_venv
 
 # Voice module path (audio_engine, voice_services moved to Voice/)
 _VOICE_DIR = os.path.join(_ROOT, "Voice")
@@ -208,6 +206,15 @@ from server.routers.runs import router as runs_router
 app.include_router(runs_router)
 from server.routers.voice import router as voice_router
 app.include_router(voice_router)
+# Live voice socket: raw Starlette route because FastAPI 0.141's
+# @router.websocket path rejects upgrades with HTTP 403 in this environment
+# (bare Starlette WebSocketRoute works). Inserted first so the broken lazy
+# router never claims the websocket scope.
+from starlette.routing import WebSocketRoute as _WebSocketRoute
+from server.routers.voice import voice_ws as _voice_ws
+app.router.routes.insert(0, _WebSocketRoute("/api/voice/ws", _voice_ws))
+from server.routers.screen import router as screen_router
+app.include_router(screen_router)
 
 # â”€â”€ Remote access guard (mobile/remote feature) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Loopback clients (the desktop app on this machine) pass freely. Any other
@@ -571,13 +578,18 @@ if __name__ == "__main__":
 
     threading.Thread(target=_warm_llm, daemon=True).start()
     
-    # Start Telegram bot in background
-    try:
-        from bot import bot
-        threading.Thread(target=bot.infinity_polling, daemon=True).start()
-        print("[API] Telegram bot started in background.")
-    except Exception as e:
-        print(f"[API] Failed to start Telegram bot: {e}")
+    # Start Telegram bot in background (text-only; no voice sessions touch it).
+    # Opt out with START_TELEGRAM=0 for the leanest voice-only footprint —
+    # one less polling thread competing with STT/TTS for CPU wakeups.
+    if os.environ.get("START_TELEGRAM", "1").lower() in ("0", "false", "no", "off"):
+        print("[API] Telegram bot disabled (START_TELEGRAM=0).")
+    else:
+        try:
+            from bot import bot
+            threading.Thread(target=bot.infinity_polling, daemon=True).start()
+            print("[API] Telegram bot started in background.")
+        except Exception as e:
+            print(f"[API] Failed to start Telegram bot: {e}")
         
     if reload_mode:
         # Import-string form (required for reload): resolve as a package module

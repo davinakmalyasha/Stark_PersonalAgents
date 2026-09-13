@@ -187,7 +187,8 @@ async def run_pipeline(req: RunRequest, request: Request):
     attachment_note = ""
     if req.attachments:
         attachment_note = "\n\nAttached files for this request:\n" + "\n".join(
-            f"- {item.get('name', 'attachment')} ({item.get('path', item.get('url', 'uploaded file'))})"
+            f"- {item.get('note') or item.get('name', 'attachment')} "
+            f"({item.get('path', item.get('url', 'uploaded file'))})"
             for item in req.attachments
         )
         try:
@@ -198,7 +199,13 @@ async def run_pipeline(req: RunRequest, request: Request):
         except Exception:
             pass
     prompt_with_attachments = req.prompt + attachment_note
-    wm.add_message(req.workspace_path, req.chat_id, "user", req.prompt, {"attachments": req.attachments} if req.attachments else None)
+    # Live screen frames reach the agent but are NOT persisted in the chat log
+    # (screenFrame) — otherwise every spoken sentence would add an image chip.
+    _stored_attachments = [a for a in req.attachments if not a.get("screenFrame")]
+    wm.add_message(
+        req.workspace_path, req.chat_id, "user", req.prompt,
+        {"attachments": _stored_attachments} if _stored_attachments else None,
+    )
     resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
     run_context = _capture_run_context(req.workspace_path, req.chat_id)
 
@@ -305,36 +312,75 @@ async def run_pipeline(req: RunRequest, request: Request):
             except Exception:
                 pass
 
-            # Wait for either state snapshot (aq) or bus event, event-driven (20ms) instead of 50+50 polling.
+            # Wait for either state snapshot (aq) or bus event via FIRST_COMPLETED
+            # (single 20ms wait) instead of serial 20ms + 20ms polling.
             try:
-                # Prefer bus event wake when idle: wait on both with shorter timeout.
+                waitables = []
+                aq_task = asyncio.create_task(aq.get())
+                waitables.append(aq_task)
+                bus_task = None
                 if _bus_event is not None and not deltas:
-                    # Brief event wait + aq poll combined — ~20ms idle cadence vs 100ms before.
+                    bus_task = asyncio.create_task(_bus_event.wait())
+                    waitables.append(bus_task)
+                done_set, _pending = await asyncio.wait(
+                    waitables, timeout=0.02, return_when=asyncio.FIRST_COMPLETED
+                )
+                if bus_task is not None and bus_task in done_set:
                     try:
-                        await asyncio.wait_for(_bus_event.wait(), timeout=0.02)
-                        if _bus_event is not None:
-                            try:
-                                _bus_event.clear()
-                            except Exception:
-                                pass
-                        # drain again after wake
-                        try:
-                            deltas2 = _bus_drain(req.chat_id)
-                            if deltas2:
-                                for d in deltas2:
-                                    _mirror_publish(req.chat_id, "delta", d)
-                                    yield _format_sse("delta", d)
-                        except Exception:
-                            pass
-                    except asyncio.TimeoutError:
+                        _bus_event.clear()
+                    except Exception:
                         pass
-                item = await asyncio.wait_for(aq.get(), timeout=0.02)
-                if item is None:
-                    break
-                if isinstance(item, dict):
-                    _mirror_publish(req.chat_id, "state", item)
-                    yield _format_sse("state", item)
-                    last_ver = item.get("state_version", 0)
+                    try:
+                        deltas2 = _bus_drain(req.chat_id)
+                        if deltas2:
+                            for d in deltas2:
+                                _mirror_publish(req.chat_id, "delta", d)
+                                yield _format_sse("delta", d)
+                    except Exception:
+                        pass
+                if aq_task in done_set:
+                    try:
+                        item = aq_task.result()
+                    except Exception:
+                        item = None
+                    # Cancel the waiter that didn't fire to avoid task leaks.
+                    for t in waitables:
+                        if not t.done():
+                            t.cancel()
+                    if item is None:
+                        break
+                    if isinstance(item, dict):
+                        _mirror_publish(req.chat_id, "state", item)
+                        yield _format_sse("state", item)
+                        last_ver = item.get("state_version", 0)
+                else:
+                    # Neither fired within 20ms — park briefly and emit an
+                    # intermediate snapshot only when the version advanced.
+                    for t in waitables:
+                        if not t.done():
+                            t.cancel()
+                    # Drain any deltas that arrived during the wait.
+                    try:
+                        deltas3 = _bus_drain(req.chat_id)
+                        if deltas3:
+                            for d in deltas3:
+                                _mirror_publish(req.chat_id, "delta", d)
+                                yield _format_sse("delta", d)
+                            if _bus_event is not None:
+                                try:
+                                    _bus_event.clear()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    if not done:
+                        snap = json.loads(safe_serialize_state())
+                        cur_ver = snap.get("state_version", 0)
+                        if cur_ver > last_ver:
+                            last_ver = cur_ver
+                            snap["_intermediate"] = True
+                            _mirror_publish(req.chat_id, "state", snap)
+                            yield _format_sse("state", snap)
             except asyncio.TimeoutError:
                 if not done:
                     snap = json.loads(safe_serialize_state())
@@ -345,10 +391,10 @@ async def run_pipeline(req: RunRequest, request: Request):
                         _mirror_publish(req.chat_id, "state", snap)
                         yield _format_sse("state", snap)
 
-        _save_chat_token_usage(req.workspace_path, req.chat_id)
+        await asyncio.to_thread(_save_chat_token_usage, req.workspace_path, req.chat_id)
 
         final_state = json.loads(safe_serialize_state())
-        final_state["artifacts"] = _collect_run_artifacts(req.workspace_path, run_context)
+        final_state["artifacts"] = await asyncio.to_thread(_collect_run_artifacts, req.workspace_path, run_context)
 
         try:
             new_ids = {w.get("id") for w in wm.list_workspaces()} - _workspace_ids_before_run
@@ -369,6 +415,13 @@ async def run_pipeline(req: RunRequest, request: Request):
                 yield chunk
         finally:
             clear_active_run(chat_id=req.chat_id, workspace_path=req.workspace_path)
+            # Run-scoped hygiene: stop background processes this run started
+            # (dev servers, watchers) so they don't hold ports after the run.
+            try:
+                from tools.MainTool._procman import cleanup_owner
+                cleanup_owner(req.chat_id or req.workspace_path or "")
+            except Exception:
+                pass
 
     set_active_run(req.workspace_path, req.chat_id)
     try:

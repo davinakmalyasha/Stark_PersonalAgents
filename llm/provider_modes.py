@@ -11,14 +11,14 @@ free      Every tier rides the multi-provider free pool
           (llm/free_providers.py). Orchestrator biases AWAY from reasoning
           models; workspace agents bias TOWARD them.
 deepseek  Direct DeepSeek API billing.
-              orchestrator: deepseek-v4-flash-vision-exp, thinking disabled
-              workspace:    deepseek-v4-flash,  thinking high on iter-1/trouble
+              orchestrator: deepseek-v4.1-flash (native vision), thinking disabled
+              workspace:    deepseek-v4.1-flash,  thinking high on iter-1/trouble
               specialists:  free pool
 opencode  Identical matrix, billed through the OpenCode Go gateway.
 command   Command Code Provider API (OpenAI-compatible).
-              orchestrator: laguna-s-2.1-free, thinking low
-              workspace:    deepseek/deepseek-v4-flash, thinking high
-              specialists:  laguna-s-2.1-free
+              orchestrator: xiaomi/mimo-v2.5, thinking low
+              workspace:    deepseek/deepseek-v4.1-flash, thinking high
+              specialists:  poolside/laguna-s-2.1-free (free slot)
 
 Tiers
 -----
@@ -27,14 +27,13 @@ workspace     Developer / General / House workspace agents
 specialist    true subagents spawned below the workspace tier (UI, Deploy, ...)
 
 Precedence contract: explicit environment overrides always win over mode
-defaults (REASONING_ITER1, ORCH_REASONING_ITER1, REASONING_ROUTINE,
-REASONING_ORCH_ROUTINE, REASONING_SUBAGENT_ROUTINE, GENERAL_MODEL_BACKEND,
-SUBAGENT_MODEL_BACKEND). This module only supplies DEFAULTS.
+defaults (GENERAL_MODEL_BACKEND, DFD_MODEL_BACKEND, SUBAGENT_MODEL_BACKEND).
+This module only supplies DEFAULTS.
 
-Model-name conventions: canonical names ("deepseek-v4-flash") are mapped to
+Model-name conventions: canonical names ("deepseek-v4.1-flash") are mapped to
 the active provider's slug by llm.llm._map_model; org-scoped literals
-("deepseek/deepseek-v4-flash", "laguna-s-2.1-free") pass through untouched,
-so command-mode entries can name gateway models directly.
+("deepseek/deepseek-v4.1-flash", "poolside/laguna-s-2.1-free") pass through
+untouched, so command-mode entries can name gateway models directly.
 """
 
 from __future__ import annotations
@@ -43,13 +42,14 @@ import os
 
 MODES = ("free", "deepseek", "opencode", "command")
 
-# Canonical vision model (maps per-provider inside llm.py). Kept here so the
+# Canonical V4.1-Flash model (maps per-provider inside llm.py). Vision is native
+# in V4.1, so vision and flash share the same id. Kept here so the
 # matrix stays readable; do not confuse with the command-mode literal slugs.
-_CANONICAL_VISION = "deepseek-v4-flash-vision-exp"
-_CANONICAL_FLASH = "deepseek-v4-flash"
+_CANONICAL_VISION = "deepseek-v4.1-flash"
+_CANONICAL_FLASH = "deepseek-v4.1-flash"
 
 _COMMAND_ORCH_MODEL_DEFAULT = "xiaomi/mimo-v2.5"
-_COMMAND_LIGHT_MODEL_DEFAULT = "laguna-s-2.1-free"
+_COMMAND_LIGHT_MODEL_DEFAULT = "poolside/laguna-s-2.1-free"
 
 MODE_MATRIX: dict[str, dict[str, dict]] = {
     "free": {
@@ -58,13 +58,13 @@ MODE_MATRIX: dict[str, dict[str, dict]] = {
         "specialist": {"backend": "free"},
     },
     "deepseek": {
-        "orchestrator": {"backend": "paid", "model": _CANONICAL_VISION, "iter_effort": "disabled"},
-        "workspace": {"backend": "paid", "model": _CANONICAL_FLASH, "iter_effort": "high"},
+        "orchestrator": {"backend": "paid", "model": _CANONICAL_VISION},
+        "workspace": {"backend": "paid", "model": _CANONICAL_FLASH},
         "specialist": {"backend": "free"},
     },
     "opencode": {
-        "orchestrator": {"backend": "paid", "model": _CANONICAL_VISION, "iter_effort": "disabled"},
-        "workspace": {"backend": "paid", "model": _CANONICAL_FLASH, "iter_effort": "high"},
+        "orchestrator": {"backend": "paid", "model": _CANONICAL_VISION},
+        "workspace": {"backend": "paid", "model": _CANONICAL_FLASH},
         "specialist": {"backend": "free"},
     },
     "command": {
@@ -72,10 +72,9 @@ MODE_MATRIX: dict[str, dict[str, dict]] = {
             "backend": "paid",
             "model_env": "COMMAND_CODE_MODEL_ORCH",
             "model": _COMMAND_ORCH_MODEL_DEFAULT,
-            "iter_effort": "low",
             "supports_audio": True,
         },
-        "workspace": {"backend": "paid", "model": _CANONICAL_FLASH, "iter_effort": "high"},
+        "workspace": {"backend": "paid", "model": _CANONICAL_FLASH},
         "specialist": {
             "backend": "paid",
             "model_env": "COMMAND_CODE_MODEL_LIGHT",
@@ -89,10 +88,19 @@ _TIER_ROLES = {
     "workspace": ("developer", "developerfixing", "general", "house", "dfd"),
 }
 
+#: Specialist roles that ride the WORKSPACE tier: same backend, model and
+#: thinking policy as the Dev agent in every provider mode (design parity).
+_TIER_OVERRIDES = {
+    "ui": "workspace",
+    "ui-design": "workspace",
+}
+
 
 def get_tier(role: str) -> str:
     """Map a role/agent name to its tier: orchestrator | workspace | specialist."""
     r = str(role or "").strip().lower()
+    if r in _TIER_OVERRIDES:
+        return _TIER_OVERRIDES[r]
     for tier, names in _TIER_ROLES.items():
         if any(r == n or n in r for n in names):
             return tier
@@ -143,28 +151,33 @@ def get_role_plan(role: str, mode: str | None = None) -> dict:
 def specialist_backend(name: str, spec_backend: str = "") -> str:
     """Backend for a specialist subagent.
 
-    Precedence: SUBAGENT_MODEL_BACKEND env > active-mode specialist entry >
-    agents/specialists/*.json spec "backend" > "deepseek". Only "free" is
-    dispatched to the free pool; every other value rides the paid llm.py path.
+    Precedence: SUBAGENT_MODEL_BACKEND env > active-mode tier entry >
+    agents/specialists/*.json spec "backend" > "deepseek". Tier entries are
+    resolved per role: UI rides the workspace tier (Dev parity), everything
+    else rides the specialist entry. Only "free" is dispatched to the free
+    pool; every other value rides the paid llm.py path.
     """
     env_backend = os.getenv("SUBAGENT_MODEL_BACKEND", "").strip().lower()
     if env_backend:
         return env_backend
-    entry = MODE_MATRIX[resolve_mode()].get("specialist") or {}
+    entry = MODE_MATRIX[resolve_mode()].get(get_tier(name)) or {}
     backend = str(entry.get("backend") or "").strip().lower()
     if backend:
         return backend
     return str(spec_backend or "deepseek").strip().lower()
 
 
-def specialist_model(spec_model: str | None = None) -> str | None:
+def specialist_model(spec_model: str | None = None, name: str = "") -> str | None:
     """Model override for specialist turns, or None to keep caller default.
 
-    Non-empty when the active mode pins a concrete model for specialists
-    (command mode -> laguna); otherwise falls back to the spec/caller value.
+    Only the true-specialist tier pins a concrete model (command mode ->
+    laguna). Workspace-tier specialists (UI) return None so the runtime
+    resolves the same canonical flash the Dev agent uses.
     """
-    entry = MODE_MATRIX[resolve_mode()].get("specialist") or {}
-    env_name = entry.get("model_env")
-    if env_name:
-        return os.getenv(env_name, entry.get("model") or "") or None
+    tier = get_tier(name)
+    entry = MODE_MATRIX[resolve_mode()].get(tier) or {}
+    if tier == "specialist":
+        env_name = entry.get("model_env")
+        if env_name:
+            return os.getenv(env_name, entry.get("model") or "") or None
     return spec_model or None

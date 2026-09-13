@@ -97,11 +97,11 @@ def _resolve_llm_provider() -> dict:
         return {
             "base": os.getenv("COMMAND_CODE_BASE_URL", "https://api.commandcode.ai/provider/v1"),
             "key": os.getenv("COMMAND_CODE_API_KEY", ""),
-            "flash": os.getenv("COMMAND_CODE_MODEL_FLASH", "deepseek/deepseek-v4-flash"),
-            "pro": os.getenv("COMMAND_CODE_MODEL_PRO", "deepseek/deepseek-v4-pro"),
-            "vision": os.getenv("COMMAND_CODE_MODEL_VISION", "deepseek/deepseek-v4-flash-vision-exp"),
+            "flash": os.getenv("COMMAND_CODE_MODEL_FLASH", "deepseek/deepseek-v4.1-flash"),
+            "pro": os.getenv("COMMAND_CODE_MODEL_PRO", "deepseek/deepseek-v4.1-flash"),
+            "vision": os.getenv("COMMAND_CODE_MODEL_VISION", "deepseek/deepseek-v4.1-flash"),
             "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "xiaomi/mimo-v2.5"),
-            "light": os.getenv("COMMAND_CODE_MODEL_LIGHT", "laguna-s-2.1-free"),
+            "light": os.getenv("COMMAND_CODE_MODEL_LIGHT", "poolside/laguna-s-2.1-free"),
             "audio": os.getenv("COMMAND_CODE_MODEL_AUDIO", "xiaomi/mimo-v2.5"),
         }
     if provider == "opencode":
@@ -110,46 +110,47 @@ def _resolve_llm_provider() -> dict:
         return {
             "base": os.getenv("DEEPSEEK_BASE_URL", "https://opencode.ai/zen/go/v1"),
             "key": os.getenv("OPENCODE_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", ""),
-            "flash": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4-flash"),
-            "pro": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4-flash"),
+            "flash": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4.1-flash"),
+            "pro": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4.1-flash"),
             "vision": os.getenv("DEEPSEEK_MODEL_VISION", DEEPSEEK_MODEL_VISION),
         }
     # default: direct DeepSeek API (or DEEPSEEK_BASE_URL override from .env)
     return {
         "base": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         "key": os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("OPENCODE_API_KEY", ""),
-        "flash": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4-flash"),
-        "pro": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4-pro"),
+        "flash": os.getenv("DEEPSEEK_MODEL_FLASH", "deepseek-v4.1-flash"),
+        "pro": os.getenv("DEEPSEEK_MODEL_PRO", "deepseek-v4.1-flash"),
         "vision": os.getenv("DEEPSEEK_MODEL_VISION", DEEPSEEK_MODEL_VISION),
     }
 
 
 def _map_model(model: str) -> str:
-    """Map a canonical model name (deepseek-v4-flash/pro/vision-exp) to the active provider's name.
+    """Map a canonical model name (deepseek-v4.1-flash) to the active provider's name.
 
-    Accepts both the colon slug used by agent constants (``deepseek:v4-flash``)
-    and the dash canonical (``deepseek-v4-flash``). Org-scoped slugs
-    (``deepseek/deepseek-v4-flash``, ``xiaomi/mimo-v2.5``) pass through.
+    Accepts both the colon slug used by agent constants (``deepseek:v4.1-flash``)
+    and the dash canonical (``deepseek-v4.1-flash``). The official alias
+    ``deepseek-flash`` maps to the same slot. Org-scoped slugs
+    (``deepseek/deepseek-v4.1-flash``, ``xiaomi/mimo-v2.5``) pass through.
     """
     cfg = _resolve_llm_provider()
     if "/" in model:
-        # Org-scoped slug (e.g. "deepseek/deepseek-v4-flash", "laguna-s-2.1-free")
-        # is already provider-specific — pass through untouched.
+        # Org-scoped slug (e.g. "deepseek/deepseek-v4.1-flash",
+        # "poolside/laguna-s-2.1-free") is already provider-specific — pass
+        # through untouched.
         return model
     # Normalize the colon form agent constants use to the canonical dash form.
-    if model == "deepseek:v4-flash":
-        model = "deepseek-v4-flash"
-    elif model == "deepseek:v4-pro":
-        model = "deepseek-v4-pro"
-    elif model == "deepseek:v4-flash-vision-exp":
-        model = "deepseek-v4-flash-vision-exp"
-    if model == "deepseek-v4-flash":
+    if model == "deepseek:v4.1-flash":
+        model = "deepseek-v4.1-flash"
+    elif model == "deepseek:flash":
+        model = "deepseek-flash"
+    if model in ("deepseek-v4.1-flash", "deepseek-flash"):
+        # Flash and Pro slots both ride V4.1-Flash (V4-Pro retired; routes to Flash).
+        if model == "deepseek-flash":
+            return cfg["flash"]
         return cfg["flash"]
-    if model == "deepseek-v4-pro":
-        return cfg["pro"]
-    if model in (DEEPSEEK_MODEL_VISION, "deepseek-v4-flash-vision-exp"):
-        # Per-provider vision slot: same slug on the DeepSeek API and OpenCode
-        # Go listings; the command gateway names its own.
+    if model in (DEEPSEEK_MODEL_VISION, "deepseek-v4.1-flash", "deepseek-flash"):
+        # Per-provider vision slot: V4.1-Flash has native vision, so the vision
+        # slot points at the same id on every provider.
         return cfg.get("vision") or DEEPSEEK_MODEL_VISION
     if model == "deepseek-v4-audio":
         # Per-provider audio slot (MiMo): only the command gateway defines one.

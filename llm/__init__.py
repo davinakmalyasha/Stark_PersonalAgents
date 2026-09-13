@@ -17,10 +17,7 @@ _VOICE = os.path.join(_ROOT, "Voice")
 if os.path.isdir(_VOICE) and _VOICE not in sys.path:
     sys.path.insert(0, _VOICE)
 
-from .llm_config import (
-    TASK_CATEGORIES,
-    get_task_category,
-)
+from .llm_config import TASK_CATEGORIES
 from .llm_stats import (
     update_token_stats,
     calculate_cost,
@@ -34,13 +31,8 @@ from .llm import (
     _save_persisted_provider,
 )
 
-# Aliases for cleaner public API
-get_task_model = get_task_category
-
 __all__ = [
     "TASK_CATEGORIES",
-    "get_task_category",
-    "get_task_model",
     "update_token_stats",
     "calculate_cost",
     "LoopGuard",

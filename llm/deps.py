@@ -30,9 +30,6 @@ class WorkspaceDeps:
             from ``llm._resolve_llm_provider()`` (None -> resolve on demand).
         allowed_tools: Optional allowlist of tool names for this agent (None ->
             use registry scope ACL).
-        mcp_scopes: Optional list of MCP server scope names visible to this
-            agent (None -> registry default).
-        caps: Optional {site: max_chars} override for tool output offload.
     """
 
     project_path: str = ""
@@ -41,8 +38,6 @@ class WorkspaceDeps:
     role: str = ""
     llm_provider: Optional[dict] = None
     allowed_tools: Optional[list[str]] = None
-    mcp_scopes: Optional[list[str]] = None
-    caps: Optional[dict] = None
     pending_images: Optional[list] = None
 
     def __post_init__(self) -> None:

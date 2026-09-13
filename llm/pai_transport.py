@@ -117,7 +117,7 @@ def _model_name(model: str) -> str:
         from llm.llm import _map_model
         return _map_model(model or "")
     except Exception:
-        return model or "deepseek-chat"
+        return model or "deepseek-v4.1-flash"
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -382,6 +382,9 @@ def _pai_usage_to_stats(
     reasoning_effort: str | None,
     reasoning_budget: int | None,
     reasoning_chars: int = 0,
+    backend: str | None = None,
+    cost_override: float | None = None,
+    extra: dict | None = None,
 ) -> None:
     try:
         from llm.llm_stats import update_token_stats
@@ -407,6 +410,9 @@ def _pai_usage_to_stats(
         reasoning_chars=reasoning_chars,
         reasoning_effort=reasoning_effort,
         reasoning_budget=reasoning_budget,
+        cost_override=cost_override,
+        backend=backend,
+        extra=extra,
     )
 
 
@@ -446,7 +452,7 @@ def pai_native_turn(
     role: str,
     messages: list,
     tools: list[dict] | None = None,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     reasoning_effort: str | None = None,
     reasoning_budget: int | None = None,
@@ -490,7 +496,7 @@ async def apai_native_turn(
     role: str,
     messages: list,
     tools: list[dict] | None = None,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     reasoning_effort: str | None = None,
     reasoning_budget: int | None = None,
@@ -643,7 +649,7 @@ async def apai_native_turn(
                     return event
 
                 _hooks = Hooks(event=_on_event)
-                from llm.native_tools import DEFAULT_USAGE_LIMITS
+                from llm.native_tools import _default_usage_limits
 
                 use_iter = os.getenv("PAI_USE_ITER", "1") != "0"
                 resp = None
@@ -656,7 +662,7 @@ async def apai_native_turn(
                             user_prompt,
                             message_history=msg_history,
                             deps=deps or WorkspaceDeps.from_shared_state(role=role),
-                            usage_limits=DEFAULT_USAGE_LIMITS,
+                            usage_limits=_default_usage_limits(),
                             cancellation_token=cancellation_token,
                             capabilities=[_hooks],
                         ) as run:
@@ -688,7 +694,7 @@ async def apai_native_turn(
                     async with agent.run_stream(
                         user_prompt,
                         message_history=msg_history,
-                        usage_limits=DEFAULT_USAGE_LIMITS,
+                        usage_limits=_default_usage_limits(),
                         deps=deps or WorkspaceDeps.from_shared_state(role=role),
                         cancellation_token=cancellation_token,
                         capabilities=[_hooks],
@@ -729,11 +735,11 @@ async def apai_native_turn(
                             }
                         )
             else:
-                from llm.native_tools import DEFAULT_USAGE_LIMITS
+                from llm.native_tools import _default_usage_limits
                 res = agent.run_sync(
                     user_prompt,
                     message_history=msg_history,
-                    usage_limits=DEFAULT_USAGE_LIMITS,
+                    usage_limits=_default_usage_limits(),
                     deps=deps or WorkspaceDeps.from_shared_state(role=role),
                 )
                 text, call_parts, reasoning = _result_to_native(res.output.parts, res)
@@ -847,7 +853,7 @@ async def apai_native_turn(
             reasoning = "".join(reasoning_acc).strip() or None
             usage = None
         else:
-            resp = llm.request(msg_history_full, settings, req_params)
+            resp = await llm.request(msg_history_full, settings, req_params)
             text, call_parts, reasoning = _result_to_native(resp.parts, resp)
             usage = getattr(resp, "usage", None)
             if not text and reasoning and not call_parts:
@@ -863,7 +869,7 @@ async def apai_native_turn(
 def pai_structured(
     messages: list,
     result_type: type,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     where: str | None = None,
     base_url: str | None = None,
@@ -896,7 +902,7 @@ def pai_structured(
 async def apai_structured(
     messages: list,
     result_type: type,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     where: str | None = None,
     base_url: str | None = None,

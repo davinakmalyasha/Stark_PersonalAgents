@@ -130,10 +130,9 @@ class RateLimitTracker:
     Tracks RPM (requests per minute) and RPD (requests per day).
     """
 
-    def __init__(self, rpm: int, rpd: int = 0, tpm: int = 0):
+    def __init__(self, rpm: int, rpd: int = 0):
         self.max_rpm = rpm
         self.max_rpd = rpd
-        self.max_tpm = tpm
         self._window: list[float] = []  # timestamps in current minute
         self._daily: list[float] = []   # timestamps in current day
         self._cooldown_until: float = 0.0
@@ -190,7 +189,6 @@ class ProviderClient:
         self.rate_limiter = RateLimitTracker(
             rpm=self.cfg.get("rpm", 30),
             rpd=self.cfg.get("rpd", 0),
-            tpm=self.cfg.get("tpm", 0),
         )
         self.default_model = self.cfg["default_model"]
         # Health memory: auth-dead providers are skipped for the pool's
@@ -315,9 +313,13 @@ class ProviderClient:
         **overrides,
     ) -> dict:
         model = overrides.pop("model", self.default_model)
+        try:
+            _max_tokens = int(os.getenv("FREE_PROVIDER_MAX_TOKENS", "8192"))
+        except Exception:
+            _max_tokens = 8192
         params = {
             "temperature": 0.7,
-            "max_tokens": 4096,
+            "max_tokens": _max_tokens,
             "top_p": 0.9,
         }
         params.update(overrides)
@@ -760,6 +762,27 @@ def _get_models_for_capability(
     else:
         matches.sort(key=lambda x: (x[0], x[1], x[3].get("priority", 99)))
     return [m[3] for m in matches]
+
+
+def model_context_window(model_id: str, default: int = 0) -> int:
+    """Largest catalog context window for a model id.
+
+    Tolerates the ``-free`` / ``:free`` id variants so a pinned compactor
+    slug resolves to its biggest advertised window regardless of provider.
+    """
+    key = str(model_id or "").strip().lower()
+    if not key:
+        return default
+    best = 0
+    for model in MODEL_CATALOG:
+        mid = str(model.get("id") or model.get("name") or "").strip().lower()
+        if not mid:
+            continue
+        if mid == key or mid.replace(":free", "-free") == key.replace(":free", "-free"):
+            best = max(best, int(model.get("context", 0) or 0))
+    return best or default
+
+
 class FreeProviders:
     """Multi-provider free LLM agent with smart routing and fallback.
 
@@ -1541,7 +1564,7 @@ def free_native_turn(
     consumes. Raises loudly when the whole pool fails â€” no silent paid
     fallback by design.
     """
-    pool = FreeProviders()
+    pool = get_pool()
     # A6b: native ModelMessage support
     if messages and isinstance(messages[0], dict):
         native_msgs = messages
@@ -1580,6 +1603,27 @@ def free_native_turn(
             **extra,
         )
     reply = str(info.get("reply", "") or "")
+    _free_reasoning = str(info.get("reasoning", "") or "").strip() or None
+    # Telemetry (shared prod+eval path): forward the pool's OpenAI-style
+    # usage into the shared token stats at $0 (free pool has no marginal
+    # cost). Telemetry-only — guarded so it cannot fail the turn.
+    try:
+        from llm.llm_stats import update_token_stats
+        _u = info.get("usage") or {}
+        _in = int(_u.get("prompt_tokens", 0) or 0)
+        _out = int(_u.get("completion_tokens", 0) or 0)
+        _hit = int(_u.get("prompt_cache_hit_tokens", 0)
+                   or _u.get("cached_tokens", 0) or 0)
+        _prov = str(info.get("provider", "") or "")
+        _mdl = str(info.get("model", "") or "")
+        update_token_stats(
+            name, _mdl or "free-pool", _in, _out, _hit,
+            f"free:{_prov}/{_mdl}"[:120],
+            reasoning_chars=len(_free_reasoning or ""),
+            cost_override=0.0, backend="free",
+        )
+    except Exception:
+        pass
     calls: list[dict] = []
     for index, tc in enumerate(info.get("tool_calls") or []):
         if not isinstance(tc, dict):

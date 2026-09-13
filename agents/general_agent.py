@@ -15,7 +15,7 @@ Two entry points share ONE core loop (:func:`general_loop`):
 Dual LLM backend via ``GENERAL_MODEL_BACKEND``:
 
 - ``deepseek`` (default): invoke_messages_with_fallback_stream on
-  ``deepseek:v4-flash`` with native function calling.
+  ``deepseek:v4.1-flash`` with native function calling.
 - ``free``: routes every turn through the multi-provider FreeAgent client
   (OpenRouter/Groq/Gemini/Mistral/NVIDIA/Cloudflare/...) â€” zero cost, same
   OpenAI-native tool protocol.
@@ -129,7 +129,7 @@ def _build_zone2(task: str, chat_id: str) -> str:
 
     if chat_id:
         try:
-            from memory.chat_context import build_chat_context
+            from server.context.chat_history import build_chat_context
 
             history = build_chat_context(
                 "_general", chat_id, max_messages=30, max_chars_per_msg=3000, exclude_traces=True
@@ -344,24 +344,22 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
             except Exception:
                 pass
 
-        # A6b/A7: native compaction — estimate_history_tokens + compact_history_native
+        # A6b/A7: native compaction — Codex-parity LLM handoff summary.
         if iteration > 1:
             try:
                 est = estimate_history_tokens(history)
                 if est >= compaction_policy.checkpoint_trigger:
-                    from llm.model_history import compact_history_native
+                    from memory.compaction_engine import compact_history_with_summary
 
                     before = est
-                    history = compact_history_native(
-                        history,
-                        policy=compaction_policy,
-                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                    history, _engine_info = compact_history_with_summary(
+                        history, project_path="", policy=compaction_policy
                     )
                     after = estimate_history_tokens(history)
                     _log(
                         f"[{_AGENT_NAME.upper()}] Native checkpoint "
                         f"({before:,} -> {after:,} est. tokens; "
-                        f"tail={compaction_policy.tail_budget_tokens:,})"
+                        f"chunks={_engine_info.get('chunks', 0)})"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")
@@ -484,15 +482,6 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                     result_str = str(execution.content)
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"
-
-            # Offload oversized results to VFS; keep the transcript compact.
-            try:
-                from tools import _tool_cap, auto_offload_result
-
-                result_str = auto_offload_result(result_str, tname, max_chars=_tool_cap("subagent"))
-            except Exception:
-                if len(result_str) > 4000:
-                    result_str = result_str[:2000] + "\n... (truncated middle) ...\n" + result_str[-2000:]
 
             if guard and guard[0] == "WARNING":
                 result_str += "\n" + guard[1]

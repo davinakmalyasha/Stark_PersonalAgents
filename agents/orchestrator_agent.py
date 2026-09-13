@@ -77,7 +77,7 @@ def _native_slice_tools(new_msgs: list) -> list[dict]:
 def _native_slice_delegated(new_msgs: list) -> bool:
     """True if the native turn spawned delegations (delegate/task/resume/create)."""
     return any(
-        tc.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
+        tc.get("tool") in ("delegate", "task", "resume_project", "create_project")
         for tc in _native_slice_tools(new_msgs)
     )
 
@@ -92,7 +92,7 @@ def _native_slice_failures(new_msgs: list) -> bool:
                     tname = p.tool_name or ""
                     content = str(p.content or "")
                     low = content.lower()
-                    if tname in ("delegate", "task", "async_task", "resume_project"):
+                    if tname in ("delegate", "task", "resume_project"):
                         if content.startswith("ERROR") or any(
                             marker in low
                             for marker in (
@@ -226,7 +226,7 @@ def orchestrator_node(s: ITState) -> dict:
 
     The Orchestrator's loop:
       1. LLM analyzes the request and decides which subagent to spawn
-      2. Spawns subagents via task() / async_task(action="start") / resume_project()
+      2. Spawns subagents via delegate() / create_project() / resume_project()
       3. Collects results
       4. Verifies results against the user request
       5. Returns summary or retries
@@ -278,32 +278,78 @@ def _run_native_orchestrator_turn(state, deps) -> tuple[str, list, str | None]:
 
     if str(getattr(_oplan, "get", lambda k, d="": d)("backend", "")) == "free":
         from llm.free_providers import free_native_turn
-        response_text, native_tool_calls, reasoning = free_native_turn(
-            "Orchestrator",
-            list(history),
-            tools=deps.native_orchestrator_tools or get_native_tools("orchestrator"),
-            capability="text",
-            prefer_reasoning=bool(getattr(_oplan, "get", lambda k, d=False: d)("think_bias", False)),
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            ToolCallPart,
+            ToolReturnPart,
         )
-        # Materialize a native ModelResponse slice for free pool (matches legacy)
-        from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
-        parts = []
-        if response_text:
-            parts.append(TextPart(content=response_text))
-        for ci, tc in enumerate(native_tool_calls or []):
-            if not isinstance(tc, dict):
-                continue
-            tname = tc.get("tool") or tc.get("name") or ""
-            targs = tc.get("args") or {}
-            if isinstance(targs, str):
-                try:
-                    targs = json.loads(targs)
-                except Exception:
+        from tools import execute_tool_detailed
+
+        tools = deps.native_orchestrator_tools or get_native_tools("orchestrator")
+        valid_tools = set(deps.valid_tools or []) or {
+            t.get("function", {}).get("name", "") for t in tools
+        }
+        prefer_reasoning = bool(getattr(_oplan, "get", lambda k, d=False: d)("think_bias", False))
+        working = list(history)
+        added: list = []
+        response_text = ""
+        # Manual tool loop: free_native_turn returns tool calls only; execute
+        # them here (the paid path executes tools inside pydantic-ai).
+        for _round in range(50):
+            text, raw_calls, _reasoning = free_native_turn(
+                "Orchestrator",
+                working,
+                tools=tools,
+                capability="text",
+                prefer_reasoning=prefer_reasoning,
+            )
+            response_text = text or ""
+            raw_calls = [tc for tc in (raw_calls or []) if isinstance(tc, dict)]
+            if not raw_calls:
+                if response_text:
+                    msg = ModelResponse(parts=[TextPart(content=response_text)])
+                    added.append(msg)
+                break
+            parts: list = []
+            if response_text:
+                parts.append(TextPart(content=response_text))
+            calls: list[tuple[str, dict, str]] = []
+            for ci, tc in enumerate(raw_calls):
+                tname = str(tc.get("tool") or tc.get("name") or "")
+                targs = tc.get("args") or {}
+                if isinstance(targs, str):
+                    try:
+                        targs = json.loads(targs)
+                    except Exception:
+                        targs = {}
+                if not isinstance(targs, dict):
                     targs = {}
-            parts.append(ToolCallPart(tool_name=tname, args=targs if isinstance(targs, dict) else {},
-                                      tool_call_id=tc.get("id") or f"orch-call-{state.iteration}-{ci}"))
-        native_msgs = [ModelResponse(parts=parts)] if parts else []
-        return response_text or "", native_msgs, None
+                cid = str(tc.get("id") or f"orch-call-{state.iteration}-{_round}-{ci}")
+                parts.append(ToolCallPart(tool_name=tname, args=targs, tool_call_id=cid))
+                calls.append((tname, targs, cid))
+            assistant_msg = ModelResponse(parts=parts)
+            added.append(assistant_msg)
+            working.append(assistant_msg)
+            for tname, targs, cid in calls:
+                if tname not in valid_tools:
+                    result_str = (
+                        f"[BLOCKED] Tool '{tname}' is not available to Orchestrator. "
+                        f"Available: {', '.join(sorted(t for t in valid_tools if t))}"
+                    )
+                else:
+                    try:
+                        execution = execute_tool_detailed(tname, targs, deps=run_deps)
+                        result_str = str(execution.content)
+                    except Exception as e:
+                        result_str = f"ERROR: {str(e)[:300]}"
+                ret = ModelRequest(parts=[ToolReturnPart(
+                    tool_name=tname, content=result_str, tool_call_id=cid,
+                )])
+                added.append(ret)
+                working.append(ret)
+        return response_text or "", added, None
 
     response_text, native_msgs, reasoning = run_native_agent(
         role="Orchestrator",
@@ -360,8 +406,17 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
     run_deps = WorkspaceDeps.from_shared_state(role="Orchestrator", chat_id=chat_id, project_path=project_path)
     orch_sess = _orch_session_log(chat_id, project_path)
 
-    from llm.model_history import compact_history_native, estimate_history_tokens
+    from llm.model_history import estimate_history_tokens
     from memory.context_compaction import get_compaction_policy
+
+    def _orch_compact(history, policy=None, summary_text=None):
+        """Real LLM checkpoint (summary + project memory + map re-anchor)."""
+        from memory.compaction_engine import compact_history_with_summary
+
+        new_history, _info = compact_history_with_summary(
+            history, project_path=project_path, policy=policy,
+        )
+        return new_history
 
     graph_deps = GraphDeps(
         deps=run_deps,
@@ -375,7 +430,7 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
         drain_follow_up=drain_follow_up,
         consume_abort=consume_abort,
         park_wait=_park_wait,
-        compact_history=compact_history_native,
+        compact_history=_orch_compact,
         estimate_tokens=estimate_history_tokens,
         append_log=_log,
     )

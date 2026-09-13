@@ -390,7 +390,7 @@ _README_TEMPLATE = """# {name}
 
 ## Getting started
 
-This project was scaffolded by the LangChain agent harness. Replace this
+This project was scaffolded by the agent harness. Replace this
 README with project-specific setup, usage, and architecture notes.
 """
 

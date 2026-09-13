@@ -5,8 +5,8 @@ design brief: no orchestrator, no Dev in the loop. Every prompt in a design
 module session goes straight to this UI loop.
 
 Session flow:
-  1. Build the opening brief: SKILL.md text inlined + lean context (user
-     brief, workspace path, existing project DESIGN.md tokens if present)
+  1. Build the opening brief: skill pointer + lean context (user brief,
+     workspace path, existing project memory if present)
      + explicit deliverables contract.
   2. start_continuable(chat_id, workspace, "UI", brief) → first turn.
   3. Continuation guard: while deliverables are missing and rounds remain,
@@ -28,10 +28,20 @@ import time
 
 _AGENT_NAME = "UI-Design"
 
-_SKILL_REL = os.path.join(".agents", "skills", "ui-ux-design", "SKILL.md")
-_DESIGN_REF_INDEX_REL = os.path.join("design-references", "INDEX.md")
-_MAX_SKILL_CHARS = 12000
-_MAX_DESIGNMD_CHARS = 4000
+_MAX_MEMORY_CHARS = 4000
+
+
+def _ui_skill_names() -> list[str]:
+    """Skill names from the UI specialist spec (single source of truth)."""
+    try:
+        spec_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "specialists", "ui.json"
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            names = json.load(f).get("skills") or []
+        return [str(n) for n in names if str(n).strip()]
+    except Exception:
+        return []
 
 
 def _harness_root() -> str:
@@ -78,13 +88,13 @@ def _session_evidence(workspace: str, since_ts: float) -> dict:
     except Exception:
         pass
     try:
-        dm = os.path.join(workspace, "DESIGN.md")
-        if os.path.isfile(dm) and os.path.getmtime(dm) >= since_ts:
-            designmd.append("DESIGN.md")
+        pm = os.path.join(workspace, ".agent-memory", "project.md")
+        if os.path.isfile(pm) and os.path.getmtime(pm) >= since_ts:
+            designmd.append(".agent-memory/project.md")
     except OSError:
         pass
     return {"html": sorted(html)[:20], "screenshots": sorted(shots)[:20],
-            "design_md": designmd}
+            "project_md": designmd}
 
 
 def _missing(evidence: dict) -> list[str]:
@@ -93,16 +103,29 @@ def _missing(evidence: dict) -> list[str]:
         missing.append("artifact HTML (created/modified this session)")
     if not evidence["screenshots"]:
         missing.append("screenshot evidence (saved in the project folder)")
-    if not evidence["design_md"]:
-        missing.append("DESIGN.md at the project root")
+    if not evidence["project_md"]:
+        missing.append("`## Design` section in .agent-memory/project.md (updated this session)")
     return missing
 
 
 def _build_brief(prompt: str, workspace: str, images: list | None) -> str:
     root = _harness_root()
-    skill = _read_text_capped(os.path.join(root, _SKILL_REL), _MAX_SKILL_CHARS)
-    prior_design = _read_text_capped(os.path.join(workspace, "DESIGN.md"),
-                                     _MAX_DESIGNMD_CHARS)
+    # Progressive disclosure: the prompt carries the skill's description and
+    # absolute path; the agent reads the full SKILL.md itself when the loop
+    # applies.
+    skills_block = ""
+    try:
+        from tools.skills import skill_pointer_block
+        skills_block = skill_pointer_block(
+            _ui_skill_names() or ["ui-ux-pro-max"],
+            workspace_path=workspace,
+            harness_root=root,
+        )
+    except Exception:
+        skills_block = ""
+    prior_design = _read_text_capped(
+        os.path.join(workspace, ".agent-memory", "project.md"), _MAX_MEMORY_CHARS
+    )
     lines = [
         "# UI/UX DESIGN SESSION (OpenDesign module)",
         "",
@@ -113,14 +136,16 @@ def _build_brief(prompt: str, workspace: str, images: list | None) -> str:
         f"Project folder — do ALL work inside it, touch nothing outside: {workspace}",
         "",
     ]
-    if skill:
-        lines += ["## Design skill (follow this loop end-to-end)", "", skill, ""]
+    if skills_block:
+        lines += [skills_block, "",
+                  "Design work MUST follow that skill file end-to-end.", ""]
     else:
         lines += ["## Design skill file missing — proceed with best practice:",
-                  "direction-lock via ask_user, build real files, self-critique,",
-                  "screenshot-verify, finalize with DESIGN.md.", ""]
+                  "generate the design system with ui-ux-pro-max's search script,",
+                  "build real files, self-critique, screenshot-verify, finalize",
+                  "the `## Design` section in .agent-memory/project.md.", ""]
     if prior_design:
-        lines += ["## Standing project contract (DESIGN.md — honor these tokens)",
+        lines += ["## Standing project memory (honor the `## Design` section; never edit other sections)",
                   "", prior_design, ""]
     if images:
         lines += ["## Attached reference images",
@@ -130,7 +155,9 @@ def _build_brief(prompt: str, workspace: str, images: list | None) -> str:
         "## Deliverables (ALL required before finishing)",
         "1. Artifact HTML created/modified during THIS session, inside the project folder.",
         "2. Screenshot evidence saved inside the project folder.",
-        "3. DESIGN.md (winning direction + tokens) at the project root.",
+        "3. The `## Design` section in .agent-memory/project.md updated this session "
+        "(direction, theme, palette, typography, concept — compact bullets; create "
+        "`.agent-memory/` if needed). Never modify `## Identity` or other lines.",
         "Keep acting with tools until all three exist. Never end a turn with",
         "text-only narration mid-loop — a text-only reply ends the session.",
         "",
@@ -217,7 +244,7 @@ def run_ui_design_direct(prompt: str, workspace_path: str = "",
             f"- Session: {child_id}",
             f"- Artifact HTML: {', '.join(evidence['html']) or '—'}",
             f"- Screenshots: {', '.join(evidence['screenshots']) or '—'}",
-            f"- DESIGN.md: {'yes' if evidence['design_md'] else 'no'}",
+            f"- project.md `## Design`: {'updated this session' if evidence['project_md'] else 'no'}",
         ]
         if still_missing:
             report_lines.append(

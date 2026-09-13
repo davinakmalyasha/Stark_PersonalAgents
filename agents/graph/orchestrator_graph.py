@@ -240,7 +240,7 @@ def _build_graph() -> GraphBuilder:
             if state.project_path and os.path.isdir(state.project_path):
                 task_message = f"## WORKSPACE\n{state.project_path}\n\n" + task_message
             try:
-                from memory.chat_context import build_chat_context
+                from server.context.chat_history import build_chat_context
                 from sync.state_sync import shared_state
                 ctx_path = "_general" if shared_state.get("is_general", False) else project_path
                 chat_history_str = build_chat_context(
@@ -285,8 +285,9 @@ def _build_graph() -> GraphBuilder:
         state.iteration += 1
         deps.append_log(f"\n[ORCH Iteration {state.iteration}]")
 
-        # Compaction at iteration boundaries (native ModelMessage history)
-        if state.iteration > 1 and deps.compact_history is not None:
+        # Compaction at iteration boundaries (native ModelMessage history).
+        # Runs whenever the policy trigger is hit, including the first turn.
+        if deps.compact_history is not None:
             try:
                 est = deps.estimate_tokens(state.history) if deps.estimate_tokens is not None else 0
                 if est >= (deps.compaction_policy.checkpoint_trigger if deps.compaction_policy else 1 << 30):
@@ -313,6 +314,10 @@ def _build_graph() -> GraphBuilder:
         state.response_text = text or ""
         state.reasoning_content = reasoning
         state.native_msgs = native_msgs or []
+        if state.native_msgs:
+            # Merge the executed turn into history so the next iteration sees
+            # its own assistant/tool turns (parity with the workspace agents).
+            state.history.extend(state.native_msgs)
 
         # Extract tool calls from native transcript slice
         calls: list[dict] = []
@@ -336,7 +341,7 @@ def _build_graph() -> GraphBuilder:
         for c in calls:
             state.tool_call_log.append({"tool": c.get("tool"), "args": c.get("args"), "id": c.get("id")})
         state.delegated_work = any(
-            c.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
+            c.get("tool") in ("delegate", "task", "resume_project", "create_project")
             for c in calls
         )
         return "decide"
@@ -513,15 +518,6 @@ def get_graph():
     if _GRAPH is None:
         _GRAPH = _build_graph().build()
     return _GRAPH
-
-
-def graph_enabled() -> bool:
-    """ORCH_GRAPH gate (retained for documentation; graph path is the only path).
-
-    Default ON (1). The legacy loop is deleted, so this is informational only —
-    setting it to 0 no longer selects a fallback.
-    """
-    return os.environ.get("ORCH_GRAPH", "1").strip() not in ("0", "false", "no", "off")
 
 
 # ── Resume helpers ───────────────────────────────────────────────────────────

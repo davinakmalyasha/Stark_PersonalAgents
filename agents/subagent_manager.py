@@ -64,6 +64,8 @@ def _activation(child_id: str) -> dict:
                 "session_path": None,
                 "name": "",
                 "parent_chat_id": "",
+                "workspace": "",
+                "last_result": "",
             }
             _ACTIVATIONS[child_id] = act
         return act
@@ -232,7 +234,7 @@ def _run_turn(
         ToolReturnPart,
     )
     from tools.AddOnTool.subagentTools import _specialist_call_backend
-    from tools import (execute_tool_detailed, auto_offload_result, _tool_cap,
+    from tools import (execute_tool_detailed,
                        active_permissions, _TASK_DEPTH,
                        get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents)
 
@@ -241,8 +243,13 @@ def _run_turn(
         act["interrupt"] = False
     act["session_path"] = session.get_session_file()
 
-    # Mirror task()'s context: depth 1, the spec's permissions.
-    _depth_token = _TASK_DEPTH.set(1)
+    # Mirror task()'s context: inherit the parent's delegation depth (+1) so
+    # continuable children cannot bypass the max-depth guard.
+    try:
+        _parent_depth = int(_TASK_DEPTH.get(0) or 0)
+    except Exception:
+        _parent_depth = 0
+    _depth_token = _TASK_DEPTH.set(_parent_depth + 1)
     _perm_token = active_permissions.set(_child_permissions(name))
     _descriptor = _descriptor_of(session) or {}
     _parent_chat = _descriptor.get("parent_chat_id", "") or ""
@@ -482,7 +489,7 @@ def _run_turn(
                 call_id = tc["id"]
                 try:
                     execution = execute_tool_detailed(tname, targs)
-                    r = auto_offload_result(execution.content, tname, max_chars=_tool_cap("subagent"))
+                    r = execution.content
                     session.append_tool_result(r, tool_call_id=call_id, tool_name=tname)
                 except Exception as e:
                     r = f"Error: {e}"
@@ -511,6 +518,7 @@ def _run_turn(
 
         if interrupted:
             content = content or "INTERRUPTED"
+        act["last_result"] = content
         session.append_custom_entry(_STATUS, {"status": "idle", "at": int(time.time() * 1000)})
         return content
     finally:
@@ -519,6 +527,30 @@ def _run_turn(
         with act["lock"]:
             act["status"] = "idle"
             act["interrupt"] = False
+
+
+def _drain_queued_turns(act: dict, session, name: str, reasoning_effort,
+                        last_result: str) -> str:
+    """Run messages queued while the previous turn was in flight (FIFO).
+
+    ``send_message`` queues while the child is running; without this drain the
+    steer would sit idle until the next external message. Called after every
+    blocking turn so queued steering is honored as real follow-up turns.
+    After an interrupt the queue is deliberately left untouched (stop means
+    stop) — a later explicit send_message can resume it.
+    """
+    if last_result == "INTERRUPTED":
+        return last_result
+    while True:
+        with act["lock"]:
+            if not act["queue"]:
+                return last_result
+            pending = list(act["queue"])
+            act["queue"].clear()
+        if not pending:
+            return last_result
+        last_result = _run_turn(act, session, name, extra_messages=pending,
+                                reasoning_effort=reasoning_effort)
 
 
 # ── Public API ───────────────────────────────────────────────────────────
@@ -530,12 +562,26 @@ def start_continuable(
     label: Optional[str] = None,
     parent_session: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    context: str = "",
 ) -> dict:
     """Create a durable continuable child and run its first turn (blocking).
+
+    ``context`` (optional) is a pre-built context pack appended as a user
+    message BEFORE the task, so the child starts with project knowledge while
+    its task stays the final, authoritative instruction.
 
     Returns ``{"child_id", "result", "status"}``. The child persists; later
     :func:`send_message` turns resume it from its log.
     """
+    from tools import _TASK_DEPTH as _TD, _MAX_TASK_DEPTH as _MAXD
+
+    if int(_TD.get(0) or 0) >= _MAXD:
+        return {
+            "child_id": "",
+            "result": (f"Error: Maximum task depth ({_MAXD}) reached. "
+                       f"Cannot start subagent '{name}'."),
+            "status": "error",
+        }
     child_id = _new_child_id(chat_id, name)
     session = get_session(
         child_id, workspace,
@@ -551,22 +597,128 @@ def start_continuable(
         "parent_chat_id": chat_id,
         "created": int(time.time() * 1000),
     })
+    if context:
+        session.append_message("user", context, source="context")
     session.append_message("user", task, source="user")
     _log_spawn(child_id, name, spawn_label)
 
     act = _activation(child_id)
     act["name"] = name
     act["parent_chat_id"] = chat_id
+    act["workspace"] = workspace
     act["session_path"] = session.get_session_file()
 
     token = current_child.set(child_id)
     try:
         result = _run_turn(act, session, name, extra_messages=[], reasoning_effort=reasoning_effort)
+        result = _drain_queued_turns(act, session, name, reasoning_effort, result)
     finally:
         current_child.reset(token)
 
     session.append_custom_entry(_STATUS, {"status": "idle", "at": int(time.time() * 1000)})
     return {"child_id": child_id, "result": result, "status": "idle"}
+
+
+def spawn_continuable(
+    chat_id: str,
+    workspace: str,
+    name: str,
+    task: str,
+    label: Optional[str] = None,
+    parent_session: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    context: str = "",
+) -> dict:
+    """Create a durable child and run its first turn in a BACKGROUND thread.
+
+    Returns ``{"child_id", "status": "running"}`` — the caller
+    keeps working and collects the result later via :func:`child_status`
+    (poll/bounded wait), steers via :func:`send_message`, or aborts via
+    :func:`interrupt`. Same durable session semantics as
+    :func:`start_continuable`.
+    """
+    from tools import _TASK_DEPTH, _MAX_TASK_DEPTH
+
+    _parent_depth = int(_TASK_DEPTH.get(0) or 0)
+    if _parent_depth >= _MAX_TASK_DEPTH:
+        return {
+            "child_id": "",
+            "result": (f"Error: Maximum task depth ({_MAX_TASK_DEPTH}) reached. "
+                       f"Cannot spawn subagent '{name}'."),
+            "status": "error",
+        }
+    child_id = _new_child_id(chat_id, name)
+    session = get_session(
+        child_id, workspace,
+        parent_session=parent_session,
+        delegation_depth=1,
+        chat_name=label or name,
+    )
+    spawn_label = label or _task_label(task) or name
+    session.append_custom_entry(_DESCRIPTOR, {
+        "name": name,
+        "label": spawn_label,
+        "parent_session": parent_session,
+        "parent_chat_id": chat_id,
+        "created": int(time.time() * 1000),
+    })
+    if context:
+        session.append_message("user", context, source="context")
+    session.append_message("user", task, source="user")
+    _log_spawn(child_id, name, spawn_label)
+
+    act = _activation(child_id)
+    act["name"] = name
+    act["parent_chat_id"] = chat_id
+    act["workspace"] = workspace
+    act["session_path"] = session.get_session_file()
+    # Mark running BEFORE the thread starts: a status/message call arriving
+    # immediately after spawn must see "running", not a stale "idle".
+    act["status"] = "running"
+
+    import contextvars as _cv
+    _ctx = _cv.copy_context()
+
+    def _runner() -> None:
+        token = current_child.set(child_id)
+        try:
+            result = _run_turn(act, session, name, extra_messages=[],
+                               reasoning_effort=reasoning_effort)
+            result = _drain_queued_turns(act, session, name, reasoning_effort, result)
+            act["last_result"] = result
+        except Exception as e:  # a background failure must surface via status, not crash the app
+            act["last_result"] = f"ERROR: background subagent failed: {e}"
+        finally:
+            current_child.reset(token)
+            session.append_custom_entry(_STATUS, {"status": "idle", "at": int(time.time() * 1000)})
+
+    threading.Thread(target=_ctx.run, args=(_runner,), name=f"subagent-{child_id[:24]}", daemon=True).start()
+    return {"child_id": child_id, "result": "", "status": "running"}
+
+
+def child_status(child_id: str, wait_seconds: float = 0.0) -> dict:
+    """Status + latest result of a continuable child (single or bounded wait).
+
+    Returns ``{"child_id", "name", "status", "result", "queued"}``.
+    ``status`` is ``running`` | ``idle`` | ``unknown``. ``wait_seconds`` is
+    clamped to ≤300s (the same bound the tool layer documents).
+    """
+    act = _ACTIVATIONS.get(child_id)
+    if act is None:
+        return {"child_id": child_id, "name": "", "status": "unknown",
+                "result": "", "queued": 0}
+    try:
+        deadline = time.time() + max(0.0, min(float(wait_seconds or 0), 300.0))
+    except (TypeError, ValueError):
+        deadline = time.time()
+    while act["status"] == "running" and time.time() < deadline:
+        time.sleep(0.25)
+    with act["lock"]:
+        status = act["status"]
+        result = str(act.get("last_result") or "")
+        queued = len(act["queue"])
+    return {"child_id": child_id, "name": act.get("name", ""), "status": status,
+            "result": result, "queued": queued}
 
 
 def send_message(
@@ -575,7 +727,9 @@ def send_message(
     """Deliver a follow-up turn to a continuable child (FIFO).
 
     A running child queues the message; an idle or cold child resumes and runs
-    it now (blocking up to ``timeout``). Returns {"result", "queued", "status"}.
+    it now, blocking up to ``timeout`` seconds. On timeout the turn keeps
+    running in the background and ``{"status": "running", "timed_out": True}``
+    is returned (collect later via :func:`child_status`).
     """
     act = _activation(child_id)
     with act["lock"]:
@@ -599,12 +753,37 @@ def send_message(
     if not pending:
         return {"result": "", "queued": False, "status": "idle"}
 
-    token = current_child.set(child_id)
     try:
-        result = _run_turn(act, session, name, extra_messages=pending)
-    finally:
-        current_child.reset(token)
-    return {"result": result, "queued": False, "status": "idle"}
+        _timeout: Optional[float] = float(timeout) if timeout else None
+    except (TypeError, ValueError):
+        _timeout = None
+
+    import contextvars as _cv
+    _out: dict = {}
+    _ctx = _cv.copy_context()
+
+    def _work() -> None:
+        token = current_child.set(child_id)
+        try:
+            result = _run_turn(act, session, name, extra_messages=pending)
+            result = _drain_queued_turns(act, session, name, None, result)
+            _out["result"] = result
+        except Exception as e:
+            _out["error"] = str(e)
+        finally:
+            current_child.reset(token)
+
+    worker = threading.Thread(
+        target=_ctx.run, args=(_work,), name=f"child-turn-{child_id[:20]}", daemon=True,
+    )
+    worker.start()
+    worker.join(_timeout)
+    if worker.is_alive():
+        # Turn still running in the background; result lands in last_result.
+        return {"result": "", "queued": False, "status": "running", "timed_out": True}
+    if "error" in _out:
+        return {"result": f"Error: {_out['error']}", "queued": False, "status": "error"}
+    return {"result": _out.get("result", ""), "queued": False, "status": "idle"}
 
 
 def interrupt(child_id: str) -> bool:

@@ -33,8 +33,6 @@ DELEGATABLE_AGENTS = ("dev", "general", "house")
 
 _AGENT_DISPLAY = {"dev": "Dev", "general": "General", "house": "House"}
 
-_REPLY_CAP = 1200
-
 _LOCK = threading.RLock()
 
 #: del_id -> entry dict. Entries survive until process exit (small).
@@ -109,8 +107,6 @@ def _result_block(entry: dict) -> str:
     reply = str(entry.get("result") or "").strip()
     if entry["status"] == "failed":
         reply = reply or entry.get("error") or "Agent crashed."
-    if len(reply) > _REPLY_CAP:
-        reply = reply[:_REPLY_CAP] + "\n… (truncated — full report in the delegation chat)"
     lines.append("reply:")
     lines.append(reply or "(no output)")
     return "\n".join(lines)
@@ -248,14 +244,15 @@ def _run_item(del_id: str, item: dict, parent_chat_id: str) -> None:
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
-def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> list[dict]:
+def start_delegations(items: list, parent_chat_id: str, fallback_ws: str,
+                      background: bool = False) -> list[dict]:
     """Validate + register + launch every item. Returns spawn summaries.
 
-    Without a parent chat id the call degrades to BLOCKING sequential runs so
-    results can be returned directly (no inbox to park on). With a parent chat
-    id the items run in PARALLEL through the pydantic-graph map+join path
-    (``map_run_delegations``); this sync facade is the fallback for callers
-    that cannot await (e.g. legacy tools).
+    ``background=True`` with a parent chat id starts one daemon thread per item
+    and returns immediately (the orchestrator parks; completions arrive as
+    inbox events). Without a parent chat id the call degrades to BLOCKING
+    sequential runs so results can be returned directly (no inbox to park on);
+    otherwise items run through the pydantic-graph map+join path.
     """
     summaries: list[dict] = []
     graph_items: list[dict] = []
@@ -347,6 +344,19 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> lis
     if not graph_items:
         return summaries
 
+    if background and parent_chat_id:
+        # Fire-and-forget fan-out: one daemon thread per item. Completion
+        # events land in the parent's inbox (enqueue_or_follow_up), so a
+        # parked orchestrator wakes with [DELEGATION RESULT] blocks.
+        for gi in graph_items:
+            threading.Thread(
+                target=_run_item,
+                args=(gi["del_id"], gi["raw"], parent_chat_id or ""),
+                daemon=True,
+                name=f"delegation-{gi['del_id']}",
+            ).start()
+        return summaries
+
     if blocking:
         # Degenerate mode: no inbox to park on — run BLOCKING and surface
         # the outcome directly in the summary.
@@ -357,7 +367,7 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> lis
                 s = next((x for x in summaries if x.get("id") == gi["del_id"]), None)
                 if s:
                     s["status"] = e["status"]
-                    s["result"] = (e.get("result") or e.get("error") or "")[:_REPLY_CAP]
+                    s["result"] = (e.get("result") or e.get("error") or "")
         return summaries
 
     # Parallel path (parent chat present): run through the graph map+join.
@@ -373,7 +383,7 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str) -> lis
                 s = next((x for x in summaries if x.get("id") == gi["del_id"]), None)
                 if s:
                     s["status"] = e_["status"]
-                    s["result"] = (e_.get("result") or e_.get("error") or "")[:_REPLY_CAP]
+                    s["result"] = (e_.get("result") or e_.get("error") or "")
         return summaries
 
 
@@ -580,7 +590,7 @@ def _build_del_graph():
             "agent": entry.get("agent_display", ""),
             "title": entry.get("title", ""),
             "status": entry.get("status", "failed"),
-            "result": (entry.get("result") or entry.get("error") or "")[:_REPLY_CAP],
+            "result": (entry.get("result") or entry.get("error") or ""),
         }
 
     collect = g.join(reduce_list_append, initial_factory=list)
@@ -711,7 +721,7 @@ async def map_run_delegations(items: list, parent_chat_id: str, fallback_ws: str
                 s = next((x for x in summaries if x.get("id") == gi["del_id"]), None)
                 if s:
                     s["status"] = e_["status"]
-                    s["result"] = (e_.get("result") or e_.get("error") or "")[:_REPLY_CAP]
+                    s["result"] = (e_.get("result") or e_.get("error") or "")
         return summaries
 
 

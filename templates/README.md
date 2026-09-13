@@ -69,17 +69,29 @@ repo stays green, a real project gets real enforcement):
   Diff-gated per stack; dispatch runs full.
 - **T2 staging (staging-level push)**: backup drill with MD5 data round-trip ·
   alembic N-1 forward-upgrade head assert · rotation age (vault or heuristic) ·
-  multi-worker burst · DNS/TLS preflight · external smoke · k6 load · live smoke
-  with golden /ready semantics (200 pass · 404 warn · 503 fail). Live jobs skip
-  at job level when unwired; `STAGING_NO_LIVE=true` forces ephemeral targets.
+  multi-worker burst · chaos drill (disposable DB killed mid-flight; `/ready`
+  must flip and recover with no app restart) · DNS/TLS preflight · external
+  smoke · OWASP ZAP DAST baseline against the live URL · k6 scenario pack
+  (`vars.K6_SCENARIO` = smoke|load|soak|spike|breakpoint) + capacity report
+  (`k6-capacity-T2`; fails under 90% of `vars.K6_TARGET_RPS` when set) · live
+  smoke with golden /ready semantics (200 pass · 404 warn · 503 fail). Live jobs
+  skip at job level when unwired; `STAGING_NO_LIVE=true` forces ephemeral
+  targets. Kill switches: `STAGING_NO_DB_DRILLS` / `_K6` / `_LIVE` / `_ROTATION`
+  / `_CHAOS` / `_DAST`.
 - **T3 release-heavy (prod-level push + tags `v*`)**: trivy image scan + size
   budget · CycloneDX SBOM (py/node/go/php/deno) + license denylist · env-audit ·
   zizmor workflow self-audit · schema-drift + migration round-trip · config
   validation · endpoint smoke · graceful shutdown · oasdiff contract diff ·
   perf benchmark · full build + static-asset integrity · tests-detected ·
-  rollback readiness.
+  rollback readiness · public-launch checklist in the summary (pipeline rows +
+  human sign-offs). Post-release (opt-in, outside the gate graph):
+  `release-watch` polls live health/ready after a green summary and can
+  auto-rollback (`RELEASE_WATCH_ENABLED` / `DEPLOY_PROVIDER` / `WATCH_URL` /
+  `AUTO_ROLLBACK`; vercel/wrangler automated, Render is manual by platform design).
 
-Perf budgets are universal defaults — tune after first green.
+Perf budgets are universal defaults — tune after first green. For "1M users":
+translate the forecast to peak RPS, run `K6_SCENARIO=load/soak/spike` at ~2x
+that with `K6_TARGET_RPS` set, and sign off the capacity artifact before launch.
 
 ## Tooling
 

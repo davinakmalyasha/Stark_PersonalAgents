@@ -83,3 +83,9 @@ scratch/eval_tmp/
 _house/
 .playwright-mcp/
 
+# Large local documentation binaries
+docs/paper_stark_v2.docx
+
+# Local agent plans
+.opencode/plans/
+

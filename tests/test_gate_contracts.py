@@ -87,8 +87,8 @@ def test_t1_every_job_runs_on_pr_and_dispatch():
 # ══ TIER 2 — staging ════════════════════════════════════════════════════════
 
 T2_WORKERS = ["backup-drill", "n-minus-one", "rotation-check", "multi-worker",
-              "dns-preflight", "tls-check", "external-smoke", "k6-load",
-              "staging-smoke"]
+              "chaos-drill", "dns-preflight", "tls-check", "external-smoke",
+              "dast-baseline", "k6-load", "staging-smoke"]
 
 
 def test_t2_default_trigger_shape():
@@ -491,3 +491,89 @@ def test_t3_strix_pentest_contract():
 
 
 import re  # noqa: E402  (used by selection-lane assertions above)
+
+
+# ══ REFINEMENT ROUND 3 — P1 release-watch · P2 k6 scenarios · P3 chaos · P4 DAST · P5 launch checklist ══
+
+
+def test_t2_k6_scenario_pack_contract():
+    text = _render(T2)
+    assert "K6_SCENARIO" in text, "scenario variable missing"
+    for scenario in ("smoke", "load", "soak", "spike", "breakpoint"):
+        assert scenario in text, f"k6 scenario '{scenario}' missing"
+    assert "--summary-export=_gate/k6-summary.json" in text, "k6 summary export missing"
+    assert "k6-capacity/v1" in text, "machine-readable capacity doc missing"
+    assert "K6_TARGET_RPS" in text, "capacity target variable missing"
+    jobs = jobs_of(text)
+    arts = [str((s.get('with') or {}).get('name')) for s in jobs['k6-load']['steps']]
+    assert 'k6-capacity-T2' in arts, "capacity artifact upload missing from k6-load"
+
+
+def test_t2_chaos_drill_contract():
+    jobs = jobs_of(_render(T2))
+    job = jobs.get('chaos-drill')
+    assert job, 'chaos-drill job missing'
+    cond = job['if'] or ''
+    assert "vars.STAGING_NO_CHAOS != 'true'" in cond, 'kill switch missing'
+    assert "needs.changes.outputs.backend" in cond, 'must obey the backend diff gate'
+    body = '\n'.join((s.get('run') or '') for s in job['steps'])
+    assert 'docker run -d --name chaos-db' in body, 'disposable DB must be docker-run'
+    assert 'docker stop chaos-db' in body and 'docker start chaos-db' in body, 'chaos stop/start missing'
+    assert 'DATABASE_URL' in body, 'drill DB wiring missing'
+    assert 'never dialed the drill DB' in body, 'non-DB apps must skip, not fail'
+    assert 'did not recover' in body, 'recovery assertion missing'
+    assert 'services:' not in str(job), 'a services container cannot be stopped — use a disposable container'
+
+
+def test_t2_dast_baseline_contract():
+    jobs = jobs_of(_render(T2))
+    job = jobs.get('dast-baseline')
+    assert job, 'dast-baseline job missing'
+    cond = job['if'] or ''
+    assert "vars.STAGING_NO_DAST != 'true'" in cond, 'kill switch missing'
+    assert "vars.STAGING_URL" in cond, 'must be live-URL gated'
+    ups = [s for s in job['steps']
+           if str(s.get('uses', '')).startswith('zaproxy/action-baseline@')]
+    assert ups, 'ZAP baseline action missing'
+    assert re.search(r'zaproxy/action-baseline@[0-9a-f]{40}\b', ups[0]['uses']), \
+        'ZAP action must be SHA-pinned'
+    with_ = ups[0].get('with') or {}
+    assert with_.get('fail_action') is True, 'ZAP must fail the job on alerts'
+    assert (with_.get('artifact_name') or '') == 'zap-baseline-T2'
+
+
+def test_t2_summary_aggregates_new_lanes():
+    jobs = jobs_of(_render(T2))
+    needs = jobs['staging-summary']['needs']
+    needs = [needs] if isinstance(needs, str) else needs
+    assert 'chaos-drill' in needs and 'dast-baseline' in needs
+    text = _render(T2)
+    assert 'R_CHAOS' in text and 'R_DAST' in text
+
+
+def test_t3_release_watch_contract():
+    text = _render(T3)
+    jobs = jobs_of(text)
+    job = jobs.get('release-watch')
+    assert job, 'release-watch job missing'
+    cond = job['if'] or ''
+    assert "vars.RELEASE_WATCH_ENABLED == 'true'" in cond, 'opt-in gate missing'
+    assert "vars.DEPLOY_PROVIDER != ''" in cond, 'provider gate missing'
+    assert 'needs.release-summary.result' in cond, 'watch must follow a green release-summary'
+    assert 'secrets.' not in cond, 'secrets must never appear in if: conditions'
+    needs = job.get('needs') or []
+    needs = [needs] if isinstance(needs, str) else needs
+    assert 'release-summary' in needs
+    body = '\n'.join((s.get('run') or '') for s in job['steps'])
+    assert 'vercel rollback' in body and 'wrangler rollback' in body, 'provider rollback commands missing'
+    assert 'AUTO_ROLLBACK' in str(job), 'auto-rollback gate missing'
+    ups = [s for s in job['steps'] if (s.get('with') or {}).get('name') == 'release-watch-report']
+    assert ups and ups[0].get('if') == 'always() && !cancelled()'
+
+
+def test_t3_launch_checklist_in_release_summary():
+    text = _render(T3)
+    assert 'Public-launch checklist' in text, 'launch checklist missing from release summary'
+    assert '"launch_checklist_human"' in text, 'machine-readable checklist missing'
+    for marker in ('privacy', 'status page', 'capacity', 'accessibility'):
+        assert marker in text, f'launch checklist missing: {marker}'

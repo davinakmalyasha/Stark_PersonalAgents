@@ -176,3 +176,92 @@ def drain_attachment_images_native(history: list, cap: int = 4, ctx=None) -> int
     except Exception:
         pass
     return 0
+
+
+def get_vision_history_capability():
+    """ProcessHistory capability: inject tool-queued images before each model request.
+
+    In the native (pydantic-ai) path tools execute INSIDE the agent run, so the
+    agent loop cannot drain ``pending_images`` between tool calls (the loop only
+    drains after the whole run returns, too late). This capability runs before
+    every model request and appends any queued images as ONE synthetic user
+    message — the only role DeepSeek accepts images in.
+
+    While the overlay is in ``continuous`` screen-sharing mode it also queues the
+    rolling latest frame, throttled to one look per ``_CONTINUOUS_MIN_GAP_S``.
+
+    Returns None when pydantic-ai capabilities are unavailable (callers append
+    it best-effort).
+    """
+    try:
+        from pydantic_ai.capabilities.process_history import ProcessHistory
+        from pydantic_ai.tools import RunContext
+    except Exception:
+        return None
+
+    async def _processor(ctx: RunContext, messages: list | None = None, *args, **kwargs) -> list:
+        out = messages if isinstance(messages, list) else []
+        try:
+            deps = getattr(ctx, "deps", None)
+            path = _continuous_screen_frame(deps)
+            if path:
+                queue_image_file(path, note="Live screen (continuous share — current view)", ctx=deps)
+            drain_into_messages_native(out, header="[Inline image(s) from tool result]", ctx=deps)
+        except Exception:
+            pass
+        return out
+
+    try:
+        return ProcessHistory(processor=_processor)
+    except Exception:
+        return None
+
+
+# ── Continuous live-screen injection (opt-in via the overlay share mode) ──
+
+_CONTINUOUS_MIN_GAP_S = 15.0
+_CONTINUOUS_MAX_AGE_S = 30.0
+_last_continuous_at = 0.0
+
+
+def _continuous_screen_frame(deps=None) -> str:
+    """Latest rolling screen frame when the overlay shares continuously.
+
+    Throttling is PER RUN when ``deps`` is given (the first model request of a
+    run may inject immediately if the frame is fresh; later requests wait
+    ``_CONTINUOUS_MIN_GAP_S``) so a new question always gets current context,
+    while one long run sees progress without a token storm. Without deps the
+    module-global timestamp is used (legacy callers).
+
+    Returns "" unless: the overlay reports mode=continuous, the frame file
+    exists and is fresh (≤30s), and the gap gate passes.
+    """
+    global _last_continuous_at
+    import os
+    import time
+
+    now = time.time()
+    last = getattr(deps, "_last_continuous_at", 0.0) if deps is not None else _last_continuous_at
+    if last and now - last < _CONTINUOUS_MIN_GAP_S:
+        return ""
+    try:
+        from server.services.screen_bridge import state
+
+        st = state()
+        if not st.get("sharing") or st.get("mode") != "continuous":
+            return ""
+        from sync.state_sync import safe_get_state
+
+        path = safe_get_state().get("live_screen_latest") or ""
+        if path and os.path.isfile(path) and (now - os.path.getmtime(path)) <= _CONTINUOUS_MAX_AGE_S:
+            if deps is not None:
+                try:
+                    deps._last_continuous_at = now
+                except Exception:
+                    _last_continuous_at = now
+            else:
+                _last_continuous_at = now
+            return path
+    except Exception:
+        pass
+    return ""

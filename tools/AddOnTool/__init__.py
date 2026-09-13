@@ -68,7 +68,6 @@ from .webTools import (
 
 from .workspaceTools import (
     capture_workspace_delta,
-    launch_parallel_attempts,
     _REDACT_PATTERNS,
     _GENERIC_SECRET_PAT,
     redact_secrets,
@@ -77,24 +76,14 @@ from .workspaceTools import (
 from .subagentTools import (
     SubagentsRegistry,
     _SUBAGENTS_REGISTRY,
-    _ASYNC_TASKS,
-    _ASYNC_LOCK,
-    _ASYNC_EXECUTOR,
     _TASK_DEPTH,
     _MAX_TASK_DEPTH,
     _load_subagents,
-    _HANDOFF_MAX_CHARS,
     _classify_error,
-    _compact_handoff,
     _handoff,
     task,
     call_subagent,
     subagent_catalog,
-    _run_subagent_in_thread,
-    start_async_task,
-    check_async_task,
-    list_async_tasks,
-    async_task,
 )
 
 from .delegationTools import (
@@ -103,6 +92,8 @@ from .delegationTools import (
 )
 
 from .dfdBridge import dfd_bridge
+
+from .screenTools import look_at_screen, set_screen_share
 
 __all__ = [
     'browser_navigate',
@@ -158,31 +149,22 @@ __all__ = [
     'web_fetch',
     'web_search',
     'capture_workspace_delta',
-    'launch_parallel_attempts',
     '_REDACT_PATTERNS',
     '_GENERIC_SECRET_PAT',
     'redact_secrets',
     'SubagentsRegistry',
     '_SUBAGENTS_REGISTRY',
-    '_ASYNC_TASKS',
-    '_ASYNC_LOCK',
-    '_ASYNC_EXECUTOR',
     '_TASK_DEPTH',
     '_MAX_TASK_DEPTH',
     '_load_subagents',
-    '_HANDOFF_MAX_CHARS',
     '_classify_error',
-    '_compact_handoff',
     '_handoff',
     'task',
     'call_subagent',
     'subagent_catalog',
-    '_run_subagent_in_thread',
-    'start_async_task',
-    'check_async_task',
-    'list_async_tasks',
-    'async_task',
     'delegate',
     'delegation_status',
     'dfd_bridge',
+    'look_at_screen',
+    'set_screen_share',
 ]

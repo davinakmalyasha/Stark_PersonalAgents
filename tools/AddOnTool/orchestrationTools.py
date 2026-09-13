@@ -18,7 +18,7 @@ def send_message(child_id: str, message: str, timeout: int = 1800) -> str:
     if r.get("status") == "error":
         return r.get("result", f"Error: unknown continuable child '{child_id}'")
     reply = r.get("result", "")
-    return f"[OK] {child_id} replied:\n{reply}"[:4000]
+    return f"[OK] {child_id} replied:\n{reply}"
 
 def list_agents() -> str:
     """List continuable subagents (durable enumeration, no resume)."""
@@ -124,7 +124,7 @@ def create_project(name: str, concept: str, wait: bool = True, parent_root: str 
             f"Dev agent: {entry.get('child_id')}",
             "",
             "Dev's first report:",
-            str(entry.get("first_reply", ""))[:2000],
+            str(entry.get("first_reply", "")),
         ]
     return "\n".join(lines)
 
@@ -167,4 +167,4 @@ def resume_project(name: str, message: str, timeout: int = 1800) -> str:
     if r.get("status") == "error":
         return r.get("result", f"Error: unknown continuable child '{child_id}'")
     reply = r.get("result", "")
-    return f"[OK] {child_id} replied:\n{reply}"[:4000]
+    return f"[OK] {child_id} replied:\n{reply}"

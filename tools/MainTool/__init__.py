@@ -7,8 +7,10 @@ from ._shared import _clean_terminal_output, _fmt_args, _log_tool
 from .editFile import (_apply_diff, apply_search_replace, apply_unified_diff,
                        _edit_snippet, edit_file, _write_file)
 from .readFile import read_file
+from .outline import outline
 from .searchCode import search_code
-from .runCommand import run_command
+from .astSearch import ast_search
+from .runCommand import run_command, LocalShellBackend
 from .planTools import update_plan, get_plan_for_context
 
 __all__ = [
@@ -16,8 +18,11 @@ __all__ = [
     "_apply_diff", "apply_search_replace", "apply_unified_diff", "_edit_snippet",
     "edit_file", "_write_file",
     "read_file",
+    "outline",
     "search_code",
+    "ast_search",
     "run_command",
+    "LocalShellBackend",
     "update_plan",
     "get_plan_for_context",
 ]

@@ -20,6 +20,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -34,7 +35,9 @@ _CONFIG_FILE = "mcp_servers.json"
 _MAX_TOOLS_PER_SERVER = 500
 _INSTRUCTIONS_CAP = 512
 
-_HR = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_HR = os.environ.get("HARNESS_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
@@ -105,6 +108,9 @@ class _StdioTransport:
     def connect(self, timeout: float) -> None:
         if not self._cmd:
             raise ValueError("stdio MCP server requires 'command'")
+        # Windows CreateProcess does not apply PATHEXT, so bare "npx"/"uvx"
+        # must resolve to the .cmd/.exe shim before Popen.
+        cmd = shutil.which(self._cmd) or self._cmd
         env = dict(os.environ)
         # env_clear-style whitelist, but always keep the minimal Windows vars
         # CreateProcess/Python need (an empty block raises WinError 87, and
@@ -121,7 +127,7 @@ class _StdioTransport:
         env.update(self._env)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._proc = subprocess.Popen(
-            [self._cmd] + self._args,
+            [cmd] + self._args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -554,7 +560,10 @@ class McpManager:
             bounded = auto_offload_result(result, "mcp", max_chars=_tool_cap("mcp"))
             _log_tool(fqname, args, bounded)
         except Exception:
-            bounded = result[:6000]
+            try:
+                bounded = result[: _tool_cap("mcp")]
+            except Exception:
+                bounded = result[:25000]
         return bounded
 
     # status / management (API endpoints) ──

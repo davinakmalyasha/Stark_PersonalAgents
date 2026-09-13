@@ -51,9 +51,12 @@ def _invalidate_from_change() -> None:
         from sync.state_sync import safe_get_state
         ws = safe_get_state().get("project_path") or os.environ.get("HARNESS_ROOT", "")
         if ws:
-            from memory.memory_manager import _repository_map_state_file, _load_repository_map_state, _save_repository_map_state
+            from memory.memory_manager import _load_repository_map_state, _save_repository_map_state
             state = _load_repository_map_state(ws)
             state["dirty"] = True
+            # The refresh fast path may only skip its scan while the watcher
+            # is the one tracking changes; this flag is what licenses it.
+            state["watcher_active"] = True
             _save_repository_map_state(ws, state)
     except Exception:
         pass

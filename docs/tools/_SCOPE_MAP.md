@@ -3,6 +3,7 @@
 ## developer
 
 - read_file
+- outline
 - edit_file
 - run_command
 - search_code
@@ -10,30 +11,6 @@
 - update_plan
 - propose_plan
 - call_subagent
-
-## ui
-
-- browser_act
-- read_file
-- search_code
-- run_command
-
-## deploy
-
-- github_apply_gate
-- run_command
-- read_file
-
-## orchestrator
-
-- create_project
-- resume_project
-- ask_user
-- delegate
-- delegation_status
-- update_plan
-- propose_plan
-- files_changed
 
 ## general
 
@@ -46,6 +23,8 @@
 - browser_act
 - propose_plan
 - files_changed
+- look_at_screen
+- set_screen_share
 
 ## house
 
@@ -67,6 +46,35 @@
 - create_project
 - run_command
 - ask_user
+- update_plan
+- propose_plan
+- files_changed
+
+## ui
+
+- browser_act
+- read_file
+- search_code
+- run_command
+- edit_file
+- ask_user
+
+## deploy
+
+- github_apply_gate
+- run_command
+- read_file
+- edit_file
+- search_code
+- ask_user
+
+## orchestrator
+
+- create_project
+- resume_project
+- ask_user
+- delegate
+- delegation_status
 - update_plan
 - propose_plan
 - files_changed

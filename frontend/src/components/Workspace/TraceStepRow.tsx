@@ -278,7 +278,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'task' || step.toolName === 'start_async_task') {
+  if (step.toolName === 'task' || step.toolName === 'call_subagent') {
     let name = 'Subagent';
     let taskDesc = '';
     if (step.args) {
@@ -288,7 +288,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
         taskDesc = parsed.task || '';
       } catch { /* args are best-effort display only */ }
     }
-    const isAsync = step.toolName === 'start_async_task';
+    const isAsync = step.toolName === 'call_subagent' && !!step.childId;
 
     // Session-keyed spawn (new traces): opens the read-only drill-in view.
     if (step.childId) {

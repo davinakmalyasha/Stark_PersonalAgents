@@ -157,12 +157,12 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         // Try to parse as JSON for cleaner field extraction and specialized task titles
         try {
           const parsed = JSON.parse(args);
-          if ((tool === 'task' || tool === 'start_async_task') && parsed.name) {
+          if ((tool === 'task' || tool === 'call_subagent') && parsed.name) {
             parsed.name = normalizeAgentName(parsed.name);
             const subagentName = parsed.name;
             displayTitle = tool === 'task'
               ? `Delegating to ${subagentName}`
-              : `Spawning async ${subagentName}`;
+              : `Subagent ${subagentName}`;
           }
           args = JSON.stringify(parsed);
         } catch {
@@ -190,8 +190,6 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         const isDelegationStep = !!currentStep && (
           currentStep.toolName === 'task'
           || currentStep.toolName === 'call_subagent'
-          || currentStep.toolName === 'start_async_task'
-          || currentStep.toolName === 'async_task'
         );
         if (isDelegationStep && currentStep) {
           currentStep.childId = childId;
@@ -274,7 +272,7 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
   for (const step of steps) {
     if (step.type === 'tool') {
       // Delegation calls must never be grouped as exploration — treat as standalone
-      const isDelegation = step.toolName === 'task' || step.toolName === 'start_async_task';
+      const isDelegation = step.toolName === 'task' || step.toolName === 'call_subagent';
       if (isDelegation) {
         currentGroup = {
           id: step.id,
@@ -333,7 +331,7 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
  * Orchestrator-only steps for the main chat.
  *
  * The main chat should only display orchestrator-level actions:
- * delegation (task / start_async_task), supervisor thoughts, and
+ * delegation (task / call_subagent), supervisor thoughts, and
  * final summaries. Subagent tool calls (read_file, write_file, run_command,
  * search_code, etc.) belong in the canvas subagent drawer, not the main chat.
  *
@@ -346,7 +344,7 @@ export function filterOrchestratorSteps(steps: TraceStep[]): TraceStep[] {
     if (s.agent === 'Supervisor' || s.agent === 'Orchestrator') return true;
 
     // Keep delegation calls regardless of which agent issued them
-    if (s.toolName === 'task' || s.toolName === 'start_async_task') return true;
+    if (s.toolName === 'task' || s.toolName === 'call_subagent') return true;
 
     // Subagent internals — drop
     return false;

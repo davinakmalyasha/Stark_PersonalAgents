@@ -22,7 +22,6 @@ function normalizeTokenAgent(nodeId: string): string[] {
   switch (lower) {
     case 'supervisor': return ['supervisor', 'orchestrator', 'director'];
     case 'dev': return ['dev', 'developer', 'coder'];
-    case 'sdet': return ['sdet', 'tester', 'qa'];
     case 'devsecops': return ['devsecops', 'devops'];
     case 'analytics': return ['analytics', 'data'];
     case 'general': return ['general', 'freeagent', 'free agent'];
@@ -36,7 +35,7 @@ function normalizeTokenAgent(nodeId: string): string[] {
 function getAgentTask(steps: ReturnType<typeof parseLogToSteps>['steps'], agentId: string): string {
   for (let i = steps.length - 1; i >= 0; i--) {
     const s = steps[i];
-    if (s.toolName !== 'task' && s.toolName !== 'start_async_task') continue;
+    if (s.toolName !== 'task' && s.toolName !== 'call_subagent') continue;
     try {
       const parsed = JSON.parse(s.args || '{}');
       if (parsed.name === agentId && typeof parsed.task === 'string') return parsed.task;
@@ -57,7 +56,7 @@ export function useCanvasAgentState({ isRunning, liveLog, tokenUsage }: Input) {
     if (!isRunning) return null;
     if (steps.length === 0) return 'Supervisor';
     const lastStep = steps[steps.length - 1];
-    if (lastStep.toolName === 'task' || lastStep.toolName === 'start_async_task') {
+    if (lastStep.toolName === 'task' || lastStep.toolName === 'call_subagent') {
       try {
         const parsed = JSON.parse(lastStep.args || '{}');
         if (parsed.name) return parsed.name;

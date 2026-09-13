@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Activity, ArrowLeft, Menu, RefreshCw, Server, ShieldCheck, Terminal, Trash2 } from 'lucide-react';
+import { Activity, ArrowLeft, RefreshCw, Server, ShieldCheck, Terminal, Trash2 } from 'lucide-react';
 import { fetchAdminHealth, fetchBots, fetchClients, fetchUsage, disableBot } from './agentsAdminApi';
 
 interface TextBoxProps {

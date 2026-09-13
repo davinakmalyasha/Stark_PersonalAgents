@@ -25,8 +25,9 @@ function extOf(path: string): string {
 function isHtml(f: WorkspaceFileEntry): boolean {
   return f.type === 'file' && extOf(f.path) === 'html';
 }
-function isDesignMd(f: WorkspaceFileEntry): boolean {
-  return f.type === 'file' && f.name.toLowerCase() === 'design.md';
+function isProjectMemory(f: WorkspaceFileEntry): boolean {
+  return f.type === 'file' &&
+    f.path.replace(/\\/g, '/').toLowerCase().endsWith('.agent-memory/project.md');
 }
 function isShot(f: WorkspaceFileEntry): boolean {
   return f.type === 'file' && IMG_EXTS.has(extOf(f.path));
@@ -53,7 +54,7 @@ export default function DesignWorkspace() {
   const knownHtml = useRef<Set<string>>(new Set());
 
   const htmlFiles = useMemo(() => files.filter(isHtml), [files]);
-  const designMd = useMemo(() => files.find(isDesignMd) || null, [files]);
+  const projectMemory = useMemo(() => files.find(isProjectMemory) || null, [files]);
   const shots = useMemo(() => files.filter(isShot), [files]);
 
   // Default + auto-select newly appeared artifacts (e.g. right after a run).
@@ -65,7 +66,7 @@ export default function DesignWorkspace() {
       setPreviewPath(fresh.path);
     } else if (!previewPath && htmlFiles.length > 0) {
       setPreviewPath(htmlFiles[0].path);
-    } else if (!previewPath && !designMd && files.length > 0) {
+    } else if (!previewPath && !projectMemory && files.length > 0) {
       const first = files.find((f) => f.type === 'file');
       if (first) setPreviewPath(first.path);
     }
@@ -206,7 +207,7 @@ export default function DesignWorkspace() {
 
   const hasArtifact = htmlFiles.length > 0;
   const hasShot = shots.length > 0;
-  const hasDesignMd = !!designMd;
+  const hasProjectMemory = !!projectMemory;
 
   return (
     <div className="fixed inset-0 flex min-h-0 bg-[#0a0a0d] text-zinc-200 select-none">
@@ -234,7 +235,7 @@ export default function DesignWorkspace() {
           {[
             { label: 'Artifact', ok: hasArtifact },
             { label: 'Shot', ok: hasShot },
-            { label: 'DESIGN.md', ok: hasDesignMd },
+            { label: 'project.md', ok: hasProjectMemory },
           ].map((c) => (
             <span
               key={c.label}
@@ -268,20 +269,20 @@ export default function DesignWorkspace() {
             </button>
           ))}
           <p className="px-2 pt-2 pb-1 text-[9.5px] font-bold tracking-widest uppercase text-zinc-600">Brand</p>
-          {designMd ? (
+          {projectMemory ? (
             <button
-              key={designMd.path}
+              key={projectMemory.path}
               type="button"
-              onClick={() => setPreviewPath(designMd.path)}
+              onClick={() => setPreviewPath(projectMemory.path)}
               className={`w-full flex items-center gap-1.5 px-2 py-[5px] text-left text-[12px] rounded-md cursor-pointer ${
-                previewPath === designMd.path ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:bg-white/[0.05] hover:text-zinc-300'
+                previewPath === projectMemory.path ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:bg-white/[0.05] hover:text-zinc-300'
               }`}
             >
               <FileText size={12} className="shrink-0 text-zinc-600" />
-              <span className="truncate flex-1 font-mono">DESIGN.md</span>
+              <span className="truncate flex-1 font-mono">project.md</span>
             </button>
           ) : (
-            <p className="px-2 text-[11px] text-zinc-600 leading-5">No DESIGN.md yet — it lands here at finalize.</p>
+            <p className="px-2 text-[11px] text-zinc-600 leading-5">No project.md `## Design` section yet — it lands here at finalize.</p>
           )}
           <p className="px-2 pt-2 pb-1 text-[9.5px] font-bold tracking-widest uppercase text-zinc-600">Shots</p>
           {shots.length === 0 && (

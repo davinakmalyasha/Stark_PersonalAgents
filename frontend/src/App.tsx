@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, FolderGit2, Palette } from 'lucide-react';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
@@ -694,9 +694,12 @@ export default function App() {
   const renderState = showVoiceTrace ? voiceLiveRun?.state : state;
   const renderIsRunning = isRunning || (showVoiceTrace && !!voiceLiveRun?.active);
 
+  const liveParsed = useMemo(() => parseLogToSteps(state?.live_terminal_log ?? ''), [state?.live_terminal_log]);
+  const voiceLiveParsed = useMemo(() => parseLogToSteps(voiceLiveRun?.state?.live_terminal_log ?? ''), [voiceLiveRun?.state?.live_terminal_log]);
+
   const displayMessages = [...messages];
   if ((isRunning || isPersisting) && state?.live_terminal_log) {
-    const { steps, assistantResponse } = parseLogToSteps(state.live_terminal_log);
+    const { steps, assistantResponse } = liveParsed;
     const elapsed = runStartTime.current
       ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
       : 'active';
@@ -725,7 +728,7 @@ export default function App() {
     });
   }
   if (showVoiceTrace && voiceLiveRun?.state) {
-    const { steps, assistantResponse } = parseLogToSteps(voiceLiveRun.state.live_terminal_log || '');
+    const { steps, assistantResponse } = voiceLiveParsed;
     const elapsed = voiceLiveRun.active
       ? 'active'
       : Math.round((Date.now() - voiceLiveRun.startedAt) / 1000) + 's';

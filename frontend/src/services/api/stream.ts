@@ -217,7 +217,6 @@ export function streamPipeline(
         for (const line of lines) {
           if (line.startsWith('event: ')) {
             currentEvent = line.slice(7).trim();
-            console.log('[streamPipeline] Event:', currentEvent);
             continue;
           }
           if (line.startsWith('data: ')) {
@@ -237,7 +236,6 @@ export function streamPipeline(
                 onState(parsed as AppState);
                 fail(parsed.error);
               } else {
-                console.log('[streamPipeline] State received, active_node:', parsed.active_node);
                 onState(parsed as AppState);
               }
               currentEvent = '';

@@ -8,7 +8,7 @@ interface TokenSummaryProps {
 function getModelContextLimit(modelName: string): number {
   const name = modelName.toLowerCase();
   if (name.includes('gemini-1.5-pro') || name.includes('gemini-3.5-pro')) return 2_000_000;
-  if (name.includes('gemini') || name.includes('deepseek-v4') || name.includes('deepseek-chat') || name.includes('deepseek-v3')) return 1_000_000;
+  if (name.includes('gemini') || name.includes('deepseek-v4') || name.includes('deepseek-flash') || name.includes('deepseek-chat') || name.includes('deepseek-v3')) return 1_000_000;
   if (name.includes('claude-3') || name.includes('claude-3-5')) return 200_000;
   if (name.includes('reasoner') || name.includes('r1') || name.includes('gpt-4') || name.includes('llama')) return 128_000;
   return 1_000_000;
@@ -16,11 +16,8 @@ function getModelContextLimit(modelName: string): number {
 
 function getModelSavingsRate(modelName: string): number {
   const name = modelName.toLowerCase();
-  if (name.includes('deepseek-v4-flash') || name.includes('deepseek-chat') || name.includes('deepseek-v3') || name.includes('deepseek-reasoner')) {
-    return 0.1372; // 0.14 - 0.0028
-  }
-  if (name.includes('deepseek-v4-pro')) {
-    return 0.431375; // 0.435 - 0.003625
+  if (name.includes('deepseek-v4.1-flash') || name.includes('deepseek-flash')) {
+    return 0.294; // 0.30 - 0.006 (peak V4.1-Flash rates)
   }
   if (name.includes('deepseek-r1')) {
     return 0.41; // 0.55 - 0.14

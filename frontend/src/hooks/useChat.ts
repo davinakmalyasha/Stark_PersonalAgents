@@ -381,7 +381,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   }, [handleSend]);
 
   const liveLog = liveState?.live_terminal_log || '';
-  const liveParsed = parseLogToSteps(liveLog);
+  const liveParsed = useMemo(() => parseLogToSteps(liveLog), [liveLog]);
   const liveText = streaming.active && streaming.text ? streaming.text : (liveParsed.assistantResponse || liveState?.outputs?.agent_report || '');
   const displayMessages = [...messages];
   if ((isRunning || voiceActive) && (liveText.trim() || streaming.active || messages.length === 0 || liveParsed.steps.length > 0)) {

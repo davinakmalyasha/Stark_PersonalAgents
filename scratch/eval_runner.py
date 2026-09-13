@@ -1,6 +1,7 @@
 """eval_runner.py — mini SWE-bench-style evaluation for the multi-agent harness.
 
-Runs real coding tasks through run_and_sync_graph against throwaway projects, applies a
+Runs real coding tasks through the Dev workspace agent (developer_node single-agent
+loop — no orchestrator) against throwaway projects, applies a
 HIDDEN test after each run (the agent never sees it — SWE-bench style), and reports
 usage + quality + success per task. Instruments both sides:
   - paid calls : shared_state token_usage (tokens, cost, reasoning_chars)
@@ -53,7 +54,7 @@ def _emit(kind: str, **fields):
 # ──────────────────────────────────────────────────────────────────────────
 
 def _dump_failure(cwd, text):
-    """Persist the FULL hidden-test output so a later SDET-FIX repair round
+    """Persist the FULL hidden-test output so a later Dev repair round
     can read it (the agent never sees it during its own attempt)."""
     try:
         with open(os.path.join(cwd, "_hidden_failure.log"), "w", encoding="utf-8") as f:
@@ -395,14 +396,31 @@ def _write(cwd, files):
             f.write(content)
 
 
+_DEVICE_FILE_NAMES = {
+    "nul", "con", "prn", "aux",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
 def _snapshot(cwd):
     snap = {}
     for root, dirs, files in os.walk(cwd):
-        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", ".agent-memory")]
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", ".agent-memory", ".deep_agents", ".next", "dist")]
         for fn in files:
+            # Windows reserved device names (nul, con, ...) can be created by
+            # shell redirects; abspath maps them to \\.\<name> and relpath then
+            # raises (different mount). They are never real project files.
+            if fn.lower().split(".")[0] in _DEVICE_FILE_NAMES:
+                continue
             full = os.path.join(root, fn)
-            rel = os.path.relpath(full, cwd)
-            snap[rel] = (os.path.getsize(full), hash(open(full, "rb").read()))
+            try:
+                rel = os.path.relpath(full, cwd)
+                snap[rel] = (os.path.getsize(full), hash(open(full, "rb").read()))
+            except Exception:
+                # Unreadable/racy entry: skip — the snapshot only feeds
+                # change detection, never correctness.
+                continue
     return snap
 
 
@@ -421,6 +439,21 @@ def _files_diff(before, after):
     deleted = sorted(before_keys - after_keys)
     modified = sorted(k for k in before_keys & after_keys if before[k] != after[k])
     return added, modified, deleted
+
+
+_REPORT_NOISE = {"_ops_out.txt", "_hidden_failure.log", "_verify_out.txt", "_next_server.log",
+                 "_ops_test.js", "package-lock.json", "bsa_telemetry.jsonl", "server_port.json"}
+
+
+def _is_noise_path(rel):
+    """True for harness/OS artifacts that must never count as agent file changes."""
+    low = str(rel or "").replace("/", "\\").lower()
+    base = os.path.basename(low)
+    if base.split(".")[0] in _DEVICE_FILE_NAMES:
+        return True
+    if base in _REPORT_NOISE:
+        return True
+    return (".deep_agents\\" in low) or (".agent-memory\\" in low)
 
 
 def _express_server(extra_routes=""):
@@ -1076,6 +1109,34 @@ except Exception as _gen9_err:
     traceback.print_exc()
     print(f"[eval] WARNING: gen9-real suite NOT loaded ({_gen9_err})", flush=True)
 
+# ── gen10: LONG-HORIZON single-agent-loop suite (landing / refine / build) ──
+# One long multi-phase prompt per task -> long Dev session (context growth,
+# compaction, many tool iterations). Budgets are applied in setup(). The hidden
+# test is a lenient functional gate; quality is judged after the run via
+# scratch/gen10_review.py (design / structure / perf / scale / maintain / security).
+try:
+    from gen10_tasks import build_tasks as _build_gen10_tasks
+    GEN10_TASKS = _build_gen10_tasks({
+        "write": _write,
+        "ensure_deps": _ensure_deps,
+        "require_test": _require_test,
+        "require_async_test": _require_async_test,
+        "api_test": _api_test,
+        "py_test": _py_test,
+        "refactor_test": _refactor_test,
+        "check_structure": _check_structure,
+        "ops_test": _ops_test,
+        "file_test": _file_test,
+    })
+    TASKS = TASKS + GEN10_TASKS
+    TASKS_BY_ID = {t["id"]: t for t in TASKS}
+    print(f"[eval] gen10 suite registered: {len(GEN10_TASKS)} tasks "
+          f"({sorted(set(t['category'] for t in GEN10_TASKS))})", flush=True)
+except Exception as _gen10_err:
+    import traceback
+    traceback.print_exc()
+    print(f"[eval] WARNING: gen10 suite NOT loaded ({_gen10_err})", flush=True)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Single-task runner
@@ -1094,12 +1155,19 @@ def _read_bsa_telemetry(path):
 
 
 def _tools_from_calls(calls):
+    """Aggregate executed-tool counts from each call's structured tool_counts.
+
+    The old implementation parsed the human-readable ``where`` tag and almost
+    always returned {} — the real counts live in ``extra.tool_counts`` written
+    by llm/native_tools.py.
+    """
     c = collections.Counter()
     for call in calls:
-        w = call.get("where", "") or ""
-        m = re.search(r":\s*([a-z_]+)", w)
-        if m:
-            c[m.group(1)] += 1
+        tc = call.get("tool_counts")
+        if isinstance(tc, dict):
+            for k, v in tc.items():
+                if isinstance(v, int) and v > 0:
+                    c[str(k)] += v
     return dict(c)
 
 
@@ -1232,7 +1300,7 @@ def _cleanup_temp_scripts(cwd, baseline_snap):
                 "test*.js", "test*.mjs", "test*.py", "*_test.js", "*_test.py", "*_test.mjs")
     try:
         for root, dirs, files in os.walk(cwd):
-            dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", ".agent-memory")]
+            dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", ".agent-memory", ".deep_agents", ".next", "dist")]
             for fn in files:
                 rel = os.path.relpath(os.path.join(root, fn), cwd)
                 if rel in baseline_snap:
@@ -1248,13 +1316,14 @@ def _cleanup_temp_scripts(cwd, baseline_snap):
 
 def _git_init(cwd):
     """Init a git repo with an initial commit so the harness can diff the
-    agent's changes: Dev's session-end diff message activates, and the SDET
+    agent's changes: Dev's session-end diff message activates, and the Dev
     repair package receives the prior attempt's diff (the 'lift from latest
     test' context). Noise files are gitignored so diffs stay clean."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         with open(os.path.join(cwd, ".gitignore"), "w", encoding="utf-8") as f:
             f.write("node_modules/\n"
+                    ".next/\ndist/\n"
                     ".agent-memory/\n.deep_agents/\n"
                     "_hidden_test.js\n_hidden_test.py\n_hidden_failure.log\n"
                     "_verify_out.txt\n_ops_out.txt\n_ops_test.js\n"
@@ -1358,6 +1427,13 @@ def run_single(task_id, keep=False):
     # Unique chat_id per run → stale task-tracking state can never leak into this run.
     run_seed = uuid.uuid4().hex[:6]
     _purge_stale_eval_tasks(task_id)
+    # Per-task call log starts clean so the review bundle contains exactly this run.
+    try:
+        _clog = os.environ.get("BSA_CALLS_LOG")
+        if _clog and os.path.isfile(_clog):
+            os.remove(_clog)
+    except OSError:
+        pass
     report = {"id": task_id, "category": task["category"], "status": "error"}
     try:
         global _USER_STYLE
@@ -1365,23 +1441,6 @@ def run_single(task_id, keep=False):
         task["setup"](tmp)
         _git_init(tmp)  # baseline commit so agent changes are diffable
         before = _snapshot(tmp)
-
-        # Write-once project identity card: name/description/purpose from the
-        # task metadata, stack/version auto-detected once, stamped STABLE (an
-        # eval task workspace IS a built project) — then frozen; the card
-        # adapts only via rare append-only [updated:] drift corrections.
-        try:
-            from memory.memory_manager import ensure_project_identity
-            _first_line = (task["prompt"].strip().splitlines() or [""])[0][:160]
-            ensure_project_identity(
-                tmp,
-                name=task.get("name") or task_id,
-                description=_first_line,
-                purpose=f"Pass the hidden test suite for {task_id}",
-                status="stable",
-            )
-        except Exception:
-            pass
 
         os.environ["BSA_MAX_SECTIONS"] = os.environ.get("BSA_MAX_SECTIONS", "3")
         tel = os.path.join(tmp, "bsa_telemetry.jsonl")
@@ -1396,15 +1455,19 @@ def run_single(task_id, keep=False):
         #    is an infrastructure failure, not an agent failure. It retries with a FRESH
         #    chat context WITHOUT consuming a repair round. If every attempt is hollow,
         #    the task is reported as status="error" (infra), not "fail" (agent).
-        from sync.sync_manager import run_and_sync_graph
         max_repairs = int(os.environ.get("BSA_MAX_REPAIRS", "2"))
         max_hollow = int(os.environ.get("BSA_MAX_HOLLOW_RETRIES", "2"))
         hollow_cost_max = float(os.environ.get("BSA_HOLLOW_COST_MAX", "0.003"))
+        # Long-horizon mode (gen10): no attempts/repairs/bailout/wall caps — the
+        # hidden gate + the agent decide when the work is done.
+        unlimited = os.environ.get("BSA_UNLIMITED", "0") == "1"
         ok, detail, attempts, repairs, dur = False, "", 0, 0, 0.0
-        sdet_repair_rounds = 0
+        helper_repair_rounds = 0
         hollow_retries = 0
+        hard_errors = 0  # consecutive developer-crash attempts (infra spin guard)
         any_work = False
         first_real_ok = None  # did the FIRST non-hollow attempt pass? (pass@1, SWE-bench style)
+        attempt_log = []  # per-attempt cost/duration evidence (repair rounds are visible)
         prev_attempt = None  # {"files": [...], "spec": bool, "report": str} from last attempt
         prev_fail_detail = ""  # the hidden-test output of the last FAILING attempt (learning evidence)
         _sig_counts = {}  # normalized failure signature -> count (no-progress bail-out)
@@ -1418,7 +1481,7 @@ def run_single(task_id, keep=False):
             except Exception:
                 return 0.0, 0
 
-        task_t0 = time.time()  # for the SDET "until done" wall-cap bound
+        task_t0 = time.time()  # for the "until done" wall-cap bound
         while True:
             attempts += 1
             # Kill leftover server processes from prior attempts (EADDRINUSE
@@ -1440,9 +1503,10 @@ def run_single(task_id, keep=False):
             t0 = time.time()
             snap_before = _snapshot(tmp)
             cost_before, calls_before = _usage_now()
-            chat_id = f"eval-{task_id}-{run_seed}-r{attempts}"
-            if hollow_retries:
-                chat_id += f"-h{hollow_retries}"
+            # One stable session across attempts: a repair round must CONTINUE
+            # the same Dev transcript (cache-warm, no cold re-derivation), not
+            # restart from an empty context.
+            chat_id = f"eval-{task_id}-{run_seed}"
             # Capture the file contents at the start of a REPAIR attempt so a
             # verified lesson can later diff exactly what the repair changed.
             pre_repair_content = None
@@ -1457,23 +1521,29 @@ def run_single(task_id, keep=False):
                 except Exception:
                     pre_repair_content = None
             last_state = None
-            sdet_repair = (
+            hard_error = False
+            repair_via_helper = (
                 repairs > 0
-                and os.environ.get("BSA_REPAIR_DIRECT_SDET", "1") != "0"
+                and os.environ.get("BSA_REPAIR_VIA_HELPER", "1") != "0"
             )
-            if sdet_repair:
+            run_dev_repair = None
+            if repair_via_helper:
+                try:
+                    from verify_helper import run_dev_repair as _rdr
+                    run_dev_repair = _rdr
+                except ImportError:
+                    run_dev_repair = None
+                if run_dev_repair is None:
+                    # verify_helper may be a stub in this tree — fall through to
+                    # the direct Dev repair path instead of silently breaking.
+                    print("[eval] verify_helper.run_dev_repair unavailable — using direct Dev repair path", flush=True)
+                    repair_via_helper = False
+            if repair_via_helper:
                 # DEV repair path: the harness hands the hidden-test failure
                 # to the Dev subagent (full toolset), never via the
                 # orchestrator. Dev reproduces, fixes and verifies internally;
                 # the hidden test re-runs below and remains the only gate.
-                try:
-                    from verify_helper import run_dev_repair
-                except ImportError:
-                    print("[eval] verify_helper.run_dev_repair removed — repair path disabled", flush=True)
-                    run_dev_repair = None
                 from sync.state_sync import safe_update_state, shared_state
-                if run_dev_repair is None:
-                    break
                 try:
                     safe_update_state({"project_path": tmp, "chat_id": chat_id,
                                        "client_request": run_task})
@@ -1511,18 +1581,19 @@ def run_single(task_id, keep=False):
                         project_path=tmp,
                         chat_id=chat_id,
                     )
-                    sdet_repair_rounds += 1
-                    last_state = {"outputs": {"agent_report": str(handoff)[:1000]}}
+                    helper_repair_rounds += 1
+                    last_state = {"outputs": {"agent_report": str(handoff)}}
                     safe_update_state({"outputs": {
                         **shared_state.get("outputs", {}),
                         "test_report": str(detail),
-                        "agent_report": str(handoff)[:1000],
+                        "agent_report": str(handoff),
                     }})
                 except Exception as e:
-                    _emit("task_error", id=task_id, error=f"sdet-fix repair failed: {str(e)[:200]}")
+                    _emit("task_error", id=task_id, error=f"helper repair failed: {str(e)[:200]}")
                     last_state = None
+                    hard_error = True
             else:
-                # Fallback (BSA_REPAIR_DIRECT_SDET=0): the repair prompt IS the
+                # Fallback (BSA_REPAIR_VIA_HELPER=0): the repair prompt IS the
                 # plan (failure detail + prior attempt state). Bypass the
                 # orchestrator's replan/ceremony turns and feed it to Dev.
                 from agents.developer_agent import developer_node
@@ -1552,12 +1623,13 @@ def run_single(task_id, keep=False):
                 except Exception as e:
                     _emit("task_error", id=task_id, error=f"direct-repair dev failed: {str(e)[:200]}")
                     last_state = None
-                # Full graph (orchestrator -> ONE subagent) runs ONLY on the
-                # first attempt and the Dev-fallback path ? NEVER after an
-                # SDET-fix repair (that would waste an extra orchestrator
-                # session AND potentially double-delegate SDET).
-                for s in run_and_sync_graph(run_task, workspace_path=tmp, chat_id=chat_id):
-                    last_state = s
+                    hard_error = True
+                # NOTE (v23 benchmark policy): Dev-only single-agent loop.
+                # The full orchestrator graph is intentionally NOT run here:
+                # inside a task workspace the request goes straight to the
+                # Dev workspace agent (same as production project_dev
+                # routing); the hidden test below is the only gate. The
+                # main-workspace orchestrator path is untouched.
             dur += time.time() - t0
             snap_after = _snapshot(tmp)
             cost_after, calls_after = _usage_now()
@@ -1592,6 +1664,24 @@ def run_single(task_id, keep=False):
 
             _emit("attempt", id=task_id, attempt=attempts, ok=ok, detail=(detail or "")[:300],
                   hollow=hollow, work=work_count, cost_delta=round(cost_delta, 5), calls_delta=calls_delta)
+            attempt_log.append({
+                "attempt": attempts,
+                "ok": bool(ok),
+                "duration_s": round(time.time() - t0, 1),
+                "cost_delta": round(cost_delta, 6),
+                "calls_delta": calls_delta,
+                "work": work_count,
+                "detail": (detail or "")[:200],
+            })
+            if hard_error:
+                hard_errors += 1
+                if hard_errors >= 3:
+                    print(f"[eval] {task_id}: developer crashed {hard_errors} attempts in a row — "
+                          f"aborting task (infrastructure failure, not an agent failure)", flush=True)
+                    _emit("bailout", id=task_id, signature="developer-crash-spin", count=hard_errors)
+                    break
+            else:
+                hard_errors = 0
             _cleanup_temp_scripts(tmp, snap_before)  # zero-LLM-cost temp script cleanup
             if ok:
                 # Verified-lesson learning: a repair round made the hidden test
@@ -1630,7 +1720,7 @@ def run_single(task_id, keep=False):
             prev_fail_detail = detail or prev_fail_detail
             # ── No-progress bail-out: the SAME failure signature ≥3 times means the
             # repair loop is not converging (environmental collision, unfixable task)
-            # — stop repairing instead of burning identical SDET sessions.
+            # — stop repairing instead of burning identical repair sessions.
             try:
                 from error_patterns import _normalize as _norm
             except Exception:
@@ -1638,7 +1728,7 @@ def run_single(task_id, keep=False):
             sig = _norm(detail or "")[:150]
             _sig_counts[sig] = _sig_counts.get(sig, 0) + 1
             max_same = int(os.environ.get("BSA_MAX_SAME_SIG", "3"))
-            if _sig_counts.get(sig, 0) >= max_same:
+            if (not unlimited) and _sig_counts.get(sig, 0) >= max_same:
                 print(f"[eval] {task_id}: same failure signature x{_sig_counts[sig]} — "
                       f"no repair progress, stopping", flush=True)
                 _emit("bailout", id=task_id, signature=sig[:120], count=_sig_counts[sig])
@@ -1665,18 +1755,20 @@ def run_single(task_id, keep=False):
                       f"{calls_delta} call(s)) — fresh-context retry {hollow_retries}/{max_hollow}", flush=True)
                 time.sleep(2.0)  # brief backoff for the transient provider failure
                 continue
-            # ── Until-done policy (SDET-fix path) ──
-            # The SDET-fix path loops until the hidden test passes, bounded only
-            # by the eval wall cap (leave a margin so the report writes before
-            # the parent kills the child). The Dev fallback keeps max_repairs.
-            sdet_mode = os.environ.get("BSA_REPAIR_DIRECT_SDET", "1") != "0"
-            until_done = sdet_mode and os.environ.get("BSA_SDET_UNTIL_DONE", "1") == "1"
-            wall_cap_s = int(os.environ.get("BSA_TASK_WALL_CAP", "2400"))
-            if attempts >= 15:
+            # ── Until-done policy (helper repair path) ──
+            # The helper repair path loops until the hidden test passes, bounded
+            # only by the eval wall cap (leave a margin so the report writes
+            # before the parent kills the child). The direct Dev fallback keeps
+            # max_repairs.
+            helper_mode = os.environ.get("BSA_REPAIR_VIA_HELPER", "1") != "0"
+            until_done = helper_mode and os.environ.get("BSA_REPAIR_UNTIL_DONE", "1") == "1"
+            wall_cap_s = int(os.environ.get("BSA_TASK_WALL_CAP", "2400") or 0)
+            if not unlimited and attempts >= 15:
                 break
-            if until_done and repairs > 0 and time.time() - task_t0 > wall_cap_s - 60:
+            if (not unlimited and until_done and wall_cap_s > 0 and repairs > 0
+                    and time.time() - task_t0 > wall_cap_s - 60):
                 break
-            if not until_done and repairs >= max_repairs:
+            if not unlimited and not until_done and repairs >= max_repairs:
                 break
             repairs += 1
             _emit("repair", id=task_id, round=repairs, reason=(detail or "")[:200])
@@ -1692,18 +1784,41 @@ def run_single(task_id, keep=False):
         # provider/LLM failures), report status="error" (infrastructure), not "fail" (agent).
         if ok:
             status = "pass"
+        elif hard_errors >= 3:
+            status = "error"
+            detail = (detail or "") + " [CRASH-SPIN: developer raised on consecutive attempts — infrastructure failure]"
         elif hollow_retries > 0 and not any_work:
             status = "error"
             detail = (detail or "") + ("" if "HOLLOW" in str(detail) else
                                        " [HOLLOW: all attempts produced no work — LLM/provider failure, not an agent failure]")
         else:
             status = "fail"
+        # ── Natural self-repair metrics (single-run, no harness repair) ──
+        # tool_seq (from the native run telemetry) is the ordered executed-tool
+        # log with per-call failure flags. A NATURAL fix cycle = the agent
+        # observed a failing check and then edited a file — entirely inside
+        # its own loop. self_checks = verification executions it ran itself.
+        _tool_seq = []
+        for _c in calls:
+            _cs = _c.get("tool_seq") or []
+            if isinstance(_cs, list):
+                _tool_seq.extend(_cs)
+        _saw_fail = False
+        _fix_cycles = 0
+        for _s in _tool_seq:
+            if _s.get("f"):
+                _saw_fail = True
+            elif _s.get("t") == "edit_file" and _saw_fail:
+                _fix_cycles += 1
+                _saw_fail = False
+        _self_checks = sum(1 for _s in _tool_seq if _s.get("t") == "run_command")
         report.update({
             "status": status,
             "attempts": attempts,
             "repairs": repairs,
             "hollow_retries": hollow_retries,
             "any_work": any_work,
+            "attempt_log": attempt_log,
             "pass_at": attempts if ok else None,
             "pass_at_1": (1 if first_real_ok else 0) if first_real_ok is not None else None,
             "prompt_style": os.environ.get("BSA_EVAL_STYLE", "spec"),
@@ -1716,9 +1831,13 @@ def run_single(task_id, keep=False):
             "cache_miss": usage.get("total_cache_miss_tokens", 0),
             "reasoning_tokens": sum((c.get("reasoning_chars") or 0) // 4 for c in calls),
             "paid_calls": len(calls),
+            "model_requests": sum((c.get("requests") or 0) for c in calls if isinstance(c.get("requests"), int)),
+            "req_log": [rl for c in calls if isinstance(c.get("req_log"), list) for rl in c.get("req_log")][:60],
+            "map_live_deltas": sum((c.get("map_live_deltas") or 0) for c in calls if isinstance(c.get("map_live_deltas"), int)),
+            "self_checks": _self_checks,
+            "natural_fix_cycles": _fix_cycles,
             "agents": sorted({c.get("agent") for c in calls}),
-            "sdet_calls": len([c for c in calls if c.get("agent") == "SDET"]),
-            "sdet_repair_rounds": sdet_repair_rounds,
+            "helper_repair_rounds": helper_repair_rounds,
             "tools": _tools_from_calls(calls),
             "bsa": {
                 "calls": len(bsa_rows),
@@ -1727,7 +1846,7 @@ def run_single(task_id, keep=False):
                 "by_kind": dict(collections.Counter(r.get("kind", "?") for r in bsa_rows)),
             },
             "files_changed": [f for f in _files_changed(before, after)
-                              if f not in ("_ops_out.txt", "_hidden_failure.log", "_verify_out.txt")][:30],
+                              if not _is_noise_path(f)][:60],
             "spec_produced": os.path.isdir(os.path.join(tmp, "specs")) and any(
                 f.endswith(".md") for f in os.listdir(os.path.join(tmp, "specs"))),
         })
@@ -1888,6 +2007,9 @@ def main():
         if args.only not in TASKS_BY_ID:
             print(f"unknown task {args.only!r}; available: {sorted(TASKS_BY_ID)}")
             return 1
+        # Per-task call telemetry file: no cross-run mixing in the shared log.
+        os.environ["BSA_CALLS_LOG"] = os.path.join(
+            PROJECT_ROOT, ".deep_agents", f"gen5_eval_calls_{args.only}.jsonl")
         r = run_single(args.only, keep=args.keep)
         print(json.dumps(r, indent=1, default=str))
         return 0 if r["status"] == "pass" else 1
@@ -1908,8 +2030,25 @@ def main():
     if purged:
         print(f"[eval] purged {purged} stale eval task-tracking file(s) from .deep_agents/tasks/", flush=True)
 
+    def _report_done(tid, wall_s, note=""):
+        """Live per-task completion line (status + wall time), read from the JSON report."""
+        try:
+            with open(os.path.join(_OUTDIR, f"{tid}.json"), encoding="utf-8") as f:
+                rep = json.load(f)
+            _st = str(rep.get("status", "?"))
+            _pa = rep.get("pass_at")
+            line = (f"    [done] {tid:<26} {_st:<6} dur={wall_s:7.1f}s "
+                    f"cost=${float(rep.get('cost', 0) or 0):.4f} pass@"
+                    f"{str(_pa) if _pa is not None else '-'}  "
+                    f"attempts={rep.get('attempts', 0)}  "
+                    f"out={rep.get('output_tokens', 0):>6,} re={rep.get('reasoning_tokens', 0):>6,} "
+                    f"miss={rep.get('cache_miss', 0):>6,}  {time.strftime('%H:%M:%S')}{(' ' + note) if note else ''}")
+            print(line, flush=True)
+        except Exception:
+            print(f"    [done] {tid:<26} (no report yet) {time.strftime('%H:%M:%S')}", flush=True)
+
     def _run_one(t):
-        print(f"\n===== {t['id']} ({t['category']}) =====", flush=True)
+        print(f"\n===== {t['id']} ({t['category']})  started {time.strftime('%H:%M:%S')} =====", flush=True)
         cmd = [sys.executable, script, "--only", t["id"]]
         if args.keep:
             cmd.append("--keep")
@@ -1917,8 +2056,11 @@ def main():
         if args.repairs is not None:
             cmd += ["--repairs", str(args.repairs)]
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        wall_cap = int(os.environ.get("BSA_TASK_WALL_CAP", "2400"))
+        env["BSA_CALLS_LOG"] = os.path.join(
+            PROJECT_ROOT, ".deep_agents", f"gen5_eval_calls_{t['id']}.jsonl")
+        wall_cap = int(os.environ.get("BSA_TASK_WALL_CAP", "2400") or 0)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        _t_start = time.time()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -1932,7 +2074,7 @@ def main():
                 errors="replace",
             )
             try:
-                child_output, _ = proc.communicate(timeout=wall_cap)
+                child_output, _ = proc.communicate(timeout=wall_cap if wall_cap > 0 else None)
                 rc = proc.returncode
             except subprocess.TimeoutExpired:
                 # Wall-cap hit (a stuck repair loop should not eat hours): kill the
@@ -1954,11 +2096,12 @@ def main():
                         "agents": [], "tools": [],
                         "test_detail": f"[WALL-CAP TIMEOUT after {wall_cap}s]",
                     }, f, indent=1, default=str)
-                print(f"    [WALL-CAP TIMEOUT after {wall_cap}s]", flush=True)
+                _report_done(t["id"], wall_cap, note="WALL-CAP-TIMEOUT")
                 return
             if rc != 0:
                 tail = (child_output or "").strip()[-2400:]
                 print(f"    [child exit {rc}]" + (f"\n{tail}" if tail else ""), flush=True)
+            _report_done(t["id"], time.time() - _t_start)
         except Exception as e:
             print(f"    [spawn error: {e}]", flush=True)
 

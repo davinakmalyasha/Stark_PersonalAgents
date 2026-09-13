@@ -38,7 +38,6 @@ def load_existing_specs(workspace_path: str = "") -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 PLAN_STATUSES = ("pending", "in_progress", "completed")
-MAX_PLAN_STEPS = 20
 MAX_STEP_CHARS = 200
 
 

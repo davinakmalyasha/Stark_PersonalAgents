@@ -35,7 +35,7 @@ print(f"[probe] {len(tools)} native tool schemas", flush=True)
 
 msgs = [{"role": "user",
          "content": "Call read_file with file_path "
-                    "'.agents/skills/ui-ux-design/SKILL.md' and then reply "
+                    "'.agents/skills/ui-ux-pro-max/SKILL.md' and then reply "
                     "with ONLY the value of its 'name' frontmatter field."}]
 try:
     t0 = time.time()

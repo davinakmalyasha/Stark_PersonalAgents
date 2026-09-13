@@ -1,41 +1,54 @@
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding='utf-8')
 
-print("=== 1. Testing P1: Compact Project Identity Projection ===")
+print("=== 1. Testing P1: Authored project memory projection ===")
 from memory.memory_manager import (
-    ensure_project_identity,
-    _format_compact_project_identity,
-    _project_identity_for_injection,
-    load_cached_project_identity,
+    load_project_memory,
+    update_project_memory,
 )
 
-# Test card parsing with updates
-sample_card = """# Project
-name: LangChain
-description: AI coding agent harness
-purpose: AI coding agent harness
-stack: Python, LangGraph
-version: Python 3.12
-status: stable
+# Authored doc fixture: Identity + Design bullets, no generated fields.
+sample_memory = """# Project
 
-[updated: 2026-08-19 12:00 UTC]
-stack: Python, LangGraph, LangChain
-version: Python 3.12.2
+## Identity
+- project: LangChain
+- purpose: AI coding agent harness
+- stack: Python, LangGraph
+- goals: long-horizon coding tasks
+
+## Design
+- direction: Terminal Minimal
+- theme: dark, dense
+- palette: primary #533afd · bg #0b0b0f
+- typography: Inter — display 32/24, body 14
+- concept: engineering console
 """
 
-compact_output = _format_compact_project_identity(sample_card, ".")
-print("Projected compact identity:\n" + compact_output)
+_mem_tmp = tempfile.mkdtemp()
+os.makedirs(os.path.join(_mem_tmp, ".agent-memory"), exist_ok=True)
+with open(os.path.join(_mem_tmp, ".agent-memory", "project.md"), "w", encoding="utf-8") as f:
+    f.write(sample_memory)
+
+compact_output = load_project_memory(_mem_tmp)
+print("Projected project memory:\n" + compact_output)
 assert "- project: LangChain" in compact_output
 assert "- purpose: AI coding agent harness" in compact_output
-assert "- stack: Python, LangGraph, LangChain" in compact_output
-assert "- runtime: Python 3.12.2" in compact_output
+assert "- stack: Python, LangGraph" in compact_output
+assert "## Design" in compact_output
+assert "- palette: primary #533afd · bg #0b0b0f" in compact_output
 assert "# Project" not in compact_output
-assert "[updated" not in compact_output
-assert "status:" not in compact_output
-print("[PASS] P1 projection format matches all rules.")
+
+assert update_project_memory(
+    _mem_tmp, "## Design\n- direction: Editorial\n- palette: primary #111111\n"
+)
+after = load_project_memory(_mem_tmp)
+assert "- direction: Editorial" in after
+assert "- project: LangChain" in after  # Identity preserved
+print("[PASS] P1 authored project memory projection matches all rules.")
 
 print("\n=== 2. Testing P2: Warmup Cache Alignment ===")
 from agents.developer_agent import _build_system_prompt

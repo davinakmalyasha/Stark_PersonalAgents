@@ -1,0 +1,122 @@
+{
+ "task_id": "g10-ecommerce-complete",
+ "category": "gen10-build",
+ "created": "2026-09-11 22:52:12",
+ "reviewer": "opencode",
+ "verdict": "Feature-complete, coherent, well-tested store; in-memory state caps scalability and this run's cost telemetry under-reported (harness gap, not the build)",
+ "rubric": {
+  "design": {
+   "score": 4,
+   "notes": "Storefront UX + full API contract coherence against the spec.\nDark design system (CSS vars, cards, sticky header, focus states, responsive auto-fill grid, accessible labels); conventional but consistent",
+   "evidence": []
+  },
+  "codebase_structure": {
+   "score": 5,
+   "notes": "routes/services/middleware/utils split + ApiError/asyncHandler; 47 files, ~3.9k LOC, no god files",
+   "evidence": []
+  },
+  "performance": {
+   "score": 4,
+   "notes": "WARNING: per-call telemetry logged requests=1/tool_calls_total=0 while tool_counts shows 53 tool calls; measured cost .0004 is unreliable for this run (harness accounting gap in long tool-loop sessions)",
+   "evidence": []
+  },
+  "scalability": {
+   "score": 3,
+   "notes": "Stock/cart/order consistency, pagination, persistence model.\nIn-memory Maps only (persistence was not required by this task); catalog scans/sorts per request; single-process",
+   "evidence": []
+  },
+  "maintainability": {
+   "score": 5,
+   "notes": "37 tests green across 5 suites, 10KB spec, 4.5KB README, consistent JSON error model",
+   "evidence": []
+  },
+  "security": {
+   "score": 4,
+   "notes": "Auth/roles/rate-limit/validation on every path; check admin-only routes.\nbcrypt, JWT roles, login rate limit, helmet CSP, write validation, escapeHtml on rendered data; dev JWT fallback secret and XFF-spoofable rate-limit key are the gaps",
+   "evidence": []
+  }
+ },
+ "rubric_definitions": {
+  "design": {
+   "desc": "Product/visual quality and API design: coherent identity, real copy, sensible information architecture, endpoints that a real client could use.",
+   "hints": [
+    "Landing/build: browse the rendered app (screenshots), check hierarchy, spacing, color/type system, states (hover/focus/empty/error), mobile vs desktop.",
+    "Refine/build: is the API contract coherent (naming, status codes, shapes, pagination) or just patched together?"
+   ]
+  },
+  "codebase_structure": {
+   "desc": "Layering, module boundaries, naming, cohesion, absence of monolith/AI-slop.",
+   "hints": [
+    "File tree + LOC distribution: routes/services/middleware/components split, no 600-line god files, no dead/duplicate modules.",
+    "Do responsibilities sit in the right layer (no DB access in routes, etc.)?"
+   ]
+  },
+  "performance": {
+   "desc": "Runtime behavior: latency, wasted work, payload sizes, build/start health.",
+   "hints": [
+    "Any N+1-ish scans, repeated full-file rewrites, blocking sync I/O on hot paths?",
+    "Landing: build output size, unnecessary re-renders, unoptimized assets."
+   ]
+  },
+  "scalability": {
+   "desc": "How the system behaves as data/users grow: state model, concurrency, config.",
+   "hints": [
+    "Persistence/state choices, uniqueness under concurrency, pagination everywhere, secrets/config via env, no hardcoded limits that break at N+1."
+   ]
+  },
+  "maintainability": {
+   "desc": "Tests, docs, readability, error handling, ease of safe change.",
+   "hints": [
+    "Do the tests actually cover the risky paths (not just happy path)?",
+    "Spec/README accuracy; consistent error model; no leftover debug code."
+   ]
+  },
+  "security": {
+   "desc": "Authn/z, input validation, secret handling, dependency and output safety.",
+   "hints": [
+    "bcrypt/JWT/rate-limit correctness, role checks on every admin path, validation on every write, no secrets in source, no XSS in rendered content."
+   ]
+  }
+ },
+ "auto": {
+  "status": "pass",
+  "pass_at": 1,
+  "pass_at_1": 1,
+  "attempts": 1,
+  "repairs": 0,
+  "hollow_retries": 0,
+  "cost_usd": 0.000372,
+  "duration_s": 476.5,
+  "input_tokens": 3232,
+  "output_tokens": 255,
+  "reasoning_tokens": 23608,
+  "cache_hit": 3072,
+  "cache_miss": 160,
+  "cache_hit_pct": 95.0,
+  "paid_calls": 1,
+  "model_requests": 1,
+  "input_tokens_per_call": 3232.0,
+  "cost_per_minute": 4.7e-05,
+  "self_checks": 8,
+  "natural_fix_cycles": 4,
+  "spec_produced": true,
+  "files_changed": 30,
+  "agents": [
+   "Developer"
+  ],
+  "tools": {},
+  "prompt_style": "spec",
+  "test_detail_head": "ecommerce ok (api + frontend + specs + tests + security + completeness)"
+ },
+ "workspace": {
+  "tmp_dir": "D:\\MyProject\\LangChain\\scratch\\eval_tmp\\eval_g10-ecommerce-complete_s75t5byi",
+  "kept": true,
+  "file_count": 43,
+  "total_loc": 3945
+ },
+ "overall": {
+  "score_avg": 4.17,
+  "max": 5
+ },
+ "calls_log": "whole-run raw per-call log (filter by timestamp/agent)"
+}

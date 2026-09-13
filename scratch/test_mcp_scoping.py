@@ -58,6 +58,13 @@ class TestScopeMatching(unittest.TestCase):
         self.assertEqual(_canonical_scope("General"), "general")
         self.assertEqual(_canonical_scope(""), "")
 
+    def test_ui_scoped_server_matches_ui_execution_only(self):
+        c = _client(scopes=["ui"])
+        self.assertTrue(self.mgr._scope_matches(c, "UI"))
+        self.assertTrue(self.mgr._scope_matches(c, "ui"))
+        self.assertFalse(self.mgr._scope_matches(c, "Dev"))
+        self.assertFalse(self.mgr._scope_matches(c, "General"))
+
 
 class TestPerScopeToolViews(unittest.TestCase):
     """One manager, several tagged servers -> distinct per-scope tool lists."""
@@ -82,6 +89,13 @@ class TestPerScopeToolViews(unittest.TestCase):
             "global": _client(
                 name="global",
                 tools=[{"name": "ping", "description": "", "inputSchema": {}}],
+            ),
+            "shadcn": _client(
+                name="shadcn",
+                scopes=["ui"],
+                tools=[{"name": "search_items", "description": "Search registry",
+                        "inputSchema": {"properties": {"q": {"type": "string"}},
+                                        "required": ["q"]}}],
             ),
         }
 
@@ -109,6 +123,53 @@ class TestPerScopeToolViews(unittest.TestCase):
         self.assertEqual(fq, "mcp__My_Server__do__thing")
         server, tool = _parse_fq(fq)
         self.assertEqual((server, tool), ("My_Server", "__".join(["do", "thing"])))
+
+    def test_ui_view_gets_ui_scoped_and_global_only(self):
+        names = [d["function"]["name"] for d in self.mgr.tool_defs_for_scope("UI")]
+        self.assertEqual(sorted(names), sorted([
+            _fq_tool_name("shadcn", "search_items"),
+            _fq_tool_name("global", "ping"),
+        ]))
+        dev_names = [d["function"]["name"] for d in self.mgr.tool_defs_for_scope("Dev")]
+        self.assertNotIn(_fq_tool_name("shadcn", "search_items"), dev_names)
+
+    def test_schemas_native_names_follow_scope(self):
+        from tools._schemas import get_native_tool_names
+
+        ui_names = get_native_tool_names("UI")
+        self.assertIn(_fq_tool_name("shadcn", "search_items"), ui_names)
+        self.assertNotIn(
+            _fq_tool_name("shadcn", "search_items"), get_native_tool_names("Dev")
+        )
+
+
+class TestMcpExecutionFallback(unittest.TestCase):
+    def test_execute_tool_detailed_dispatches_mcp_names(self):
+        from unittest.mock import patch
+
+        from tools._registry import execute_tool_detailed
+
+        with patch(
+            "tools.mcp.mcp_bridge.mcp_execute", return_value="ok-from-bridge"
+        ) as m:
+            res = execute_tool_detailed(
+                "mcp__shadcn__search_items", {"q": "button"}, scope="UI"
+            )
+        self.assertEqual(res.content, "ok-from-bridge")
+        m.assert_called_once_with(
+            "mcp__shadcn__search_items", {"q": "button"}, scope="UI"
+        )
+
+
+class TestSubagentToolScope(unittest.TestCase):
+    def test_tool_in_scope_allows_mcp_names_and_spec_tools(self):
+        from tools.AddOnTool.subagentTools import _tool_in_scope
+
+        spec = ["browser_act", "edit_file"]
+        self.assertTrue(_tool_in_scope("browser_act", spec))
+        self.assertTrue(_tool_in_scope("mcp__shadcn__search_items", spec))
+        self.assertFalse(_tool_in_scope("run_command", spec))
+        self.assertTrue(_tool_in_scope("anything", []))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ print("DEEPSEEK_API_KEY set:", bool(os.getenv("DEEPSEEK_API_KEY")))
 
 try:
     llm = ChatOpenAI(
-        model="deepseek-v4-flash",
+        model="deepseek-v4.1-flash",
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url="https://api.deepseek.com",
         temperature=0.1,

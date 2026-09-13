@@ -18,11 +18,17 @@ Why this is lightweight vs live mode:
  - Proper mic close order fixes the Python-CFFI popup after app close
 """
 import argparse
+import os
 import sys
 import time
 import threading
 import queue
 from pathlib import Path
+
+# Same as Voice/audio_engine.py: drop pocket-tts beartype runtime checks
+# (per-call overhead on the synthesis hot path). Set before pocket_tts
+# is imported below.
+os.environ.setdefault("POCKET_TTS_NO_BEARTYPE", "1")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JARVIS_SAFETENSORS = REPO_ROOT / ".deep_agents" / "tts_ref" / "jarvis_pocket.safetensors"

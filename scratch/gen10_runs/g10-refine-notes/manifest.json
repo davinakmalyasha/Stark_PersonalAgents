@@ -1,0 +1,53 @@
+{
+ "tmp_dir": "D:\\MyProject\\LangChain\\scratch\\eval_tmp\\eval_g10-refine-notes_bxslhsiv",
+ "file_count": 23,
+ "files_by_ext": {
+  ".js": 14,
+  ".json": 3,
+  ".md": 2,
+  "(none)": 1,
+  ".log": 1,
+  ".html": 1,
+  ".css": 1
+ },
+ "loc_by_ext": {
+  ".json": 870,
+  ".js": 787,
+  ".md": 194,
+  ".html": 19,
+  ".css": 4
+ },
+ "total_loc": 1874,
+ "dependencies": {
+  "express": "^4.19.0"
+ },
+ "scripts": {
+  "start": "node server.js",
+  "test": "node --test tests/"
+ },
+ "files": [
+  ".gitignore",
+  "README.md",
+  "_hidden_failure.log",
+  "config.js",
+  "data\\notes.json",
+  "middleware\\errors.js",
+  "middleware\\noteLookup.js",
+  "middleware\\validateNote.js",
+  "package-lock.json",
+  "package.json",
+  "public\\app.js",
+  "public\\index.html",
+  "public\\style.css",
+  "routes\\health.js",
+  "routes\\index.js",
+  "routes\\notes.js",
+  "server.js",
+  "services\\notesService.js",
+  "specs\\SPEC-refactor.md",
+  "store\\noteStore.js",
+  "tests\\helpers\\server.js",
+  "tests\\notes.test.js",
+  "utils\\params.js"
+ ]
+}

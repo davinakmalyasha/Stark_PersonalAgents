@@ -14,13 +14,13 @@ Read-class tools remain available: read_file, search_code, browser_*,
 read_pdf, ask_user, update_plan, propose_plan, plus all the existing
 read-only registry calls.
 
-Write-class tool blocklist (deliberately narrow, per user direction
-"read tools only" — no edit_file, no destructive shell):
+Write-class tool blocklist (deliberately narrow): edit_file, create_project,
+resume_project, github_apply_gate, house_set_device, house_run_scene,
+create_docx, create_xlsx, delegate, call_subagent.
 
-  edit_file, run_command (any), create_project,
-  github_apply_gate, house_set_device, house_run_scene,
-  create_docx, create_xlsx, delegate, task, call_subagent,
-  async_task, resume_project, interrupt_agent.
+run_command is not blanket-blocked in plan mode: each call is checked by
+`_is_destructive_shell` (delegates to MainTool._cmdpolicy.is_read_only), so
+read-only shells stay available while writes/side effects are vetoed.
 """
 
 from __future__ import annotations
@@ -29,52 +29,26 @@ from __future__ import annotations
 WRITE_CLASS_TOOLS: frozenset[str] = frozenset({
     "edit_file", "create_project", "resume_project",
     "github_apply_gate", "house_set_device", "house_run_scene",
-    "house_apply_state", "create_docx", "create_xlsx",
-    "delegate", "delegation_status",
-    "task", "call_subagent", "async_task", "start_async_task",
-    "interrupt_agent",
-    "create_chat", "add_message", "delete_chat", "delete_workspace",
-    "update_feature", "update_project_meta",
+    "create_docx", "create_xlsx",
+    "delegate", "call_subagent",
 })
 
 
 def _is_destructive_shell(command: str) -> bool:
     """Plan mode allows *read-only* shell commands (ls, cat, find, grep).
-    Anything that looks like a write or remote/exec is vetoed."""
-    if not command:
-        return False
-    cmd = command.strip().lower()
-    # Read-only allowlist (very small; safer to veto anything else).
-    read_only_prefixes = (
-        "ls", "dir", "cat", "type", "head", "tail", "find", "grep",
-        "rg ", "git status", "git log", "git diff", "git show",
-        "git branch", "git remote -v", "git ls-files",
-        "where ", "which ", "echo ", "printf ",
-        "python -c ", "python3 -c ",
-    )
-    for prefix in read_only_prefixes:
-        if cmd == prefix.rstrip() or cmd.startswith(prefix):
-            # Even read-only allowlist can be tricked — block obvious writes.
-            for bad in (">", ">>", "rm ", "del ", "mv ", "cp ", "move ",
-                        "copy ", "tee ", "invoke-webrequest", "curl ",
-                        "wget ", "invoke-restmethod", "bitsadmin",
-                        "certutil", "reg ", "schtasks", "sc ",
-                        "format-", "clear-disk", "initialize-disk",
-                        "remove-item", "set-content", "add-content",
-                        "new-item -type file", "ni -type file",
-                        "out-file", "sc create", "stop-service",
-                        "start-service", "restart-service", "kill ",
-                        "taskkill", "pkill", "remove-variable",
-                        "set-variable ", "$env:", "[environment]",
-                        "pip install", "npm install", "npm i ",
-                        "cargo install", "go install", "brew install",
-                        "gem install", "iex ", "invoke-expression",
-                        "sudo ", "runas ", "icacls ", "takeown ",
-                        "format-volume"):
-                if bad in cmd:
-                    return True
-            return False
-    return True  # anything not in the read-only allowlist is vetoed
+
+    Delegates to tools/MainTool/_cmdpolicy.is_read_only: a command is allowed
+    only when every segment parses to an allowlisted read-only program, has no
+    output redirection, and contains no nested shell. Anything unverifiable is
+    treated as destructive.
+    """
+    try:
+        from .MainTool._cmdpolicy import is_read_only
+        ok, _reason = is_read_only(command)
+        return not ok
+    except Exception:
+        # Conservative fallback: unknown command shape is vetoed.
+        return bool(command)
 
 
 def plan_mode_guard(ctx: dict) -> str | None:

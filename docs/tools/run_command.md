@@ -1,10 +1,10 @@
 # run_command
 
-- **Description:** Run a shell command. Foreground blocks and streams logs; background returns a key managed via process_action.
+- **Description:** Run a shell command (Git Bash, POSIX). Foreground blocks and streams output; server-like commands (npm run dev, vite, uvicorn, python -m http.server...) that exceed the timeout are auto-moved to background. Background runs return a process name managed via process_action. Windows tools work as subprocesses: powershell.exe -NoProfile -Command '...' or cmd.exe /c '...'.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, ui, deploy, general, house, dfd
+- **Scopes (from _SCOPE_MAP):** developer, general, house, dfd, ui, deploy
 - **Parallel-safe (PARALLEL_SAFE):** False
-- **Compact doc:** run_command(command, timeout?, background?, process_action?, shell?, workdir?, expect?, stream?) — Full POSIX bash (default): pipes, &&, $( ), jq, gh pipelines all work. shell='cmd' for legacy, workdir sets cwd, expect checks output regex, stream for live output.
+- **Compact doc:** run_command(command, timeout?, idle_timeout?, background?, process_action?, workdir?, expect?, tail_lines?, ready_timeout?, input?) — Git Bash (POSIX): pipes, &&, $( ), jq, gh. timeout ms (default 120000; <1000 = seconds; max 600000); idle_timeout kills commands idle by output AND CPU (default 60000; 0 = off); server-like/busy commands auto-background on timeout. process_action=list|logs|kill|wait|ready|send|kill_all. background+expect waits for readiness and reports the listening URL. workdir sets cwd, expect checks output regex.
 - **Required args (validated):** (none)
 - **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema | redact via Hooks.after_tool_execute | offload via after_tool_execute
@@ -12,13 +12,16 @@
 
 ## Parameters (JSON Schema)
 
-  - `command` (string, optional): Shell command; also names the process for process_action='logs'|'kill'.
-  - `timeout` (integer, optional): Foreground timeout ms.
+  - `command` (string, optional): Shell command; also names the process for process_action='logs'|'kill'|'wait'.
+  - `timeout` (integer, optional): Wall-clock limit in ms (default 120000, max 600000; values <1000 are seconds). Use >=60000 for installs; background=true for servers.
+  - `idle_timeout` (integer, optional): Kill after this long with no output and no CPU activity, in ms (default 60000; 0 disables). Server-like/busy commands are backgrounded instead of killed.
   - `background` (boolean, optional): 
-  - `process_action` (string, optional): 'list' | 'logs' | 'kill'.
-  - `shell` (string, optional): 'bash' only (Git Bash 5.3.15); 'cmd' is removed — use bash.
+  - `process_action` (string, optional): 'list' | 'logs' | 'kill' | 'wait' | 'ready' | 'send' | 'kill_all' (command carries the process name).
   - `workdir` (string, optional): Working directory (default project root).
-  - `expect` (string, optional): Regex expected in output; typed pass/fail.
+  - `expect` (string, optional): Regex expected in output; typed pass/fail. For background starts it is awaited up to ready_timeout.
+  - `tail_lines` (integer, optional): Lines returned by process_action='logs' (default 200).
+  - `ready_timeout` (integer, optional): Background readiness wait in ms (default 15000; 0 = don't wait). Also used by process_action='ready'.
+  - `input` (string, optional): process_action='send': text written to the background process stdin.
 
 ## How to recreate
 

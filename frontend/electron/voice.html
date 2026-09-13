@@ -38,7 +38,7 @@ body.state-error   { --accent: #f2a0a0; --accent-soft: rgba(242, 160, 160, 0.35)
   transition: border-color 0.5s ease, border-radius 0.25s ease;
   overflow: hidden;
 }
-.main-row { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: 100%; height: 100%; flex-shrink: 0; }
+.main-row { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: 100%; height: 100%; flex-shrink: 0; transition: opacity 0.2s ease, transform 0.2s ease; }
 .container::before {
   content: '';
   position: absolute;
@@ -505,6 +505,500 @@ body.is-menu-open .voice-menu {
 body.is-menu-open .voice-menu-head { color: #64748b; }
 body.is-menu-open .voice-menu button { color: #334155; }
 body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a; }
+
+/* ── Look-at-screen mode — Gemini-style dark glass panel ──
+   The compact orb morphs into a screen-share panel: window grows first
+   (resizeOverlay), then .screen-panel fades/scales in while .main-row fades
+   out. Exit plays the reverse before the window shrinks back. */
+.screen-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 12px 10px;
+  border-radius: 18px;
+  background: linear-gradient(160deg, rgba(21, 25, 37, 0.97), rgba(11, 14, 22, 0.98));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 18px 50px rgba(2, 6, 18, 0.55), 0 0 calc(var(--voice-level, 0) * 22px) rgba(122, 167, 255, 0.35);
+  color: #e6eaf3;
+  -webkit-app-region: drag;
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+  transform-origin: 100% 0;
+  pointer-events: none;
+  transition: opacity 0.28s ease, transform 0.28s cubic-bezier(0.2, 0.85, 0.25, 1), box-shadow 0.25s ease;
+  --voice-level: 0;
+}
+body.is-screen .screen-panel { display: flex; }
+body.is-screen:not(.is-screen-closing) .screen-panel {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+/* Staggered child entrance (C12) */
+body.is-screen:not(.is-screen-closing) .screen-head { animation: panelChildIn 0.34s cubic-bezier(0.2, 0.85, 0.25, 1) both; }
+body.is-screen:not(.is-screen-closing) .screen-caption { animation: panelChildIn 0.34s cubic-bezier(0.2, 0.85, 0.25, 1) 0.045s both; }
+body.is-screen:not(.is-screen-closing) .screen-chips { animation: panelChildIn 0.34s cubic-bezier(0.2, 0.85, 0.25, 1) 0.09s both; }
+body.is-screen:not(.is-screen-closing) .screen-foot { animation: panelChildIn 0.34s cubic-bezier(0.2, 0.85, 0.25, 1) 0.135s both; }
+@keyframes panelChildIn {
+  from { opacity: 0; transform: translateY(9px); }
+  to { opacity: 1; transform: none; }
+}
+body.is-screen .main-row {
+  opacity: 0;
+  transform: scale(0.92);
+  pointer-events: none;
+}
+body.is-screen .bars-btn .orb-ripple { animation: none; }
+body.is-screen .menu-toggle { top: 10px; right: 10px; }
+body.is-screen .scan { display: none; }
+
+.screen-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding-right: 26px;
+}
+.screen-status {
+  flex: 1;
+  min-width: 0;
+  font: 600 13px/1.2 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  color: #eef1f8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.35s ease;
+}
+body.state-thinking .screen-status,
+body.state-processing .screen-status { color: #c3b3e8; }
+body.state-speaking .screen-status { color: #9be1e6; }
+body.state-error .screen-status { color: #f2a0a0; }
+.screen-head-sp { flex-shrink: 0; width: 0; }
+.screen-icon-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #cdd6e6;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.screen-icon-btn:hover { background: rgba(255, 255, 255, 0.14); color: #fff; }
+
+/* Source chips row (mirrors the reference: one chip per shared source) */
+.screen-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  -webkit-app-region: no-drag;
+}
+.screen-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 6px 5px 9px;
+  border-radius: 999px;
+  background: rgba(64, 86, 178, 0.35);
+  border: 1px solid rgba(122, 167, 255, 0.4);
+  color: #dbe4f7;
+  font: 500 11px/1 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.screen-chip:hover { background: rgba(64, 86, 178, 0.5); border-color: rgba(122, 167, 255, 0.6); }
+.screen-chip.paused { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.12); color: rgba(219, 226, 238, 0.6); }
+.screen-chip-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7aa7ff;
+  box-shadow: 0 0 7px rgba(122, 167, 255, 0.9);
+  animation: livePulse 2s ease-in-out infinite;
+}
+.screen-chip.paused .screen-chip-dot { background: rgba(219, 226, 238, 0.45); box-shadow: none; animation: none; }
+@keyframes livePulse { 50% { opacity: 0.35; } }
+.screen-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.screen-chip-x {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: rgba(219, 228, 247, 0.65);
+  font-size: 13px;
+  line-height: 1;
+}
+.screen-chip-x:hover { background: rgba(255, 255, 255, 0.16); color: #fff; }
+
+/* Live-preview popover (opens on chip/eye click; stream runs regardless) */
+.screen-preview-pop {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 42px;
+  bottom: 10px;
+  z-index: 5;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(9, 12, 19, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 14px 34px rgba(2, 6, 18, 0.6);
+}
+.screen-preview-pop.open { display: flex; animation: popIn 0.22s cubic-bezier(0.2, 0.85, 0.25, 1) both; }
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.screen-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.screen-pop-name {
+  min-width: 0;
+  flex: 1;
+  font: 600 11px/1.2 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  color: rgba(230, 234, 243, 0.8);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.screen-pop-close { width: 22px; height: 22px; }
+
+.screen-preview {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #05070d;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background-size: cover;
+  background-position: center;
+  -webkit-app-region: no-drag;
+}
+.screen-preview video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.screen-preview::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 10px;
+  border: 1px solid var(--accent-soft);
+  pointer-events: none;
+  transition: border-color 0.5s ease;
+}
+/* Idle/off/paused/starting states (B9) */
+.screen-preview-state {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 26px;
+  background: radial-gradient(circle at 50% 40%, rgba(21, 26, 40, 0.55), rgba(5, 7, 13, 0.85));
+  text-align: center;
+  transition: opacity 0.25s ease;
+}
+.screen-preview.live .screen-preview-state { opacity: 0; pointer-events: none; }
+.screen-preview-empty {
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(230, 234, 243, 0.5);
+}
+.screen-preview-action {
+  padding: 7px 15px;
+  border-radius: 999px;
+  background: linear-gradient(120deg, #7aa7ff, #b197fc);
+  color: #0b1020;
+  font: 600 11.5px/1 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  box-shadow: 0 6px 18px rgba(122, 167, 255, 0.3);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
+}
+.screen-preview-action:hover { transform: translateY(-1px) scale(1.03); box-shadow: 0 8px 22px rgba(122, 167, 255, 0.45); }
+.screen-preview-action:active { transform: scale(0.97); }
+.screen-spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  border-top-color: #7aa7ff;
+  animation: spin 0.9s linear infinite;
+}
+/* LIVE badge: grey OFF when not sharing (B9) */
+.screen-live.paused { color: rgba(230, 234, 243, 0.45); }
+.screen-live.paused i { background: rgba(230, 234, 243, 0.4); box-shadow: none; animation: none; }
+
+.screen-caption {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 56px;
+  padding: 9px 11px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-app-region: no-drag;
+}
+.screen-caption::-webkit-scrollbar { width: 5px; }
+.screen-caption::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 3px; }
+/* Thinking shimmer: a slow sweep across the captions while the agent reads */
+.screen-caption::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  background: linear-gradient(105deg, transparent 42%, rgba(255, 255, 255, 0.07) 50%, transparent 58%);
+  transform: translateX(-130%);
+  opacity: 0;
+  pointer-events: none;
+}
+body.state-thinking .screen-caption::after,
+body.state-processing .screen-caption::after {
+  opacity: 1;
+  animation: screenShimmer 2.6s ease-in-out infinite;
+}
+@keyframes screenShimmer {
+  0% { transform: translateX(-130%); }
+  55%, 100% { transform: translateX(130%); }
+}
+.screen-role {
+  display: block;
+  font: 700 9.5px/1 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  letter-spacing: 0.14em;
+  color: rgba(160, 180, 220, 0.75);
+  margin-bottom: 7px;
+  transition: color 0.4s ease;
+}
+body.state-listening .screen-role { color: #9fc1f0; }
+body.state-thinking .screen-role,
+body.state-processing .screen-role { color: #c3b3e8; }
+body.state-speaking .screen-role { color: #9be1e6; }
+body.state-error .screen-role { color: #f2a0a0; }
+.screen-caption-text {
+  display: block;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: rgba(235, 239, 248, 0.92);
+  white-space: pre-wrap;
+}
+.screen-caption-text.swap { animation: captionIn 0.22s ease; }
+@keyframes captionIn {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+
+.screen-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+.screen-badge {
+  flex-shrink: 0;
+  font: 700 9.5px/1 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  letter-spacing: 0.14em;
+  color: rgba(230, 234, 243, 0.45);
+  min-width: 34px;
+}
+.screen-badge.live { color: #ffb9b9; animation: livePulse 2s ease-in-out infinite; }
+.screen-badge.cont { color: #7aa7ff; }
+.screen-foot-sp { flex: 1; }
+.screen-mic {
+  position: relative;
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #ffffff;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  box-shadow: 0 8px 22px rgba(2, 6, 18, 0.45);
+  transition: transform 0.2s ease, box-shadow 0.3s ease;
+}
+.screen-mic:hover { transform: scale(1.05); }
+.screen-mic:active { transform: scale(0.94); }
+.screen-mic .bars { height: 16px; gap: 2.5px; }
+.screen-mic .bars i { width: 3px; height: 6px; background: #0f172a; transition: height 0.12s linear, opacity 0.5s ease; }
+body.state-muted .screen-mic .bars i { opacity: 0.35; }
+body.state-listening .screen-mic,
+body.state-thinking .screen-mic,
+body.state-processing .screen-mic,
+body.state-speaking .screen-mic { box-shadow: 0 0 0 2px var(--accent-soft), 0 8px 22px rgba(2, 6, 18, 0.45); }
+.screen-send {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(120deg, #7aa7ff, #b197fc);
+  color: #0b1020;
+  box-shadow: 0 6px 18px rgba(122, 167, 255, 0.35);
+}
+.screen-send svg { width: 13px; height: 13px; }
+
+/* Source picker sheet (in-panel) */
+.screen-picker {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 22px;
+  background: rgba(9, 12, 19, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  color: #e6eaf3;
+}
+.screen-picker.open { display: flex; }
+.screen-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font: 600 12px/1 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  color: rgba(230, 234, 243, 0.85);
+}
+.screen-picker-grid {
+  flex: 1;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  align-content: start;
+  -webkit-app-region: no-drag;
+}
+.screen-picker-grid::-webkit-scrollbar { width: 6px; }
+.screen-picker-grid::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 3px; }
+.screen-picker-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  color: rgba(230, 234, 243, 0.85);
+  text-align: left;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.18s ease, box-shadow 0.18s ease;
+  animation: pickerItemIn 0.32s cubic-bezier(0.2, 0.85, 0.25, 1) both;
+}
+@keyframes pickerItemIn {
+  from { opacity: 0; transform: translateY(7px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.screen-picker-item:hover {
+  background: rgba(122, 167, 255, 0.16);
+  border-color: rgba(122, 167, 255, 0.4);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 18px rgba(2, 6, 18, 0.45);
+}
+.screen-picker-item.active { border-color: #7aa7ff; }
+.screen-picker-item.active::after {
+  content: '✓';
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #7aa7ff;
+  color: #0b1020;
+  font-size: 11px;
+  font-weight: 700;
+}
+.screen-picker-item img { width: 100%; aspect-ratio: 16/10; object-fit: cover; border-radius: 6px; background: #05070d; }
+.screen-picker-item span {
+  font-size: 10.5px;
+  line-height: 1.3;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.screen-picker-empty {
+  grid-column: 1 / -1;
+  padding: 22px 0;
+  text-align: center;
+  font-size: 12px;
+  color: rgba(230, 234, 243, 0.45);
+}
+
+/* Menu + voice picker go dark over the panel */
+body.is-screen.is-menu-open .menu-panel {
+  top: 42px;
+  right: 8px;
+  left: auto;
+  width: 190px;
+  height: auto;
+  padding: 6px;
+  background: rgba(18, 22, 33, 0.98);
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 14px 34px rgba(2, 6, 18, 0.6);
+  animation: screenMenuIn 0.18s ease both;
+}
+@keyframes screenMenuIn {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+body.is-screen .menu-item { color: #dbe2ee; }
+body.is-screen .menu-item:hover { background: rgba(255, 255, 255, 0.08); color: #ffffff; }
+body.is-screen .menu-item b { color: rgba(219, 226, 238, 0.4); }
+body.is-screen .menu-toggle {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: #dbe2ee;
+}
+body.is-screen .menu-toggle:hover { background: rgba(255, 255, 255, 0.16); color: #ffffff; }
+body.is-screen .voice-menu {
+  right: 10px;
+  bottom: 10px;
+  background: rgba(18, 22, 33, 0.98);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+body.is-screen .voice-menu-head { color: rgba(219, 226, 238, 0.55); }
+body.is-screen .voice-menu button { color: #dbe2ee; }
+body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08); color: #ffffff; }
+
+/* Accessibility: honor the OS reduced-motion setting */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .screen-preview::before, .screen-caption::after { display: none; }
+}
 </style></head>
 <body>
 <div class="container">
@@ -512,6 +1006,15 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     <i></i><i></i><i></i>
   </button>
   <div id="menu-panel" class="menu-panel" aria-hidden="true">
+    <button id="menu-screen" class="menu-item" type="button" style="display:none">
+      <span>Look at screen</span><b>›</b>
+    </button>
+    <button id="menu-share" class="menu-item" type="button" style="display:none">
+      <span>Pause sharing</span><b>›</b>
+    </button>
+    <button id="menu-continuous" class="menu-item" type="button" style="display:none">
+      <span>Continuous look: off</span><b>›</b>
+    </button>
     <button id="menu-close" class="menu-item" type="button">
       <span>Close Overlay</span><b>×</b>
     </button>
@@ -523,7 +1026,6 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     </button>
   </div>
   <div class="main-row">
-    <div class="grip"><span></span><span></span><span></span></div>
 
     <!-- Live bars: the voice toggle -->
     <button id="mic-btn" class="bars-btn" title="Unmute">
@@ -586,6 +1088,75 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     <div id="feed" class="feed"></div>
   </div>
 
+  <!-- Look-at-screen mode (compact floating overlay) -->
+  <div id="screen-panel" class="screen-panel" aria-hidden="true">
+    <div class="screen-head">
+      <span id="screen-status" class="screen-status">Listening…</span>
+      <span class="screen-head-sp"></span>
+      <button id="screen-preview-btn" class="screen-icon-btn" title="Preview what is shared" aria-label="Preview what is shared">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+          <circle cx="12" cy="12" r="3"></circle>
+        </svg>
+      </button>
+      <button id="screen-source-btn" class="screen-icon-btn" title="Change what you share" aria-label="Change what you share">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="4" width="20" height="14" rx="2"></rect>
+          <path d="M8 22h8"></path><path d="M12 18v4"></path>
+        </svg>
+      </button>
+      <button id="screen-exit-btn" class="screen-icon-btn" title="Back to voice" aria-label="Back to voice">✕</button>
+    </div>
+    <div class="screen-caption" id="screen-caption">
+      <span class="screen-role" id="screen-caption-role">READING</span>
+      <span class="screen-caption-text" id="screen-caption-text">Captions will show here</span>
+    </div>
+    <div class="screen-chips" id="screen-chips" style="display:none">
+      <button id="screen-chip" class="screen-chip" type="button" title="Preview what is shared">
+        <span class="screen-chip-dot"></span>
+        <span id="screen-chip-name" class="screen-chip-name">Screen 1</span>
+        <span id="screen-chip-x" class="screen-chip-x" title="Stop sharing" role="button" aria-label="Stop sharing">×</span>
+      </button>
+    </div>
+    <div class="screen-foot">
+      <span id="screen-badge" class="screen-badge">OFF</span>
+      <span class="screen-foot-sp"></span>
+      <button id="screen-mic" class="screen-mic" title="Unmute" aria-label="Toggle microphone">
+        <span class="orb-ripple"></span>
+        <span class="orb-ripple r2"></span>
+        <span class="bars"><i></i><i></i><i></i><i></i></span>
+      </button>
+      <button id="screen-send" class="screen-send" title="Send now" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+    <div id="screen-preview-pop" class="screen-preview-pop" aria-hidden="true">
+      <div class="screen-pop-head">
+        <span id="screen-pop-name" class="screen-pop-name">Screen 1</span>
+        <button id="screen-pop-close" class="screen-icon-btn screen-pop-close" title="Close preview" aria-label="Close preview">✕</button>
+      </div>
+      <div class="screen-preview" id="screen-preview">
+        <video id="screen-video" autoplay muted playsinline></video>
+        <div id="screen-preview-state" class="screen-preview-state">
+          <div id="screen-spinner" class="screen-spinner" style="display:none"></div>
+          <div id="screen-preview-empty" class="screen-preview-empty">No screen shared</div>
+          <button id="screen-preview-action" class="screen-preview-action" type="button" style="display:none">Share screen</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="screen-picker" class="screen-picker" aria-hidden="true">
+    <div class="screen-picker-head">
+      <span>What should the agent see?</span>
+      <button id="screen-picker-close" class="screen-icon-btn" title="Close" aria-label="Close picker">✕</button>
+    </div>
+    <div id="screen-picker-grid" class="screen-picker-grid"></div>
+  </div>
+
   <div class="scan"></div>
 </div>
 <script>
@@ -614,6 +1185,37 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   const feedWrap = $('feed-wrap');
   const feed = $('feed');
   const feedStatus = $('feed-status');
+  // Look-at-screen mode refs
+  const menuScreen = $('menu-screen');
+  const menuShare = $('menu-share');
+  const menuContinuous = $('menu-continuous');
+  const screenPanel = $('screen-panel');
+  const screenVideo = $('screen-video');
+  const screenPreview = $('screen-preview');
+  const screenPreviewEmpty = $('screen-preview-empty');
+  const screenSourceBtn = $('screen-source-btn');
+  const screenCaptionText = $('screen-caption-text');
+  const screenCaptionRole = $('screen-caption-role');
+  const screenPreviewState = $('screen-preview-state');
+  const screenSpinner = $('screen-spinner');
+  const screenPreviewAction = $('screen-preview-action');
+  const screenStatusEl = $('screen-status');
+  const screenBadge = $('screen-badge');
+  const screenChips = $('screen-chips');
+  const screenChip = $('screen-chip');
+  const screenChipName = $('screen-chip-name');
+  const screenChipX = $('screen-chip-x');
+  const screenPreviewBtn = $('screen-preview-btn');
+  const screenExitBtn = $('screen-exit-btn');
+  const screenPreviewPop = $('screen-preview-pop');
+  const screenPopName = $('screen-pop-name');
+  const screenPopClose = $('screen-pop-close');
+  const screenMic = $('screen-mic');
+  const screenSend = $('screen-send');
+  const screenFootBars = screenMic ? screenMic.querySelectorAll('.bars i') : null;
+  const screenPicker = $('screen-picker');
+  const screenPickerGrid = $('screen-picker-grid');
+  const screenPickerClose = $('screen-picker-close');
 
   const bridge = window.voiceBridge || null;
   function send(type, payload) { if (bridge) bridge.sendEvent(Object.assign({ type: type }, payload || {})); }
@@ -650,19 +1252,21 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 
   let micOn = false;
   let speaking = false;
-  let incrementalTtsBuffer = '';  // Phase 8-V6: accumulated reply → one gapless speakStreamed
+  let incrementalTtsBuffer = '';  // settled sentences awaiting speak-out
   let ttsHeldUntil = 0;         // Phase 8-V1: sentence-settle debounce timestamp
   let thinking = false;
   let accumulated = '';
   let lastReply = '';
   let stream = null;
-  let audioCtx = null;
+  let micNodes = null;      // {src} on the shared auCtx while the mic is on
   let analyser = null;
   let freqBuf = null;
   let levelBuf = null;
   let roundTimer = null;
   let roundRunning = false;
   let abortRef = null;
+  let ttsAbortRef = null;      // latest sentence fetch (barge-in aborts all via list too)
+  const ttsAbortAll = [];      // every in-flight /api/tts/stream fetch
   let lastSpeechAt = 0;        // global: last time speech was heard (any round)
   let lastLang = '';           // 'id' | 'en' — STT language hint
   let sending = false;         // polish+send in flight guard
@@ -670,6 +1274,30 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   let mutePendingSend = false; // hardware-mute pressed while a speech round runs
   let chatId = localStorage.getItem('voice.chatId') || '';
   let chatLock = null;
+  let chatVerifiedAt = 0;      // cache verified (chatId,wsId) to skip re-verify per turn
+  let chatVerifiedKey = '';
+
+  // ── Per-stage timing marks (debug-gated, zero UI cost when off) ──
+  // Enable: localStorage.setItem('voice.debug','1'). Shows
+  // [vad +0][run +…][delta +…][tts +…][audio +…] in feed-status + console.
+  const T_DEBUG = (function () { try { return localStorage.getItem('voice.debug') === '1'; } catch (_e) { return false; } })();
+  let tMarks = {};
+  function tReset() { tMarks = { t0: performance.now() }; }
+  function tMark(name) {
+    tMarks[name] = performance.now();
+    if (!T_DEBUG) return;
+    try {
+      const b = tMarks.t0 || tMarks[name];
+      const fmt = (k) => (tMarks[k] !== undefined ? Math.round(tMarks[k] - b) : null);
+      const parts = ['vad +' + (fmt('vad') ?? 0) + 'ms'];
+      if (fmt('run') !== null) parts.push('run +' + fmt('run') + 'ms');
+      if (fmt('delta') !== null) parts.push('delta +' + fmt('delta') + 'ms');
+      if (fmt('tts') !== null) parts.push('tts +' + fmt('tts') + 'ms');
+      if (fmt('audio') !== null) parts.push('audio +' + fmt('audio') + 'ms');
+      if (feedStatus) feedStatus.textContent = parts.join(' ');
+      if (typeof console !== 'undefined' && console.debug) console.debug('[Voice][t] ' + name + ' ' + parts.join(' '));
+    } catch (_e) {}
+  }
 
   const audio = new Audio();
   audio.volume = 1.0;
@@ -695,33 +1323,55 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     if (!animId) drawWave();
   }
 
+  // One analyser read per frame, shared by the orb bars, the footer bars and
+  // the voice-level glow on the screen preview.
+  function readMicRms() {
+    if (!analyser || !levelBuf) return 0;
+    analyser.getByteTimeDomainData(levelBuf);
+    let rms = 0;
+    for (let i = 0; i < levelBuf.length; i++) {
+      const sample = (levelBuf[i] - 128) / 128;
+      rms += sample * sample;
+    }
+    return Math.sqrt(rms / levelBuf.length);
+  }
+
+  let lastGlow = -1;
+  function applyVoiceGlow(loudness) {
+    if (!screenPanel) return;
+    const v = Math.round(Math.min(1, loudness) * 100) / 100;
+    if (v === lastGlow) return;
+    lastGlow = v;
+    screenPanel.style.setProperty('--voice-level', v.toFixed(2));
+  }
+  function resetVoiceGlow() {
+    if (lastGlow === 0) return;
+    lastGlow = 0;
+    if (screenPanel) screenPanel.style.setProperty('--voice-level', '0');
+  }
+
   // Live equalizer bars — heights follow the actual voice level
   function updateBars() {
     if (!barEls) return;
     let heights;
+    let loudness = 0;
     if (waveMode === 'listening' && analyser && freqBuf) {
       analyser.getByteFrequencyData(freqBuf);
-      let rms = 0;
-      if (levelBuf) {
-        analyser.getByteTimeDomainData(levelBuf);
-        for (let i = 0; i < levelBuf.length; i++) {
-          const sample = (levelBuf[i] - 128) / 128;
-          rms += sample * sample;
-        }
-        rms = Math.sqrt(rms / levelBuf.length);
-      }
+      loudness = readMicRms();
       // Use real microphone energy as the main driver. The frequency bins
       // only add a little variation between bars, so quiet input stays quiet
       // and a louder voice visibly lifts the whole group.
-      const loudness = Math.min(1, rms * 9);
+      const norm = Math.min(1, loudness * 9);
       heights = [0, 1, 2, 3].map((i) => {
         const v = freqBuf[Math.floor((i / 4) * freqBuf.length * 0.6)] / 255;
         const variation = 0.58 + v * 0.42;
-        return 4 + loudness * variation * 21;
+        return 4 + norm * variation * 21;
       });
+      applyVoiceGlow(loudness * 9);
     } else if (waveMode === 'thinking') {
       const t = Date.now() / 190;
       heights = [0, 1, 2, 3].map((i) => 5 + Math.abs(Math.sin(t + i * 1.1)) * 17);
+      resetVoiceGlow();
     } else if (waveMode === 'speaking') {
       heights = [0, 1, 2, 3].map((i) => {
         if (!fakeBars[20 + i]) fakeBars[20 + i] = 0.3;
@@ -730,59 +1380,72 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         fakeBars[20 + i] *= 0.9;
         return 4 + fakeBars[20 + i] * 19;
       });
+      resetVoiceGlow();
     } else {
       heights = [9, 7, 8, 7];
+      resetVoiceGlow();
     }
     for (let i = 0; i < barEls.length && i < 4; i++) {
       barEls[i].style.height = heights[i].toFixed(1) + 'px';
     }
+    // Footer mic on the screen panel mirrors the same levels (its own copy of
+    // the bar markup is separate from the orb's).
+    if (screenFootBars && screenActive()) {
+      for (let i = 0; i < screenFootBars.length && i < 4; i++) {
+        screenFootBars[i].style.height = heights[i].toFixed(1) + 'px';
+      }
+    }
   }
 
   function drawWave() {
-    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
     updateBars();
-    const W = wave.width, H = wave.height;
-    wctx.clearRect(0, 0, W, H);
-    const bars = 20;
-    const bw = W / bars;
+    // Screen mode hides the wave canvas — keep the RAF loop alive only for the
+    // footer bars / voice glow, skip all canvas work (was 60fps of dead repaints
+    // competing with STT + TTS on a CPU-only box).
+    if (!screenActive()) {
+      const W = wave.width, H = wave.height;
+      wctx.clearRect(0, 0, W, H);
+      const bars = 20;
+      const bw = W / bars;
 
-    const base = waveMode === 'listening' ? '159,193,240'
-      : waveMode === 'thinking' ? '195,179,232'
-      : waveMode === 'speaking' ? '155,225,230'
-      : '148,163,184';
-    const grad = wctx.createLinearGradient(0, 0, W, 0);
-    grad.addColorStop(0, 'rgba(' + base + ',0.2)');
-    grad.addColorStop(0.5, 'rgba(' + base + ',0.65)');
-    grad.addColorStop(1, 'rgba(' + base + ',0.2)');
-    wctx.fillStyle = grad;
+      const base = waveMode === 'listening' ? '159,193,240'
+        : waveMode === 'thinking' ? '195,179,232'
+        : waveMode === 'speaking' ? '155,225,230'
+        : '148,163,184';
+      const grad = wctx.createLinearGradient(0, 0, W, 0);
+      grad.addColorStop(0, 'rgba(' + base + ',0.2)');
+      grad.addColorStop(0.5, 'rgba(' + base + ',0.65)');
+      grad.addColorStop(1, 'rgba(' + base + ',0.2)');
+      wctx.fillStyle = grad;
 
-    const half = Math.ceil(bars / 2);
-    for (let i = 0; i < half; i++) {
-      let h = 0.06;
-      if (waveMode === 'listening' && analyser && freqBuf) {
-        analyser.getByteFrequencyData(freqBuf);
-        const v = freqBuf[Math.floor((i / half) * freqBuf.length * 0.55)] / 255;
-        h = Math.max(0.07, v * v);
-      } else if (waveMode === 'thinking') {
-        h = Math.max(0.09, Math.abs(Math.sin(Date.now() / 250 + i * 0.55)) * 0.9);
-      } else if (waveMode === 'speaking') {
-        if (!fakeBars[i]) fakeBars[i] = 0.12;
-        fakeBars[i] += (Math.random() - 0.5) * 0.55;
-        fakeBars[i] = Math.min(1, Math.max(0.07, fakeBars[i]));
-        fakeBars[i] *= 0.92;
-        h = fakeBars[i];
-      }
-      const bh = Math.max(3, h * (H - 4));
-      const x = i * bw + 1;
-      const w = Math.max(1.5, bw - 2.5);
-      wctx.beginPath();
-      wctx.roundRect(x, (H - bh) / 2, w, bh, 1.5);
-      wctx.fill();
-      if (i < bars / 2 - 1 || bars % 2 === 0) {
-        const xm = W - x - w;
+      const half = Math.ceil(bars / 2);
+      for (let i = 0; i < half; i++) {
+        let h = 0.06;
+        if (waveMode === 'listening' && analyser && freqBuf) {
+          analyser.getByteFrequencyData(freqBuf);
+          const v = freqBuf[Math.floor((i / half) * freqBuf.length * 0.55)] / 255;
+          h = Math.max(0.07, v * v);
+        } else if (waveMode === 'thinking') {
+          h = Math.max(0.09, Math.abs(Math.sin(Date.now() / 250 + i * 0.55)) * 0.9);
+        } else if (waveMode === 'speaking') {
+          if (!fakeBars[i]) fakeBars[i] = 0.12;
+          fakeBars[i] += (Math.random() - 0.5) * 0.55;
+          fakeBars[i] = Math.min(1, Math.max(0.07, fakeBars[i]));
+          fakeBars[i] *= 0.92;
+          h = fakeBars[i];
+        }
+        const bh = Math.max(3, h * (H - 4));
+        const x = i * bw + 1;
+        const w = Math.max(1.5, bw - 2.5);
         wctx.beginPath();
-        wctx.roundRect(xm, (H - bh) / 2, w, bh, 1.5);
+        wctx.roundRect(x, (H - bh) / 2, w, bh, 1.5);
         wctx.fill();
+        if (i < bars / 2 - 1 || bars % 2 === 0) {
+          const xm = W - x - w;
+          wctx.beginPath();
+          wctx.roundRect(xm, (H - bh) / 2, w, bh, 1.5);
+          wctx.fill();
+        }
       }
     }
     // Phase 8-V6: idle CPU guard — pause the animation loop when nothing is
@@ -805,8 +1468,15 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     void label.offsetWidth;
     label.classList.add('swap');
     if (extraText !== undefined) textEl.textContent = extraText;
-    document.body.className = 'state-' + cls;
+    // Preserve layout/mode classes — only state-* changes here (previously the
+    // whole className was replaced, which wiped is-menu-open/is-expanded).
+    const keep = ['is-menu-open', 'is-menu-closing', 'is-expanded', 'is-screen', 'is-screen-closing', 'is-demo'];
+    const kept = keep.filter((c) => document.body.classList.contains(c));
+    document.body.className = kept.concat(['state-' + cls]).join(' ');
     micBtn.className = 'bars-btn' + (micOn ? ' on' : '');
+    if (screenMic) screenMic.className = 'screen-mic' + (micOn ? ' on' : '');
+    lastStatusKey = cls;
+    syncScreenCaption();
     const stageKey = { listening: 'listening', thinking: 'thinking', processing: 'thinking', speaking: 'speaking' }[s];
     document.querySelectorAll('.stage').forEach((el) => el.classList.toggle('on', el.dataset.s === stageKey));
     startWave(s === 'muted' || s === 'idle' ? 'idle' : s);
@@ -817,10 +1487,14 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   function updateMicBtn() {
     micBtn.classList.toggle('on', micOn);
     micBtn.title = micOn ? 'Mute' : 'Unmute';
+    if (screenMic) {
+      screenMic.classList.toggle('on', micOn);
+      screenMic.title = micOn ? 'Mute' : 'Unmute';
+    }
   }
 
-  function showHint() { hintEl.style.display = ''; sendBtn.style.display = ''; }
-  function hideHint() { hintEl.style.display = 'none'; sendBtn.style.display = 'none'; }
+  function showHint() { hintEl.style.display = ''; sendBtn.style.display = ''; if (screenSend) screenSend.style.display = 'flex'; }
+  function hideHint() { hintEl.style.display = 'none'; sendBtn.style.display = 'none'; if (screenSend) screenSend.style.display = 'none'; }
 
   // Parse STT JSON defensively (handles both {text} and legacy [{text}, status] shapes)
   function extractTranscript(data) {
@@ -972,11 +1646,28 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     let lastSoundAt = Date.now();
     const startedAt = Date.now();
     let lastPeekText = '';
+    try { window.__lastPeekText = window.__lastPeekText || ''; } catch(_e){}
+    // WS push writes window.__lastPeekText; mirror it into this round's
+    // local so the skip-empty fast path and flush see WS transcripts.
+    const _wsMirrorTimer = setInterval(() => {
+      try {
+        const w = window.__lastPeekText || '';
+        if (w && w !== lastPeekText) {
+          lastPeekText = w;
+          accumulated = w;
+          setStatus('listening', w);
+          send('transcript', { text: w });
+          showHint();
+        }
+      } catch(_e){}
+    }, 150);
 
-    // Live transcript: poll /api/voice/peek so the user sees words appear
-    // as they speak (the "streaming input" feel).
+    // Live transcript: WS push is primary (see openVoiceWs); HTTP peek is the
+    // fallback when the socket is down. Tick 500ms so idle cost is ~2 req/s
+    // worst-case instead of ~3.3 req/s.
     let captureSelfHealAt = 0;
     const peekTimer = setInterval(async () => {
+      if (_voiceWs && _voiceWs.readyState === 1) return; // WS push active
       try {
         const r = await fetch(API + '/api/voice/peek');
         const d = await r.json();
@@ -998,7 +1689,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
           showHint();
         }
       } catch (_e) { /* ignore */ }
-    }, 300);
+    }, 500);
 
     const monitor = setInterval(() => {
       let level = 0;
@@ -1022,29 +1713,50 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         // interrupt (abort) only when TTS is speaking.
       }
       const elapsed = Date.now() - startedAt;
-      // End the round after 2.5s of quiet, or after the hard cap
+      // End the round after quiet gap, or after the hard cap. 60ms tick so
+      // silence detection lands within ~60ms of SEND_SILENCE_MS, not ~200ms.
       if (elapsed >= MAX_ROUND_MS || (elapsed >= MIN_ROUND_MS && Date.now() - lastSoundAt >= SEND_SILENCE_MS)) {
         clearInterval(monitor);
         clearInterval(peekTimer);
+        try { clearInterval(_wsMirrorTimer); } catch(_e){}
         finishRound();
       }
-    }, 200);
+    }, 60);
 
     async function finishRound() {
-      // No speech detected by browser VAD → still flush server capture
-      // (it may have heard something the browser meter missed).
+      // Fast path: browser VAD heard nothing AND the server stream has shown
+      // no rolling text → skip the POST /api/voice/send round-trip entirely
+      // (it would 422 anyway). The server may still have heard something the
+      // browser meter missed only when lastPeekText is non-empty.
+      if (!roundHasSpeech && !lastPeekText && !accumulated.trim()) {
+        return;
+      }
+      tReset();
+      tMark('vad');
+      // Screen mode: start the frame capture NOW so its JPEG encode + upload
+      // overlap with the STT flush below instead of blocking TTFB.
+      kickTurnFrameCapture();
       let t = '';
       try {
-        const r = await fetch(API + '/api/voice/send', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
-        });
-        const d = await r.json();
-        if (!r.ok || (d && d.error)) {
-          if (r.status !== 422) setStatus('error', String((d && d.error) || ('HTTP ' + r.status)).slice(0, 400));
-        } else {
-          t = d.text || '';
+        // Prefer WS flush (one live socket) over an extra HTTP POST, with
+        // HTTP fallback when the socket is down or the flush times out.
+        let viaWs = false;
+        if (_voiceWs && _voiceWs.readyState === 1) {
+          const wt = await wsFlushRound(1200);
+          if (typeof wt === 'string') { t = wt; viaWs = true; }
+        }
+        if (!viaWs) {
+          const r = await fetch(API + '/api/voice/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          const d = await r.json();
+          if (!r.ok || (d && d.error)) {
+            if (r.status !== 422) setStatus('error', String((d && d.error) || ('HTTP ' + r.status)).slice(0, 400));
+          } else {
+            t = d.text || '';
+          }
         }
       } catch (e) {
         console.error('[Voice] send failed', e);
@@ -1070,12 +1782,14 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       // Hands-free auto-send: if idle, start new LLM run; if LLM already
       // thinking, stream as steering (ChatGPT live) so breath+continue works.
       const pending = accumulated.trim();
+      if (!pending) turnFramePromise = null; // round produced nothing — drop the pending frame
       if (pending && !sending) {
         if (thinking) {
           // Stream incremental words to the running LLM + show immediately in chat
           const delta = pending;
           accumulated = '';
           hideHint();
+          turnFramePromise = null; // steering carries no attachment
           // Show in chat bubble immediately (transcript already did, but ensure)
           send('transcript', { text: delta });
           // Steer the running run — LLM will see it next iteration
@@ -1083,8 +1797,8 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
             fetch(API + '/api/steer', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ chat_id: chatId, message: delta })}).catch(()=>{});
           }
         } else {
-          // No active run — wait tiny debounce then start one (0.3s silence already, so 100ms extra is enough)
-          await sleep(100);
+          // No active run — silence gap already observed, so send immediately
+          // (the old extra 100ms debounce just added TTFB with no accuracy win).
           const text2 = accumulated.trim();
           if (text2 && !sending && !thinking) {
             accumulated = '';
@@ -1119,6 +1833,10 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         localStorage.setItem('voice.wsId', voiceWsId);
         localStorage.setItem('voice.wsPath', voiceWsPath);
         localStorage.setItem('voice.chatId', chatId);
+        updateMenuMode();
+        // Screen mode is a personal-workspace feature: leaving personal
+        // (or closing the panel) ends sharing instead of silently capturing.
+        if (screenActive() && !isPersonalChat()) exitScreenMode();
       }
     });
   }
@@ -1126,12 +1844,21 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   function ensureChat() {
     if (chatLock) return chatLock;
     chatLock = (async () => {
-      // 1) Known chat (IPC-synced or stored) — but VERIFY it still exists.
-      //    Stale chat ids silently drop messages on the backend.
+      // 1) Known chat (IPC-synced or stored) — VERIFY it still exists, but
+      //    cache the verification for 5min so consecutive voice turns skip
+      //    the serial re-verify round-trip before POST /api/run.
+      const verifiedKey = voiceWsId + '|' + chatId;
       if (chatId && voiceWsId) {
+        if (chatVerifiedKey === verifiedKey && Date.now() - chatVerifiedAt < 5 * 60 * 1000) {
+          return chatId;
+        }
         try {
           const check = await fetch(API + '/api/workspaces/' + encodeURIComponent(voiceWsId) + '/chats/' + encodeURIComponent(chatId));
-          if (check.ok) return chatId;
+          if (check.ok) {
+            chatVerifiedKey = verifiedKey;
+            chatVerifiedAt = Date.now();
+            return chatId;
+          }
         } catch (_e) { /* fall through */ }
       }
       // 2) Fresh resolution: the ACTIVE workspace synced from the main window
@@ -1163,28 +1890,27 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         chatId = (await createRes.json()).id;
       }
       localStorage.setItem('voice.chatId', chatId);
+      chatVerifiedKey = voiceWsId + '|' + chatId;
+      chatVerifiedAt = Date.now();
       return chatId;
     })();
     return chatLock;
   }
 
-  // Save the agent reply to the chat so it lands in history + memory context
-  async function persistReply(chat, reply) {
-    if (!voiceWsId || !chat || !reply) return;
-    try {
-      await fetch(API + '/api/workspaces/' + voiceWsId + '/chats/' + chat + '/messages', {
+  // Save the agent reply to the chat so it lands in history + memory context.
+  // Fire-and-forget by design: callers MUST NOT await this before starting
+  // TTS — persistence must never add to TTFB-audio.
+  function persistReply(chat, reply) {
+    if (!voiceWsId || !chat || !reply) return Promise.resolve();
+    // Phase 8-V2 fix: ALWAYS tell the main window the reply landed — the
+    // chat must refresh in real time. Send the event immediately; the POST
+    // itself runs in the background.
+    try { send('reply', { text: reply.slice(0, 500) }); } catch (_e) {}
+    return fetch(API + '/api/workspaces/' + voiceWsId + '/chats/' + chat + '/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ role: 'agent', content: reply }),
-      });
-    } catch (e) {
-      console.error('[Voice] failed to persist reply', e);
-    }
-    // Phase 8-V2 fix: ALWAYS tell the main window the reply landed — the
-    // chat must refresh in real time (navigating away/back was the only
-    // way to see it before because the per-sentence TTS path never sent
-    // the `reply` event).
-    send('reply', { text: reply.slice(0, 500) });
+      }).catch((e) => { console.error('[Voice] failed to persist reply', e); });
   }
 
   function progressFromState(s) {
@@ -1217,11 +1943,25 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   let menuClosingTimer = null;
   let lastLogLen = 0;
 
-  function resizeOverlay() {
+  function resizeOverlay(animate) {
     const menuVisible = menuOpen || menuClosing;
+    const morph = !!animate && !prefersReducedMotion();
+    // Screen mode owns the layout: the panel is fixed-size and the menu drops
+    // inside it (CSS), so opening the menu must not resize the window.
+    if (screenActive()) {
+      if (bridge && bridge.resize) bridge.resize(SCREEN_W, SCREEN_H, morph);
+      return;
+    }
+    // Menu height follows the visible items (a personal chat adds "Look at
+    // screen"): 3 items = 140 as before, 4 items = 174.
+    const menuItems = 3 + (isPersonalChat() ? 1 : 0);
     const w = expanded ? 400 : menuVisible ? 286 : 84;
-    const h = expanded ? 344 : menuVisible ? 140 : 84;
-    if (bridge && bridge.resize) bridge.resize(w, h);
+    const h = expanded ? 344 : menuVisible ? 38 + menuItems * 34 : 84;
+    if (bridge && bridge.resize) bridge.resize(w, h, morph);
+  }
+
+  function prefersReducedMotion() {
+    try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (_e) { return false; }
   }
 
   function finishMenuClose() {
@@ -1239,6 +1979,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       menuOpen = true;
       menuClosing = false;
       expanded = false;
+      if (screenPicker) screenPicker.classList.remove('open');
       expandBtn.classList.remove('expanded');
       feedWrap.style.display = 'none';
       document.body.classList.remove('is-expanded');
@@ -1278,6 +2019,510 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     feedWrap.style.display = on ? '' : 'none';
     resizeOverlay();
   }
+
+  // ── Look-at-screen mode ──────────────────────────────────────────────
+  // The compact orb morphs into a screen-share panel (Gemini-style). Sharing
+  // is explicit: entering the mode turns it on (or opens the source picker
+  // the first time); frames go to POST /api/vision/frame — one at each voice
+  // turn, plus server-requested captures from the agent's look_at_screen tool.
+  // Compact floating overlay (reference proportions): 300×232.
+  const SCREEN_W = 300;
+  const SCREEN_H = 232;
+  const SCREEN_SOURCE_KEY = 'voice.screenSourceId';
+  const GUEST_CHAT = '_personal';   // screen mode is a personal-workspace feature
+  let voiceMode = 'voice';          // 'voice' | 'screen'
+  let screenSharing = 'off';        // 'off' | 'on' | 'continuous'
+  let screenStream = null;
+  let screenSourceId = localStorage.getItem(SCREEN_SOURCE_KEY) || '';
+  let screenSourceLabel = '';
+  let screenTimer = null;
+  let screenExitTimer = null;
+  let screenBusy = false;
+  let lastStatusKey = 'idle';
+
+  function isPersonalChat() { return voiceWsId === GUEST_CHAT; }
+  function screenActive() { return voiceMode === 'screen'; }
+
+  const ROLE_BY_STATUS = {
+    listening: 'YOU', thinking: 'THINKING', processing: 'THINKING',
+    speaking: 'ANSWER', error: 'ERROR', muted: 'MUTED', idle: 'READING',
+  };
+
+  const STATUS_BY_KEY = {
+    listening: 'Listening…', thinking: 'Thinking…', processing: 'Thinking…',
+    speaking: 'Answering', error: 'Error', muted: 'Muted', idle: 'Voice',
+  };
+
+  function syncScreenCaption() {
+    if (!screenCaptionText) return;
+    try {
+      screenCaptionRole.textContent = ROLE_BY_STATUS[lastStatusKey] || 'READING';
+      if (screenStatusEl) screenStatusEl.textContent = STATUS_BY_KEY[lastStatusKey] || 'Voice';
+      const t = (textEl.textContent || '').trim();
+      if (t && t !== screenCaptionText.textContent) {
+        screenCaptionText.textContent = t;
+        screenCaptionText.classList.remove('swap');
+        void screenCaptionText.offsetWidth;
+        screenCaptionText.classList.add('swap');
+      }
+    } catch (_e) {}
+  }
+
+  // Source chip: mirrors the reference (one chip per shared source). Body
+  // click opens the live preview; × stops sharing but stays in the panel.
+  function updateScreenChip() {
+    try {
+      const hasSource = !!(screenSourceLabel || screenSourceId);
+      if (screenChips) screenChips.style.display = hasSource ? '' : 'none';
+      if (screenChipName) screenChipName.textContent = screenSourceLabel || 'Screen';
+      if (screenChip) screenChip.classList.toggle('paused', screenSharing === 'off');
+      if (screenPopName) screenPopName.textContent = screenSourceLabel || 'Screen';
+    } catch (_e) {}
+  }
+
+  function togglePreviewPop(open) {
+    if (!screenPreviewPop) return;
+    const show = open === undefined ? !screenPreviewPop.classList.contains('open') : !!open;
+    screenPreviewPop.classList.toggle('open', show);
+    screenPreviewPop.setAttribute('aria-hidden', show ? 'false' : 'true');
+  }
+
+  // Preview states (B9): live | starting | paused | off | error.
+  function setPreviewState(state, text) {
+    if (!screenPreviewState) return;
+    screenPreview.classList.toggle('live', state === 'live');
+    screenPreviewState.style.display = state === 'live' ? 'none' : 'flex';
+    if (screenSpinner) screenSpinner.style.display = state === 'starting' ? '' : 'none';
+    if (text !== undefined && screenPreviewEmpty) screenPreviewEmpty.textContent = text;
+    const actionable = state === 'off' || state === 'paused' || state === 'error';
+    if (screenPreviewAction) {
+      screenPreviewAction.style.display = actionable ? '' : 'none';
+      screenPreviewAction.textContent = state === 'paused' ? 'Resume' : (state === 'error' ? 'Try again' : 'Share screen');
+      screenPreviewAction.dataset.state = state;
+    }
+    // Footer badge: LIVE (red pulse) / CONT (blue) / OFF (grey).
+    if (screenBadge) {
+      const live = state === 'live';
+      const cont = live && screenSharing === 'continuous';
+      screenBadge.textContent = cont ? 'CONT' : (live ? 'LIVE' : 'OFF');
+      screenBadge.classList.toggle('live', live && !cont);
+      screenBadge.classList.toggle('cont', cont);
+    }
+    updateScreenChip();
+  }
+
+  function updateMenuMode() {
+    const personal = isPersonalChat();
+    const inScreen = screenActive();
+    if (menuScreen) {
+      menuScreen.style.display = personal ? '' : 'none';
+      menuScreen.querySelector('span').textContent = inScreen ? 'Voice mode' : 'Look at screen';
+    }
+    if (menuShare) {
+      menuShare.style.display = inScreen ? '' : 'none';
+      menuShare.querySelector('span').textContent = screenSharing === 'off' ? 'Resume sharing' : 'Pause sharing';
+    }
+    if (menuContinuous) {
+      menuContinuous.style.display = inScreen ? '' : 'none';
+      menuContinuous.querySelector('span').textContent = screenSharing === 'continuous' ? 'Continuous look: on' : 'Continuous look: off';
+    }
+  }
+
+  async function enterScreenMode() {
+    if (screenActive()) return;
+    showScreenLayout();
+    if (!bridge) return; // demo / browser preview
+    if (!screenSourceId) {
+      openScreenPicker(true);
+    } else {
+      setSharingMode('on');
+    }
+  }
+
+  // Layout-only switch (shared by the menu entry and agent-initiated capture):
+  // window + panel morph, no sharing decisions. Cancels any menu collapse
+  // instantly so the 1.2s close animation never plays over the panel entrance.
+  function showScreenLayout() {
+    clearTimeout(screenExitTimer);
+    screenExitTimer = null;
+    cancelMenuInstant();
+    if (expanded) setExpanded(false);
+    voiceMode = 'screen';
+    document.body.classList.remove('is-screen-closing');
+    document.body.classList.add('is-screen');
+    updateMenuMode();
+    resizeOverlay(true);
+    syncScreenCaption();
+  }
+
+  function cancelMenuInstant() {
+    clearTimeout(menuClosingTimer);
+    menuClosingTimer = null;
+    menuOpen = false;
+    menuClosing = false;
+    menuBtn.classList.remove('active');
+    menuBtn.setAttribute('aria-expanded', 'false');
+    menuBtn.title = 'Open voice controls';
+    document.body.classList.remove('is-menu-open', 'is-menu-closing');
+    menuPanel.setAttribute('aria-hidden', 'true');
+  }
+
+  function exitScreenMode() {
+    if (!screenActive()) return;
+    stopScreenShare();
+    togglePreviewPop(false);
+    voiceMode = 'voice';
+    document.body.classList.add('is-screen-closing');
+    updateMenuMode();
+    // One continuous motion: the window tween (260ms) and the panel fade
+    // (280ms) run together while the orb fades back in (0.2s base transition).
+    resizeOverlay(true);
+    clearTimeout(screenExitTimer);
+    screenExitTimer = setTimeout(() => {
+      screenExitTimer = null;
+      document.body.classList.remove('is-screen', 'is-screen-closing');
+      updateMenuMode();
+    }, 260);
+  }
+
+  async function setSharingMode(mode) {
+    if (mode === 'off') {
+      stopScreenShare('pause');
+      updateMenuMode();
+      return true;
+    }
+    if (!screenStream) {
+      const ok = await startScreenShare();
+      if (!ok) return false;
+    }
+    screenSharing = mode;
+    setScreenTimer();
+    // Refresh badge/chip (e.g. LIVE -> CONT) without touching the preview.
+    if (screenStream) setPreviewState('live');
+    updateMenuMode();
+    broadcastScreenState();
+    return true;
+  }
+
+  async function startScreenShare(sourceId) {
+    if (screenStream) return true;
+    if (!bridge || !bridge.selectScreenSource || !navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setPreviewState('error', 'Screen sharing needs the desktop app');
+      return false;
+    }
+    if (sourceId !== undefined && sourceId !== null) {
+      screenSourceId = sourceId || '';
+      try {
+        if (screenSourceId) localStorage.setItem(SCREEN_SOURCE_KEY, screenSourceId);
+        else localStorage.removeItem(SCREEN_SOURCE_KEY);
+      } catch (_e) {}
+    }
+    screenBusy = true;
+    setPreviewState('starting', 'Starting screen capture…');
+    try {
+      let selName = '';
+      try {
+        // One enumeration: the main process resolves the target (explicit pick
+        // or primary screen) AND returns its label — no second lookup.
+        const sel = await bridge.selectScreenSource(screenSourceId);
+        if (sel && sel.ok) {
+          screenSourceId = sel.id;
+          selName = sel.name || '';
+        }
+      } catch (_e) {}
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5 }, audio: false });
+      screenStream = stream;
+      screenVideo.srcObject = stream;
+      stream.getVideoTracks().forEach((track) => {
+        track.addEventListener('ended', () => stopScreenShare('ended'));
+      });
+      if (bridge.setScreenProtection) bridge.setScreenProtection(true);
+      screenSharing = 'on';
+      setPreviewState('live');
+      // Give the compositor a beat so the first capture is a real frame, not black.
+      await new Promise((r) => setTimeout(r, 250));
+      if (selName) {
+        screenSourceLabel = selName;
+        updateScreenChip();
+        broadcastScreenState();
+      } else {
+        resolveScreenSourceLabel();
+      }
+      setScreenTimer();
+      broadcastScreenState();
+      return true;
+    } catch (e) {
+      console.error('[Voice] screen share failed', e);
+      screenSharing = 'off';
+      setPreviewState('error', 'Screen sharing was not started');
+      screenCaptionText.textContent = 'Could not start screen sharing.';
+      broadcastScreenState();
+      return false;
+    } finally {
+      screenBusy = false;
+    }
+  }
+
+  function stopScreenShare(reason) {
+    clearScreenTimer();
+    if (screenStream) {
+      try { screenStream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
+      screenStream = null;
+    }
+    try { screenVideo.srcObject = null; } catch (_e) {}
+    // State first: setPreviewState/updateScreenChip read screenSharing.
+    screenSharing = 'off';
+    setPreviewState('off', reason === 'ended'
+      ? 'Sharing stopped'
+      : (reason === 'pause' ? 'Paused — the agent can’t see your screen' : 'No screen shared'));
+    if (bridge && bridge.setScreenProtection) bridge.setScreenProtection(false);
+    lastFrameHash = '';
+    lastFrameAttachment = null;
+    turnFramePromise = null;
+    broadcastScreenState();
+  }
+
+  function setScreenTimer() {
+    clearScreenTimer();
+    if (screenSharing === 'continuous' && screenStream) {
+      screenTimer = setInterval(() => { uploadScreenFrame('continuous'); }, 5000);
+    }
+  }
+
+  function clearScreenTimer() {
+    if (screenTimer) { clearInterval(screenTimer); screenTimer = null; }
+  }
+
+  async function resolveScreenSourceLabel() {
+    try {
+      const list = (bridge && bridge.listScreenSources) ? await bridge.listScreenSources() : [];
+      const match = (list || []).find((s) => s.id === screenSourceId);
+      screenSourceLabel = match ? match.name : 'Entire screen';
+    } catch (_e) {
+      screenSourceLabel = 'Entire screen';
+    }
+    updateScreenChip();
+    broadcastScreenState();
+  }
+
+  function ensureVideoReady(timeoutMs) {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      const tick = () => {
+        if (screenVideo && screenVideo.readyState >= 2 && screenVideo.videoWidth) return resolve(true);
+        if (Date.now() - t0 > (timeoutMs || 2000)) return resolve(false);
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
+  }
+
+  async function screenCaptureJpeg() {
+    if (!screenStream) return null;
+    if (!(await ensureVideoReady(2000))) return null;
+    const vw = screenVideo.videoWidth;
+    const vh = screenVideo.videoHeight;
+    if (!vw || !vh) return null;
+    const scale = Math.min(1, 1280 / vw);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(vw * scale));
+    canvas.height = Math.max(1, Math.round(vh * scale));
+    canvas.getContext('2d').drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+    const url = canvas.toDataURL('image/jpeg', 0.72);
+    return url.indexOf(',') >= 0 ? url.split(',')[1] : null;
+  }
+
+  async function uploadScreenFrame(label, reqId) {
+    const b64 = await screenCaptureJpeg();
+    if (!b64) return null;
+    // Identical static screen: reuse the previous attachment instead of
+    // re-uploading + re-writing the same 80KB JPEG. Explicit tool captures
+    // (reqId) always upload — the server resolves the request from the upload.
+    const isContinuous = label === 'continuous';
+    const hash = (!isContinuous && !reqId) ? cheapScreenHash(b64) : '';
+    if (hash && hash === lastFrameHash && lastFrameAttachment) {
+      return lastFrameAttachment;
+    }
+    try {
+      const resp = await fetch(API + '/api/vision/frame', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_b64: b64,
+          mime: 'image/jpeg',
+          chat_id: chatId || '',
+          label: label || 'turn',
+          source: screenSourceLabel || '',
+          req_id: reqId || '',
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + resp.status));
+      const attachment = data.attachment || null;
+      if (hash && attachment) {
+        lastFrameHash = hash;
+        lastFrameAttachment = attachment;
+      }
+      return attachment;
+    } catch (e) {
+      console.error('[Voice] screen frame upload failed', e);
+      return null;
+    }
+  }
+
+  // Sampled FNV-1a (fast, collision-resistant enough for frame dedupe).
+  let lastFrameHash = '';
+  let lastFrameAttachment = null;
+  function cheapScreenHash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i += 31) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(36) + ':' + str.length;
+  }
+
+  // Fresh frame the moment a voice turn ends (see sendToPipeline).
+  async function captureTurnFrame() {
+    if (!screenActive() || screenSharing === 'off') return null;
+    return uploadScreenFrame('turn');
+  }
+
+  // Round-end kick: capture overlaps the STT flush; sendToPipeline awaits it.
+  let turnFramePromise = null;
+  function kickTurnFrameCapture() {
+    if (turnFramePromise) return;
+    if (thinking || !screenActive() || screenSharing === 'off') return;
+    turnFramePromise = captureTurnFrame().catch(() => null);
+  }
+
+  function broadcastScreenState() {
+    try {
+      if (_voiceWs && _voiceWs.readyState === 1) {
+        _voiceWs.send(JSON.stringify({
+          type: 'screen-state',
+          sharing: screenSharing !== 'off',
+          mode: screenSharing,
+          source: screenSourceLabel || '',
+        }));
+      }
+    } catch (_e) {}
+  }
+
+  function sendScreenAck(reqId, ok, error, extra) {
+    try {
+      if (_voiceWs && _voiceWs.readyState === 1) {
+        _voiceWs.send(JSON.stringify(Object.assign({
+          type: 'screen-ack', req_id: reqId, ok: !!ok, error: error || '',
+        }, extra || {})));
+      }
+    } catch (_e) {}
+  }
+
+  // Agent tool request: look_at_screen → capture now (turns sharing on if off,
+  // and shows the panel so the user sees what is being shared).
+  async function onScreenCaptureRequest(reqId) {
+    if (!screenActive()) showScreenLayout();
+    if (!screenStream || screenSharing === 'off') {
+      const ok = await setSharingMode('on');
+      if (!ok) { sendScreenAck(reqId, false, 'Screen sharing is not available'); return; }
+    }
+    const att = await uploadScreenFrame('tool', reqId);
+    if (!att) sendScreenAck(reqId, false, 'Frame capture failed');
+  }
+
+  // Agent tool request: set_screen_share → switch mode, then ack.
+  async function onScreenModeRequest(reqId, mode) {
+    const wanted = ['on', 'off', 'continuous'].indexOf(mode) >= 0 ? mode : 'on';
+    const ok = await setSharingMode(wanted);
+    if (ok) sendScreenAck(reqId, true, '', { mode: screenSharing, sharing: screenSharing !== 'off' });
+    else sendScreenAck(reqId, false, 'Could not switch screen sharing');
+  }
+
+  // ── Source picker ──
+  async function openScreenPicker(firstTime) {
+    if (!screenPicker) return;
+    togglePreviewPop(false);
+    screenPicker.dataset.first = firstTime ? '1' : '';
+    screenPicker.classList.add('open');
+    screenPickerGrid.innerHTML = '<div class="screen-picker-empty">Looking for screens…</div>';
+    let list = [];
+    try {
+      list = (bridge && bridge.listScreenSources) ? await bridge.listScreenSources() : [];
+    } catch (_e) { list = []; }
+    renderScreenPicker(list);
+  }
+
+  function renderScreenPicker(list) {
+    const ordered = (list || []).slice().sort((a, b) => (a.kind === 'screen' ? 0 : 1) - (b.kind === 'screen' ? 0 : 1));
+    screenPickerGrid.innerHTML = '';
+    if (!ordered.length) {
+      const empty = document.createElement('div');
+      empty.className = 'screen-picker-empty';
+      empty.textContent = 'No screens or windows found';
+      screenPickerGrid.appendChild(empty);
+      return;
+    }
+    ordered.forEach((source, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'screen-picker-item' + (source.id === screenSourceId ? ' active' : '');
+      btn.style.animationDelay = Math.min(idx, 10) * 35 + 'ms';
+      if (source.thumbnail) {
+        const img = document.createElement('img');
+        img.src = source.thumbnail;
+        img.alt = '';
+        btn.appendChild(img);
+      }
+      const cap = document.createElement('span');
+      cap.textContent = (source.kind === 'screen' ? 'Screen · ' : 'Window · ') + source.name;
+      btn.appendChild(cap);
+      btn.addEventListener('click', async () => {
+        screenPicker.classList.remove('open');
+        if (screenStream) stopScreenShare();
+        await startScreenShare(source.id);
+      });
+      screenPickerGrid.appendChild(btn);
+    });
+  }
+
+  function closeScreenPicker() {
+    if (!screenPicker) return;
+    const firstTime = screenPicker.dataset.first === '1';
+    screenPicker.dataset.first = '';
+    screenPicker.classList.remove('open');
+    // Entering screen mode implies sharing: closing the first-time picker
+    // falls back to the primary screen instead of leaving a dead panel.
+    if (firstTime && screenActive() && !screenStream) setSharingMode('on');
+  }
+
+  // Design-QA only (?demo=screen): paint a mock document into the preview so
+  // the panel can be screenshotted without a real capture stream.
+  function paintDemoPreview() {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 640; c.height = 360;
+      const x = c.getContext('2d');
+      const g = x.createLinearGradient(0, 0, 0, 360);
+      g.addColorStop(0, '#1b2030');
+      g.addColorStop(1, '#0e121c');
+      x.fillStyle = g;
+      x.fillRect(0, 0, 640, 360);
+      x.fillStyle = '#f4f6fb';
+      x.fillRect(48, 28, 544, 304);
+      x.fillStyle = '#c7cede';
+      for (let i = 0; i < 12; i++) x.fillRect(76, 84 + i * 19, i % 4 === 3 ? 300 : 488, 6);
+      x.fillStyle = 'rgba(122, 167, 255, 0.35)';
+      x.fillRect(76, 122, 420, 14);
+      x.fillStyle = '#2b3348';
+      x.font = '600 15px Segoe UI';
+      x.fillText('Attention Is All You Need', 76, 62);
+      screenPreview.style.backgroundImage = 'url(' + c.toDataURL('image/png') + ')';
+      setPreviewState('live');
+    } catch (_e) {}
+  }
+
+  updateMenuMode();
 
   function feedLine(text, kind) {
     if (!feed) return;
@@ -1329,14 +2574,35 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     let streamReplyText = '';
     let spokenUpTo = 0;
     let incrementalMuted = false;
-    // Helper for true streaming: accumulate completed sentences into a single
-    // gapless buffer spoken once at the end (harness-style single stream).
-    // Phase 8-V6: one /api/tts/stream call per reply — no concurrent TTS.
-    // scheduled back-to-back), so the user hears the FIRST sentence while the
-    // agent is still working on the rest — no more "silence until done".
+    // True incremental speech: each settled sentence fires its own
+    // /api/tts/stream call immediately (pipelined). The backend worker stays
+    // serial (Pocket is NOT thread-safe) so sentences synthesize in FIFO
+    // order; the shared ttsNextTime scheduler keeps them gapless. First
+    // sentence audio starts while the LLM is still streaming the rest.
+    const ttsFlights = [];
+    let ttsSentences = 0;
+    function queueSentenceTts(clean) {
+      const useVoice = voiceForLanguage(detectLanguage(clean));
+      ttsSentences++;
+      if (!incrementalMuted) {
+        incrementalMuted = true;
+        const ctx = ensureAuCtx();
+        if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
+        speaking = true;
+        setStatus('speaking', clean.slice(0,120));
+      }
+      try {
+        const p = speakStreamed(clean, useVoice).catch((e) => {
+          console.warn('[Voice] sentence TTS failed, continuing', e);
+          return false;
+        });
+        ttsFlights.push(p);
+      } catch (e) {
+        console.warn('[Voice] sentence TTS threw', e);
+      }
+    }
     function maybeSpeakIncremental(forceFlush = false) {
       if (!streamReplyText || spokenUpTo >= streamReplyText.length) return;
-      const now = Date.now();
       const unsent = streamReplyText.slice(spokenUpTo);
       // Find sentence boundary: ". ", "! ", "? " or end
       let boundary = -1;
@@ -1347,15 +2613,6 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         const sp = unsent.lastIndexOf(' ', 150);
         boundary = sp > 40 ? sp : 150;
       }
-      // Hold the boundary briefly so mid-sentence pauses don't split a word.
-      if (boundary !== -1 && !forceFlush) {
-        const hold = 350; // ms — enough for normal inter-word pauses, short enough to feel live
-        if (now - ttsHeldUntil > 0 && boundary < unsent.length - 2) {
-          // Only speak if the sentence is "settled" — we haven't seen new text
-          // for `hold` ms OR the boundary is followed by substantial content.
-          ttsHeldUntil = now;
-        }
-      }
       if (boundary === -1) return;
       const sentence = unsent.slice(0, boundary).trim();
       if (!sentence) { spokenUpTo += boundary + 1; return; }
@@ -1364,19 +2621,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       if (isGarbage(clean)) { spokenUpTo += boundary + 1; return; }
       spokenUpTo += boundary + 1;
       while (spokenUpTo < streamReplyText.length && streamReplyText[spokenUpTo] === ' ') spokenUpTo++;
-      if (!incrementalMuted) {
-        incrementalMuted = true;
-        const ctx = ensureTtsCtx();
-        if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
-        speaking = true;
-        setStatus('speaking', clean.slice(0,120));
-      }
-      // Phase 8-V6: ONE stream per reply — accumulate all sentences, then
-      // speak them through a single speakStreamed call (harness-style gapless
-      // single buffer). No per-sentence HTTP → no concurrent TTS calls on the
-      // (non-thread-safe) model, no choppiness, no CPU spikes.
-      if (!incrementalTtsBuffer) incrementalTtsBuffer = '';
-      incrementalTtsBuffer += ' ' + clean;
+      queueSentenceTts(clean);
     }
     try {
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1409,6 +2654,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
                   textEl.textContent = ('… ' + parsed.text.slice(-100)).slice(-120);
                   requestAnimationFrame(refreshMarquee);
                 } else {
+                  if (tMarks.delta === undefined) tMark('delta');
                   streamReplyText += parsed.text;
                   textEl.textContent = streamReplyText.slice(-120);
                   requestAnimationFrame(refreshMarquee);
@@ -1450,38 +2696,33 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       });
       const reply = ((lastState && lastState.outputs && lastState.outputs.agent_report) || '').trim();
       if (reply) {
-        if (feedStatus) feedStatus.textContent = 'answering';
+        if (!T_DEBUG && feedStatus) feedStatus.textContent = 'answering';
         feedMsg('Assistant: ' + reply.slice(0, 200), 'agent');
-        await persistReply(chat, reply);
-        if (incrementalMuted || spokenUpTo < streamReplyText.length || incrementalTtsBuffer) {
-          // Phase 8-V6: flush the accumulated reply through ONE gapless
-          // speakStreamed call (single stream, no concurrent TTS), then wait
-          // for it to finish before returning to listening.
-          maybeSpeakIncremental(true);
-          if (incrementalTtsBuffer && incrementalTtsBuffer.trim()) {
-            const buf = incrementalTtsBuffer.trim();
-            incrementalTtsBuffer = '';
-            const useVoice = voiceForLanguage(detectLanguage(buf));
-            const ok = await speakStreamed(buf, useVoice);
-            if (!ok) {
-              const resp = await fetch(API + '/api/tts', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: buf, voice: useVoice, engine: 'pocket' }) });
-              if (resp.ok) {
-                const blob = await resp.blob();
-                const url = URL.createObjectURL(blob);
-                audio.src = url;
-                await audio.play();
-                await new Promise((res) => { audio.onended = res; audio.onpause = () => { if (!speaking) res(); }; });
-              }
-            }
-          }
+        persistReply(chat, reply); // fire-and-forget: never block TTFB-audio
+        // Flush any trailing fragment, then wait for pipelined sentences.
+        maybeSpeakIncremental(true);
+        if (ttsFlights.length) {
+          try { await Promise.allSettled(ttsFlights); } catch (_e) {}
           speaking = false;
           incrementalMuted = false;
+          incrementalTtsBuffer = '';
           if (micOn) setStatus('listening', accumulated || 'Listening');
           return true;
         } else {
-          // No incremental text was spoken (reply arrived instantly) — full reply
-          setStatus('processing', 'Preparing voice…');
-          await speak(reply);
+          // No incremental text was spoken (reply arrived with no streamable
+          // deltas, or deltas had no sentence boundary) — full reply fallback.
+          // Prefer the final agent_report text (canonical) over deltas.
+          const tail = reply.slice(spokenUpTo).trim() || reply;
+          if (ttsSentences === 0) {
+            setStatus('processing', 'Preparing voice…');
+            await speak(tail);
+          } else {
+            // Sentences already spoke the streamed text; speak any remainder
+            // the delta stream missed (report vs deltas skew).
+            const missing = tail.length > streamReplyText.length + 20 ? tail.slice(streamReplyText.length).trim() : '';
+            if (missing) await speak(missing);
+            else { speaking = false; incrementalMuted = false; if (micOn) setStatus('listening', accumulated || 'Listening'); }
+          }
           return true;
         }
       }
@@ -1533,6 +2774,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     }
     send('pipeline-start', { workspaceId: voiceWsId, chatId: chat, prompt: text });
     abortRef = new AbortController();
+    tMark('run');
     // Watchdog: if the run stalls (no done frame within RUN_TIMEOUT_MS), bail
     // out of the thinking state so the overlay never hangs forever.
     let runSettled = false;
@@ -1547,6 +2789,17 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
     }, RUN_TIMEOUT_MS);
     try {
+      // Fresh screen frame at turn end (screen mode, sharing on). The frame
+      // rides /api/run attachments → vision channel; runs.py keeps screenFrame
+      // entries out of the persisted chat log.
+      let _attachments = [];
+      try {
+        // Prefer the frame captured at round-end (overlapped with STT flush).
+        const pendingFrame = turnFramePromise;
+        turnFramePromise = null;
+        const frame = pendingFrame ? await pendingFrame : await captureTurnFrame();
+        if (frame) _attachments = [frame];
+      } catch (_e) {}
       const resp = await fetch(API + '/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1556,7 +2809,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
           temperature: voiceTemp,
           workspace_path: (voiceWsPath !== null && voiceWsPath !== undefined) ? voiceWsPath : '',
           chat_id: chat,
-          attachments: [],
+          attachments: _attachments,
           workspace_kind: voiceWsId === '_house' ? 'house' : (voiceWsId === '_personal' ? 'personal' : 'general'),
         }),
         signal: abortRef.signal,
@@ -1581,26 +2834,31 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       .slice(0, 800);
   }
 
-  // Gapless TTS state — Web Audio scheduling + barge-in truncation
-  let ttsCtx = null;
+  // Single shared AudioContext (24kHz = Pocket TTS native) for BOTH the mic
+  // analyser chain and TTS playback — one realtime thread instead of two.
+  // The mic stream is resampled down by Web Audio automatically (inaudible
+  // and irrelevant for a level meter); TTS buffers stay native (no resample
+  // cost). Never closed on mic-off — mic nodes are just disconnected; the
+  // context lives for the overlay lifetime. Gapless TTS state lives here too.
+  let auCtx = null;
   let ttsNextTime = 0;
   const ttsSources = new Set();
   let _ttsStartAt = 0; // AudioContext time when current utterance started (for played_ms)
 
-  function ensureTtsCtx() {
-    if (!ttsCtx || ttsCtx.state === 'closed') {
-      try { ttsCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 }); }
-      catch (_e) { ttsCtx = new (window.AudioContext || window.webkitAudioContext)(); }
-      ttsNextTime = ttsCtx.currentTime;
+  function ensureAuCtx() {
+    if (!auCtx || auCtx.state === 'closed') {
+      try { auCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 }); }
+      catch (_e) { auCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+      ttsNextTime = auCtx.currentTime;
     }
-    if (ttsCtx.state === 'suspended') ttsCtx.resume().catch(() => {});
-    return ttsCtx;
+    if (auCtx.state === 'suspended') auCtx.resume().catch(() => {});
+    return auCtx;
   }
 
   function _ttsPlayedMs() {
     try {
-      if (!_ttsStartAt || !ttsCtx) return 0;
-      const ms = Math.max(0, (ttsCtx.currentTime - _ttsStartAt) * 1000);
+      if (!_ttsStartAt || !auCtx) return 0;
+      const ms = Math.max(0, (auCtx.currentTime - _ttsStartAt) * 1000);
       return Math.round(ms);
     } catch (_e) { return 0; }
   }
@@ -1611,6 +2869,9 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     if (wasSpeaking) playedMs = _ttsPlayedMs();
     speaking = false;
     incrementalTtsBuffer = '';
+    // Abort in-flight TTS fetches so their late chunks never schedule.
+    for (const c of ttsAbortAll.splice(0)) { try { c.abort(); } catch (_e) {} }
+    if (ttsAbortRef) { try { ttsAbortRef.abort(); } catch (_e) {} ttsAbortRef = null; }
     // Stop Web Audio scheduled sources
     for (const s of [...ttsSources]) {
       try { s.stop(); s.disconnect(); } catch (_e) {}
@@ -1618,17 +2879,27 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     ttsSources.clear();
     ttsNextTime = 0;
     _ttsStartAt = 0;
-    if (ttsCtx && ttsCtx.state === 'suspended') ttsCtx.resume().catch(()=>{});
+    if (auCtx && auCtx.state === 'suspended') auCtx.resume().catch(()=>{});
     audio.pause();
     if (audio.src) { try { URL.revokeObjectURL(audio.src); } catch(_e){} }
     audio.removeAttribute('src');
     try { audio.load(); } catch(_e){}
-    // Report truncation to backend so history can carry interrupted_at_ms
+    // Barge-in fast path: cancel backend synthesis (queued + in-flight) and
+    // report truncation for history. Fire-and-forget — never block the mic.
+    fetch(API + '/api/tts/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }).catch(() => {});
     if (wasSpeaking && playedMs > 0) {
       fetch(API + '/api/voice/interrupt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ played_ms: playedMs }),
+      }).catch(() => {});
+    } else {
+      // Even without audible playback, purge any queued synthesis so the
+      // next utterance doesn't wait behind a stale one.
+      fetch(API + '/api/voice/interrupt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ played_ms: 0 }),
       }).catch(() => {});
     }
   }
@@ -1638,7 +2909,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     if (!clean) return;
     lastReply = clean;
     speaking = true;
-    _ttsStartAt = ensureTtsCtx().currentTime;
+    _ttsStartAt = ensureAuCtx().currentTime;
     setStatus('processing', 'Preparing voice…');
     const useVoice = voiceForLanguage(detectLanguage(clean));
     // Phase 8-V3: full duplex — the browser mic has AEC on (echoCancellation/
@@ -1677,23 +2948,88 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
 
   // Stream TTS chunks (SSE /api/tts/stream) gapless via Web Audio.
   // First audio ~0.2-0.5s; chunks concat without gaps unlike HTMLAudio per-chunk.
-  // Pre-buffer lead: schedule first chunk slightly ahead so subsequent chunks
-  // have time to decode — eliminates jitter gaps that cause "choppy".
+  // pcm16 frames build an AudioBuffer directly (no decodeAudioData, no WAV
+  // header); wav frames keep the legacy decode path. Pre-buffer lead on the
+  // first scheduled buffer hides decode jitter.
   function speakStreamed(text, useVoice) {
     return new Promise((resolve) => {
       let done = false;
       let streamFailed = false;
       let pendingDecodes = 0;
       let startedScheduling = false;
-      const ctx = ensureTtsCtx();
+      let firstAudioMarked = false;
+      let myLive = 0; // this sentence's scheduled-but-unended buffers (shared set is global for barge-in kill)
+      const ctx = ensureAuCtx();
       ttsNextTime = Math.max(ttsNextTime, ctx.currentTime) || ctx.currentTime;
       setStatus('speaking', text.slice(0, 120) + (text.length > 120 ? '…' : ''));
       if (!_ttsStartAt) _ttsStartAt = ctx.currentTime;
+      const myAbort = new AbortController();
+      ttsAbortRef = myAbort;
+      try { ttsAbortAll.push(myAbort); } catch(_e){}
+      if (tMarks.tts === undefined) tMark('tts');
+      // Safety: a hung SSE stream must never wedge the overlay in speaking.
+      setTimeout(() => {
+        if (!done) { streamFailed = true; done = true; checkDone(); }
+      }, 60000);
+
+      function markFirstAudio() {
+        if (!firstAudioMarked) { firstAudioMarked = true; tMark('audio'); }
+      }
 
       function checkDone() {
-        if (done && pendingDecodes === 0 && ttsSources.size === 0) {
+        if (done && pendingDecodes === 0 && myLive <= 0) {
+          try {
+            const i = ttsAbortAll.indexOf(myAbort);
+            if (i >= 0) ttsAbortAll.splice(i, 1);
+          } catch(_e){}
           resolve(!streamFailed);
         }
+      }
+
+      function schedulePcm16(b64, sr) {
+        // Raw int16 mono @sr — same samples the WAV path carries, minus the
+        // header + base64 bloat and the async decode per chunk.
+        try {
+          const bin = atob(b64);
+          const len = bin.length >> 1;
+          if (len <= 0) return;
+          const i16 = new Int16Array(len);
+          for (let i = 0; i < len; i++) i16[i] = bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8);
+          const f32 = new Float32Array(len);
+          for (let i = 0; i < len; i++) f32[i] = i16[i] / 32768;
+          const buffer = ctx.createBuffer(1, len, sr || 24000);
+          buffer.getChannelData(0).set(f32);
+          scheduleBuffer(buffer);
+        } catch (e) {
+          console.warn('[Voice] pcm16 schedule failed', e);
+        }
+      }
+
+      function scheduleBuffer(buffer) {
+        if (!speaking && !ttsFlightsPending()) { checkDone(); return; }
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        const lead = startedScheduling ? 0.0 : 0.08;
+        startedScheduling = true;
+        const startAt = Math.max(ttsNextTime, ctx.currentTime + lead);
+        try { src.start(startAt); } catch (_e) { try { src.start(); } catch(__e){} }
+        ttsNextTime = startAt + buffer.duration;
+        ttsSources.add(src);
+        myLive++;
+        markFirstAudio();
+        src.onended = () => {
+          ttsSources.delete(src);
+          myLive--;
+          try { src.disconnect(); } catch(_e){}
+          checkDone();
+        };
+      }
+
+      function ttsFlightsPending() {
+        // Other pipelined sentences may still be speaking; don't drop buffers
+        // just because this sentence's own fetch finished.
+        return speaking;
       }
 
       function scheduleWavBytes(bytes) {
@@ -1705,22 +3041,7 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         p.then((buffer) => {
           pendingDecodes--;
           if (!speaking) { checkDone(); return; }
-          const src = ctx.createBufferSource();
-          src.buffer = buffer;
-          src.connect(ctx.destination);
-          // Pre-buffer lead: first chunk +0.15s (was +0.02s) so decode of chunk 2
-          // finishes before chunk 1 ends → gapless. Subsequent chunks back-to-back.
-          const lead = startedScheduling ? 0.0 : 0.15;
-          startedScheduling = true;
-          const startAt = Math.max(ttsNextTime, ctx.currentTime + lead);
-          try { src.start(startAt); } catch (_e) { try { src.start(); } catch(__e){} }
-          ttsNextTime = startAt + buffer.duration;
-          ttsSources.add(src);
-          src.onended = () => {
-            ttsSources.delete(src);
-            try { src.disconnect(); } catch(_e){}
-            checkDone();
-          };
+          scheduleBuffer(buffer);
         }).catch((e) => {
           pendingDecodes--;
           console.warn('[Voice] decode failed', e);
@@ -1738,7 +3059,8 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
       fetch(API + '/api/tts/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice: useVoice, engine: 'pocket' }),
+        body: JSON.stringify({ text, voice: useVoice, engine: 'pocket', format: 'pcm16' }),
+        signal: myAbort.signal,
       })
         .then(async (resp) => {
           if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1757,7 +3079,9 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
               try { ev = JSON.parse(line.slice(6).trim()); } catch (_e) { continue; }
               if (ev.error) { streamFailed = true; done = true; checkDone(); return; }
               if (ev.done) { done = true; checkDone(); return; }
-              if (ev.chunk) {
+              if (ev.pcm16) {
+                schedulePcm16(ev.pcm16, ev.sr || 24000);
+              } else if (ev.chunk) {
                 const bytes = Uint8Array.from(atob(ev.chunk), (c) => c.charCodeAt(0));
                 scheduleWavBytes(bytes);
               }
@@ -1766,9 +3090,10 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
           done = true;
           checkDone();
           // If stream finished but no audio scheduled at all, resolve false to trigger fallback
-          setTimeout(() => { if (done && pendingDecodes===0 && ttsSources.size===0 && ttsNextTime === ctx.currentTime) { streamFailed = true; checkDone(); } }, 800);
+          setTimeout(() => { if (done && pendingDecodes===0 && !startedScheduling) { streamFailed = true; checkDone(); } }, 800);
         })
         .catch((e) => {
+          if (e && e.name === 'AbortError') { done = true; checkDone(); return; }
           console.error('[Voice] TTS stream failed', e);
           streamFailed = true;
           done = true;
@@ -1856,15 +3181,17 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
       .then((s) => {
         stream = s;
-        audioCtx = new AudioContext();
-        audioCtx.resume().catch(() => {});
-        const src = audioCtx.createMediaStreamSource(stream);
-        analyser = audioCtx.createAnalyser();
+        // Shared auCtx (24kHz): mic is resampled down automatically — fine
+        // for a level meter. Never closed here; nodes disconnect on mic-off.
+        const actx = ensureAuCtx();
+        const src = actx.createMediaStreamSource(stream);
+        analyser = actx.createAnalyser();
         analyser.fftSize = 2048;
         analyser.smoothingTimeConstant = 0.75;
         freqBuf = new Uint8Array(analyser.frequencyBinCount);
         levelBuf = new Uint8Array(analyser.fftSize);
         src.connect(analyser);
+        micNodes = { src };
         micOn = true;
         localStorage.setItem('voice.micOn', '1');
         accumulated = '';
@@ -1901,7 +3228,10 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     // Stop server-side capture (discard — mic off, no transcribe).
     fetch(API + '/api/voice/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ discard: true }) }).catch(() => {});
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
-    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; analyser = null; freqBuf = null; levelBuf = null; }
+    // Disconnect mic nodes but keep the shared auCtx alive — TTS playback
+    // uses the same context and must survive mic-off.
+    if (micNodes) { try { micNodes.src.disconnect(); } catch(_e){} micNodes = null; }
+    analyser = null; freqBuf = null; levelBuf = null;
     stopSpeaking();
     if (abortRef) { abortRef.abort(); abortRef = null; }
     thinking = false;
@@ -1933,6 +3263,40 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
     voiceMenu.style.display = voiceMenu.style.display === 'none' ? '' : 'none';
   });
   menuDetail.addEventListener('click', () => { setMenuOpen(false); setExpanded(true); });
+  menuScreen.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+    if (screenActive()) exitScreenMode(); else enterScreenMode();
+  });
+  menuShare.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+    setSharingMode(screenSharing === 'off' ? 'on' : 'off');
+  });
+  menuContinuous.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+    setSharingMode(screenSharing === 'continuous' ? 'on' : 'continuous');
+  });
+  screenMic.addEventListener('click', () => { micOn ? stopListening() : startListening(); });
+  screenSend.addEventListener('click', sendNow);
+  screenSourceBtn.addEventListener('click', () => openScreenPicker(false));
+  screenPickerClose.addEventListener('click', closeScreenPicker);
+  screenExitBtn.addEventListener('click', () => exitScreenMode());
+  screenPreviewBtn.addEventListener('click', () => togglePreviewPop());
+  screenPopClose.addEventListener('click', () => togglePreviewPop(false));
+  // Chip body opens the live preview; × stops sharing (stays in the panel).
+  screenChip.addEventListener('click', () => togglePreviewPop());
+  screenChipX.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setSharingMode('off');
+  });
+  screenPreviewAction.addEventListener('click', () => {
+    const st = screenPreviewAction.dataset.state || 'off';
+    if (st === 'paused') setSharingMode('on');
+    else if (st === 'error') startScreenShare();
+    else openScreenPicker(false);
+  });
   sendBtn.addEventListener('click', sendNow);
   replayArea.addEventListener('click', replayLast);
   closeBtn.addEventListener('click', () => { stopListening(); if (bridge) bridge.close(); else window.close(); });
@@ -1949,11 +3313,14 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   });
 
   // Resume AudioContext on first interaction (needed if it started suspended)
-  window.addEventListener('pointerdown', () => { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+  window.addEventListener('pointerdown', () => { if (auCtx && auCtx.state === 'suspended') auCtx.resume(); });
 
-  // ── WS relay stub (pydantic WS relay pattern — local tiny+jarvis, no provider) ──
-  // Browser ↔ backend PCM16 bridge: keeps same Agent, removes poll when wired.
+  // ── WS live relay (transcript push + flush) — HTTP peek/send is fallback ──
+  // Server pushes {type:"transcript"} on change (~150ms tick); client flushes
+  // the round with {type:"send"} → {type:"final"}. Same strings as the HTTP
+  // path, just no 300-500ms poll. Reconnects with backoff when down.
   let _voiceWs = null;
+  let _wsFlushWaiters = [];
   function openVoiceWs() {
     try {
       const wsUrl = API.replace(/^http/, 'ws') + '/api/voice/ws';
@@ -1963,11 +3330,61 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
         try { ws.send(JSON.stringify({ type: 'ping' })); } catch(_e) {}
       };
       ws.onmessage = (ev) => {
-        // Placeholder: when wired, binary frames are PCM16 audio; json is transcript.
+        try {
+          if (typeof ev.data !== 'string') return;
+          const msg = JSON.parse(ev.data);
+          if (!msg || !msg.type) return;
+          if (msg.type === 'transcript') {
+            const t = (msg.text || '').trim();
+            if (t && t !== lastPeekTextRef()) {
+              setLastPeekText(t);
+              accumulated = t;
+              setStatus('listening', t);
+              send('transcript', { text: t });
+              showHint();
+            }
+          } else if (msg.type === 'final') {
+            const waiters = _wsFlushWaiters.splice(0);
+            const t = (msg.text || '').trim();
+            waiters.forEach((w) => { try { w(t); } catch(_e){} });
+          } else if (msg.type === 'interrupted') {
+            // ack, nothing to do
+          } else if (msg.type === 'screen-capture') {
+            onScreenCaptureRequest(msg.req_id || '').catch(() => {});
+          } else if (msg.type === 'screen-mode') {
+            onScreenModeRequest(msg.req_id || '', msg.mode).catch(() => {});
+          }
+        } catch(_e) {}
       };
-      ws.onclose = () => { _voiceWs = null; };
-      ws.onerror = () => { _voiceWs = null; };
+      ws.onclose = () => {
+        if (_voiceWs === ws) _voiceWs = null;
+        // Fail open: HTTP fallback covers the gap; the overlay heartbeat
+        // below reconnects (no backoff chain — one timer owns supervision).
+        const waiters = _wsFlushWaiters.splice(0);
+        waiters.forEach((w) => { try { w(null); } catch(_e){} });
+        try { if (!hbTimer) hbTimer = setInterval(overlayHeartbeat, 500); } catch(_e){}
+      };
+      ws.onerror = () => { try { ws.close(); } catch(_e){} };
     } catch(_e) {}
+  }
+  // oneRound's peek timer reads this; WS handler writes it. Function refs
+  // avoid temporal-dead-zone issues (openVoiceWs is defined after oneRound).
+  function lastPeekTextRef() { try { return window.__lastPeekText || ''; } catch(_e){ return ''; } }
+  function setLastPeekText(t) { try { window.__lastPeekText = t; } catch(_e){} }
+  function wsFlushRound(timeoutMs) {
+    return new Promise((resolve) => {
+      try {
+        if (!_voiceWs || _voiceWs.readyState !== 1) { resolve(null); return; }
+        const timer = setTimeout(() => {
+          const i = _wsFlushWaiters.indexOf(done);
+          if (i >= 0) _wsFlushWaiters.splice(i, 1);
+          resolve(null); // fall back to HTTP on timeout
+        }, timeoutMs || 1200);
+        const done = (t) => { clearTimeout(timer); resolve(t); };
+        _wsFlushWaiters.push(done);
+        _voiceWs.send(JSON.stringify({ type: 'send' }));
+      } catch(_e) { resolve(null); }
+    });
   }
   // Opportunistically open (handshake verified, no impact on HTTP path).
   try { openVoiceWs(); } catch(_e) {}
@@ -1979,38 +3396,104 @@ body.is-menu-open .voice-menu button:hover { background: #f1f5f9; color: #0f172a
   // orb is the same compact size as it is after closing the menu.
   resizeOverlay();
 
+  // Mirror transcript / reply text into the screen panel caption.
+  try {
+    if (window.MutationObserver && textEl) {
+      new MutationObserver(syncScreenCaption).observe(textEl, { childList: true, characterData: true, subtree: true });
+    }
+  } catch (_e) {}
+
+  // Design-QA hook: open voice.html?demo=screen|picker|paused|off in a plain
+  // browser to preview the panel without the desktop bridge (screenshots).
+  try {
+    const demo = new URLSearchParams(location.search).get('demo');
+    if (demo) {
+      document.body.classList.add('is-demo');
+      enterScreenMode();
+      setTimeout(() => {
+        screenSourceLabel = 'Chrome — Attention Is All You Need (paper)';
+        screenCaptionRole.textContent = 'READING';
+        screenCaptionText.textContent = 'Highlighted: “scaled dot-product attention” — explain it simply';
+        lastStatusKey = 'listening';
+        document.body.classList.remove('state-idle');
+        document.body.classList.add('state-listening');
+        syncScreenCaption();
+        updateScreenChip();
+        if (demo === 'off') {
+          screenSourceLabel = '';
+          updateScreenChip();
+          setPreviewState('off', 'Share your screen so the agent can see it');
+        } else if (demo === 'paused') {
+          paintDemoPreview();
+          setPreviewState('paused', 'Paused — the agent can’t see your screen');
+        } else {
+          paintDemoPreview();
+          setPreviewState('live');
+          togglePreviewPop(true);
+        }
+        if (demo === 'picker') {
+          screenPicker.dataset.first = '';
+          screenPicker.classList.add('open');
+          renderScreenPicker([
+            { id: 'screen:0:0', kind: 'screen', name: 'Entire Screen', thumbnail: screenPreview.style.backgroundImage.slice(5, -2) },
+            { id: 'screen:1:0', kind: 'screen', name: 'Screen 2 — Dell U2723QE', thumbnail: screenPreview.style.backgroundImage.slice(5, -2) },
+            { id: 'window:1', kind: 'window', name: 'Attention Is All You Need — Chrome', thumbnail: screenPreview.style.backgroundImage.slice(5, -2) },
+            { id: 'window:2', kind: 'window', name: 'voice.html — Electron', thumbnail: '' },
+          ]);
+        }
+      }, 80);
+    }
+  } catch (_e) {}
+
   // ── Lazy TTS: warm on open (loading spinner on mic btn), free on close ──
+  // One overlay heartbeat (500ms) owns both TTS warm-status and WS
+  // supervision — a single timer instead of a poller + a backoff chain.
+  // It parks itself once warm AND socket-live; ws.onclose restarts it.
   let ttsWarm = false;
-  let ttsPollTimer = null;
+  let hbTimer = null;
   function startTtsLoading() {
     if (ttsWarm) return;
     micBtn.classList.add('loading');
     // Kick the warm-up (idempotent on the server).
     fetch(API + '/api/voice/warm_tts', { method: 'POST' }).catch(() => {});
-    ttsPollTimer = setInterval(async () => {
+    if (!hbTimer) hbTimer = setInterval(overlayHeartbeat, 500);
+  }
+  async function overlayHeartbeat() {
+    // 1) TTS warm status (until warm).
+    if (!ttsWarm) {
       try {
         const r = await fetch(API + '/api/voice/tts_status');
         const d = await r.json().catch(() => ({}));
         if (d && d.tts_warm) {
           ttsWarm = true;
-          clearInterval(ttsPollTimer);
-          ttsPollTimer = null;
           micBtn.classList.remove('loading');
           updateMicBtn();
         }
       } catch (_e) {}
-    }, 500);
+    }
+    // 2) WS supervision: reconnect when down/closed (0 = connecting, wait).
+    try {
+      if (!_voiceWs || _voiceWs.readyState === 3) openVoiceWs();
+    } catch (_e) {}
+    // 3) Park when nothing left to supervise.
+    if (ttsWarm && _voiceWs && _voiceWs.readyState === 1) {
+      clearInterval(hbTimer);
+      hbTimer = null;
+    }
   }
   function releaseTts() {
-    if (ttsPollTimer) { clearInterval(ttsPollTimer); ttsPollTimer = null; }
-    // Best-effort free (fire-and-forget) — close-triggered only.
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    // Best-effort free (fire-and-forget) — close-triggered only. ASR too so
+    // overlay-close returns the fallback ONNX sessions as well as the TTS GB.
+    try { stopScreenShare(); } catch (_e) {}
     fetch(API + '/api/voice/release_tts', { method: 'POST' }).catch(() => {});
+    fetch(API + '/api/voice/release_asr', { method: 'POST' }).catch(() => {});
   }
   startTtsLoading();
   window.addEventListener('beforeunload', releaseTts);
   if (bridge && bridge.onClose) bridge.onClose(releaseTts);
 
-  if (localStorage.getItem('voice.micOn') === '1') {
+  if (localStorage.getItem('voice.micOn') === '1' && !document.body.classList.contains('is-demo')) {
     setTimeout(startListening, 400);
   }
 })();

@@ -25,6 +25,12 @@ import tempfile
 import time
 from pathlib import Path
 
+# POCKET_TTS_NO_BEARTYPE=1: pocket-tts wraps every function with beartype
+# runtime type checks (see pocket_tts/__init__.py) — pure per-call overhead
+# on the synthesis hot path. Must be set before pocket_tts is first
+# imported; all pocket imports below are lazy, so module top is safe.
+os.environ.setdefault("POCKET_TTS_NO_BEARTYPE", "1")
+
 import numpy as np  # MUST be imported before any PortAudio callback thread runs
 
 ROOT = Path(__file__).parent
@@ -318,16 +324,33 @@ def synthesize_tts(text: str, out_wav_path: str, voice: str = DEFAULT_TTS_VOICE)
             return False
 
 
-def synthesize_tts_stream(text: str, voice: str = DEFAULT_TTS_VOICE):
+def synthesize_tts_stream(text: str, voice: str = DEFAULT_TTS_VOICE, cancel_event=None):
     """Synthesize speech with Pocket TTS in streaming chunks.
 
     Yields ``(samples_float32_1d, sample_rate)`` chunks as they are produced
     — first chunk typically lands in well under a second.
+
+    ``cancel_event`` (optional ``threading.Event``): checked between Pocket's
+    internal sentence-chunks so barge-in can abort early without waiting for
+    the full utterance. The voice state is never mutated (Pocket copies it
+    when ``copy_state=True``), so cancelling never corrupts cloning.
     """
     with _tts_lock:
+        if cancel_event is not None:
+            try:
+                if cancel_event.is_set():
+                    return
+            except Exception:
+                pass
         model = _load_tts_model()
         state = _voice_state(voice)
         for chunk in model.generate_audio_stream(state, text, frames_after_eos=TTS_FRAMES_AFTER_EOS):
+            if cancel_event is not None:
+                try:
+                    if cancel_event.is_set():
+                        break
+                except Exception:
+                    pass
             yield chunk.detach().cpu().numpy(), int(model.sample_rate)
 
 
@@ -368,6 +391,26 @@ def release_tts() -> None:
         gc.collect()
     except Exception:
         pass
+
+
+def release_asr() -> None:
+    """Drop the file-fallback ASR Transcriber (live-mode close).
+
+    The live MicTranscriber is already closed by stop_capture(); this frees
+    the lazily-loaded ``_asr`` fallback instance (ONNX sessions) so an
+    overlay-close returns that RAM too. Reloads lazily on the next
+    transcribe_file. Idempotent.
+    """
+    global _asr
+    with _asr_lock:
+        tr, _asr = _asr, None
+    if tr is not None:
+        try:
+            close = getattr(tr, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
 
 
 # ── Server-side mic capture — Moonshine MicTranscriber (streaming) ──────────
@@ -504,8 +547,12 @@ def start_capture() -> bool:
         # start_capture calls each allocate the ONNX sessions and blow memory.
         with _capture_start_lock:
             # Build the mic. on_text = rolling hypothesis, on_line = finished lines.
+            # update_interval 0.2s (default 0.5s): rolling hypothesis at 5Hz
+            # for live feel; transcription still runs on MicTranscriber's
+            # worker thread, never the PortAudio callback.
             mic = (MicTranscriber().language("en")
-                   .on_text(_live_on_text).on_line(_live_on_line))
+                   .on_text(_live_on_text).on_line(_live_on_line)
+                   .update_interval(0.2))
             # Device selection: prefer the real mic (see _find_input_device).
             dev = _find_input_device()
             if dev is not None:

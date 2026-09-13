@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, dialog, ipcMain, screen, Tray, Menu, globalShortcut, nativeImage, session } = require('electron');
+const { app, BrowserWindow, shell, dialog, ipcMain, screen, Tray, Menu, globalShortcut, nativeImage, session, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -12,10 +12,22 @@ const TRAY_ICON_B64 = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IAr
 let mainWindow;
 let voiceWindow;
 let apiProcess;
+let apiPid = null;
 let tray;
 let isQuitting = false;
 
-const isDev = !app.isPackaged;
+// Prod mode: load minified dist/ even when unpackaged (dev launcher uses
+// `npm run electron:dev` → vite URL + DevTools). Set ELECTRON_PROD=1 in
+// start_desktop_prod.bat for the lightweight daily driver.
+const isProd = process.env.ELECTRON_PROD === '1' || app.isPackaged;
+const isDev = !isProd;
+
+// Single-instance: a second launch focuses the running app and exits — never
+// a second Electron + second API server warming duplicate models (2×RAM).
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+}
 
 function sendToMain(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -84,6 +96,8 @@ function startApiServer() {
         env: { ...process.env, STARK_PORT },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      apiPid = apiProcess.pid || null;
+      setApiPid(apiPid);
 
     apiProcess.stdout.on('data', (data) => {
       console.log(`[API] ${data.toString().trim()}`);
@@ -98,9 +112,13 @@ function startApiServer() {
     });
 
     // Self-heal: restart the API server if it dies while the app is open.
+    // The app is "open" while the tray lives — the main window may be
+    // destroyed (lightweight close) with voice still running.
     apiProcess.on('exit', (code) => {
       console.error(`[API] server exited (${code})`);
-      if (mainWindow && !mainWindow.isDestroyed() && !isQuitting) {
+      apiPid = null;
+      setApiPid(null);
+      if (!isQuitting) {
         console.log('[API] restarting in 3s...');
         setTimeout(() => startApiServer(), 3000);
       }
@@ -162,12 +180,12 @@ function createWindow() {
 
   mainWindow.maximize();
 
-  // Closing the window hides it to the tray so voice mode keeps running.
-  mainWindow.on('close', (e) => {
-    if (!isQuitting) {
-      e.preventDefault();
-      mainWindow.hide();
-    }
+  // Lightweight-by-design: closing the window DESTROYS the whole renderer
+  // (+ GPU process RSS) instead of hiding it. Tray + API server + voice
+  // overlay survive; tray-open re-creates the window (cold React mount
+  // ~1-2s, accepted tradeoff). No 'close' preventDefault on purpose.
+  mainWindow.on('closed', () => {
+    mainWindow = null;
   });
 
   // ── Forward renderer console to main process stdout ──
@@ -188,16 +206,16 @@ function createWindow() {
     mainWindow.loadURL('http://localhost:9000');
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    // Prod: same-origin via the local API server, which serves dist/ + /api
+    // on one origin (see api_server.py spa_fallback). This is why prod works
+    // at all: dist/index.html uses absolute /assets + relative /api paths,
+    // both of which are broken over file:// (blank black window).
+    waitForApiThenLoad(mainWindow);
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
-  });
-
-  mainWindow.on('closed', () => {
-    mainWindow = null;
   });
 }
 
@@ -266,26 +284,102 @@ ipcMain.on('voice-set-chat', (_event, payload) => {
   }
 });
 
-// Overlay → resize itself (compact circle ↔ expanded process feed)
-ipcMain.on('voice-resize', (_event, w, h) => {
-  if (voiceWindow && !voiceWindow.isDestroyed()) {
-    const bounds = voiceWindow.getBounds();
-    const nextWidth = Math.round(w);
-    // Resize around the current right edge so the mic stays in place while
-    // the controls extend beside it. Dragging still determines the edge.
-    const x = bounds.x - (nextWidth - bounds.width);
-    voiceWindow.setBounds({
-      x,
-      y: bounds.y,
-      width: nextWidth,
-      height: Math.round(h),
-    });
-  }
+// Overlay → resize itself (compact circle ↔ expanded process feed ↔ screen
+// panel). `animate` runs an eased morph for the orb ↔ screen-panel transition;
+// VOICE_NO_RESIZE_ANIM=1 forces the instant path (safe fallback). The resizer
+// is a shared module so smoke tests exercise the same implementation.
+const { createVoiceResizer } = require('./resizeAnim.cjs');
+const voiceResizer = createVoiceResizer();
+
+ipcMain.on('voice-resize', (_event, w, h, animate) => {
+  voiceResizer.resize(voiceWindow, w, h, animate);
 });
 
 // Overlay close button
 ipcMain.on('voice-close', () => {
   if (voiceWindow && !voiceWindow.isDestroyed()) voiceWindow.close();
+});
+
+// ── IPC: Screen sharing ("look at screen" mode) ──
+// The overlay lists sources (desktopCapturer, main-process only), then calls
+// getDisplayMedia; the request handler below resolves the pending selection —
+// no OS picker, no default-screen surprise when a source was chosen.
+// A short-lived cache avoids re-enumerating (thumbnail generation is
+// expensive) both for the picker and for the label lookup after selection.
+let pendingScreenSourceId = null;
+let screenSourceCache = { at: 0, raw: [], list: [] };
+const SCREEN_SOURCE_TTL_MS = 10000;
+
+async function listScreenSourcesCached() {
+  const now = Date.now();
+  if (screenSourceCache.list.length && now - screenSourceCache.at < SCREEN_SOURCE_TTL_MS) {
+    return screenSourceCache.list;
+  }
+  const sources = await desktopCapturer.getSources({
+    types: ['screen', 'window'],
+    thumbnailSize: { width: 320, height: 200 },
+    fetchWindowIcons: false,
+  });
+  // Never offer our own windows as share targets: the overlay/main window
+  // would otherwise appear as ("meaningless, mirror-prone") picker entries.
+  // getMediaSourceId() matches the desktopCapturer id of the same window.
+  const ownIds = new Set();
+  for (const w of [voiceWindow, mainWindow]) {
+    try {
+      if (w && !w.isDestroyed()) ownIds.add(w.getMediaSourceId());
+    } catch (_e) {}
+  }
+  const kept = sources.filter((source) => {
+    if (ownIds.has(source.id)) return false;
+    if (!source.name || !source.name.trim()) return false;
+    return true;
+  });
+  const list = kept.map((source) => ({
+    id: source.id,
+    name: source.name,
+    kind: source.id.startsWith('screen:') ? 'screen' : 'window',
+    display_id: source.display_id || '',
+    thumbnail: source.thumbnail && !source.thumbnail.isEmpty() ? source.thumbnail.toDataURL() : '',
+  }));
+  // Keep the raw DesktopCapturerSource objects too — the getDisplayMedia
+  // request handler needs them for the callback.
+  screenSourceCache = { at: now, raw: kept, list };
+  return list;
+}
+
+ipcMain.handle('voice-screen-sources', async () => {
+  try {
+    return await listScreenSourcesCached();
+  } catch (err) {
+    console.error('[Electron] screen sources failed:', err.message);
+    return [];
+  }
+});
+
+ipcMain.handle('voice-screen-select', async (_event, sourceId) => {
+  try {
+    const list = await listScreenSourcesCached();
+    // No explicit pick → the primary screen (first 'screen' entry), so the
+    // caller never needs a second enumeration just to learn the label.
+    const chosen = sourceId
+      ? list.find((s) => s.id === sourceId)
+      : (list.find((s) => s.kind === 'screen') || list[0]);
+    pendingScreenSourceId = chosen ? chosen.id : null;
+    return { ok: !!chosen, id: chosen ? chosen.id : '', name: chosen ? chosen.name : '' };
+  } catch (err) {
+    console.error('[Electron] screen select failed:', err.message);
+    return { ok: false, id: '', name: '' };
+  }
+});
+
+// While sharing, exclude the overlay itself from capture (WDA_EXCLUDEFROMCAPTURE)
+// so the user never sees the preview mirrored inside the shared frame.
+ipcMain.on('voice-screen-protect', (_event, on) => {
+  if (voiceWindow && !voiceWindow.isDestroyed()) {
+    try {
+      voiceWindow.setContentProtection(!!on);
+    } catch (_e) {}
+  }
 });
 
 // Legacy channels (kept for compatibility with older renderer code)
@@ -307,6 +401,9 @@ ipcMain.on('voice-status', (_, status) => {
 
 // ── IPC: Native folder picker ──
 ipcMain.handle('select-folder', async () => {
+  // The main window may be destroyed (lightweight close) — recreate first
+  // so the dialog has a parent.
+  if (!mainWindow || mainWindow.isDestroyed()) showMainWindow();
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     title: 'Select Workspace Folder',
@@ -316,6 +413,16 @@ ipcMain.handle('select-folder', async () => {
 });
 
 // ── Tray ──
+function setApiPid(pid) {
+  apiPid = pid || null;
+  try {
+    if (tray && !tray.isDestroyed()) {
+      tray.setToolTip(apiPid
+        ? `VinCode — Voice Assistant (Ctrl+G) — API PID ${apiPid}`
+        : 'VinCode — Voice Assistant (Ctrl+G)');
+    }
+  } catch (_e) {}
+}
 function createTray() {
   const icon = nativeImage.createFromDataURL(TRAY_ICON_B64);
   tray = new Tray(icon);
@@ -361,6 +468,22 @@ function checkApiRunning() {
   });
 }
 
+// Prod boot: cold torch/ONNX imports make the first server start slow, so
+// poll /api/health (1s cadence, 90s bound) before loading the UI. Without
+// this the window paints before /api (and the SPA shell) can answer.
+function waitForApiThenLoad(win, tries = 90) {
+  checkApiRunning().then((ok) => {
+    if (win.isDestroyed()) return;
+    if (ok || tries <= 0) {
+      const port = process.env.STARK_PORT || '8123';
+      if (!ok) console.error('[Electron] API not healthy after 90s — loading UI anyway (expect backend errors).');
+      win.loadURL(`http://127.0.0.1:${port}/`);
+      return;
+    }
+    setTimeout(() => waitForApiThenLoad(win, tries - 1), 1000);
+  });
+}
+
 function killApiProcess() {
   if (apiProcess && !apiProcess.killed) {
     const pid = apiProcess.pid;
@@ -391,6 +514,22 @@ app.whenReady().then(async () => {
     callback(allowed.includes(permission));
   });
 
+  // getDisplayMedia for the overlay's "look at screen" mode: resolve to the
+  // source the picker confirmed (voice-screen-select) or the primary screen.
+  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+    const resolveWith = (raw) => {
+      const source = raw.find((s) => s.id === pendingScreenSourceId) || raw[0];
+      if (!source) return callback({});
+      callback({ video: source });
+    };
+    if (screenSourceCache.raw.length && Date.now() - screenSourceCache.at < SCREEN_SOURCE_TTL_MS) {
+      return resolveWith(screenSourceCache.raw);
+    }
+    desktopCapturer.getSources({ types: ['screen', 'window'] })
+      .then(resolveWith)
+      .catch(() => callback({}));
+  }, { useSystemPicker: false });
+
   // Global shortcut so Ctrl+G works even when the app window is closed
   globalShortcut.register('CommandOrControl+G', () => toggleVoice());
 
@@ -415,6 +554,11 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
+  showMainWindow();
+});
+
+// Second launch (single-instance lock): focus the running app, no dupes.
+app.on('second-instance', () => {
   showMainWindow();
 });
 

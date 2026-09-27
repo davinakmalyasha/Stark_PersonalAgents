@@ -167,37 +167,7 @@ def _child_permissions(name: str) -> list:
 # â”€â”€ The turn loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
-def _is_native_slice(second: list) -> bool:
-    """True when a backend result's 2nd element is a transcript slice.
-
-    Handles both legacy LC (AIMessage/ToolMessage — test compat) and native
-    ModelMessage (ModelResponse/ModelRequest) slices. Used by the
-    continuable turn loop to decide whether the backend already executed
-    tools (native full turn) or returned raw tool-call dicts.
-    """
-    try:
-        for m in (second or [])[:2]:
-            cname = m.__class__.__name__ if hasattr(m, "__class__") else ""
-            if cname in ("AIMessage", "ToolMessage", "ModelResponse", "ModelRequest"):
-                return True
-            try:
-                from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS
-                if isinstance(m, (_MR, _MS)):
-                    return True
-            except Exception:
-                pass
-            if isinstance(m, dict) and ("tool" in m or "name" in m):
-                return False
-        # Fallback isinstance check across all items
-        try:
-            from pydantic_ai.messages import ModelRequest as _MR2, ModelResponse as _MS2
-            if any(isinstance(m, (_MR2, _MS2)) for m in (second or [])):
-                return True
-        except Exception:
-            pass
-        return False
-    except Exception:
-        return False
+# _is_native_slice lives in agents/specialist_loop.py (single shared copy).
 
 
 def _run_turn(
@@ -231,11 +201,19 @@ def _run_turn(
         TextPart,
         ThinkingPart,
         ToolCallPart,
-        ToolReturnPart,
     )
-    from tools.AddOnTool.subagentTools import _specialist_call_backend
+    from tools.AddOnTool.subagentTools import (
+        _maybe_compact_free,
+        _specialist_backend,
+        _specialist_call_backend,
+    )
+    from agents.specialist_loop import (
+        SpecialistLoopHooks,
+        run_specialist_loop,
+        specialist_turn_deps,
+    )
     from tools import (execute_tool_detailed,
-                       active_permissions, _TASK_DEPTH,
+                       active_permissions, active_tool_caps, _TASK_DEPTH,
                        get_native_tools, _SUBAGENTS_REGISTRY, _load_subagents)
 
     with act["lock"]:
@@ -251,8 +229,13 @@ def _run_turn(
         _parent_depth = 0
     _depth_token = _TASK_DEPTH.set(_parent_depth + 1)
     _perm_token = active_permissions.set(_child_permissions(name))
+    _caps_token = None
     _descriptor = _descriptor_of(session) or {}
     _parent_chat = _descriptor.get("parent_chat_id", "") or ""
+
+    # Per-turn deps (role + parent chat) so scope-aware tools (update_plan,
+    # vision) resolve the specialist instead of falling back to the parent.
+    _turn_deps = specialist_turn_deps(name, _parent_chat)
 
     interrupted = False
 
@@ -318,6 +301,7 @@ def _run_turn(
         if not _SUBAGENTS_REGISTRY:
             _load_subagents()
         spec = _SUBAGENTS_REGISTRY.get(name) or {}
+        _caps_token = active_tool_caps.set(dict(spec.get("tool_caps") or {}) or None)
         allowed_tools = set(spec.get("tools", []))
         native_tools = [
             definition for definition in get_native_tools()
@@ -329,193 +313,89 @@ def _run_turn(
         except Exception:
             pass
 
-        content = ""
-        i = 0
-        while True:
-            i += 1
-            if act["interrupt"]:
-                interrupted = True
-                break
+        _backend = _specialist_backend(name)
+
+        def _mgr_backend(msgs, iteration, _last_tool):
+            return _specialist_call_backend(
+                name,
+                msgs,
+                native_tools=native_tools or None,
+                model=spec.get("model") or None,
+                reasoning_effort=None,  # registry thinking profile applies downstream
+                where=f"{name} continuable iter {iteration}",
+            )
+
+        def _mgr_execute(tc):
             try:
-                res = _specialist_call_backend(
-                    name,
-                    list(history),
-                    native_tools=native_tools or None,
-                    reasoning_effort=None,  # static per-role mapping in _build_model_settings
-                    where=f"{name} continuable iter {i}",
+                execution = execute_tool_detailed(
+                    tc.get("tool", ""), tc.get("args") or {}, deps=_turn_deps,
                 )
-            except Exception:
-                break
+                return (str(execution.content), str(execution.content), False)
+            except Exception as e:
+                return (f"Error: {e}", str(e)[:300], True)
 
-            reasoning = getattr(res, "reasoning_content", None)
-            # A5: native full turn — pydantic-ai executed the tools internally.
-            # The 3rd element is the transcript slice (ModelMessage or LC);
-            # extend history + session log. Keep legacy LC fallback for tests.
-            if isinstance(res, tuple) and len(res) == 3:
-                candidate = res[1]
-                is_slice = _is_native_slice(candidate)
-                # Also try direct ModelMessage isinstance as extra guard
-                if not is_slice:
-                    try:
-                        from pydantic_ai.messages import ModelRequest as _MRx, ModelResponse as _MSx
-                        if candidate and isinstance(candidate[0], (_MRx, _MSx)):
-                            is_slice = True
-                    except Exception:
-                        pass
-                if is_slice:
-                    response_text, slice_msgs, reasoning = res
-                    reasoning = reasoning or getattr(res, "reasoning_content", None)
-                    # Detect native vs LC slice
-                    is_native_slice = False
-                    try:
-                        is_native_slice = bool(slice_msgs and isinstance(slice_msgs[0], (ModelRequest, ModelResponse)))
-                    except Exception:
-                        is_native_slice = False
-                    if is_native_slice:
-                        history.extend(slice_msgs)
-                        slice_calls: list[dict] = []
-                        for m in slice_msgs:
-                            if isinstance(m, ModelResponse):
-                                for p in getattr(m, "parts", []) or []:
-                                    if isinstance(p, ToolCallPart):
-                                        args = p.args if isinstance(p.args, dict) else {}
-                                        if isinstance(args, str):
-                                            try:
-                                                import json
-                                                args = json.loads(args)
-                                            except Exception:
-                                                args = {}
-                                        slice_calls.append({
-                                            "id": p.tool_call_id or "",
-                                            "name": p.tool_name or "",
-                                            "args": args if isinstance(args, dict) else {},
-                                        })
-                    else:
-                        # Legacy LC slice (test compat) — convert to native for history
-                        try:
-                            from llm.pai_transport import _messages_to_pai
-                            _converted = _messages_to_pai(slice_msgs)  # type: ignore
-                            history.extend(_converted)
-                        except Exception:
-                            try:
-                                history.extend(slice_msgs)  # type: ignore
-                            except Exception:
-                                pass
-                        slice_calls = [
-                            {"id": tc.get("id", ""), "name": tc.get("name", ""), "args": tc.get("args") or {}}
-                            for m in slice_msgs
-                            if m.__class__.__name__ == "AIMessage"
-                            for tc in (getattr(m, "tool_calls", None) or [])
-                        ]
-                    blocks = [{"type": "text", "text": str(response_text)}]
-                    if reasoning:
-                        blocks.insert(0, {"type": "thinking", "thinking": str(reasoning)})
-                    session.append_assistant(
-                        blocks,
-                        stop_reason="toolUse" if slice_calls else "stop",
-                    )
-                    if not slice_calls:
-                        content = str(response_text)
-                        break
-                    for tc in slice_calls:
-                        session.append_tool_result(
-                            "ok",
-                            tool_call_id=tc.get("id", ""),
-                            tool_name=tc.get("name", ""),
-                            is_error=False,
-                        )
-                    continue
-            if isinstance(res, tuple):
-                response_text, native_tool_calls = res[0], res[1]
-                reasoning = reasoning or (res[2] if len(res) > 2 else None)
-            else:
-                response_text = getattr(res, "content", str(res))
-            response_text = str(response_text)
-
-            # Native tool calls only. The provider API owns the tool protocol;
-            # pseudo-tool text is not generated or parsed in durable sessions.
-            tool_calls = []
-            for call_index, tc in enumerate(native_tool_calls or []):
-                tname = tc.get("tool") or tc.get("name", "")
-                if tname:
-                    tool_calls.append({
-                        "tool": tname,
-                        "args": tc.get("args") or {},
-                        "id": tc.get("id") or f"cont-{i}-{call_index + 1}",
-                    })
-
-            blocks = [{"type": "text", "text": response_text}]
+        def _mgr_append_final(transcript, text, reasoning):
+            _parts: list[Any] = []
             if reasoning:
-                blocks.insert(0, {"type": "thinking", "thinking": str(reasoning)})
+                _parts.append(ThinkingPart(content=str(reasoning)))
+            if text:
+                _parts.append(TextPart(content=text))
+            if _parts:
+                transcript.append(ModelResponse(parts=_parts))
+            elif text or reasoning:
+                # Ensure at least one part
+                transcript.append(ModelResponse(parts=[TextPart(content=text or "")]))
 
-            if not tool_calls:
-                session.append_assistant(blocks, stop_reason="stop")
-                # Native history append — ModelResponse with TextPart/ThinkingPart
-                _parts: list[Any] = []
-                if reasoning:
-                    _parts.append(ThinkingPart(content=str(reasoning)))
-                if response_text:
-                    _parts.append(TextPart(content=response_text))
-                if _parts:
-                    history.append(ModelResponse(parts=_parts))
-                elif response_text or reasoning:
-                    # Ensure at least one part
-                    history.append(ModelResponse(parts=[TextPart(content=response_text or "")]))
-                content = response_text
-                break
-
-            session.append_assistant(blocks, stop_reason="toolUse")
-            # Native history: ModelResponse with ToolCallPart
+        def _mgr_append_calls(transcript, text, reasoning, calls):
             _resp_parts: list[Any] = []
-            if response_text:
-                _resp_parts.append(TextPart(content=response_text))
+            if text:
+                _resp_parts.append(TextPart(content=text))
             if reasoning:
                 _resp_parts.append(ThinkingPart(content=str(reasoning)))
-            for tc in tool_calls:
+            for tc in calls:
                 _resp_parts.append(ToolCallPart(
                     tool_name=tc["tool"],
                     args=tc.get("args") or {},
                     tool_call_id=tc.get("id", ""),
                 ))
-            history.append(ModelResponse(parts=_resp_parts))
+            transcript.append(ModelResponse(parts=_resp_parts))
 
-            results = []
-            for tc in tool_calls:
-                tname = tc.get("tool", "")
-                targs = tc.get("args", {})
-                if act["interrupt"]:
-                    interrupted = True
-                    break
-                call_id = tc["id"]
-                try:
-                    execution = execute_tool_detailed(tname, targs)
-                    r = execution.content
-                    session.append_tool_result(r, tool_call_id=call_id, tool_name=tname)
-                except Exception as e:
-                    r = f"Error: {e}"
-                    session.append_tool_result(
-                        str(e)[:300], tool_call_id=call_id, tool_name=tname, is_error=True,
-                    )
-                results.append(str(r))
-            if interrupted:
-                break
-            for tc, result in zip(tool_calls, results):
-                history.append(ModelRequest(parts=[ToolReturnPart(
-                    tool_name=tc.get("tool", ""),
-                    content=str(result),
-                    tool_call_id=tc["id"],
-                )]))
-
-            # Vision: drain tool-queued inline images into ONE user message — native
-            try:
-                from llm.deps import WorkspaceDeps
-                _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=_parent_chat)
-                from tools.vision_channel import drain_into_messages_native
-                if drain_into_messages_native(history, header="[Inline image(s) from tool result]", ctx=_sub_deps):
-                    session.append_message("system", "[VISION] inline image(s) injected")
-            except Exception:
-                pass
-
+        _hooks = SpecialistLoopHooks(
+            id_prefix="cont",
+            parallel=False,
+            check_interrupt=lambda: bool(act["interrupt"]),
+            raise_backend_errors=False,
+            note_vision=True,
+            classify_error=lambda _text, _raised: bool(_raised),
+            log_assistant=lambda b, s: session.append_assistant(
+                b, stop_reason=s),
+            log_tool_result=lambda c, i, t, e: session.append_tool_result(
+                c, tool_call_id=i, tool_name=t, is_error=e),
+            log_system=lambda t: session.append_message("system", t),
+            append_final=_mgr_append_final,
+            append_with_calls=_mgr_append_calls,
+            compact=lambda t: _maybe_compact_free(name, t, _backend),
+            deps=_turn_deps,
+        )
+        _outcome = run_specialist_loop(
+            name=name,
+            transcript=history,
+            backend_fn=_mgr_backend,
+            execute_fn=_mgr_execute,
+            hooks=_hooks,
+        )
+        content = _outcome.content
+        interrupted = _outcome.interrupted
+        backend_error = _outcome.backend_error
+        if backend_error:
+            content = f"ERROR: {backend_error}"
+            act["last_result"] = content
+            session.append_custom_entry(_STATUS, {
+                "status": "failed",
+                "at": int(time.time() * 1000),
+                "error": backend_error[:300],
+            })
+            return content
         if interrupted:
             content = content or "INTERRUPTED"
         act["last_result"] = content
@@ -523,6 +403,8 @@ def _run_turn(
         return content
     finally:
         active_permissions.reset(_perm_token)
+        if _caps_token is not None:
+            active_tool_caps.reset(_caps_token)
         _TASK_DEPTH.reset(_depth_token)
         with act["lock"]:
             act["status"] = "idle"

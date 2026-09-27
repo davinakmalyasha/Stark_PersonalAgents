@@ -18,24 +18,41 @@ except ImportError:
 from tools import get_native_tool_names
 
 class SubagentsRegistry(dict):
+    def _canonical_key(self, key):
+        """Canonical registry key for `key` (case-insensitive, incl. prefix)."""
+        if isinstance(key, str):
+            # Exact hit first (preserves current behavior + golden key order).
+            if dict.__contains__(self, key):
+                return key
+            lowered = key.lower()
+            for k in self.keys():
+                if isinstance(k, str) and k.lower() == lowered:
+                    return k
+            if "-" in key:
+                prefix = key.split("-")[0]
+                if dict.__contains__(self, prefix):
+                    return prefix
+                lowered_prefix = prefix.lower()
+                for k in self.keys():
+                    if isinstance(k, str) and k.lower() == lowered_prefix:
+                        return k
+        return None
+
     def __contains__(self, key):
-        if super().__contains__(key):
+        if dict.__contains__(self, key):
             return True
-        if isinstance(key, str) and "-" in key:
-            prefix = key.split("-")[0]
-            if prefix in self:
-                return True
-        return False
+        return self._canonical_key(key) is not None
 
     def __getitem__(self, key):
-        if super().__contains__(key):
-            return super().__getitem__(key)
-        if isinstance(key, str) and "-" in key:
-            prefix = key.split("-")[0]
-            if prefix in self:
-                val = dict(super().__getitem__(prefix))
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        canonical = self._canonical_key(key)
+        if canonical is not None:
+            if isinstance(key, str) and "-" in key:
+                val = dict(dict.__getitem__(self, canonical))
                 val["name"] = key
                 return val
+            return dict.__getitem__(self, canonical)
         raise KeyError(key)
 
     def get(self, key, default=None):
@@ -46,158 +63,129 @@ class SubagentsRegistry(dict):
 
 _SUBAGENTS_REGISTRY = SubagentsRegistry()
 
+
+def _canonical_subagent_name(name: str) -> str:
+    """Resolve user/LLM-supplied subagent name to its canonical registry key.
+
+    Case-insensitive + whitespace-tolerant (`" explore "` -> `"Explore"`).
+    Hyphen-suffixed variants (`"Explore-xyz"`) are NOT spawnable — they
+    resolve only for runtime lookups via the registry itself. Returns ""
+    when there is no match.
+    """
+    if not isinstance(name, str):
+        return ""
+    stripped = name.strip()
+    if not stripped:
+        return ""
+    if not _SUBAGENTS_REGISTRY:
+        _load_subagents()
+    if dict.__contains__(_SUBAGENTS_REGISTRY, stripped):
+        return stripped
+    lowered = stripped.lower()
+    for k in _SUBAGENTS_REGISTRY.keys():
+        if isinstance(k, str) and k.lower() == lowered:
+            return k
+    return ""
+
 _TASK_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("task_depth", default=0)
 
 _MAX_TASK_DEPTH = 3
 
+def _workspace_entries() -> list[dict]:
+    """Runtime registry entries for delegatable workspace agents.
+
+    Everything (name, description, prompt module, tools, model pin, runtime
+    node) comes from agents/workspace_registry.py — this loader adds no agent
+    facts of its own.
+    """
+    from agents.workspace_registry import delegatable_specs
+
+    out: list[dict] = []
+    for spec in delegatable_specs():
+        system_prompt = ""
+        if spec.prompt_module:
+            try:
+                import importlib
+                mod_name, attr = spec.prompt_module.split(":", 1)
+                system_prompt = str(getattr(importlib.import_module(mod_name), attr) or "")
+            except Exception as e:
+                print(f"[SUBAGENT] {spec.key} prompt load skipped: {e}")
+        out.append({
+            "name": spec.runtime_name or spec.display,
+            "description": spec.description,
+            "system_prompt": system_prompt,
+            "tools": list(dict.fromkeys(get_native_tool_names(spec.key))),
+            "model": spec.model,
+            "runtime": spec.runtime,
+            "state_builder": spec.state_builder,
+        })
+    return out
+
+
+def _specialist_entries() -> list[dict]:
+    """Runtime registry entries for config-defined specialists."""
+    from agents.workspace_registry import _load_specialists
+
+    out: list[dict] = []
+    for spec in _load_specialists().values():
+        tools = [str(t) for t in spec.tools]
+        if os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1":
+            # Headless eval: no human to answer ask_user (it would block to its
+            # timeout), so drop the interactive tools from every specialist spec.
+            tools = [t for t in tools if t not in ("ask_user", "propose_plan")]
+        entry = {
+            "name": spec.display,
+            "kind": spec.kind or "subagent",
+            "internal": spec.internal,
+            "description": spec.description,
+            "when_to_use": spec.when_to_use,
+            "system_prompt": spec.system_prompt,
+            "tools": list(dict.fromkeys(tools)),
+            "skills": list(dict.fromkeys(spec.skills)),
+            "backend": spec.backend,
+            "thinking": spec.thinking,
+            "compaction": dict(spec.compaction or {}),
+            "tool_caps": dict(spec.tool_caps or {}),
+            "permissions": list(spec.permissions or []),
+        }
+        if spec.model:
+            entry["model"] = spec.model
+        if spec.response_format is not None:
+            entry["response_format"] = spec.response_format
+        out.append(entry)
+    return out
+
+
 def _load_subagents():
     global _SUBAGENTS_REGISTRY
     try:
-        from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE as _DEV_SYSTEM_TEMPLATE
-        from agents.general_prompt import _GENERAL_SYSTEM_TEMPLATE
-        from agents.house_prompt import _HOUSE_SYSTEM_TEMPLATE
-
-        subs = [
-            {
-                "name": "Dev",
-                "description": "Developer — pure implementer: receives specs and tasks from the orchestrator, writes clean tested TDD code, handles errors",
-                "system_prompt": _DEV_SYSTEM_TEMPLATE,
-                "tools": list(get_native_tool_names("developer")),
-                "model": "deepseek:v4.1-flash",
-            },
-            {
-                "name": "General",
-                "description": "General — non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder — code requests route back to Dev.",
-                "system_prompt": _GENERAL_SYSTEM_TEMPLATE,
-                "tools": list(get_native_tool_names("general")),
-                "model": "deepseek:v4.1-flash",
-            },
-            {
-                "name": "House",
-                "description": "House — home control specialist: reads and actuates the smart home via house_* tools (lights, climate, locks, plugs, blinds, cameras, scenes). NOT a coder — code requests route back to Dev.",
-                "system_prompt": _HOUSE_SYSTEM_TEMPLATE,
-                "tools": list(get_native_tool_names("house")),
-                "model": "deepseek:v4.1-flash",
-            },
-        ]
-        for s in subs:
-            # CF1: deterministic tool order — `set()` iteration is hash-randomized
-            # across processes, which would make each subagent SystemMessage bytes
-            # differ per restart/subprocess and silently invalidate the DeepSeek
-            # prefix cache. dict.fromkeys preserves first-occurrence order.
-            # D2: terminal-node subagents (Dev/General) get NO
-            # delegation tools — every prompt declares them terminal nodes and the
-            # orchestrator is the only delegator. general-purpose keeps them below.
-            s["tools"] = list(dict.fromkeys(s.get("tools", [])))
+        # CF1: deterministic tool order — `set()` iteration is hash-randomized
+        # across processes, which would make each subagent SystemMessage bytes
+        # differ per restart/subprocess and silently invalidate the DeepSeek
+        # prefix cache. dict.fromkeys preserves first-occurrence order.
+        for s in _workspace_entries():
             _SUBAGENTS_REGISTRY[s["name"]] = s
 
-        # Register explicit aliases for backward compatibility and tests.
-        # FreeAgent/general-purpose now resolve to the General subagent; its own
-        # node runs the loop, so these names only affect prompt/tool resolution.
-        aliases = {
-            "Vision": "General",
-            "FreeAgent": "General",
-            "general-purpose": "General",
-        }
-        for alias, base_name in aliases.items():
-            if base_name in _SUBAGENTS_REGISTRY:
-                alias_spec = dict(_SUBAGENTS_REGISTRY[base_name])
-                alias_spec["name"] = alias
-                _SUBAGENTS_REGISTRY[alias] = alias_spec
+        # Explicit aliases from the registry (Vision/FreeAgent/general-purpose
+        # -> General). Alias specs are copies so prompt/tool resolution matches.
+        from agents.workspace_registry import delegatable_specs
 
-        # True subagents (task-scoped specialists) from agents/specialists/*.json.
-        # Workspace agents above stay code-defined; specialists are config-driven
-        # (opencode-style). Missing/corrupt file is a silent no-op so the three
-        # workspace agents always come up.
-        for spec in _load_subagents_config():
+        for spec in delegatable_specs():
+            base_name = spec.runtime_name or spec.display
+            for alias in spec.aliases:
+                base = _SUBAGENTS_REGISTRY.get(base_name)
+                if base is not None:
+                    alias_spec = dict(base)
+                    alias_spec["name"] = alias
+                    _SUBAGENTS_REGISTRY[alias] = alias_spec
+
+        # True subagents (task-scoped specialists) from agents/specialists/*.json,
+        # normalized by the registry. Missing/corrupt files are a silent no-op so
+        # the workspace agents always come up.
+        for spec in _specialist_entries():
             _SUBAGENTS_REGISTRY[spec["name"]] = spec
     except Exception as e:
         print(f"Error loading modularized subagents: {e}")
-
-
-def _specialists_dir() -> str:
-    """Directory for per-specialist JSON files (agents/specialists/*.json)."""
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        "agents", "specialists",
-    )
-
-
-def _parse_specialist_entry(e: dict) -> dict | None:
-    """Normalize one raw JSON dict into a registry spec."""
-    if not isinstance(e, dict):
-        return None
-    name = str(e.get("name") or "").strip()
-    prompt = e.get("system_prompt")
-    if isinstance(prompt, list):
-        prompt = "\n".join(str(ln) for ln in prompt)
-    elif not isinstance(prompt, str):
-        prompt = ""
-    when_to_use = str(e.get("when_to_use") or "").strip()
-    tools = [str(t) for t in (e.get("tools") or [])]
-    if os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1":
-        # Headless eval: no human to answer ask_user (it would block to its
-        # timeout), so drop the interactive tools from every specialist spec.
-        tools = [t for t in tools if t not in ("ask_user", "propose_plan")]
-    skills = [str(s).strip() for s in (e.get("skills") or []) if str(s).strip()]
-    internal = bool(e.get("internal"))
-    spec = {
-        "name": name,
-        "kind": "subagent",
-        "internal": internal,
-        "description": when_to_use or "Specialist subagent.",
-        "when_to_use": when_to_use,
-        "system_prompt": prompt or "You are a specialized subagent.",
-        "tools": list(dict.fromkeys(tools)),
-        "skills": list(dict.fromkeys(skills)),
-        "backend": str(e.get("backend") or "").strip().lower(),
-    }
-    if e.get("model"):
-        spec["model"] = str(e["model"])
-    if not spec["name"]:
-        return None
-    # Internal specialists (Compactor) may have tools=[]; others need ≥1 tool.
-    if not spec["tools"] and not internal:
-        return None
-    return spec
-
-
-def _load_subagents_config() -> list[dict]:
-    """Load specialist specs from agents/specialists/*.json. Never raises."""
-    try:
-        import glob as _glob
-        import json as _json
-
-        out: list[dict] = []
-        spec_dir = _specialists_dir()
-        if os.path.isdir(spec_dir):
-            for path in sorted(_glob.glob(os.path.join(spec_dir, "*.json"))):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = _json.load(f)
-                    # Per-file format is a single spec dict; allow wrapped list too.
-                    entries: list[dict]
-                    if isinstance(data, dict) and "subagents" in data:
-                        entries = data.get("subagents") or []
-                    elif isinstance(data, dict) and data.get("name"):
-                        entries = [data]
-                    elif isinstance(data, list):
-                        entries = data
-                    else:
-                        continue
-                    for e in entries:
-                        spec = _parse_specialist_entry(e)
-                        if spec:
-                            out.append(spec)
-                except Exception as e:
-                    print(f"[SUBAGENT] {os.path.basename(path)} load skipped: {e}")
-            if out:
-                return out
-
-        return out
-    except Exception as e:
-        print(f"[SUBAGENT] specialists load skipped: {e}")
-        return []
 
 
 def _subagent_only_names() -> list[str]:
@@ -261,8 +249,10 @@ def call_subagent(name: str = "", task: str = "", action: str = "run",
     if a in ("run", "spawn"):
         if not name or not task:
             return "Error: call_subagent requires name and task."
-        if name not in allowed:
+        canonical = _canonical_subagent_name(name)
+        if not canonical or canonical not in allowed:
             return f"Error: Unknown subagent '{name}'. Available: {', '.join(allowed)}"
+        name = canonical
         if a == "run":
             return _TASK_TOOL_DELEGATE(name=name, task=task)
         # spawn: durable child + background first turn + context pack + skills.
@@ -405,11 +395,20 @@ def _specialist_call_backend(
     instance (tool-less specialists). The free pool keeps its single-turn
     ``(text, tool_calls, reasoning)`` triple (caller owns execution).
     """
-    # UI design parity: the UI specialist rides the Dev tier with full
-    # thinking — design taste is the whole point, so effort defaults to high.
-    if not reasoning_effort and str(name or "").strip().lower() in (
-        "ui", "ui-design", "design",
-    ):
+    # Thinking profile: an explicit caller override wins; otherwise the agent
+    # registry spec decides ("inherit" = built-in per-role mapping downstream).
+    if not reasoning_effort:
+        try:
+            from agents.workspace_registry import get_profile
+
+            _eff = str(get_profile(name).get("thinking") or "inherit").strip().lower()
+            if _eff and _eff != "inherit":
+                reasoning_effort = _eff
+        except Exception:
+            pass
+    # Legacy alias fallback (ui-design/"design" resolve to the UI spec's tier
+    # but are not registry keys themselves).
+    if not reasoning_effort and str(name or "").strip().lower() in ("ui-design", "design"):
         reasoning_effort = "high"
 
     if _specialist_backend(name) == "free":
@@ -419,12 +418,21 @@ def _specialist_call_backend(
         # failure — no silent paid fallback by design.
         from llm.free_providers import free_native_turn
 
+        prefer_reasoning = None
+        try:
+            from agents.workspace_registry import thinking_prefer_reasoning
+
+            prefer_reasoning = thinking_prefer_reasoning(reasoning_effort or "inherit")
+        except Exception:
+            prefer_reasoning = None
+
         return free_native_turn(
             name,
             messages,
             tools=native_tools or None,
             capability="coding",
             temperature=temp,
+            prefer_reasoning=prefer_reasoning,
         )
 
     if schema is not None:
@@ -466,13 +474,37 @@ def _specialist_call_backend(
         _spec_sys = None
     if isinstance(_spec_sys, list):
         _spec_sys = "\n".join(str(s) for s in _spec_sys)
+
+    # Per-run deps: registry compaction overrides + per-agent tool caps; the
+    # model context window is filled in by run_native_agent after resolution.
+    _deps = None
+    try:
+        from llm.deps import WorkspaceDeps
+
+        _deps = WorkspaceDeps.from_shared_state(role=name)
+        _profile = {}
+        try:
+            from agents.workspace_registry import get_profile
+
+            _profile = get_profile(name)
+        except Exception:
+            _profile = {}
+        if _profile.get("compaction"):
+            _deps.compaction = dict(_profile["compaction"])
+        if _profile.get("tool_caps"):
+            _deps.tool_caps = dict(_profile["tool_caps"])
+    except Exception:
+        _deps = None
+
     return run_native_agent(
         role=name,
         messages=list(messages),
         tools=native_tools,
+        model=model,
         temp=temp,
-        reasoning_effort=reasoning_effort,  # static per-role mapping applies downstream
+        reasoning_effort=reasoning_effort,
         where=where,
+        deps=_deps,
         system_prompt=_spec_sys or "You are a specialized subagent.",
     )
 
@@ -510,6 +542,81 @@ def _tool_in_scope(tool_name: str, tool_names: list) -> bool:
     return n in tool_names or not tool_names
 
 
+def _maybe_compact_free(name: str, messages: list, backend: str) -> None:
+    """Compact an over-budget specialist transcript on the free-pool path.
+
+    The paid native path gets compaction from the ProcessHistory capability;
+    free-pool turns are plain single-shot calls, so the spawner owns the
+    checkpoint. Mutates ``messages`` in place; never raises.
+    """
+    if backend != "free" or len(messages) < 4:
+        return
+    try:
+        from llm.model_history import compact_history_native, estimate_history_tokens
+        from memory.context_compaction import get_compaction_policy
+
+        overrides = {}
+        if _SUBAGENTS_REGISTRY:
+            overrides = (_SUBAGENTS_REGISTRY.get(name) or {}).get("compaction") or {}
+        policy = get_compaction_policy(str(name or "developer"))
+        try:
+            if overrides.get("checkpoint_tokens"):
+                policy = type(policy)(
+                    role=policy.role,
+                    checkpoint_trigger=int(overrides["checkpoint_tokens"]),
+                    hard_limit=int(overrides.get("hard_limit") or policy.hard_limit),
+                    summary_output_tokens=int(
+                        overrides.get("summary_output_tokens") or policy.summary_output_tokens
+                    ),
+                )
+        except Exception:
+            pass
+        # Free pool: clamp the checkpoint to what the likely top pool models
+        # can accept (pure ranking; ~150k trigger for the current top-3 coding
+        # set). A lower explicit spec override above still wins via min().
+        try:
+            from agents.workspace_registry import thinking_prefer_reasoning
+            from llm.compaction_native import clamp_policy
+            from llm.free_providers import likely_min_window
+
+            _thinking = str((_SUBAGENTS_REGISTRY.get(name) or {}).get("thinking") or "inherit")
+            _prefer = thinking_prefer_reasoning(_thinking)
+            policy = clamp_policy(
+                policy, likely_min_window("coding", prefer_reasoning=_prefer, top_n=3)
+            )
+        except Exception:
+            pass
+        if estimate_history_tokens(messages) < policy.checkpoint_trigger:
+            return
+
+        from llm.native_tools import _run_coro_blocking
+        from memory.compaction_engine import run_compaction_summary
+        from tools import shared_state
+
+        project_path = str(shared_state.get("project_path") or "")
+        engine = _run_coro_blocking(run_compaction_summary(list(messages), project_path)) or {}
+        summary = str(engine.get("summary") or "")
+        if not summary:
+            print(f"[SUBAGENT] {name}: compaction produced no summary — keeping transcript")
+            return
+        compacted = compact_history_native(
+            list(messages),
+            policy=policy,
+            full_project_map=str(engine.get("full_map") or "") or None,
+            summary_text=summary,
+            project_memory_text=str(engine.get("project_memory") or ""),
+            user_messages=list(engine.get("user_messages") or []),
+        )
+        messages[:] = compacted
+        print(
+            f"[SUBAGENT] {name}: compacted transcript "
+            f"({engine.get('chunks', 0)} chunk(s), via {engine.get('model')}, "
+            f"window {engine.get('window')})"
+        )
+    except Exception as e:
+        print(f"[SUBAGENT] {name}: free-path compaction skipped: {e}")
+
+
 def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     """Delegate a specialized subtask to a subagent with full tool access.
 
@@ -528,7 +635,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     from tools import (
         _HARNESS_ROOT,
         active_permissions,
-        execute_tool_detailed,
+        active_tool_caps,
         shared_state,
     )
     depth = _TASK_DEPTH.get()
@@ -538,9 +645,11 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     if not _SUBAGENTS_REGISTRY:
         _load_subagents()
 
-    if name not in _SUBAGENTS_REGISTRY:
+    canonical = _canonical_subagent_name(name)
+    if not canonical or canonical not in _SUBAGENTS_REGISTRY:
         allowed = ", ".join(_SUBAGENTS_REGISTRY.keys())
         return f"Error: Unknown subagent '{name}'. Available subagents: {allowed}"
+    name = canonical
 
     spec = _SUBAGENTS_REGISTRY[name]
     sys_prompt = spec.get("system_prompt", "You are a specialized subagent.")
@@ -584,68 +693,60 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
     depth_token = _TASK_DEPTH.set(depth + 1)
     token = active_permissions.set(perms)
+    caps_token = active_tool_caps.set(dict(spec.get("tool_caps") or {}) or None)
     try:
         chat_id = shared_state.get("chat_id", "default_chat")
-        if name == "Dev":
-            from agents.developer_agent import developer_node
-            from sync.state_sync import safe_update_state
-            
-            project_path = shared_state.get("project_path", _HARNESS_ROOT)
-            
-            dev_state = {
-                "client_request": task,
-                "tech_spec": shared_state.get("outputs", {}).get("tech_spec", ""),
-                "requirements": shared_state.get("outputs", {}).get("requirements", ""),
-                "project_path": project_path,
-                "chat_id": chat_id,
-                "error_count": 0,
-                "test_report": "",
-            }
-            
-            res_dict = developer_node(dev_state)
-            
-            # Sync outputs back to shared_state
-            if "code" in res_dict and res_dict["code"]:
-                safe_update_state({
-                    "outputs": {
-                        **shared_state.get("outputs", {}),
-                        "code": res_dict["code"],
-                        "test_report": res_dict.get("test_report", ""),
-                    }
-                })
-            
-            return _handoff(res_dict.get("agent_report") or res_dict.get("code") or "Developer completed execution.", "Dev")
 
-        # General routes through its own node (agents/general_agent.py) —
-        # dual-backend loop (deepseek flash or free providers), profile and
-        # chat-history injection, session logging. The old FreeAgent
-        # single-shot special case is gone: task('FreeAgent') now resolves to
-        # the General spec via the registry alias.
-        if name in ("General", "general-purpose", "FreeAgent"):
-            from agents.general_agent import general_node
+        # Workspace agents route through their own node (registry `runtime`):
+        # Dev (dynamic spec/requirements context), General and House (plain
+        # state). Specialists (kind="subagent") fall through to the generic
+        # native loop below.
+        if spec.get("kind") != "subagent" and spec.get("runtime"):
+            import importlib
             from sync.state_sync import safe_update_state
 
-            gen_state = {
+            _mod_name, _fn_name = str(spec["runtime"]).split(":", 1)
+            _node = getattr(importlib.import_module(_mod_name), _fn_name)
+            _project_path = shared_state.get("project_path", _HARNESS_ROOT)
+
+            if spec.get("state_builder") == "dev":
+                dev_state = {
+                    "client_request": task,
+                    "tech_spec": shared_state.get("outputs", {}).get("tech_spec", ""),
+                    "requirements": shared_state.get("outputs", {}).get("requirements", ""),
+                    "project_path": _project_path,
+                    "chat_id": chat_id,
+                    "error_count": 0,
+                    "test_report": "",
+                }
+                res_dict = _node(dev_state)
+
+                # Sync outputs back to shared_state
+                if "code" in res_dict and res_dict["code"]:
+                    safe_update_state({
+                        "outputs": {
+                            **shared_state.get("outputs", {}),
+                            "code": res_dict["code"],
+                            "test_report": res_dict.get("test_report", ""),
+                        }
+                    })
+
+                return _handoff(
+                    res_dict.get("agent_report") or res_dict.get("code")
+                    or f"{name} completed execution.",
+                    name,
+                )
+
+            plain_state = {
                 "client_request": task,
-                "project_path": shared_state.get("project_path", _HARNESS_ROOT),
+                "project_path": _project_path,
                 "chat_id": chat_id,
             }
-            res_dict = general_node(gen_state)
-            return _handoff(res_dict.get("agent_report") or "General completed with no output.", name)
-
-        # House routes through its own node (agents/house_agent.py) —
-        # home-control loop over the house_* tools, same shape as General.
-        if name == "House":
-            from agents.house_agent import house_node
-            from sync.state_sync import safe_update_state
-
-            house_state = {
-                "client_request": task,
-                "project_path": shared_state.get("project_path", _HARNESS_ROOT),
-                "chat_id": chat_id,
-            }
-            res_dict = house_node(house_state)
-            return _handoff(res_dict.get("agent_report") or "House completed with no output.", name)
+            res_dict = _node(plain_state)
+            return _handoff(
+                res_dict.get("agent_report") or f"{name} completed with no output.",
+                name,
+            )
 
         # All other subagents use the same native loop with a fresh transcript.
         resolved_task = task
@@ -658,7 +759,6 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
             TextPart,
             ThinkingPart,
             ToolCallPart,
-            ToolReturnPart,
             UserPromptPart,
         )
         messages: list = []
@@ -734,235 +834,88 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
         # There is no turn ceiling. Cancellation, provider failure, a final
         # response, or an explicit structured-output request are the lifecycle
         # boundaries; context checkpoints handle long transcripts.
-        content = ""
-        _sub_trouble = False
-        _last_tool_name = ""
+        # ── Subagent loop: single shared engine (agents/specialist_loop.py) ──
+        # There is no turn ceiling. Cancellation, provider failure, a final
+        # response, or an explicit structured-output request are the lifecycle
+        # boundaries; context checkpoints handle long transcripts.
         try:
-            sub_iter = 0
-            while True:
-                sub_iter += 1
-                # Call LLM
-                _effort = subagent_effort
-                res = _specialist_call_backend(
+            _backend = _specialist_backend(name)
+            # Per-turn deps (role + caller chat) so scope-aware tools
+            # (update_plan, vision) resolve the specialist, not the caller.
+            from agents.specialist_loop import (
+                SpecialistLoopHooks,
+                run_specialist_loop,
+                specialist_turn_deps,
+            )
+            _loop_deps = specialist_turn_deps(name)
+
+            def _task_backend(msgs, iteration, last_tool):
+                return _specialist_call_backend(
                     name,
-                    list(messages),
+                    msgs,
                     native_tools=native_tools,
                     schema=schema,
                     model=subagent_model,
-                    reasoning_effort=_effort,
-                    where=f"{name} iter {sub_iter}: {_last_tool_name or 'start'}",
+                    reasoning_effort=subagent_effort,
+                    where=f"{name} iter {iteration}: {last_tool or 'start'}",
                 )
 
-                # Extract response text
-                additional_kwargs = {}
-                reasoning = getattr(res, "reasoning_content", None)
+            def _task_execute(tc):
+                s = _subagent_execute_one(tc, tool_names, _loop_deps)
+                return (s, s, False)
+
+            def _task_append_final(transcript, text, reasoning):
+                _parts: list = []
                 if reasoning:
-                    additional_kwargs["reasoning_content"] = reasoning
+                    _parts.append(ThinkingPart(content=reasoning))
+                _parts.append(TextPart(content=text))
+                transcript.append(ModelResponse(parts=_parts))
 
-                # A5: native full turn — pydantic-ai executed the tools already.
-                # The slice (ModelResponse tool-calls + ModelRequest tool results)
-                # IS the execution record; extend history, log to the session, and
-                # finish when the model stopped calling tools.
-                _native_slice = None
-                if isinstance(res, tuple) and len(res) == 3 and _is_native_slice(res[1]):
-                    response_text, _native_slice, reasoning = res
-                    content = str(response_text or "")
-                    if reasoning:
-                        additional_kwargs["reasoning_content"] = reasoning
-                    messages.extend(_native_slice)
-                    _native_calls = [
-                        {"id": p.tool_call_id or "", "name": p.tool_name or ""}
-                        for m in _native_slice
-                        if isinstance(m, ModelResponse)
-                        for p in getattr(m, "parts", []) or []
-                        if isinstance(p, ToolCallPart)
-                    ]
-                    if sub_sess is not None:
-                        try:
-                            blocks = [{"type": "text", "text": content}]
-                            if reasoning:
-                                blocks.insert(0, {"type": "thinking", "thinking": reasoning})
-                            stop = "toolUse" if _native_calls else "stop"
-                            sub_sess.append_assistant(blocks, stop_reason=stop)
-                            for tc in _native_calls:
-                                sub_sess.append_tool_result(
-                                    "ok",
-                                    tool_call_id=tc.get("id", ""),
-                                    tool_name=tc.get("name", ""),
-                                    is_error=False,
-                                )
-                        except Exception:
-                            pass
-                    if _native_calls:
-                        # Native turn used tools; continue the loop so a final
-                        # no-tool turn produces the handoff.
-                        _last_tool_name = _native_calls[-1].get("name", "")
-                        continue
-                    break
-
-                if schema and hasattr(res, "model_dump_json"):
-                    content = res.model_dump_json()
-                    messages.append(ModelResponse(parts=[TextPart(content=content)]))
-                    if sub_sess is not None:
-                        try:
-                            sub_sess.append_assistant(content, stop_reason="stop")
-                        except Exception:
-                            pass
-                    break  # Structured output â†’ done
-                elif schema and hasattr(res, "json"):
-                    content = res.json()
-                    messages.append(ModelResponse(parts=[TextPart(content=content)]))
-                    if sub_sess is not None:
-                        try:
-                            sub_sess.append_assistant(content, stop_reason="stop")
-                        except Exception:
-                            pass
-                    break
-                else:
-                    # Native mode returns (text, native_tool_calls, reasoning)
-                    native_tool_calls = []
-                    if isinstance(res, tuple):
-                        if len(res) == 3:
-                            response_text, native_tool_calls, reasoning = res
-                        else:
-                            response_text, native_tool_calls = res
-                            reasoning = None
-                        if reasoning:
-                            additional_kwargs["reasoning_content"] = reasoning
-                    else:
-                        response_text = str(res)
-                    content = response_text
-
-                # Native tool calls only. Tool schemas and call arguments stay
-                # in the provider's structured API protocol.
-                tool_calls = []
-                for call_index, tc in enumerate(native_tool_calls or []):
-                    tname = tc.get("tool") or tc.get("name", "")
-                    if tname:
-                        tool_calls.append({
-                            "tool": tname,
-                            "args": tc.get("args") or {},
-                            "id": tc.get("id") or f"sub-{sub_iter}-{call_index + 1}",
-                        })
-
-                if not tool_calls:
-                    # No native tool calls: the subagent chose its final response.
-                    parts: list = []
-                    if additional_kwargs.get("reasoning_content"):
-                        parts.append(ThinkingPart(content=additional_kwargs["reasoning_content"]))
-                    parts.append(TextPart(content=content))
-                    messages.append(ModelResponse(parts=parts))
-                    if sub_sess is not None:
-                        try:
-                            blocks = [{"type": "text", "text": content}]
-                            if additional_kwargs.get("reasoning_content"):
-                                blocks.insert(0, {"type": "thinking",
-                                                  "thinking": additional_kwargs["reasoning_content"]})
-                            sub_sess.append_assistant(blocks, stop_reason="stop")
-                        except Exception:
-                            pass
-                    break
-
-                # Record the AI response (native: carry tool-call parts)
-                parts: list = []
-                if additional_kwargs.get("reasoning_content"):
-                    parts.append(ThinkingPart(content=additional_kwargs["reasoning_content"]))
-                if content:
-                    parts.append(TextPart(content=content))
-                for tc in tool_calls:
-                    parts.append(ToolCallPart(
+            def _task_append_calls(transcript, text, reasoning, calls):
+                _parts: list = []
+                if reasoning:
+                    _parts.append(ThinkingPart(content=reasoning))
+                if text:
+                    _parts.append(TextPart(content=text))
+                for tc in calls:
+                    _parts.append(ToolCallPart(
                         tool_name=tc["tool"],
                         args=tc.get("args") or {},
                         tool_call_id=tc.get("id", ""),
                     ))
-                messages.append(ModelResponse(parts=parts))
+                transcript.append(ModelResponse(parts=_parts))
 
-                # Child session log (P1): record the step's assistant message
-                if sub_sess is not None:
-                    try:
-                        blocks = [{"type": "text", "text": content}]
-                        if reasoning:
-                            blocks.insert(0, {"type": "thinking", "thinking": reasoning})
-                        sub_sess.append_assistant(blocks, stop_reason="toolUse")
-                    except Exception:
-                        pass
-
-                # Execute tools and collect results. Independent read-only calls
-                # (PARALLEL_SAFE) run concurrently; results stay in call order so
-                # the provider's call-id → result pairing is preserved.
-                # Out-of-scope tools are filtered BEFORE execution.
-                tool_results = []
-                structured_results = []
-                _sub_exec_pool = None
-                _sub_allowed = [c for c in tool_calls if _tool_in_scope(c.get("tool", ""), tool_names)]
-                try:
-                    from tools import run_tool_calls as _run_tool_calls
-                    _sub_exec_pool = _run_tool_calls(
-                        _sub_allowed,
-                        lambda tc: _subagent_execute_one(tc, tool_names),
-                    )
-                except Exception:
-                    _sub_exec_pool = []
-                _sub_result_by_id = {}
-                if len(_sub_exec_pool) == len(_sub_allowed):
-                    for _tc, _res in zip(_sub_allowed, _sub_exec_pool):
-                        _sub_result_by_id[str(_tc.get("id") or "")] = _res
-                for tc in tool_calls:
-                    tool_name = tc.get("tool", "")
-                    args = tc.get("args", {})
-                    _cid = str(tc.get("id") or "")
-                    if _cid in _sub_result_by_id:
-                        result = _sub_result_by_id[_cid]
-                    elif not _tool_in_scope(tool_name, tool_names):
-                        result = f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
-                    else:
-                        try:
-                            execution = execute_tool_detailed(tool_name, args)
-                            result = execution.content
-                        except Exception as e:
-                            result = f"ERROR: {str(e)[:200]}"
-
-                    result = str(result)
-                    tool_results.append(f"[{tool_name}] {result}")
-                    structured_results.append((tc, result))
-                    if sub_sess is not None:
-                        try:
-                            is_error = str(result).lstrip().startswith(("ERROR:", "[SKIPPED]", "Error:"))
-                            sub_sess.append_tool_result(
-                                result,
-                                tool_call_id=tc["id"],
-                                tool_name=tool_name,
-                                is_error=is_error,
-                            )
-                        except Exception:
-                            pass
-                    # Verification-before-DONE bookkeeping
-                    _last_tool_name = tool_name
-
-                # Feed every result back as a native ToolMessage. Never merge
-                # tool output into a synthetic human turn; the provider needs
-                # the call id to associate each result with its function call.
-                feedback = "\n".join(tool_results) if tool_results else "No tool results."
-                # Trouble signal → the NEXT turn diagnoses with the spec effort
-                _j = feedback.lower()
-                if any(k in _j for k in ("[error]", "[skipped]", "failed", "exception",
-                                         "traceback", "timeout", "not found", "cannot find module")):
-                    _sub_trouble = True
-                for tc, result in structured_results:
-                    messages.append(ModelRequest(parts=[ToolReturnPart(
-                        tool_name=str(tc.get("tool", "")),
-                        content=str(result),
-                        tool_call_id=str(tc["id"]),
-                    )]))
-
-                # Vision: drain tool-queued inline images into ONE user message.
-                try:
-                    from llm.deps import WorkspaceDeps
-                    _sub_deps = WorkspaceDeps.from_shared_state(role=name, chat_id=chat_id)
-                    from tools.vision_channel import drain_into_messages_native
-                    drain_into_messages_native(messages, header="[Inline image(s) from tool result]", ctx=_sub_deps)
-                except Exception:
-                    pass
+            _hooks = SpecialistLoopHooks(
+                id_prefix="sub",
+                parallel=True,
+                schema=schema,
+                raise_backend_errors=True,
+                note_vision=False,
+                scope_filter=lambda tc: (
+                    None
+                    if _tool_in_scope(tc.get("tool", ""), tool_names)
+                    else f"[SKIPPED] Tool '{tc.get('tool', '')}' not in subagent permissions."
+                ),
+                classify_error=lambda t, r: bool(r) or t.lstrip().startswith(
+                    ("ERROR:", "[SKIPPED]", "Error:")),
+                log_assistant=lambda b, s: sub_sess.append_assistant(
+                    b, stop_reason=s),
+                log_tool_result=lambda c, i, t, e: sub_sess.append_tool_result(
+                    c, tool_call_id=i, tool_name=t, is_error=e),
+                log_system=None,
+                append_final=_task_append_final,
+                append_with_calls=_task_append_calls,
+                compact=lambda t: _maybe_compact_free(name, t, _backend),
+                deps=_loop_deps,
+            )
+            _outcome = run_specialist_loop(
+                name=name,
+                transcript=messages,
+                backend_fn=_task_backend,
+                execute_fn=_task_execute,
+                hooks=_hooks,
+            )
+            content = _outcome.content
 
             # No budget checks here; subagents are managed by LoopGuard and structural loops.
 
@@ -975,6 +928,7 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
 
     finally:
         active_permissions.reset(token)
+        active_tool_caps.reset(caps_token)
         _TASK_DEPTH.reset(depth_token)
 
     # Specialist subagents (kind="subagent"): the final assistant message IS
@@ -988,25 +942,13 @@ def task(name: str, task: str, reasoning_effort: Optional[str] = None) -> str:
     # eats a multi-KB dump.
     return _handoff(content, name)
 
-def _is_native_slice(second: list) -> bool:
-    """True when a backend result's 2nd element is a transcript slice
-    (native full turn) rather than a list of tool-call dicts (free
-    single-turn triple)."""
-    try:
-        from pydantic_ai.messages import ModelRequest as _MR, ModelResponse as _MS
-        for m in (second or [])[:2]:
-            if isinstance(m, (_MR, _MS)):
-                return True
-            if isinstance(m, dict) and ("tool" in m or "name" in m):
-                return False
-        return False
-    except Exception:
-        return False
+# _is_native_slice lives in agents/specialist_loop.py (single shared copy).
 
 
-def _subagent_execute_one(tool_call: dict, tool_names: list) -> str:
-    """Thread-pool worker for a subagent's parallel read-only batch. Only
-    PARALLEL_SAFE tools reach this path (enforced by run_tool_calls)."""
+def _subagent_execute_one(tool_call: dict, tool_names: list, deps=None) -> str:
+    """Thread-pool worker for a subagent's parallel batch. Only PARALLEL_SAFE
+    tools reach this path (enforced by run_tool_calls). ``deps`` carries the
+    specialist identity so scope-aware tools resolve it (None = parent)."""
     tool_name = str(tool_call.get("tool", "") or "")
     args = tool_call.get("args") or {}
     if not isinstance(args, dict):
@@ -1015,7 +957,7 @@ def _subagent_execute_one(tool_call: dict, tool_names: list) -> str:
         return f"[SKIPPED] Tool '{tool_name}' not in subagent permissions."
     try:
         from tools import execute_tool_detailed
-        execution = execute_tool_detailed(tool_name, args)
+        execution = execute_tool_detailed(tool_name, args, deps=deps)
         return str(execution.content)
     except Exception as e:
         return f"ERROR: {str(e)[:200]}"

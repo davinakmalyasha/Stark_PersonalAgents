@@ -3,7 +3,7 @@ Skills warehouse.
 
 Stage 1 of the mature-harness gap mega-plan. Per the user's direction:
 "warehouse... but don't wire to anything yet, because i want to fill it later
-since skill is going to be use by subagents (anything below dev, ui, deploy
+since skill is going to be use by subagents (anything below dev, ui, devops
 subagents, so ui subagents later will get a skill stuff)".
 
 What this module does:

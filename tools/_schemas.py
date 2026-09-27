@@ -8,6 +8,41 @@ The facade imports these values back so existing callers continue to use
 tools.TOOL_DEFINITIONS, tools._TOOL_DOCS, and tools._TOOL_REQUIRED_ARGS.
 """
 
+# Scope ACL + delegatable-agent text — single source of truth is
+# agents/workspace_registry.py. The registry module is loaded by file path
+# (bypassing agents/__init__ so the tools<->agents cycle cannot trigger during
+# bootstrap). A registry failure fails loud.
+def _load_agent_registry():
+    import importlib.util
+    import sys as _sys
+
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _reg_path = os.path.join(_here, "..", "agents", "workspace_registry.py")
+    _spec = importlib.util.spec_from_file_location("_workspace_registry", _reg_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _sys.modules["_workspace_registry"] = _mod
+    _spec.loader.exec_module(_mod)
+    return _mod
+
+
+_AGENT_REGISTRY = _load_agent_registry()
+_SCOPE_MAP: dict[str, list[str]] = dict(_AGENT_REGISTRY.scope_map())
+
+_DELEGATE_SPECS = _AGENT_REGISTRY.delegatable_specs()
+_DELEGATE_DISPLAYS = [s.display for s in _DELEGATE_SPECS]
+_DELEGATE_AGENTS_TEXT = " / ".join(_DELEGATE_DISPLAYS)
+_DELEGATE_ENUM = list(_DELEGATE_DISPLAYS)
+_DELEGATE_SOLO = ", ".join(f"just {d}" for d in _DELEGATE_DISPLAYS[:-1]) + (
+    f", or just {_DELEGATE_DISPLAYS[-1]}" if len(_DELEGATE_DISPLAYS) > 1 else ""
+)
+_DELEGATE_MIXED = ", ".join(
+    f"{_DELEGATE_DISPLAYS[0]} + {d}" for d in _DELEGATE_DISPLAYS[1:]
+) + (", all three" if len(_DELEGATE_DISPLAYS) == 3
+     else f", all {len(_DELEGATE_DISPLAYS)}")
+_DELEGATE_AGENT_DESC = "Target workspace agent. " + "; ".join(
+    f"{s.display} {s.delegate_blurb or s.description}" for s in _DELEGATE_SPECS
+) + ". Case-insensitive."
+
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
@@ -25,17 +60,6 @@ TOOL_DEFINITIONS = [
                 "limit": {"type": "integer", "description": "Max lines."}
             },
             "required": []
-        }
-    },
-    {
-        "name": "outline",
-        "description": "Signature outline of ONE file — every function/class/method with its definition line, bodies omitted (~1/10 the tokens of a full read). Use before read_file: pick the symbol here, then read_file(offset=line, limit=N) for just its body.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "File to outline."}
-            },
-            "required": ["file_path"]
         }
     },
     {
@@ -361,11 +385,25 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "update_plan",
-        "description": "Maintain the plan dock. Call when jobs change (spawn, progress, abort). FULL REPLACEMENT each call: send every step with its current status; at most one in_progress. Settled jobs use status=completed — put the reason in the step text when not successful.",
+        "description": "Maintain the plan dock. Call when jobs change (spawn, progress, abort). FULL REPLACEMENT each call: send every step with its current status; at most one in_progress. Settled jobs use status=completed — put the reason in the step text when not successful. For small tweaks use ops instead of resending everything (mutually exclusive with plan): [{op, match?, step?, status?}] with op=add (needs step) | set_status (needs match+status) | rename (needs match+step) | remove (needs match); match is a case-insensitive substring of the step text.",
         "parameters": {
             "type": "object",
             "properties": {
                 "explanation": {"type": "string", "description": "Short note shown above the plan (e.g. 'Spawned 3 jobs, waiting for results'). Keep to one line."},
+                "ops": {
+                    "type": "array",
+                    "description": "Incremental patch (alternative to plan).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": ["add", "set_status", "rename", "remove"], "description": "Patch operation."},
+                            "match": {"type": "string", "description": "Case-insensitive substring of the step text (set_status/rename/remove)."},
+                            "step": {"type": "string", "description": "Step text (add, or rename's new text)."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Status (add/set_status)."}
+                        },
+                        "required": ["op"]
+                    }
+                },
                 "plan": {
                     "type": "array",
                     "minItems": 1,
@@ -383,7 +421,7 @@ TOOL_DEFINITIONS = [
                     }
                 }
             },
-            "required": ["plan"]
+            "required": []
         }
     },
     {
@@ -416,7 +454,18 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "delegate",
-        "description": "Spawn one or more workspace agents (Dev / General / House) IN PARALLEL. Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\nBATCHING — per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. Any agent mix is allowed and runs in parallel — solo scope (just Dev, just House, or just General) or mixed (Dev + House, Dev + General, all three). The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing — one call, all independent items.\n\nCHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat — so never guess an id.",
+        "description": (
+            f"Spawn one or more workspace agents ({_DELEGATE_AGENTS_TEXT}) IN PARALLEL. "
+            "Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\n"
+            "BRIEF — you define WHAT, never HOW. Each item carries outcome (what Sir gets when it is done, in Sir's terms) and acceptance (how success will be judged — observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if Sir named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each — if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\n"
+            "BATCHING — per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. "
+            f"Any agent mix is allowed and runs in parallel — solo scope ({_DELEGATE_SOLO}) or mixed ({_DELEGATE_MIXED}). "
+            "The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing — one call, all independent items.\n\n"
+            "EFFORT — match effort to the request: one job for a simple ask, 2-4 for comparisons, more ONLY when directions are truly independent. Jobs beyond the parallel cap wait as 'queued' and start automatically — never flood the system.\n\n"
+            "RESULTS — each job's final reply arrives as a [DELEGATION RESULT] summary (plus its artifact path and, when set, acceptance). Drill into the full report with delegation_status(id=...) when needed; never paste reports into your reply.\n\n"
+            "CHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat — so never guess an id.\n\n"
+            "RESUME — project continues a REGISTERED project's durable Dev session instead of starting a new chat. When the request is a follow-up, bug fix, or new work on an EXISTING project and you have no chat_id from a prior [DELEGATION RESULT] in this session, pass project=<name> (agent must be Dev or omitted) instead of workspace/chat_id. The message goes to the project's durable Dev in its own project chat — nothing new is created — and the completion arrives as a [DELEGATION RESULT] like any other job. Unknown names return [NOT FOUND] with the available names — never guess. Omit project for genuinely new work."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -427,10 +476,14 @@ TOOL_DEFINITIONS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "agent": {"type": "string", "enum": ["Dev", "General", "House"], "description": "Target workspace agent. Dev builds/fixes software; General handles research, docs, images, personal notes/admin; House controls smart-home devices. Case-insensitive."},
-                            "task": {"type": "string", "description": "Complete, self-contained instruction: goal, relevant paths/targets, constraints, and how to verify success. The agent sees only this text. Context, not method — do not prescribe step-by-step process."},
+                            "agent": {"type": "string", "enum": _DELEGATE_ENUM, "description": _DELEGATE_AGENT_DESC},
+                            "task": {"type": "string", "description": "Complete, self-contained instruction: goal, relevant paths/targets, constraints. The agent sees only this text. Context, not method — do not prescribe step-by-step process (use outcome/acceptance for the WHAT)."},
+                            "outcome": {"type": "string", "description": "What Sir gets when this job is done — the visible result, in Sir's terms, 1-2 sentences. WHAT, never HOW: no libraries, frameworks, architecture, step lists, or design direction. Real paths Sir named are fine as targets; invented ones are not."},
+                            "acceptance": {"type": "string", "description": "How success will be judged — observable evidence (a behavior, a result, something that must exist or respond). Not internals. Name a command only if Sir named it or it is the project's standard entry point. The specialist chooses how to meet and prove it."},
+                            "timeout": {"type": "integer", "minimum": 0, "description": "Wall-clock seconds before the job is aborted and marked FAILED (default 3600; 0 = no limit). Fresh jobs only."},
                             "title": {"type": "string", "description": "Short label for the delegation chat (e.g. 'Space game · Dev')."},
                             "chat_id": {"type": "string", "description": "Omit for a new chat. Set ONLY with a chat_id surfaced by an earlier [DELEGATION RESULT] in this session — never guess. Unknown ids silently start a new chat."},
+                            "project": {"type": "string", "description": "Registered project name (fuzzy match, e.g. 'my-app'). Set this INSTEAD of workspace/chat_id to continue the project's durable Dev session in its own project chat — no new tab is created. Only with agent Dev (or omitted)."},
                             "workspace": {"type": "string", "description": "Workspace id, folder path, or name. Omit to use the default: current project for Dev, General workspace for General, House workspace for House."},
                             "images": {"type": "array", "items": {"type": "string"}, "description": "Absolute file paths of image attachments relevant to THIS item. Missing files are silently dropped, so only attach paths you have verified exist."}
                         },
@@ -440,14 +493,19 @@ TOOL_DEFINITIONS = [
                     "examples": [
                         {
                             "items": [
-                                {"agent": "Dev", "task": "Build a snake game in Python with tests", "title": "Snake game · Dev"},
-                                {"agent": "House", "task": "Turn off the living room lights", "title": "Lights off · House"},
-                                {"agent": "General", "task": "Save a journal note: shipped v0.1", "title": "Note · General"}
+                                {"agent": "Dev", "task": "Build a snake game in Python with tests", "title": "Snake game · Dev", "outcome": "A playable snake game that starts with one command and keeps a high score.", "acceptance": "The game starts and is playable; the project's test command passes."},
+                                {"agent": "House", "task": "Turn off the living room lights", "title": "Lights off · House", "outcome": "Living room lights are off.", "acceptance": "The living room light reports power=off."},
+                                {"agent": "General", "task": "Save a journal note: shipped v0.1", "title": "Note · General", "outcome": "The note is saved in the journal.", "acceptance": "Searching the journal for 'shipped v0.1' finds the note."}
                             ]
                         },
                         {
                             "items": [
-                                {"agent": "Dev", "task": "Fix the login crash (regression from PR #42)", "title": "Login crash fix", "chat_id": "<id from prior [DELEGATION RESULT]>"}
+                                {"agent": "Dev", "task": "Fix the login crash (regression from PR #42)", "title": "Login crash fix", "chat_id": "<id from prior [DELEGATION RESULT]>", "outcome": "Login no longer crashes.", "acceptance": "Logging in with valid credentials reaches the home screen; the project's test command passes."}
+                            ]
+                        },
+                        {
+                            "items": [
+                                {"agent": "Dev", "task": "Fix the login crash on the settings screen and add a regression test", "title": "Login crash fix", "project": "my-app"}
                             ]
                         }
                     ]
@@ -458,24 +516,39 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "delegation_status",
-        "description": "List all delegations spawned this session with live statuses (running / done / failed) and their chat ids. Call when you need to know what is still outstanding — typically before a wrap-up summary, after a long wait, or when you are unsure whether everything has settled.",
+        "description": "List all delegations spawned this session with live statuses (queued / running / done / failed / cancelled) and their chat ids. Call when you need to know what is still outstanding — typically before a wrap-up summary, after a long wait, or when you are unsure whether everything has settled. Pass id for ONE job's full evidence bundle (task, outcome, acceptance, full report, recent chat, file digest); wait_seconds (0-300) waits briefly for a job first; status filters the board.",
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "id": {"type": "string", "description": "Job id (del-xxxx) for the full evidence bundle of one job. Omit for the board."},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 300, "description": "Wait up to this long for a job before answering (default 0 = answer now)."},
+                "status": {"type": "string", "enum": ["queued", "running", "done", "failed", "cancelled"], "description": "Board filter: only show jobs in this state."}
+            },
             "required": []
         }
     },
     {
-        "name": "resume_project",
-        "description": "Resume an existing project's durable Dev agent in one call: resolves the project by name/path and delivers the follow-up message. Replaces find_project_dev + send_message + list_agents. If the project is not found, returns [NOT FOUND] with available names.",
+        "name": "job_message",
+        "description": "Steer a RUNNING delegation mid-flight when Sir adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Project name or folder path (fuzzy match, e.g. 'my-app')."},
-                "message": {"type": "string", "description": "Follow-up instruction to deliver to the project's Dev agent."},
-                "timeout": {"type": "integer", "description": "Seconds to wait for the reply (default 1800)."}
+                "job_id": {"type": "string", "description": "Job id (del-xxxx) from delegate or delegation_status."},
+                "message": {"type": "string", "description": "Steering message: the added scope or direction change."}
             },
-            "required": ["name", "message"]
+            "required": ["job_id", "message"]
+        }
+    },
+    {
+        "name": "job_cancel",
+        "description": "Cancel ONE running delegation when Sir says stop. Fresh jobs: cooperative abort of the job chat. Resume jobs: interrupt of the durable Dev child. Settles the entry as CANCELLED and reports back as a [DELEGATION RESULT]. Already-settled jobs are a no-op.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Job id (del-xxxx) from delegate or delegation_status."},
+                "reason": {"type": "string", "description": "One-clause reason shown in the wrap-up (default: cancelled by Sir)."}
+            },
+            "required": ["job_id"]
         }
     },
     {
@@ -484,7 +557,7 @@ TOOL_DEFINITIONS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Subagent type from the Subagents list, e.g. UI | Deploy. Required for run/spawn."},
+                "name": {"type": "string", "description": "Subagent type from the Subagents list, e.g. UI | DevOps. Required for run/spawn."},
                 "task": {"type": "string", "description": "Goal + targets (files/URL/repo) + acceptance check + constraints. Context, not method — do not prescribe design direction or step-by-step process. Required for run/spawn."},
                 "action": {"type": "string", "enum": ["run", "spawn", "status", "message", "stop", "list"], "default": "run", "description": "Lifecycle action (default run)."},
                 "child_id": {"type": "string", "description": "Spawned child id (from action=spawn) for status/message/stop."},
@@ -596,7 +669,6 @@ TOOL_DEFINITIONS = [
 
 _TOOL_DOCS = {
     "read_file": "read_file(file_path?, file_paths?, offset?, limit?) — Read one file, or batch several via file_paths in ONE call ([FILE] sections; offset 1-based, applies per file in a batch). Full read returns first page + header; PARTIAL -> page with offset/limit; unchanged repeat -> cached stub.",
-    "outline": "outline(file_path) — Every signature in one file with definition lines, no bodies (~1/10 the tokens). Then read_file(offset=line, limit=N) for one body.",
     "edit_file": "edit_file(file_path, old_string?, new_string?, diff?, verify?) — A: old_string+new_string = targeted unique replace; B: new_string only = create/overwrite whole file; C: diff = '*** Add/Update/Delete/Move File' headers (optional *** Begin Patch/End Patch) with @@ hunks: '-' removed, '+' added, ' ' context anchors (numbers optional). verify=py_compile|tsc|shell after write.",
     "run_command": "run_command(command, timeout?, idle_timeout?, background?, process_action?, workdir?, expect?, tail_lines?, ready_timeout?, input?) — Git Bash (POSIX): pipes, &&, $( ), jq, gh. timeout ms (default 120000; <1000 = seconds; max 600000); idle_timeout kills commands idle by output AND CPU (default 60000; 0 = off); server-like/busy commands auto-background on timeout. process_action=list|logs|kill|wait|ready|send|kill_all. background+expect waits for readiness and reports the listening URL. workdir sets cwd, expect checks output regex.",
     "search_code": "search_code(pattern?, patterns?, path?, glob?, mode?, output?, ignore_case?, smart_case?, word?, fixed_strings?, context?, max_matches?, annotate?, snippet?) — Regex search (content) or filename search. output=lines|files|count; results annotated with enclosing symbol; snippet=function returns the body; up to 100 lines shown (full list in scratch).",
@@ -613,14 +685,15 @@ _TOOL_DOCS = {
     "create_docx": "create_docx(file_path, title?, content?) — Create a Word document (.docx).",
     "create_xlsx": "create_xlsx(file_path, headers, rows) — Create an Excel spreadsheet (.xlsx).",
     "read_pdf": "read_pdf(file_path, max_pages?, page_numbers?) — Read text from a PDF file.",
-    "delegate": "delegate(items=[{agent, task, title?, chat_id?}]) — Spawn Dev/General/House agents IN PARALLEL; each gets its own chat, results arrive as [DELEGATION RESULT] events.",
-    "delegation_status": "delegation_status() — List this session's delegations with live statuses and chats.",
+    "delegate": f"delegate(items=[{{agent, task, outcome?, acceptance?, timeout?, title?, chat_id?, project?, workspace?, images?}}]) — Spawn {'/'.join(_DELEGATE_DISPLAYS)} agents; each gets its own chat (project=<name> continues a registered project's durable Dev in its own chat instead). outcome/acceptance define WHAT success is — never method. Results arrive as [DELEGATION RESULT] summaries + artifact paths; drill in with delegation_status(id).",
+    "delegation_status": "delegation_status(id?, wait_seconds?, status?) — Board of this session's delegations (queued/running/done/failed/cancelled) with chats and elapsed time; id=<del-id> drills into one job's full evidence (task, outcome, acceptance, full artifact report, recent chat, file digest).",
+    "job_message": "job_message(job_id, message) — Steer a RUNNING delegation mid-flight (fresh: steering channel; resume: durable Dev FIFO). Running jobs only; never blocks.",
+    "job_cancel": "job_cancel(job_id, reason?) — Cancel ONE running delegation (fresh: abort; resume: interrupt). Reports back as [DELEGATION RESULT] CANCELLED.",
     "call_subagent": "call_subagent(name, task, action?, child_id?, message?, wait_seconds?) — Specialist subagent lifecycle: run (block) / spawn (background) / status / message / stop / list (e.g. UI for browser verification).",
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
     "create_project": "create_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
-    "resume_project": "resume_project(name, message, timeout?) — One-call resume: find the project's Dev and deliver the message (replaces find_project_dev + send_message).",
-    "update_plan": "update_plan(explanation?, plan=[{step, status}]) — Maintain the task plan. FULL replacement: always send every step. At most one step in_progress.",
+    "update_plan": "update_plan(explanation?, plan?, ops?) — Maintain the task plan. FULL replacement: always send every step (at most one in_progress), or patch small tweaks via ops=[{op: add|set_status|rename|remove, match?, step?, status?}] (mutually exclusive with plan).",
     "house_get_state": "house_get_state() — Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question.",
     "house_get_device": "house_get_device(device_id) — One device's state, capabilities, room, online status.",
     "house_set_device": "house_set_device(device_id, state) — Actuate a device: light {power,brightness,colorTemp}, thermostat {targetTemp,mode}, lock {locked}, plug {power}, blinds {position}, camera {recording}. Sensors read-only.",
@@ -665,7 +738,7 @@ _EVAL_BLOCKED_TOOLS = {"ask_user", "propose_plan"}
 def _eval_blocked(name: str) -> bool:
     """True for tools no agent may be offered in a headless eval run.
 
-    Specialist subagents (UI/Deploy) carry their own tool allow-lists from
+    Specialist subagents (UI/DevOps) carry their own tool allow-lists from
     agents/specialists/*.json, which bypass the developer-scope exclusion.
     Without a human connected, an ask_user call would block until its timeout,
     so the tools are removed for every scope while DEEP_AGENTS_EVAL_RUN=1.
@@ -705,25 +778,8 @@ def get_native_tools(scope: Optional[str] = None) -> list[dict]:
         pass
     return sorted(tools, key=lambda t: t["function"]["name"])
 
-# Scope ACL — single source of truth is agents/workspace_registry.py.
-# B1: the hand-copied literal fallback is removed. The registry module is
-# loaded by file path (bypassing agents/__init__ so the tools<->agents cycle
-# cannot trigger during bootstrap). A scope-map failure fails loud.
-def _load_registry_scope() -> dict[str, list[str]]:
-    import importlib.util
-    import os
-    import sys as _sys
-
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _reg_path = os.path.join(_here, "..", "agents", "workspace_registry.py")
-    _spec = importlib.util.spec_from_file_location("_workspace_registry", _reg_path)
-    _mod = importlib.util.module_from_spec(_spec)
-    _sys.modules["_workspace_registry"] = _mod
-    _spec.loader.exec_module(_mod)
-    return dict(_mod.scope_map())
-
-
-_SCOPE_MAP: dict[str, list[str]] = _load_registry_scope()
+# Scope ACL + delegatable text are derived at the top of this module from
+# agents/workspace_registry.py (single source of truth; see _AGENT_REGISTRY).
 
 
 def get_native_tool_names(scope: Optional[str] = None) -> list[str]:

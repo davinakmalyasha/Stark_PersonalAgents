@@ -97,7 +97,7 @@ that with `K6_TARGET_RPS` set, and sign off the capacity artifact before launch.
 
 | tool            | purpose |
 |-----------------|---------|
-| `github_apply_gate`      | CI/deploy gate: seed tiered workflows (T1 fast-checks / T2 staging / T3 release-heavy), branch ladder, prod branch protection. Agent-visible (Deploy scope). |
+| `github_apply_gate`      | CI/deploy gate: seed tiered workflows (T1 fast-checks / T2 staging / T3 release-heavy), branch ladder, prod branch protection. Agent-visible (DevOps scope). |
 | `github_apply_observability` | RUNTIME scaffold (health/ready + JSON logging + DSN-dormant Sentry). Warehouse-only — NOT in any agent scope; a future devops subagent calls it. Run before go-live so T2/T3 live-smoke has a real `/ready`. |
 
 Runtime vs CI separation: `github_apply_gate` installs *checks that run on GitHub*;

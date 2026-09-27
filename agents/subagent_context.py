@@ -1,6 +1,6 @@
 """Subagent context pack — bounded project context for specialist subagents.
 
-Specialist subagents (UI, Deploy, …) are spawned with only a task string
+Specialist subagents (UI, DevOps, …) are spawned with only a task string
 today, so they re-discover the workspace from scratch. This module assembles a
 compact context block once at spawn time:
 
@@ -43,12 +43,17 @@ def _read_parent_state() -> dict:
         return {}
 
 
-def _read_plan(state: dict) -> str:
+def _read_plan(state: dict, name: str = "") -> str:
     try:
         from tools import get_plan_for_context
+        from agents.workspace_registry import get_spec
+
+        spec = get_spec(name) if name else None
+        scope = (spec.plan_scope if spec and spec.plan_scope else "developer")
         chat_id = str(state.get("chat_id") or "")
-        # The parent that spawns specialists is the Developer workspace agent.
-        return str(get_plan_for_context("developer", chat_id) or "").strip()
+        # The parent that spawns specialists is the Developer workspace agent;
+        # the registry's plan_scope names the plan owner for each specialist.
+        return str(get_plan_for_context(scope, chat_id) or "").strip()
     except Exception:
         return ""
 
@@ -91,7 +96,7 @@ def build_context_pack(name: str = "", max_chars: int = 60000) -> str:
     if goal:
         sections.append("## Parent goal (in progress)\n" + goal[:4000])
 
-    plan = _read_plan(state)
+    plan = _read_plan(state, name)
     if plan:
         sections.append("## Parent plan\n" + plan)
 

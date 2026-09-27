@@ -176,9 +176,14 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
                 "verify. UI's `## Design` decisions stand until the human overrides.\n"
                 "- Feature work inside an existing design system stays with you "
                 "(follow `## Design`).\n"
-                "- Go-live, production hardening, the CI/security gate, branch "
-                "ladder/protection, or deploy configs belong to Deploy: delegate it "
-                "with repo/host + acceptance check in the task, keep coding."
+                "- Verification + go-live, production hardening, the CI/security gate, branch "
+                "ladder/protection, or deploy configs belong to DevOps: delegate it "
+                "with repo/host + acceptance check in the task, keep coding.\n"
+                "- Codebase recon — where something lives or is used, a cross-file "
+                "flow trace, an unfamiliar subsystem, pre-plan evidence — belongs to "
+                "Explore: spawn it with one focused question and keep working; it is "
+                "read-only and returns file:line evidence. Read directly only for "
+                "small, known targets."
             )
     except Exception as e:
         print(f"Error rendering subagent catalog: {e}")
@@ -921,7 +926,6 @@ def developer_node(s: ITState) -> dict:
                     _dev_plan = get_role_plan("Developer")
                 except Exception:
                     _dev_plan = {}
-                reasoning_effort = "high"
                 reasoning_budget = None
 
                 if str(_dev_plan.get("backend")) == "free":
@@ -947,7 +951,6 @@ def developer_node(s: ITState) -> dict:
                         messages=list(run_messages),
                         tools=native_dev_tools,
                         temp=0.2,
-                        reasoning_effort=reasoning_effort,
                         reasoning_budget=reasoning_budget,
                         where=where_tag,
                         deps=run_deps,

@@ -12,7 +12,7 @@
 
 ## Parameters (JSON Schema)
 
-  - `name` (string, optional): Subagent type from the Subagents list, e.g. UI | Deploy. Required for run/spawn.
+  - `name` (string, optional): Subagent type from the Subagents list, e.g. UI | DevOps. Required for run/spawn.
   - `task` (string, optional): Goal + targets (files/URL/repo) + acceptance check + constraints. Context, not method — do not prescribe design direction or step-by-step process. Required for run/spawn.
   - `action` (string, optional): Lifecycle action (default run).
   - `child_id` (string, optional): Spawned child id (from action=spawn) for status/message/stop.

@@ -3,8 +3,10 @@
   "kind": "subagent",
   "when_to_use": "Frontend/UI design owner — greenfield UI, redesign, design system, visual direction — and the browser/UI verifier (navigate, click, fill, extract, screenshot). Delivers real frontend artifacts and owns the `## Design` section of .agent-memory/project.md; not for feature work inside an existing design system (Dev does that, following `## Design`).",
   "backend": "deepseek",
+  "thinking": "high",
+  "provider_tier": "workspace",
   "skills": ["ui-ux-pro-max", "agent-browser", "emil-design-eng"],
-  "tools": ["browser_act", "read_file", "search_code", "run_command", "edit_file", "ask_user"],
+  "tools": ["browser_act", "read_file", "search_code", "run_command", "edit_file", "ask_user", "update_plan"],
   "system_prompt": [
     "# UI — FRONTEND DESIGN & VERIFICATION SPECIALIST",
     "",
@@ -21,6 +23,8 @@
     "- `.agent-memory/project.md` — the standing Identity/Design contract.",
     "- A real browser (`browser_act`): navigate, interact, extract, screenshot; screenshots arrive as images you can see.",
     "- MCP: component-registry tools (shadcn) appear in your tool list when the project uses components.json; prefer them over pasting components in real React/Tailwind work.",
+    "",
+    "- Multi-step work: keep a live plan with update_plan (full replacement, one step in_progress) so follow-up turns resume where you left off.",
     "",
     "Report back: what you did, exact observations (commands, URLs, values, file/screenshot paths), pass/fail per criterion, blockers."
   ]

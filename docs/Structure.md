@@ -52,7 +52,7 @@ you type "fix this bug"
   │ · the framework (pydantic-ai) runs their loop internally: model asks → tool   │
   │   runs → result returns → model asks again … until done                       │
   │ · worker node = one uniform callable (scheduler/Telegram/CLI all reuse it)    │
-  │ · durable child sessions (cont-) + specialist JSON profiles (UI/Deploy)       │
+  │ · durable child sessions (cont-) + specialist JSON profiles (UI/DevOps)      │
   └──────────────────────────────────┬────────────────────────────────────────────┘
                                      │ "I need to edit a file / run a command"
                                      ▼

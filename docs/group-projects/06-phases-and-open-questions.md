@@ -59,15 +59,15 @@ Each phase has a **test project** that must pass before the next begins. Test pr
 
 ---
 
-### Phase 3 — Discoverability
+### Phase 3 — Discoverability  ✅ BUILT
 
-| | |
-|---|---|
-| **Scope** | Steps 7–9. `plan_execution`, the op tool surface, `@task`, MCP/skill overlay, member toolset, routing regression test. |
-| **Why** | Without this the feature exists but you have to know it exists. |
-| **Test project** | **`synthetic-vault`** — a project needing a capability that is *not* currently in the agent's scope, e.g. attaching an MCP server so a member can query issue data. Assert: `attach_mcp` makes the tool visible to exactly that project; `plan_execution` returns `group` for it; the routing test passes in both directions. |
-| **Gate** | The routing regression test (`03` §2.3) passes, **including negative cases**. `@task` skips detection. An attached MCP tool is visible to exactly one member and not to others. |
-| **Effort** | Medium, but this is the phase where prompt engineering matters most. |
+**Build record: `03-orchestrator-tools.md` §12.** The copy boundary this phase was gated on is settled at `01` §13 — **option A**, decided by what Phase 2 built.
+
+**Status: done — gate met.** `pytest tests/ -q` → **229 passed, 0 failed** (+18 over Phase 2). Routing is a tool call with a rationale and a deterministic classifier (12/12 on the case set, negatives included); `@task` forces without re-routing; capability changes reach the folder and only their own project.
+
+**A real bug was caught by the gate test:** the portability check's Windows-path regex matched the `s:/` inside `https://`, so *every* project with an MCP server would have been rejected as non-portable. Also fixed: `_verify` demanded a runner it did not need, and `CAPABILITY_CHANGED` was writable but not reducible.
+
+**Honest limit:** the routing test asserts the deterministic **classifier**, not a model's choice — a routing test that needed a model would not be run. The LLM planner is wired and inspected, not asserted.
 
 ---
 

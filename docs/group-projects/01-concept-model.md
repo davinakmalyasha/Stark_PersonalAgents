@@ -666,19 +666,24 @@ Note that `no_item_status_invalidated` in `also_require` means **"the plan was r
 
 ---
 
-## 13. Open — Copy Boundary
+## 13. Copy Boundary — DECIDED
 
-The folder materialises agents, skills, tool bindings, and MCP config (§2). **How much of the harness itself travels with the folder is undecided.**
+**Decision: option A — declarations copy, the runtime pins.**
 
-| Option | Folder carries | Gets harness bug fixes | Self-contained with no harness |
-|---|---|---|---|
-| **A. Declarations only** *(recommended)* | `agents/`, `skills/`, `tools/bindings.json`, `mcp/servers.json`, `lock.json` | **Yes** | No — needs a pinned runtime |
-| B. Full copy | Everything incl. `tools/`, `llm/`, `agents/` | **No** — one fork per project | **Yes** |
-| C. Orchestrator's choice per project | Default A; vendor a frozen copy when a project must outlive harness changes | Depends per project | Depends per project |
+Phase 2 built this, so the decision is recorded rather than taken:
 
-The analogy that settles it either way: nobody copies `node_modules` into a project — they copy `package.json` + `package-lock.json` and install. **Declarations copy, dependencies install, the runtime pins.** `lock.json` (harness version + content digests) is what makes a folder reproducible rather than merely self-describing.
+| Carried in the folder | Pinned, not carried |
+|---|---|
+| `agents/*.json`, `skills/*/*.md`, `tools/bindings.json`, `mcp/servers.json`, `deps/` | the harness runtime (`tools/`, `llm/`, `agents/`) |
+| `.gp/lock.json` — harness version + digests | |
 
-**This blocks nothing before Phase 3.** Phase 0 (durability), Phase 1 (supervisor), and Phase 2 (real members) are identical under A, B, and C. Decide before Phase 3.
+**Why A and not B.** A full copy means every `tools/` bug fix is unfreeable into existing projects, and you fork a ~60-tool warehouse per project. The analogy holds: nobody copies `node_modules` into a project — they copy `package.json` + `package-lock.json` and install. Declarations copy, dependencies install, the runtime pins.
+
+**What is genuinely lost.** A folder cannot run with *no* harness present, and a project created today runs against tomorrow's runtime. Option B buys hermeticity at the cost of never receiving fixes.
+
+**Option C remains available as an additive refinement,** not a redesign: a `vendor: true` manifest flag that also snapshots the runtime into `<project>/.gp/runtime/`, for a project that must outlive harness changes. Nothing in Phase 2's layout has to change to support it — `lock.json` already records what was pinned. Recorded as a future option; not built, and not needed by any current phase.
+
+The three open questions this left are settled: the folder is a **bundle of declarations** (A), `lock.json` is the **pinning record**, and **regeneration** is the migration path when the runtime moves — `derived_from` + `derived_at_version` on every agent make that a command rather than archaeology.
 
 ---
 

@@ -298,3 +298,58 @@ What the orchestrator is for, stated as a contract:
 | Mutations via an op queue | Single-writer, ordered, one audit trail, creation ≡ mutation | Direct writes (races, no ordering); optimistic locking (spreads the invariant across writers) |
 | Read tools bypass the queue | 15 s latency on a read is absurd | Everything through the queue (uniform but unusable for reads) |
 | Narrow member toolset | Board membership is a supervisory concern; workers cannot expand their own permissions | Members get full ops (privilege escalation by self-append) |
+
+---
+
+## 12. Build Record — Phase 3
+
+**Status: BUILT.** `pytest tests/ -q` → **229 passed, 0 failed** (211 before, +18).
+
+### 12.1 What shipped
+
+| File | Contents |
+|---|---|
+| `agents/group/planner.py` | `classify_shape` (a scored heuristic — **no model call**), `parse_directive` for `@task`, `propose_environment`, `propose_plan`, and `plan_execution` with an injectable LLM planner |
+| `agents/group/tools.py` | `GroupToolkit` — the orchestrator surface (creation, mutation via ops, reads that bypass the queue) and the member surface, plus `TOOL_DOCS` written as routing policy |
+| `agents/group/materialize.py` | `add_mcp_server` / `remove_mcp_server` / `add_skill` / `remove_skill` / `set_member_tools` / `remove_agent` — live capability changes that edit the folder |
+| `agents/group/supervisor.py` | Seven new ops, all folder-writing, all still queued; `ProjectContext` carries the folder and the injection points; `llm` criteria reach an injected judge |
+| `agents/group/criteria.py` | `llm` criteria evaluated through an injected `judge`, `unsupported` when none is configured |
+| `tests/test_group_routing.py` | 18 tests, including the routing regression both ways |
+
+### 12.2 The routing decision is now auditable
+
+"Is this a group project?" was an invisible model judgement. It is now:
+
+- a **tool call** (`plan_execution`) with a `rationale` string, and
+- a **scored heuristic** by default, so the regression test runs offline.
+
+The classifier gets **12/12** across the case set, including every negative. That matters more than the positives: the expensive failure is wrapping a trivial job in a three-day project, not missing one.
+
+`@task` is a **prefix flag**, not a parser (section 4). It changes confirmation, not classification — asserted by a test, because the moment it starts influencing the shape there are two routers that can disagree.
+
+### 12.3 What building revealed
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | **The portability check rejected every URL.** `_WINDOWS_ABS` was `[A-Za-z]:[\\/]`, which matches the `s:/` inside `https://` — so `mcp/servers.json` reported *"holds an absolute path 'https://mcp.sentry.dev/mcp'"*. Since attaching an MCP server is the whole point of this phase, the check would have refused every interesting project. | **Real bug, caught by the test that attaches a server and re-checks portability.** Fixed with a lookbehind: `(?<![A-Za-z0-9])[A-Za-z]:[\\/]`. Worth recording because it is a *false positive* in a guard — the kind that gets "fixed" by weakening the guard rather than the regex. |
+| 2 | **`_verify` required a runner.** It returned early when `self.runner is None`, so a project whose items are driven by hand could never have its results judged — even though verification is about *criteria*, not about executing anything. | **Design smell, fixed.** Only `_collect` needs a runner. A hand-driven project now verifies normally. |
+| 3 | **`CAPABILITY_CHANGED` was in `ALL_KINDS` but not `REDUCED_KINDS`.** Writing one would have made the log unreplayable — `rebuild()` would raise `UnknownEventKind` on a project that had ever changed its capabilities. | Added as an explicit **no-op** reducer with the reason stated: capability files are the folder's own truth, not projections of the log, but the event still exists for the audit trail. |
+
+### 12.4 Deliberate Phase 3 limits
+
+| Limit | Why |
+|---|---|
+| The LLM planner is injectable, and **no test exercises it** | Same seam as the runner. `plan_execution(planner=...)` is wired and inspected; a model call is not asserted anywhere. |
+| The routing test asserts the **classifier**, not the model's choice | A routing test that needed a model would not be run. The classifier is the floor the model refines, and the floor is what can be regression-tested. |
+| `set_completion` and `update_item` still reject | They need field-level event deltas. Faking them would corrupt the log; refusing is honest. |
+| `board`, `item_detail`, `events` return text, not structured data | Enough to prove the reads bypass the queue and answer correctly. A UI wants JSON; that is Phase 4. |
+| Phase 3 does **not** register the tools in `tools/_schemas.py` | The registry wiring is an integration step; the surface is what this phase had to decide, and `TOOL_DOCS` carries the routing text that belongs there. |
+
+### 12.5 Still open
+
+| Item | Where |
+|---|---|
+| Registering the group tools in the live tool registry so the orchestrator actually sees them | Phase 4 integration |
+| `tests/run_all.py` reports false failures and CI runs it | `07` §11.2 |
+| Wiring `start_group_scheduler` into server boot | Phase 4 |
+| Real-LLM coverage for `LocalRunner` and the LLM planner | no phase claims it yet |

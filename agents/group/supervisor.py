@@ -36,13 +36,44 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
+from dataclasses import dataclass, field
 
+from . import criteria as criteria_mod
 from . import events as ev
+from .runner import ItemRunner, RunContext
 from .store import ProjectStore, evaluate_completion
 
 #: Default lease for a claimed item. Phase 2 renews while there is progress.
 LEASE_SECONDS = 30 * 60.0
+
+
+@dataclass
+class ProjectContext:
+    """What the supervisor needs to run items of one project.
+
+    Built by the caller (a registry in the app, a lambda in tests) so the
+    supervisor never needs to know how projects are stored on disk. That is
+    the same seam as :class:`ItemRunner`, and for the same reason: the tick
+    stays testable and free of I/O assumptions.
+    """
+
+    project_id: str
+    root: str
+    members: dict[str, dict] = field(default_factory=dict)
+    autonomy: dict = field(default_factory=dict)
+    manifest_members: list[dict] = field(default_factory=list)
+
+    def member_chat_id(self, member_name: str) -> str:
+        """One durable chat per member (``02`` section 8).
+
+        Deterministic, so a restart resumes the same conversation rather than
+        starting a fresh one.
+        """
+        return f"gp-{self.project_id}-{member_name}"
+
+    def default_member(self) -> str | None:
+        names = list(self.members)
+        return names[0] if names else None
 
 #: Consecutive no-event ticks before a project is called stalled (``02`` 6.2).
 STALL_TICKS = 50
@@ -56,6 +87,17 @@ _PHASE_1_OPS = frozenset({
     "add_milestone", "add_item", "update_item", "cancel_item",
     "invalidate_item", "pause", "resume", "close", "set_completion",
 })
+
+
+#: Blocked reasons that are worth another attempt. A lease expiry means the
+#: member died, not that the work is impossible, so the item goes back to the
+#: queue — and `attempts` (already incremented by the reaper) eventually
+#: converts it to a failure rather than looping forever.
+RETRYABLE_BLOCK_REASONS = frozenset({"lease_expired"})
+
+#: Blocked reasons that need the orchestrator or a human to act, and must
+#: therefore not be mistaken for a deadlock.
+WAITING_BLOCK_REASONS = frozenset({ev.AWAITING_APPROVAL, "approval_rejected"})
 
 
 class OpRejected(Exception):
@@ -84,13 +126,15 @@ class Supervisor:
     """Ticks one or more projects. One instance per process."""
 
     def __init__(self, store: ProjectStore, *,
-                 runner: Any = None,
+                 runner: ItemRunner | None = None,
+                 context_for: Callable[[str], ProjectContext | None] | None = None,
                  lease_seconds: float = LEASE_SECONDS,
                  stall_ticks: int = STALL_TICKS,
                  clock: Callable[[], float] = time.time,
                  log: Callable[[str], None] | None = None) -> None:
         self.store = store
-        self.runner = runner          # Phase 2 fills this in; None in Phase 1
+        self.runner = runner          # None keeps dispatch inert (Phase 1)
+        self.context_for = context_for
         self.lease_seconds = lease_seconds
         self.stall_ticks = stall_ticks
         self.clock = clock
@@ -368,7 +412,16 @@ class Supervisor:
         milestones = {m["id"]: m for m in self.store.milestones(project_id)}
         items = {i["id"]: i for i in self.store.items(project_id)}
         for item in items.values():
-            if item["status"] != "todo":
+            status = item["status"]
+            if status == "todo":
+                pass
+            elif status == "blocked":
+                # A transient block (the member died) goes back in the queue.
+                # A block that needs a human (`approval_rejected`) does not —
+                # requeueing it would just re-run work nobody approved.
+                if item.get("blocked_reason") not in RETRYABLE_BLOCK_REASONS:
+                    continue
+            else:
                 continue
             milestone = milestones.get(item["milestone_id"])
             if milestone is None or milestone["status"] not in ("ready", "doing"):
@@ -387,36 +440,131 @@ class Supervisor:
     # ── phase 5: dispatch ───────────────────────────────────────────────
 
     def _dispatch(self, project_id: str) -> int:
-        """Claim ready items — but ONLY when a runner exists to execute them.
+        """Claim ready items and hand them to the runner.
 
-        Phase 1 has no members, so this is inert by design: claiming an item we
-        cannot run would leave it `doing` until the lease expired, which is
-        worse than leaving it `ready`.
+        Inert without a runner: claiming an item we cannot run would leave it
+        ``doing`` until its lease expired, which is worse than leaving it
+        ``ready``. That is why Phase 1 could tick with no members at all.
+        """
+        if self.runner is None or self.context_for is None:
+            return 0
+        context = self.context_for(project_id)
+        if context is None:
+            return 0
+
+        started = 0
+        for item in self.store.items(project_id, status="ready"):
+            member_name = self.runner.member_for(item) or context.default_member()
+            member = context.members.get(member_name or "")
+            if member is None:
+                # An item with nobody able to take it. Leave it ready and
+                # visible rather than claiming it into a dead end.
+                continue
+            self.store.append(
+                project_id, ev.ITEM_CLAIMED, "supervisor", item_id=item["id"],
+                data={"lease_owner": member_name,
+                      "lease_expires": self.clock() + self.lease_seconds},
+            )
+            claimed = self.store.item(item["id"]) or item
+            self.runner.start(RunContext(
+                project_id=project_id,
+                project_root=context.root,
+                item=claimed,
+                member=member,
+                member_name=member_name or "",
+                chat_id=context.member_chat_id(member_name or ""),
+                autonomy=context.autonomy,
+            ))
+            started += 1
+        return started
+
+    # ── phase 6: collect what finished ──────────────────────────────────
+
+    def _collect(self, project_id: str) -> int:
+        """Harvest finished runs into the item — WITHOUT changing its status.
+
+        The run result and the verdict are deliberately separate events: a
+        result is a fact about an attempt, a verdict is a judgement about the
+        work. Keeping them apart is what lets phase 7 be re-run, makes a retry
+        legible on the board, and keeps ``item.progress`` honest.
         """
         if self.runner is None:
             return 0
-        claimed = 0
-        for item in self.store.items(project_id, status="ready"):
-            owner = self.runner.member_for(item) if hasattr(self.runner, "member_for") else None
+        collected = 0
+        for result in self.runner.collect(project_id):
+            item = self.store.item(result.item_id)
+            if item is None or item["status"] != "doing":
+                # Cancelled, invalidated or reaped while it ran. The lease
+                # already decided its fate; a late result must not resurrect it.
+                continue
+            actor = f"member:{item.get('lease_owner') or '?'}"
             self.store.append(
-                project_id, ev.ITEM_CLAIMED, "supervisor", item_id=item["id"],
-                data={"lease_owner": owner,
-                      "lease_expires": self.clock() + self.lease_seconds},
+                project_id, ev.ITEM_PROGRESS, actor, item_id=result.item_id,
+                data={"result": result.report, "error": result.error,
+                      "cost_usd": result.cost_usd, "cost_tokens": result.cost_tokens},
             )
-            claimed += 1
-        return claimed
+            collected += 1
+        return collected
 
-    # ── phases 6-7: collect + verify (Phase 2) ──────────────────────────
-
-    def _collect(self, project_id: str) -> int:
-        if self.runner is None:
-            return 0
-        return int(self.runner.collect(project_id) or 0)
+    # ── phase 7: verify against the acceptance criteria ─────────────────
 
     def _verify(self, project_id: str) -> int:
-        if self.runner is None:
+        """Judge harvested items against their own acceptance criteria.
+
+        Deterministic wherever it can be (``01`` section 4.6). A ``manual``
+        criterion parks the item — it stays ``doing`` and counts as a
+        legitimate wait, so it never looks like a stall.
+        """
+        if self.runner is None or self.context_for is None:
             return 0
-        return int(self.runner.verify(project_id) or 0)
+        context = self.context_for(project_id)
+        if context is None:
+            return 0
+
+        changed = 0
+        for item in self.store.items(project_id, status="doing"):
+            if not item.get("result") and not item.get("error"):
+                continue  # still running
+            if item.get("error"):
+                changed += self._settle_failure(
+                    project_id, item, f"run failed: {item['error']}")
+                continue
+
+            evaluation = criteria_mod.evaluate_item(item, context.root)
+            if evaluation.passed:
+                self.store.append(project_id, ev.ITEM_DONE, "supervisor",
+                                  item_id=item["id"])
+                changed += 1
+            elif evaluation.pending:
+                # Park it — but only announce it once, or the inbox fills with
+                # the same question every 15 seconds.
+                if item.get("blocked_reason") != ev.AWAITING_APPROVAL:
+                    self.store.append(
+                        project_id, ev.APPROVAL_REQUESTED, "supervisor",
+                        item_id=item["id"],
+                        data={"pending": [r.detail for r in evaluation.pending]},
+                    )
+                    changed += 1
+            elif evaluation.failed:
+                changed += self._settle_failure(project_id, item,
+                                                evaluation.summary())
+            # `unsupported` criteria (llm, Phase 3) leave the item `doing`
+            # rather than guessing a verdict — an unverifiable item must not
+            # silently become done or silently become failed.
+        return changed
+
+    def _settle_failure(self, project_id: str, item: dict, reason: str) -> int:
+        """Retry while attempts remain; otherwise fail for good (BR-02)."""
+        attempts = int(item.get("attempts") or 0)
+        max_attempts = int(item.get("max_attempts") or 3)
+        if attempts < max_attempts:
+            self.store.append(project_id, ev.ITEM_READY, "supervisor",
+                              item_id=item["id"],
+                              data={"retry": attempts, "reason": reason[:400]})
+        else:
+            self.store.append(project_id, ev.ITEM_FAILED, "supervisor",
+                              item_id=item["id"], data={"reason": reason[:400]})
+        return 1
 
     # ── phase 8: invalidation bursts ────────────────────────────────────
 
@@ -491,10 +639,14 @@ class Supervisor:
 
         Without this, every project that pauses overnight for an approval — or
         while the orchestrator re-plans — would look like a failure.
+
+        Note the reasons are checked on the ITEM, not only on ``blocked``: a
+        manual acceptance criterion parks the item while it stays ``doing``,
+        because the work exists and is still ours. Checking status alone is how
+        a legitimate overnight wait gets mistaken for a deadlock.
         """
         return any(
             i["status"] == "invalidated"                              # re-plan open
-            or (i["status"] == "blocked"
-                and i.get("blocked_reason") == "awaiting_approval")   # waiting on you
+            or i.get("blocked_reason") in WAITING_BLOCK_REASONS        # waiting on you
             for i in self.store.items(project_id)
         )

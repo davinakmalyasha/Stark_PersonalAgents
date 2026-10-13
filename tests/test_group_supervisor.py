@@ -201,30 +201,41 @@ def test_dependency_within_a_milestone_gates():
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def test_expired_lease_blocks_then_fails():
-    """RT-05: every `doing` item has a bounded lifetime."""
+def test_expired_lease_is_reaped_then_requeued_until_max_attempts():
+    """RT-05: every `doing` item has a bounded lifetime.
+
+    A lease expiry means the member died, not that the work is impossible, so
+    the item blocks (recorded in the log) and goes straight back in the queue.
+    It never sits `blocked` on the board: the retry is bounded by `attempts`,
+    which converts it to a failure instead of looping forever.
+    """
     with Rig() as rig:
         rig.create()
         rig.sup.tick(rig.pid)
+
+        # First expiry: reaped, then requeued in the same tick.
         rig.store.append(rig.pid, rig.ev.ITEM_CLAIMED, "member:x", item_id="i1",
-                         data={"lease_owner": "x", "lease_expires": 1.0})  # long past
+                         data={"lease_owner": "x", "lease_expires": 1.0})
         assert rig.store.item("i1")["status"] == "doing"
-        assert rig.store.item("i1")["attempts"] == 1
-
         rig.sup.tick(rig.pid)
-        assert rig.store.item("i1")["status"] == "blocked", "expired lease did not reap"
-        assert rig.store.item("i1")["blocked_reason"] == "lease_expired"
-        assert rig.store.item("i1")["lease_owner"] is None
+        kinds = [e["kind"] for e in rig.store.events(rig.pid)]
+        assert rig.ev.LEASE_EXPIRED in kinds, "expired lease produced no event"
+        assert rig.ev.ITEM_BLOCKED in kinds, "expiry did not record a block"
+        item = rig.store.item("i1")
+        assert item["status"] == "ready", f"not requeued: {item['status']}"
+        assert item["lease_owner"] is None, "the dead member kept its lease"
 
-        # Drive it to max_attempts and it must fail rather than loop forever.
-        for _ in range(4):
-            item = rig.store.item("i1")
-            if item["status"] != "blocked":
+        # Keep killing it; the attempts ceiling must win.
+        for _ in range(8):
+            if rig.store.item("i1")["status"] == "failed":
                 break
             rig.store.append(rig.pid, rig.ev.ITEM_CLAIMED, "member:x", item_id="i1",
                              data={"lease_owner": "x", "lease_expires": 1.0})
             rig.sup.tick(rig.pid)
-        assert rig.store.item("i1")["status"] == "failed"
+        assert rig.store.item("i1")["status"] == "failed", (
+            f"never failed after repeated expiries: {rig.store.item('i1')['status']}"
+        )
+        assert rig.store.item("i1")["attempts"] == 3
 
 
 def test_live_lease_is_not_reaped():

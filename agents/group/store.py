@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS items (
   tags_json          TEXT,
   cost_tokens        INTEGER DEFAULT 0,
   cost_usd           REAL DEFAULT 0,
+  result             TEXT,
+  error              TEXT,
   blocked_reason     TEXT,
   invalidated_reason TEXT,
   updated_at         REAL
@@ -198,6 +200,8 @@ def _new_item(project_id: str, milestone_id: str, spec: dict) -> dict:
         "tags_json": json.dumps(list(spec.get("tags") or [])),
         "cost_tokens": 0,
         "cost_usd": 0.0,
+        "result": "",
+        "error": "",
         "blocked_reason": None,
         "invalidated_reason": None,
         "updated_at": time.time(),
@@ -216,7 +220,7 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
     milestone_id = event.get("milestone_id")
     touched: set[tuple[str, str]] = set()
 
-    if kind not in ev.PHASE_1_REDUCED:
+    if kind not in ev.REDUCED_KINDS:
         raise ev.UnknownEventKind(kind, event.get("seq"))
 
     def touch_item() -> dict | None:
@@ -355,6 +359,30 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
             entry["lease_expires"] = None
         return touched
 
+    if kind == ev.ITEM_PROGRESS:
+        # A finished attempt, recorded WITHOUT a status change. Phase 6 writes
+        # this; phase 7 decides the transition from the acceptance criteria.
+        # Keeping the two apart is what lets a run be harvested and judged
+        # separately, and what makes a retry visible on the board.
+        entry = touch_item()
+        if entry is not None:
+            if data.get("result"):
+                entry["result"] = str(data["result"])
+            if data.get("error"):
+                entry["error"] = str(data["error"])
+            entry["cost_tokens"] = int(entry.get("cost_tokens") or 0) + int(data.get("cost_tokens") or 0)
+            entry["cost_usd"] = float(entry.get("cost_usd") or 0) + float(data.get("cost_usd") or 0)
+            entry["lease_owner"] = None
+            entry["lease_expires"] = None
+            if state.project:
+                state.project["spent_tokens"] = (
+                    int(state.project.get("spent_tokens") or 0) + int(data.get("cost_tokens") or 0))
+                state.project["spent_usd"] = (
+                    float(state.project.get("spent_usd") or 0) + float(data.get("cost_usd") or 0))
+                state.project["updated_at"] = time.time()
+                touched.add(("projects", state.project_id))
+        return touched
+
     if kind == ev.ITEM_DONE:
         entry = touch_item()
         if entry is not None:
@@ -411,6 +439,32 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
             # a plan error, not an execution error (01 section 4.4, DM-15).
             entry["status"] = "invalidated"
             entry["invalidated_reason"] = data.get("reason") or "plan revised"
+            entry["lease_owner"] = None
+            entry["lease_expires"] = None
+        return touched
+
+    if kind == ev.APPROVAL_REQUESTED:
+        # Park the item WITHOUT changing its status. `doing` is correct: the
+        # work exists and is still ours, we are just waiting on a human. The
+        # reason is what tells the stall detector this is a legitimate wait.
+        entry = touch_item()
+        if entry is not None:
+            entry["blocked_reason"] = ev.AWAITING_APPROVAL
+        return touched
+
+    if kind == ev.APPROVAL_GRANTED:
+        entry = touch_item()
+        if entry is not None:
+            entry["blocked_reason"] = None
+        return touched
+
+    if kind == ev.APPROVAL_REJECTED:
+        # AU-10: a rejection blocks the item and asks the orchestrator to
+        # re-plan. It is not a failure of the member's work.
+        entry = touch_item()
+        if entry is not None:
+            entry["status"] = "blocked"
+            entry["blocked_reason"] = "approval_rejected"
             entry["lease_owner"] = None
             entry["lease_expires"] = None
         return touched
@@ -476,7 +530,22 @@ class ProjectStore:
         self._db.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self._db.executescript(_SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self) -> None:
+        """Additive column migrations, matching ``chat_store.py:88-94``.
+
+        Must stay additive: a project folder from an earlier version has to
+        open, and its event log has to replay, without losing anything.
+        """
+        wanted = {"items": ("result", "error")}
+        for table, columns in wanted.items():
+            existing = {row["name"] for row in
+                        self._db.execute(f"PRAGMA table_info({table})").fetchall()}
+            for column in columns:
+                if column not in existing:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
 
     # ── events: the truth ───────────────────────────────────────────────
 
@@ -749,7 +818,8 @@ _COLUMNS = {
               "attempts", "max_attempts", "owner_member", "workdir",
               "lease_owner", "lease_expires", "depends_on_json",
               "acceptance_json", "tags_json", "cost_tokens", "cost_usd",
-              "blocked_reason", "invalidated_reason", "updated_at"),
+              "result", "error", "blocked_reason", "invalidated_reason",
+              "updated_at"),
     "ops": ("id", "project_id", "kind", "payload_json", "actor", "state",
             "error", "created_at", "applied_at"),
 }

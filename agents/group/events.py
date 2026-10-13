@@ -38,6 +38,7 @@ ITEM_CREATED = "item.created"
 ITEM_READY = "item.ready"
 ITEM_CLAIMED = "item.claimed"
 ITEM_RELEASED = "item.released"
+ITEM_PROGRESS = "item.progress"
 ITEM_DONE = "item.done"
 ITEM_FAILED = "item.failed"
 ITEM_BLOCKED = "item.blocked"
@@ -75,8 +76,8 @@ CAPABILITY_CHANGED = "capability.changed"
 ALL_KINDS = frozenset({
     PROJECT_CREATED, PROJECT_RESUMED, PROJECT_PAUSED, PROJECT_CLOSED, PROJECT_STALLED,
     MILESTONE_CREATED, MILESTONE_READY, MILESTONE_DONE, MILESTONE_FAILED,
-    ITEM_CREATED, ITEM_READY, ITEM_CLAIMED, ITEM_RELEASED, ITEM_DONE,
-    ITEM_FAILED, ITEM_BLOCKED, ITEM_INVALIDATED, ITEM_CANCELLED,
+    ITEM_CREATED, ITEM_READY, ITEM_CLAIMED, ITEM_RELEASED, ITEM_PROGRESS,
+    ITEM_DONE, ITEM_FAILED, ITEM_BLOCKED, ITEM_INVALIDATED, ITEM_CANCELLED,
     PLAN_REVISED, IDEA_PROPOSED,
     OP_SUBMITTED, OP_APPLIED, OP_REJECTED,
     LEASE_EXPIRED, BUDGET_WARN, BUDGET_STOP, DEADLINE_REACHED,
@@ -85,17 +86,22 @@ ALL_KINDS = frozenset({
     MEMBER_ADDED, MEMBER_REMOVED, MEMBER_HALTED, CAPABILITY_CHANGED,
 })
 
-#: Kinds the Phase 1 reducer understands. Anything outside this set that is
-#: replayed raises :class:`UnknownEventKind` — loudly, never silently ignored.
-PHASE_1_REDUCED = frozenset({
+#: Kinds the reducer implements. Anything outside this set that is replayed
+#: raises :class:`UnknownEventKind` — loudly, never silently ignored.
+REDUCED_KINDS = frozenset({
     PROJECT_CREATED, PROJECT_RESUMED, PROJECT_PAUSED, PROJECT_CLOSED, PROJECT_STALLED,
     MILESTONE_CREATED, MILESTONE_READY, MILESTONE_DONE, MILESTONE_FAILED,
-    ITEM_CREATED, ITEM_READY, ITEM_CLAIMED, ITEM_RELEASED, ITEM_DONE,
-    ITEM_FAILED, ITEM_BLOCKED, ITEM_INVALIDATED, ITEM_CANCELLED,
+    ITEM_CREATED, ITEM_READY, ITEM_CLAIMED, ITEM_RELEASED, ITEM_PROGRESS,
+    ITEM_DONE, ITEM_FAILED, ITEM_BLOCKED, ITEM_INVALIDATED, ITEM_CANCELLED,
     PLAN_REVISED, IDEA_PROPOSED,
     OP_SUBMITTED, OP_APPLIED, OP_REJECTED,
     LEASE_EXPIRED, BUDGET_WARN, BUDGET_STOP, DEADLINE_REACHED,
+    APPROVAL_REQUESTED, APPROVAL_GRANTED, APPROVAL_REJECTED,
 })
+
+#: A parked item keeps its status but carries this reason, so the stall
+#: detector can tell "waiting on a human" from "stuck" (``02`` section 6.2).
+AWAITING_APPROVAL = "awaiting_approval"
 
 # ── statuses ────────────────────────────────────────────────────────────────
 

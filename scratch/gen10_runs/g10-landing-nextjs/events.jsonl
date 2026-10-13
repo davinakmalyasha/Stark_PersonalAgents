@@ -1,5 +1,0 @@
-{"ts": 1789142359.224, "event": "task_start", "id": "g10-landing-nextjs", "category": "gen10-landing"}
-{"ts": 1789142897.086, "event": "attempt", "id": "g10-landing-nextjs", "attempt": 1, "ok": false, "detail": "PRICING status 404", "hollow": false, "work": 34, "cost_delta": 0.0156, "calls_delta": 1}
-{"ts": 1789142897.097, "event": "repair", "id": "g10-landing-nextjs", "round": 1, "reason": "PRICING status 404"}
-{"ts": 1789143261.964, "event": "attempt", "id": "g10-landing-nextjs", "attempt": 2, "ok": true, "detail": "landing ok (build + routes + api + persisted in data\\submissions.json)", "hollow": false, "work": 24, "cost_delta": 0.00033, "calls_delta": 1}
-{"ts": 1789143262.014, "event": "task_result", "id": "g10-landing-nextjs", "status": "pass", "pass_at": 2, "pass_at_1": 0, "prompt_style": "spec", "attempts": 2, "repairs": 1, "hollow_retries": 0, "cost": 0.015931, "duration_s": 868.0, "agents": ["Developer"], "spec_produced": false}

@@ -106,8 +106,8 @@ TASK_FOCUS = {
         "design": "Storefront UX + full API contract coherence against the spec.",
         "security": "Auth/roles/rate-limit/validation on every path; check admin-only routes.",
         "scalability": "Stock/cart/order consistency, pagination, persistence across restarts.",
-        "maintainability": "Deployment evidence: git remote origin set to "
-                           "davinakmalyasha/TestAgents, project pushed, README run/deploy notes.",
+        "maintainability": "Deployment evidence: README run/deploy notes; git remote may point at "
+                           "davinakmalyasha/TestAgents (push is best-effort, not gated).",
     },
 }
 

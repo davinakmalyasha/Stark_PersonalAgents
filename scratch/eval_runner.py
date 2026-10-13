@@ -2003,18 +2003,20 @@ def main():
         os.environ["BSA_HOLLOW_COST_MAX"] = str(args.hollow_cost)
     os.environ["BSA_EVAL_STYLE"] = args.style
 
+    tasks = TASKS
     if args.only:
         if args.only not in TASKS_BY_ID:
             print(f"unknown task {args.only!r}; available: {sorted(TASKS_BY_ID)}")
             return 1
+        # gen10 long-horizon: disarm any parent-side wall-cap default before spawn.
+        if TASKS_BY_ID[args.only]["category"].startswith("gen10-"):
+            os.environ.setdefault("BSA_TASK_WALL_CAP", "0")
         # Per-task call telemetry file: no cross-run mixing in the shared log.
         os.environ["BSA_CALLS_LOG"] = os.path.join(
             PROJECT_ROOT, ".deep_agents", f"gen5_eval_calls_{args.only}.jsonl")
         r = run_single(args.only, keep=args.keep)
         print(json.dumps(r, indent=1, default=str))
         return 0 if r["status"] == "pass" else 1
-
-    tasks = TASKS
     if args.gens:
         gens = [g.strip() for g in args.gens.split(",") if g.strip()]
         tasks = [t for t in tasks if any(t["category"].startswith(f"gen{g}-") for g in gens)]
@@ -2023,6 +2025,13 @@ def main():
         tasks = [t for t in tasks if t["category"] == args.category]
     if not args.all:
         tasks = tasks[: (args.limit or 3)]
+
+    # gen10 long-horizon: disarm the parent wall-cap (default 2400s) unless the
+    # operator set BSA_TASK_WALL_CAP explicitly. BSA_UNLIMITED only arms the
+    # child repair loop via task setup() — parent _run_one must not kill a
+    # healthy unlimited run at 40 minutes.
+    if any(t["category"].startswith("gen10-") for t in tasks):
+        os.environ.setdefault("BSA_TASK_WALL_CAP", "0")
 
     # Each task runs in a fresh subprocess so shared_state is clean per task.
     script = os.path.abspath(__file__)

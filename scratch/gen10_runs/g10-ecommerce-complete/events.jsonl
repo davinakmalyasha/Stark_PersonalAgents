@@ -1,3 +1,0 @@
-{"ts": 1789141130.543, "event": "task_start", "id": "g10-ecommerce-complete", "category": "gen10-build"}
-{"ts": 1789141615.249, "event": "attempt", "id": "g10-ecommerce-complete", "attempt": 1, "ok": true, "detail": "ecommerce ok (api + frontend + specs + tests + security + completeness)", "hollow": false, "work": 47, "cost_delta": 0.00037, "calls_delta": 1}
-{"ts": 1789141615.288, "event": "task_result", "id": "g10-ecommerce-complete", "status": "pass", "pass_at": 1, "pass_at_1": 1, "prompt_style": "spec", "attempts": 1, "repairs": 0, "hollow_retries": 0, "cost": 0.000372, "duration_s": 476.5, "agents": ["Developer"], "spec_produced": true}

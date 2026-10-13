@@ -45,6 +45,10 @@ _ENV_FLAGS = {
     "BSA_REPAIR_VIA_HELPER": "0",  # direct Dev repair path
     "BSA_MAX_REPAIRS": "100",
     "BSA_REPAIR_UNTIL_DONE": "1",
+    # Parent-side _run_one timeout (eval_runner) must also be 0 — BSA_UNLIMITED
+    # only reaches the child via setup(); without this the 2400s default kills
+    # healthy long-horizon runs. Defense-in-depth: main() also setdefaults it.
+    "BSA_TASK_WALL_CAP": "0",
     # Context management (NOT an effort cap): compact before the provider's
     # context window forces an error. The agent keeps working on the summary.
     "COMPACTION_CHECKPOINT_TOKENS": "100000",
@@ -740,9 +744,9 @@ _ECOM_PROMPT = (
     "judge a store about to take real orders: the customer journey, the operator/admin "
     "journey, data integrity under real use, security, tests, documentation and "
     "operational concerns all have to hold up together.\n\n"
-    "Also here the github repo: "
-    "https://github.com/davinakmalyasha/TestAgents.git — publish the finished project "
-    "there.\n\n"
+    "If credentials are available, you may also push the finished project to "
+    "https://github.com/davinakmalyasha/TestAgents.git — a push is nice-to-have, "
+    "not required for the gate.\n\n"
     "A hidden end-to-end gate boots the app and walks it like a real customer and a real "
     "admin — including behavior across a restart — and runs YOUR test suite."
 )

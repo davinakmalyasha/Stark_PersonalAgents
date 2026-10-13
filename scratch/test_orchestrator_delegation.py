@@ -32,14 +32,20 @@ class FakeWM:
         self.messages = []    # (ws, cid, role, content)
         self._n = 0
 
-    def create_chat(self, ws, title="", model="Automatic Fallback"):
+    def create_chat(self, ws, title="", model="Automatic Fallback",
+                    parent_chat_id="", parent_workspace_id=""):
         self._n += 1
         cid = f"chat-{self._n}"
         self.chats[(ws, cid)] = {"id": cid, "title": title}
         return {"id": cid}
 
     def get_chat(self, ws, cid, include_traces=False, include_usage=True):
-        return self.chats.get((ws, cid))
+        base = self.chats.get((ws, cid))
+        if base is None:
+            return None
+        msgs = [{"role": r, "content": c}
+                for (w, c_id, r, c) in self.messages if w == ws and c_id == cid]
+        return {"id": cid, "title": base.get("title", ""), "messages": msgs}
 
     def add_message(self, ws, cid, role, content, metadata=None):
         self.messages.append((ws, cid, role, str(content)))
@@ -220,7 +226,7 @@ def test_cancel_all_and_abort_wake(fake_env, monkeypatch):
     ))
 
     delegation.start_delegations(
-        [{"agent": "House", "task": "slow thing"}], "parent-1", ""
+        [{"agent": "House", "task": "slow thing"}], "parent-1", "", background=True,
     )
     assert _wait_until(lambda: delegation.running_count("parent-1") == 1)
 
@@ -257,17 +263,90 @@ def test_status_table_renders(fake_env):
     delegation.reset_delegations()
 
 
+def test_status_table_filter_and_detail(fake_env):
+    from agents import delegation
+
+    delegation.reset_delegations()
+    summaries = delegation.start_delegations(
+        [{"agent": "General", "task": "note today i ate pasta", "title": "Note"}],
+        "parent-1", "",
+    )
+    jid = summaries[0]["id"]
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
+    assert "No delegations with status 'running'" in delegation.status_table(status="running")
+    assert "[OK]" in delegation.status_table(status="done")
+    detail = delegation.job_detail(jid)
+    assert "[JOB DETAIL]" in detail
+    assert "note today i ate pasta" in detail  # original task text
+    assert "general done:" in detail  # capped result
+    assert "recent chat:" in detail  # mirrored chat tail
+    assert delegation.job_detail("del-nope").startswith("Error: unknown job id")
+    # Bounded wait on a settled job returns immediately with its snapshot.
+    snap = delegation.wait_for_job(jid, wait_seconds=5)
+    assert snap and snap["status"] == "done"
+    assert delegation.wait_for_job("del-nope") is None
+    delegation.reset_delegations()
+
+
+def test_job_message_and_cancel(fake_env, monkeypatch):
+    import agents.house_agent as ha
+    from agents import delegation
+    from tools.AddOnTool import delegationTools as dt
+    from inbox import drain_steering
+
+    delegation.reset_delegations()
+    gate = threading.Event()
+
+    def slow_house(state):
+        gate.wait(timeout=10)
+        return {"agent_report": "house late"}
+
+    monkeypatch.setattr(ha, "house_node", slow_house)
+    # Thread path (production semantics): returns while the job runs.
+    summaries = delegation.start_delegations(
+        [{"agent": "House", "task": "dim lights", "title": "Lights"}],
+        "parent-1", "", background=True,
+    )
+    jid = summaries[0]["id"]
+    assert _wait_until(lambda: (delegation.get_entry(jid) or {}).get("status") == "running")
+
+    # Steer while running: mirrored + steered.
+    out = dt.job_message(jid, "also lock the door")
+    assert out.startswith("[OK]")
+    assert "also lock the door" in drain_steering(summaries[0]["chat_id"])
+
+    # Cancel: settles CANCELLED and wakes the parent exactly once.
+    out = dt.job_cancel(jid, "Sir changed his mind")
+    assert out.startswith("[OK]")
+    e = delegation.get_entry(jid)
+    assert e["status"] == "cancelled" and e["error"] == "Sir changed his mind"
+    wakes = _drain_all("parent-1")
+    assert any("CANCELLED" in w and jid in w for w in wakes)
+    # The runner thread landing later must not overwrite the cancellation.
+    gate.set()
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
+    assert delegation.get_entry(jid)["status"] == "cancelled"
+    assert not [w for w in _drain_all("parent-1") if jid in w and "DONE" in w]
+
+    # Steering / cancelling a settled job is a clean error / no-op.
+    err = dt.job_message(jid, "too late")
+    assert err.startswith("Error:")
+    assert dt.job_cancel(jid).startswith("[OK]")
+    assert dt.job_message("del-nope", "hi").startswith("Error:")
+    assert dt.job_cancel("del-nope").startswith("Error:")
+    delegation.reset_delegations()
+
+
 # ── Orchestrator loop integration (mocked LLM) ───────────────────────────────
 
 
 def _native_slice(text: str, tool_calls: list) -> list:
-    """Build the native run_native_agent return slice from a fake turn.
+    """Build a fake run_native_agent transcript slice from a scripted turn.
 
     Mirrors llm.pai_transport._pai_to_lc: AIMessage with tool_calls + one
-    ToolMessage per call. The orchestrator loop reads this slice for
-    _native_slice_tools / _native_slice_failures / the transcript.
-    ``tool_calls`` may be plain dicts (default result content "ok") or dicts
-    with an extra ``_content`` key carrying realistic tool output.
+    ToolMessage per call; the graph driver consumes this slice as the turn's
+    native messages. ``tool_calls`` may be plain dicts (default result content
+    "ok") or dicts with an extra ``_content`` key carrying realistic output.
     """
     from langchain_core.messages import AIMessage, ToolMessage
 
@@ -412,7 +491,8 @@ def test_orchestrator_spawns_parks_forwards_finishes(fake_env, monkeypatch):
     }
     res = orch.orchestrator_node(state)
 
-    assert _wait_until(lambda: turn["n"] >= 3, timeout=15)
+    # spawn turn + wake turn(s) that forward the results
+    assert turn["n"] >= 2
     assert "All done" in res["agent_report"]
     # The loop only exits when no children remain.
     assert delegation.running_count("parent-1") == 0
@@ -468,6 +548,7 @@ def router_env(tmp_path, monkeypatch):
     chats = FakeWM()
     monkeypatch.setattr(wm, "add_workspace", lambda p, n="": {"id": f"ws-{n}", "path": p})
     monkeypatch.setattr(wm, "create_chat", chats.create_chat)
+    monkeypatch.setattr(wm, "get_chat", chats.get_chat)
     monkeypatch.setattr(wm, "add_message", chats.add_message)
     monkeypatch.setattr(wm, "list_workspaces", lambda: [])
 
@@ -513,17 +594,43 @@ def _index_child(index_path: str, workspace_path: str) -> str:
     return ""
 
 
-def test_resume_project_wrapper(router_env):
-    from tools.AddOnTool.orchestrationTools import resume_project
+def test_delegate_project_resume_mode(router_env):
+    """delegate(project=...) continues the durable Dev: tracked job, no new chat."""
     from agents.project_router import create_project as cp
+    from agents import delegation
+    delegation.reset_delegations()
 
     entry = cp("Gamma", "an api service", wait=True)
-    out = resume_project(entry["name"], "fix the login bug")
-    assert "[OK]" in out and "fix the login bug" in out
+    chats_before = len(router_env["chats"].chats)
+    summaries = delegation.start_delegations(
+        [{"agent": "Dev", "task": "fix the login bug", "title": "Login fix", "project": "Gamma"}],
+        parent_chat_id="", fallback_ws="",
+    )
+    assert len(summaries) == 1 and summaries[0]["ok"]
+    assert summaries[0]["mode"] == "resume"
+    assert summaries[0]["status"] == "done"
+    assert "fix the login bug" in summaries[0]["result"]
     assert router_env["sent"][0]["child_id"] == entry["child_id"]
+    # No new chat created — the durable project chat was continued.
+    assert len(router_env["chats"].chats) == chats_before
+    e = delegation.get_entry(summaries[0]["id"])
+    assert e["mode"] == "resume" and e["project"] == "Gamma"
+    assert e["chat_id"] == entry["chat_id"]
 
-    missing = resume_project("Nonexistent Project Xyz", "hello")
-    assert "[NOT FOUND]" in missing
+    # Unknown project → deterministic Error, nothing spawned.
+    bad = delegation.start_delegations(
+        [{"task": "hello", "project": "Nonexistent Project Xyz"}],
+        parent_chat_id="", fallback_ws="",
+    )
+    assert not bad[0]["ok"] and bad[0]["error"].startswith("Error: [NOT FOUND]")
+
+    # project= requires the Dev agent.
+    wrong = delegation.start_delegations(
+        [{"agent": "General", "task": "hello", "project": "Gamma"}],
+        parent_chat_id="", fallback_ws="",
+    )
+    assert not wrong[0]["ok"] and wrong[0]["error"].startswith("Error:")
+    delegation.reset_delegations()
 
 
 def test_multi_project_burst_parallel(router_env):
@@ -681,15 +788,17 @@ def test_crashing_agent_reports_failed_event(fake_env, monkeypatch):
 
     monkeypatch.setattr(ga, "general_node", exploding)
 
-    delegation.start_delegations(
+    summaries = delegation.start_delegations(
         [{"agent": "General", "task": "will explode"}], "parent-1", ""
     )
+    jid = summaries[0]["id"]
     assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
 
     events = _drain_all("parent-1")
-    assert len(events) == 1
-    assert "status: FAILED" in events[0]
-    assert "disk on fire" in events[0]
+    mine = [e for e in events if jid in e]
+    assert len(mine) == 1
+    assert "status: FAILED" in mine[0]
+    assert "disk on fire" in mine[0]
     # Error mirrored into the job chat too.
     assert any(s == "failed" for s in
                ("failed",) ) or True  # mirror recorded via FakeWM below
@@ -788,7 +897,13 @@ def test_orchestrator_scope_excludes_run_command(monkeypatch):
     from tools._schemas import get_native_tool_names
     names = get_native_tool_names("orchestrator")
     assert "run_command" not in names
-    assert {"create_project", "resume_project", "ask_user", "delegate", "delegation_status", "update_plan"} <= set(names)
+    # Consolidated job system: project=<name> resumes a durable Dev; per-job
+    # control via job_message/job_cancel; the job tracker is automatic, so
+    # update_plan is NOT an orchestrator tool.
+    assert {"create_project", "ask_user", "delegate", "delegation_status",
+            "job_message", "job_cancel", "propose_plan"} <= set(names)
+    assert "resume_project" not in names
+    assert "update_plan" not in names
 
 
 def test_ledger_roundtrip_and_truncation(tmp_path, monkeypatch):
@@ -847,9 +962,271 @@ def test_scoped_plan_injection_only_own_scope(tmp_path):
 def test_template_markers_present():
     import agents.orchestrator_agent as orch
     t = orch._ORCHESTRATOR_SYSTEM_TEMPLATE
-    assert "PLANNING" in t
+    assert "JOB TRACKER" in t and "automatic" in t
     assert "YOUR MEMORY" in t
     assert "delegation_status" in t
+    # Brief boundary + artifact + honesty rules present.
+    assert "outcome" in t and "acceptance" in t
+    assert "never HOW" in t or "WHAT" in t
+    assert "artifact" in t
+    assert "failed or cancelled" in t
+    # The orchestrator no longer writes plans manually.
+    assert "update_plan" not in t
+
+
+# ── P0 refinements: brief boundary, deadlines, queue, artifacts, telemetry ────
+
+
+def test_delegate_brief_fields_and_method_line(fake_env):
+    from agents import delegation
+
+    delegation.reset_delegations()
+    summaries = delegation.start_delegations(
+        [{
+            "agent": "General", "task": "save a note", "title": "Note",
+            "outcome": "The note is saved.", "acceptance": "Searching finds it.",
+        }],
+        "parent-1", "", background=True,
+    )
+    jid = summaries[0]["id"]
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
+    e = delegation.get_entry(jid)
+    assert e["outcome"] == "The note is saved."
+    assert e["acceptance"] == "Searching finds it."
+    # The composed task carries outcome/acceptance + the standing method line.
+    assert "Outcome (what done looks like): The note is saved." in e["task"]
+    assert "Acceptance (how success will be judged): Searching finds it." in e["task"]
+    assert "Method is yours to choose" in e["task"]
+    assert e["duration_s"] is not None
+    delegation.reset_delegations()
+
+
+def test_artifact_written_and_wake_carries_summary_pointer(fake_env, monkeypatch, tmp_path):
+    from agents import delegation
+
+    monkeypatch.setenv("HARNESS_ROOT", str(tmp_path))
+    delegation.reset_delegations()
+
+    long_tail = ("x" * 4000) + "TAIL-MARKER-END"
+    import agents.general_agent as ga
+    monkeypatch.setattr(ga, "general_node", lambda state: (
+        {"agent_report": "HEAD-MARKER start.\n" + long_tail}
+    ))
+
+    summaries = delegation.start_delegations(
+        [{"agent": "General", "task": "long report", "title": "Long"}],
+        "parent-1", "", background=True,
+    )
+    jid = summaries[0]["id"]
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
+    e = delegation.get_entry(jid)
+    artifact = e.get("artifact") or ""
+    assert artifact and os.path.isfile(artifact)
+    with open(artifact, "r", encoding="utf-8") as f:
+        body = f.read()
+    assert "TAIL-MARKER-" in body and "HEAD-MARKER" in body  # full report kept
+
+    # Wake delivery happens right after the status flip — give it a moment.
+    wakes: list[str] = []
+
+    def _grab():
+        wakes.extend(_drain_all("parent-1"))
+        return any(jid in w for w in wakes)
+
+    assert _wait_until(_grab, timeout=5)
+    wake = next(w for w in wakes if jid in w)
+    assert "artifact:" in wake
+    assert "HEAD-MARKER" in wake
+    assert "TAIL-MARKER-" not in wake  # summary only — no full paste
+    assert "[... " in wake and "more chars" in wake
+
+    detail = delegation.job_detail(jid)
+    assert "TAIL-MARKER-" in detail  # drill-in reads the artifact
+    delegation.reset_delegations()
+
+
+def test_job_deadline_watchdog_marks_failed(fake_env, monkeypatch):
+    import agents.house_agent as ha
+    from agents import delegation
+
+    delegation.reset_delegations()
+    monkeypatch.setenv("ORCH_JOB_KILL_GRACE", "1")
+    gate = threading.Event()
+
+    def hung_house(state):
+        gate.wait(timeout=15)
+        return {"agent_report": "late"}
+
+    monkeypatch.setattr(ha, "house_node", hung_house)
+    summaries = delegation.start_delegations(
+        [{"agent": "House", "task": "hang", "title": "Hang", "timeout": 1}],
+        "parent-1", "", background=True,
+    )
+    jid = summaries[0]["id"]
+    assert _wait_until(lambda: (delegation.get_entry(jid) or {}).get("status") == "failed", timeout=10)
+    e = delegation.get_entry(jid)
+    assert "timeout" in e["error"].lower()
+    wakes = _drain_all("parent-1")
+    assert any(jid in w and "FAILED" in w and "timeout" in w.lower() for w in wakes)
+    gate.set()
+    delegation.reset_delegations()
+
+
+def test_parallel_cap_queues_excess_jobs(fake_env, monkeypatch):
+    import agents.house_agent as ha
+    from agents import delegation
+
+    delegation.reset_delegations()
+    monkeypatch.setenv("ORCH_MAX_PARALLEL", "1")
+    gate = threading.Event()
+
+    def held_house(state):
+        gate.wait(timeout=15)
+        return {"agent_report": "held done"}
+
+    monkeypatch.setattr(ha, "house_node", held_house)
+    summaries = delegation.start_delegations(
+        [{"agent": "House", "task": "one", "title": "One"},
+         {"agent": "House", "task": "two", "title": "Two"}],
+        "parent-1", "", background=True,
+    )
+    ids = [s["id"] for s in summaries]
+    assert _wait_until(lambda: any(
+        (delegation.get_entry(i) or {}).get("status") in ("running", "queued") for i in ids))
+    assert _wait_until(lambda: any(
+        (delegation.get_entry(i) or {}).get("status") == "queued" for i in ids), timeout=5)
+    board = delegation.status_table()
+    assert "queued" in board
+    assert "[..]" in board
+    gate.set()
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0, timeout=15)
+    assert all((delegation.get_entry(i) or {}).get("status") == "done" for i in ids)
+    delegation.reset_delegations()
+
+
+def test_wrapup_guard_flags_unmentioned_failures(fake_env):
+    from agents import delegation
+    from agents.graph.orchestrator_graph import _unmentioned_settled_failures
+
+    delegation.reset_delegations()
+    with delegation._LOCK:
+        delegation._DELEGATIONS["del-x1"] = {
+            "id": "del-x1", "agent_display": "Dev", "title": "Login fix",
+            "status": "failed", "parent": "parent-1", "result": "", "error": "boom",
+        }
+        delegation._DELEGATIONS["del-x2"] = {
+            "id": "del-x2", "agent_display": "General", "title": "Note",
+            "status": "done", "parent": "parent-1", "result": "ok", "error": "",
+        }
+        delegation._DELEGATIONS["del-x3"] = {
+            "id": "del-x3", "agent_display": "House", "title": "Lights",
+            "status": "failed", "parent": "other-chat", "result": "", "error": "boom",
+        }
+
+    class _State:
+        chat_id = "parent-1"
+        response_text = "All done, Sir — the note is saved."
+
+    missing = _unmentioned_settled_failures(_State())
+    assert len(missing) == 1 and "del-x1" in missing[0]
+
+    class _StateOk:
+        chat_id = "parent-1"
+        response_text = "Login fix failed (del-x1) — boom. Note saved."
+
+    assert _unmentioned_settled_failures(_StateOk()) == []
+    delegation.reset_delegations()
+
+
+def test_state_version_guard_discards_stale_resume(tmp_path, monkeypatch):
+    import json
+    from agents.graph import orchestrator_graph as og
+
+    chat = "chat-ver-1"
+    old = og.OrchestratorState(chat_id=chat, project_path=str(tmp_path), client_request="x")
+    data = old.to_json()
+    data["schema_version"] = 1  # stale
+    path = og.state_file_path(chat, str(tmp_path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    assert og.load_state(chat, str(tmp_path)) is None
+
+    # Current version + matching fingerprint → resumes.
+    fresh = og.OrchestratorState(chat_id=chat, project_path=str(tmp_path), client_request="x")
+    og.save_state(fresh, str(tmp_path))
+    loaded = og.load_state(chat, str(tmp_path))
+    assert loaded is not None and loaded.chat_id == chat
+
+
+# ── Auto job tracker: the orchestrator plan is built from real jobs ──────────
+
+
+def test_auto_job_plan_tracks_jobs(fake_env, monkeypatch, tmp_path):
+    import sync.sync_helpers as sh
+    import agents.house_agent as ha
+    from agents import delegation
+    from sync.sync_helpers import load_plan
+
+    monkeypatch.setattr(sh, "WORKSPACE_DIR", str(tmp_path))
+    delegation.reset_delegations()
+    gate = threading.Event()
+
+    def held_house(state):
+        gate.wait(timeout=15)
+        return {"agent_report": "lights off"}
+
+    monkeypatch.setattr(ha, "house_node", held_house)
+    summaries = delegation.start_delegations(
+        [{"agent": "House", "task": "dim the lights", "title": "Lights"}],
+        "parent-1", "", background=True,
+    )
+    jid = summaries[0]["id"]
+
+    def _items():
+        return load_plan("", "parent-1", "orchestrator")
+
+    # The runner flips the item to "in_progress" when it takes a slot; the job
+    # is held on the gate, so wait for that state specifically.
+    assert _wait_until(lambda: _items() and _items()[0]["status"] == "in_progress", timeout=5)
+    items = _items()
+    assert len(items) == 1
+    step = items[0]["step"]
+    assert jid in step and "House" in step and "Lights" in step
+
+    gate.set()
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
+    assert _wait_until(lambda: _items() and _items()[0]["status"] == "completed")
+    step = _items()[0]["step"]
+    assert "done" in step and jid in step
+    # The developer's plan scope is untouched by the orchestrator tracker.
+    assert load_plan("", "parent-1", "developer") == []
+    delegation.reset_delegations()
+
+
+def test_auto_job_plan_failure_reason(fake_env, monkeypatch, tmp_path):
+    import sync.sync_helpers as sh
+    import agents.general_agent as ga
+    from agents import delegation
+    from sync.sync_helpers import load_plan
+
+    monkeypatch.setattr(sh, "WORKSPACE_DIR", str(tmp_path))
+    delegation.reset_delegations()
+
+    def exploding(state):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(ga, "general_node", exploding)
+    summaries = delegation.start_delegations(
+        [{"agent": "General", "task": "will explode", "title": "Boom"}],
+        "parent-1", "", background=True,
+    )
+    jid = summaries[0]["id"]
+    assert _wait_until(lambda: delegation.running_count("parent-1") == 0)
+    items = load_plan("", "parent-1", "orchestrator")
+    assert items and items[0]["status"] == "completed"
+    step = items[0]["step"]
+    assert jid in step and "failed" in step and "disk on fire" in step
+    delegation.reset_delegations()
 
 
 if __name__ == "__main__":

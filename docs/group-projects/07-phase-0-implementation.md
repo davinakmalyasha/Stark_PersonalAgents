@@ -422,12 +422,21 @@ None of these change the design. All of them are the reason §2.3 exists.
 
 | # | Assertion | Result |
 |---|---|---|
-| 1 | No regressions | **PASS** — 133 → 137 passed, the same 46 pre-existing failures throughout |
+| 1 | No regressions | **PASS** — `pytest tests/ -q` → **183 passed, 0 failed** |
 | 2 | Jobs survive a restart; `running` reconciles to `failed(process_restart)` | **PASS** — `test_jobs_survive_a_restart` |
 | 3 | Concurrent tasks produce independent reports | **PASS** — verified FAILING before the fix (`chat-A received ['report::B']`) |
 | 4 | `_DELEGATIONS` is a cache | **PASS** — `test_cache_is_a_cache`, plus an end-to-end check against a real `jobs.db` |
 
-The 46 pre-existing failures are all `missing 1 required positional argument` — pytest-fixture-style tests that the zero-arg `tests/run_all.py` runner cannot drive. They are unrelated to Phase 0 and were failing before it.
+**Correction to an earlier claim in this document.** This section originally reported "the same 46 pre-existing failures throughout", based on `tests/run_all.py`. That was wrong, and so was the diagnosis. **The suite has no pre-existing failures:**
+
+| Runner | Result |
+|---|---|
+| `python -m pytest tests/ -q` | **183 passed, 0 failed** — the real state |
+| `python tests/run_all.py` | 137 passed, **46 "failed"** — runner defects, not code failures |
+
+The 46 are the legacy zero-argument runner's own limitations: 23 are `ModuleNotFoundError: No module named 'agents' / 'llm' / 'tools'` (it never puts the repo root on `sys.path`, relying on `_util`'s side effect, which only lands once an alphabetically-later module imports it), and 23 are `TypeError: ... missing 1 required positional argument` (pytest-fixture tests it cannot drive). All 46 pass under pytest.
+
+**This matters because `.github/workflows/template-validate.yml` runs `python tests/run_all.py`** — so CI has been reporting red on a green suite. Fixing that is its own change: either point CI at pytest, or repair the runner. Not part of Phase 0.
 
 ### 11.3 What building actually revealed
 
@@ -438,7 +447,7 @@ Three findings the spec predicted, and one it did not.
 | 1 | **The row shape ≠ the live entry shape.** | **Real and material.** The `jobs` columns are a *subset*: `agent_display`, `delivered`, `started`, `task`, `outcome`, `acceptance` are not columns. Rehydrated rows broke `status_table` (`KeyError: 'agent_display'`) and `undelivered_count` (every job looked undelivered). Fixed by adding **`entry_json`** — the full entry as a payload alongside the queryable columns. `mark()` merges into it so both stay consistent. This is the one design refinement Phase 0 needed. |
 | 2 | `reset_delegations()` needed to clear the store. | **Confirmed** — and it needed a new `JobStore.delete()` to do it. |
 | 3 | Status-transition points were where §4.3 predicted. | **Confirmed** — insertion at the single site, plus four transitions (`_finalize_entry`, `_run_item`, `_run_resume_item`, `cancel_all`). All now persist. |
-| 4 | **Not predicted: the test suite is not isolated.** | `tests/_util.py::tools_stub()` replaces `sys.modules["tools"]` with a minimal stub and **never restores it**, so any later test module that imports the real agent stack dies with `ImportError: cannot import name 'ToolExecutionResult' from 'tools'`. Both new test files work around it by installing a path-only `agents` package shim that loads `agents.delegation`/`agents.jobs.store` without executing `agents/__init__.py`. **This is a pre-existing test-infrastructure bug worth its own fix.** |
+| 4 | **Not predicted: the `tools` stub is installed globally and never restored.** | `tests/_util.py::tools_stub()` replaces `sys.modules["tools"]` with a minimal stub. Under **pytest** this is harmless in practice — `test_agent_profile` (alphabetically first) imports the real `agents` package and caches it before the stub lands, so later modules never re-import. Under **`run_all.py`** it is fatal: that same import fails on the path defect, so `agents` is never cached, and the next module to need it dies with `ImportError: cannot import name 'ToolExecutionResult' from 'tools'`. Both new test files sidestep it with a path-only `agents` package shim, which is also ~12s faster than importing the real stack. **Latent trap; worth fixing alongside the runner.** |
 
 ### 11.4 Cost notes
 

@@ -141,9 +141,23 @@ Phases 4a and 4b are separate because a milestone gates its items: an item can b
      emit nothing if already consistent
 ```
 
-This runs on every tick, not just at boot, and it is cheap when consistent: one indexed `MAX(seq)` comparison. That is what makes "events are the only truth" safe in practice — the board is self-healing within one tick of any divergence, whether the cause was a crash, a manual edit, or a bug.
+This runs on every tick, not just at boot, and it is cheap when consistent: one indexed `MAX(seq)` comparison.
 
-Full `rebuild()` from `seq = 0` still exists for repair and for the DM-16 test, but it is not on the hot path.
+**What it does and does not fix — corrected after building Phase 1.** An earlier version of this section claimed the board is *"self-healing within one tick of any divergence, whether the cause was a crash, a manual edit, or a bug."* That was wrong, and the Phase 1 tests prove it.
+
+A tail replay re-applies **only the events after the checkpoint**, so it can only repair divergence where the events landed but their projection writes did not:
+
+| Divergence | Repaired by |
+|---|---|
+| An event written but its projection update never committed | **Phase 0 tail replay**, within one tick |
+| A row corrupted by hand, or deleted, with the checkpoint current | **Only `rebuild()`** — replaying the tail cannot recreate a row an *earlier* event created |
+| Anything at all, at boot | **`rebuild()`** — boot never trusts the tables (`§5.1`) |
+
+The narrow case is not a weakness in practice, because `append()` writes the event, the projection, and the checkpoint in **one transaction** — so a crash cannot produce the wide case. What tail replay actually guards is a future code path that writes an event without persisting it, and that is worth catching within 15 seconds.
+
+`ensure_consistent()` is honest about this: it returns the number of events replayed, and `0` means "checkpoint is current", not "the board is correct."
+
+Full `rebuild()` from `seq = 0` exists for repair and for the DM-16 test, and is not on the hot path.
 
 ### 3.1 Phase 1 — apply operations
 
@@ -439,7 +453,7 @@ The left column costs tokens and can be asleep for hours. The right column costs
 | RT-09 | Ops apply in submission order | Must | Given ops A then B, When the tick applies them, Then A's event `seq` precedes B's |
 | RT-10 | `delegate` and group project share one concurrency governor | Must | Given both active, When slots are exhausted, Then neither bypasses the semaphore |
 | RT-11 | Projections are rebuilt from events on boot | Must | Given a boot with divergent projections, When `recover_all_projects()` runs, Then every projection equals `rebuild()` output |
-| RT-12 | Projection divergence self-heals within one tick | Must | Given a manually corrupted projection row, When the next tick runs, Then phase 0 replays the tail and the row is correct |
+| RT-12 | A projection that **lags** the event log self-heals within one tick | Must | Given an event whose projection write did not commit, When the next tick runs, Then phase 0 replays the tail and the projection is correct. **Arbitrary corruption with a current checkpoint is explicitly out of scope** — only `rebuild()` repairs that (§3.0) |
 | RT-13 | A milestone's completion propagates in the same tick | Must | Given the last item of a milestone becomes `done`, When the tick ends, Then the milestone is `done` — no second tick of lag |
 | RT-14 | Invalidations coalesce into one orchestrator wake per burst | Must | Given 5 invalidations in one tick, When counted, Then the orchestrator was woken exactly once |
 | RT-15 | An item in a non-live milestone is never dispatched | Must | Given an item with all deps `done` whose milestone is `todo`, When the supervisor selects work, Then it is not eligible |
@@ -463,3 +477,51 @@ The left column costs tokens and can be asleep for hours. The right column costs
 | Stall detection counts **events**, not activity | A busy project always emits events, so a quiet-but-working member never looks idle | CPU/wall-clock activity sampling (wrong signal; workers are I/O-bound and legitimately idle) |
 | Reuse the delegation slot semaphore | One governor, not two | A second limiter for projects (starvation risk either way) |
 | Cumulative per-member conversations | Continuity across items is the feature; compaction already handles growth | One conversation per item (loses the learning, and multiplies cold starts) |
+
+---
+
+## 12. Build Record
+
+**Status: BUILT.** Gate met. `pytest tests/ -q` → **198 passed, 0 failed** (183 before Phase 1, +15).
+
+### 12.1 What shipped
+
+| File | Contents |
+|---|---|
+| `agents/group/events.py` | **The frozen vocabulary (D-13).** 37 kinds, the status enums, the `ITEM_STATUS_KIND` / `MILESTONE_STATUS_KIND` correspondence (DM-19), and `UnknownEventKind` |
+| `agents/group/store.py` | `ProjectStore` — events table (truth) + projects/milestones/items/ops/checkpoint (projections), the single pure `_reduce`, `append` / `submit_op` / `rebuild` / `ensure_consistent`, and `evaluate_completion` |
+| `agents/group/supervisor.py` | `Supervisor` — all 11 tick phases, `recover_all_projects` for boot |
+| `tests/test_group_supervisor.py` | 15 tests: the synthetic ledger, gating, leases, invalidation bursts, gates, rebuild equivalence, corruption repair |
+| `tests/_util.py` | new `agents_shim()` — imports `agents.*` submodules without executing `agents/__init__.py` |
+
+### 12.2 The whole module is one reducer
+
+`_reduce(state, event) -> touched_keys` is the only place that knows how an event changes state. Two callers use it: `append()` (incremental, one transaction) and `rebuild()` (full replay). Because there is exactly one implementation, `rebuild()` is provably equivalent to the incremental path — which is the thing DM-16 asserts and the reason every future change to the projection model is free.
+
+`test_rebuild_reproduces_the_projections_exactly` drives a project partway, rebuilds, and compares. It also asserts idempotence.
+
+### 12.3 What building revealed
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | **The budget gate could never fire.** `item.done` updated only the *item's* cost; the project's `spent_usd` was never accumulated, so `_gate` always saw 0. | **Real bug.** The reducer now accumulates to the project row on `item.done`. Accumulated rather than summed on read, because the gate runs every tick and must not walk the item table. Caught by `test_budget_stop_halts_dispatch`. |
+| 2 | **Milestone completion did not propagate within a tick.** `_milestones` read deps from a snapshot taken at the start of the pass, so finishing `m1` only released `m2` on the *next* tick — 15 seconds of dead time per milestone, and a deviation from "readiness is derived every tick". | **Real bug.** The pass now walks milestones in `seq_no` order and updates its own local copy, so a completion is visible to dependents in the same pass. Locked in by `test_milestone_completion_propagates_in_the_same_tick`. |
+| 3 | **`ensure_consistent` heals less than this document claimed.** §3.0 originally said divergence self-heals *"whether the cause was a crash, a manual edit, or a bug."* It cannot: replaying the tail cannot recreate a row an **earlier** event created. | **Doc corrected, not the code.** §3.0 now states precisely what tail replay repairs (an event whose projection write did not commit) and what needs `rebuild()` (anything else). RT-12 corrected to match. A test asserts each side. |
+| 4 | The `tools` stub trap generalises. | `tests/_util.py::agents_shim()` now exists so any future test can import `agents.*` safely. It also made the suite **faster** — 125s before Phase 1, 86s after. |
+
+### 12.4 Deliberate Phase 1 limits
+
+| Limit | Why it is correct for this phase |
+|---|---|
+| `dispatch` is inert — it never claims without a runner | Claiming an item it cannot run would leave it `doing` until the lease expired, which is worse than leaving it `ready`. Phase 2 supplies the runner. |
+| No members, no approvals, no messages | Their kinds are declared in the vocabulary but not reduced, so replaying one raises `UnknownEventKind` rather than silently ignoring it. |
+| `update_item` and `set_completion` are rejected ops with a clear message | Both need event kinds that carry field-level deltas. Deferred rather than faked. |
+| `add_milestone` / `add_item` are the only plan mutations | Enough to prove the op queue; `reprioritize` and the rest are Phase 3. |
+
+### 12.5 Still open
+
+| Item | Where |
+|---|---|
+| `tests/run_all.py` reports 46 false failures and CI runs it | `07` §11.2 |
+| Wiring the supervisor into server boot (`start_group_scheduler`, `05` §10) | Phase 4 — nothing needs it until projects are created from the UI |
+| `scratch/gen10_current.pid` tracked; `error_patterns.py` dormant | `07` §11.5 |

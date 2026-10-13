@@ -37,18 +37,13 @@ Each phase has a **test project** that must pass before the next begins. Test pr
 
 ---
 
-### Phase 1 — Supervisor without an LLM
+### Phase 1 — Supervisor without an LLM  ✅ BUILT
 
-| | |
-|---|---|
-| **Scope** | Step 3. Supervisor thread, tick (all 11 phases), milestone progression, readiness at both levels, leases, invalidation + coalescing, resume, budget/deadline gates. **No members yet.** |
-| **Why** | Proves the hardest, cheapest thing: a durable DAG that advances with no model in the loop. If this works, the LLM is decoration on a working scheduler. |
-| **Test project** | **`synthetic-ledger`** — 5 milestones × 12 items, hand-written DAG, no members. Items completed by hand via ops. Assert: milestone readiness gates its items; readiness propagates; an expired lease blocks; a failed dependency never dispatches; **one invalidation burst wakes the orchestrator once**; budget stops the project; `kill -9` → restart → completes with nothing lost or duplicated; a deliberate deadlock raises `project.stalled` rather than spinning. |
-| **Rebuild test** | Drop every projection table, call `rebuild()`, assert field-for-field equality (DM-16). Then corrupt one row mid-run and assert tick phase 0 self-heals it within one tick. |
-| **Gate** | The DAG reaches `done` on `all_milestones_done`. `kill -9` mid-run → restart → completes. A deliberate deadlock stalls. Projections provably rebuildable. |
-| **Effort** | The largest single piece. Everything here is deterministic and therefore testable without a model. |
+**Build record: `02-runtime.md` §12.** The event vocabulary (D-13) was settled first, as this section required, and is now frozen code in `agents/group/events.py`.
 
-**The rebuild test is the most valuable test in the feature.** If dropping the projections and rebuilding reproduces the state exactly, then the event log is provably sufficient — which is what makes every future model change free.
+**Status: done — gate met.** `pytest tests/ -q` → **198 passed, 0 failed** (+15 over Phase 0). The synthetic ledger completes; a deadlocked project stalls rather than spins; projections provably rebuild from the log. Two real bugs were found and fixed by the tests (the budget gate could never fire; milestone completion lagged a tick), and one over-claim in `02` §3.0 was corrected.
+
+**What Phase 1 deliberately does not do:** `dispatch` is inert — it never claims an item without a runner, because claiming work it cannot run is worse than leaving it ready. Phase 2 supplies the runner.
 
 ---
 
@@ -250,7 +245,7 @@ Mitigation that already exists: the `never` tier removes tools from the material
 | D-10 | Does the completion predicate ever need to be LLM-judged ("is this good enough?")? | No. `llm` criteria are per-item; the project predicate stays deterministic | Phase 1 |
 | D-11 | Multi-project concurrency — how many projects may be live at once? | Needs a cap; the slot semaphore is shared | Phase 1 |
 | D-12 | When a member is `remove_member`, what happens to its in-flight item? | Lease released → `blocked(reassignment)`. Never silently reassigned | Phase 3 |
-| D-13 | **Is the event `kind` vocabulary final?** | It is now an API old projects replay through forever, so a missing kind is a permanent hole in the history. Get it right before Phase 1, not after | **Phase 1** |
+| ~~D-13~~ | ~~Is the event `kind` vocabulary final?~~ **RESOLVED.** 37 kinds frozen in `agents/group/events.py`, grouped by concern, with `ITEM_STATUS_KIND`/`MILESTONE_STATUS_KIND` asserting the state↔kind correspondence (DM-19). Replaying an unimplemented kind raises `UnknownEventKind` rather than silently ignoring it, so a gap can only ever be loud. Adding kinds later is fine; renaming one is not. |
 | D-14 | How long should the invalidation re-plan window be before escalating to the human inbox? | 10 min default; tunable | Phase 2 |
 | D-15 | Does an invalidated item's successor reuse the id, or get a new one? | **New id.** Reusing makes the event log ambiguous — `item.invalidated` then `item.done` on the same id would look like a resurrection | Phase 1 |
 | D-16 | Should milestone `acceptance` exist, or is "all items done" enough? | Optional; useful for a phase-level manual checkpoint ("design approved") | Phase 2 |

@@ -68,17 +68,19 @@ def try_enqueue(chat_id: str, content: str) -> bool:
 
 
 def enqueue_or_follow_up(chat_id: str, content: str) -> None:
-    """Deliver via enqueue if active, plus inbox.follow_up for park_wait compat."""
-    enqueued = try_enqueue(chat_id, content)
-    # Always also write to inbox so the current park_wait (polling) wakes;
-    # when the orchestrator migrates to agent.iter, the inbox write becomes the
-    # fallback for non-active runs.
+    """Deliver one ordered completion to the orchestrator's inbox.
+
+    The current orchestrator graph explicitly parks on ``park_wait``.  Sending
+    the same result through both ``RunContext.enqueue`` and that inbox can make
+    one child completion appear twice or arrive before the delegation step has
+    settled.  Keep the inbox as the canonical transport; ``try_enqueue`` stays
+    available for a future fully native runner that does not use graph parking.
+    """
     try:
         from inbox import follow_up
         follow_up(chat_id, content)
     except Exception:
         pass
-    # enqueued flag kept for future when inbox can be skipped
 
 
 def enqueue_or_steer(chat_id: str, content: str) -> None:

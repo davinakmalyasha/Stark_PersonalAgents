@@ -151,6 +151,28 @@ def emit(chat_id: str, kind: str, text: str, agent: str = "", model: str = "") -
         pass
     _notify_async_waiters(chat_id)
 
+
+def emit_event(chat_id: str, payload: dict) -> None:
+    """Structured frames (tool_started/tool_finished, ...) on the same transport.
+
+    Drained and SSE-forwarded exactly like token deltas; the frontend
+    distinguishes frames by ``kind``. Best-effort: never raises.
+    """
+    if not enabled() or not chat_id or not isinstance(payload, dict):
+        return
+    try:
+        with _LOCK:
+            q = _BUS.setdefault(chat_id, deque())
+            if len(q) >= _MAX_ENTRIES:
+                return
+            frame = dict(payload)
+            frame.setdefault("ts", time.time())
+            q.append(frame)
+            _ACTIVE[chat_id] = time.time()
+    except Exception:
+        pass
+    _notify_async_waiters(chat_id)
+
 def drain(chat_id: str, limit: int = 60) -> list[dict]:
     if not enabled() or not chat_id:
         return []

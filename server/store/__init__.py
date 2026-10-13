@@ -7,6 +7,7 @@ from server.store.chat_store import (
     list_chats,
     get_chat,
     create_chat,
+    find_chat_workspace_id,
     save_chat,
     delete_chat,
     add_message,
@@ -39,7 +40,7 @@ from server.store.mode_store import get_mode, set_mode
 
 __all__ = [
     "SESSIONS_ROOT", "CHATS_DB",
-    "list_chats", "get_chat", "create_chat", "save_chat", "delete_chat", "add_message",
+    "list_chats", "get_chat", "create_chat", "find_chat_workspace_id", "save_chat", "delete_chat", "add_message",
     "update_chat_title", "get_chat_tasks", "save_chat_tasks",
     "REGISTRY_PATH", "GENERAL_WORKSPACE_ID", "HOUSE_WORKSPACE_ID", "PERSONAL_WORKSPACE_ID", "DFD_WORKSPACE_ID",
     "VIRTUAL_WORKSPACE_IDS", "GENERAL_CHAT_DIR", "HOUSE_CHAT_DIR", "PERSONAL_CHAT_DIR", "DFD_CHAT_DIR",

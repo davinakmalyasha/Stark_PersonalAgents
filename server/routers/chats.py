@@ -9,7 +9,7 @@ from fastapi import APIRouter, File, Request, UploadFile; from fastapi.responses
 from server.store.workspace_registry import get_workspace
 from server.store.chat_store import (
     list_chats, get_chat, create_chat, delete_chat, add_message,
-    update_chat_title, save_chat,
+    update_chat_title as store_update_chat_title, save_chat,
 )
 
 router = APIRouter(tags=["chats"])
@@ -41,7 +41,9 @@ async def create_chat_endpoint(workspace_id: str, req: Request):
     body = await req.json()
     title = body.get("title", "")
     model = body.get("model", "Automatic Fallback")
-    chat = create_chat(ws["path"], title, model)
+    parent_chat_id = str(body.get("parent_chat_id") or body.get("parentChatId") or "")
+    parent_workspace_id = str(body.get("parent_workspace_id") or body.get("parentWorkspaceId") or "")
+    chat = create_chat(ws["path"], title, model, parent_chat_id, parent_workspace_id)
     return JSONResponse(content=chat)
 
 
@@ -139,13 +141,13 @@ async def upload_chat_attachments(workspace_id: str, chat_id: str, files: list[U
 
 
 @router.put("/api/workspaces/{workspace_id}/chats/{chat_id}/title")
-async def update_chat_title(workspace_id: str, chat_id: str, req: Request):
+async def update_chat_title_endpoint(workspace_id: str, chat_id: str, req: Request):
     ws = get_workspace(workspace_id)
     if not ws:
         return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
     body = await req.json()
     title = body.get("title", "")
-    ok = update_chat_title(ws["path"], chat_id, title)
+    ok = store_update_chat_title(ws["path"], chat_id, title)
     return JSONResponse(content={"status": "ok" if ok else "not found"})
 
 

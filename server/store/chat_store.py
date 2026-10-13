@@ -91,6 +91,18 @@ def _init_db(db: sqlite3.Connection) -> None:
     if "tasks_json" not in cols:
         db.execute("ALTER TABLE chats ADD COLUMN tasks_json TEXT")
         db.commit()
+        cols.append("tasks_json")
+    if "parent_chat_id" not in cols:
+        db.execute("ALTER TABLE chats ADD COLUMN parent_chat_id TEXT")
+        db.commit()
+        cols.append("parent_chat_id")
+    if "parent_workspace_id" not in cols:
+        db.execute("ALTER TABLE chats ADD COLUMN parent_workspace_id TEXT")
+        db.commit()
+        cols.append("parent_workspace_id")
+    if "token_usage_json" not in cols:
+        db.execute("ALTER TABLE chats ADD COLUMN token_usage_json TEXT")
+        db.commit()
     # FTS5 for title/content search
     try:
         db.execute("""
@@ -196,7 +208,84 @@ def _jsonl_path(workspace_path: str, chat_id: str) -> str:
 
 # Public API — mirrors old workspace_manager chat CRUD but via SQLite+JSONL
 
+def find_chat_workspace_id(chat_id: str) -> str:
+    """Best-effort lookup of a chat's workspace_id (for parent linkage).
+
+    Returns "" when unknown. Never raises — callers use it to fill
+    parent_workspace_id when only parent_chat_id is known (e.g. a child
+    spawned in a different workspace than its parent).
+    """
+    if not chat_id:
+        return ""
+    try:
+        db = _get_db()
+        cur = db.execute("SELECT workspace_id FROM chats WHERE id=?", (chat_id,))
+        row = cur.fetchone()
+        return str(row[0] or "") if row else ""
+    except Exception:
+        return ""
+
+
+def _resolve_parent_workspace_id(parent_chat_id: str, hint: str = "") -> str:
+    if hint:
+        return hint
+    return find_chat_workspace_id(parent_chat_id)
+
+
+_PARENT_BACKFILL_DONE = False
+
+def _backfill_parents() -> None:
+    global _PARENT_BACKFILL_DONE
+    if _PARENT_BACKFILL_DONE:
+        return
+    _PARENT_BACKFILL_DONE = True
+    try:
+        ledger = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".agent-memory", "orchestrator_jobs.jsonl")
+        # Fallback to harness root
+        if not os.path.isfile(ledger):
+            ledger = os.path.join(r"d:\MyProject\LangChain", ".agent-memory", "orchestrator_jobs.jsonl")
+        if not os.path.isfile(ledger):
+            return
+        db = _get_db()
+        # Only backfill chats where parent is still null
+        updated = 0
+        with open(ledger, "r", encoding="utf-8") as f:
+            for line in f:
+                line=line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                child = rec.get("chat_id") or rec.get("chatId")
+                parent = rec.get("parent") or rec.get("parent_chat_id")
+                ws = rec.get("workspace") or ""
+                if not child or not parent:
+                    continue
+                try:
+                    cur = db.execute("SELECT parent_chat_id, parent_workspace_id FROM chats WHERE id=?", (child,))
+                    row = cur.fetchone()
+                    if row and not row[0]:
+                        parent_ws = find_chat_workspace_id(parent)
+                        db.execute("UPDATE chats SET parent_chat_id=?, parent_workspace_id=? WHERE id=?", (parent, parent_ws or None, child))
+                        updated += 1
+                    elif row and row[0] and not row[1]:
+                        # Parent known but workspace missing (older rows saved
+                        # with parent_workspace_id="") — heal it in place.
+                        parent_ws = find_chat_workspace_id(row[0])
+                        if parent_ws:
+                            db.execute("UPDATE chats SET parent_workspace_id=? WHERE id=?", (parent_ws, child))
+                            updated += 1
+                except Exception:
+                    continue
+        if updated:
+            db.commit()
+    except Exception:
+        pass
+
 def list_chats(workspace_path: str) -> list[dict]:
+    _backfill_parents()
     db = _get_db()
     # Determine workspace_id for filter
     ws_id = workspace_path or GENERAL_WORKSPACE_ID
@@ -214,11 +303,16 @@ def list_chats(workspace_path: str) -> list[dict]:
             pass
     # Lazy migration removed — chats.db + sessions/{kind}/ JSONL are canonical
     try:
-        cur = db.execute("SELECT id, title, model, created_at, updated_at, message_count FROM chats WHERE workspace_id=? ORDER BY updated_at DESC", (ws_id,))
+        cur = db.execute("SELECT id, title, model, created_at, updated_at, message_count, parent_chat_id, parent_workspace_id FROM chats WHERE workspace_id=? ORDER BY updated_at DESC", (ws_id,))
         rows = cur.fetchall()
         out = []
         for r in rows:
-            out.append({"id": r[0], "title": r[1], "messageCount": r[5], "model": r[2], "createdAt": r[3], "updatedAt": r[4]})
+            item = {"id": r[0], "title": r[1], "messageCount": r[5], "model": r[2], "createdAt": r[3], "updatedAt": r[4]}
+            if r[6]:
+                item["parentChatId"] = r[6]
+            if r[7]:
+                item["parentWorkspaceId"] = r[7]
+            out.append(item)
         return out
     except Exception:
         return []
@@ -228,7 +322,7 @@ def get_chat(workspace_path: str, chat_id: str, include_traces: bool = True, inc
         return None
     _validate_chat_id(chat_id)
     db = _get_db()
-    cur = db.execute("SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned FROM chats WHERE id=?", (chat_id,))
+    cur = db.execute("SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned, token_usage_json, parent_chat_id, parent_workspace_id FROM chats WHERE id=?", (chat_id,))
     row = cur.fetchone()
     if not row:
         return None
@@ -248,11 +342,20 @@ def get_chat(workspace_path: str, chat_id: str, include_traces: bool = True, inc
             meta["isTrace"] = True
         msgs.append({"id": mid, "role": role, "content": content, "timestamp": ts, "metadata": meta} if meta else {"id": mid, "role": role, "content": content, "timestamp": ts})
     chat = {"id": row[0], "title": row[3], "model": row[4], "createdAt": row[5], "updatedAt": row[6], "messages": msgs, "isPinned": bool(row[7])}
+    if len(row) > 9 and row[9]:
+        chat["parentChatId"] = row[9]
+    if len(row) > 10 and row[10]:
+        chat["parentWorkspaceId"] = row[10]
+    if row[8]:
+        try:
+            chat["token_usage"] = json.loads(row[8])
+        except Exception:
+            pass
     chat["_traces_loaded"] = include_traces
     chat["_usage_loaded"] = include_usage
     return chat
 
-def create_chat(workspace_path: str, title: str = "", model: str = "Automatic Fallback") -> dict:
+def create_chat(workspace_path: str, title: str = "", model: str = "Automatic Fallback", parent_chat_id: str = "", parent_workspace_id: str = "") -> dict:
     db = _get_db()
     chat_id = f"chat-{uuid.uuid4().hex[:12]}"
     now = datetime.now().isoformat()
@@ -277,8 +380,12 @@ def create_chat(workspace_path: str, title: str = "", model: str = "Automatic Fa
         ws_id = DFD_WORKSPACE_ID
     elif workspace_path in ('', GENERAL_WORKSPACE_ID):
         ws_id = GENERAL_WORKSPACE_ID
-    db.execute("INSERT INTO chats (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, mode) VALUES (?,?,?,?,?,?,?,?,?)",
-               (chat_id, ws_id, workspace_path or "", title or "New Chat", model, now, now, 0, "build"))
+    # Cross-workspace hierarchy: a spawned child usually knows its parent chat
+    # id but not the parent's workspace. Resolve it so the sidebar can group
+    # orchestrator → workspace-agent → sub-delegation chains anywhere.
+    resolved_parent_ws = _resolve_parent_workspace_id(parent_chat_id or "", parent_workspace_id or "")
+    db.execute("INSERT INTO chats (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, mode, parent_chat_id, parent_workspace_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+               (chat_id, ws_id, workspace_path or "", title or "New Chat", model, now, now, 0, "build", parent_chat_id or None, resolved_parent_ws or None))
     db.commit()
     # Create empty JSONL
     jpath = _jsonl_path(workspace_path or GENERAL_WORKSPACE_ID, chat_id)
@@ -308,14 +415,18 @@ def save_chat(workspace_path: str, chat_id: str, data: dict) -> bool:
             title = data.get("title", "Untitled")
             model = data.get("model", "Automatic Fallback")
             is_pinned = 1 if data.get("isPinned") else 0
-            db.execute("UPDATE chats SET title=?, model=?, updated_at=?, message_count=?, pinned=?, tasks_json=? WHERE id=?", (title, model, data["updatedAt"], len(messages), is_pinned,
-                        json.dumps(data.get("tasks", []), ensure_ascii=False), chat_id))
+            tu_json = json.dumps(data.get("token_usage"), ensure_ascii=False) if data.get("token_usage") else None
+            db.execute("UPDATE chats SET title=?, model=?, updated_at=?, message_count=?, pinned=?, tasks_json=?, token_usage_json=? WHERE id=?", (title, model, data["updatedAt"], len(messages), is_pinned,
+                        json.dumps(data.get("tasks", []), ensure_ascii=False), tu_json, chat_id))
             if db.execute("SELECT changes()").fetchone()[0] == 0:
-                # Insert if not exists
+                # Insert if not exists — preserve parent linkage (spawned-child
+                # grouping) instead of dropping it on this fallback path.
                 ws_id = workspace_path or GENERAL_WORKSPACE_ID
-                db.execute("INSERT OR IGNORE INTO chats (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, pinned, tasks_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                parent_id = data.get("parentChatId") or data.get("parent_chat_id")
+                parent_ws = data.get("parentWorkspaceId") or data.get("parent_workspace_id")
+                db.execute("INSERT OR IGNORE INTO chats (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, pinned, tasks_json, token_usage_json, parent_chat_id, parent_workspace_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (chat_id, ws_id, workspace_path or "", title, model, data.get("createdAt", data["updatedAt"]), data["updatedAt"], len(messages), is_pinned,
-                            json.dumps(data.get("tasks", []), ensure_ascii=False)))
+                            json.dumps(data.get("tasks", []), ensure_ascii=False), tu_json, parent_id, parent_ws))
             # Replace messages
             db.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
             jpath = _jsonl_path(workspace_path or GENERAL_WORKSPACE_ID, chat_id)
@@ -375,7 +486,7 @@ def delete_chat(workspace_path: str, chat_id: str) -> bool:
     return True
 
 def update_chat_title(workspace_path: str, chat_id: str, title: str) -> bool:
-    chat = get_chat(workspace_path, chat_id, include_traces=False, include_usage=False)
+    chat = get_chat(workspace_path, chat_id, include_traces=True, include_usage=True)
     if chat is None:
         return False
     chat["title"] = title

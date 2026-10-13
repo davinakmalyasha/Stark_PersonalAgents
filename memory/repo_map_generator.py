@@ -132,7 +132,7 @@ def _extract_ast_signatures(content: str, lang: str, with_lines: bool = False) -
             )
             # `export const fn = (...) => {}` / `const fn = function() {}` are
             # lexical declarations, not function_declarations — without this
-            # the dominant arrow-function idiom is invisible to the map/outline.
+            # the dominant arrow-function idiom is invisible to the map.
             if not is_target and node_type == "lexical_declaration" and depth == 0:
                 span = content_bytes[node.start_byte:node.end_byte][:400]
                 is_target = b"=>" in span or b"function" in span
@@ -608,9 +608,9 @@ class RepoMapGenerator:
     def _top_level_symbols_from_content(self, content: str, ext: str) -> list[str]:
         """Top-level symbol display tokens for one file body.
 
-        Uses the same tree-sitter/regex extraction as the outline tool, but
-        keeps only depth 0 (module-level functions and classes) so the delta
-        reference scan stays on names that wiring flags care about.
+        Uses the same tree-sitter/regex signature extraction as the project
+        map, but keeps only depth 0 (module-level functions and classes) so
+        the delta reference scan stays on names that wiring flags care about.
         """
         lang_map = {
             ".py": "python", ".php": "php", ".ts": "typescript",

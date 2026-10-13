@@ -149,6 +149,33 @@ async def undo_run(run_id: str):
     return JSONResponse(content={"status": "conflict" if conflicts else "undone", "results": results, "conflicts": conflicts})
 
 
+def _persist_run_crash(chat_id: str, workspace_path: str, prompt: str, tb_text: str) -> str:
+    """Write a full crash report to .deep_agents/errors/ for post-mortems.
+
+    The chat surface only ever gets str(e); the file keeps prompt + route
+    context + traceback so crashes are diagnosable without a live repro.
+    Returns the log path ("" when unwritable). Never raises.
+    """
+    import os
+    from datetime import datetime
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(here))
+        err_dir = os.path.join(root, ".deep_agents", "errors")
+        os.makedirs(err_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_chat = "".join(c if (c.isalnum() or c in "-_") else "_" for c in (chat_id or "nochat"))[:40]
+        path = os.path.join(err_dir, f"{stamp}-{safe_chat}.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"chat_id: {chat_id}\nworkspace_path: {workspace_path}\n"
+                    f"prompt: {(prompt or '')[:2000]}\n\n{tb_text}")
+        print(f"[RUN] crash log: {path}", flush=True)
+        return path
+    except Exception as e:
+        print(f"[RUN] crash-log write failed: {e}", flush=True)
+        return ""
+
+
 class RunRequest(BaseModel):
     prompt: str
     model: str = "Automatic Fallback"
@@ -260,12 +287,14 @@ async def run_pipeline(req: RunRequest, request: Request):
             except Exception as e:
                 import traceback
                 had_error = True
+                tb_text = traceback.format_exc()
+                _persist_run_crash(req.chat_id, req.workspace_path, req.prompt, tb_text)
                 try:
                     err_state = json.loads(safe_serialize_state())
                 except Exception:
                     err_state = {}
                 err_state["error"] = str(e)
-                err_state["traceback"] = traceback.format_exc()
+                err_state["traceback"] = tb_text
                 aq.put_nowait(err_state)
                 aq.put_nowait(None)
             finally:
@@ -435,7 +464,10 @@ async def run_pipeline(req: RunRequest, request: Request):
 def _save_chat_token_usage(workspace_path: str, chat_id: str):
     import workspace_manager as wm
     from sync.state_sync import safe_get_state
-    if not chat_id or not workspace_path:
+    if not chat_id:
+        return
+    # General workspace uses "" path — still persist (empty means _general)
+    if workspace_path is None:
         return
     try:
         chat = wm.get_chat(workspace_path, chat_id, include_traces=False, include_usage=True)

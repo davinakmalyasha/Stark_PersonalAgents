@@ -564,7 +564,7 @@ if __name__ == "__main__":
             from llm.pai_transport import pai_native_turn
             from llm.provider_modes import MODE_MATRIX
             orch = MODE_MATRIX.get("command", {}).get("orchestrator") or {}
-            model = orch.get("model") if isinstance(orch, dict) else "xiaomi/mimo-v2.5"
+            model = orch.get("model") if isinstance(orch, dict) else "xiaomi/mimo-v2.6-flash"
             pai_native_turn(
                 role="Orchestrator",
                 messages=[{"role": "user", "content": "Reply with the single word: ready"}],

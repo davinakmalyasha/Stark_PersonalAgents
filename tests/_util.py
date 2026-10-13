@@ -98,6 +98,41 @@ def attach_real_apply_template():
     return stub
 
 
+@contextlib.contextmanager
+def agents_shim(*module_names):
+    """Import ``agents.<x>`` submodules WITHOUT executing ``agents/__init__.py``.
+
+    ``agents/__init__.py`` pulls the whole agent stack (``developer_agent`` ->
+    ``from tools import ...``). This suite replaces ``sys.modules['tools']``
+    with a stub via :func:`tools_stub` and never restores it, so a plain
+    ``import agents.foo`` raises ``ImportError: cannot import name
+    'ToolExecutionResult' from 'tools'`` depending on test order. A path-only
+    package object sidesteps the ``__init__`` entirely — and is ~12s faster
+    than importing the real stack.
+
+    Yields ``{module_name: module}``. Every touched ``sys.modules`` entry is
+    restored on exit, with ``agents`` restored last so the tree is never left
+    half-swapped.
+    """
+    names = ["agents", *module_names]
+    saved = {name: sys.modules.get(name) for name in names}
+
+    pkg = types.ModuleType("agents")
+    pkg.__path__ = [os.path.join(REPO_ROOT, "agents")]
+    sys.modules["agents"] = pkg
+    try:
+        yield {name: importlib.import_module(name) for name in module_names}
+    finally:
+        # Submodules first, then the package itself, so `agents` is never a
+        # shim pointing at a restored child (or vice versa).
+        for name in sorted(saved, key=lambda n: n == "agents"):
+            module = saved[name]
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
 # ── env isolation ───────────────────────────────────────────────────────────
 
 _CI_ENV_KEYS = ("CI_DEV_BRANCH", "CI_STAGING_BRANCH", "CI_PROD_BRANCHES")

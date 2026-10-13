@@ -141,12 +141,18 @@ body.state-listening .orb-ripple { animation: rippleOut 2.8s ease-out infinite; 
   border: 2.5px solid transparent;
   border-top-color: #0f172a;
   animation: spin 0.9s linear infinite;
-  opacity: 0;
+  opacity: 1;
   transition: opacity 0.35s ease;
 }
 .bars-btn.loading::before { display: none; }
 .bars-btn.loading .bars { opacity: 0; transition: opacity 0.35s ease; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Boot loading (first open / reopen before TTS warm + WS live) ── */
+/* Visual-only: no flow change. Orb keeps its white face, spinner stays
+   visible, label gently pulses so the overlay never looks blank-white. */
+body.is-booting #voice-text { color: #94a3b8; animation: bootPulse 1.1s ease-in-out infinite; }
+@keyframes bootPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 
 /* ── Info column ── */
 .info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
@@ -1262,6 +1268,13 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   let analyser = null;
   let freqBuf = null;
   let levelBuf = null;
+  // TTS output meter (visual-only tap — never in the audio path). Each
+  // scheduled TTS BufferSource also connects to ttsAnalyser so the speaking
+  // bars follow the agent's real voice instead of a random walk. Null until
+  // the shared AudioContext exists; resident for overlay lifetime like auCtx.
+  let ttsAnalyser = null;
+  let ttsFreqBuf = null;
+  let ttsLevelBuf = null;
   let roundTimer = null;
   let roundRunning = false;
   let abortRef = null;
@@ -1269,7 +1282,13 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   const ttsAbortAll = [];      // every in-flight /api/tts/stream fetch
   let lastSpeechAt = 0;        // global: last time speech was heard (any round)
   let lastLang = '';           // 'id' | 'en' — STT language hint
-  let sending = false;         // polish+send in flight guard
+  let sending = false;         // polish+send dispatch guard (short-lived, NOT held for whole run)
+  let runSeq = 0;              // voice pipeline generation — only the latest run may write pipeline-done/trace
+  let lastSentText = '';       // content dedupe: same transcript must never dispatch twice
+  let lastSentAt = 0;
+  let autoSendTimer = null;    // hands-free auto-send debounce (coalesces rapid round ends)
+  let captureGen = 0;          // mic capture generation — stale rounds after toggle must not send
+  function clearVoicePeek() { try { window.__lastPeekText = ''; } catch (_e) {} }
   let roundHasSpeech = false;  // current round captured speech
   let mutePendingSend = false; // hardware-mute pressed while a speech round runs
   let chatId = localStorage.getItem('voice.chatId') || '';
@@ -1350,7 +1369,52 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     if (screenPanel) screenPanel.style.setProperty('--voice-level', '0');
   }
 
-  // Live equalizer bars — heights follow the actual voice level
+  // TTS meter helpers — pure visual reads, no audio-flow change.
+  function ensureTtsAnalyser(ctx) {
+    try {
+      if (ttsAnalyser && ttsFreqBuf && ttsLevelBuf) return ttsAnalyser;
+      const c = ctx || auCtx;
+      if (!c || typeof c.createAnalyser !== 'function') return null;
+      ttsAnalyser = c.createAnalyser();
+      ttsAnalyser.fftSize = 2048;
+      ttsAnalyser.smoothingTimeConstant = 0.8;
+      ttsFreqBuf = new Uint8Array(ttsAnalyser.frequencyBinCount);
+      ttsLevelBuf = new Uint8Array(ttsAnalyser.fftSize);
+      return ttsAnalyser;
+    } catch (_e) { return null; }
+  }
+  function readTtsRms() {
+    if (!ttsAnalyser || !ttsLevelBuf) return 0;
+    try {
+      ttsAnalyser.getByteTimeDomainData(ttsLevelBuf);
+    } catch (_e) { return 0; }
+    let rms = 0;
+    for (let i = 0; i < ttsLevelBuf.length; i++) {
+      const sample = (ttsLevelBuf[i] - 128) / 128;
+      rms += sample * sample;
+    }
+    return Math.sqrt(rms / ttsLevelBuf.length);
+  }
+  function ttsBarHeights() {
+    // Returns real-TTS heights or null when nothing audible is playing
+    // (lead-in gap, <audio> fallback path, analyser missing) so callers can
+    // fall back to the legacy shimmer instead of flatlining.
+    try {
+      if (!ttsAnalyser || !ttsFreqBuf) return null;
+      ttsAnalyser.getByteFrequencyData(ttsFreqBuf);
+      const loudness = readTtsRms();
+      const norm = Math.min(1, loudness * 7);
+      if (norm < 0.02) return null;
+      const heights = [0, 1, 2, 3].map((i) => {
+        const v = ttsFreqBuf[Math.floor((i / 4) * ttsFreqBuf.length * 0.6)] / 255;
+        const variation = 0.58 + v * 0.42;
+        return 4 + norm * variation * 21;
+      });
+      return { heights, loudness, norm };
+    } catch (_e) { return null; }
+  }
+
+  // Live equalizer bars — listening follows the mic, speaking follows TTS
   function updateBars() {
     if (!barEls) return;
     let heights;
@@ -1373,14 +1437,22 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       heights = [0, 1, 2, 3].map((i) => 5 + Math.abs(Math.sin(t + i * 1.1)) * 17);
       resetVoiceGlow();
     } else if (waveMode === 'speaking') {
-      heights = [0, 1, 2, 3].map((i) => {
-        if (!fakeBars[20 + i]) fakeBars[20 + i] = 0.3;
-        fakeBars[20 + i] += (Math.random() - 0.5) * 0.5;
-        fakeBars[20 + i] = Math.min(1, Math.max(0.15, fakeBars[20 + i]));
-        fakeBars[20 + i] *= 0.9;
-        return 4 + fakeBars[20 + i] * 19;
-      });
-      resetVoiceGlow();
+      // Real agent voice first (TTS analyser tap); legacy random shimmer
+      // only as fallback (silent gap, <audio> fallback, no analyser yet).
+      const tts = ttsBarHeights();
+      if (tts) {
+        heights = tts.heights;
+        applyVoiceGlow(tts.norm);
+      } else {
+        heights = [0, 1, 2, 3].map((i) => {
+          if (!fakeBars[20 + i]) fakeBars[20 + i] = 0.3;
+          fakeBars[20 + i] += (Math.random() - 0.5) * 0.5;
+          fakeBars[20 + i] = Math.min(1, Math.max(0.15, fakeBars[20 + i]));
+          fakeBars[20 + i] *= 0.9;
+          return 4 + fakeBars[20 + i] * 19;
+        });
+        resetVoiceGlow();
+      }
     } else {
       heights = [9, 7, 8, 7];
       resetVoiceGlow();
@@ -1428,11 +1500,28 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
         } else if (waveMode === 'thinking') {
           h = Math.max(0.09, Math.abs(Math.sin(Date.now() / 250 + i * 0.55)) * 0.9);
         } else if (waveMode === 'speaking') {
-          if (!fakeBars[i]) fakeBars[i] = 0.12;
-          fakeBars[i] += (Math.random() - 0.5) * 0.55;
-          fakeBars[i] = Math.min(1, Math.max(0.07, fakeBars[i]));
-          fakeBars[i] *= 0.92;
-          h = fakeBars[i];
+          // Same rule as the orb: real TTS spectrum when audible, else the
+          // legacy shimmer so the wave never flatlines mid-utterance.
+          let usedTts = false;
+          try {
+            if (ttsAnalyser && ttsFreqBuf) {
+              ttsAnalyser.getByteFrequencyData(ttsFreqBuf);
+              const ttsLoud = readTtsRms();
+              if (ttsLoud * 7 >= 0.02) {
+                const v = ttsFreqBuf[Math.floor((i / half) * ttsFreqBuf.length * 0.55)] / 255;
+                h = Math.max(0.07, v * v * Math.min(1, ttsLoud * 7) * 1.6);
+                if (h <= 0.071) h = Math.max(0.09, v * 0.9);
+                usedTts = true;
+              }
+            }
+          } catch (_e) { usedTts = false; }
+          if (!usedTts) {
+            if (!fakeBars[i]) fakeBars[i] = 0.12;
+            fakeBars[i] += (Math.random() - 0.5) * 0.55;
+            fakeBars[i] = Math.min(1, Math.max(0.07, fakeBars[i]));
+            fakeBars[i] *= 0.92;
+            h = fakeBars[i];
+          }
         }
         const bh = Math.max(3, h * (H - 4));
         const x = i * bw + 1;
@@ -1470,7 +1559,9 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     if (extraText !== undefined) textEl.textContent = extraText;
     // Preserve layout/mode classes — only state-* changes here (previously the
     // whole className was replaced, which wiped is-menu-open/is-expanded).
-    const keep = ['is-menu-open', 'is-menu-closing', 'is-expanded', 'is-screen', 'is-screen-closing', 'is-demo'];
+    // is-booting is visual-only (cold-start loading) so it must survive status
+    // updates until the heartbeat explicitly clears it.
+    const keep = ['is-menu-open', 'is-menu-closing', 'is-expanded', 'is-screen', 'is-screen-closing', 'is-demo', 'is-booting'];
     const kept = keep.filter((c) => document.body.classList.contains(c));
     document.body.className = kept.concat(['state-' + cls]).join(' ');
     micBtn.className = 'bars-btn' + (micOn ? ' on' : '');
@@ -1572,7 +1663,15 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   async function sendText(raw) {
     const text = cleanTranscript(raw);
     if (!text || sending) return;
+    // Content dedupe (the working send wins): rapid double-dispatch of the
+    // same transcript (mirror + peek + flush racing) sends only once. A
+    // genuinely repeated sentence 5s+ later still sends normally.
+    const now = Date.now();
+    if (text === lastSentText && (now - lastSentAt) < 5000) return;
     sending = true;
+    lastSentText = text;
+    lastSentAt = now;
+    clearVoicePeek();
     try {
       setStatus('thinking');
       const final = text;
@@ -1580,7 +1679,8 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
         textEl.textContent = final;
         send('transcript', { text: final });
       }
-      sendToPipeline(final);
+      runSeq++;
+      sendToPipeline(final, runSeq);
     } finally {
       sending = false;
     }
@@ -1641,6 +1741,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
 
   async function oneRound() {
     if (!stream || !micOn) return;
+    const myGen = captureGen; // stale rounds (mic toggled mid-round) must not send
     const buf = analyser ? new Uint8Array(analyser.fftSize) : null;
     roundHasSpeech = false;
     let lastSoundAt = Date.now();
@@ -1651,6 +1752,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     // local so the skip-empty fast path and flush see WS transcripts.
     const _wsMirrorTimer = setInterval(() => {
       try {
+        if (myGen !== captureGen) return; // stale round after mic toggle
         const w = window.__lastPeekText || '';
         if (w && w !== lastPeekText) {
           lastPeekText = w;
@@ -1724,6 +1826,11 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     }, 60);
 
     async function finishRound() {
+      // Stale round after mic toggle — never send (this was the mic-off
+      // resend + Hello-loop source). The fresh generation owns the mic now.
+      if (myGen !== captureGen || !micOn) {
+        return;
+      }
       // Fast path: browser VAD heard nothing AND the server stream has shown
       // no rolling text → skip the POST /api/voice/send round-trip entirely
       // (it would 422 anyway). The server may still have heard something the
@@ -1781,6 +1888,8 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
 
       // Hands-free auto-send: if idle, start new LLM run; if LLM already
       // thinking, stream as steering (ChatGPT live) so breath+continue works.
+      // Debounced: rapid successive round-ends coalesce into one dispatch so
+      // a stuttering silence gap can't fire two runs for one utterance.
       const pending = accumulated.trim();
       if (!pending) turnFramePromise = null; // round produced nothing — drop the pending frame
       if (pending && !sending) {
@@ -1788,6 +1897,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
           // Stream incremental words to the running LLM + show immediately in chat
           const delta = pending;
           accumulated = '';
+          clearVoicePeek();
           hideHint();
           turnFramePromise = null; // steering carries no attachment
           // Show in chat bubble immediately (transcript already did, but ensure)
@@ -1797,14 +1907,22 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
             fetch(API + '/api/steer', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ chat_id: chatId, message: delta })}).catch(()=>{});
           }
         } else {
-          // No active run — silence gap already observed, so send immediately
-          // (the old extra 100ms debounce just added TTFB with no accuracy win).
-          const text2 = accumulated.trim();
-          if (text2 && !sending && !thinking) {
-            accumulated = '';
-            hideHint();
-            sendText(text2);
-          }
+          // No active run — silence gap already observed; debounce 700ms so
+          // a split silence gap sends once. thinking/sending re-checked at
+          // fire time; stale mic generations are dropped.
+          const fireGen = captureGen;
+          if (autoSendTimer) clearTimeout(autoSendTimer);
+          autoSendTimer = setTimeout(() => {
+            autoSendTimer = null;
+            if (fireGen !== captureGen || !micOn) return;
+            const text2 = accumulated.trim();
+            if (text2 && !sending && !thinking) {
+              accumulated = '';
+              clearVoicePeek();
+              hideHint();
+              sendText(text2);
+            }
+          }, 700);
         }
       }
     }
@@ -2567,7 +2685,9 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   // (sendToPipeline). Handles state
   // frames, live feed, progress, pipeline-done, reply, TTS speaking, errors.
   // Returns true when the reply was spoken / handled; false on transport error.
-  async function consumeRunStream(resp, chat, userText) {
+  async function consumeRunStream(resp, chat, userText, mySeq) {
+    const seq = (typeof mySeq === 'number') ? mySeq : runSeq;
+    const isStale = () => seq !== runSeq;
     let lastState = null;
     let failed = false;
     let failReason = '';
@@ -2687,13 +2807,16 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
         if (evDone) break;
       }
       thinking = false;
-      send('pipeline-done', {
-        workspaceId: voiceWsId,
-        chatId: chat,
-        state: lastState,
-        status: failed ? 'error' : 'complete',
-        error: failReason || undefined,
-      });
+      if (!isStale()) {
+        send('pipeline-done', {
+          workspaceId: voiceWsId,
+          chatId: chat,
+          state: lastState,
+          status: failed ? 'error' : 'complete',
+          error: failReason || undefined,
+          runSeq: seq,
+        });
+      }
       const reply = ((lastState && lastState.outputs && lastState.outputs.agent_report) || '').trim();
       if (reply) {
         if (!T_DEBUG && feedStatus) feedStatus.textContent = 'answering';
@@ -2745,17 +2868,18 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       if (e.name === 'AbortError') {
         setStatus('listening', accumulated || 'Listening');
         if (feedStatus) feedStatus.textContent = 'stopped';
-        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'aborted' });
+        if (!isStale()) send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'aborted', runSeq: seq });
       } else {
         console.error('[Voice] run failed', e);
         setStatus('error', 'Run failed');
-        send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'error', error: String(e) });
+        if (!isStale()) send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: lastState, status: 'error', error: String(e), runSeq: seq });
       }
       return false;
     }
   }
 
-  async function sendToPipeline(text) {
+  async function sendToPipeline(text, mySeq) {
+    const seq = (typeof mySeq === 'number') ? mySeq : (++runSeq);
     thinking = true;
     setStatus('thinking');
     lastLogLen = 0;
@@ -2772,20 +2896,22 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
       return;
     }
-    send('pipeline-start', { workspaceId: voiceWsId, chatId: chat, prompt: text });
+    send('pipeline-start', { workspaceId: voiceWsId, chatId: chat, prompt: text, runSeq: seq });
     abortRef = new AbortController();
+    const myAbort = abortRef;
     tMark('run');
     // Watchdog: if the run stalls (no done frame within RUN_TIMEOUT_MS), bail
     // out of the thinking state so the overlay never hangs forever.
+    // Stale (superseded) runs stay silent so they can't wipe the live run.
     let runSettled = false;
     const watchdog = setTimeout(() => {
-      if (runSettled) return;
+      if (runSettled || seq !== runSeq) return;
       runSettled = true;
       console.error('[Voice] run watchdog timeout — aborting');
       thinking = false;
-      if (abortRef) { try { abortRef.abort(); } catch (_e) {} abortRef = null; }
+      if (abortRef === myAbort) { try { myAbort.abort(); } catch (_e) {} abortRef = null; }
       setStatus('error', 'Run timed out');
-      send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: null, status: 'timeout', error: 'Run timed out' });
+      send('pipeline-done', { workspaceId: voiceWsId, chatId: chat, state: null, status: 'timeout', error: 'Run timed out', runSeq: seq });
       setTimeout(() => { if (micOn) setStatus('listening', accumulated || 'Listening'); }, 2500);
     }, RUN_TIMEOUT_MS);
     try {
@@ -2812,13 +2938,13 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
           attachments: _attachments,
           workspace_kind: voiceWsId === '_house' ? 'house' : (voiceWsId === '_personal' ? 'personal' : 'general'),
         }),
-        signal: abortRef.signal,
+        signal: myAbort.signal,
       });
-      await consumeRunStream(resp, chat, text);
+      await consumeRunStream(resp, chat, text, seq);
     } finally {
       runSettled = true;
       clearTimeout(watchdog);
-      abortRef = null;
+      if (abortRef === myAbort) abortRef = null;
     }
   }
 
@@ -2850,8 +2976,11 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       try { auCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 }); }
       catch (_e) { auCtx = new (window.AudioContext || window.webkitAudioContext)(); }
       ttsNextTime = auCtx.currentTime;
+      // auCtx was recreated — rebuild the visual-only TTS tap with it.
+      ttsAnalyser = null; ttsFreqBuf = null; ttsLevelBuf = null;
     }
     if (auCtx.state === 'suspended') auCtx.resume().catch(() => {});
+    ensureTtsAnalyser(auCtx);
     return auCtx;
   }
 
@@ -3010,6 +3139,12 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
         const src = ctx.createBufferSource();
         src.buffer = buffer;
         src.connect(ctx.destination);
+        // Visual-only TTS meter tap — extra connection into the analyser,
+        // audio still flows src -> destination exactly as before.
+        try {
+          const tap = ensureTtsAnalyser(ctx);
+          if (tap) src.connect(tap);
+        } catch (_e) {}
         const lead = startedScheduling ? 0.0 : 0.08;
         startedScheduling = true;
         const startAt = Math.max(ttsNextTime, ctx.currentTime + lead);
@@ -3193,14 +3328,20 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
         src.connect(analyser);
         micNodes = { src };
         micOn = true;
+        captureGen++; // fresh generation — stale pre-toggle rounds can't send
         localStorage.setItem('voice.micOn', '1');
         accumulated = '';
+        clearVoicePeek();
+        if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
         lastSpeechAt = 0;
         lastLang = '';
         sending = false;
         mutePendingSend = false;
         hideHint();
         updateMicBtn();
+        // Mic is live — boot pulse no longer needed (spinner stays until
+        // TTS warm via the existing loading logic). Visual-only.
+        try { setBootLoading(false); } catch (_e) {}
         setStatus('listening', 'Listening');
         send('mic', { mic: true });
         // Laptop hardware mute button → instant send trigger
@@ -3222,9 +3363,16 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   }
 
   function stopListening() {
+    // Mic toggle = capture control ONLY. It must never abort the in-flight
+    // LLM run: turning the mic off while the agent answers keeps the chat
+    // trace alive (previously abortRef.abort() here wiped voiceLiveRun back
+    // to Thinking while TTS kept playing). Explicit Stop uses sendNow/abort.
+    captureGen++;
     micOn = false;
     localStorage.setItem('voice.micOn', '0');
     clearTimeout(roundTimer);
+    if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
+    clearVoicePeek();
     // Stop server-side capture (discard — mic off, no transcribe).
     fetch(API + '/api/voice/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ discard: true }) }).catch(() => {});
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
@@ -3233,8 +3381,6 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     if (micNodes) { try { micNodes.src.disconnect(); } catch(_e){} micNodes = null; }
     analyser = null; freqBuf = null; levelBuf = null;
     stopSpeaking();
-    if (abortRef) { abortRef.abort(); abortRef = null; }
-    thinking = false;
     mutePendingSend = false;
     accumulated = '';
     hideHint();
@@ -3243,13 +3389,16 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     send('mic', { mic: false });
   }
 
-  // Manual send: immediately submits whatever is currently accumulated
+  // Manual send: immediately submits whatever is currently accumulated.
+  // Explicit user action — supersedes any in-flight run (it goes stale).
   function sendNow() {
     const text = accumulated.trim();
     if (!text) return;
     accumulated = '';
+    clearVoicePeek();
+    if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
     hideHint();
-    if (thinking && abortRef) { abortRef.abort(); abortRef = null; thinking = false; }
+    if (thinking && abortRef) { runSeq++; try { abortRef.abort(); } catch (_e) {} abortRef = null; thinking = false; }
     if (speaking) stopSpeaking();
     sendText(text);
   }
@@ -3451,8 +3600,49 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   // It parks itself once warm AND socket-live; ws.onclose restarts it.
   let ttsWarm = false;
   let hbTimer = null;
+  // Boot loading — visual-only, no pipeline/TTS/WS flow change. Shown on
+  // every overlay open (first time + after close/reopen, which is always a
+  // cold page load with TTS/ASR released). Cleared by the heartbeat once
+  // warm + socket-live, or by mic-live, or by a fail-safe timeout.
+  let bootCleared = false;
+  function setBootLoading(on) {
+    try {
+      if (on) {
+        if (bootCleared) return;
+        document.body.classList.add('is-booting');
+        // Don't stomp a live status (listening/speaking/thinking); only fill
+        // the default blank label so reopen never looks empty-white.
+        const cur = (textEl && textEl.textContent || '').trim();
+        if (!cur || cur === 'Ctrl+G to toggle') textEl.textContent = 'Warming voice…';
+        // Gentle shimmer behind the spinner so the wave isn't dead static.
+        // startWave sends nothing — pure RAF visuals.
+        try { startWave('thinking'); } catch (_e) {}
+      } else {
+        bootCleared = true;
+        document.body.classList.remove('is-booting');
+      }
+    } catch (_e) {}
+  }
+  function maybeClearBoot() {
+    if (bootCleared) return;
+    const wsLive = _voiceWs && _voiceWs.readyState === 1;
+    const micLive = micOn || speaking || thinking;
+    if ((ttsWarm && wsLive) || micLive) {
+      setBootLoading(false);
+      // If nothing took over the status yet, park the wave back to idle so
+      // the boot shimmer doesn't linger under the Voice label.
+      try {
+        const cur = (textEl && textEl.textContent || '').trim();
+        if (!micLive && (cur === 'Warming voice…' || cur === 'Starting…')) {
+          textEl.textContent = 'Voice';
+          startWave('idle');
+        }
+      } catch (_e) {}
+    }
+  }
   function startTtsLoading() {
     if (ttsWarm) return;
+    setBootLoading(true);
     micBtn.classList.add('loading');
     // Kick the warm-up (idempotent on the server).
     fetch(API + '/api/voice/warm_tts', { method: 'POST' }).catch(() => {});
@@ -3475,6 +3665,8 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     try {
       if (!_voiceWs || _voiceWs.readyState === 3) openVoiceWs();
     } catch (_e) {}
+    // 2b) Boot loading is visual-only — clear once warm + live, or mic-live.
+    try { maybeClearBoot(); } catch (_e) {}
     // 3) Park when nothing left to supervise.
     if (ttsWarm && _voiceWs && _voiceWs.readyState === 1) {
       clearInterval(hbTimer);
@@ -3490,6 +3682,9 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     fetch(API + '/api/voice/release_asr', { method: 'POST' }).catch(() => {});
   }
   startTtsLoading();
+  // Fail-safe: never wedge the overlay in boot pulse if the backend is down.
+  // Visual-only — TTS warm spinner + WS retry continue independently.
+  setTimeout(() => { try { setBootLoading(false); } catch (_e) {} }, 20000);
   window.addEventListener('beforeunload', releaseTts);
   if (bridge && bridge.onClose) bridge.onClose(releaseTts);
 

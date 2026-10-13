@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { AppState, ChatMessage, ChatAttachment, SessionTab, TokenUsage, StreamDelta } from '../types';
-import { addChatMessage, fetchChat, uploadChatAttachments } from '../services/api';
+import { addChatMessage, fetchChat, uploadChatAttachments, abortRun } from '../services/api';
 import { startHousePipeline } from './houseChatService';
 import { parseLogToSteps } from '../utils/logParser';
+import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
 
 interface ThreadState { key: string; messages: ChatMessage[] }
 interface UsageState { key: string; value: TokenUsage | null }
+type SessionPipelineKind = 'general' | 'house' | 'personal' | 'design';
 
 /**
  * Runs the agent pipeline against ANY session (project chat or general chat).
@@ -18,7 +20,7 @@ interface UsageState { key: string; value: TokenUsage | null }
  * finished run never writes another tab's messages. Thread/usage state is
  * keyed by session, so a stale view never shows the wrong conversation.
  */
-export function useSessionRunner(session: SessionTab | null, onFinished?: () => void) {
+export function useSessionRunner(session: SessionTab | null, onFinished?: () => void, pipelineKind: SessionPipelineKind = 'general') {
   const [thread, setThread] = useState<ThreadState>({ key: '', messages: [] });
   const [usageState, setUsageState] = useState<UsageState>({ key: '', value: null });
   const [isRunning, setIsRunning] = useState(false);
@@ -30,42 +32,28 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
   const startedAtRef = useRef<number | null>(null);
   const runningRef = useRef(false);
   const currentKeyRef = useRef('');
-  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
-  const streamRef = useRef({ text: '', reasoning: '', agent: '' });
-  const rateRef = useRef({ lastTs: 0, lastChars: 0, ema: 0 });
+  // Owning run target for Stop: persist the partial into the same session.
+  const runTargetRef = useRef<SessionTab | null>(null);
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
+  const streamRef = useRef(emptyStreamAccum());
+  const rateRef = useRef(emptyRateAccum());
 
   const applyDelta = useCallback((delta: StreamDelta) => {
-    const now = performance.now();
-    if (delta.kind === 'reasoning') {
-      streamRef.current.reasoning += delta.text;
-    } else if (delta.kind === 'text') {
-      const chars = delta.text.length;
-      const r = rateRef.current;
-      if (r.lastTs > 0) {
-        const dt = Math.max(16, now - r.lastTs) / 1000;
-        const rate = (chars / 4) / dt;
-        r.ema = r.ema === 0 ? rate : r.ema * 0.8 + rate * 0.2;
-      }
-      r.lastTs = now;
-      r.lastChars = chars;
-      streamRef.current.text += delta.text;
-    } else if (delta.kind === 'end') {
-      rateRef.current.ema = 0;
-    }
-    if (delta.agent) streamRef.current.agent = delta.agent;
+    const rate = applyDeltaToAccum(streamRef.current, rateRef.current, delta, performance.now());
     setStreaming({
       text: streamRef.current.text,
       reasoning: streamRef.current.reasoning,
       agent: streamRef.current.agent,
+      segments: [...streamRef.current.segments],
       active: true,
-      rate: Math.round(rateRef.current.ema),
+      rate,
     });
   }, []);
 
   const resetStream = useCallback(() => {
-    streamRef.current = { text: '', reasoning: '', agent: '' };
-    rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
-    setStreaming({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+    streamRef.current = emptyStreamAccum();
+    rateRef.current = emptyRateAccum();
+    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
   }, []);
 
   const finishedRef = useRef(onFinished);
@@ -108,6 +96,7 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
           isStreaming: streaming.active,
           streamingReasoning: streaming.reasoning,
           streamRate: streaming.rate,
+          liveTimeline: streaming.segments,
         },
       },
     ];
@@ -148,6 +137,7 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
     if (!prompt.trim() && !files.length) return;
     const s = target;
     const runKey = `${s.workspaceId}:${s.chatId}`;
+    runTargetRef.current = s;
     setNotification(null);
 
     const wsInfo = {
@@ -166,16 +156,33 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
     }
 
     const userMsg: ChatMessage = {
-      id: `usr-${Date.now()}`,
+      id: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       role: 'user',
       content: prompt.trim() || `Attached ${attachments.length} file${attachments.length > 1 ? 's' : ''}`,
       timestamp: new Date().toISOString(),
       metadata: attachments.length ? { attachments } : undefined,
     };
+    // Seed from server when switching keys so history never wipes to [userMsg].
+    // The drawer merges persisted + runner messages, but seeding here covers
+    // the race where the 5s poll hasn't loaded yet.
     setThread((prev) => ({
       key: runKey,
       messages: [...(prev.key === runKey ? prev.messages : []), userMsg],
     }));
+    if (runKey !== currentKeyRef.current) {
+      fetchChat(s.workspaceId, s.chatId).then((chat) => {
+        if (!chat?.messages?.length) return;
+        setThread((prev) => {
+          if (prev.key !== runKey) return prev;
+          const seen = new Set(prev.messages.map((m) => m.id));
+          const seeded = (chat.messages || []).filter((m) => !seen.has(m.id));
+          // Insert seeded history before the optimistic userMsg(s).
+          const optimistic = prev.messages.filter((m) => m.id === userMsg.id || m.role === 'user' && !seen.has(m.id));
+          void optimistic;
+          return { key: runKey, messages: [...seeded.filter((m) => m.id !== userMsg.id), ...prev.messages] };
+        });
+      }).catch(() => {});
+    }
     runningRef.current = true;
     startedAtRef.current = Date.now();
     setIsRunning(true);
@@ -207,9 +214,15 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
             isTrace: true,
             // Full step list (incl. subagent tool calls) — the coding tab's
             // Activity panel replays the whole run from this metadata.
+            // Parity with finishHouseMessage(): usage + project_ref so
+            // "Worked for Ns" + usage chip survive reload.
             steps,
             duration,
             artifacts: state?.artifacts,
+            usage: state?.token_usage,
+            project_ref: (state as any)?.project_ref,
+            ...(streamRef.current.reasoning.trim() ? { thinking: streamRef.current.reasoning } : {}),
+            ...(streamRef.current.segments.length ? { liveTimeline: [...streamRef.current.segments] } : {}),
           });
           const chat = await fetchChat(s.workspaceId, s.chatId);
           if (stillCurrent()) {
@@ -233,17 +246,54 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
         setIsRunning(false);
         finishedRef.current?.();
       },
-      undefined,
+      pipelineKind,
       applyDelta,
     );
-  }, [applyDelta, resetStream]);
+  }, [applyDelta, pipelineKind, resetStream]);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();
+    const target = runTargetRef.current;
+    const key = target ? `${target.workspaceId}:${target.chatId}` : '';
+    if (target) abortRun(target.chatId).catch(() => {});
+    const partialText = streamRef.current.text;
+    const partialReasoning = streamRef.current.reasoning;
+    const log = liveStateRef.current?.live_terminal_log || '';
+    const hasPartial = !!(partialText.trim() || partialReasoning.trim() || log.trim());
     runningRef.current = false;
     setIsRunning(false);
     setLiveState(null);
-  }, []);
+    if (target && hasPartial && currentKeyRef.current === key) {
+      // Keep the partial: same unified-trace persist as completion, stopped.
+      const state = liveStateRef.current;
+      const { steps, assistantResponse } = parseLogToSteps(log);
+      const finalResponse = partialText.trim() || assistantResponse || state?.outputs?.agent_report || '';
+      const duration = startedAtRef.current
+        ? Math.round((Date.now() - startedAtRef.current) / 1000) + 's'
+        : undefined;
+      const meta: Record<string, unknown> = {
+        isTrace: true,
+        steps,
+        duration,
+        artifacts: state?.artifacts,
+        usage: state?.token_usage,
+        project_ref: (state as any)?.project_ref,
+        stopped: true,
+      };
+      if (partialReasoning.trim()) meta.thinking = partialReasoning;
+      if (streamRef.current.segments.length) meta.liveTimeline = [...streamRef.current.segments];
+      addChatMessage(target.workspaceId, target.chatId, 'agent', finalResponse, meta)
+        .then(() => fetchChat(target.workspaceId, target.chatId))
+        .then((chat) => {
+          if (currentKeyRef.current === key) {
+            setThread({ key, messages: chat.messages || [] });
+            setUsageState({ key, value: chat.token_usage ?? null });
+          }
+        })
+        .catch(() => {});
+    }
+    resetStream();
+  }, [resetStream]);
 
   // ── Combined usage: persisted chat usage + live run usage ──
   const liveUsage = liveState?.token_usage;

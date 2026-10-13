@@ -1,4 +1,4 @@
-import { Code2, MessageSquare, Plus, X } from 'lucide-react';
+import { Bot, Code2, MessageSquare, Plus, X } from 'lucide-react';
 import type { SessionTab } from '../types';
 
 interface TaskTabsProps {
@@ -27,13 +27,17 @@ export default function TaskTabs({
       {tabs.map((tab) => {
         const isActive = tab.id === activeTabId;
         const isRunning = tab.id === runningTabId;
-        const Icon = tab.type === 'coding' ? Code2 : MessageSquare;
+        const spawned = Boolean((tab as SessionTab).isSpawned || (tab as SessionTab).parentChatId);
+        const Icon = spawned ? Bot : tab.type === 'coding' ? Code2 : MessageSquare;
+        const tooltip = spawned
+          ? `${tab.title} — spawned · ${tab.workspaceName}`
+          : tab.type === 'coding' ? `${tab.title} — ${tab.workspaceName}` : tab.title;
         return (
           <div
             key={tab.id}
             role="tab"
             aria-selected={isActive}
-            title={tab.type === 'coding' ? `${tab.title} — ${tab.workspaceName}` : tab.title}
+            title={tooltip}
             onClick={() => onActivateTab(tab.id)}
             onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); onCloseTab(tab.id); } }}
             className={`group flex items-center gap-2 h-[30px] px-2.5 rounded-lg border shrink-0 max-w-[210px] cursor-pointer transition-all duration-150 select-none ${
@@ -43,7 +47,7 @@ export default function TaskTabs({
             }`}
           >
             <Icon size={12} className={`shrink-0 ${isActive ? 'text-zinc-200' : 'text-zinc-500'}`} />
-            <span className="truncate text-[12px] leading-none">{tab.title}</span>
+            <span className="truncate text-[12px] leading-none">{spawned ? `↳ ${tab.title}` : tab.title}</span>
             {isRunning && <span className="session-run-dot" title="Running" />}
             <button
               onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }}

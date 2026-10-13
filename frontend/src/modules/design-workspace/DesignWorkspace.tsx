@@ -43,7 +43,7 @@ export default function DesignWorkspace() {
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [previewFailed, setPreviewFailed] = useState(false);
-  const [subagentView, setSubagentView] = useState<{ childId: string; label: string } | null>(null);
+  const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
   const [annotate, setAnnotate] = useState(false);
   const [draft, setDraft] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const [note, setNote] = useState('');
@@ -465,7 +465,7 @@ export default function DesignWorkspace() {
           onOpenStats={() => {}}
           onOpenInWorkspace={openInCoding}
           onCloseIde={goHome}
-          onOpenSubagent={(childId, label) => setSubagentView({ childId, label })}
+          onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
           workspaceId={workspace.id}
           chatId={chatId}
         />
@@ -480,11 +480,12 @@ export default function DesignWorkspace() {
         <div className="absolute inset-0 z-40 bg-[#0c0c0f] flex flex-col px-4 sm:px-8 lg:px-12 py-4">
           <div className="max-w-[1100px] w-full mx-auto flex-1 min-h-0 flex flex-col">
             <SubagentSessionView
-              workspaceId={workspace.id}
+              workspaceId={subagentView.workspaceId || workspace.id}
               childId={subagentView.childId}
               label={subagentView.label}
               parentTitle="OpenDesign"
               onBack={() => setSubagentView(null)}
+              onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
             />
           </div>
         </div>

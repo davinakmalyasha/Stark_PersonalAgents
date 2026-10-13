@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2 } from 'lucide-react';
+import iconUrl from '../../electron/icon.png';
 import HouseHeader from './HouseHeader';
 import HouseChat from './HouseChat';
 import HouseSidebar from './HouseSidebar';
@@ -13,7 +14,6 @@ import { useHouseChat } from './useHouseChat';
 import { useSessions, tabId } from './useSessions';
 import { useSessionRunner } from './useSessionRunner';
 import { addWorkspace, createChat, updateChatTitle, deleteChat } from '../services/api';
-import { seedAssistantMemory } from './assistant';
 import '../house/house.css';
 
 export default function House() {
@@ -23,7 +23,7 @@ export default function House() {
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
-  const [subagentView, setSubagentView] = useState<{ childId: string; label: string } | null>(null);
+  const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
   const [exitingIdeTab, setExitingIdeTab] = useState<import('../types').SessionTab | null>(null);
 
   const sessions = useSessions();
@@ -80,11 +80,6 @@ export default function House() {
     refreshSessions();
   }, [refreshSessions]);
   const runner = useSessionRunner(isCodingTab && activeTab ? activeTab : null, handleRunFinished);
-
-  // Teach the assistant its name + "Sir" address style (persisted in the general profile)
-  useEffect(() => {
-    seedAssistantMemory();
-  }, []);
 
   // Room-workspace sidebars navigate home via #/?ws=<id>&chat=<id> — once the
   // session layer has booted, open that chat and clean the hash.
@@ -162,19 +157,21 @@ export default function House() {
   }, [refreshSessions, openChat]);
 
   const handleRenameChat = useCallback((workspaceId: string, chatId: string, title: string) => {
-    updateChatTitle(workspaceId, chatId, title)
-      .then(() => refreshSessions())
-      .catch(() => {});
-  }, [refreshSessions]);
+    // Optimistic so the sidebar shows the new title instantly.
+    sessions.renameChatLocal(workspaceId, chatId, title);
+    updateChatTitle(workspaceId, chatId, title).catch(() => {
+      sessions.forceRefresh();
+    });
+  }, [sessions]);
 
   const handleDeleteChat = useCallback((workspaceId: string, chatId: string) => {
-    deleteChat(workspaceId, chatId)
-      .then(() => {
-        closeTab(tabId(workspaceId, chatId));
-        return refreshSessions();
-      })
-      .catch(() => {});
-  }, [closeTab, refreshSessions]);
+    // Optimistic: close tab + remove from list immediately; server is fire-and-forget.
+    sessions.removeChatLocal(workspaceId, chatId);
+    closeTab(tabId(workspaceId, chatId));
+    deleteChat(workspaceId, chatId).catch(() => {
+      sessions.forceRefresh();
+    });
+  }, [closeTab, sessions]);
 
   const handleLaunchRoom = useCallback((room: 'personal' | 'house') => {
     if (transitioning) return;
@@ -212,15 +209,6 @@ export default function House() {
     }, 320);
   }, [transitioning]);
 
-  const launchDesign = useCallback(() => {
-    if (transitioning) return;
-    setSidebarOpen(false);
-    setTransitioning(true);
-    setTimeout(() => {
-      window.location.hash = '#/design';
-    }, 320);
-  }, [transitioning]);
-
   const launchPersonal = useCallback(() => {
     if (transitioning) return;
     setSidebarOpen(false);
@@ -253,6 +241,49 @@ export default function House() {
     [chat.chats, chat.activeChatId],
   );
 
+  const generalChatView = (
+    <div className="flex-1 min-h-0 flex flex-col">
+      <HouseChat
+        title={activeGeneralTitle}
+        messages={chat.displayMessages}
+        isRunning={chat.isRunning}
+        isLoading={chat.isLoading}
+        notification={chat.notification ?? blockedNote}
+        threadRef={chat.threadRef}
+        isVoiceMode={chat.isVoiceMode}
+        totalCost={chat.totalCost}
+        totalInput={chat.totalInput}
+        totalOutput={chat.totalOutput}
+        totalCacheHitTokens={chat.totalCacheHitTokens}
+        activeContextTokens={chat.activeContextTokens}
+        onSend={handleGeneralSend}
+        onCancel={chat.handleCancel}
+        onToggleVoice={chat.toggleVoice}
+        onOpenStats={() => setIsStatsOpen(true)}
+        onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
+        workspaceId={chat.workspaceId}
+        chatId={activeTabChatId}
+      />
+    </div>
+  );
+
+  // Initial blank (Electron shows #0c0c0e) — reuse the single desktop icon
+  // (frontend/electron/icon.png) so changing it updates both places.
+  if (!sessions.booted) {
+    return (
+      <div className="fixed inset-0 grid place-items-center bg-[#0c0c0e] select-none">
+        <div className="flex flex-col items-center gap-4 animate-[splashIn_.35s_ease]">
+          <img src={iconUrl} alt="Stark" width={96} height={96} style={{ borderRadius: 24 }} className="shadow-[0_8px_32px_rgba(0,0,0,.45)]" />
+          <div className="flex gap-1.5">
+            <span className="house-typing-dot" />
+            <span className="house-typing-dot" />
+            <span className="house-typing-dot" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="house-root fixed inset-0 flex flex-col overflow-hidden select-none">
       <HouseHeader
@@ -273,43 +304,7 @@ export default function House() {
         {exitingIdeTab ? (
           <>
             {/* Chat is visible immediately under the exiting IDE — feels like the IDE slides away */}
-            {subagentView ? (
-              <div className="flex-1 min-h-0 flex flex-col max-w-[1400px] w-full mx-auto px-4 sm:px-8 lg:px-10 pt-2 pb-3">
-                <div className="house-chat-card flex flex-col flex-1 min-h-0 rounded-2xl border house-hairline px-4 pt-2 pb-3 overflow-hidden">
-                  <SubagentSessionView
-                    workspaceId={chat.workspaceId ?? sessions.workspaces.find((w) => w.isGeneral)?.id ?? ''}
-                    childId={subagentView.childId}
-                    label={subagentView.label}
-                    parentTitle={activeGeneralTitle}
-                    onBack={() => setSubagentView(null)}
-                  />
-                </div>
-              </div>
-            ) : (
-              <div className="flex-1 min-h-0 flex flex-col">
-                <HouseChat
-                  title={activeGeneralTitle}
-                  messages={chat.displayMessages}
-                  isRunning={chat.isRunning}
-                  isLoading={chat.isLoading}
-                  notification={chat.notification ?? blockedNote}
-                  threadRef={chat.threadRef}
-                  isVoiceMode={chat.isVoiceMode}
-                  totalCost={chat.totalCost}
-                  totalInput={chat.totalInput}
-                  totalOutput={chat.totalOutput}
-                  totalCacheHitTokens={chat.totalCacheHitTokens}
-                  activeContextTokens={chat.activeContextTokens}
-                  onSend={handleGeneralSend}
-                  onCancel={chat.handleCancel}
-                  onToggleVoice={chat.toggleVoice}
-                  onOpenStats={() => setIsStatsOpen(true)}
-                  onOpenSubagent={(childId, label) => setSubagentView({ childId, label })}
-                  workspaceId={chat.workspaceId}
-                  chatId={activeTabChatId}
-                />
-              </div>
-            )}
+            {generalChatView}
             <div className="absolute inset-0 z-10 ide-exit bg-[#0a0a0d]">
               <CodingIDE
                 key={exitingIdeTab.id}
@@ -330,42 +325,23 @@ export default function House() {
               onCloseIde={handleCloseIde}
             />
           </div>
-        ) : subagentView ? (
-          <div className="flex-1 min-h-0 flex flex-col max-w-[1400px] w-full mx-auto px-4 sm:px-8 lg:px-10 pt-2 pb-3">
-            <div className="house-chat-card flex flex-col flex-1 min-h-0 rounded-2xl border house-hairline px-4 pt-2 pb-3 overflow-hidden">
-              <SubagentSessionView
-                workspaceId={chat.workspaceId ?? sessions.workspaces.find((w) => w.isGeneral)?.id ?? ''}
-                childId={subagentView.childId}
-                label={subagentView.label}
-                parentTitle={activeGeneralTitle}
-                onBack={() => setSubagentView(null)}
-              />
-            </div>
-          </div>
         ) : (
-          <div className="flex-1 min-h-0 flex flex-col">
-            <HouseChat
-              title={activeGeneralTitle}
-              messages={chat.displayMessages}
-              isRunning={chat.isRunning}
-              isLoading={chat.isLoading}
-              notification={chat.notification ?? blockedNote}
-              threadRef={chat.threadRef}
-              isVoiceMode={chat.isVoiceMode}
-              totalCost={chat.totalCost}
-              totalInput={chat.totalInput}
-              totalOutput={chat.totalOutput}
-              totalCacheHitTokens={chat.totalCacheHitTokens}
-              activeContextTokens={chat.activeContextTokens}
-              onSend={handleGeneralSend}
-              onCancel={chat.handleCancel}
-              onToggleVoice={chat.toggleVoice}
-              onOpenStats={() => setIsStatsOpen(true)}
-              onOpenSubagent={(childId, label) => setSubagentView({ childId, label })}
-              workspaceId={chat.workspaceId}
-              chatId={activeTabChatId}
+          generalChatView
+        )}
+
+        {/* Child sessions open as a right-side drill-in drawer. The parent
+            conversation remains visible and never receives child transcript. */}
+        {subagentView && !isCodingTab && (
+          <aside className="subagent-session-drawer" aria-label="Subagent session">
+            <SubagentSessionView
+              workspaceId={subagentView.workspaceId || chat.workspaceId || sessions.workspaces.find((w) => w.isGeneral)?.id || ''}
+              childId={subagentView.childId}
+              label={subagentView.label}
+              parentTitle={activeGeneralTitle}
+              onBack={() => setSubagentView(null)}
+              onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
             />
-          </div>
+          </aside>
         )}
       </main>
 
@@ -391,7 +367,6 @@ export default function House() {
         onLaunchCoding={launchCoding}
         onLaunchHouse={launchHouse}
         onLaunchAdmin={launchAdmin}
-        onLaunchDesign={launchDesign}
       />
 
       {projectDialogOpen && (

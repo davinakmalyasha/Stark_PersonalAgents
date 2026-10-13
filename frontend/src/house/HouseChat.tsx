@@ -32,7 +32,7 @@ interface Props {
   /** Docked panel close (ide-panel only): returns to the chat card view. */
   onCloseIde?: () => void;
   /** Drill-in for spawned subagents (blocks in the thread). */
-  onOpenSubagent?: (childId: string, label: string) => void;
+  onOpenSubagent?: (childId: string, label: string, childWorkspace?: string) => void;
   /** Session ids — power the live running/done status of spawn blocks. */
   workspaceId?: string | null;
   chatId?: string | null;

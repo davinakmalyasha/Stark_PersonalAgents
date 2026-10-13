@@ -49,7 +49,7 @@ export default function AgentCanvas(props: Props) {
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<AgentTask | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
-  const [subagentView, setSubagentView] = useState<{ childId: string; label: string } | null>(null);
+  const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
 
   // Track when the current run started so running cards show a live elapsed clock.
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
@@ -127,18 +127,19 @@ export default function AgentCanvas(props: Props) {
         chatId={props.chatId}
       />
 
-      <ChatView {...props} traceSteps={steps} onOpenSubagentSession={(childId, label) => setSubagentView({ childId, label })} />
+      <ChatView {...props} traceSteps={steps} onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })} />
 
       {/* Subagent session drawer — child-keyed, read-only transcript */}
       {subagentView && (
         <div className="absolute top-0 right-0 h-full w-[440px] bg-[#0c0c0f] border-l border-zinc-800 shadow-2xl flex flex-col z-50">
           <div className="flex-1 min-h-0 px-3 pt-1 pb-3">
             <SubagentSessionView
-              workspaceId={props.workspaceId ?? ''}
+              workspaceId={subagentView.workspaceId || props.workspaceId || ''}
               childId={subagentView.childId}
               label={subagentView.label}
               parentTitle={props.chatTitle ?? 'Main session'}
               onBack={() => setSubagentView(null)}
+              onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
             />
           </div>
         </div>

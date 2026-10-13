@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import type { TokenUsage } from '../types';
 import type { BoardAgent, BoardAgentStatus } from '../types/board.types';
-import { parseLogToSteps } from '../utils/logParser';
+import { delegationTarget, isDelegationToolName, parseLogToSteps } from '../utils/logParser';
 
 interface Input {
   isRunning: boolean;
@@ -10,7 +10,8 @@ interface Input {
 }
 
 const AGENT_ROSTER: { id: string; label: string; role: BoardAgent['role'] }[] = [
-  { id: 'Supervisor', label: 'Supervisor', role: 'Orchestrator' },
+  // id stays 'Supervisor' to match legacy trace labels; the UI shows "Stark".
+  { id: 'Supervisor', label: 'Stark', role: 'Orchestrator' },
   { id: 'Dev', label: 'Developer Subagent', role: 'Subagent' },
   { id: 'General', label: 'General Subagent', role: 'Subagent' },
   { id: 'Vision', label: 'Vision Agent', role: 'Subagent' },
@@ -35,13 +36,9 @@ function normalizeTokenAgent(nodeId: string): string[] {
 function getAgentTask(steps: ReturnType<typeof parseLogToSteps>['steps'], agentId: string): string {
   for (let i = steps.length - 1; i >= 0; i--) {
     const s = steps[i];
-    if (s.toolName !== 'task' && s.toolName !== 'call_subagent') continue;
-    try {
-      const parsed = JSON.parse(s.args || '{}');
-      if (parsed.name === agentId && typeof parsed.task === 'string') return parsed.task;
-    } catch {
-      // Not a delegation step we can read.
-    }
+    if (!isDelegationToolName(s.toolName)) continue;
+    const target = delegationTarget(s.args);
+    if (target.name === agentId && target.task) return target.task;
   }
   return '';
 }
@@ -56,13 +53,9 @@ export function useCanvasAgentState({ isRunning, liveLog, tokenUsage }: Input) {
     if (!isRunning) return null;
     if (steps.length === 0) return 'Supervisor';
     const lastStep = steps[steps.length - 1];
-    if (lastStep.toolName === 'task' || lastStep.toolName === 'call_subagent') {
-      try {
-        const parsed = JSON.parse(lastStep.args || '{}');
-        if (parsed.name) return parsed.name;
-      } catch {
-        // Malformed delegation args — fall through to the agent field.
-      }
+    if (isDelegationToolName(lastStep.toolName)) {
+      const target = delegationTarget(lastStep.args);
+      if (target.name) return target.name;
     }
     return lastStep.agent || 'Supervisor';
   }, [isRunning, steps]);

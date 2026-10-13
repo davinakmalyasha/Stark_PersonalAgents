@@ -1,5 +1,5 @@
 {
-  "name": "Personal Agents",
+  "name": "stark",
   "private": true,
   "version": "2.0.0",
   "description": "Stark — Multi-Agent AI Desktop Workspace",
@@ -15,14 +15,20 @@
     "lint": "eslint ."
   },
   "build": {
-    "appId": "com.vincode.workspace",
-    "productName": "VinCode",
+    "appId": "com.stark.workspace",
+    "productName": "Stark",
     "directories": {
       "output": "release"
     },
     "files": [
       "dist/**/*",
       "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/stark-root.txt",
+        "to": "stark-root.txt"
+      }
     ],
     "win": {
       "target": "nsis",

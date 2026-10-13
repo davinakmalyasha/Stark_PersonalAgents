@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { MessageSquare, Plus, Trash2, Pencil, MoreHorizontal, ChevronDown } from 'lucide-react';
+import { MessageSquare, Plus, Trash2, Pencil, MoreHorizontal, ChevronDown, Bot, CornerDownRight } from 'lucide-react';
 import { PanelLeftClose, FolderPlus } from 'lucide-react';
+import { isSpawnedChat } from '../../utils/chatHierarchy';
 import { fetchWorkspaces, addWorkspace, removeWorkspace, fetchChats, createChat, deleteChat, fetchChat, updateChatTitle } from '../../services/api';
 import type { WorkspaceInfo, ChatSummary, ChatData } from '../../types';
 import SidebarProjectList from './SidebarProjectList';
@@ -41,6 +42,8 @@ export default function Sidebar({
     workspace: WorkspaceInfo | null;
     chatId: string | null;
   }>({ isOpen: false, workspace: null, chatId: null });
+  const [deletingChatId, setDeletingChatId] = useState<string | null>(null);
+  const [generalLimit, setGeneralLimit] = useState(15);
 
   // Split into General and Projects
   const generalWs = workspaces.find((w) => w.isGeneral);
@@ -147,12 +150,34 @@ export default function Sidebar({
 
   const confirmDeleteChat = async () => {
     const { workspace, chatId } = deleteConfirm;
-    if (workspace && chatId) {
-      await deleteChat(workspace.id, chatId);
-      const chats = await fetchChats(workspace.id);
-      setChatMap((prev) => ({ ...prev, [workspace.id]: chats }));
+    if (!workspace || !chatId) {
+      setDeleteConfirm({ isOpen: false, workspace: null, chatId: null });
+      return;
     }
     setDeleteConfirm({ isOpen: false, workspace: null, chatId: null });
+    setDeletingChatId(chatId);
+    await new Promise((r) => setTimeout(r, 220));
+    try {
+      await deleteChat(workspace.id, chatId);
+      setChatMap((prev) => ({
+        ...prev,
+        [workspace.id]: (prev[workspace.id] ?? []).filter((c) => c.id !== chatId),
+      }));
+      if (activeChatId === chatId && activeWorkspaceId === workspace.id) {
+        const remaining = (chatMap[workspace.id] ?? []).filter((c) => c.id !== chatId);
+        const nextId = remaining[0]?.id;
+        if (nextId) {
+          const next = await fetchChat(workspace.id, nextId).catch(() => null);
+          if (next) onSelectChat(workspace, next);
+        }
+      }
+    } catch (err) {
+      console.error('[Sidebar] deleteChat failed:', err);
+      const chats = await fetchChats(workspace.id).catch(() => []);
+      setChatMap((prev) => ({ ...prev, [workspace.id]: chats }));
+    } finally {
+      setDeletingChatId(null);
+    }
   };
 
   const handleSelectChat = async (ws: WorkspaceInfo, chatId: string) => {
@@ -180,11 +205,41 @@ export default function Sidebar({
     await loadWorkspaces();
   };
 
+  // Live indicator — which chats currently have an agent streaming
+  const [liveChatIds, setLiveChatIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      if (document.hidden) return;
+      try {
+        const res = await fetch('/api/runs/active');
+        const data = await res.json();
+        const ids = new Set<string>();
+        for (const r of (Array.isArray((data as any)?.runs) ? (data as any).runs : data?.running ? [data] : [])) {
+          if (r.chat_id) ids.add(String(r.chat_id));
+        }
+        if (!cancelled) setLiveChatIds(ids);
+      } catch {}
+    };
+    poll();
+    const id = window.setInterval(poll, 2500);
+    const onVis = () => { if (!document.hidden) poll(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { cancelled = true; window.clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
+  }, []);
+
   const saveGeneralChatName = async (chat: ChatSummary) => {
     const title = generalChatName.trim();
-    if (title && generalWs) {
+    if (!title || !generalWs) { setEditingGeneralChatId(null); return; }
+    const prevTitle = chat.title || '';
+    // Optimistic: show new title instantly
+    handleLocalChatTitleUpdated(generalWs.id, chat.id, title);
+    setEditingGeneralChatId(null);
+    try {
       await updateChatTitle(generalWs.id, chat.id, title);
-      handleLocalChatTitleUpdated(generalWs.id, chat.id, title);
+    } catch (err) {
+      console.error('[Sidebar] updateChatTitle failed:', err);
+      handleLocalChatTitleUpdated(generalWs.id, chat.id, prevTitle);
     }
     setEditingGeneralChatId(null);
   };
@@ -233,29 +288,112 @@ export default function Sidebar({
                     No conversations yet
                   </div>
                 )}
-                {chatMap['_general']?.map((chat) => {
-                  const isChatActive = chat.id === activeChatId && activeWorkspaceId === '_general';
-                  const isEditing = editingGeneralChatId === chat.id;
+                {(() => {
+                  const chats = chatMap['_general'] || [];
+                  // Build parent -> children map for grouped view. Same-ws
+                  // children nest directly; cross-workspace spawn children
+                  // (orchestrator → project agents) nest here too so the
+                  // hierarchy reads in one place.
+                  const byId = new Map(chats.map((c) => [c.id, c] as const));
+                  const childrenByParent = new Map<string, typeof chats>();
+                  const tops: typeof chats = [];
+                  for (const c of chats) {
+                    const p = (c as any).parentChatId as string | undefined;
+                    if (p && byId.has(p)) {
+                      const arr = childrenByParent.get(p) || [];
+                      arr.push(c);
+                      childrenByParent.set(p, arr);
+                    } else {
+                      tops.push(c);
+                    }
+                  }
+                  // Cross-workspace spawned children of each general parent.
+                  const wsList = workspaces;
+                  const crossKids = new Map<string, { ws: WorkspaceInfo; chat: ChatSummary }[]>();
+                  for (const w of wsList) {
+                    if (w.id === '_general') continue;
+                    for (const c of chatMap[w.id] ?? []) {
+                      const p = (c as any).parentChatId as string | undefined;
+                      if (p && byId.has(p)) {
+                        const arr = crossKids.get(p) || [];
+                        arr.push({ ws: w, chat: c });
+                        crossKids.set(p, arr);
+                      }
+                    }
+                  }
+                  const Row = ({ chat, indented, wsOverride, fromTitle }: { chat: typeof chats[number]; indented?: boolean; wsOverride?: WorkspaceInfo; fromTitle?: string }) => {
+                    const wsForRow = wsOverride ?? generalWs;
+                    const isChatActive = chat.id === activeChatId && activeWorkspaceId === wsForRow.id;
+                    const isEditing = !wsOverride && editingGeneralChatId === chat.id;
+                    const isLive = liveChatIds.has(chat.id);
+                    const isDeleting = chat.id === deletingChatId;
+                    const spawned = isSpawnedChat(chat) || !!wsOverride;
+                    const RowIcon = spawned ? Bot : MessageSquare;
                     return (
                       <div
-                        key={chat.id}
-                        draggable
+                        key={`${wsForRow.id}:${chat.id}`}
+                        draggable={!isDeleting}
                         onDragStart={(e) => {
-                          e.dataTransfer.setData('text/plain', `${generalWs.id}:${chat.id}`);
+                          e.dataTransfer.setData('text/plain', `${wsForRow.id}:${chat.id}`);
                           e.dataTransfer.effectAllowed = 'move';
                         }}
-                        onClick={() => handleSelectChat(generalWs, chat.id)}
+                        onClick={() => !isDeleting && handleSelectChat(wsForRow, chat.id as string)}
                         className={`chat-row relative flex items-center gap-1.5 w-full text-[12px] rounded-md transition-colors cursor-pointer group ${
                           isChatActive ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-200'
-                        }`}
-                        style={{ padding: '8px 9px' }}
+                        } ${indented ? 'ml-3 pl-2 border-l border-zinc-800/60' : ''} ${isDeleting ? 'is-deleting' : ''} ${spawned ? 'bg-violet-400/[0.05]' : ''}`}
+                        style={{ padding: indented ? '6px 8px' : '8px 9px' }}
+                        title={spawned ? `Auto-spawned${fromTitle ? ` from “${fromTitle}”` : wsOverride ? ` · ${wsOverride.name}` : ''}` : chat.title}
                       >
-                      <MessageSquare size={11} className="flex-shrink-0 text-zinc-600" />
-                      {isEditing ? <input value={generalChatName} autoFocus onClick={(event) => event.stopPropagation()} onChange={(event) => setGeneralChatName(event.target.value)} onBlur={() => saveGeneralChatName(chat)} onKeyDown={(event) => { if (event.key === 'Enter') saveGeneralChatName(chat); if (event.key === 'Escape') setEditingGeneralChatId(null); }} className="min-w-0 flex-1 rounded border border-zinc-600 bg-zinc-900 px-1 py-0.5 text-[11px] text-zinc-100 outline-none" /> : <span className="truncate flex-1">{chat.title || 'Untitled'}</span>}
-                      {!isEditing && <><span className="text-[10px] text-zinc-600 flex-shrink-0 ml-1 tabular-nums group-hover:opacity-0">{relativeTime(chat.updatedAt)}</span><div className="absolute right-1 hidden items-center gap-0.5 rounded bg-zinc-800 group-hover:flex"><button onClick={(event) => { event.stopPropagation(); setGeneralChatName(chat.title || ''); setEditingGeneralChatId(chat.id); }} className="p-1 text-zinc-400 hover:text-white" title="Rename"><Pencil size={11}/></button><button onClick={(event) => handleDeleteChat(event, generalWs, chat.id)} className="p-1 text-zinc-400 hover:text-white" title="Delete"><Trash2 size={11}/></button></div></>}
-                    </div>
+                        {isLive
+                          ? <span className="w-2 h-2 rounded-full bg-white animate-pulse flex-shrink-0" title="Stark is working in this chat" />
+                          : indented
+                            ? <CornerDownRight size={10} className="flex-shrink-0 text-zinc-600" />
+                            : <RowIcon size={indented ? 10 : 11} className={`flex-shrink-0 ${spawned ? 'text-violet-300/80' : indented ? 'text-zinc-500' : 'text-zinc-600'}`} />}
+                        {isEditing ? <input value={generalChatName} autoFocus onClick={(event) => event.stopPropagation()} onChange={(event) => setGeneralChatName(event.target.value)} onBlur={() => saveGeneralChatName(chat)} onKeyDown={(event) => { if (event.key === 'Enter') saveGeneralChatName(chat); if (event.key === 'Escape') setEditingGeneralChatId(null); }} className="min-w-0 flex-1 rounded border border-zinc-600 bg-zinc-900 px-1 py-0.5 text-[11px] text-zinc-100 outline-none" /> : (
+                          <span className="truncate flex-1">
+                            <span className="block truncate">{chat.title || 'Untitled'}</span>
+                            {spawned && (
+                              <span className="mt-0.5 flex items-center gap-1">
+                                <span className="inline-flex items-center rounded-full border border-violet-400/20 bg-violet-400/[0.08] px-1.5 py-px text-[9px] font-medium text-violet-200/80">auto</span>
+                                <span className="truncate text-[10px] text-zinc-600">{fromTitle ? `from ${fromTitle}` : wsOverride ? wsOverride.name : 'spawned'}</span>
+                              </span>
+                            )}
+                          </span>
+                        )}
+                        {!isEditing && <><span className="text-[10px] text-zinc-600 flex-shrink-0 ml-1 tabular-nums group-hover:opacity-0">{relativeTime(chat.updatedAt)}</span><div className="absolute right-1 hidden items-center gap-0.5 rounded bg-zinc-800 group-hover:flex"><button onClick={(event) => { event.stopPropagation(); setGeneralChatName(chat.title || ''); setEditingGeneralChatId(chat.id); }} className="p-1 text-zinc-400 hover:text-white" title="Rename"><Pencil size={11}/></button><button onClick={(event) => handleDeleteChat(event, wsForRow, chat.id)} className="p-1 text-zinc-400 hover:text-white" title="Delete"><Trash2 size={11}/></button></div></>}
+                      </div>
+                    );
+                  };
+                  const visibleTops = tops.slice(0, generalLimit);
+                  const remainingTops = tops.length - visibleTops.length;
+                  return (
+                    <>
+                      {visibleTops.map((top) => {
+                        const kids = childrenByParent.get(top.id) || [];
+                        const xkids = crossKids.get(top.id) || [];
+                        if (!kids.length && !xkids.length) return <Row key={top.id} chat={top} />;
+                        return (
+                          <div key={top.id} className="mb-1">
+                            <Row chat={top} />
+                            <div className="mt-0.5 flex flex-col gap-0.5">
+                              {kids.map((k) => <Row key={k.id} chat={k} indented fromTitle={top.title} />)}
+                              {xkids.map(({ ws, chat }) => <Row key={`${ws.id}:${chat.id}`} chat={chat} indented wsOverride={ws} fromTitle={top.title} />)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {remainingTops > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setGeneralLimit((n) => n + 15)}
+                          className="w-full mb-1.5 py-1.5 rounded-lg text-[11px] font-medium text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                        >
+                          Load more ({remainingTops})
+                        </button>
+                      )}
+                    </>
                   );
-                })}
+                })()}
               </div>
             </div>
             </div></div>
@@ -287,6 +425,8 @@ export default function Sidebar({
               relativeTime={relativeTime}
               handleAddWorkspace={handleAddWorkspace}
               onChatTitleUpdated={handleLocalChatTitleUpdated}
+              liveChatIds={liveChatIds}
+              deletingChatId={deletingChatId}
             /></div>
 
         </div>

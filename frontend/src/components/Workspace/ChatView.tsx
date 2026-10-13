@@ -37,7 +37,7 @@ interface Props {
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
   /** Session-keyed subagent drill-in (delegation rows carrying childId). */
-  onOpenSubagentSession?: (childId: string, label: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
 }
 
 export default function ChatView({

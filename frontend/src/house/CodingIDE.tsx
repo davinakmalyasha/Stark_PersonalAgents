@@ -446,7 +446,7 @@ export default function CodingIDE({ session, runner, isGlobalRunning, onCloseIde
   const [contentCache, setContentCache] = useState<Record<string, { text: string; truncated: boolean } | null>>({});
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
-  const [subagentView, setSubagentView] = useState<{ childId: string; label: string } | null>(null);
+  const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const prevRunning = useRef(false);
 
@@ -564,7 +564,7 @@ export default function CodingIDE({ session, runner, isGlobalRunning, onCloseIde
           onOpenStats={() => {}}
           onOpenInWorkspace={() => { window.location.hash = `#/coding?ws=${encodeURIComponent(session.workspaceId)}&chat=${encodeURIComponent(session.chatId)}`; }}
           onCloseIde={onCloseIde}
-          onOpenSubagent={(childId, label) => setSubagentView({ childId, label })}
+          onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
           workspaceId={session.workspaceId}
           chatId={session.chatId}
         />
@@ -575,11 +575,12 @@ export default function CodingIDE({ session, runner, isGlobalRunning, onCloseIde
         <div className="absolute inset-0 z-40 bg-[#0c0c0f] flex flex-col px-4 sm:px-8 lg:px-12 py-4">
           <div className="max-w-[1100px] w-full mx-auto flex-1 min-h-0 flex flex-col">
             <SubagentSessionView
-              workspaceId={session.workspaceId}
+              workspaceId={subagentView.workspaceId || session.workspaceId}
               childId={subagentView.childId}
               label={subagentView.label}
               parentTitle={session.title}
               onBack={() => setSubagentView(null)}
+              onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
             />
           </div>
         </div>

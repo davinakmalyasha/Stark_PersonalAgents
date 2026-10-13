@@ -1,10 +1,18 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Plus, MessageSquare, Pencil, Trash2, Check, Code2, Home, ShieldCheck, User, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, ChevronUp, Palette,
+  Plus, MessageSquare, Pencil, Trash2, Check, Code2, Home, User, ChevronRight,
+  ChevronDown, Search, Pin, PinOff, ChevronUp, LayoutGrid, Bot, CornerDownRight,
 } from 'lucide-react';
-import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
+import type { ChatSummary, ChatsFilter, SubagentInfo, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
+import WorkspaceSwitcher from './WorkspaceSwitcher';
+import { fetchChatSubagents } from '../services/api';
+import {
+  buildGlobalLookup,
+  collectSpawnedChildrenOf,
+  groupWorkspaceChats,
+  isSpawnedChat,
+} from '../utils/chatHierarchy';
 
 interface Props {
   /** 'full' = main workspace (source dropdown + adaptive +). 'room' = House/
@@ -33,13 +41,18 @@ interface Props {
   onLaunchCoding: () => void;
   onLaunchHouse: () => void;
   onLaunchAdmin: () => void;
-  /** Optional: design-module launcher (Main workspace only — rooms omit it). */
-  onLaunchDesign?: () => void;
 }
 
 interface RowChat extends ChatSummary {
   sid: string; // session tab id
   ws: WorkspaceInfo;
+  /** Nesting depth for same-workspace parent chains (0 = top-level). */
+  depth?: number;
+  /** Cross-workspace parent info for the "from X" badge. */
+  parentTitle?: string;
+  parentWsName?: string;
+  /** Which top-level parent this spawned row is nested under (for keys). */
+  nestParentSid?: string;
 }
 
 const FILTERS: { key: ChatsFilter; label: string; icon: typeof MessageSquare }[] = [
@@ -60,6 +73,25 @@ function relativeTime(iso: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+/** Render caps — keeps the sidebar DOM light when a workspace has hundreds of
+ * chats. The full list stays in memory (tabs resolve from it); only the visible
+ * rows are capped, with a Load more button per section. */
+const GENERAL_PAGE = 15;
+const PROJECT_PAGE = 7;
+const ROOM_PAGE = 15;
+
+function LoadMoreButton({ remaining, onClick }: { remaining: number; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="w-full mb-1.5 py-1.5 rounded-lg text-[11px] font-medium text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.04] transition-colors cursor-pointer"
+    >
+      Load more ({remaining})
+    </button>
+  );
+}
+
 /**
  * Chat management sidebar. Full variant (main workspace): a source dropdown
  * (General / Coding / House / Personal) switches which chats are listed; the
@@ -73,15 +105,27 @@ export default function HouseSidebar({
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
   onOpenSession, onNewChat, onNewProject, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
-  onLaunchPersonal, onLaunchCoding, onLaunchHouse, onLaunchAdmin, onLaunchDesign,
+  onLaunchPersonal, onLaunchCoding, onLaunchHouse, onLaunchAdmin,
 }: Props) {
   const [editing, setEditing] = useState<{ sid: string; title: string } | null>(null);
   const [confirmDeleteSid, setConfirmDeleteSid] = useState<string | null>(null);
+  const [deletingSid, setDeletingSid] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
   const [collapsedWs, setCollapsedWs] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
   const filterRef = useRef<HTMLDivElement | null>(null);
   const deleteTimer = useRef<number | null>(null);
+  const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
+  const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
+  const [generalLimit, setGeneralLimit] = useState(GENERAL_PAGE);
+  const [roomLimit, setRoomLimit] = useState(ROOM_PAGE);
+  const [projectLimits, setProjectLimits] = useState<Record<string, number>>({});
+  /** Collapsed spawn-nests: parent session-tab-id -> collapsed. Default expanded. */
+  const [collapsedSpawns, setCollapsedSpawns] = useState<Set<string>>(new Set());
+  /** Durable subagents per parent chat (workspace agents → specialists). */
+  const [subagentsBySid, setSubagentsBySid] = useState<Record<string, SubagentInfo[]>>({});
+  const [subagentsLoading, setSubagentsLoading] = useState<Set<string>>(new Set());
+  const subagentsRequested = useRef<Set<string>>(new Set());
 
   const isPinned = (sid: string) => pinnedChats.includes(sid);
   const general = workspaces.find((w) => w.isGeneral);
@@ -94,6 +138,109 @@ export default function HouseSidebar({
       [...rows].sort((a, b) => Number(pinnedChats.includes(b.sid)) - Number(pinnedChats.includes(a.sid))),
     [pinnedChats],
   );
+
+  /** Global chat lookup so a spawned child can name its parent anywhere. */
+  const globalLookup = useMemo(
+    () => buildGlobalLookup(workspaces, chatsByWs),
+    [workspaces, chatsByWs],
+  );
+
+  const withParentInfo = useCallback((row: RowChat): RowChat => {
+    const parentId = (row as ChatSummary).parentChatId;
+    if (!parentId) return row;
+    const hit = globalLookup.get(parentId);
+    if (!hit) return row;
+    return { ...row, parentTitle: hit.title, parentWsName: hit.wsName };
+  }, [globalLookup]);
+
+  /** Nests the user explicitly expanded — auto-collapse seeding never touches these. */
+  const userExpanded = useRef<Set<string>>(new Set());
+  const toggleSpawnCollapsed = useCallback((sid: string) => {
+    setCollapsedSpawns((prev) => {
+      const next = new Set(prev);
+      if (next.has(sid)) {
+        next.delete(sid);
+        userExpanded.current.add(sid);
+      } else {
+        next.add(sid);
+        userExpanded.current.delete(sid);
+      }
+      return next;
+    });
+  }, []);
+
+  // Default-collapsed spawn nests: seed every parent that has spawned children
+  // as collapsed so lower agents live inside their parent instead of reading
+  // as flat siblings. User expands explicitly; seeding only ever adds.
+  useEffect(() => {
+    const parents = new Set<string>();
+    const byId = new Set<string>();
+    for (const ws of workspaces) {
+      for (const c of chatsByWs[ws.id] ?? []) byId.add(c.id);
+    }
+    for (const ws of workspaces) {
+      for (const c of chatsByWs[ws.id] ?? []) {
+        const p = (c as ChatSummary).parentChatId;
+        if (p && byId.has(p)) parents.add(tabId(workspaces.find((w) => (chatsByWs[w.id] ?? []).some((x) => x.id === p))?.id ?? ws.id, p));
+      }
+    }
+    // Cross-workspace children (orchestrator → project) nest under general parents.
+    if (general) {
+      const lookup = buildGlobalLookup(workspaces, chatsByWs);
+      for (const c of chatsByWs[general.id] ?? []) {
+        const hasKids = (collectSpawnedChildrenOf(c.id, workspaces, chatsByWs, lookup) ?? []).length > 0;
+        if (hasKids) parents.add(tabId(general.id, c.id));
+      }
+    }
+    if (parents.size === 0) return;
+    setCollapsedSpawns((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const sid of parents) {
+        // Only auto-collapse on first sight — never re-collapse a nest the
+        // user explicitly expanded this session.
+        if (!next.has(sid) && !userExpanded.current.has(sid)) {
+          next.add(sid);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaces, chatsByWs]);
+
+  /** Lazily load durable subagents (workspace agent → specialists) for a parent. */
+  const ensureSubagents = useCallback((row: RowChat) => {
+    if (subagentsRequested.current.has(row.sid)) return;
+    subagentsRequested.current.add(row.sid);
+    setSubagentsLoading((prev) => new Set(prev).add(row.sid));
+    fetchChatSubagents(row.ws.id, row.id)
+      .then((list) => {
+        if (Array.isArray(list) && list.length > 0) {
+          setSubagentsBySid((prev) => ({ ...prev, [row.sid]: list }));
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        setSubagentsLoading((prev) => {
+          const next = new Set(prev);
+          next.delete(row.sid);
+          return next;
+        });
+      });
+  }, []);
+
+  // Prefetch subagent badges for visible parents (cheap list calls, cached).
+  useEffect(() => {
+    if (!open) return;
+    const pool: RowChat[] = [];
+    if (general) pool.push(...(chatsByWs[general.id] ?? []).slice(0, 15).map((c) => withWs(general, c)));
+    for (const ws of projects.slice(0, 6)) {
+      pool.push(...(chatsByWs[ws.id] ?? []).slice(0, 5).map((c) => withWs(ws, c)));
+    }
+    for (const row of pool) ensureSubagents(row);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, chatsByWs, general?.id]);
 
   // ── Rows for the active filter ──
   const generalRows = useMemo(
@@ -141,9 +288,14 @@ export default function HouseSidebar({
 
   const handleDelete = (row: RowChat) => {
     if (confirmDeleteSid === row.sid) {
-      onDeleteChat(row.ws.id, row.id);
+      if (deletingSid) return;
+      setDeletingSid(row.sid);
       setConfirmDeleteSid(null);
       if (deleteTimer.current) window.clearTimeout(deleteTimer.current);
+      window.setTimeout(() => {
+        onDeleteChat(row.ws.id, row.id);
+        setDeletingSid(null);
+      }, 220);
     } else {
       setConfirmDeleteSid(row.sid);
       if (deleteTimer.current) window.clearTimeout(deleteTimer.current);
@@ -151,6 +303,77 @@ export default function HouseSidebar({
         setConfirmDeleteSid((cur) => (cur === row.sid ? null : cur));
       }, 2500);
     }
+  };
+
+  // ── Leaf actions: session leaves share the normal chat trio (pin / delete /
+  // rename), operating on the owning child chat. Keyed per-leaf so confirm +
+  // editing states never collide across leaves of the same chat.
+  const leafKeyOf = (chat: RowChat, leafId: string) => `${chat.sid}::${leafId}`;
+
+  const startLeafRename = (chat: RowChat, leafKey: string) => {
+    setConfirmDeleteSid(null);
+    setEditing({ sid: leafKey, title: chat.title || '' });
+  };
+
+  const commitLeafRename = (chat: RowChat, leafKey: string) => {
+    if (editing && editing.sid === leafKey && editing.title.trim() && editing.title.trim() !== (chat.title || '')) {
+      onRenameChat(chat.ws.id, chat.id, editing.title.trim());
+    }
+    setEditing(null);
+  };
+
+  const handleLeafDelete = (chat: RowChat, leafKey: string) => {
+    if (confirmDeleteSid === leafKey) {
+      if (deletingSid) return;
+      setDeletingSid(leafKey);
+      setConfirmDeleteSid(null);
+      if (deleteTimer.current) window.clearTimeout(deleteTimer.current);
+      window.setTimeout(() => {
+        onDeleteChat(chat.ws.id, chat.id);
+        setDeletingSid(null);
+      }, 220);
+    } else {
+      setConfirmDeleteSid(leafKey);
+      if (deleteTimer.current) window.clearTimeout(deleteTimer.current);
+      deleteTimer.current = window.setTimeout(() => {
+        setConfirmDeleteSid((cur) => (cur === leafKey ? null : cur));
+      }, 2500);
+    }
+  };
+
+  /** Hover trio for a session leaf — same affordances as a normal chat row. */
+  const renderLeafActions = (chat: RowChat, leafKey: string) => {
+    const pinned = isPinned(chat.sid);
+    const isConfirming = confirmDeleteSid === leafKey;
+    return (
+      <div className="absolute right-1 hidden group-hover/sub:flex items-center gap-0.5 bg-[#18181d] rounded-md border border-white/[0.06] px-0.5 py-0.5">
+        <button
+          title={pinned ? 'Unpin child chat' : 'Pin child chat'}
+          onClick={(e) => { e.stopPropagation(); onTogglePin(chat.sid); }}
+          className={`grid place-items-center w-6 h-6 rounded-md transition-colors ${
+            pinned ? 'text-zinc-200' : 'text-zinc-500 hover:text-white hover:bg-white/[0.07]'
+          }`}
+        >
+          {pinned ? <PinOff size={11} /> : <Pin size={11} />}
+        </button>
+        <button
+          title={isConfirming ? 'Click again to delete this child chat' : 'Delete child chat'}
+          onClick={(e) => { e.stopPropagation(); handleLeafDelete(chat, leafKey); }}
+          className={`grid place-items-center w-6 h-6 rounded-md transition-colors ${
+            isConfirming ? 'text-red-400 bg-red-500/15' : 'text-zinc-500 hover:text-white hover:bg-white/[0.07]'
+          }`}
+        >
+          {isConfirming ? <Check size={11} /> : <Trash2 size={11} />}
+        </button>
+        <button
+          title="Rename child chat"
+          onClick={(e) => { e.stopPropagation(); startLeafRename(chat, leafKey); }}
+          className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.07] transition-colors"
+        >
+          <Pencil size={11} />
+        </button>
+      </div>
+    );
   };
 
   const toggleCollapsed = (wsId: string) => {
@@ -166,22 +389,39 @@ export default function HouseSidebar({
   };
 
   // ── One chat row (shared by every view) ──
-  const renderRow = (row: RowChat, showWs: boolean) => {
+  // Hierarchy: spawned chats (orchestrator → workspace agents, workspace →
+  // sub-delegations) render indented with a connector + Bot icon + "from X"
+  // badge so they never read as plain top-level chats.
+  const renderRow = (row: RowChat, showWs: boolean, opts?: { depth?: number; hideParentBadge?: boolean }) => {
     const isEditing = editing?.sid === row.sid;
     const isConfirming = confirmDeleteSid === row.sid;
+    const isDeleting = deletingSid === row.sid;
     const isActive = row.sid === activeTabId;
     const isRunning = row.sid === runningTabId;
     const pinned = isPinned(row.sid);
-    const Icon = row.ws.isGeneral ? MessageSquare : Code2;
+    const spawned = isSpawnedChat(row);
+    const depth = Math.min(opts?.depth ?? row.depth ?? 0, 4);
+    const Icon = spawned ? Bot : row.ws.isGeneral ? MessageSquare : Code2;
+    const parentLabel = row.parentTitle
+      ? `Spawned from “${row.parentTitle}”${row.parentWsName ? ` (${row.parentWsName})` : ''}`
+      : spawned
+        ? 'Auto-spawned by a higher agent'
+        : showWs ? `${row.title || 'Untitled'} — ${row.ws.name}` : row.title || 'Untitled';
     return (
       <div
         key={row.sid}
-        onClick={() => { if (!isEditing) { onOpenSession(row.ws.id, row.id); onClose(); } }}
-        className={`house-sidebar-row group relative flex items-center gap-2.5 rounded-lg mb-1 pl-3 pr-2 py-2 cursor-pointer ${
+        onClick={() => { if (!isEditing && !isDeleting) { onOpenSession(row.ws.id, row.id); onClose(); } }}
+        className={`house-sidebar-row group relative flex items-center gap-2 rounded-lg mb-1 pr-2 py-2 cursor-pointer ${
           isActive ? 'is-active' : ''
-        }`}
-        title={showWs ? `${row.title || 'Untitled'} — ${row.ws.name}` : row.title || 'Untitled'}
+        } ${isDeleting ? 'is-deleting' : ''} ${spawned ? 'is-spawned' : ''}`}
+        style={{ paddingLeft: 12 + depth * 14 }}
+        title={parentLabel}
       >
+        {depth > 0 && (
+          <span className="pointer-events-none absolute left-0 top-0 bottom-0" style={{ left: 12 + (depth - 1) * 14 }} aria-hidden="true">
+            <span className="block h-full w-px bg-white/[0.08]" />
+          </span>
+        )}
         {isEditing ? (
           <input
             autoFocus
@@ -197,16 +437,30 @@ export default function HouseSidebar({
           />
         ) : (
           <>
+            {depth > 0 && <CornerDownRight size={11} className="flex-shrink-0 text-zinc-600" />}
             {isRunning ? (
               <span className="session-run-dot shrink-0" title="Running" />
             ) : (
-              <Icon size={12} className={`flex-shrink-0 ${row.ws.isGeneral ? 'text-zinc-600' : 'text-zinc-500'}`} />
+              <Icon size={12} className={`flex-shrink-0 ${spawned ? 'text-violet-300/80' : row.ws.isGeneral ? 'text-zinc-600' : 'text-zinc-500'}`} />
             )}
-            <span className={`flex-1 min-w-0 truncate text-[12.5px] ${isActive ? 'text-white' : 'text-zinc-400'}`}>
-              {row.title || 'Untitled'}
+            <span className="flex-1 min-w-0">
+              <span className={`block truncate text-[12.5px] ${isActive ? 'text-white' : 'text-zinc-400'}`}>
+                {row.title || 'Untitled'}
+              </span>
+              {spawned && !opts?.hideParentBadge && (
+                <span className="mt-0.5 flex items-center gap-1 min-w-0">
+                  <span className="inline-flex items-center rounded-full border border-violet-400/20 bg-violet-400/[0.08] px-1.5 py-px text-[9px] font-medium text-violet-200/80">
+                    auto
+                  </span>
+                  <span className="truncate text-[10px] text-zinc-600">
+                    {row.parentTitle ? `from ${row.parentTitle}` : 'spawned by agent'}
+                    {showWs && row.ws?.name ? ` · ${row.ws.name}` : ''}
+                  </span>
+                </span>
+              )}
             </span>
             {pinned && <Pin size={10} className="text-zinc-500 shrink-0 rotate-45" />}
-            {showWs && <span className="text-[9.5px] text-zinc-600 shrink-0 truncate max-w-[64px]">{row.ws.name}</span>}
+            {showWs && !spawned && <span className="text-[9.5px] text-zinc-600 shrink-0 truncate max-w-[64px]">{row.ws.name}</span>}
             <span className="text-[10px] text-zinc-600 flex-shrink-0 tabular-nums">{relativeTime(row.updatedAt)}</span>
             <div className="absolute right-1 hidden group-hover:flex items-center gap-0.5 bg-[#18181d] rounded-md border border-white/[0.06] px-0.5 py-0.5">
               <button
@@ -241,17 +495,185 @@ export default function HouseSidebar({
     );
   };
 
+  /** Nested subagent leaves (workspace agent → specialists) under a chat. */
+  const renderSubagents = (row: RowChat, depth: number) => {
+    const list = subagentsBySid[row.sid] ?? [];
+    if (list.length === 0) {
+      if (subagentsLoading.has(row.sid)) {
+        return (
+          <div
+            className="py-1 text-[10.5px] text-zinc-700 italic"
+            style={{ paddingLeft: 12 + (depth + 1) * 14 }}
+          >
+            loading subagents…
+          </div>
+        );
+      }
+      return null;
+    }
+    return (
+      <div className="mt-0.5 flex flex-col gap-0.5">
+        {list.map((s) => {
+          const leafKey = leafKeyOf(row, s.child_id);
+          const isEditingLeaf = editing?.sid === leafKey;
+          return (
+            <div
+              key={s.child_id}
+              onClick={() => { if (!isEditingLeaf) { onOpenSession(row.ws.id, row.id); onClose(); } }}
+              className="group/sub relative flex items-center gap-1.5 rounded-lg pr-2 py-1.5 cursor-pointer hover:bg-white/[0.04]"
+              style={{ paddingLeft: 12 + (depth + 1) * 14 }}
+              title={`Subagent ${s.label || s.name} — opens its chat`}
+            >
+              <CornerDownRight size={10} className="flex-shrink-0 text-zinc-700" />
+              <Bot size={11} className="flex-shrink-0 text-zinc-600" />
+              {isEditingLeaf ? (
+                <input
+                  autoFocus
+                  value={editing.title}
+                  onChange={(e) => setEditing({ sid: leafKey, title: e.target.value })}
+                  onBlur={() => commitLeafRename(row, leafKey)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') commitLeafRename(row, leafKey);
+                    if (e.key === 'Escape') setEditing(null);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="min-w-0 flex-1 rounded-md border border-white/25 bg-black/40 px-2 py-0.5 text-[11.5px] text-white outline-none focus:border-white/40"
+                />
+              ) : (
+                <span className="flex-1 min-w-0 truncate text-[11.5px] text-zinc-500">
+                  {s.label || s.name || s.child_id}
+                </span>
+              )}
+              <span
+                className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${s.status === 'running' ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-700'}`}
+                title={s.status}
+              />
+              {renderLeafActions(row, leafKey)}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  /**
+   * One spawned child rendered as session leaves only (no purple duplicate
+   * chat row). Each leaf opens that child chat — same destination the purple
+   * row had. A child with zero recorded sessions gets a single leaf-style
+   * fallback row (Bot + chat title) so it stays reachable.
+   */
+  const renderKidLeaves = (kid: RowChat, depth: number) => {
+    const leaves = renderSubagents(kid, depth);
+    if (leaves) return leaves;
+    const leafKey = leafKeyOf(kid, kid.id);
+    const isEditingLeaf = editing?.sid === leafKey;
+    return (
+      <div className="mt-0.5 flex flex-col gap-0.5">
+        <div
+          key={kid.sid}
+          onClick={() => { if (!isEditingLeaf) { onOpenSession(kid.ws.id, kid.id); onClose(); } }}
+          className="group/sub relative flex items-center gap-1.5 rounded-lg pr-2 py-1.5 cursor-pointer hover:bg-white/[0.04]"
+          style={{ paddingLeft: 12 + (depth + 1) * 14 }}
+          title={`${kid.title || 'Untitled'} — opens child chat`}
+        >
+          <CornerDownRight size={10} className="flex-shrink-0 text-zinc-700" />
+          <Bot size={11} className="flex-shrink-0 text-zinc-600" />
+          {isEditingLeaf ? (
+            <input
+              autoFocus
+              value={editing.title}
+              onChange={(e) => setEditing({ sid: leafKey, title: e.target.value })}
+              onBlur={() => commitLeafRename(kid, leafKey)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitLeafRename(kid, leafKey);
+                if (e.key === 'Escape') setEditing(null);
+              }}
+              onClick={(e) => e.stopPropagation()}
+              className="min-w-0 flex-1 rounded-md border border-white/25 bg-black/40 px-2 py-0.5 text-[11.5px] text-white outline-none focus:border-white/40"
+            />
+          ) : (
+            <span className="flex-1 min-w-0 truncate text-[11.5px] text-zinc-500">
+              {kid.title || 'Untitled'}
+            </span>
+          )}
+          {renderLeafActions(kid, leafKey)}
+        </div>
+      </div>
+    );
+  };
+
+  /** Prefetch session leaves for kids when a nest expands (lazy, cached). */
+  const prefetchKids = useCallback((kids: RowChat[]) => {
+    for (const k of kids) ensureSubagents(k);
+  }, [ensureSubagents]);
+
   const renderBody = () => {
-    // Room variant: one flat list of every chat (title or workspace match).
+    // Room variant: nested-collapsed — spawned chats live inside their parent
+    // instead of flat siblings. Search stays flat so children are findable.
     if (variant === 'room') {
+      const annotate = (rows: RowChat[]) => rows.map(withParentInfo);
       if (searching) {
-        const hits = allRows.filter((r) =>
-          (r.title || 'untitled').toLowerCase().includes(q) || r.ws.name.toLowerCase().includes(q));
+        const hits = annotate(allRows).filter((r) =>
+          (r.title || 'untitled').toLowerCase().includes(q) || r.ws.name.toLowerCase().includes(q)
+          || (r.parentTitle || '').toLowerCase().includes(q));
         if (hits.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats match “{filter.trim()}”.</div>;
-        return hits.map((row) => renderRow(row, !row.ws.isGeneral));
+        return hits.map((row) => renderRow(row, !row.ws.isGeneral, { depth: isSpawnedChat(row) ? 1 : 0 }));
       }
       if (allRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
-      return allRows.map((row) => renderRow(row, !row.ws.isGeneral));
+      const annotated = annotate(allRows);
+      const byId = new Map(annotated.map((r) => [r.id, r]));
+      const tops: RowChat[] = [];
+      const kidsByParent = new Map<string, RowChat[]>();
+      for (const row of annotated) {
+        const p = (row as ChatSummary).parentChatId;
+        if (p && byId.has(p)) {
+          const arr = kidsByParent.get(p) || [];
+          arr.push({ ...row, depth: 1 });
+          kidsByParent.set(p, arr);
+        } else {
+          tops.push(row);
+        }
+      }
+      for (const arr of kidsByParent.values()) {
+        arr.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      }
+      const visibleTops = tops.slice(0, roomLimit);
+      const remainingRows = tops.length - visibleTops.length;
+      return (
+        <>
+          {visibleTops.map((parent) => {
+            const kids = kidsByParent.get(parent.id) ?? [];
+            const collapsed = kids.length > 0 && collapsedSpawns.has(parent.sid);
+            return (
+              <div key={parent.sid} className="mb-0.5">
+                <div className="flex items-center gap-0.5">
+                  {kids.length > 0 ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); if (collapsed) prefetchKids(kids); toggleSpawnCollapsed(parent.sid); }}
+                      title={collapsed ? `Expand ${kids.length} spawned` : 'Collapse spawned'}
+                      aria-label={collapsed ? 'Expand spawned chats' : 'Collapse spawned chats'}
+                      className="grid place-items-center w-5 h-5 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+                    >
+                      {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                    </button>
+                  ) : (
+                    <span className="w-5 shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">{renderRow(parent, !parent.ws.isGeneral)}</div>
+                </div>
+                {!collapsed && kids.map((kid) => (
+                  <div key={kid.sid} className="flex-1 min-w-0">
+                    {renderKidLeaves(kid, 0)}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          {remainingRows > 0 && (
+            <LoadMoreButton remaining={remainingRows} onClick={() => setRoomLimit((n) => n + ROOM_PAGE)} />
+          )}
+        </>
+      );
     }
 
     if (chatsFilter === 'house' || chatsFilter === 'personal') {
@@ -272,20 +694,116 @@ export default function HouseSidebar({
 
     if (searching) {
       if (searchRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats match “{filter.trim()}”.</div>;
-      return searchRows.map((row) => renderRow(row, chatsFilter === 'coding'));
+      return searchRows.map((r) => {
+        const row = withParentInfo(r);
+        return renderRow(row, chatsFilter === 'coding', { depth: isSpawnedChat(row) ? 1 : 0 });
+      });
     }
 
     if (chatsFilter === 'general') {
-      if (generalRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
-      return generalRows.map((row) => renderRow(row, false));
+      if (!general) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
+      // Same-workspace chains nest here too (e.g. 1+3 spawned from New
+      // Conversation): spawned chats are leaves inside their parent, never
+      // purple top-level siblings.
+      const generalRaw = (chatsByWs[general.id] ?? []).map((c) => ({ ...c }));
+      const { tops: generalTops, childrenByParent: generalKids } = groupWorkspaceChats(general, generalRaw, globalLookup);
+      const generalTopRows: RowChat[] = pinnedSort(generalTops.map((t) => {
+        const base = generalRows.find((r) => r.id === t.id);
+        const row: RowChat = { ...(base ?? withWs(general, t)), depth: 0 };
+        return withParentInfo(row);
+      }));
+      if (generalTopRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
+      const visibleRows = generalTopRows.slice(0, generalLimit);
+      const remainingRows = generalTopRows.length - visibleRows.length;
+      return (
+        <>
+          {visibleRows.map((parent) => {
+            // Same-workspace children first (leaves, not purple rows).
+            const sameWsKids: RowChat[] = (generalKids.get(parent.id) ?? []).map((k) => {
+              const base = generalRows.find((r) => r.id === k.id);
+              const row: RowChat = { ...(base ?? withWs(general, k)), depth: 0, parentTitle: k.parentTitle, parentWsName: k.parentWsName };
+              return withParentInfo(row);
+            });
+            // Orchestrator → workspace agents: cross-workspace children nest
+            // here under their true parent chat (same-ws ones handled above).
+            const kids = collectSpawnedChildrenOf(parent.id, workspaces, chatsByWs, globalLookup)
+              .filter((k) => k.workspaceId !== general.id)
+              .map((k) => {
+                const ws = workspaces.find((w) => w.id === k.workspaceId);
+                if (!ws) return null;
+                const row: RowChat = { ...k, sid: tabId(ws.id, k.id), ws, nestParentSid: parent.sid };
+                return row;
+              })
+              .filter((r): r is RowChat => r !== null);
+            const allKids = [...sameWsKids, ...kids];
+            const collapsed = collapsedSpawns.has(parent.sid);
+            const subCount = (subagentsBySid[parent.sid] ?? []).length;
+            const totalNested = allKids.length + subCount;
+            return (
+              <div key={parent.sid} className="mb-0.5">
+                <div className="flex items-center gap-0.5">
+                  {totalNested > 0 ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); if (collapsed) prefetchKids(allKids); toggleSpawnCollapsed(parent.sid); }}
+                      title={collapsed ? `Expand ${totalNested} spawned` : 'Collapse spawned'}
+                      aria-label={collapsed ? 'Expand spawned chats' : 'Collapse spawned chats'}
+                      className="grid place-items-center w-5 h-5 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+                    >
+                      {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                    </button>
+                  ) : (
+                    <span className="w-5 shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">{renderRow(parent, false)}</div>
+                </div>
+                {!collapsed && totalNested > 0 && (
+                  <div className="flex flex-col gap-0.5" role="group" aria-label={`Spawned from ${parent.title}`}>
+                    {sameWsKids.map((kid) => (
+                      <div key={kid.sid}>
+                        {renderKidLeaves(kid, 0)}
+                      </div>
+                    ))}
+                    {kids.map((kid) => {
+                      const kidWsId = (kid as unknown as { workspaceId?: string }).workspaceId ?? kid.ws.id;
+                      const wsOfKid = workspaces.find((w) => w.id === kidWsId) ?? kid.ws;
+                      const showWsKid: RowChat = { ...kid, ws: wsOfKid };
+                      return (
+                        <div key={showWsKid.sid}>
+                          {renderKidLeaves(showWsKid, showWsKid.depth ?? 1)}
+                        </div>
+                      );
+                    })}
+                    {renderSubagents(parent, 0)}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {remainingRows > 0 && (
+            <LoadMoreButton remaining={remainingRows} onClick={() => setGeneralLimit((n) => n + GENERAL_PAGE)} />
+          )}
+        </>
+      );
     }
 
-    // Coding: collapsible per-project groups
+    // Coding: collapsible per-project groups with spawn hierarchy.
+    // Same-workspace delegations nest under their parent; cross-workspace
+    // children (orchestrator → this project) show a "from X" badge.
     if (codingGroups.length === 0) {
       return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No projects yet — use + to add one.</div>;
     }
     return codingGroups.map(({ ws, rows }) => {
       const collapsed = collapsedWs.has(ws.id);
+      const rawChats = (chatsByWs[ws.id] ?? []).map((c) => ({ ...c }));
+      const { tops, childrenByParent } = groupWorkspaceChats(ws, rawChats, globalLookup);
+      const topRows: RowChat[] = pinnedSort(tops.map((t) => {
+        const base = rows.find((r) => r.id === t.id);
+        const row: RowChat = { ...(base ?? withWs(ws, t)), depth: 0 };
+        return withParentInfo(row);
+      }));
+      const limit = projectLimits[ws.id] ?? PROJECT_PAGE;
+      const visibleTops = topRows.slice(0, limit);
+      const remainingRows = topRows.length - visibleTops.length;
       return (
         <div key={ws.id} className="mb-2.5">
           <div className="w-full flex items-center gap-1.5 px-1 pb-1 select-none">
@@ -305,10 +823,57 @@ export default function HouseSidebar({
           </div>
           {!collapsed && (
             <div>
-              {rows.length === 0 ? (
+              {topRows.length === 0 ? (
                 <div className="px-3 py-1.5 text-[11px] text-zinc-700">No chats yet</div>
               ) : (
-                rows.map((row) => renderRow(row, false))
+                <>
+                  {visibleTops.map((top) => {
+                    const kids = (childrenByParent.get(top.id) ?? []).map((k) => {
+                      const base = rows.find((r) => r.id === k.id);
+                      const row: RowChat = { ...(base ?? withWs(ws, k)), depth: k.depth, parentTitle: k.parentTitle, parentWsName: k.parentWsName };
+                      return withParentInfo(row);
+                    });
+                    const spawnCollapsed = collapsedSpawns.has(top.sid);
+                    const subs = subagentsBySid[top.sid] ?? [];
+                    const nestedTotal = kids.length + subs.length;
+                    return (
+                      <div key={top.sid} className="mb-0.5">
+                        <div className="flex items-center gap-0.5">
+                          {nestedTotal > 0 ? (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); if (spawnCollapsed) prefetchKids(kids); toggleSpawnCollapsed(top.sid); }}
+                              title={spawnCollapsed ? `Expand ${nestedTotal} nested` : 'Collapse nested'}
+                              aria-label={spawnCollapsed ? 'Expand nested chats' : 'Collapse nested chats'}
+                              className="grid place-items-center w-5 h-5 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+                            >
+                              {spawnCollapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                            </button>
+                          ) : (
+                            <span className="w-5 shrink-0" />
+                          )}
+                          <div className="flex-1 min-w-0">{renderRow(top, false, { depth: 0 })}</div>
+                        </div>
+                        {!spawnCollapsed && nestedTotal > 0 && (
+                          <div className="flex flex-col gap-0.5" role="group" aria-label={`Nested under ${top.title}`}>
+                            {kids.map((kid) => (
+                              <div key={kid.sid} className="flex items-center gap-0.5">
+                                <span className="w-5 shrink-0" />
+                                <div className="flex-1 min-w-0">{renderKidLeaves(kid, Math.max(0, (kid.depth ?? 1) - 1))}</div>
+                              </div>
+                            ))}
+                            {renderSubagents(top, 0)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {remainingRows > 0 && (
+                    <LoadMoreButton
+                      remaining={remainingRows}
+                      onClick={() => setProjectLimits((prev) => ({ ...prev, [ws.id]: (prev[ws.id] ?? PROJECT_PAGE) + PROJECT_PAGE }))}
+                    />
+                  )}
+                </>
               )}
             </div>
           )}
@@ -405,95 +970,35 @@ export default function HouseSidebar({
           {renderBody()}
         </div>
 
-        {/* ── Workspaces ── */}
-        <div className="border-t house-hairline px-4 pt-3.5 pb-2 mt-2 text-[10px] uppercase tracking-widest font-semibold text-zinc-600">
-          Workspaces
+        {/* ── Workspaces trigger (bottom) ── */}
+        <div className="border-t house-hairline mt-2 px-3 py-3 shrink-0">
+          <button
+            ref={workspaceTriggerRef}
+            onClick={() => setWorkspaceModalOpen((v) => !v)}
+            aria-expanded={workspaceModalOpen}
+            aria-haspopup="dialog"
+            className={`w-full flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 border transition-colors cursor-pointer ${
+              workspaceModalOpen
+                ? 'bg-white/[0.06] border-white/[0.08] text-white'
+                : 'bg-white/[0.02] border-white/[0.05] text-zinc-400 hover:bg-white/[0.05] hover:border-white/[0.08] hover:text-zinc-200'
+            }`}
+          >
+            <span className="grid place-items-center w-7 h-7 rounded-lg bg-white/[0.04] border border-white/[0.06] shrink-0">
+              <LayoutGrid size={13} />
+            </span>
+            <span className="flex-1 text-left text-[11px] font-semibold tracking-widest uppercase">Workspaces</span>
+            <ChevronRight size={12} className={`text-zinc-500 transition-transform ${workspaceModalOpen ? 'rotate-90' : ''}`} />
+          </button>
         </div>
-        <div className="px-3 pb-3.5 flex flex-col gap-1.5">
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchPersonal}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchPersonal(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <User size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">Personal Workspace</div>
-              <div className="text-[10px] text-zinc-500">Personal tools & life admin</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchCoding}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchCoding(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <Code2 size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">Coding Workspace</div>
-              <div className="text-[10px] text-zinc-500">Multi-agent software development</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchHouse}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchHouse(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <Home size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">House Workspace</div>
-              <div className="text-[10px] text-zinc-500">Smart home control & monitoring</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchAdmin}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchAdmin(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <ShieldCheck size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">Agents Admin</div>
-              <div className="text-[10px] text-zinc-500">Proxy fleet — super-operator only</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          {onLaunchDesign && (
-            <div
-              role="button"
-              tabIndex={0}
-              onClick={onLaunchDesign}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchDesign(); } }}
-              className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-              title="OpenDesign — agent-led UI design iteration for a workspace (straight to the UI subagent loop)"
-            >
-              <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-                <Palette size={15} />
-              </span>
-              <div className="flex-1 min-w-0">
-                <div className="text-[12.5px] font-medium text-zinc-200">OpenDesign Module</div>
-                <div className="text-[10px] text-zinc-500">Agent-led UI design iteration</div>
-              </div>
-              <ChevronRight size={13} className="text-zinc-600" />
-            </div>
-          )}
-        </div>
+        <WorkspaceSwitcher
+          open={workspaceModalOpen && open}
+          onClose={() => setWorkspaceModalOpen(false)}
+          anchorRef={workspaceTriggerRef}
+          onLaunchPersonal={onLaunchPersonal}
+          onLaunchCoding={onLaunchCoding}
+          onLaunchHouse={onLaunchHouse}
+          onLaunchAdmin={onLaunchAdmin}
+        />
       </aside>
     </>
   );

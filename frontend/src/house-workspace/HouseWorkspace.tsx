@@ -16,7 +16,7 @@ import MessageStream from '../components/Workspace/MessageStream';
 import PromptDock from '../components/Workspace/PromptDock';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import { updateChatTitle, deleteChat } from '../services/api';
-import { getAssistantName, seedAssistantMemory } from '../house/assistant';
+import { getAssistantName } from '../house/assistant';
 import './houseControl.css';
 import '../house/house.css';
 
@@ -77,10 +77,6 @@ export default function HouseWorkspace() {
   // Dedicated "House" conversation — bound to the _house workspace + house agent.
   const chat = useHouseChat({ pinnedChatTitle: HOUSE_CHAT_TITLE, workspaceKind: 'house' });
   const assistantName = getAssistantName();
-
-  useEffect(() => {
-    seedAssistantMemory();
-  }, []);
 
   const showToast = useCallback((text: string) => {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);

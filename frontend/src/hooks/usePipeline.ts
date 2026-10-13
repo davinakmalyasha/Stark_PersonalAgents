@@ -1,11 +1,13 @@
 import { useState, useCallback, useRef } from 'react';
 import type { AppState, ChatAttachment, StreamDelta } from '../types';
 import { streamPipeline } from '../services/api';
+import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
 
 export interface LiveStream {
   text: string;
   reasoning: string;
   agent: string;
+  segments: StreamSegment[];
   active: boolean;
   rate: number; // tokens/sec estimate
 }
@@ -23,7 +25,7 @@ interface UsePipelineReturn {
   attachMirror: (chatId: string) => void;
 }
 
-const EMPTY_STREAM: LiveStream = { text: '', reasoning: '', agent: '', active: false, rate: 0 };
+const EMPTY_STREAM: LiveStream = { text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 };
 
 export function usePipeline(): UsePipelineReturn {
   const [state, setState] = useState<AppState | null>(null);
@@ -34,40 +36,24 @@ export function usePipeline(): UsePipelineReturn {
   const [runMode, setRunMode] = useState<'local' | 'mirror' | null>(null);
 
   // tok/s estimation: chars since last delta / seconds since last delta, smoothed
-  const rateRef = useRef({ lastTs: 0, lastChars: 0, ema: 0 });
-  const streamRef = useRef({ text: '', reasoning: '', agent: '' });
+  const rateRef = useRef(emptyRateAccum());
+  const streamRef = useRef(emptyStreamAccum());
 
   const applyDelta = useCallback((delta: StreamDelta) => {
-    const now = performance.now();
-    if (delta.kind === 'reasoning') {
-      streamRef.current.reasoning += delta.text;
-    } else if (delta.kind === 'text') {
-      const chars = delta.text.length;
-      const r = rateRef.current;
-      if (r.lastTs > 0) {
-        const dt = Math.max(16, now - r.lastTs) / 1000;
-        const rate = (chars / 4) / dt; // ~4 chars per token
-        r.ema = r.ema === 0 ? rate : r.ema * 0.8 + rate * 0.2;
-      }
-      r.lastTs = now;
-      r.lastChars = chars;
-      streamRef.current.text += delta.text;
-    } else if (delta.kind === 'end') {
-      rateRef.current.ema = 0;
-    }
-    if (delta.agent) streamRef.current.agent = delta.agent;
+    const rate = applyDeltaToAccum(streamRef.current, rateRef.current, delta, performance.now());
     setStreaming({
       text: streamRef.current.text,
       reasoning: streamRef.current.reasoning,
       agent: streamRef.current.agent,
+      segments: [...streamRef.current.segments],
       active: true,
-      rate: Math.round(rateRef.current.ema),
+      rate,
     });
   }, []);
 
   const resetStream = useCallback(() => {
-    streamRef.current = { text: '', reasoning: '', agent: '' };
-    rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
+    streamRef.current = emptyStreamAccum();
+    rateRef.current = emptyRateAccum();
     setStreaming(EMPTY_STREAM);
   }, []);
 
@@ -77,10 +63,10 @@ export function usePipeline(): UsePipelineReturn {
     setError(null);
     resetStream();
     setState({
-      active_node: 'supervisor',
+      active_node: 'orchestrator',
       next_agent: '',
       completed_nodes: [],
-      thoughts: { supervisor: 'Analyzing request...', developer: '' },
+      thoughts: { orchestrator: 'Analyzing request...', developer: '' },
       client_request: prompt,
       outputs: {
         requirements: '',
@@ -95,7 +81,7 @@ export function usePipeline(): UsePipelineReturn {
       project_path: workspacePath,
       agents_plan: '',
       antigravity_log: [],
-      live_terminal_log: `[THOUGHT] [Supervisor] Analyzing request...\n`,
+      live_terminal_log: `[THOUGHT] [Stark] Analyzing request...\n`,
       selected_model: model,
       selected_temp: temp,
       token_usage: {

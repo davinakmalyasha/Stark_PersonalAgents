@@ -7,7 +7,7 @@ import TokenStatsModal from './components/Layout/TokenStatsModal';
 import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 import { usePipeline } from './hooks/usePipeline';
-import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun } from './services/api';
+import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun, abortRun } from './services/api';
 const API_BASE = '/api';
 import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment, AgentTask } from './types';
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
@@ -16,7 +16,7 @@ const WELCOME_MESSAGES: ChatMessage[] = [
   {
     id: 'welcome-1',
     role: 'system',
-    content: 'Connected to VinCode v3 — Supervisor + Developer agent online. Add a workspace folder to get started.',
+    content: 'Connected to Stark v3 — orchestrator online, workspace agents ready. Add a workspace folder to get started.',
     timestamp: new Date().toISOString(),
   },
 ];
@@ -32,6 +32,7 @@ export default function App() {
     workspaceId: string;
     chatId: string;
     startedAt: number;
+    runSeq?: number;
   } | null>(null);
   const [isPersisting, setIsPersisting] = useState(false);
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -78,6 +79,17 @@ export default function App() {
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
   const activeTaskRef = useRef<string | null>(null);
+  // Stop bookkeeping: the persist effect below runs after cancel() already
+  // cleared the stream, so capture "was this a Stop" + partial thinking here.
+  const cancelledRef = useRef(false);
+  const cancelThinkingRef = useRef('');
+  const cancelTextRef = useRef('');
+  const lastStreamingRef = useRef(streaming);
+  useEffect(() => {
+    if (streaming.reasoning || streaming.segments.length || streaming.text) {
+      lastStreamingRef.current = streaming;
+    }
+  }, [streaming]);
   // Live mirroring (mobile/remote): remember which run instance we already
   // attached to so the poll doesn't re-attach to a finished run.
   const mirroredRunStart = useRef('');
@@ -155,6 +167,14 @@ export default function App() {
       if (state?.error) {
         return;
       }
+      // Stop (not done): keep the partial, marked stopped. Capture + reset
+      // here — cancel() already cleared the live stream by the time we run.
+      const wasStopped = cancelledRef.current;
+      const stoppedThinking = cancelThinkingRef.current;
+      const stoppedText = cancelTextRef.current;
+      cancelledRef.current = false;
+      cancelThinkingRef.current = '';
+      cancelTextRef.current = '';
       if (activeTaskRef.current && activeWorkspace && activeChat) {
         updateTaskStatus(activeWorkspace.id, activeChat.id, activeTaskRef.current, 'completed').catch(() => {});
         activeTaskRef.current = null;
@@ -178,7 +198,9 @@ export default function App() {
               const { steps, assistantResponse } = parseLogToSteps(log);
               // General mode stores the final text in outputs rather than the
               // terminal log. Use it as the same unified trace response.
-              const finalResponse = assistantResponse || state?.outputs?.agent_report || '';
+              // On Stop, the visible streamed partial wins (it never lands in
+              // the log).
+              const finalResponse = stoppedText.trim() || assistantResponse || state?.outputs?.agent_report || '';
               const duration = runStartTime.current
                 ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
                 : undefined;
@@ -189,12 +211,17 @@ export default function App() {
               const chatSteps = filterOrchestratorSteps(steps);
 
               // Save a single unified agent message with trace metadata
+              // Wire streaming reasoning on success too (was only on Stop) — otherwise past reasoning vanishes.
+              // Use lastStreamingRef because usePipeline resets streaming before this effect fires.
+              const live = lastStreamingRef.current;
+              const successThinking = (live.reasoning || streaming.reasoning || '').trim();
+              const successTimeline = live.segments?.length ? [...live.segments] : streaming.segments?.length ? [...streaming.segments] : [];
               await addChatMessage(
                 activeWorkspace.id,
                 activeChat.id,
                 'agent',
                 finalResponse,
-                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined }
+                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined, thinking: (stoppedThinking || successThinking) || undefined, liveTimeline: successTimeline.length ? successTimeline : undefined, ...(wasStopped ? { stopped: true } : {}) }
               );
             }
             // Now re-fetch to sync messages and token stats
@@ -220,12 +247,15 @@ export default function App() {
   // While idle, watch /api/runs/active: when a run starts for THIS chat from
   // another client (phone or second browser), attach to its event stream so
   // both screens show the identical live session.
+  // Suppressed while a voice session owns this chat — the overlay's SSE is
+  // the working stream; attaching a second one is the stream-then-gone bug.
   useEffect(() => {
     if (isRunning || !activeChat) return;
     let cancelled = false;
     const tick = async () => {
       if (cancelled || document.hidden) return;
       try {
+        if (Date.now() - lastVoiceEventAt.current < 30000) return;
         const run = await fetchActiveRun();
         if (cancelled || !run.running) return;
         if (run.chat_id === activeChat.id && run.started_at && run.started_at !== mirroredRunStart.current) {
@@ -454,6 +484,12 @@ export default function App() {
   // and token deltas stream into the voice-live agent bubble.
   const [voiceInputText, setVoiceInputText] = useState('');
   const voiceStreamRef = useRef({ text: '', reasoning: '' });
+  // Single voice-trace owner: the overlay's run is canonical. runSeq from
+  // pipeline-start lets stale done/state/delta frames fall through instead of
+  // wiping the live run. lastVoiceEventAt suppresses the mirror poll while a
+  // voice session owns this chat (the mirror is the broken duplicate stream).
+  const voiceRunSeqRef = useRef(0);
+  const lastVoiceEventAt = useRef(0);
 
   const toggleVoice = useCallback(() => {
     (window as any).antigravity?.voiceToggle?.();
@@ -506,29 +542,59 @@ export default function App() {
         setIsVoiceMode(false);
       }
       if (ev?.type === 'pipeline-start') {
+        lastVoiceEventAt.current = Date.now();
         voiceStreamRef.current = { text: '', reasoning: '' };
+        const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : voiceRunSeqRef.current + 1;
+        voiceRunSeqRef.current = seq;
+        const prompt = typeof (ev as any)?.prompt === 'string' ? (ev as any).prompt : '';
+        // Replace the live-input ghost with the single canonical user bubble
+        // so one utterance never stacks Hello x N.
+        if (prompt) {
+          setMessages((prev) => {
+            const withoutLive = prev.filter((m) => m.id !== 'voice-live-input');
+            const last = withoutLive[withoutLive.length - 1];
+            if (last && last.role === 'user' && last.content === prompt) return withoutLive;
+            return [...withoutLive, { id: `voice-user-${Date.now()}`, role: 'user', content: prompt, timestamp: new Date().toISOString() }];
+          });
+        }
         setVoiceLiveRun({
           state: null,
           active: true,
           workspaceId: ev.workspaceId || '',
           chatId: ev.chatId || '',
           startedAt: Date.now(),
+          runSeq: seq,
         });
       } else if (ev?.type === 'pipeline-state') {
-        setVoiceLiveRun((current) => ({
-          state: ev.state as AppState,
-          active: true,
-          workspaceId: ev.workspaceId || current?.workspaceId || '',
-          chatId: ev.chatId || current?.chatId || '',
-          startedAt: current?.startedAt || Date.now(),
-        }));
+        lastVoiceEventAt.current = Date.now();
+        const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : undefined;
+        if (seq === undefined || seq === voiceRunSeqRef.current) {
+          setVoiceLiveRun((current) => ({
+            state: ev.state as AppState,
+            active: true,
+            workspaceId: ev.workspaceId || current?.workspaceId || '',
+            chatId: ev.chatId || current?.chatId || '',
+            startedAt: current?.startedAt || Date.now(),
+            runSeq: current?.runSeq ?? voiceRunSeqRef.current,
+          }));
+        }
       } else if (ev?.type === 'pipeline-done') {
-        setVoiceLiveRun((current) => current ? {
-          ...current,
-          state: (ev.state as AppState | null) || current.state,
-          active: false,
-        } : null);
+        lastVoiceEventAt.current = Date.now();
+        const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : undefined;
+        // Stale/superseded runs (mic-off abort, watchdog of an old run) must
+        // not wipe the live run's trace. Aborted frames never clear either —
+        // the run continues server-side and its later frames still arrive.
+        const fresh = seq === undefined || seq === voiceRunSeqRef.current;
+        const completed = (ev as any)?.status !== 'aborted';
+        if (fresh && completed) {
+          setVoiceLiveRun((current) => current ? {
+            ...current,
+            state: (ev.state as AppState | null) || current.state,
+            active: false,
+          } : null);
+        }
       } else if (ev?.type === 'delta' && ev.text) {
+        lastVoiceEventAt.current = Date.now();
         // Phase 8-V2: live tokens from the voice run stream into the overlay.
         const kind = ev.kind === 'reasoning' ? 'reasoning' : 'text';
         voiceStreamRef.current[kind] += String(ev.text);
@@ -536,9 +602,12 @@ export default function App() {
       }
       if (ev?.type === 'opened') syncVoiceChat();
       if (ev?.type === 'reply') {
+        lastVoiceEventAt.current = Date.now();
         voiceStreamRef.current = { text: '', reasoning: '' };
+        // Ordered clear: refresh first, THEN drop the trace. Clearing before
+        // the fetch resolves was the answer-flash-then-Thinking bug.
         refreshActiveChat();
-        setVoiceLiveRun(null);
+        window.setTimeout(() => setVoiceLiveRun(null), 800);
       }
       // Live input streaming: the overlay streams STT words as they are heard —
       // append them to the chat in real time (one live user bubble).
@@ -575,12 +644,19 @@ export default function App() {
   }, [isRunning, refreshActiveChat]);
 
   // ── Keyboard shortcuts: Esc cancels a running pipeline, "?" opens help ──
+  const handleCancelPipeline = useCallback(() => {
+    cancelledRef.current = true;
+    cancelThinkingRef.current = streaming.reasoning || '';
+    cancelTextRef.current = streaming.text || '';
+    if (activeChat) abortRun(activeChat.id).catch(() => {});
+    cancel();
+  }, [cancel, streaming.reasoning, streaming.text, activeChat]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const typing = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
       if (e.key === 'Escape' && isRunning && !typing) {
-        cancel();
+        handleCancelPipeline();
       } else if (e.key === '?' && !isRunning && !typing) {
         e.preventDefault();
         setShowShortcuts((v) => !v);
@@ -588,7 +664,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isRunning, cancel]);
+  }, [isRunning, handleCancelPipeline]);
 
   const handleSelectWorkspace = useCallback((ws: WorkspaceInfo) => {
     setActiveWorkspace(ws);
@@ -698,7 +774,7 @@ export default function App() {
   const voiceLiveParsed = useMemo(() => parseLogToSteps(voiceLiveRun?.state?.live_terminal_log ?? ''), [voiceLiveRun?.state?.live_terminal_log]);
 
   const displayMessages = [...messages];
-  if ((isRunning || isPersisting) && state?.live_terminal_log) {
+  if (isRunning || isPersisting) {
     const { steps, assistantResponse } = liveParsed;
     const elapsed = runStartTime.current
       ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
@@ -724,6 +800,7 @@ export default function App() {
         isStreaming: isRunning && streaming.active,
         streamingReasoning: streaming.active ? streaming.reasoning : '',
         streamRate: isRunning ? streaming.rate : 0,
+        liveTimeline: streaming.segments,
       },
     });
   }
@@ -806,7 +883,7 @@ export default function App() {
           chatMode={chatModeState}
           onSend={handleSend}
           onRunTask={handleRunTask}
-          onCancel={cancel}
+          onCancel={handleCancelPipeline}
           onModelChange={setModel}
           onClearNotification={() => setNotification(null)}
           workspaceId={activeWorkspace?.id ?? null}

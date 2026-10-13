@@ -3,8 +3,200 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const { exec } = require('child_process');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const VOICE_HTML = path.join(__dirname, 'voice.html');
+
+// Stark is a thin shell: the UI build (frontend/dist) and the Python backend
+// live in the project tree, not inside the installer. Unpackaged, that tree
+// is two levels up. Packaged, it is configured via STARK_ROOT, a
+// resources/stark-root.txt file, or the known default path.
+function resolveStarkRoot() {
+  let fromFile = null;
+  try {
+    fromFile = fs.readFileSync(path.join(process.resourcesPath || '', 'stark-root.txt'), 'utf8').trim();
+  } catch { /* not packaged or no config file */ }
+  const candidates = [
+    process.env.STARK_ROOT,
+    fromFile,
+    'D:\\MyProject\\LangChain',
+    path.join(process.env.USERPROFILE || '', 'MyProject', 'LangChain'),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(path.join(candidate, 'server', 'api_server.py'))) {
+      console.log(`[Electron] Stark root: ${candidate}`);
+      return candidate;
+    }
+  }
+  const fallback = path.join(__dirname, '..', '..');
+  console.error('[Electron] No Stark root found — falling back to', fallback);
+  return fallback;
+}
+const STARK_ROOT = resolveStarkRoot();
+const FRONTEND_ROOT = path.join(STARK_ROOT, 'frontend');
+
+// The installed desktop app intentionally serves the workspace's frontend
+// build, rather than a frozen copy embedded in the installer. Keep that
+// contract reliable: use the project's local toolchain, watch every input
+// that can affect the build, and invalidate Chromium's renderer caches after
+// a rebuild so an old service worker cannot hide the new UI.
+const FRONTEND_BUILD_INPUTS = [
+  path.join(FRONTEND_ROOT, 'index.html'),
+  path.join(FRONTEND_ROOT, 'vite.config.ts'),
+  path.join(FRONTEND_ROOT, 'package.json'),
+  path.join(FRONTEND_ROOT, 'package-lock.json'),
+  path.join(FRONTEND_ROOT, 'tsconfig.json'),
+  path.join(FRONTEND_ROOT, 'tsconfig.app.json'),
+  path.join(FRONTEND_ROOT, 'tsconfig.node.json'),
+  path.join(FRONTEND_ROOT, 'postcss.config.js'),
+  path.join(FRONTEND_ROOT, 'tailwind.config.js'),
+  path.join(FRONTEND_ROOT, '.env'),
+  path.join(FRONTEND_ROOT, '.env.production'),
+];
+
+function walkFrontendFiles(root, files = []) {
+  if (!fs.existsSync(root)) return files;
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return files; }
+  for (const entry of entries) {
+    const file = path.join(root, entry.name);
+    try {
+      if (entry.isDirectory()) walkFrontendFiles(file, files);
+      else if (/\.(ts|tsx|js|jsx|css|html|json)$/.test(entry.name)) files.push(file);
+    } catch { /* a file may disappear while an editor is saving it */ }
+  }
+  return files;
+}
+
+function frontendInputFiles() {
+  return [
+    ...walkFrontendFiles(path.join(FRONTEND_ROOT, 'src')),
+    ...walkFrontendFiles(path.join(FRONTEND_ROOT, 'public')),
+    ...FRONTEND_BUILD_INPUTS,
+  ];
+}
+
+function isFrontendStale() {
+  try {
+    if (process.env.SKIP_FRONTEND_BUILD === '1') return false;
+    const distIndex = path.join(FRONTEND_ROOT, 'dist', 'index.html');
+    if (!fs.existsSync(distIndex)) return true;
+    const distTime = fs.statSync(distIndex).mtimeMs;
+    return frontendInputFiles().some((file) => {
+      try { return fs.existsSync(file) && fs.statSync(file).mtimeMs > distTime; } catch { return false; }
+    });
+  } catch { return false; }
+}
+
+function localFrontendBin(name) {
+  const suffix = process.platform === 'win32' ? '.cmd' : '';
+  return path.join(FRONTEND_ROOT, 'node_modules', '.bin', `${name}${suffix}`);
+}
+
+function runFrontendTool(command, args) {
+  return spawnSync(command, args, {
+    cwd: FRONTEND_ROOT,
+    stdio: 'inherit',
+    // Windows .cmd launchers need a shell, but this still points directly at
+    // the workspace's local binary and never depends on global npm.
+    shell: process.platform === 'win32',
+    timeout: 180000,
+  });
+}
+
+function buildFrontendSync() {
+  try {
+    console.log('[Electron] Building frontend dist from the workspace...');
+    const localTsc = localFrontendBin('tsc');
+    const localVite = localFrontendBin('vite');
+    let result;
+
+    if (fs.existsSync(localTsc) && fs.existsSync(localVite)) {
+      result = runFrontendTool(localTsc, ['-b']);
+      if (result.status === 0) result = runFrontendTool(localVite, ['build']);
+    } else {
+      // Fallback for a machine that has no local node_modules. This is only a
+      // fallback; normal desktop launches use the project-local binaries.
+      const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+      result = runFrontendTool(npmCommand, ['run', 'build']);
+    }
+
+    if (result.error || result.status !== 0) {
+      console.error('[Electron] frontend build failed, serving the last good dist', result.error?.message || '');
+      return false;
+    }
+    console.log('[Electron] frontend build done');
+    return true;
+  } catch (e) {
+    console.error('[Electron] buildFrontendSync error', e.message);
+    return false;
+  }
+}
+
+async function clearRendererCaches(win) {
+  if (!win || win.isDestroyed()) return;
+  try { await win.webContents.session.clearCache(); } catch (e) {
+    console.warn('[Electron] renderer cache clear skipped:', e.message);
+  }
+  try {
+    // Keep cookies/localStorage (so the user stays signed in), but remove the
+    // PWA caches/service worker that can otherwise serve an older index.html.
+    await win.webContents.session.clearStorageData({
+      storages: ['serviceworkers', 'cachestorage'],
+    });
+  } catch (e) {
+    console.warn('[Electron] service-worker cache clear skipped:', e.message);
+  }
+}
+
+async function reloadWithFreshFrontend(win) {
+  if (!win || win.isDestroyed()) return;
+  await clearRendererCaches(win);
+  if (!win.isDestroyed()) {
+    console.log('[Electron] reloading window with the new dist');
+    try { win.reload(); } catch (e) { console.error('[Electron] reload failed:', e.message); }
+  }
+}
+
+let frontendWatcher = null;
+function setupFrontendWatcher() {
+  try {
+    if (!isProd || process.env.SKIP_FRONTEND_BUILD === '1' || frontendWatcher) return;
+    const watchers = [];
+    let timer = null;
+    let building = false;
+    const onChange = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(async () => {
+        if (building) return;
+        building = true;
+        console.log('[Electron] frontend input changed — rebuilding...');
+        const built = buildFrontendSync();
+        building = false;
+        if (built) await reloadWithFreshFrontend(mainWindow);
+      }, 800);
+    };
+    const watchTree = (root) => {
+      if (!fs.existsSync(root)) return;
+      try { watchers.push(fs.watch(root, { recursive: true }, onChange)); } catch (e) {
+        console.warn(`[Electron] could not watch ${root}:`, e.message);
+      }
+    };
+    watchTree(path.join(FRONTEND_ROOT, 'src'));
+    watchTree(path.join(FRONTEND_ROOT, 'public'));
+    for (const file of FRONTEND_BUILD_INPUTS) {
+      if (fs.existsSync(file)) {
+        try { watchers.push(fs.watch(file, onChange)); } catch (e) {
+          console.warn(`[Electron] could not watch ${file}:`, e.message);
+        }
+      }
+    }
+    if (!watchers.length) return;
+    frontendWatcher = {
+      close: () => watchers.forEach((watcher) => { try { watcher.close(); } catch {} }),
+    };
+    console.log('[Electron] watching frontend build inputs for auto-rebuild');
+  } catch (e) { console.error('[Electron] setupFrontendWatcher', e.message); }
+}
 
 // 32x32 tray icon (indigo dot on dark circle)
 const TRAY_ICON_B64 = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAJdSURBVFhH7ZY9aBRBFMdTprRJ3tybwMYoISFCgh8xCOqJSFBBjoRACCHGREPAJliltDJVsLexvPIqsbGysbQzlaQRAjZHKsuV/+6N2X1vb3Z2c+n8w6/Yu5n3MfPe2x0a+q+aYuY5Itt04FmuGaiiKBom4k1jbJuI/xhj4z50jOHdKIouSRu1BYPG8EmBMw/cbTTsHgKX9oKFLIzhb9p4OET2iIjGpe1SYZMx9lgarAd3USfSR1+lmQ/KuQNX0piSvpRwZ+c9dg/HpcWJwinYWMiVq3fjmWuteHLyofqvP/xe+vynXvbeameeiJsPDuMXL3/H2zunOR4/bcfR+KzakwUtPDISGek7UdpuepMDma6ufVeOs6xv/ExORe7NwwfSdyIi/qwXpyDztfUfymERz7d+eU8CrSl9J5Xvm3CPFj8oRz6etT4pG1lUR4yO2gW5yIHsi+68jMsT88pWJoBWLgD8IBc5cPfSeAizcxvK1lkAdi8XgK8A52+/UcZDuHf/nbLlILJvcwEQ8apc5EBVS+Mh3Lz1WtnKBLAvArBNucgxNjaljIfgG1BIOBcAhoNclKW1/EU58IGWlTayoOhzAUC+dwDGbpVO8A8jPpG+E6Ew9OIzrt94FRTEwp19tVfwUfpOhGvwDSOAk1ha+aqcgrAxjLni+X7E20puKGJ6+knSnmg1ZBziuEdH+swpLUb/G7EuOF01gouECi27ijqo1vMJiwcZhJp8IUqHE3elsSogiUqZS/UGVFsaDqQTdOchQuugf8sLNDmxdqXP8KpCkeJ1int19J4vzulF6S/Uf/jEH8HliAAAAABJRU5ErkJggg==';
@@ -28,6 +220,9 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 }
+
+// Windows taskbar / notifications identity (must match electron-builder appId).
+if (process.platform === 'win32') app.setAppUserModelId('com.stark.workspace');
 
 function sendToMain(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -63,21 +258,21 @@ function killPort(port) {
 
 function startApiServer() {
   const voicePython = process.env.VOICE_PYTHON && fs.existsSync(process.env.VOICE_PYTHON) ? process.env.VOICE_PYTHON : null;
-  const venvPython = path.join(__dirname, '..', '..', 'venv', 'Scripts', 'python.exe');
-  const venvDotPython = path.join(__dirname, '..', '..', '.venv', 'Scripts', 'python.exe');
-  const venv312Python = path.join(__dirname, '..', '..', 'venv312', 'Scripts', 'python.exe');
+  const venvPython = path.join(STARK_ROOT, 'venv', 'Scripts', 'python.exe');
+  const venvDotPython = path.join(STARK_ROOT, '.venv', 'Scripts', 'python.exe');
+  const venv312Python = path.join(STARK_ROOT, 'venv312', 'Scripts', 'python.exe');
   
   let pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
   if (voicePython) {
     pythonCmd = voicePython;
-  } else if (fs.existsSync(venvPython) && fs.existsSync(path.join(__dirname, '..', '..', 'venv', 'pyvenv.cfg'))) {
+  } else if (fs.existsSync(venvPython) && fs.existsSync(path.join(STARK_ROOT, 'venv', 'pyvenv.cfg'))) {
     pythonCmd = venvPython;
-  } else if (fs.existsSync(venvDotPython) && fs.existsSync(path.join(__dirname, '..', '..', '.venv', 'pyvenv.cfg'))) {
+  } else if (fs.existsSync(venvDotPython) && fs.existsSync(path.join(STARK_ROOT, '.venv', 'pyvenv.cfg'))) {
     pythonCmd = venvDotPython;
-  } else if (fs.existsSync(venv312Python) && fs.existsSync(path.join(__dirname, '..', '..', 'venv312', 'pyvenv.cfg'))) {
+  } else if (fs.existsSync(venv312Python) && fs.existsSync(path.join(STARK_ROOT, 'venv312', 'pyvenv.cfg'))) {
     pythonCmd = venv312Python;
   }
-  const apiPath = path.join(__dirname, '..', '..', 'server', 'api_server.py');
+  const apiPath = path.join(STARK_ROOT, 'server', 'api_server.py');
   const STARK_PORT = process.env.STARK_PORT || '8123';
 
   killStaleApiServers().then(() => {
@@ -92,7 +287,7 @@ function startApiServer() {
       const args = [apiPath];
 
       apiProcess = spawn(pythonCmd, args, {
-        cwd: path.join(__dirname, '..', '..'),
+        cwd: STARK_ROOT,
         env: { ...process.env, STARK_PORT },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -161,7 +356,7 @@ function createWindow() {
     height: 900,
     minWidth: 1100,
     minHeight: 700,
-    title: 'Antigravity 2.0 — Agent Workspace',
+    title: 'Stark — Agent Workspace',
     icon: path.join(__dirname, 'icon.png'),
     backgroundColor: '#0c0c0e',
     webPreferences: {
@@ -210,7 +405,7 @@ function createWindow() {
     // on one origin (see api_server.py spa_fallback). This is why prod works
     // at all: dist/index.html uses absolute /assets + relative /api paths,
     // both of which are broken over file:// (blank black window).
-    waitForApiThenLoad(mainWindow);
+    clearRendererCaches(mainWindow).finally(() => waitForApiThenLoad(mainWindow));
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -418,20 +613,20 @@ function setApiPid(pid) {
   try {
     if (tray && !tray.isDestroyed()) {
       tray.setToolTip(apiPid
-        ? `VinCode — Voice Assistant (Ctrl+G) — API PID ${apiPid}`
-        : 'VinCode — Voice Assistant (Ctrl+G)');
+        ? `Stark — Voice Assistant (Ctrl+G) — API PID ${apiPid}`
+        : 'Stark — Voice Assistant (Ctrl+G)');
     }
   } catch (_e) {}
 }
 function createTray() {
   const icon = nativeImage.createFromDataURL(TRAY_ICON_B64);
   tray = new Tray(icon);
-  tray.setToolTip('VinCode — Voice Assistant (Ctrl+G)');
+  tray.setToolTip('Stark — Voice Assistant (Ctrl+G)');
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Open VinCode', click: () => showMainWindow() },
+    { label: 'Open Stark', click: () => showMainWindow() },
     { label: 'Toggle Voice Mode', click: () => toggleVoice() },
     { type: 'separator' },
-    { label: 'Quit VinCode', click: () => { isQuitting = true; app.quit(); } },
+    { label: 'Quit Stark', click: () => { isQuitting = true; app.quit(); } },
   ]));
   tray.on('double-click', () => showMainWindow());
 }
@@ -477,7 +672,11 @@ function waitForApiThenLoad(win, tries = 90) {
     if (ok || tries <= 0) {
       const port = process.env.STARK_PORT || '8123';
       if (!ok) console.error('[Electron] API not healthy after 90s — loading UI anyway (expect backend errors).');
-      win.loadURL(`http://127.0.0.1:${port}/`);
+      let buildStamp = Date.now();
+      try { buildStamp = Math.floor(fs.statSync(path.join(FRONTEND_ROOT, 'dist', 'index.html')).mtimeMs); } catch {}
+      // The changing query also bypasses any renderer navigation cache left by
+      // an older build, while the cache clear above removes the PWA worker.
+      win.loadURL(`http://127.0.0.1:${port}/?stark_build=${buildStamp}`);
       return;
     }
     setTimeout(() => waitForApiThenLoad(win, tries - 1), 1000);
@@ -535,6 +734,16 @@ app.whenReady().then(async () => {
 
   createTray();
 
+  // Production desktop launches always rebuild from the workspace's local
+  // toolchain before starting the API. This makes the installed EXE pick up
+  // every frontend edit even when timestamps are unreliable or an editor
+  // rewrites a file in place. SKIP_FRONTEND_BUILD=1 remains an escape hatch.
+  if (isProd && process.env.SKIP_FRONTEND_BUILD !== '1') {
+    buildFrontendSync();
+  } else if (isFrontendStale()) {
+    buildFrontendSync();
+  }
+
   // Always ensure a fresh server — a stale one on :8123 may be old code
   // (e.g. after `start_api.bat` left a detached handle, or a previous app
   // run's child survived the window close). Kill it and start fresh.
@@ -545,7 +754,11 @@ app.whenReady().then(async () => {
   }
   console.log('[Electron] Starting API server...');
   startApiServer();
-  setTimeout(createWindow, 1500);
+  setTimeout(() => {
+    createWindow();
+    // After the window exists, watch src so edits live-reload without restart.
+    setTimeout(setupFrontendWatcher, 2000);
+  }, 1500);
 });
 
 // Stay alive in the tray so voice mode keeps working when the window is closed.

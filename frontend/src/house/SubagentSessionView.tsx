@@ -1,18 +1,24 @@
-import { useCallback, useEffect, useState } from 'react';
-import { ChevronRight, ChevronDown, LoaderCircle, Wrench, ArrowLeft } from 'lucide-react';
-import type { SubagentSession, SubagentSessionEntry } from '../types';
-import { fetchSubagentSession } from '../services/api';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { ArrowLeft, ChevronDown, ChevronRight, LoaderCircle, Wrench } from 'lucide-react';
+import type { ChatData, SessionTab, SubagentSession, SubagentSessionEntry, WorkspaceInfo } from '../types';
+import { fetchChat, fetchSubagentSession, fetchWorkspaces } from '../services/api';
+import MessageStream from '../components/Workspace/MessageStream';
 import Markdown from '../components/Workspace/Markdown';
+import PromptDock from '../components/Workspace/PromptDock';
+import { useSessionRunner } from './useSessionRunner';
+import './house.css';
 
 const POLL_MS = 2500;
 
 interface SubagentSessionViewProps {
+  /** Workspace hint from the delegation step. It may be an id, path, or name. */
   workspaceId: string;
   childId: string;
-  /** Fallback label while the session loads (from the clicked block). */
+  /** Fallback label while the child chat loads. */
   label: string;
   parentTitle: string;
   onBack: () => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
 }
 
 function ToolRow({ entry }: { entry: SubagentSessionEntry }) {
@@ -22,7 +28,7 @@ function ToolRow({ entry }: { entry: SubagentSessionEntry }) {
     <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] overflow-hidden">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setOpen((value) => !value)}
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left cursor-pointer hover:bg-white/[0.04] transition-colors"
       >
         {open
@@ -43,131 +49,254 @@ function ToolRow({ entry }: { entry: SubagentSessionEntry }) {
   );
 }
 
+function workspaceMatches(workspace: WorkspaceInfo, hint: string): boolean {
+  const normalized = hint.trim().toLowerCase();
+  if (!normalized) return false;
+  return [workspace.id, workspace.path, workspace.name]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase() === normalized);
+}
+
+function workspaceFallback(hint: string): WorkspaceInfo {
+  return {
+    id: hint,
+    name: hint.replace(/^_/, '') || 'Subagent',
+    path: hint,
+    exists: true,
+    chatCount: 0,
+    addedAt: '',
+  };
+}
+
+function pipelineKindFor(workspace: WorkspaceInfo): 'general' | 'house' | 'personal' {
+  const kind = workspace.workspaceKind
+    || (workspace.isHouse ? 'house' : workspace.isPersonal ? 'personal' : workspace.isGeneral ? 'general' : undefined);
+  if (kind === 'house') return 'house';
+  // The ordinary delegated General agent is the direct personal/general
+  // worker. The default `general` kind would route a follow-up back through
+  // the orchestrator, which would make the child drawer feel like a new root.
+  if (kind === 'general' || workspace.id.toLowerCase().includes('general')) return 'personal';
+  return 'general';
+}
+
 /**
- * Read-only drill-in for one spawned subagent session: breadcrumb
- * (parent / label), the child's transcript, and a disabled dock —
- * "Subagent sessions cannot be prompted. Back to main session."
- * Polls while the child reports status=running.
+ * Drill into the actual child chat created by delegation. New delegated
+ * agents are normal chat-store records (`chat-*`), so they use the same
+ * MessageStream and PromptDock as every other conversation. The durable
+ * subagent-session projection remains as a compatibility fallback for older
+ * `cont-*`/`sub-*` sessions.
  */
 export default function SubagentSessionView({
-  workspaceId, childId, label, parentTitle, onBack,
+  workspaceId,
+  childId,
+  label,
+  parentTitle,
+  onBack,
+  onOpenSubagentSession,
 }: SubagentSessionViewProps) {
-  const [session, setSession] = useState<SubagentSession | null>(null);
-  const [loadedOnce, setLoadedOnce] = useState(false);
+  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
+  const [childChat, setChildChat] = useState<ChatData | null>(null);
+  const [legacySession, setLegacySession] = useState<SubagentSession | null>(null);
+  const [loadedKey, setLoadedKey] = useState('');
+  const [errorKey, setErrorKey] = useState('');
+  const requestKey = `${workspaceId}:${childId}`;
 
-  // Reset when a different child is opened (state-tracked previous key)
-  const [prevKey, setPrevKey] = useState(`${workspaceId}:${childId}`);
-  if (prevKey !== `${workspaceId}:${childId}`) {
-    setPrevKey(`${workspaceId}:${childId}`);
-    setSession(null);
-    setLoadedOnce(false);
-  }
+  const resolvedWorkspace = useMemo(() => {
+    return workspaces.find((workspace) => workspaceMatches(workspace, workspaceId))
+      || (workspaceId ? workspaceFallback(workspaceId) : null);
+  }, [workspaces, workspaceId]);
 
-  const load = useCallback(() => {
-    fetchSubagentSession(workspaceId, childId)
-      .then((data) => { if (data) setSession(data); })
-      .catch(() => {})
-      .finally(() => setLoadedOnce(true));
+  // Resolve the workspace hint once per opened child. Delegation metadata
+  // stores the compact workspace id, while older traces sometimes stored a
+  // path or display name.
+  useEffect(() => {
+    let cancelled = false;
+    fetchWorkspaces()
+      .then((items) => { if (!cancelled) setWorkspaces(items); })
+      .catch(() => { /* the id fallback below can still load a known chat */ });
+    return () => { cancelled = true; };
   }, [workspaceId, childId]);
 
-  useEffect(() => { load(); }, [load]);
+  const loadChild = useCallback(async () => {
+    if (!resolvedWorkspace) return;
+    const resolvedId = resolvedWorkspace.id;
+    const chat = await fetchChat(resolvedId, childId).catch(() => null);
+    if (chat) {
+      setChildChat(chat);
+      setLegacySession(null);
+      setErrorKey('');
+      setLoadedKey(requestKey);
+      return;
+    }
 
-  const failed = loadedOnce && !session;
+    // Compatibility path for the old durable session endpoint. This is not
+    // the primary path for delegated chat ids, but keeps historical links
+    // usable instead of showing a misleading "blocked" state.
+    const session = await fetchSubagentSession(resolvedId, childId).catch(() => null);
+    if (session) {
+      setLegacySession(session);
+      setChildChat(null);
+      setErrorKey('');
+    } else {
+      setErrorKey(requestKey);
+    }
+    setLoadedKey(requestKey);
+  }, [resolvedWorkspace, childId, requestKey]);
 
-  const running = session?.info.status === 'running';
   useEffect(() => {
-    if (!running) return;
-    const id = window.setInterval(load, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [running, load]);
+    if (!resolvedWorkspace) return;
+    let cancelled = false;
+    const load = async () => {
+      if (cancelled) return;
+      await loadChild();
+    };
+    load();
+    // Delegation can be opened while the child is still running and before
+    // its first assistant message is persisted. Keep the drawer live until
+    // it becomes a normal chat record.
+    const timer = window.setInterval(() => { if (!document.hidden) load(); }, POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [resolvedWorkspace, loadChild]);
 
-  // Session label wins when it carries a real task label; descriptor-less
-  // sub- sessions only know the agent name — keep the clicked block's label.
-  const sessionLabel = session?.info.label || '';
-  const sessionName = session?.info.name || '';
-  const displayLabel = sessionLabel && sessionLabel !== sessionName ? sessionLabel : (label || sessionLabel);
+  const childTab = useMemo<SessionTab | null>(() => {
+    const activeChat = loadedKey === requestKey ? childChat : null;
+    if (!activeChat || !resolvedWorkspace) return null;
+    return {
+      id: `${resolvedWorkspace.id}:${childId}`,
+      type: 'chat',
+      title: activeChat.title || label || 'Subagent',
+      workspaceId: resolvedWorkspace.id,
+      workspaceName: resolvedWorkspace.name,
+      workspacePath: resolvedWorkspace.path,
+      chatId: childId,
+      updatedAt: activeChat.updatedAt || '',
+    };
+  }, [childChat, loadedKey, requestKey, resolvedWorkspace, childId, label]);
+
+  const runner = useSessionRunner(childTab, undefined, childTab ? pipelineKindFor(resolvedWorkspace!) : 'general');
+  const activeChildChat = loadedKey === requestKey ? childChat : null;
+  const activeLegacySession = loadedKey === requestKey ? legacySession : null;
+  // Full parity: merge persisted + runner messages (dedup by id) instead of
+  // XOR-switching, so previous replies never vanish mid-run and rapid sends
+  // never collapse into one bubble.
+  const childMessages = (() => {
+    const persisted = activeChildChat?.messages || [];
+    const live = runner.messages;
+    if (!live.length && !runner.isRunning) return persisted;
+    if (!persisted.length) return live;
+    const seen = new Set(persisted.map((m) => m.id));
+    // Runner's first items may duplicate persisted when seeded after key switch.
+    const fresh = live.filter((m) => !seen.has(m.id));
+    // If runner already contains full history (post-fetch), prefer it.
+    if (!fresh.length && live.length >= persisted.length) return live;
+    return [...persisted, ...fresh];
+  })();
+  const running = runner.isRunning || activeLegacySession?.info.status === 'running';
+  const childName = activeChildChat?.title || activeLegacySession?.info.name || label || 'Subagent';
+  const displayLabel = childName && childName !== label ? childName : (label || childName);
+  const isLoading = loadedKey !== requestKey && !errorKey;
+  const hasLoadError = errorKey === requestKey;
+
+  const handleSend = useCallback((prompt: string, files: File[]) => {
+    if (childTab) runner.send(childTab, prompt, files);
+  }, [childTab, runner]);
 
   return (
-    <div className="h-full min-h-0 flex flex-col">
-      {/* ── Breadcrumb: parent (back) / subagent label ── */}
-      <div className="flex items-center gap-1.5 px-1 py-2 shrink-0 select-none min-w-0">
+    <div className="subagent-session-view">
+      <header className="subagent-session-view-header">
         <button
           type="button"
           onClick={onBack}
           title="Back to main session"
-          className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
+          aria-label="Back to main session"
+          className="subagent-session-back"
         >
-          <ArrowLeft size={13} />
+          <ArrowLeft size={15} />
         </button>
-        <button
-          type="button"
-          onClick={onBack}
-          className="text-[12.5px] text-zinc-500 hover:text-zinc-300 truncate max-w-[45%] transition-colors cursor-pointer"
-        >
-          {parentTitle}
-        </button>
-        <span className="text-zinc-700 text-[12px] shrink-0">/</span>
-        <span className="text-[12.5px] font-semibold text-zinc-200 truncate">
-          {displayLabel}
-        </span>
+        <div className="subagent-session-breadcrumb">
+          <button type="button" onClick={onBack} className="subagent-session-parent" title={parentTitle}>
+            {parentTitle}
+          </button>
+          <span aria-hidden="true">/</span>
+          <strong title={displayLabel}>{displayLabel}</strong>
+        </div>
         {running && (
-          <span className="flex items-center gap-1.5 shrink-0 ml-1">
-            <span className="session-run-dot" title="Running" />
-            <span className="text-[10px] text-zinc-500">running</span>
+          <span className="subagent-session-status">
+            <span className="session-run-dot" /> running
           </span>
         )}
-      </div>
+      </header>
 
-      {/* ── Transcript ── */}
-      <div className="flex-1 min-h-0 overflow-y-auto house-thread px-1 pt-1 pb-4">
-        {failed && !session ? (
-          <div className="h-full flex flex-col items-center justify-center gap-2 text-zinc-600 py-6">
-            <p className="text-[12px]">Subagent session not found.</p>
-            <button type="button" onClick={onBack} className="text-[11.5px] text-zinc-400 hover:text-white underline underline-offset-2 cursor-pointer">
-              Back to main session
-            </button>
+      <div className="subagent-session-view-body">
+        {isLoading && !activeChildChat && !activeLegacySession ? (
+          <div className="subagent-session-state">
+            <LoaderCircle size={18} className="animate-spin" />
+            <span>Opening child chat…</span>
           </div>
-        ) : !session ? (
-          <div className="h-full flex items-center justify-center py-6">
-            <LoaderCircle size={18} className="text-zinc-600 animate-spin" />
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3.5">
-            {session.entries.length === 0 && (
+        ) : childTab ? (
+          <MessageStream
+            messages={childMessages}
+            hasActiveChat
+            onOpenSubagent={() => {}}
+            onOpenSubagentSession={onOpenSubagentSession}
+            workspaceId={childTab.workspaceId}
+            chatId={childTab.chatId}
+            onRetry={(prompt) => { if (prompt) runner.send(childTab, prompt, []); }}
+          />
+        ) : activeLegacySession ? (
+          <div className="subagent-session-legacy-thread">
+            {activeLegacySession.entries.length === 0 && (
               <p className="text-[12px] text-zinc-600 text-center py-6">No transcript recorded yet.</p>
             )}
-            {session.entries.map((entry, i) => {
+            {activeLegacySession.entries.map((entry, index) => {
               if (entry.kind === 'user') {
                 return (
-                  <div key={i} className="flex justify-end house-enter">
+                  <div key={index} className="flex justify-end house-enter">
                     <div className="max-w-[85%] px-3.5 py-2 rounded-2xl rounded-br-xs bg-white/[0.09] border border-white/[0.08] text-[13px] leading-6 text-zinc-100 whitespace-pre-wrap">
                       {entry.content}
                     </div>
                   </div>
                 );
               }
-              if (entry.kind === 'tool') {
-                return <ToolRow key={i} entry={entry} />;
-              }
+              if (entry.kind === 'tool') return <ToolRow key={index} entry={entry} />;
               return (
-                <div key={i} className="text-[13px] leading-6 text-zinc-200 house-enter">
+                <div key={index} className="text-[13px] leading-6 text-zinc-200 house-enter">
                   <Markdown content={entry.content} />
                 </div>
               );
             })}
           </div>
-        )}
+        ) : hasLoadError ? (
+          <div className="subagent-session-state">
+            <p>That child chat is no longer available.</p>
+            <button type="button" onClick={loadChild} className="subagent-session-retry">Try again</button>
+          </div>
+        ) : null}
       </div>
 
-      {/* ── Disabled dock ── */}
-      <div className="shrink-0 pt-1">
-        <button
-          type="button"
-          onClick={onBack}
-          className="w-full flex items-center justify-center gap-2 rounded-xl border house-hairline bg-white/[0.03] hover:bg-white/[0.06] px-4 py-3 text-[12.5px] text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
-        >
-          <span className="truncate">Subagent sessions cannot be prompted. Back to main session.</span>
-        </button>
+      <div className="subagent-session-view-dock">
+        {runner.notification && <div className="subagent-session-notice">{runner.notification}</div>}
+        {childTab ? (
+          <PromptDock
+            onSend={handleSend}
+            onCancel={runner.cancel}
+            isRunning={runner.isRunning}
+            isVoiceMode={false}
+            onToggleVoice={() => {}}
+            voiceInputText=""
+            onOpenStats={() => {}}
+            totalCost={runner.usage.total_cost}
+            totalInput={runner.usage.total_input_tokens}
+            totalOutput={runner.usage.total_output_tokens}
+            totalCacheHitTokens={runner.usage.total_cache_hit_tokens || 0}
+            activeContextTokens={runner.activeContextTokens}
+          />
+        ) : activeLegacySession ? (
+          <div className="subagent-session-legacy-dock">This older child session is read-only.</div>
+        ) : null}
       </div>
     </div>
   );

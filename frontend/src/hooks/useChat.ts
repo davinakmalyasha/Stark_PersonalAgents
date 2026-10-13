@@ -6,10 +6,11 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, AgentTask, StreamDelta } from '../types';
-import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, fetchTasks, startTask, deleteTask } from '../services/api';
+import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, fetchTasks, startTask, deleteTask, abortRun } from '../services/api';
 import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from '../house/houseChatService';
 import { getAssistantName } from '../house/assistant';
 import { parseLogToSteps } from '../utils/logParser';
+import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
 
 export interface UseChatProps {
   onActive?: (payload: { wsId: string; chatId: string }) => void;
@@ -37,42 +38,29 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const threadRef = useRef<HTMLDivElement | null>(null);
   const liveStateRef = useRef<AppState | null>(null);
   const startedAtRef = useRef<number | null>(null);
-  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
-  const streamRef = useRef({ text: '', reasoning: '', agent: '' });
-  const rateRef = useRef({ lastTs: 0, lastChars: 0, ema: 0 });
+  // Owning run target for Stop: persist the partial into the same chat.
+  const runWsRef = useRef<WorkspaceInfo | null>(null);
+  const runChatIdRef = useRef<string | null>(null);
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
+  const streamRef = useRef(emptyStreamAccum());
+  const rateRef = useRef(emptyRateAccum());
 
   const applyDelta = useCallback((delta: StreamDelta) => {
-    const now = performance.now();
-    if (delta.kind === 'reasoning') {
-      streamRef.current.reasoning += delta.text;
-    } else if (delta.kind === 'text') {
-      const chars = delta.text.length;
-      const r = rateRef.current;
-      if (r.lastTs > 0) {
-        const dt = Math.max(16, now - r.lastTs) / 1000;
-        const rate = (chars / 4) / dt;
-        r.ema = r.ema === 0 ? rate : r.ema * 0.8 + rate * 0.2;
-      }
-      r.lastTs = now;
-      r.lastChars = chars;
-      streamRef.current.text += delta.text;
-    } else if (delta.kind === 'end') {
-      rateRef.current.ema = 0;
-    }
-    if (delta.agent) streamRef.current.agent = delta.agent;
+    const rate = applyDeltaToAccum(streamRef.current, rateRef.current, delta, performance.now());
     setStreaming({
       text: streamRef.current.text,
       reasoning: streamRef.current.reasoning,
       agent: streamRef.current.agent,
+      segments: [...streamRef.current.segments],
       active: true,
-      rate: Math.round(rateRef.current.ema),
+      rate,
     });
   }, []);
 
   const resetStream = useCallback(() => {
-    streamRef.current = { text: '', reasoning: '', agent: '' };
-    rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
-    setStreaming({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+    streamRef.current = emptyStreamAccum();
+    rateRef.current = emptyRateAccum();
+    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
   }, []);
 
   const refreshMessages = useCallback(async () => {
@@ -142,16 +130,15 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       if (ev?.type === 'reply') {
         setIsVoiceMode(false);
         setVoiceActive(false);
-        streamRef.current = { text: '', reasoning: '', agent: '' };
-        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '' }));
-        refreshMessages();
+        streamRef.current = emptyStreamAccum();
+        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '', segments: [] }));        refreshMessages();
       }
       // Phase 8-V2 fix: a voice run started — begin the live bubble.
       if (ev?.type === 'pipeline-start') {
         setVoiceActive(true);
-        streamRef.current = { text: '', reasoning: '', agent: '' };
-        rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
-        setStreaming({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+        streamRef.current = emptyStreamAccum();
+        rateRef.current = emptyRateAccum();
+        setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
       }
       // Phase 8-V2: live tokens from a voice run stream into the house chat —
       // merge them into the same streaming bubble as local runs.
@@ -164,6 +151,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           text: streamRef.current.text,
           reasoning: streamRef.current.reasoning,
           agent: streamRef.current.agent,
+          segments: [...streamRef.current.segments],
           active: true,
           rate: s.rate,
         }));
@@ -179,13 +167,15 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           return [...prev, { id: 'voice-live-input', role: 'user', content: t, timestamp: new Date().toISOString() }];
         });
       }
-      // When run starts, replace live input bubble with persisted user message (avoid duplicate)
+      // When run starts, replace live input bubble with the single canonical
+      // user message (avoid duplicate Hello x N stacking).
       if (ev?.type === 'pipeline-start' && (ev as any).prompt) {
+        const prompt = String((ev as any).prompt);
         setMessages((prev) => {
-          const hasLive = prev.some(m => m.id === 'voice-live-input');
-          if (!hasLive) return prev;
-          // Keep live bubble until run completes — will be replaced on refresh
-          return prev;
+          const withoutLive = prev.filter((m) => m.id !== 'voice-live-input');
+          const last = withoutLive[withoutLive.length - 1];
+          if (last && last.role === 'user' && last.content === prompt) return withoutLive;
+          return [...withoutLive, { id: `voice-user-${Date.now()}`, role: 'user', content: prompt, timestamp: new Date().toISOString() }];
         });
       }
     });
@@ -254,8 +244,29 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort();
+    const ws = runWsRef.current;
+    const chatId = runChatIdRef.current;
+    // Actually cancel server-side too — detaching the fetch alone leaves the
+    // run burning tokens (the orphan-run bug).
+    if (chatId) abortRun(chatId).catch(() => {});
+    const partialText = streamRef.current.text;
+    const partialReasoning = streamRef.current.reasoning;
+    const log = liveStateRef.current?.live_terminal_log || '';
+    const hasPartial = !!(partialText.trim() || partialReasoning.trim() || log.trim());
     setIsRunning(false);
     setLiveState(null);
+    if (ws && chatId && hasPartial) {
+      // Keep the partial: same persist path as completion, marked stopped.
+      const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
+      const snap = liveStateRef.current;
+      finishHouseMessage(ws, chatId, snap, duration, {
+        thinking: partialReasoning,
+        liveTimeline: [...streamRef.current.segments],
+        stopped: true,
+        textOverride: partialText,
+      }).then(setMessages).catch(() => {});
+    }
+    resetStream();
   }, []);
 
   const handleSend = useCallback(async (prompt: string, files: File[]) => {
@@ -313,7 +324,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     }
 
     const userMsg: ChatMessage = {
-      id: `usr-${Date.now()}`,
+      id: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       role: 'user',
       content: prompt.trim() || `Attached ${attachments.length} file${attachments.length > 1 ? 's' : ''}`,
       timestamp: new Date().toISOString(),
@@ -324,6 +335,8 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     setLiveState(null);
     resetStream();
     startedAtRef.current = Date.now();
+    runWsRef.current = ws;
+    runChatIdRef.current = chatId;
 
     abortRef.current = startHousePipeline(
       prompt.trim(),
@@ -334,7 +347,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       async () => {
         try {
           const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
-          const updated = await finishHouseMessage(ws, chatId!, liveStateRef.current, duration);
+          const updated = await finishHouseMessage(ws, chatId!, liveStateRef.current, duration, { thinking: streamRef.current.reasoning, liveTimeline: [...streamRef.current.segments] });
           setMessages(updated);
           setChats(await fetchChats(ws.id));
           fetchChat(ws.id, chatId!).then((chat) => setTokenUsage(chat.token_usage ?? null)).catch(() => {});
@@ -384,7 +397,9 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const liveParsed = useMemo(() => parseLogToSteps(liveLog), [liveLog]);
   const liveText = streaming.active && streaming.text ? streaming.text : (liveParsed.assistantResponse || liveState?.outputs?.agent_report || '');
   const displayMessages = [...messages];
-  if ((isRunning || voiceActive) && (liveText.trim() || streaming.active || messages.length === 0 || liveParsed.steps.length > 0)) {
+  // Show the live bubble immediately on send so the "Thinking" placeholder
+  // appears before the first reasoning delta (the blank-wait bug).
+  if (isRunning || voiceActive) {
     displayMessages.push({
       id: 'house-live', role: 'agent', agentName: streaming.agent || getAssistantName(), content: liveText,
       timestamp: new Date().toISOString(), duration: 'active',
@@ -393,19 +408,38 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         isStreaming: streaming.active,
         streamingReasoning: streaming.reasoning,
         streamRate: streaming.rate,
+        liveTimeline: streaming.segments,
       },
     });
   }
 
   const liveUsage = liveState?.token_usage;
+  // Fallback for chats created before token_usage_json existed — sum per-message usage
+  const messagesUsage = useMemo<TokenUsage | null>(() => {
+    if (tokenUsage) return null;
+    let agg: TokenUsage | null = null;
+    for (const m of messages) {
+      const u = (m.metadata as any)?.usage as TokenUsage | undefined;
+      if (!u) continue;
+      if (!agg) agg = { total_input_tokens: 0, total_output_tokens: 0, total_cache_hit_tokens: 0, total_cache_miss_tokens: 0, total_cost: 0, calls: [] };
+      agg.total_input_tokens += u.total_input_tokens || 0;
+      agg.total_output_tokens += u.total_output_tokens || 0;
+      agg.total_cache_hit_tokens += (u as any).total_cache_hit_tokens || 0;
+      agg.total_cache_miss_tokens += (u as any).total_cache_miss_tokens || 0;
+      agg.total_cost += u.total_cost || 0;
+      agg.calls.push(...(u.calls || []));
+    }
+    return agg;
+  }, [messages, tokenUsage]);
+  const effectiveTokenUsage = tokenUsage || messagesUsage;
   const combinedTokenUsage = useMemo<TokenUsage>(() => ({
-    total_input_tokens: (tokenUsage?.total_input_tokens || 0) + (liveUsage?.total_input_tokens || 0),
-    total_output_tokens: (tokenUsage?.total_output_tokens || 0) + (liveUsage?.total_output_tokens || 0),
-    total_cache_hit_tokens: (tokenUsage?.total_cache_hit_tokens || 0) + (liveUsage?.total_cache_hit_tokens || 0),
-    total_cache_miss_tokens: (tokenUsage?.total_cache_miss_tokens || 0) + (liveUsage?.total_cache_miss_tokens || 0),
-    total_cost: (tokenUsage?.total_cost || 0) + (liveUsage?.total_cost || 0),
-    calls: [...(tokenUsage?.calls || []), ...(liveUsage?.calls || [])],
-  }), [tokenUsage, liveUsage]);
+    total_input_tokens: (effectiveTokenUsage?.total_input_tokens || 0) + (liveUsage?.total_input_tokens || 0),
+    total_output_tokens: (effectiveTokenUsage?.total_output_tokens || 0) + (liveUsage?.total_output_tokens || 0),
+    total_cache_hit_tokens: (effectiveTokenUsage?.total_cache_hit_tokens || 0) + (liveUsage?.total_cache_hit_tokens || 0),
+    total_cache_miss_tokens: (effectiveTokenUsage?.total_cache_miss_tokens || 0) + (liveUsage?.total_cache_miss_tokens || 0),
+    total_cost: (effectiveTokenUsage?.total_cost || 0) + (liveUsage?.total_cost || 0),
+    calls: [...(effectiveTokenUsage?.calls || []), ...(liveUsage?.calls || [])],
+  }), [effectiveTokenUsage, liveUsage]);
   const lastCall = combinedTokenUsage.calls[combinedTokenUsage.calls.length - 1];
   const lastModelName = lastCall?.model || 'Automatic Fallback';
   const activeContextTokens = lastCall?.input || 0;

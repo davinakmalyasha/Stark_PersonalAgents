@@ -25,9 +25,13 @@ export async function fetchChat(workspaceId: string, chatId: string): Promise<Ch
 }
 
 export async function deleteChat(workspaceId: string, chatId: string): Promise<void> {
-  await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}`, {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}`, {
     method: 'DELETE',
   });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(body || `Failed to delete chat (HTTP ${res.status})`);
+  }
 }
 
 export async function fetchChatSubagents(workspaceId: string, chatId: string): Promise<SubagentInfo[]> {
@@ -74,7 +78,7 @@ export async function uploadChatAttachments(workspaceId: string, chatId: string,
 }
 
 export async function updateChatTitle(workspaceId: string, chatId: string, title: string): Promise<void> {
-  await fetch(
+  const res = await fetch(
     `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/title`,
     {
       method: 'PUT',
@@ -82,4 +86,8 @@ export async function updateChatTitle(workspaceId: string, chatId: string, title
       body: JSON.stringify({ title }),
     },
   );
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(body || `Failed to rename chat (HTTP ${res.status})`);
+  }
 }

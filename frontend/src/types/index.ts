@@ -1,4 +1,4 @@
-// ── Antigravity IDE Type Definitions ──
+// ── Stark IDE Type Definitions ──
 
 export interface TokenCall {
   agent: string;
@@ -63,11 +63,17 @@ export interface ProjectRef {
 
 /** P10: live token delta frame from the backend SSE stream. */
 export interface StreamDelta {
-  kind: 'text' | 'reasoning' | 'usage' | 'end';
+  kind: 'text' | 'reasoning' | 'usage' | 'end' | 'tool_started' | 'tool_finished';
   text: string;
   agent?: string;
   model?: string;
   ts?: number;
+  /** tool_started/tool_finished only: tool name + JSON-encoded args. */
+  tool?: string;
+  args?: string;
+  /** tool_finished only. */
+  ok?: boolean;
+  ms?: number;
 }
 
 export interface PlanItem {
@@ -174,6 +180,8 @@ export interface ChatSummary {
   model: string;
   createdAt: string;
   updatedAt: string;
+  parentChatId?: string;
+  parentWorkspaceId?: string;
 }
 
 export interface ChatData {
@@ -184,6 +192,8 @@ export interface ChatData {
   updatedAt: string;
   messages: ChatMessage[];
   token_usage?: TokenUsage;
+  parentChatId?: string;
+  parentWorkspaceId?: string;
 }
 
 export interface ChatMessage {
@@ -280,6 +290,10 @@ export interface SessionTab {
   workspacePath: string;
   chatId: string;
   updatedAt: string;
+  /** Spawned by a higher agent — used to nest/group instead of flat siblings. */
+  parentChatId?: string;
+  parentWorkspaceId?: string;
+  isSpawned?: boolean;
 }
 
 /** Live pipeline status from GET /api/runs/active. */

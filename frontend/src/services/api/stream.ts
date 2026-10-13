@@ -38,8 +38,7 @@ export async function submitAskAnswers(batchId: string, answers: AskAnswer[]): P
   }
 }
 
-export async function fetchActiveRun(): Promise<ActiveRun> {
-  try {
+export async function fetchActiveRun(): Promise<ActiveRun> {  try {
     const res = await fetch(`${API_BASE}/runs/active`);
     if (!res.ok) return { running: false, workspace_path: '', chat_id: '', started_at: '' };
     return await res.json();
@@ -48,8 +47,7 @@ export async function fetchActiveRun(): Promise<ActiveRun> {
   }
 }
 
-export async function steerRun(chatId: string, message: string): Promise<boolean> {
-  try {
+export async function steerRun(chatId: string, message: string): Promise<boolean> {  try {
     const res = await fetch(`${API_BASE}/steer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -58,6 +56,23 @@ export async function steerRun(chatId: string, message: string): Promise<boolean
     if (!res.ok) return false;
     const data = await res.json();
     return !!data?.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function abortRun(chatId: string): Promise<boolean> {
+  // Tell the backend to actually cancel the run (inbox abort + pydantic-ai
+  // cancellation token). Fire-and-forget from Stop handlers — the fetch
+  // abort alone only detaches this client while the run keeps burning tokens.
+  if (!chatId) return false;
+  try {
+    const res = await fetch(`${API_BASE}/abort`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId }),
+    });
+    return res.ok;
   } catch {
     return false;
   }

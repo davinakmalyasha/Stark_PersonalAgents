@@ -43,6 +43,82 @@ _LOCK = threading.RLock()
 #: del_id -> entry dict. Entries survive until process exit (small).
 _DELEGATIONS: dict[str, dict] = {}
 
+
+# ── Durable job store (Phase 0) ──────────────────────────────────────────────
+# _DELEGATIONS stays the live object; every status transition is also written
+# through to <harness>/.deep_agents/jobs.db, so a restart no longer loses the
+# record of what was in flight. The dict is a CACHE: _job() falls back to the
+# store on a miss, and _all_jobs() unions both. See
+# docs/group-projects/07-phase-0-implementation.md section 4.
+_STORE_FAILED = False
+
+
+def _store():
+    """Lazy JobStore, or None when unavailable. Never fatal."""
+    global _STORE_FAILED
+    if _STORE_FAILED:
+        return None
+    try:
+        from agents.jobs import get_store
+        return get_store()
+    except Exception as e:
+        _STORE_FAILED = True
+        _log(f"[DELEGATE] job store unavailable, memory-only: {e}")
+        return None
+
+
+def _persist(entry: dict | None) -> None:
+    """Write-through one delegation entry to the durable store."""
+    if not entry or not entry.get("id"):
+        return
+    store = _store()
+    if store is None:
+        return
+    try:
+        store.upsert(entry)
+    except Exception as e:
+        _log(f"[DELEGATE] store write skipped for {entry.get('id')}: {e}")
+
+
+def _job(del_id: str) -> dict | None:
+    """Read one job: live cache first, durable store on a miss."""
+    entry = _DELEGATIONS.get(del_id)
+    if entry is not None:
+        return entry
+    store = _store()
+    if store is None:
+        return None
+    try:
+        row = store.get(del_id)
+    except Exception:
+        row = None
+    if row is not None:
+        _DELEGATIONS[del_id] = row  # rehydrate the cache
+    return row
+
+
+def _all_jobs(parent_chat_id: str = "") -> list[dict]:
+    """Union of the live cache and the store, deduped by id (live wins).
+
+    An empty ``parent_chat_id`` means every job.
+    """
+    merged: dict[str, dict] = {}
+    store = _store()
+    if store is not None:
+        try:
+            rows = (store.list_for_parent(parent_chat_id) if parent_chat_id
+                    else [store.get(i) for i in store.all_ids()])
+            for row in rows:
+                if row:
+                    merged[row["id"]] = row
+        except Exception:
+            pass
+    for del_id, entry in list(_DELEGATIONS.items()):
+        if parent_chat_id and entry.get("parent") != parent_chat_id:
+            continue
+        merged[del_id] = entry
+    return list(merged.values())
+
 # ── Concurrency slots (bounded fan-out) ──────────────────────────────────────
 #: A flood guard: at most ORCH_MAX_PARALLEL jobs execute at once (default 6);
 #: the rest wait as status="queued" and start as slots free. Mirrors Anthropic's
@@ -256,7 +332,7 @@ def _sync_orchestrator_job_plan(parent_chat_id: str) -> None:
     try:
         with _LOCK:
             entries = sorted(
-                (dict(e) for e in _DELEGATIONS.values() if e.get("parent") == chat),
+                (dict(e) for e in _all_jobs(chat)),
                 key=lambda e: str(e.get("started") or ""),
             )
         if not entries:
@@ -453,6 +529,7 @@ def _finalize_entry(del_id: str, parent_chat_id: str, status: str, result: str,
             except Exception as e:
                 _log(f"[DELEGATE] Artifact skipped for {del_id}: {e}")
         snapshot = dict(entry)
+    _persist(snapshot)
     _emit_completion(snapshot, parent_chat_id)
     return snapshot
 
@@ -526,6 +603,8 @@ def _run_resume_item(del_id: str, parent_chat_id: str) -> None:
                 return  # cancelled while queued
             cur["status"] = "running"
             cur["last_event_at"] = datetime.now().isoformat(timespec="seconds")
+            _snapshot = dict(cur)
+        _persist(_snapshot)
         _sync_orchestrator_job_plan(parent_chat_id)
         _run_resume_turn(del_id, parent_chat_id)
     finally:
@@ -616,6 +695,8 @@ def _run_item(del_id: str, item: dict, parent_chat_id: str) -> None:
                 return
             cur["status"] = "running"
             cur["last_event_at"] = datetime.now().isoformat(timespec="seconds")
+            _snapshot = dict(cur)
+        _persist(_snapshot)
         _sync_orchestrator_job_plan(parent_chat_id)
 
         state_token = None
@@ -850,6 +931,7 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str,
         }
         with _LOCK:
             _DELEGATIONS[del_id] = entry
+        _persist(entry)
 
         # Deadline watchdog (fresh jobs only): abort + tombstone as FAILED.
         if resume_info is None and job_timeout and job_timeout > 0:
@@ -947,8 +1029,8 @@ def running_count(parent_chat_id: str) -> int:
     """Unfinished delegations spawned from this chat (queued + running)."""
     with _LOCK:
         return sum(
-            1 for e in _DELEGATIONS.values()
-            if e["status"] in ("queued", "running") and e.get("parent") == (parent_chat_id or "")
+            1 for e in _all_jobs(parent_chat_id or "")
+            if e.get("status") in ("queued", "running")
         )
 
 
@@ -961,16 +1043,15 @@ def undelivered_count(parent_chat_id: str) -> int:
     """
     with _LOCK:
         return sum(
-            1 for e in _DELEGATIONS.values()
-            if e.get("parent") == (parent_chat_id or "")
-            and e.get("status") in ("done", "failed", "cancelled")
+            1 for e in _all_jobs(parent_chat_id or "")
+            if e.get("status") in ("done", "failed", "cancelled")
             and not e.get("delivered")
         )
 
 
 def get_entry(del_id: str) -> dict | None:
     with _LOCK:
-        e = _DELEGATIONS.get(del_id)
+        e = _job(del_id)
         return dict(e) if e else None
 
 
@@ -982,17 +1063,18 @@ def cancel_all() -> int:
     """
     n = 0
     with _LOCK:
-        for e in _DELEGATIONS.values():
-            if e["status"] in ("queued", "running"):
+        for e in _all_jobs():
+            if e.get("status") in ("queued", "running"):
                 e["status"] = "cancelled"
                 e["error"] = "cancelled by user request"
+                _persist(e)
                 n += 1
     return n
 
 
 def status_table(status: str | None = None) -> str:
     with _LOCK:
-        entries = sorted(_DELEGATIONS.values(), key=lambda e: e["started"], reverse=True)
+        entries = sorted(_all_jobs(), key=lambda e: e.get("started") or "", reverse=True)
     want = str(status or "").strip().lower()
     if want:
         entries = [e for e in entries if e.get("status") == want]
@@ -1063,7 +1145,8 @@ def job_detail(del_id: str) -> str:
     own chat shows, and what files changed under its workspace (best-effort).
     """
     with _LOCK:
-        e = dict(_DELEGATIONS[del_id]) if del_id in _DELEGATIONS else None
+        found = _job(del_id)
+        e = dict(found) if found else None
     if e is None:
         return f"Error: unknown job id '{del_id}'. Call delegation_status() for the board."
     lines = [
@@ -1362,9 +1445,17 @@ async def map_run_delegations(graph_items: list) -> list[dict]:
 
 
 def reset_delegations() -> None:
-    """Test helper."""
+    """Test helper: clear the live cache AND the durable store, so a test that
+    starts from a clean slate cannot read back rows from an earlier run."""
     global _ACTIVE_SLOTS
     with _LOCK:
         _DELEGATIONS.clear()
         _ACTIVE_SLOTS = 0
         _SLOT_COND.notify_all()
+    store = _store()
+    if store is not None:
+        try:
+            for job_id in list(store.all_ids()):
+                store.delete(job_id)
+        except Exception:
+            pass

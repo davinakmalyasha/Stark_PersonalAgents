@@ -147,35 +147,50 @@ def update_task(workspace_path: str, chat_id: str, task_id: str, **changes) -> d
 def run_task_background(workspace_id: str, workspace_path: str, chat_id: str, task: dict) -> None:
     task_id = task["id"]
     update_task(workspace_path, chat_id, task_id, status="running", lastRunAt=task_now().isoformat())
+
+    # Each run gets its OWN state scope. start_task_scheduler spawns one thread
+    # per due task, so two tasks due in the same tick used to both publish to —
+    # and read back from — the root shared_state, and therefore both reported
+    # whichever agent_report happened to be written last. The scoping mechanism
+    # already existed and is used by agents/delegation.py:622-627; the scheduler
+    # simply never set it. Mirrors that pattern, including the reset.
+    from sync.state_sync import active_state, new_scoped_state
+    state_token = active_state.set(new_scoped_state({
+        "chat_id": chat_id,
+        "project_path": workspace_path,
+    }))
     try:
-        prompt = task.get("prompt", "")
-        attachments = task.get("attachments", [])
-        add_message(workspace_path, chat_id, "user", prompt, {"attachments": attachments, "taskId": task_id} if attachments else {"taskId": task_id})
-        if workspace_path in ("", GENERAL_WORKSPACE_ID):
-            from agents.general_agent import run_general_direct
-            for _ in run_general_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
-                pass
-        else:
-            from verify_helper import run_graph_with_verify
-            for _ in run_graph_with_verify(prompt, workspace_path=workspace_path, chat_id=chat_id):
-                pass
         try:
-            from sync.state_sync import safe_get_state
-            report = safe_get_state().get("outputs", {}).get("agent_report", "")
-        except Exception:
-            report = ""
-        if report and chat_id:
-            add_message(workspace_path, chat_id, "agent", report, {"taskId": task_id})
-        recurrence = (task.get("schedule") or {}).get("recurrence", "none")
-        current_next = parse_task_time((task.get("schedule") or {}).get("nextRunAt")) or task_now()
-        next_run = next_recurring_time(current_next, recurrence)
-        if next_run:
-            schedule = {**(task.get("schedule") or {}), "nextRunAt": next_run.isoformat()}
-            update_task(workspace_path, chat_id, task_id, status="scheduled", schedule=schedule)
-        else:
-            update_task(workspace_path, chat_id, task_id, status="completed", completedAt=task_now().isoformat())
-    except Exception as exc:
-        update_task(workspace_path, chat_id, task_id, status="failed", error=str(exc))
+            prompt = task.get("prompt", "")
+            attachments = task.get("attachments", [])
+            add_message(workspace_path, chat_id, "user", prompt, {"attachments": attachments, "taskId": task_id} if attachments else {"taskId": task_id})
+            if workspace_path in ("", GENERAL_WORKSPACE_ID):
+                from agents.general_agent import run_general_direct
+                for _ in run_general_direct(prompt, chat_id=chat_id, images=[a.get("path") for a in attachments if a.get("isImage") and a.get("path")] or None):
+                    pass
+            else:
+                from verify_helper import run_graph_with_verify
+                for _ in run_graph_with_verify(prompt, workspace_path=workspace_path, chat_id=chat_id):
+                    pass
+            try:
+                from sync.state_sync import safe_get_state
+                report = safe_get_state().get("outputs", {}).get("agent_report", "")
+            except Exception:
+                report = ""
+            if report and chat_id:
+                add_message(workspace_path, chat_id, "agent", report, {"taskId": task_id})
+            recurrence = (task.get("schedule") or {}).get("recurrence", "none")
+            current_next = parse_task_time((task.get("schedule") or {}).get("nextRunAt")) or task_now()
+            next_run = next_recurring_time(current_next, recurrence)
+            if next_run:
+                schedule = {**(task.get("schedule") or {}), "nextRunAt": next_run.isoformat()}
+                update_task(workspace_path, chat_id, task_id, status="scheduled", schedule=schedule)
+            else:
+                update_task(workspace_path, chat_id, task_id, status="completed", completedAt=task_now().isoformat())
+        except Exception as exc:
+            update_task(workspace_path, chat_id, task_id, status="failed", error=str(exc))
+    finally:
+        active_state.reset(state_token)
 
 
 def start_task_scheduler() -> None:

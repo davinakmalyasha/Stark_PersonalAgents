@@ -47,16 +47,15 @@ Each phase has a **test project** that must pass before the next begins. Test pr
 
 ---
 
-### Phase 2 — Real members
+### Phase 2 — Real members  ✅ BUILT
 
-| | |
-|---|---|
-| **Scope** | Steps 4–6. `create_group_project`, folder scaffolding + `deps/`, manifest parse/write, `materialize.py` (agents/skills/bindings/MCP), `WorkspaceDeps` envelope, approval integration, member execution (agents/*.json → chat → prompt → verify). |
-| **Why** | Turns the board from bookkeeping into work, and makes the folder genuinely self-contained. |
-| **Test project** | **`synthetic-report`** — one `general` member, 3 milestones / 6 items: fetch three public URLs, write each summary to `context/findings.md`, produce `artifacts/report.md`. Assert: one chat per member; item boundaries visible in the transcript; acceptance criteria evaluated; restart mid-item resumes that member's conversation; **an item discovered to be based on a wrong assumption is `invalidated`, `attempts` unchanged, one re-plan wake**. |
-| **Portability test** | Copy the folder to a second root, point `STARK_PROJECTS_ROOT` at it, boot. Assert: it loads and resumes. Then assert (P-1) no absolute paths are present, and (P-2) no secret value appears anywhere in the folder. |
-| **Gate** | A real member completes real items. A gated action queues an approval and blocks the item. Restart resumes mid-item without re-sending an external write. The folder survives a move between roots. |
-| **Effort** | Substantial. This is where prompt quality decides whether the feature is usable. |
+**Build record: `01-concept-model.md` §14.**
+
+**Status: done — gate met.** `pytest tests/ -q` → **211 passed, 0 failed** (+13 over Phase 1). A project folder is created, its capability set is materialised into it, members run items through an injectable runner, and acceptance criteria decide done.
+
+**Two real bugs were found, both latent since earlier phases:** nothing requeued a lease-expired item (it stayed `blocked` forever — Phase 1 never noticed because it had no members to die), and a `manual` criterion caused a false stall because the wait detector checked status instead of reason.
+
+**Honest limit:** members are exercised with a **fake runner**. The suite covers dispatch, harvest, criteria, and transitions; it does **not** cover a real LLM run. `LocalRunner._execute_node` is the one seam that would call a model.
 
 ---
 

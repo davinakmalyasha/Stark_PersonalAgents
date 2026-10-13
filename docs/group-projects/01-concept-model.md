@@ -679,3 +679,55 @@ The folder materialises agents, skills, tool bindings, and MCP config (§2). **H
 The analogy that settles it either way: nobody copies `node_modules` into a project — they copy `package.json` + `package-lock.json` and install. **Declarations copy, dependencies install, the runtime pins.** `lock.json` (harness version + content digests) is what makes a folder reproducible rather than merely self-describing.
 
 **This blocks nothing before Phase 3.** Phase 0 (durability), Phase 1 (supervisor), and Phase 2 (real members) are identical under A, B, and C. Decide before Phase 3.
+
+---
+
+## 14. Build Record — Phase 2
+
+**Status: BUILT.** `pytest tests/ -q` → **211 passed, 0 failed** (198 before, +13).
+
+### 14.1 What shipped
+
+| File | Contents |
+|---|---|
+| `agents/group/manifest.py` | `PROJECT.md` parse / render / validate. Prose for humans, one fenced YAML block for the harness; both kept, YAML authoritative. Validation refuses an item with no acceptance criteria (DM-06) at creation rather than as a silent deadlock later. |
+| `agents/group/criteria.py` | Acceptance evaluation — `file_exists`, `dir_exists`, `min_bytes`, `glob_nonempty`, `regex`, `command`, plus `manual` (pending) and `llm` (unsupported until Phase 3). Every path is resolved under the project root and refused if it escapes. |
+| `agents/group/materialize.py` | Resolving a `WorkspaceSpec` or specialist profile into `agents/<name>.json` with provenance (DM-09); copying skills; writing `tools/bindings.json`; filtering the MCP catalogue into `mcp/servers.json` with credentials by **name** only (DM-10). |
+| `agents/group/project.py` | The folder tree, `AGENTS.md` / `inbox.md` / `context/` scaffolds, `lock.json`, a rendered `plan.md`, **executable portability checks** (P-1, P-2), `copy_to`, and `create_group_project`. |
+| `agents/group/runner.py` | `ItemRunner` interface, `RunContext`, `build_prompt` (the six things a member is told), and `LocalRunner` with an injectable `execute`. |
+| `agents/group/supervisor.py` | Phases 5–7 come alive: dispatch → collect → verify. |
+| `tests/test_group_members.py` | 13 tests. |
+
+### 14.2 The seam that made it testable
+
+The supervisor holds an `ItemRunner` and a `context_for` callable. It never imports an agent, and it never looks at a disk layout. That is why the whole member lifecycle — dispatch, run, harvest, judge — is asserted end to end with a **fake runner**, and why the tick still makes no LLM calls (RT-01).
+
+**A real LLM run is not asserted anywhere in this suite.** `LocalRunner._execute_node` is the one seam that would call a model, and it is exercised only by inspection. Saying the suite covers member execution would be false; it covers everything *around* the model.
+
+### 14.3 What building revealed
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | **Nothing requeued a lease-expired item.** `_reap` set it `blocked`, and `_readiness` only ever looked at `todo` — so a member that died left its item blocked **forever**. Phase 1 never noticed because Phase 1 had no members to die. | **Real bug, latent since Phase 1.** `_readiness` now treats `blocked(lease_expired)` as retryable and requeues it, bounded by `attempts`. The Phase 1 test was updated to assert the better behaviour: the item is reaped *and* requeued in the same tick, so `blocked` is a log entry rather than a board state that can strand work. |
+| 2 | **A manual criterion caused a false stall.** The item correctly stayed `doing` while parked, but the stall detector only recognised `blocked` + `awaiting_approval` — so an overnight approval wait was reported as a deadlock. | **Real bug.** Fixed by using the `approval.*` kinds that were declared in the vocabulary but never reduced: `approval.requested` parks the item (reason set, **status unchanged**), and `_has_legitimate_wait` now checks the reason rather than the status. Rejection blocks the item properly (AU-10). |
+| 3 | **`item.progress` was documented but never implemented.** `01` §7.3 listed it; `events.py` did not have it. Phase 2 needs a way to record a finished attempt *without* a status change. | Added, with a reducer. Result and verdict stay separate events on purpose: a result is a fact about an attempt, a verdict is a judgement about the work. That is what makes phase 7 re-runnable and a retry visible. |
+| 4 | **Three `MaterializationError` raise-sites referenced an undefined name.** `project.py` used it at module scope while only importing it lazily inside the function. | Caught by **ruff, not by tests** — none of the tests reached those branches. Now `mat.MaterializationError`. A reminder that a green suite says nothing about untested branches. |
+| 5 | **A `?` in a YAML flow mapping is a syntax error.** `{kind: manual, prompt: does this look right?}` fails to parse. | Manifest authoring trap. Criteria prompts in a flow mapping must be quoted. Not a code bug, but it belongs in the record because it will bite a human writing a manifest by hand. |
+
+### 14.4 Deliberate Phase 2 limits
+
+| Limit | Why |
+|---|---|
+| `LocalRunner` is process-local; in-flight threads are lost on restart | Same trade as `delegation._DELEGATIONS`. The **lease** recovers the item, and the member's conversation survives because the transcript is persisted. Claiming otherwise would need a durable run store, which `07`'s `JobStore` already sketches — deferred. |
+| Approval **detection** exists; approval **flow** does not | `approval.requested` parks an item and it is exempt from stall detection, which is what the gate asked for. The inbox round-trip, Telegram, and read-back are Phase 4 (`04` §8). |
+| `llm` criteria return `unsupported` | Phase 3. An unverifiable criterion leaves the item `doing` rather than guessing a verdict — it must not silently become done *or* silently become failed. |
+| `update_item` / `set_completion` / `reprioritize` ops still reject | Unchanged from Phase 1. They need field-level event deltas; faking them would corrupt the log. |
+| The registry is reached through an injected `spec_lookup` | So `agents/group/` stays importable without pulling the whole agent stack — which is also what keeps the test suite fast. |
+
+### 14.5 Still open
+
+| Item | Where |
+|---|---|
+| Copy boundary — declarations vs vendoring the runtime | `01` §13, still the Phase 3 gate |
+| `tests/run_all.py` reports 46 false failures and CI runs it | `07` §11.2 |
+| Wiring into server boot (`create_group_project` from the UI) | Phase 4 |

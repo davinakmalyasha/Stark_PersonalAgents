@@ -1,9 +1,9 @@
 @echo off
-title Antigravity 2.0 — Desktop
+title Stark - Desktop (Dev)
 echo =============================================
-echo   Antigravity 2.0 — Desktop Mode
+echo   Stark - Desktop Mode (dev, live reload)
 echo =============================================
 echo.
-echo Starting Antigravity 2.0 App...
-cd /d D:\MyProject\LangChain\frontend
+echo Starting Stark App...
+cd /d "%~dp0..\frontend"
 call npm run electron:dev

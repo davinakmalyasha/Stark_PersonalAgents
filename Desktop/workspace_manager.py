@@ -19,6 +19,7 @@ from server.store.chat_store import (
     list_chats,
     get_chat,
     create_chat,
+    find_chat_workspace_id,
     save_chat,
     delete_chat,
     add_message,
@@ -54,7 +55,7 @@ __all__ = [
     "list_workspaces", "add_workspace", "remove_workspace", "get_workspace",
     "cleanup_orphaned_chat_dirs", "init_default_workspace", "probe_environment",
     "get_workspace_rules_and_profile", "get_client_name",
-    "list_chats", "create_chat", "get_chat", "save_chat", "delete_chat", "add_message",
+    "list_chats", "create_chat", "get_chat", "find_chat_workspace_id", "save_chat", "delete_chat", "add_message",
     "update_chat_title", "get_chat_tasks", "save_chat_tasks",
     "get_mode",
 ]

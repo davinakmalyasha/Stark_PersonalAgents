@@ -246,6 +246,8 @@ def resolve_batch(batch_id: str, answers: list[dict]) -> bool:
         if batch is None:
             return False
         for a in answers or []:
+            if not isinstance(a, dict):
+                continue
             qid = str(a.get("id") or "")
             if not qid:
                 continue

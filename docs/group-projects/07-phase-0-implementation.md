@@ -3,7 +3,7 @@
 **Version**: 1.0
 **Date**: 2026-10-01
 **Author**: Stark design session
-**Status**: Ready to build — nothing implemented yet
+**Status**: **BUILT** — gate 4/4. See §11 for the build record and what it revealed.
 **Depends on**: `05-integration-map.md` §13 (steps 1–2), `01-concept-model.md` §7
 
 Phase 0 makes the **existing** delegation system durable. It fixes the foundation group projects will sit on, and it is worth doing even if group projects never ship.
@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   title          TEXT,
   status         TEXT NOT NULL,   -- queued|running|done|failed|cancelled
   attempts       INTEGER DEFAULT 0,
+  lease_owner    TEXT,            -- Phase 1; NULL in Phase 0
+  lease_expires  REAL,
   workdir        TEXT,
   usage_json     TEXT,
   result         TEXT,
@@ -91,10 +93,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   artifact       TEXT,
   created_at     REAL NOT NULL,
   updated_at     REAL NOT NULL,
-  finished_at    REAL
+  finished_at    REAL,
+  entry_json     TEXT             -- ← added during build; see §4.6
 );
 CREATE INDEX IF NOT EXISTS ix_jobs_parent ON jobs(parent_chat_id, status);
-CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status, updated_at);
+CREATE INDEX IF NOT EXISTS ix_jobs_project ON jobs(project_id, status);
 ```
 
 **`project_id` and `item_id` exist now and are NULL.** Phase 1 sets them for group-project jobs; because the columns are already there, Phase 1 needs no `ALTER TABLE` on existing databases. This matches the additive-migration habit already in the repo (`chat_store.py:88-94` adds `tasks_json` exactly this way).
@@ -205,6 +208,24 @@ job_detail(del_id)                 # must still answer
 ```
 
 That is gate assertion #4 (§8). Without it, `_DELEGATIONS` is still the source of truth and the store is decoration.
+
+### 4.6 `entry_json` — the fidelity payload
+
+**Added during build.** The columns in §3.2 are a *queryable projection*, not the whole entry. A delegation entry carries fields with no column — `agent_display`, `delivered`, `started`, `task`, `outcome`, `acceptance`, `mode`, `project`, `child_id`, `images`, `timeout` — and read paths depend on them:
+
+| Read path | Needs | Would fail with columns alone |
+|---|---|---|
+| `status_table()` | `agent_display`, `started` | `KeyError: 'agent_display'` |
+| `undelivered_count()` | `delivered` | every job looks undelivered |
+| `_sync_orchestrator_job_plan()` | `started`, `title` | plan renders blank |
+
+So each row also stores `entry_json` — the full entry, JSON-encoded (`default=str` for anything exotic).
+
+**Consistency rule:** `upsert()` writes both; `mark()` updates the columns *and* merges the change into `entry_json` inside the same transaction. On read, `entry_json` supplies the shape and the columns are laid over the top, with a NULL column never clobbering a JSON value.
+
+**Why not just add the missing columns?** The entry shape belongs to `delegation.py` and can grow. Columns would need a migration per field, and a missed one fails at read time with a `KeyError` — which is exactly how this was found. The payload makes the round-trip shape-agnostic; the columns stay for querying.
+
+**Phase 1 note:** this becomes a projection properly — `events` will be the truth and `entry_json` will be rebuilt from it (`01` §7). Nothing here needs to change for that; the payload is just a projection that is currently maintained by hand.
 
 ---
 
@@ -379,3 +400,56 @@ Recorded so it is expected rather than alarming:
 - The `agent` / `title` / `workdir` fields may not all be available at the single insertion point at `:852`, which would mean persisting at the first status transition instead.
 
 None of these change the design. All of them are the reason §2.3 exists.
+
+---
+
+## 11. Build Record
+
+**Status: BUILT.** Gate 4/4. Committed to `development`.
+
+### 11.1 What shipped
+
+| File | Change |
+|---|---|
+| `agents/jobs/__init__.py` | new — exports `JobStore`, `get_store`, `db_path` |
+| `agents/jobs/store.py` | new — schema, DAO, WAL connection, boot reconcile |
+| `agents/delegation.py` | `_store` / `_persist` / `_job` / `_all_jobs`; persistence at the 4 status transitions + insertion; reads routed through the store; `reset_delegations` clears both |
+| `server/services/task_scheduler.py` | `run_task_background` sets and resets a scoped `active_state` |
+| `tests/test_task_isolation.py` | new — gate 3, written first and failing |
+| `tests/test_job_store.py` | new — gate 2 and gate 4 |
+
+### 11.2 Gate results
+
+| # | Assertion | Result |
+|---|---|---|
+| 1 | No regressions | **PASS** — 133 → 137 passed, the same 46 pre-existing failures throughout |
+| 2 | Jobs survive a restart; `running` reconciles to `failed(process_restart)` | **PASS** — `test_jobs_survive_a_restart` |
+| 3 | Concurrent tasks produce independent reports | **PASS** — verified FAILING before the fix (`chat-A received ['report::B']`) |
+| 4 | `_DELEGATIONS` is a cache | **PASS** — `test_cache_is_a_cache`, plus an end-to-end check against a real `jobs.db` |
+
+The 46 pre-existing failures are all `missing 1 required positional argument` — pytest-fixture-style tests that the zero-arg `tests/run_all.py` runner cannot drive. They are unrelated to Phase 0 and were failing before it.
+
+### 11.3 What building actually revealed
+
+Three findings the spec predicted, and one it did not.
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | **The row shape ≠ the live entry shape.** | **Real and material.** The `jobs` columns are a *subset*: `agent_display`, `delivered`, `started`, `task`, `outcome`, `acceptance` are not columns. Rehydrated rows broke `status_table` (`KeyError: 'agent_display'`) and `undelivered_count` (every job looked undelivered). Fixed by adding **`entry_json`** — the full entry as a payload alongside the queryable columns. `mark()` merges into it so both stay consistent. This is the one design refinement Phase 0 needed. |
+| 2 | `reset_delegations()` needed to clear the store. | **Confirmed** — and it needed a new `JobStore.delete()` to do it. |
+| 3 | Status-transition points were where §4.3 predicted. | **Confirmed** — insertion at the single site, plus four transitions (`_finalize_entry`, `_run_item`, `_run_resume_item`, `cancel_all`). All now persist. |
+| 4 | **Not predicted: the test suite is not isolated.** | `tests/_util.py::tools_stub()` replaces `sys.modules["tools"]` with a minimal stub and **never restores it**, so any later test module that imports the real agent stack dies with `ImportError: cannot import name 'ToolExecutionResult' from 'tools'`. Both new test files work around it by installing a path-only `agents` package shim that loads `agents.delegation`/`agents.jobs.store` without executing `agents/__init__.py`. **This is a pre-existing test-infrastructure bug worth its own fix.** |
+
+### 11.4 Cost notes
+
+- `job_detail()` takes ~8.5s on first call standalone, because it does `import tools.watcher` and `import workspace_manager`. Pre-existing; in the full suite `tools` is stubbed so the import fails fast and it costs nothing. Not introduced here, not fixed here.
+- The new tests add ~0.1s to the suite (17.6s total, from 15.9s). An earlier version that imported the real agent stack cost 12s; the module shim removed that.
+
+### 11.5 Deliberately still open
+
+| Item | Where |
+|---|---|
+| `scratch/gen10_current.pid` is tracked — a runtime PID file in version control | noted, not fixed |
+| `error_patterns.py` is a new module with **zero** imports anywhere — dormant | noted, not wired |
+| The `tools_stub()` isolation bug | §11.3 finding 4 |
+| Whether `_DELEGATIONS` should stop being read directly anywhere else | §10 risk row 5 |

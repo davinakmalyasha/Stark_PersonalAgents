@@ -16,9 +16,11 @@ Each phase has a **test project** that must pass before the next begins. Test pr
 
 ---
 
-### Phase 0 — Durability foundation
+### Phase 0 — Durability foundation  ✅ BUILT
 
-**Full spec: `07-phase-0-implementation.md`.** This is the only phase with its own implementation document, because it is the only one that touches code which exists today.
+**Full spec: `07-phase-0-implementation.md`, now including a build record (§11).** This is the only phase with its own implementation document, because it is the only one that touches code which exists today.
+
+**Status: done — gate 4/4.** Three deliverables shipped; the four gate assertions pass; the same 46 pre-existing test failures throughout (pytest-fixture tests the zero-arg runner cannot drive, unrelated to Phase 0). One design refinement was needed — `entry_json`, the fidelity payload (`07` §4.6) — and one pre-existing test-infrastructure bug was found (`07` §11.3, finding 4).
 
 | | |
 |---|---|

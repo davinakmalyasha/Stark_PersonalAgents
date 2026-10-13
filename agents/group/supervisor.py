@@ -37,6 +37,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from . import criteria as criteria_mod
 from . import events as ev
@@ -63,6 +64,19 @@ class ProjectContext:
     autonomy: dict = field(default_factory=dict)
     manifest_members: list[dict] = field(default_factory=list)
 
+    #: The folder, for capability ops that edit files rather than rows.
+    paths: Any = None
+    #: Injection points for materialising NEW capabilities (Phase 3). Kept
+    #: here rather than imported so `agents/group/` stays importable without
+    #: the whole agent stack.
+    spec_lookup: Callable[[str], Any] | None = None
+    profile_lookup: Callable[[str], Any] | None = None
+    skill_lookup: Callable[[str], Any] | None = None
+    mcp_catalogue: dict = field(default_factory=dict)
+    #: Optional `(criterion, root) -> (bool, str)` for `llm` criteria. With no
+    #: judge an `llm` criterion is `unsupported`, never guessed.
+    judge: Callable[..., Any] | None = None
+
     def member_chat_id(self, member_name: str) -> str:
         """One durable chat per member (``02`` section 8).
 
@@ -75,17 +89,40 @@ class ProjectContext:
         names = list(self.members)
         return names[0] if names else None
 
+    def member_ceiling(self, member_name: str) -> list[str] | None:
+        """The scope map's allowlist for a member, if a lookup is available."""
+        if self.spec_lookup is None:
+            return None
+        agent = self.members.get(member_name) or {}
+        key = str(agent.get("derived_from") or member_name)
+        spec = self.spec_lookup(key)
+        if spec is None:
+            return None
+        return list(getattr(spec, "tools", ()) or ())
+
 #: Consecutive no-event ticks before a project is called stalled (``02`` 6.2).
 STALL_TICKS = 50
 
 #: Fraction of budget at which a one-off warning is emitted.
 BUDGET_WARN_AT = 0.8
 
-#: Op kinds this phase can apply. Anything else is rejected, loudly, with the
-#: op left visible on the board rather than silently dropped.
-_PHASE_1_OPS = frozenset({
+#: Op kinds the supervisor can apply. Anything else is rejected, loudly, with
+#: the op left visible on the board rather than silently dropped.
+_SUPPORTED_OPS = frozenset({
+    # plan
     "add_milestone", "add_item", "update_item", "cancel_item",
     "invalidate_item", "pause", "resume", "close", "set_completion",
+    # members
+    "add_member", "remove_member", "attach_tool",
+    # environment
+    "attach_mcp", "detach_mcp", "attach_skill", "detach_skill",
+})
+
+#: Ops that edit the project FOLDER rather than the database. They still go
+#: through the queue, so there is one writer and one event per change.
+_FOLDER_OPS = frozenset({
+    "add_member", "remove_member", "attach_tool",
+    "attach_mcp", "detach_mcp", "attach_skill", "detach_skill",
 })
 
 
@@ -206,8 +243,8 @@ class Supervisor:
     def _apply_one(self, project_id: str, op: dict) -> None:
         kind = op.get("kind") or ""
         payload = op.get("payload") or {}
-        if kind not in _PHASE_1_OPS:
-            raise OpRejected(f"{kind!r} is not implemented in Phase 1")
+        if kind not in _SUPPORTED_OPS:
+            raise OpRejected(f"{kind!r} is not implemented")
 
         if kind == "pause":
             self.store.append(project_id, ev.PROJECT_PAUSED, "orchestrator")
@@ -220,10 +257,7 @@ class Supervisor:
                               data={"status": payload.get("status") or "done"})
             return
         if kind == "set_completion":
-            # Completion lives on the project row; re-emitting the create event
-            # would rewrite history, so update the projection via a close-free
-            # path: record it as a plan revision carrying the new spec.
-            raise OpRejected("set_completion is Phase 3 (needs completion.json write)")
+            raise OpRejected("set_completion needs a field-level event; deferred")
         if kind == "add_milestone":
             if not str(payload.get("id") or "").strip():
                 raise OpRejected("add_milestone requires an id")
@@ -247,6 +281,124 @@ class Supervisor:
                               item_id=payload["item_id"],
                               data={"reason": payload.get("reason") or "operator"})
             return
+        if kind in _FOLDER_OPS:
+            self._op_capability(project_id, kind, payload)
+            return
+
+    # ── capability ops: these edit the folder, not the database ─────────
+
+    def _op_capability(self, project_id: str, kind: str, payload: dict) -> None:
+        """Apply an environment change to the project folder.
+
+        Still an op: queued, applied by the single writer, and followed by
+        exactly one event. The *file* is the project's own copy, so a change
+        here never touches the catalogue or any other project
+        (``03`` section 3.2).
+        """
+        from . import materialize as mat
+
+        context = self.context_for(project_id) if self.context_for else None
+        paths = getattr(context, "paths", None) if context else None
+        if paths is None:
+            raise OpRejected(f"{kind!r} needs a project folder, which is not configured")
+
+        if kind == "attach_mcp":
+            server = str(payload.get("server") or "")
+            if not server:
+                raise OpRejected("attach_mcp requires a server name")
+            entry = mat.add_mcp_server(
+                paths, context.mcp_catalogue or {}, server,
+                payload.get("overrides"),
+            )
+            self._capability_event(project_id, "mcp", server,
+                                   {"server": server, "tools": entry.get("enabled_tools") or []})
+            return
+
+        if kind == "detach_mcp":
+            server = str(payload.get("server") or "")
+            if not mat.remove_mcp_server(paths, server):
+                raise OpRejected(f"MCP server {server!r} is not attached")
+            self._capability_event(project_id, "mcp", server, {"server": server})
+            return
+
+        if kind == "attach_skill":
+            name = str(payload.get("name") or "")
+            found = (context.skill_lookup or (lambda _n: None))(name)
+            if found is None:
+                raise OpRejected(f"skill {name!r} was not found")
+            mat.add_skill(paths, found)
+            self._capability_event(project_id, "skill", name, {"skill": name})
+            return
+
+        if kind == "detach_skill":
+            name = str(payload.get("name") or "")
+            if not mat.remove_skill(paths, name):
+                raise OpRejected(f"skill {name!r} is not attached")
+            self._capability_event(project_id, "skill", name, {"skill": name})
+            return
+
+        if kind == "attach_tool":
+            member = str(payload.get("member") or "")
+            if not member:
+                raise OpRejected("attach_tool requires a member")
+            tools = [str(t) for t in (payload.get("tools") or [])]
+            if not tools:
+                raise OpRejected("attach_tool requires at least one tool")
+            ceiling = context.member_ceiling(member) if context else None
+            try:
+                agent = mat.set_member_tools(paths, member, tools, ceiling=ceiling)
+            except mat.MaterializationError as exc:
+                raise OpRejected(str(exc)) from exc
+            self._capability_event(project_id, "tools", member,
+                                   {"member": member, "tools": agent.get("tools") or []})
+            return
+
+        if kind == "add_member":
+            name = str(payload.get("name") or "")
+            derived = str(payload.get("derived_from") or "")
+            if not name or not derived:
+                raise OpRejected("add_member requires name and derived_from")
+            spec = (context.spec_lookup or (lambda _k: None))(derived)
+            profile = None if spec is not None else (
+                (context.profile_lookup or (lambda _k: None))(derived))
+            if spec is None and profile is None:
+                raise OpRejected(f"unknown agent {derived!r}")
+            try:
+                agent = (mat.agent_from_spec(
+                            spec, name, model=str(payload.get("model") or ""),
+                            thinking=str(payload.get("thinking") or ""),
+                            tools=payload.get("tools"),
+                            skills=list(payload.get("skills") or []),
+                            mcp=list(payload.get("mcp") or []))
+                         if spec is not None
+                         else mat.agent_from_profile(profile, name))
+                mat.write_agent(agent, paths.agents_dir)
+            except mat.MaterializationError as exc:
+                raise OpRejected(str(exc)) from exc
+            self._capability_event(project_id, "member", name,
+                                   {"member": name, "derived_from": derived})
+            return
+
+        if kind == "remove_member":
+            name = str(payload.get("name") or "")
+            if not mat.remove_agent(paths, name):
+                raise OpRejected(f"member {name!r} does not exist")
+            for item in self.store.items(project_id, status="doing"):
+                if item.get("owner_member") == name:
+                    # Never silently reassign work: release it and let the
+                    # board show that it needs an owner (D-12).
+                    self.store.append(project_id, ev.ITEM_BLOCKED, "supervisor",
+                                      item_id=item["id"],
+                                      data={"reason": "reassignment"})
+            self._capability_event(project_id, "member", name, {"member": name})
+            return
+
+        raise OpRejected(f"{kind!r} is not implemented")  # pragma: no cover
+
+    def _capability_event(self, project_id: str, subject: str, name: str,
+                          data: dict) -> None:
+        self.store.append(project_id, ev.CAPABILITY_CHANGED, "orchestrator",
+                          data={"subject": subject, "name": name, **data})
 
     def _op_add_item(self, project_id: str, payload: dict) -> None:
         milestone_id = str(payload.get("milestone_id") or "")
@@ -514,8 +666,12 @@ class Supervisor:
         Deterministic wherever it can be (``01`` section 4.6). A ``manual``
         criterion parks the item — it stays ``doing`` and counts as a
         legitimate wait, so it never looks like a stall.
+
+        Note this does NOT require a runner. Verification is about criteria,
+        not about executing anything, and a project whose items are driven by
+        hand still needs its results judged.
         """
-        if self.runner is None or self.context_for is None:
+        if self.context_for is None:
             return 0
         context = self.context_for(project_id)
         if context is None:
@@ -530,7 +686,8 @@ class Supervisor:
                     project_id, item, f"run failed: {item['error']}")
                 continue
 
-            evaluation = criteria_mod.evaluate_item(item, context.root)
+            evaluation = criteria_mod.evaluate_item(item, context.root,
+                                                    getattr(context, "judge", None))
             if evaluation.passed:
                 self.store.append(project_id, ev.ITEM_DONE, "supervisor",
                                   item_id=item["id"])

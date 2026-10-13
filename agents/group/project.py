@@ -38,7 +38,9 @@ DEFAULT_PROJECTS_ROOT = os.environ.get("STARK_PROJECTS_ROOT", r"D:\StarkProjects
 SCHEMA = 1
 
 #: Windows drive-qualified path, the most common accidental absolute path.
-_WINDOWS_ABS = re.compile(r"[A-Za-z]:[\\/]")
+#: The lookbehind matters: without it `[A-Za-z]:[\\/]` also matches the `s:/`
+#: inside `https://`, so every URL in the folder reads as an absolute path.
+_WINDOWS_ABS = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
 _UNIX_ABS = re.compile(r"(?<![\w:/])/(?:home|Users|root|var|etc|opt|srv|mnt|tmp)/")
 
 _TEXT_SUFFIXES = (".md", ".json", ".txt", ".yaml", ".yml")

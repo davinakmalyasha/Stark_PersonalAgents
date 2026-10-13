@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
+from typing import Any
 
 #: A criterion that runs a shell command is a capability. Bounded hard.
 COMMAND_TIMEOUT = 120
@@ -205,8 +206,16 @@ _CHECKS = {
 # ── entry points ────────────────────────────────────────────────────────────
 
 
-def evaluate_criterion(criterion: dict, root: str) -> Result:
-    """Evaluate one criterion. Never raises — a bad criterion is a FAIL."""
+def evaluate_criterion(criterion: dict, root: str,
+                       judge: Any = None) -> Result:
+    """Evaluate one criterion. Never raises — a bad criterion is a FAIL.
+
+    ``judge`` is an optional callable ``(criterion, root) -> (bool, str)`` for
+    the ``llm`` kind. It is injected rather than imported so that the
+    supervisor's tick stays free of any model dependency (RT-01): the app
+    wires a real judge, tests wire a fake, and with no judge at all an ``llm``
+    criterion is reported ``unsupported`` rather than guessed.
+    """
     if not isinstance(criterion, dict):
         return Result({"kind": "?"}, FAIL, f"malformed criterion: {criterion!r}")
     kind = str(criterion.get("kind") or "check").lower()
@@ -215,8 +224,19 @@ def evaluate_criterion(criterion: dict, root: str) -> Result:
         return Result(criterion, PENDING,
                       str(criterion.get("prompt") or "awaiting human review"))
     if kind == "llm":
-        return Result(criterion, UNSUPPORTED,
-                      "llm criteria arrive in Phase 3")
+        if judge is None:
+            return Result(criterion, UNSUPPORTED,
+                          "llm criterion with no judge configured")
+        try:
+            verdict = judge(criterion, root)
+        except Exception as exc:  # noqa: BLE001 - a broken judge is not a pass
+            return Result(criterion, FAIL, f"judge error: {type(exc).__name__}: {exc}")
+        if isinstance(verdict, tuple):
+            passed, detail = bool(verdict[0]), str(verdict[1] if len(verdict) > 1 else "")
+        else:
+            passed, detail = bool(verdict), ""
+        return Result(criterion, PASS if passed else FAIL,
+                      detail or ("judged acceptable" if passed else "judged unacceptable"))
     if kind == "budget":
         return Result(criterion, PASS, "budget is enforced by the gate")
 
@@ -232,12 +252,12 @@ def evaluate_criterion(criterion: dict, root: str) -> Result:
         return Result(criterion, FAIL, f"{type(exc).__name__}: {exc}")
 
 
-def evaluate_item(item: dict, root: str) -> Evaluation:
+def evaluate_item(item: dict, root: str, judge: Any = None) -> Evaluation:
     """Evaluate every criterion on an item. An item with none fails."""
     criteria = item.get("acceptance") or []
     if not criteria:
         return Evaluation([Result({}, FAIL, "item has no acceptance criteria")])
-    return Evaluation([evaluate_criterion(c, root) for c in criteria])
+    return Evaluation([evaluate_criterion(c, root, judge) for c in criteria])
 
 
 def describe(criterion: dict) -> str:

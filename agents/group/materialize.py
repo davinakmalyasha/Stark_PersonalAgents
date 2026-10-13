@@ -360,3 +360,144 @@ def write_deps(deps: dict, dest_dir: str) -> list[str]:
             handle.write(json.dumps(payload, indent=2) + "\n")
         written.append(path)
     return written
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Live capability changes (Phase 3)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The orchestrator can change a RUNNING project's capability set: add an MCP
+# server, copy a skill in, widen (never widen past the ceiling) a member's
+# tools. These helpers edit the folder; the caller turns each into an op so
+# there is still exactly one writer and one event per change.
+
+
+def read_json(path: str, default: Any = None) -> Any:
+    if not os.path.isfile(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def read_agents(agents_dir: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not os.path.isdir(agents_dir):
+        return out
+    for filename in sorted(os.listdir(agents_dir)):
+        if not filename.endswith(".json"):
+            continue
+        data = read_json(os.path.join(agents_dir, filename))
+        if isinstance(data, dict) and data.get("name"):
+            out[data["name"]] = data
+    return out
+
+
+def add_mcp_server(paths: Any, catalogue: dict, server: str,
+                   overrides: dict | None = None) -> dict:
+    """Attach one server to the project. Credentials stay names (DM-10)."""
+    current = read_json(os.path.join(paths.mcp_dir, "servers.json"), {}) or {}
+    servers = dict(current.get("servers") or {})
+    if server in servers:
+        return servers[server]
+    if not servers:
+        os.makedirs(paths.mcp_dir, exist_ok=True)
+    selected = select_mcp_servers(catalogue, [server], {server: overrides or {}})
+    servers[server] = selected[server]
+    write_mcp_servers(servers, paths.mcp_dir)
+    return servers[server]
+
+
+def remove_mcp_server(paths: Any, server: str) -> bool:
+    current = read_json(os.path.join(paths.mcp_dir, "servers.json"), {}) or {}
+    servers = dict(current.get("servers") or {})
+    if server not in servers:
+        return False
+    servers.pop(server)
+    write_mcp_servers(servers, paths.mcp_dir)
+    return True
+
+
+def add_skill(paths: Any, skill: dict) -> str:
+    path = copy_skill(skill, paths.skills_dir)
+    index = read_json(os.path.join(paths.skills_dir, "index.json"), {}) or {}
+    entries = [e for e in (index.get("skills") or [])
+               if e.get("name") != skill.get("name")]
+    entries.append({"name": skill.get("name"),
+                    "description": skill.get("description") or "",
+                    "allowed_tools": list(skill.get("allowed_tools") or [])})
+    os.makedirs(paths.skills_dir, exist_ok=True)
+    with open(os.path.join(paths.skills_dir, "index.json"), "w",
+              encoding="utf-8", newline="\n") as handle:
+        handle.write(dumps({"schema": SCHEMA, "skills": entries}))
+    return path
+
+
+def remove_skill(paths: Any, name: str) -> bool:
+    import shutil
+
+    target = os.path.join(paths.skills_dir, name)
+    if not os.path.isdir(target):
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    index_path = os.path.join(paths.skills_dir, "index.json")
+    index = read_json(index_path, {}) or {}
+    entries = [e for e in (index.get("skills") or []) if e.get("name") != name]
+    with open(index_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(dumps({"schema": SCHEMA, "skills": entries}))
+    return True
+
+
+def set_member_tools(paths: Any, member: str, tools: list[str],
+                     *, ceiling: list[str] | None = None) -> dict:
+    """Narrow or extend a member's tools — but never past the ceiling.
+
+    ``ceiling`` is the scope map's allowlist for the member's ``derived_from``.
+    A project may only ever intersect it (``04`` section 5), so a hand-edited
+    binding cannot grant a tool the agent never had.
+    """
+    agent_path = os.path.join(paths.agents_dir, f"{member}.json")
+    agent = read_json(agent_path)
+    if not isinstance(agent, dict):
+        raise MaterializationError(f"member {member!r} has no materialised agent")
+    wanted = list(tools)
+    if ceiling is not None:
+        allowed = [t for t in wanted if t in ceiling]
+        dropped = sorted(set(wanted) - set(allowed))
+        if dropped:
+            raise MaterializationError(
+                f"tools {dropped} are outside {member!r}'s scope ceiling; a "
+                f"project may narrow capabilities, never widen them"
+            )
+        wanted = allowed
+    agent["tools"] = wanted
+    write_agent(agent, paths.agents_dir)
+
+    bindings_path = os.path.join(paths.tools_dir, "bindings.json")
+    bindings = read_json(bindings_path, {}) or {}
+    agents = dict(bindings.get("agents") or {})
+    entry = dict(agents.get(member) or {})
+    entry["allow"] = wanted
+    entry.setdefault("caps", agent.get("tool_caps") or {})
+    entry["derived_from"] = agent.get("derived_from") or ""
+    agents[member] = entry
+    os.makedirs(paths.tools_dir, exist_ok=True)
+    with open(bindings_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(dumps({"schema": SCHEMA, "agents": agents}))
+    return agent
+
+
+def remove_agent(paths: Any, member: str) -> bool:
+    agent_path = os.path.join(paths.agents_dir, f"{member}.json")
+    if not os.path.isfile(agent_path):
+        return False
+    os.remove(agent_path)
+    bindings_path = os.path.join(paths.tools_dir, "bindings.json")
+    bindings = read_json(bindings_path, {}) or {}
+    agents = dict(bindings.get("agents") or {})
+    if agents.pop(member, None) is not None:
+        with open(bindings_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(dumps({"schema": SCHEMA, "agents": agents}))
+    return True

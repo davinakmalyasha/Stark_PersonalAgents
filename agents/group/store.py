@@ -306,6 +306,13 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
         # not change shape.
         return touched
 
+    if kind == ev.CAPABILITY_CHANGED:
+        # The capability files (agents/, skills/, tools/, mcp/) are the
+        # folder's own truth, not projections of this log — so there is
+        # nothing to reduce. It is still an event, so the change is auditable
+        # and replayable without raising.
+        return touched
+
     # ── milestones ───────────────────────────────────────────────────────
     if kind == ev.MILESTONE_CREATED:
         milestone = _new_milestone(

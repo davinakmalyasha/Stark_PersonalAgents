@@ -97,6 +97,11 @@ REDUCED_KINDS = frozenset({
     OP_SUBMITTED, OP_APPLIED, OP_REJECTED,
     LEASE_EXPIRED, BUDGET_WARN, BUDGET_STOP, DEADLINE_REACHED,
     APPROVAL_REQUESTED, APPROVAL_GRANTED, APPROVAL_REJECTED,
+    # A capability change edits the FOLDER (agents/, skills/, tools/, mcp/),
+    # which is the folder's own truth and not a projection of the log. It is
+    # reduced as a no-op so replay never raises, while remaining a first-class
+    # event that the audit trail and the UI both see.
+    CAPABILITY_CHANGED,
 })
 
 #: A parked item keeps its status but carries this reason, so the stall

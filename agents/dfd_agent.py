@@ -160,8 +160,7 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         )
         return reply, calls, []
 
-    # Paid path — static per-role thinking: DFD=high.
-    effort_override = "high"
+    # Paid path — thinking comes from the agent registry (DFD: high).
 
     # Native agent (Track B): pydantic-ai executes tools internally (default).
     # A4: the legacy single-turn registry path (PAI_NATIVE_TOOLS=0) is removed;
@@ -171,7 +170,6 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         messages=list(history),
         tools=native_tools,
         temp=0.2,
-        reasoning_effort=effort_override,
         where=where_tag,
         deps=deps,
         system_prompt=system_prompt,
@@ -487,9 +485,10 @@ def run_dfd_direct(prompt: str, chat_id: str = "", images: list | None = None):
     except Exception as e:
         import traceback
 
+        print(f"[DFD Error] {e}\n{traceback.format_exc()}", flush=True)
         safe_update_state({
             "error": str(e),
-            "live_terminal_log": f"[DFD Error] {e}\n{traceback.format_exc()}",
+            "live_terminal_log": f"[DFD Error] {e}",
         })
         yield json.loads(safe_serialize_state())
 
@@ -525,7 +524,8 @@ def dfd_node(s: ITState) -> dict:
         import traceback
 
         tb = traceback.format_exc()
-        _log(f"[DFD CRASH] {e}\n{tb}")
+        print(f"[DFD CRASH] {e}\n{tb}", flush=True)
+        _log(f"[DFD CRASH] {e}")
         safe_append_live_log(f"\n[DFD CRASH] {e}")
         return {
             "messages": [],

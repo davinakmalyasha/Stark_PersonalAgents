@@ -258,8 +258,9 @@ def run_ui_design_direct(prompt: str, workspace_path: str = "",
                           "design_child_id": child_id})
     except Exception as e:
         import traceback
+        print(f"[{_AGENT_NAME} Error] {e}\n{traceback.format_exc()}", flush=True)
         yield from _snap(
-            f"[{_AGENT_NAME} Error] {e}\n{traceback.format_exc()}",
+            f"[{_AGENT_NAME} Error] {e}",
             {"agent_report": f"ERROR: UI design session failed: {e}",
              "design_child_id": child_id},
         )

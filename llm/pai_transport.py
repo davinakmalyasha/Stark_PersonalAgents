@@ -426,6 +426,30 @@ def _emit_stream(role: str, kind: str, text: str, where: str) -> None:
         pass
 
 
+def _emit_tool_frame(role: str, kind: str, tool: str, args_json: str = "",
+                     ok: bool | None = None, ms: int = 0, preview: str = "",
+                     chat_id: str = "") -> None:
+    """Structured tool-lifecycle frame (tool_started/tool_finished) for the
+    Codex-style step pills. Best-effort: never raises, no-ops without a chat."""
+    try:
+        from server.realtime.bus import emit_event as _bus_emit_event
+        from llm.llm import _effective_stream_chat_id
+        cid = chat_id or _effective_stream_chat_id()
+        if not cid:
+            return
+        _bus_emit_event(cid, {
+            "kind": kind,
+            "tool": str(tool or ""),
+            "args": str(args_json or ""),
+            "ok": ok,
+            "ms": int(ms or 0),
+            "text": str(preview or "")[:300],
+            "agent": role or "",
+        })
+    except Exception:
+        pass
+
+
 def _run_coro_blocking(coro):
     """Sync↔async bridge — see llm/native_tools._run_coro_blocking for rationale.
 

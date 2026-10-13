@@ -19,6 +19,7 @@ from __future__ import annotations
 import inspect
 import os
 import re
+import time
 from typing import Any, Optional
 
 from decimal import Decimal
@@ -364,6 +365,22 @@ def _before_tool_validate(
     return args
 
 
+def _registry_thinking(role: str) -> Optional[str]:
+    """Registry thinking profile for a role (None = built-in role buckets).
+
+    Byte-compat: the registry specs carry today's literal values
+    (Developer/DFD high, General/House low); an explicit caller effort always
+    wins, and any lookup failure falls back to `_build_model_settings` buckets.
+    """
+    try:
+        from agents.workspace_registry import get_profile
+
+        value = str(get_profile(role).get("thinking") or "inherit").strip().lower()
+        return None if value in ("", "inherit") else value
+    except Exception:
+        return None
+
+
 def _on_model_request_error(ctx: RunContext[WorkspaceDeps], *, request_context: Any, error: Exception) -> Any:
     """P0-5: surface 429/retry_after for logging; let tenacity/HTTPX handle retry."""
     try:
@@ -377,6 +394,33 @@ def _on_model_request_error(ctx: RunContext[WorkspaceDeps], *, request_context: 
                 from llm.llm import log_terminal
 
                 log_terminal(f"[model_request_error:{ctx.deps.role}] retryable={err_str[:200]} retry_after={retry_after}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Context-window overflow diagnostics: the window-aware ProcessHistory
+    # trigger should keep requests below the limit; when a provider still
+    # rejects, say exactly why so the run fails loudly instead of silently.
+    try:
+        from llm.free_providers import _is_context_window_error
+        from llm.model_history import estimate_history_tokens
+
+        err_str = str(error) or str(getattr(error, "body", "") or "")
+        if _is_context_window_error(error):
+            est = 0
+            try:
+                est = estimate_history_tokens(getattr(ctx, "messages", []) or [])
+            except Exception:
+                pass
+            try:
+                from llm.llm import log_terminal
+
+                log_terminal(
+                    f"[context-overflow:{ctx.deps.role}] estimated={est:,} tok "
+                    f"window={getattr(ctx.deps, 'context_window', 0):,} — "
+                    f"compaction will fire on the next request if history fits; "
+                    f"error={err_str[:200]}"
+                )
             except Exception:
                 pass
     except Exception:
@@ -809,6 +853,7 @@ async def arun_native_agent(
     from llm.pai_transport import _build_model_settings, _model_profile_for
 
     deps = deps or WorkspaceDeps.from_shared_state(role=role)
+    model_id = ""
 
     if model is None or isinstance(model, str):
         cfg = deps.llm_provider or _resolve_provider_cfg()
@@ -822,6 +867,10 @@ async def arun_native_agent(
             # here instead of letting pydantic-ai infer it (it requires
             # "provider:model" and would raise UserError).
             model_id = _model_name(model)
+        if reasoning_effort is None:
+            # Registry profile when the caller passes no explicit effort;
+            # "inherit" -> None keeps the legacy per-role bucket mapping.
+            reasoning_effort = _registry_thinking(role)
         settings = _build_model_settings(role, model_id, temp, reasoning_effort, reasoning_budget)
         profile = _model_profile_for(model_id)
         from pydantic_ai.models.openai import OpenAIChatModel
@@ -831,6 +880,19 @@ async def arun_native_agent(
             model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings, profile=profile)
         else:
             model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
+
+    # Window-aware compaction: publish the resolved model's context window on
+    # deps so the ProcessHistory processor clamps its trigger below the model
+    # limit (a 256k laguna specialist must compact around ~200k, not 400k).
+    try:
+        from llm.model_history import window_for_model
+
+        if not getattr(deps, "context_window", 0) and isinstance(model_id, str) and model_id:
+            _win = window_for_model(model_id)
+            if _win > 0:
+                deps.context_window = int(_win)
+    except Exception:
+        pass
 
     # ── Per-request profiler (PAI_REQ_PROFILE=1) ─────────────────────────────
     # Wraps the model's request methods so EVERY model request records:
@@ -939,6 +1001,8 @@ async def arun_native_agent(
 
     events_log: list[dict] = []
     _text_start_seen_nt: dict[int, str] = {}
+    # tool_call_id -> (start_monotonic, tool_name, args_json) for ms + finish matching
+    _tool_start_nt: dict[str, tuple] = {}
     _tel_debug_on = os.getenv("PAI_TEL_DEBUG", "0") == "1"
 
     def _tel_dbg():
@@ -952,12 +1016,48 @@ async def arun_native_agent(
             return None
 
     def _on_event(ctx, event):
+        from llm.pai_transport import _emit_tool_frame
         from pydantic_ai.messages import (
             PartStartEvent, PartDeltaEvent, TextPart, ThinkingPart,
             TextPartDelta, ThinkingPartDelta,
+            FunctionToolCallEvent, FunctionToolResultEvent, ToolReturnPart,
         )
         try:
-            if isinstance(event, PartStartEvent):
+            if isinstance(event, FunctionToolCallEvent):
+                part = event.part
+                cid = event.tool_call_id or ""
+                tname = str(getattr(part, "tool_name", "") or "")
+                try:
+                    import json as _json
+                    pargs = getattr(part, "args", {})
+                    args_json = pargs if isinstance(pargs, str) else _json.dumps(pargs or {}, default=str)
+                except Exception:
+                    args_json = ""
+                _tool_start_nt[cid] = (time.monotonic(), tname, args_json[:500])
+                if stream_emit:
+                    _emit_tool_frame(role, "tool_started", tname, args_json[:500],
+                                     chat_id=getattr(deps, "chat_id", "") or "")
+            elif isinstance(event, FunctionToolResultEvent):
+                part = event.part
+                cid = getattr(part, "tool_call_id", "") or ""
+                started = _tool_start_nt.pop(cid, None)
+                ms = int((time.monotonic() - started[0]) * 1000) if started else 0
+                tname = started[1] if started else str(getattr(part, "tool_name", "") or "")
+                args_json = started[2] if started else ""
+                if isinstance(part, ToolReturnPart):
+                    content = part.content
+                    preview = content if isinstance(content, str) else str(content or "")
+                    bad = preview.lstrip().startswith(
+                        ("Error:", "Error ", "[ERR]", "[ERROR]", "[BLOCKED]"))
+                    ok: bool | None = not bad
+                else:
+                    preview = str(getattr(part, "content", "") or "") or "validation retry requested"
+                    ok = False
+                if stream_emit:
+                    _emit_tool_frame(role, "tool_finished", tname, args_json,
+                                     ok=ok, ms=ms, preview=preview[:300],
+                                     chat_id=getattr(deps, "chat_id", "") or "")
+            elif isinstance(event, PartStartEvent):
                 if isinstance(event.part, ThinkingPart):
                     c = event.part.content or ""
                     if _tel_debug_on:

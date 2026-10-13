@@ -17,6 +17,53 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.tools import RunContext
 
 
+def policy_for_deps(deps: Any):
+    """Compaction policy for one run's deps.
+
+    Precedence: shared policy keyed by the real role name (specialists keep
+    their own key), then the registry spec's ``compaction`` overrides, then a
+    window clamp (75% trigger / 85% hard) so a sub-400k model compacts before
+    the provider rejects the request (a 256k laguna specialist triggers ~196k).
+    """
+    from memory.context_compaction import CompactionPolicy, get_compaction_policy
+
+    role = getattr(deps, "role", "") or "developer"
+    policy = get_compaction_policy(str(role) or "developer")
+
+    overrides = getattr(deps, "compaction", None) or {}
+    if overrides:
+        def _ov(name: str, fallback: int) -> int:
+            try:
+                value = int(overrides.get(name) or 0)
+                return value if value > 0 else fallback
+            except Exception:
+                return fallback
+
+        policy = CompactionPolicy(
+            role=policy.role,
+            checkpoint_trigger=_ov("checkpoint_tokens", policy.checkpoint_trigger),
+            hard_limit=_ov("hard_limit", policy.hard_limit),
+            summary_output_tokens=_ov("summary_output_tokens", policy.summary_output_tokens),
+        )
+
+    return clamp_policy(policy, int(getattr(deps, "context_window", 0) or 0))
+
+
+def clamp_policy(policy, window: int):
+    """Clamp a compaction policy below a model window (75% trigger / 85% hard)."""
+    window = int(window or 0)
+    if window <= 0:
+        return policy
+    from memory.context_compaction import CompactionPolicy
+
+    return CompactionPolicy(
+        role=policy.role,
+        checkpoint_trigger=min(policy.checkpoint_trigger, max(4096, int(window * 0.75))),
+        hard_limit=min(policy.hard_limit, max(8192, int(window * 0.85))),
+        summary_output_tokens=policy.summary_output_tokens,
+    )
+
+
 def _trim_stale_thinking(messages: list[ModelMessage]) -> list[ModelMessage]:
     """Drop old chain-of-thought from history while keeping the API contract.
 
@@ -134,15 +181,9 @@ async def native_history_processor(
             pass
     try:
         from llm.model_history import compact_history_native, estimate_history_tokens
-        from memory.context_compaction import get_compaction_policy
 
-        role = getattr(getattr(ctx, "deps", None), "role", "") or "developer"
-        # Normalize role: Orchestrator -> orchestrator, Developer -> developer, etc.
-        role_key = str(role).lower() if isinstance(role, str) else "developer"
-        # Map WorkspaceDeps roles to policy keys
-        if role_key not in ("developer", "orchestrator", "general", "house", "dfd"):
-            role_key = "developer"
-        policy = get_compaction_policy(role_key)
+        _deps = getattr(ctx, "deps", None)
+        policy = policy_for_deps(_deps)
         est = estimate_history_tokens(messages)
         if est < policy.checkpoint_trigger and est < policy.hard_limit:
             return messages

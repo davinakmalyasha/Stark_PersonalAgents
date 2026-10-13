@@ -45,7 +45,8 @@ instructions. Keep secrets out of source, logs, and reports.
 
 ## Loop
 1. Locate & Read: check projectMap/search_code; read minimum necessary code,
-   tests, and callers.
+   tests, and callers. When the read-set is unknown or spans many files, spawn
+   Explore (call_subagent) for recon instead of reading everything yourself.
 2. Complete Edit: implement the full solution wired end-to-end; match project
    patterns; no stubs.
 3. Verify & Repair: run focused checks (tests, build, the app itself). If a

@@ -764,6 +764,23 @@ def _get_models_for_capability(
     return [m[3] for m in matches]
 
 
+def likely_min_window(capability: str = "coding", prefer_reasoning: bool | None = None,
+                      top_n: int = 3) -> int:
+    """Smallest context window among the top-ranked pool candidates (0 = unknown).
+
+    Pure ranking only (no rate-state touched). Spawners clamp compaction below
+    what the likely models can accept; ``top_n`` covers the primary pick plus
+    the most likely fallbacks.
+    """
+    try:
+        models = _get_models_for_capability(capability, prefer_reasoning=prefer_reasoning)
+        windows = [int(m.get("context", 0) or 0) for m in models[:max(1, int(top_n))]]
+        windows = [w for w in windows if w > 0]
+        return min(windows) if windows else 0
+    except Exception:
+        return 0
+
+
 def model_context_window(model_id: str, default: int = 0) -> int:
     """Largest catalog context window for a model id.
 
@@ -1451,7 +1468,9 @@ def _free_turn_emitters(name: str, chat_id: str):
 
         def on_reasoning(t, _c=chat_id, _n=name, _e=_bus_emit):
             try:
-                _e(_c, "thinking", t, agent=_n)
+                # "reasoning" is the kind the frontend stream accumulates;
+                # "thinking" frames were silently dropped (invisible thought).
+                _e(_c, "reasoning", t, agent=_n)
             except Exception:
                 pass
 

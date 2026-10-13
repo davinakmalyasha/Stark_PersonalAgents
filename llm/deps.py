@@ -39,6 +39,13 @@ class WorkspaceDeps:
     llm_provider: Optional[dict] = None
     allowed_tools: Optional[list[str]] = None
     pending_images: Optional[list] = None
+    #: Resolved model context window (0 = unknown) — compaction clamps below it.
+    context_window: int = 0
+    #: Registry spec compaction overrides {checkpoint_tokens, hard_limit,
+    #: summary_output_tokens} (empty = shared policy).
+    compaction: Optional[dict] = None
+    #: Per-agent tool output caps {tool_name: chars} (empty = global defaults).
+    tool_caps: Optional[dict] = None
 
     def __post_init__(self) -> None:
         if not self.project_path:

@@ -208,6 +208,35 @@ def history_to_debug_text(history: list[ModelMessage]) -> str:
 
 # ── Native compaction helpers (A6b/A7) ────────────────────────────────────
 
+#: Paid canonical models with their known context windows.
+_PAID_WINDOWS = {
+    "deepseek-v4.1-flash": 1_000_000,
+    "deepseek-v4.1-vision": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+}
+
+
+def window_for_model(model_id: str) -> int:
+    """Best-effort context window for a model id (0 = unknown, no clamp).
+
+    Free-pool models resolve from config/free_catalog.json; paid canonical
+    slugs use the static map above. Callers clamp the compaction trigger to
+    this value so a 256k model compacts long before the provider rejects.
+    """
+    m = str(model_id or "").strip().lower()
+    if not m:
+        return 0
+    for key, win in _PAID_WINDOWS.items():
+        if key in m:
+            return int(win)
+    try:
+        from llm.free_providers import model_context_window
+
+        return int(model_context_window(m, 0) or 0)
+    except Exception:
+        return 0
+
+
 def compact_history_native(
     history: list[ModelMessage],
     *,

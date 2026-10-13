@@ -18,6 +18,7 @@ No langchain imports in this module (fixed-concept banned list).
 """
 import json
 import os
+from contextvars import ContextVar
 
 from dotenv import load_dotenv
 
@@ -28,6 +29,11 @@ load_dotenv(override=True)
 # Override to route DeepSeek calls through a compatible gateway (e.g. OpenCode Go:
 # DEEPSEEK_BASE_URL=https://opencode.ai/zen/go/v1 with OPENCODE_API_KEY set) temporarily.
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# A delegated workspace run executes in its own thread and must publish its
+# reasoning/text/tool frames to its own chat.  The parent orchestrator remains
+# the default when no override is active.
+stream_chat_override: ContextVar[str] = ContextVar("stream_chat_override", default="")
 
 
 def log_terminal(msg: str) -> None:
@@ -100,7 +106,7 @@ def _resolve_llm_provider() -> dict:
             "flash": os.getenv("COMMAND_CODE_MODEL_FLASH", "deepseek/deepseek-v4.1-flash"),
             "pro": os.getenv("COMMAND_CODE_MODEL_PRO", "deepseek/deepseek-v4.1-flash"),
             "vision": os.getenv("COMMAND_CODE_MODEL_VISION", "deepseek/deepseek-v4.1-flash"),
-            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "xiaomi/mimo-v2.5"),
+            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "xiaomi/mimo-v2.6-flash"),
             "light": os.getenv("COMMAND_CODE_MODEL_LIGHT", "poolside/laguna-s-2.1-free"),
             "audio": os.getenv("COMMAND_CODE_MODEL_AUDIO", "xiaomi/mimo-v2.5"),
         }
@@ -130,7 +136,7 @@ def _map_model(model: str) -> str:
     Accepts both the colon slug used by agent constants (``deepseek:v4.1-flash``)
     and the dash canonical (``deepseek-v4.1-flash``). The official alias
     ``deepseek-flash`` maps to the same slot. Org-scoped slugs
-    (``deepseek/deepseek-v4.1-flash``, ``xiaomi/mimo-v2.5``) pass through.
+    (``deepseek/deepseek-v4.1-flash``, ``xiaomi/mimo-v2.6-flash``) pass through.
     """
     cfg = _resolve_llm_provider()
     if "/" in model:
@@ -242,7 +248,15 @@ def _is_retryable_http_error(err_str: str) -> bool:
 
 
 def _effective_stream_chat_id() -> str:
-    """Active chat id for StreamBus emission (global shared_state)."""
+    """Return the chat that owns the current StreamBus frame.
+
+    Delegated agents set ``stream_chat_override`` for the duration of their
+    run.  Falling back to shared state preserves the existing direct-run
+    behavior for the root orchestrator/general/house surfaces.
+    """
+    overridden = stream_chat_override.get()
+    if overridden:
+        return str(overridden)
     try:
         from sync.state_sync import shared_state
         return str(shared_state.get("chat_id") or "")

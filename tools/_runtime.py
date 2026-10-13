@@ -26,6 +26,10 @@ except ImportError:
 
 active_permissions: ContextVar[Optional[list[FilesystemPermission]]] = ContextVar("active_permissions", default=None)
 
+#: Per-agent output caps (chars) set by the spawner from the agent registry.
+#: Consumed by _tool_cap; None = global defaults.
+active_tool_caps: ContextVar[Optional[dict]] = ContextVar("active_tool_caps", default=None)
+
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -121,7 +125,6 @@ _TOOL_CAP_DEFAULTS = {
     # Character caps (not bytes), applied centrally in execute_tool_detailed.
     # Full output past a cap is offloaded to /scratch/large_tool_results/.
     "read_file": 50000,
-    "outline": 16000,
     "search_code": 16000,
     "ast_search": 16000,
     "edit_file": 10000,
@@ -150,7 +153,21 @@ def _tool_cap(site: str) -> int:
     key = _CAP_KEY_ALIASES.get(key, key)
     default = _TOOL_CAP_DEFAULTS.get(key, 16000)
     env_name = f"CAP_{key.upper()}"
-    return int(os.environ.get(env_name, str(default)))
+    env_val = os.environ.get(env_name)
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except Exception:
+            pass
+    caps = active_tool_caps.get()
+    if caps:
+        v = caps.get(key)
+        try:
+            if v is not None:
+                return int(v)
+        except Exception:
+            pass
+    return default
 
 def _create_budgeted_preview(content_str: str, max_chars: int = 8000,
                              head_ratio: float = 0.25, min_lines: int = 4) -> str:

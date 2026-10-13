@@ -105,7 +105,7 @@ def create_project(name: str, concept: str, wait: bool = True, parent_root: str 
             f"[OK] Project '{entry.get('name')}' already has a durable Dev agent.\n"
             f"Chat: {entry.get('chat_id')}\n"
             f"Dev agent: {entry.get('child_id')}\n"
-            "Use resume_project(name, message) to continue it."
+            "Use delegate with project='<name>' to continue it."
         )
     lines = [
         f"[OK] Project '{entry.get('name')}' created.",
@@ -127,44 +127,3 @@ def create_project(name: str, concept: str, wait: bool = True, parent_root: str 
             str(entry.get("first_reply", "")),
         ]
     return "\n".join(lines)
-
-def list_projects_tool() -> list:
-    from agents.project_router import list_projects as _lp
-    try:
-        return _lp()
-    except Exception:
-        return []
-
-def resume_project(name: str, message: str, timeout: int = 1800) -> str:
-    """One-call resume: resolve project and deliver message to its durable Dev.
-
-    Replaces find_project_dev + send_message (+ list_agents for discovery).
-    Returns the Dev reply or a [NOT FOUND] with available project names.
-    """
-    from tools import shared_state, _HARNESS_ROOT
-    from agents.project_router import find_project_dev as _find
-    from agents.subagent_manager import send_message as _sm
-    # resolve
-    try:
-        info = _find(name)
-    except Exception as e:
-        return f"Error: {e}"
-    if not info:
-        available = ", ".join(p.get("name", "") for p in list_projects_tool()) or "none"
-        return f"[NOT FOUND] No registered project matches '{name}'. Available projects: {available}"
-    child_id = info.get("child_id", "")
-    if not child_id:
-        return f"Error: project '{info.get('name')}' has no durable Dev agent."
-    ws = shared_state.get("project_path") or _HARNESS_ROOT
-    # Prefer the project's own workspace if available
-    ws = info.get("workspace_path") or ws
-    try:
-        r = _sm(child_id, message, ws, timeout=float(timeout or 1800))
-    except Exception as e:
-        return f"Error: {e}"
-    if r.get("queued"):
-        return f"[OK] Message queued for {child_id} (child is running; it will process it at its next step)."
-    if r.get("status") == "error":
-        return r.get("result", f"Error: unknown continuable child '{child_id}'")
-    reply = r.get("result", "")
-    return f"[OK] {child_id} replied:\n{reply}"

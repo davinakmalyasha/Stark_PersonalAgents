@@ -15,7 +15,7 @@ read_pdf, ask_user, update_plan, propose_plan, plus all the existing
 read-only registry calls.
 
 Write-class tool blocklist (deliberately narrow): edit_file, create_project,
-resume_project, github_apply_gate, house_set_device, house_run_scene,
+github_apply_gate, house_set_device, house_run_scene,
 create_docx, create_xlsx, delegate, call_subagent.
 
 run_command is not blanket-blocked in plan mode: each call is checked by
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 # Tools blocked in plan mode.
 WRITE_CLASS_TOOLS: frozenset[str] = frozenset({
-    "edit_file", "create_project", "resume_project",
+    "edit_file", "create_project",
     "github_apply_gate", "house_set_device", "house_run_scene",
     "create_docx", "create_xlsx",
     "delegate", "call_subagent",

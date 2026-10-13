@@ -68,6 +68,8 @@ class ToolExecutionResult:
             "[ERR]",
             "[ERROR]",
             "[BLOCKED]",
+            "[REJECTED]",
+            "[NOT FOUND]",
             "Tool execution error",
         ))
         # The [OK]/[ERR] tag is authoritative; exit code is only a fallback.
@@ -146,6 +148,30 @@ def _cap_tool_result(res: ToolExecutionResult) -> ToolExecutionResult:
     return replace(res, content=capped, offloaded=True)
 
 
+def _emit_tool_frame_lazy(deps: Any, kind: str, name: str, args: Any = None,
+                          ok: Any = None, ms: int = 0, preview: str = "") -> None:
+    """Best-effort tool_started/tool_finished frame for the live step pills.
+
+    Lazy imports (this module must not import llm at load time — native_tools
+    imports tools). Silent when there is no chat to attribute to (tests,
+    offline callers).
+    """
+    try:
+        chat_id = getattr(deps, "chat_id", "") or ""
+        if not chat_id:
+            return
+        import json as _json
+        try:
+            args_json = _json.dumps(args or {}, default=str)[:500]
+        except Exception:
+            args_json = ""
+        from llm.pai_transport import _emit_tool_frame
+        _emit_tool_frame(getattr(deps, "role", "") or "", kind, name,
+                         args_json, ok=ok, ms=ms, preview=preview, chat_id=chat_id)
+    except Exception:
+        pass
+
+
 def execute_tool_detailed(
     name: str,
     args: dict,
@@ -158,7 +184,33 @@ def execute_tool_detailed(
     loop already filtered the call against its own allowlist, and the native
     path scopes via ``FilteredToolset``. No hooks, no guards. Results are
     capped at the tool's character budget (full output is offloaded).
+
+    Emits tool_started/tool_finished frames around the call (best-effort) so
+    the UI can render Codex-style live step pills without log scraping.
     """
+    import time as _time
+    _t0 = _time.time()
+    _emit_tool_frame_lazy(deps, "tool_started", name, args)
+    try:
+        res = _execute_tool_detailed_inner(name, args, scope=scope, deps=deps)
+    except Exception as e:
+        _emit_tool_frame_lazy(deps, "tool_finished", name, args,
+                              ok=False, ms=int((_time.time() - _t0) * 1000),
+                              preview=f"Error: {e}"[:300])
+        raise
+    _emit_tool_frame_lazy(deps, "tool_finished", name, args,
+                          ok=not res.is_error, ms=int((_time.time() - _t0) * 1000),
+                          preview=(res.content or "")[:300])
+    return res
+
+
+def _execute_tool_detailed_inner(
+    name: str,
+    args: dict,
+    scope: Optional[str] = None,
+    deps: Any = None,
+) -> ToolExecutionResult:
+    """The actual dispatch (see execute_tool_detailed for the contract)."""
     import tools as _facade
 
     impl = getattr(_facade, name, None)

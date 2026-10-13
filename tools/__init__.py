@@ -51,7 +51,7 @@ from .HouseTool import (
 from .MainTool import (
     _clean_terminal_output, _fmt_args, _log_tool,
     _apply_diff, apply_search_replace, apply_unified_diff, _edit_snippet,
-    edit_file, _write_file, read_file, outline, search_code, ast_search, run_command,
+    edit_file, _write_file, read_file, search_code, ast_search, run_command,
     LocalShellBackend,
     update_plan, get_plan_for_context,
 )
@@ -111,13 +111,14 @@ from .AddOnTool import (
     interrupt_agent,
     report,
     create_project,
-    resume_project,
     _SUBAGENTS_REGISTRY,
     _TASK_DEPTH,
     _MAX_TASK_DEPTH,
     _load_subagents,
     delegate,
     delegation_status,
+    job_message,
+    job_cancel,
 )
 from .AddOnTool.dfdBridge import dfd_bridge as _dfd_bridge_impl
 from agents.client_manager import create_client as _create_client_impl
@@ -210,7 +211,9 @@ from ._runtime import (
     _TOOL_MTIME_MAP,
     WORKSPACE,
     active_permissions,
+    active_tool_caps,
     enforce_fs_permission,
+    FilesystemPermission,
     _increment_cache_version,
     auto_offload_result,
     _tool_cap,

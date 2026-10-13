@@ -57,8 +57,6 @@ from .orchestrationTools import (
     report,
     ask_user,
     create_project,
-    list_projects_tool,
-    resume_project,
 )
 
 from .webTools import (
@@ -89,6 +87,8 @@ from .subagentTools import (
 from .delegationTools import (
     delegate,
     delegation_status,
+    job_message,
+    job_cancel,
 )
 
 from .dfdBridge import dfd_bridge
@@ -144,8 +144,6 @@ __all__ = [
     'report',
     'ask_user',
     'create_project',
-    'list_projects_tool',
-    'resume_project',
     'web_fetch',
     'web_search',
     'capture_workspace_delta',
@@ -164,6 +162,8 @@ __all__ = [
     'subagent_catalog',
     'delegate',
     'delegation_status',
+    'job_message',
+    'job_cancel',
     'dfd_bridge',
     'look_at_screen',
     'set_screen_share',

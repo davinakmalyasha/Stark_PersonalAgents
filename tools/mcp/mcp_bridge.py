@@ -30,7 +30,7 @@ import urllib.request
 from sync.state_sync import safe_update_state, safe_append_live_log
 
 _MCP_PROTOCOL_VERSION = "2025-06-18"
-_CLIENT_INFO = {"name": "vincode-harness", "version": "2.0.0"}
+_CLIENT_INFO = {"name": "stark-harness", "version": "2.0.0"}
 _CONFIG_FILE = "mcp_servers.json"
 _MAX_TOOLS_PER_SERVER = 500
 _INSTRUCTIONS_CAP = 512

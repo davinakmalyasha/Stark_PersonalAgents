@@ -18,25 +18,44 @@ import house_manager as hm
 
 def _fmt_device(d: dict) -> str:
     state = ", ".join(f"{k}={v}" for k, v in d.get("state", {}).items())
-    return f"{d.get('id')} [{d.get('type')}] {d.get('name')} ({d.get('roomId')}): {state}"
+    room = d.get('roomId') or d.get('room', '?')
+    return f"{d.get('id')} [{d.get('type')}] {d.get('name')} ({room}): {state}"
+
+
+def _as_list(value) -> list:
+    """devices/rooms/scenes exist as lists (workspace UI) or dicts (legacy seed)."""
+    if isinstance(value, dict):
+        return list(value.values())
+    return list(value) if isinstance(value, list) else []
 
 
 def house_get_state() -> str:
     """Read the full house state: rooms, devices, scenes, energy, security."""
     state = hm.get_house_state()
-    lines = [f"## House ({len(state.get('rooms', []))} rooms, "
-             f"{len(state.get('devices', []))} devices)"]
+    devices = _as_list(state.get('devices', []))
+    rooms = _as_list(state.get('rooms', []))
+    scenes = _as_list(state.get('scenes', []))
+    lines = [f"## House ({len(rooms)} rooms, "
+             f"{len(devices)} devices)"]
     lines.append(hm.house_summary())
     by_room: dict[str, list[dict]] = {}
-    for d in state.get("devices", []):
-        by_room.setdefault(d.get("roomId", "?"), []).append(d)
-    for room in state.get("rooms", []):
-        lines.append(f"\n### {room.get('name')} ({room.get('id')})")
-        for d in by_room.get(room.get("id", ""), []):
+    for d in devices:
+        if isinstance(d, dict):
+            by_room.setdefault(d.get("roomId") or d.get("room", "?"), []).append(d)
+    for room in rooms:
+        if isinstance(room, dict):
+            rid, rname = room.get("id", ""), room.get("name", "")
+        else:
+            rid, rname = str(room), str(room)
+        lines.append(f"\n### {rname} ({rid})")
+        for d in by_room.get(rid, []):
             lines.append(f"- {_fmt_device(d)}")
     lines.append("\n### Scenes")
-    for s in state.get("scenes", []):
-        lines.append(f"- {s.get('id')} \"{s.get('name')}\" ({len(s.get('actions', []))} actions)")
+    for s in scenes:
+        if not isinstance(s, dict):
+            continue
+        actions = s.get('actions', [])
+        lines.append(f"- {s.get('id')} \"{s.get('name')}\" ({len(actions)} actions)")
     return "\n".join(lines)
 
 

@@ -12,6 +12,7 @@ else falls back to the sequential path, byte-for-byte identical to today.
 from __future__ import annotations
 
 import os
+import contextvars
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from threading import RLock
@@ -28,7 +29,6 @@ from typing import Callable, Iterable
 #: entries for absent tools are inert.
 PARALLEL_SAFE = frozenset({
     "read_file",
-    "outline",
     "search_code",
     "read_pdf",
     "github_search_code",
@@ -111,7 +111,11 @@ def run_tool_calls(
     futures: dict[Future, int] = {}
     with _EXECUTOR_LOCK:
         for idx in safe_idx:
-            fut = pool.submit(execute_one, calls[idx])
+            # Delegated agents carry their chat/state routing in ContextVars.
+            # Copy the caller context into each worker so parallel read-only
+            # tools cannot fall back to the parent run's stream/state target.
+            call_context = contextvars.copy_context()
+            fut = pool.submit(call_context.run, execute_one, calls[idx])
             futures[fut] = idx
     for fut in as_completed(futures):
         idx = futures[fut]

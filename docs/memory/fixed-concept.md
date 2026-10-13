@@ -76,9 +76,10 @@ MCP / workspace" are first-class requirements.
 ### Roles & boundaries
 
 - **Orchestrator** is NOT a coder. Its only "verification" is: did the
-  workspace agent produce what the user asked? It tracks jobs via a plan
-  tracker and job ledger; it can call `delegate`/`delegation_status`,
-  `create_project`/`resume_project`, `ask_user`, plan tools.
+  workspace agent produce what the user asked? Its job tracker is built
+  automatically from the real delegations (no manual plan writing); it can call
+  `delegate`/`delegation_status`/`job_message`/`job_cancel`, `create_project`,
+  `ask_user`, `propose_plan`.
 - **Workspace agents** are single-agent loops: they call tools, get results,
   iterate until the task is done or they hit a limit. They own their
   conversation history, compaction, and session persistence.
@@ -98,21 +99,34 @@ Tools are stored "in a warehouse" instead of being hand-wired per agent.
 1. **Implementation**: a plain Python function (the `execute` body) lives in
    `tools/` (or `tools/AddOnTool/`), with its docstring/params as the schema.
 2. **Registry**: `agents/workspace_registry.py` is the **single source of
-   truth** mapping agent key → allowed tool names, MCP scopes, tier, history
-   namespace. Adding a new agent = adding one `WorkspaceSpec`.
+   truth** for every agent — workspace agents are code entries (`WorkspaceSpec`),
+   specialists are config files (`agents/specialists/*.json`) loaded by the same
+   module. One spec carries: tools/MCP scope, tier + `provider_tier`, model pin,
+   thinking profile, compaction budget, per-agent tool caps, runtime node
+   entrypoint, prompt module, aliases, delegatability, history namespace.
+   Adding an agent = adding one spec (JSON for specialists, one entry for
+   workspace agents) — consumers derive from it, no hardcoded name lists.
 3. **Selection at build time**: an agent gets its tools by looking up the
    registry (scope ACL), never by hand-listing tools in the agent file.
-4. **Per-run scoping**: `WorkspaceDeps` carries the concrete allowlist for a
-   run; pydantic-ai `FilteredToolset` enforces it at tool-build time.
+4. **Per-run scoping**: `WorkspaceDeps` carries the concrete allowlist,
+   compaction overrides, tool caps and resolved context window for a run;
+   pydantic-ai `FilteredToolset` enforces the allowlist at tool-build time and
+   the ProcessHistory processor clamps compaction below the model window.
 5. **MCP servers**: scoped per agent via `scopes` in
    `.deep_agents/mcp_servers.json`; MCP tools are first-class tools in the
-   same warehouse model.
+   same warehouse model. The registry does not duplicate MCP config.
+6. **Consumers read the registry, never name lists**: `tools/_schemas` (scope
+   map + delegate prose), `tools/AddOnTool/subagentTools` (runtime registry +
+   node dispatch), `agents/delegation` (delegatable set, display, node call),
+   `llm/provider_modes` (tier/backend/model), `agents/orchestrator_agent`
+   (specialists block), `agents/subagent_context` (plan scope).
 
 ### What "scale" means here
 
-- New workspace/app = new `WorkspaceSpec` (maybe a new `WorkspaceDeps`
-  factory for its workspace bindings) + system prompt. No touching the
-  orchestrator or other agents.
+- New workspace agent = one `WorkspaceSpec` + its node/prompt modules (runtime
+  behavior stays code; the registry points at it).
+- New specialist = one `agents/specialists/<name>.json` — prompt, tools,
+  skills, model, thinking, compaction, caps, tier. Zero consumer edits.
 - New tool = new function + register it; adding it to an agent = one tuple
   entry in that agent's spec.
 - New MCP server = register it; exposing it to an agent = add its scope to

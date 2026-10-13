@@ -16,7 +16,6 @@ head+tail preview plus a pointer it can page with `read_file(offset, limit)`.
 | `subagent` | 32000 | call_subagent, delegate, subagent replies |
 | `mcp` | 25000 | MCP tools (`mcp__*` also map here) |
 | `browser_act` | 24000 | browser_act / browser_navigate |
-| `outline` | 16000 | outline |
 | `search_code` | 16000 | search_code |
 | `edit_file` | 10000 | edit_file (including verify output) |
 | `web_search` | 10000 | web_search |
@@ -53,7 +52,7 @@ Caps are applied at the two execution boundaries, not per loop:
   (paid models and specialist subagents).
 
 Tools with their own semantic limits (`search_code` match count and
-`max_matches`, `read_file` paging, `outline`, MCP manager) self-cap first; the
+`max_matches`, `read_file` paging, MCP manager) self-cap first; the
 boundary cap is a backstop.
 
 ## run_command execution limits (time, not chars)

@@ -2,7 +2,7 @@
 
 - **Description:** Run a shell command (Git Bash, POSIX). Foreground blocks and streams output; server-like commands (npm run dev, vite, uvicorn, python -m http.server...) that exceed the timeout are auto-moved to background. Background runs return a process name managed via process_action. Windows tools work as subprocesses: powershell.exe -NoProfile -Command '...' or cmd.exe /c '...'.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, general, house, dfd, ui, deploy
+- **Scopes (from _SCOPE_MAP):** developer, general, house, dfd, deploy, explore, ui
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** run_command(command, timeout?, idle_timeout?, background?, process_action?, workdir?, expect?, tail_lines?, ready_timeout?, input?) — Git Bash (POSIX): pipes, &&, $( ), jq, gh. timeout ms (default 120000; <1000 = seconds; max 600000); idle_timeout kills commands idle by output AND CPU (default 60000; 0 = off); server-like/busy commands auto-background on timeout. process_action=list|logs|kill|wait|ready|send|kill_all. background+expect waits for readiness and reports the listening URL. workdir sets cwd, expect checks output regex.
 - **Required args (validated):** (none)

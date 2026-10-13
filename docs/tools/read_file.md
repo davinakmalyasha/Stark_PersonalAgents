@@ -2,7 +2,7 @@
 
 - **Description:** Read one file, or several in ONE call via file_paths (each gets its own [FILE] section; offset/limit apply to every file in the batch) — when 2+ files are needed, batch them in a single call to save turns. A full read returns the first page under a [FILE] header (lines x-y of N); when PARTIAL is shown, page onward with offset/limit. A repeat full read of an unchanged file returns a cached stub — use offset/limit to re-read a specific slice.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, ui, deploy
+- **Scopes (from _SCOPE_MAP):** developer, deploy, explore, ui
 - **Parallel-safe (PARALLEL_SAFE):** True
 - **Compact doc:** read_file(file_path?, file_paths?, offset?, limit?) — Read one file, or batch several via file_paths in ONE call ([FILE] sections; offset 1-based, applies per file in a batch). Full read returns first page + header; PARTIAL -> page with offset/limit; unchanged repeat -> cached stub.
 - **Required args (validated):** (none)

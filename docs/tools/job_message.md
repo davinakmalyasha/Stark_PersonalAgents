@@ -1,20 +1,19 @@
-# resume_project
+# job_message
 
-- **Description:** Resume an existing project's durable Dev agent in one call: resolves the project by name/path and delivers the follow-up message. Replaces find_project_dev + send_message + list_agents. If the project is not found, returns [NOT FOUND] with available names.
+- **Description:** Steer a RUNNING delegation mid-flight when Sir adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** False
-- **Compact doc:** resume_project(name, message, timeout?) — One-call resume: find the project's Dev and deliver the message (replaces find_project_dev + send_message).
-- **Required args (validated):** message, name
+- **Compact doc:** job_message(job_id, message) — Steer a RUNNING delegation mid-flight (fresh: steering channel; resume: durable Dev FIFO). Running jobs only; never blocks.
+- **Required args (validated):** job_id, message
 - **Deps-migrated:** False (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema(TOOL_DEFINITIONS) | Hooks.before/after_tool_execute (cache/guard/redact/offload) | Tool(args_validator, max_retries) | FilteredToolset(allowed_tools)
 - **Pipeline:** thin registry shim: direct execute -> ToolExecutionResult
 
 ## Parameters (JSON Schema)
 
-  - `name` (string, required): Project name or folder path (fuzzy match, e.g. 'my-app').
-  - `message` (string, required): Follow-up instruction to deliver to the project's Dev agent.
-  - `timeout` (integer, optional): Seconds to wait for the reply (default 1800).
+  - `job_id` (string, required): Job id (del-xxxx) from delegate or delegation_status.
+  - `message` (string, required): Steering message: the added scope or direction change.
 
 ## How to recreate
 

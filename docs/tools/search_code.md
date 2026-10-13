@@ -2,7 +2,7 @@
 
 - **Description:** Regex-search file contents ('content', default) or match path globs ('files'). Output styles: lines (default), files (matching paths), count (matches per file). Matching lines are annotated with their enclosing symbol unless annotate=false; snippet='function' returns the enclosing function body instead of single lines. Multi-pattern results ranked via patterns=[...]. Results are workspace-relative; up to max_matches lines shown (default 100; full list saved to /scratch when exceeded). Narrow with path/glob.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, ui, deploy
+- **Scopes (from _SCOPE_MAP):** developer, deploy, explore, ui
 - **Parallel-safe (PARALLEL_SAFE):** True
 - **Compact doc:** search_code(pattern?, patterns?, path?, glob?, mode?, output?, ignore_case?, smart_case?, word?, fixed_strings?, context?, max_matches?, annotate?, snippet?) — Regex search (content) or filename search. output=lines|files|count; results annotated with enclosing symbol; snippet=function returns the body; up to 100 lines shown (full list in scratch).
 - **Required args (validated):** (none)

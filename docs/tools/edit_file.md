@@ -2,7 +2,7 @@
 
 - **Description:** Edit or create files. Mode A — targeted change: old_string -> new_string (must match exactly and uniquely; identical strings error). Mode B — create or overwrite a WHOLE file: file_path + new_string only. Mode C — batch/multi-file diff: '*** Add File: p' / '*** Update File: p' / '*** Delete File: p' / '*** Move to: p' headers, optionally wrapped in '*** Begin Patch' / '*** End Patch'. Update bodies use @@ hunks: lines prefixed '-' are removed, '+' are added, and ' ' (space) are unchanged context lines that anchor the hunk — line numbers are optional and ignored, so hunks tolerate drift (preferred over SEARCH/REPLACE for multi-hunk and multi-file edits). Applied transactionally with [OK]/[ERROR] summary. verify = 'py_compile' | 'tsc' | shell command, runs after the write.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, ui, deploy
+- **Scopes (from _SCOPE_MAP):** developer, deploy, ui
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** edit_file(file_path, old_string?, new_string?, diff?, verify?) — A: old_string+new_string = targeted unique replace; B: new_string only = create/overwrite whole file; C: diff = '*** Add/Update/Delete/Move File' headers (optional *** Begin Patch/End Patch) with @@ hunks: '-' removed, '+' added, ' ' context anchors (numbers optional). verify=py_compile|tsc|shell after write.
 - **Required args (validated):** file_path

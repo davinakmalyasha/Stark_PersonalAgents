@@ -1,18 +1,19 @@
-# outline
+# job_cancel
 
-- **Description:** Signature outline of ONE file — every function/class/method with its definition line, bodies omitted (~1/10 the tokens of a full read). Use before read_file: pick the symbol here, then read_file(offset=line, limit=N) for just its body.
+- **Description:** Cancel ONE running delegation when Sir says stop. Fresh jobs: cooperative abort of the job chat. Resume jobs: interrupt of the durable Dev child. Settles the entry as CANCELLED and reports back as a [DELEGATION RESULT]. Already-settled jobs are a no-op.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer
-- **Parallel-safe (PARALLEL_SAFE):** True
-- **Compact doc:** outline(file_path) — Every signature in one file with definition lines, no bodies (~1/10 the tokens). Then read_file(offset=line, limit=N) for one body.
-- **Required args (validated):** file_path
+- **Scopes (from _SCOPE_MAP):** orchestrator
+- **Parallel-safe (PARALLEL_SAFE):** False
+- **Compact doc:** job_cancel(job_id, reason?) — Cancel ONE running delegation (fresh: abort; resume: interrupt). Reports back as [DELEGATION RESULT] CANCELLED.
+- **Required args (validated):** job_id
 - **Deps-migrated:** False (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema(TOOL_DEFINITIONS) | Hooks.before/after_tool_execute (cache/guard/redact/offload) | Tool(args_validator, max_retries) | FilteredToolset(allowed_tools)
 - **Pipeline:** thin registry shim: direct execute -> ToolExecutionResult
 
 ## Parameters (JSON Schema)
 
-  - `file_path` (string, required): File to outline.
+  - `job_id` (string, required): Job id (del-xxxx) from delegate or delegation_status.
+  - `reason` (string, optional): One-clause reason shown in the wrap-up (default: cancelled by Sir).
 
 ## How to recreate
 

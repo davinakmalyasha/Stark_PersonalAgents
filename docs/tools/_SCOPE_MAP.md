@@ -3,13 +3,11 @@
 ## developer
 
 - read_file
-- outline
 - edit_file
 - run_command
 - search_code
 - ask_user
 - update_plan
-- propose_plan
 - call_subagent
 
 ## general
@@ -50,14 +48,15 @@
 - propose_plan
 - files_changed
 
-## ui
+## orchestrator
 
-- browser_act
-- read_file
-- search_code
-- run_command
-- edit_file
+- create_project
 - ask_user
+- delegate
+- delegation_status
+- job_message
+- job_cancel
+- propose_plan
 
 ## deploy
 
@@ -68,14 +67,18 @@
 - search_code
 - ask_user
 
-## orchestrator
+## explore
 
-- create_project
-- resume_project
+- read_file
+- search_code
+- run_command
+
+## ui
+
+- browser_act
+- read_file
+- search_code
+- run_command
+- edit_file
 - ask_user
-- delegate
-- delegation_status
-- update_plan
-- propose_plan
-- files_changed
 

@@ -123,6 +123,14 @@ from .AddOnTool import (
 from .AddOnTool.dfdBridge import dfd_bridge as _dfd_bridge_impl
 from agents.client_manager import create_client as _create_client_impl
 from .AddOnTool.screenTools import look_at_screen, set_screen_share
+from .AddOnTool.groupTools import (
+    create_group_project,
+    group_board,
+    group_events,
+    group_item_detail,
+    group_update,
+    plan_execution,
+)
 
 # DFD bridge tool (facade name == import name; registry resolves via TOOL_MAP)
 dfd_bridge = _dfd_bridge_impl

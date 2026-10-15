@@ -241,6 +241,15 @@ _register(
             "job_message",
             "job_cancel",
             "propose_plan",
+            # Group projects (Phase 4). `plan_execution` decides the SHAPE of a
+            # request; `group_update` is the single mutation entry point so the
+            # orchestrator's tool list does not grow by one per operation.
+            "plan_execution",
+            "create_group_project",
+            "group_board",
+            "group_item_detail",
+            "group_events",
+            "group_update",
         ),
         tier="orchestrator",
         history_ns="",

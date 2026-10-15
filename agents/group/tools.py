@@ -143,15 +143,20 @@ class GroupToolkit:
     #  Orchestrator — mutation (all queued)
     # ════════════════════════════════════════════════════════════════════
 
-    def add_item(self, project_id: str, *, milestone_id: str, title: str,
-                 detail: str, acceptance: list[dict],
+    def add_item(self, project_id: str, *, item_id: str, milestone_id: str,
+                 title: str, detail: str, acceptance: list[dict],
                  depends_on: list[str] | None = None,
                  owner_member: str = "", workdir: str = "") -> ToolResult:
+        """Add one item. ``item_id`` is required — without it the item cannot
+        be addressed by later ops, so the supervisor refuses it."""
+        if not str(item_id or "").strip():
+            return ToolResult(False, "add_item needs an item_id (e.g. 'm2.i1')")
         if not acceptance:
             return ToolResult(False, "an item needs acceptance criteria")
         op = self._submit(project_id, "add_item", {
-            "milestone_id": milestone_id, "title": title, "detail": detail,
-            "acceptance": acceptance, "depends_on": list(depends_on or []),
+            "id": item_id, "milestone_id": milestone_id, "title": title,
+            "detail": detail, "acceptance": acceptance,
+            "depends_on": list(depends_on or []),
             "owner_member": owner_member, "workdir": workdir,
         })
         return ToolResult(True, f"queued add_item (#{op}); read the board to confirm")

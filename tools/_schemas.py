@@ -665,6 +665,130 @@ TOOL_DEFINITIONS = [
             "required": ["business_name", "vertical"]
         }
     },
+    {
+        "name": "plan_execution",
+        "description": (
+            "Decide the SHAPE of a request before starting anything: solo, group, or "
+            "scheduled. Use when a request might be more than one self-contained "
+            "action — several dependent steps, more than one kind of expertise, or "
+            "work that should continue after this conversation ends. Typical signals: "
+            "'sort out', 'reconcile', 'audit', 'end to end', 'get this done by Friday', "
+            "'figure out why ... and fix it'. "
+            "Do NOT use for a single self-contained request ('rename these files') or "
+            "for recurring work ('every morning check X') — the first is `solo`, the "
+            "second is `scheduled` and belongs to the task scheduler. "
+            "Always call this BEFORE create_group_project. Returns the shape, a "
+            "rationale, a proposed environment, and a plan preview."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "What the user wants, in their words."},
+                "horizon": {"type": "string", "enum": ["minutes", "hours", "days"], "description": "How long the work is expected to take."},
+                "reversible": {"type": "boolean", "description": "Can every step be undone inside the project folder?"},
+                "needs_human": {"type": "boolean", "description": "Will any step need a decision only the user can make?"},
+                "constraints": {"type": "string", "description": "Deadline, budget, or anything that must not be touched."}
+            },
+            "required": ["goal"]
+        }
+    },
+    {
+        "name": "create_group_project",
+        "description": (
+            "Start a durable project that keeps working until it is done, across "
+            "sessions and restarts, with its own folder, agents, tasks and board. "
+            "Use ONLY after plan_execution returned shape=group and the user agreed "
+            "to the preview. Do NOT use for a single self-contained request or for "
+            "recurring work. "
+            "Pass structured milestones and members — do not hand-write a manifest. "
+            "Returns the project id and folder path; the effects are queued, so "
+            "follow progress with group_board."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "The outcome wanted, one or two sentences."},
+                "milestones": {
+                    "type": "array",
+                    "description": "Ordered phases. Each: {id, title, depends_on?, items:[{id, title, detail, acceptance:[...]}]}. Every item MUST have at least one acceptance criterion or it can never be completed.",
+                    "items": {"type": "object"}
+                },
+                "members": {
+                    "type": "array",
+                    "description": "Agents for this project. Each: {name, derived_from, model?, thinking?, tools?, skills?, mcp?}. Omit entirely for a single-agent project (the orchestrator does the work).",
+                    "items": {"type": "object"}
+                },
+                "autonomy": {"type": "object", "description": "Permission envelope: project_folder / external_read / external_write / destructive, each autonomous | needs_approval | blocked."},
+                "completion": {"type": "object", "description": "Machine-evaluated done-condition. Default: {kind: all_milestones_done, also_require: [no_item_status_failed]}."},
+                "budget_usd": {"type": "number", "description": "Hard spend ceiling. Enforced, not advisory."},
+                "deadline": {"type": "string", "description": "ISO timestamp after which dispatch halts."},
+                "skills": {"type": "array", "items": {"type": "string"}, "description": "Skill names to copy into the project."},
+                "mcp": {"type": "array", "items": {"type": "string"}, "description": "MCP servers to attach (must already be installed on this machine)."},
+                "project_id": {"type": "string", "description": "Optional folder slug; otherwise derived from the goal."}
+            },
+            "required": ["goal", "milestones"]
+        }
+    },
+    {
+        "name": "group_board",
+        "description": (
+            "Read a project's current state: milestones, items, statuses, spend, and "
+            "anything waiting on a human. Use to answer 'what is left?' or 'why is "
+            "this stuck?'. Read-only and immediate — it does not wait for a tick."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"project_id": {"type": "string", "description": "Project id."}},
+            "required": ["project_id"]
+        }
+    },
+    {
+        "name": "group_item_detail",
+        "description": "One item in full: status, attempts, latest result, and its acceptance criteria. Use when the board shows something blocked or failed and you need the reason.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project id."},
+                "item_id": {"type": "string", "description": "Item id from the board."}
+            },
+            "required": ["project_id", "item_id"]
+        }
+    },
+    {
+        "name": "group_events",
+        "description": "A project's event log in order — every state change, who made it, and when. Use to explain what happened while the user was away, or to trace a decision.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project id."},
+                "since": {"type": "integer", "description": "Only events after this seq (for polling)."},
+                "limit": {"type": "integer", "description": "Max events (default 50)."}
+            },
+            "required": ["project_id"]
+        }
+    },
+    {
+        "name": "group_update",
+        "description": (
+            "Change a RUNNING project. One op per call, applied by the supervisor on "
+            "its next tick (~15s), writing exactly one event. "
+            "ops: add_item, add_milestone, invalidate_item, cancel_item, add_member, "
+            "remove_member, attach_tool, attach_mcp, detach_mcp, attach_skill, "
+            "detach_skill, pause, resume, close. "
+            "'invalidate_item' means the PLAN was wrong — not that the work failed; it "
+            "does not count as a retry. Use it when a member reports an assumption "
+            "turned out to be false. Read the result back with group_board."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project id."},
+                "op": {"type": "string", "enum": ["add_item", "add_milestone", "invalidate_item", "cancel_item", "add_member", "remove_member", "attach_tool", "attach_mcp", "detach_mcp", "attach_skill", "detach_skill", "pause", "resume", "close"], "description": "Which change to make."},
+                "params": {"type": "object", "description": "Op arguments: e.g. {item_id, reason} for invalidate_item; {milestone_id, title, detail, acceptance} for add_item; {name, derived_from} for add_member; {server} for attach_mcp."}
+            },
+            "required": ["project_id", "op"]
+        }
+    },
 ]
 
 _TOOL_DOCS = {
@@ -701,6 +825,12 @@ _TOOL_DOCS = {
     "house_get_history": "house_get_history(device_id, hours?) — Mock hourly kWh usage series for a device (max 168h).",
     "dfd_bridge": "dfd_bridge(action?, id?, orderId?, payload?, path?, method?, url?, timeout?) — Call the DFD Agency API bridge (NON-MONEY): leads, orders, milestones, notes, activities, client requests, projects, articles, whatsapp. Named actions (lead_list, order_get, milestone_create, note_create, activity_create, request_update, project_update, article_create, whatsapp_send) or raw method+url.",
     "create_client": "create_client(business_name, vertical, features?, whatsapp?, domain?, approved_by?, order_id?) — Create client scaffold under D:\\MyProject\\DFDClientProjects\\<slug>\\ (client.json + progress.md + mem/). REQUIRES explicit owner approval (approved_by).",
+    "plan_execution": "plan_execution(goal, horizon?, reversible?, needs_human?, constraints?) — Decide the SHAPE of a request: solo | group | scheduled, with a rationale, a proposed environment and a plan preview. Call BEFORE create_group_project. NOT for a single self-contained request (solo) or recurring work (scheduled).",
+    "create_group_project": "create_group_project(goal, milestones, members?, autonomy?, completion?, budget_usd?, deadline?, skills?, mcp?, project_id?) — Start a durable project that runs until done, across restarts. Only after plan_execution returned shape=group and the user agreed. Every item needs acceptance criteria. Queued; follow with group_board.",
+    "group_board": "group_board(project_id) — Milestones, items, statuses, spend, and what is waiting on a human. Read-only, immediate.",
+    "group_item_detail": "group_item_detail(project_id, item_id) — One item in full: attempts, latest result, and its acceptance criteria (why it passed or failed).",
+    "group_events": "group_events(project_id, since?, limit?) — The project's event log in order: every state change, actor, and time. Use to explain what happened while the user was away.",
+    "group_update": "group_update(project_id, op, params?) — Change a RUNNING project: add_item, add_milestone, invalidate_item, cancel_item, add_member, remove_member, attach_tool, attach_mcp, detach_mcp, attach_skill, detach_skill, pause, resume, close. One op per call; queued until the next supervisor tick (~15s). invalidate_item = the PLAN was wrong, not that work failed.",
 }
 
 _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {

@@ -85,15 +85,41 @@ class ProjectContext:
         """
         return f"gp-{self.project_id}-{member_name}"
 
+    def effective_members(self) -> dict[str, dict]:
+        """The members, or the sole-member default (``01`` §5.3).
+
+        A project with no members is a project of one. The default is the
+        ``general`` workspace agent **not** the orchestrator node: the
+        orchestrator is a *coordinator* whose node delegates, so using it as a
+        runner target would be circular. "The orchestrator does the work"
+        means it stops delegating and runs.
+        """
+        if self.members:
+            return self.members
+        spec = None
+        if self.spec_lookup is not None:
+            spec = self.spec_lookup("general")
+        return {SOLE_MEMBER: {
+            "name": SOLE_MEMBER,
+            "derived_from": "general",
+            "runtime": (getattr(spec, "runtime", "") if spec
+                        else "") or "agents.general_agent:general_node",
+            "state_builder": (getattr(spec, "state_builder", "plain") if spec
+                              else "plain") or "plain",
+            "tools": list(getattr(spec, "tools", ()) or ()) if spec else [],
+            "model": "",
+            "thinking": "inherit",
+        }}
+
     def default_member(self) -> str | None:
-        names = list(self.members)
+        names = list(self.effective_members())
         return names[0] if names else None
 
     def member_ceiling(self, member_name: str) -> list[str] | None:
         """The scope map's allowlist for a member, if a lookup is available."""
         if self.spec_lookup is None:
             return None
-        agent = self.members.get(member_name) or {}
+        agent = self.effective_members().get(member_name) or {}
         key = str(agent.get("derived_from") or member_name)
         spec = self.spec_lookup(key)
         if spec is None:
@@ -137,6 +163,12 @@ RETRYABLE_BLOCK_REASONS = frozenset({"lease_expired"})
 WAITING_BLOCK_REASONS = frozenset({ev.AWAITING_APPROVAL, "approval_rejected"})
 
 
+#: The member name used when a project declares none: a project of one
+#: (``01`` §5.3). It maps to the ``general`` workspace agent, not to the
+#: orchestrator node — see :meth:`ProjectContext.effective_members`.
+SOLE_MEMBER = "orchestrator"
+
+
 class OpRejected(Exception):
     """A queued op is invalid. The project is left untouched."""
 
@@ -162,7 +194,8 @@ def recover_all_projects(store: ProjectStore, project_ids: list[str]) -> int:
 class Supervisor:
     """Ticks one or more projects. One instance per process."""
 
-    def __init__(self, store: ProjectStore, *,
+    def __init__(self, store: ProjectStore | None = None, *,
+                 store_for: Callable[[str], ProjectStore] | None = None,
                  runner: ItemRunner | None = None,
                  context_for: Callable[[str], ProjectContext | None] | None = None,
                  lease_seconds: float = LEASE_SECONDS,
@@ -170,7 +203,12 @@ class Supervisor:
                  clock: Callable[[], float] = time.time,
                  log: Callable[[str], None] | None = None) -> None:
         self.store = store
-        self.runner = runner          # None keeps dispatch inert (Phase 1)
+        #: Each project owns its own `state.db`, so one Supervisor instance can
+        #: serve many projects by swapping this at the top of each tick. That
+        #: is safe because there is exactly ONE supervisor thread (``02``
+        #: §2.1) — the single-writer guarantee is structural, not a lock.
+        self.store_for = store_for
+        self.runner = runner          # None keeps dispatch inert
         self.context_for = context_for
         self.lease_seconds = lease_seconds
         self.stall_ticks = stall_ticks
@@ -185,6 +223,12 @@ class Supervisor:
 
     def tick(self, project_id: str) -> dict:
         """Run all phases once. Never raises for a project-level problem."""
+        if self.store_for is not None:
+            resolved = self.store_for(project_id)
+            if resolved is not None:
+                self.store = resolved
+        if self.store is None:
+            return {"project": project_id, "phases": {}, "halted": "no store"}
         report: dict = {"project": project_id, "phases": {}, "halted": None}
         try:
             report["phases"]["recover"] = self.store.ensure_consistent(project_id)
@@ -404,6 +448,14 @@ class Supervisor:
         milestone_id = str(payload.get("milestone_id") or "")
         if milestone_id not in {m["id"] for m in self.store.milestones(project_id)}:
             raise OpRejected(f"unknown milestone {milestone_id!r}")
+        # An item with no id is not a naming preference — without it the
+        # reducer cannot address the row at all, and the item would be dropped
+        # silently. Refuse instead.
+        item_id = str(payload.get("id") or "").strip()
+        if not item_id:
+            raise OpRejected("add_item requires an item `id` (e.g. 'm2.i1')")
+        if self.store.item(item_id) is not None:
+            raise OpRejected(f"item {item_id!r} already exists")
         if not (payload.get("acceptance") or []):
             # DM-06: an item without acceptance criteria can never be "done".
             raise OpRejected("item requires non-empty acceptance criteria")
@@ -416,9 +468,9 @@ class Supervisor:
             raise OpRejected(
                 f"cross-milestone dependency not allowed (DM-14): {foreign}"
             )
-        self._check_cycle(project_id, payload.get("id"), depends, milestone_id)
+        self._check_cycle(project_id, item_id, depends, milestone_id)
         self.store.append(project_id, ev.ITEM_CREATED, "orchestrator",
-                          milestone_id=milestone_id, item_id=payload.get("id"),
+                          milestone_id=milestone_id, item_id=item_id,
                           data=payload)
 
     def _op_update_item(self, project_id: str, payload: dict) -> None:
@@ -605,9 +657,10 @@ class Supervisor:
             return 0
 
         started = 0
+        members = context.effective_members()
         for item in self.store.items(project_id, status="ready"):
             member_name = self.runner.member_for(item) or context.default_member()
-            member = context.members.get(member_name or "")
+            member = members.get(member_name or "")
             if member is None:
                 # An item with nobody able to take it. Leave it ready and
                 # visible rather than claiming it into a dead end.

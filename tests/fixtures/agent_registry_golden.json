@@ -73,7 +73,13 @@
       "delegation_status",
       "job_message",
       "job_cancel",
-      "propose_plan"
+      "propose_plan",
+      "plan_execution",
+      "create_group_project",
+      "group_board",
+      "group_item_detail",
+      "group_events",
+      "group_update"
     ]
   },
   "tier": {
@@ -461,7 +467,7 @@
     "Compactor": {
       "kind": "subagent",
       "internal": true,
-      "description": "Internal compaction handoff — do not invoke directly via call_subagent. The checkpoint engine delegates transcript summarization here.",
+      "description": "Internal compaction handoff \u2014 do not invoke directly via call_subagent. The checkpoint engine delegates transcript summarization here.",
       "tools": [],
       "skills": [],
       "backend": "free",
@@ -470,7 +476,7 @@
     "DevOps": {
       "kind": "subagent",
       "internal": false,
-      "description": "Verify + release owner — pre-production polisher: run test suites/coverage/regression and report observed results (gate test, security, performance), then production readiness audit and runtime hardening (health/ready probes, structured logging, error tracking, docker/nginx/env docs), installing the tiered CI/security gate (T1 fast-checks / T2 staging / T3 release), branch ladder + protection, and verifying the first run and live URL with observed facts. Not feature work (Dev) or design/browser checks (UI).",
+      "description": "Verify + release owner \u2014 pre-production polisher: run test suites/coverage/regression and report observed results (gate test, security, performance), then production readiness audit and runtime hardening (health/ready probes, structured logging, error tracking, docker/nginx/env docs), installing the tiered CI/security gate (T1 fast-checks / T2 staging / T3 release), branch ladder + protection, and verifying the first run and live URL with observed facts. Not feature work (Dev) or design/browser checks (UI).",
       "tools": [
         "github_apply_gate",
         "run_command",
@@ -496,7 +502,7 @@
     "Dev": {
       "kind": "",
       "internal": false,
-      "description": "Developer — pure implementer: receives specs and tasks from the orchestrator, writes clean tested TDD code, handles errors",
+      "description": "Developer \u2014 pure implementer: receives specs and tasks from the orchestrator, writes clean tested TDD code, handles errors",
       "tools": [
         "read_file",
         "edit_file",
@@ -513,7 +519,7 @@
     "Explore": {
       "kind": "subagent",
       "internal": false,
-      "description": "Read-only codebase recon — 'where is X defined/used', trace a flow across files, map an unfamiliar subsystem, or gather exact file:line evidence before a plan or a risky edit. Reads and searches only; never edits, builds, or deploys. One focused question per spawn; not implementation (Dev) or browser checks (UI).",
+      "description": "Read-only codebase recon \u2014 'where is X defined/used', trace a flow across files, map an unfamiliar subsystem, or gather exact file:line evidence before a plan or a risky edit. Reads and searches only; never edits, builds, or deploys. One focused question per spawn; not implementation (Dev) or browser checks (UI).",
       "tools": [
         "read_file",
         "search_code",
@@ -526,7 +532,7 @@
     "FreeAgent": {
       "kind": "",
       "internal": false,
-      "description": "General — non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder — code requests route back to Dev.",
+      "description": "General \u2014 non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder \u2014 code requests route back to Dev.",
       "tools": [
         "run_command",
         "read_pdf",
@@ -547,7 +553,7 @@
     "General": {
       "kind": "",
       "internal": false,
-      "description": "General — non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder — code requests route back to Dev.",
+      "description": "General \u2014 non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder \u2014 code requests route back to Dev.",
       "tools": [
         "run_command",
         "read_pdf",
@@ -568,7 +574,7 @@
     "House": {
       "kind": "",
       "internal": false,
-      "description": "House — home control specialist: reads and actuates the smart home via house_* tools (lights, climate, locks, plugs, blinds, cameras, scenes). NOT a coder — code requests route back to Dev.",
+      "description": "House \u2014 home control specialist: reads and actuates the smart home via house_* tools (lights, climate, locks, plugs, blinds, cameras, scenes). NOT a coder \u2014 code requests route back to Dev.",
       "tools": [
         "run_command",
         "ask_user",
@@ -588,7 +594,7 @@
     "UI": {
       "kind": "subagent",
       "internal": false,
-      "description": "Frontend/UI design owner — greenfield UI, redesign, design system, visual direction — and the browser/UI verifier (navigate, click, fill, extract, screenshot). Delivers real frontend artifacts and owns the `## Design` section of .agent-memory/project.md; not for feature work inside an existing design system (Dev does that, following `## Design`).",
+      "description": "Frontend/UI design owner \u2014 greenfield UI, redesign, design system, visual direction \u2014 and the browser/UI verifier (navigate, click, fill, extract, screenshot). Delivers real frontend artifacts and owns the `## Design` section of .agent-memory/project.md; not for feature work inside an existing design system (Dev does that, following `## Design`).",
       "tools": [
         "browser_act",
         "read_file",
@@ -609,7 +615,7 @@
     "Vision": {
       "kind": "",
       "internal": false,
-      "description": "General — non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder — code requests route back to Dev.",
+      "description": "General \u2014 non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder \u2014 code requests route back to Dev.",
       "tools": [
         "run_command",
         "read_pdf",
@@ -630,7 +636,7 @@
     "general-purpose": {
       "kind": "",
       "internal": false,
-      "description": "General — non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder — code requests route back to Dev.",
+      "description": "General \u2014 non-coding life & work assistant: research, documents (PDF/docx/xlsx), planning, web browsing, image understanding, personal admin. NOT a coder \u2014 code requests route back to Dev.",
       "tools": [
         "run_command",
         "read_pdf",
@@ -649,8 +655,8 @@
       "model": ""
     }
   },
-  "subagent_catalog": "- DevOps — Verify + release owner — pre-production polisher: run test suites/coverage/regression and report observed results (gate test, security, performance), then production readiness audit and runtime hardening (health/ready probes, structured logging, error tracking, docker/nginx/env docs), installing the tiered CI/security gate (T1 fast-checks / T2 staging / T3 release), branch ladder + protection, and verifying the first run and live URL with observed facts. Not feature work (Dev) or design/browser checks (UI).\n- Explore — Read-only codebase recon — 'where is X defined/used', trace a flow across files, map an unfamiliar subsystem, or gather exact file:line evidence before a plan or a risky edit. Reads and searches only; never edits, builds, or deploys. One focused question per spawn; not implementation (Dev) or browser checks (UI).\n- UI — Frontend/UI design owner — greenfield UI, redesign, design system, visual direction — and the browser/UI verifier (navigate, click, fill, extract, screenshot). Delivers real frontend artifacts and owns the `## Design` section of .agent-memory/project.md; not for feature work inside an existing design system (Dev does that, following `## Design`).",
-  "orchestrator_specialists_block": "Specialists:\n- Dev â€” builds and fixes software, runs tests, verifies.\n- General â€” research, documents, images, personal notes/journal/reminders,\n  everyday admin.\n- House â€” smart home: lights, climate, locks, scenes.",
-  "delegate_description": "Spawn one or more workspace agents (Developer / General / House) IN PARALLEL. Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\nBRIEF — you define WHAT, never HOW. Each item carries outcome (what Sir gets when it is done, in Sir's terms) and acceptance (how success will be judged — observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if Sir named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each — if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\nBATCHING — per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. Any agent mix is allowed and runs in parallel — solo scope (just Developer, just General, or just House) or mixed (Developer + General, Developer + House, all three). The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing — one call, all independent items.\n\nEFFORT — match effort to the request: one job for a simple ask, 2-4 for comparisons, more ONLY when directions are truly independent. Jobs beyond the parallel cap wait as 'queued' and start automatically — never flood the system.\n\nRESULTS — each job's final reply arrives as a [DELEGATION RESULT] summary (plus its artifact path and, when set, acceptance). Drill into the full report with delegation_status(id=...) when needed; never paste reports into your reply.\n\nCHAT CONTINUATION — chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat — so never guess an id.\n\nRESUME — project continues a REGISTERED project's durable Dev session instead of starting a new chat. When the request is a follow-up, bug fix, or new work on an EXISTING project and you have no chat_id from a prior [DELEGATION RESULT] in this session, pass project=<name> (agent must be Dev or omitted) instead of workspace/chat_id. The message goes to the project's durable Dev in its own project chat — nothing new is created — and the completion arrives as a [DELEGATION RESULT] like any other job. Unknown names return [NOT FOUND] with the available names — never guess. Omit project for genuinely new work.",
-  "delegate_doc": "delegate(items=[{agent, task, outcome?, acceptance?, timeout?, title?, chat_id?, project?, workspace?, images?}]) — Spawn Developer/General/House agents; each gets its own chat (project=<name> continues a registered project's durable Dev in its own chat instead). outcome/acceptance define WHAT success is — never method. Results arrive as [DELEGATION RESULT] summaries + artifact paths; drill in with delegation_status(id)."
+  "subagent_catalog": "- DevOps \u2014 Verify + release owner \u2014 pre-production polisher: run test suites/coverage/regression and report observed results (gate test, security, performance), then production readiness audit and runtime hardening (health/ready probes, structured logging, error tracking, docker/nginx/env docs), installing the tiered CI/security gate (T1 fast-checks / T2 staging / T3 release), branch ladder + protection, and verifying the first run and live URL with observed facts. Not feature work (Dev) or design/browser checks (UI).\n- Explore \u2014 Read-only codebase recon \u2014 'where is X defined/used', trace a flow across files, map an unfamiliar subsystem, or gather exact file:line evidence before a plan or a risky edit. Reads and searches only; never edits, builds, or deploys. One focused question per spawn; not implementation (Dev) or browser checks (UI).\n- UI \u2014 Frontend/UI design owner \u2014 greenfield UI, redesign, design system, visual direction \u2014 and the browser/UI verifier (navigate, click, fill, extract, screenshot). Delivers real frontend artifacts and owns the `## Design` section of .agent-memory/project.md; not for feature work inside an existing design system (Dev does that, following `## Design`).",
+  "orchestrator_specialists_block": "Specialists:\n- Dev \u00e2\u20ac\u201d builds and fixes software, runs tests, verifies.\n- General \u00e2\u20ac\u201d research, documents, images, personal notes/journal/reminders,\n  everyday admin.\n- House \u00e2\u20ac\u201d smart home: lights, climate, locks, scenes.",
+  "delegate_description": "Spawn one or more workspace agents (Developer / General / House) IN PARALLEL. Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\nBRIEF \u2014 you define WHAT, never HOW. Each item carries outcome (what Sir gets when it is done, in Sir's terms) and acceptance (how success will be judged \u2014 observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if Sir named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each \u2014 if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\nBATCHING \u2014 per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. Any agent mix is allowed and runs in parallel \u2014 solo scope (just Developer, just General, or just House) or mixed (Developer + General, Developer + House, all three). The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing \u2014 one call, all independent items.\n\nEFFORT \u2014 match effort to the request: one job for a simple ask, 2-4 for comparisons, more ONLY when directions are truly independent. Jobs beyond the parallel cap wait as 'queued' and start automatically \u2014 never flood the system.\n\nRESULTS \u2014 each job's final reply arrives as a [DELEGATION RESULT] summary (plus its artifact path and, when set, acceptance). Drill into the full report with delegation_status(id=...) when needed; never paste reports into your reply.\n\nCHAT CONTINUATION \u2014 chat_id is optional. Omit it for a new job (default). Set it ONLY when this item is a follow-up, correction, or bug on a chat you can identify from a prior [DELEGATION RESULT] in this session. If the chat_id you pass does not exist, the runtime silently starts a new chat \u2014 so never guess an id.\n\nRESUME \u2014 project continues a REGISTERED project's durable Dev session instead of starting a new chat. When the request is a follow-up, bug fix, or new work on an EXISTING project and you have no chat_id from a prior [DELEGATION RESULT] in this session, pass project=<name> (agent must be Dev or omitted) instead of workspace/chat_id. The message goes to the project's durable Dev in its own project chat \u2014 nothing new is created \u2014 and the completion arrives as a [DELEGATION RESULT] like any other job. Unknown names return [NOT FOUND] with the available names \u2014 never guess. Omit project for genuinely new work.",
+  "delegate_doc": "delegate(items=[{agent, task, outcome?, acceptance?, timeout?, title?, chat_id?, project?, workspace?, images?}]) \u2014 Spawn Developer/General/House agents; each gets its own chat (project=<name> continues a registered project's durable Dev in its own chat instead). outcome/acceptance define WHAT success is \u2014 never method. Results arrive as [DELEGATION RESULT] summaries + artifact paths; drill in with delegation_status(id)."
 }

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import json
 import os
 import shutil
 import subprocess
@@ -96,6 +95,36 @@ def attach_real_apply_template():
     stub = tools_stub()
     stub.apply_template = template_tools().apply_template
     return stub
+
+
+def restore_tools() -> None:
+    """Evict the ``tools`` stub so the REAL package imports again.
+
+    :func:`tools_stub` replaces ``sys.modules['tools']`` with a minimal module
+    and (deliberately) never restores it, because the suites that use it need
+    it for their whole module. Any LATER test that wants the real facade must
+    therefore evict it first — otherwise ``import tools`` silently yields the
+    stub and every attribute lookup fails with a confusing ``AttributeError``.
+
+    Clearing the cached stub means the next :func:`tools_stub` call rebuilds
+    and reinstalls it, so this is safe to call in either order.
+    """
+    global _TOOLS_STUB
+    current = sys.modules.get("tools")
+    if current is None or current is _TOOLS_STUB:
+        # Drop the stub and anything imported through it (e.g. a submodule the
+        # stub briefly satisfied) so the real package re-imports cleanly.
+        for name in [n for n in list(sys.modules)
+                     if n == "tools" or n.startswith("tools.")]:
+            sys.modules.pop(name, None)
+    _TOOLS_STUB = None
+
+
+def real_tools():
+    """The real ``tools`` package, evicting the stub if one is installed."""
+    restore_tools()
+    import tools
+    return tools
 
 
 @contextlib.contextmanager

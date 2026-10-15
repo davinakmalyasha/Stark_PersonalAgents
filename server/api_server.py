@@ -172,8 +172,27 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app):
-    yield
-    _shutdown_voice()
+    # Both schedulers start HERE rather than under __main__ only, so they also
+    # run under `uvicorn server.api_server:app` (and --reload, and tests). The
+    # task scheduler used to be __main__-only, which meant it silently did not
+    # run in exactly the modes people debug in — a scheduler that is not
+    # running looks identical to a project that is stalled.
+    from server.services.task_scheduler import start_task_scheduler
+    start_task_scheduler()
+    try:
+        from server.services.group_scheduler import start_group_scheduler
+        start_group_scheduler()
+    except Exception as _exc:  # noqa: BLE001 - group projects are optional
+        print(f"[API] group scheduler not started: {_exc}", flush=True)
+    try:
+        yield
+    finally:
+        try:
+            from server.services.group_scheduler import stop_group_scheduler
+            stop_group_scheduler()
+        except Exception:  # noqa: BLE001
+            pass
+        _shutdown_voice()
 
 # Reassign app with lifespan (FastAPI accepts lifespan=; must be set before
 # routers are included — this runs _shutdown_voice on uvicorn shutdown too).
@@ -542,6 +561,10 @@ if __name__ == "__main__":
         print(f"[API] Port {STARK_PORT} already in use — another api_server is running. Exiting quietly.")
         sys.exit(0)
 
+    # Schedulers start in _lifespan (above), so they run under uvicorn and
+    # --reload too, not only under __main__. Kept here as a no-op call for the
+    # direct `python server/api_server.py` path, where lifespan still fires —
+    # start_task_scheduler() is idempotent.
     from server.services.task_scheduler import start_task_scheduler as _start_task_scheduler
     _start_task_scheduler()
 

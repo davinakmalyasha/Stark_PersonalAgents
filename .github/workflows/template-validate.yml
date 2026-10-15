@@ -20,7 +20,11 @@ jobs:
         # pytest, not tests/run_all.py. run_all.py is a zero-dependency runner
         # that cannot supply fixtures, so it SKIPs 23 fixture-based tests — and
         # before it was fixed it also failed 46 tests it could not import.
-        # pytest is the runner that actually exercises everything.
+        #
+        # The suite imports the REAL runtime (`tools` -> `agents` -> `llm`), so
+        # a bare jinja2+pyyaml install cannot even collect it: it dies on
+        # `No module named 'dotenv'`. requirements-test.txt is the runtime set
+        # minus the voice stack, fastembed and tree-sitter-languages.
         run: |
-          pip install --quiet jinja2 pyyaml pytest
+          pip install --quiet -r requirements-test.txt
           python -m pytest tests/ -q

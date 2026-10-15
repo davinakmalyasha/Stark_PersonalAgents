@@ -312,3 +312,60 @@ def test_group_tools_resolve_through_the_facade():
     for name in ("plan_execution", "create_group_project", "group_board",
                  "group_item_detail", "group_events", "group_update"):
         assert callable(getattr(facade, name, None)), f"{name} is not on the facade"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The runner scopes its run — found by the first REAL run
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_local_runner_scopes_the_run_and_captures_cost():
+    """A member run must not pollute root state, and must report its cost.
+
+    Found by the first real run: ``spend`` stayed $0.00 because the runner
+    read a ``cost_usd`` key that no agent node returns. Cost lives in the
+    scoped ``state_sync`` token usage, exactly as delegation reads it
+    (``delegation.py:739``) — so the runner has to set a scope, or the budget
+    ceiling can never fire.
+    """
+    import types as _types
+
+    from sync.state_sync import reset_shared_state, safe_get_state
+
+    root_before = dict(safe_get_state().get("outputs") or {})
+
+    fake = _types.ModuleType("gp_fake_agent")
+
+    def run(state):
+        from sync.state_sync import safe_update_state
+        safe_update_state({
+            "outputs": {"agent_report": "did the thing"},
+            "token_usage": {"total_input_tokens": 100, "total_output_tokens": 20,
+                            "total_cache_hit_tokens": 0,
+                            "total_cache_miss_tokens": 0,
+                            "total_cost": 0.25, "calls": []},
+        })
+        return {"agent_report": "did the thing"}
+
+    fake.run = run
+    sys.modules["gp_fake_agent"] = fake
+    try:
+        from agents.group.runner import LocalRunner, RunContext
+        result = LocalRunner()._execute_node(RunContext(
+            project_id="p", project_root=REPO_ROOT,
+            item={"id": "i1", "title": "t"},
+            member={"runtime": "gp_fake_agent:run", "derived_from": "general"},
+            member_name="m", chat_id="c", autonomy={},
+        ))
+    finally:
+        sys.modules.pop("gp_fake_agent", None)
+
+    assert result.ok, result.error
+    assert result.report == "did the thing"
+    assert result.cost_usd == 0.25, "cost was not captured from the scoped state"
+    assert result.cost_tokens == 120
+    # The ROOT state must be untouched: a member run is scoped, like a job.
+    assert (safe_get_state().get("outputs") or {}) == root_before, (
+        "the member run leaked into the root state"
+    )
+    reset_shared_state()

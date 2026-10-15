@@ -249,6 +249,41 @@ def test_live_lease_is_not_reaped():
         assert rig.store.item("i1")["status"] == "doing", "a live lease was reaped"
 
 
+def test_an_item_being_worked_is_not_a_stall():
+    """A member running silently is not a deadlock.
+
+    Found by the first real run: a live LLM item produced no events for 22
+    consecutive ticks while it worked. Without this exemption anything slower
+    than the stall threshold would be declared deadlocked mid-work.
+    """
+    with Rig(stall_ticks=3) as rig:
+        rig.create()
+        rig.sup.tick(rig.pid)
+        rig.store.append(rig.pid, rig.ev.ITEM_CLAIMED, "member:x", item_id="i1",
+                         data={"lease_owner": "x",
+                               "lease_expires": rig.sup.clock() + 10_000})
+        for _ in range(10):
+            rig.sup.tick(rig.pid)
+        assert rig.store.project(rig.pid)["halt_reason"] != "stalled", (
+            "an item actively being worked was reported as a deadlock"
+        )
+        assert rig.store.item("i1")["status"] == "doing"
+
+
+def test_an_expired_lease_stops_exempting_the_item():
+    """The exemption is self-limiting: expiry hands the item to the reaper."""
+    with Rig(stall_ticks=3) as rig:
+        rig.create()
+        rig.sup.tick(rig.pid)
+        rig.store.append(rig.pid, rig.ev.ITEM_CLAIMED, "member:x", item_id="i1",
+                         data={"lease_owner": "x", "lease_expires": 1.0})
+        for _ in range(8):
+            rig.sup.tick(rig.pid)
+        # The lease expired, so the item is no longer `doing` with an owner; the
+        # project may legitimately stall once nothing else can progress.
+        assert rig.store.item("i1")["status"] in ("ready", "blocked", "failed")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Invalidation
 # ════════════════════════════════════════════════════════════════════════════

@@ -485,3 +485,67 @@ Stated explicitly so a future reader does not "helpfully" extend the blast radiu
 | pydantic-ai internals | `fixed-concept.md` §4 — we build on the framework, we do not reimplement it. |
 | `.deep_agents/` schema | Project state is in the project folder (`01` §2). |
 | The SSE run pipeline | The supervisor is out-of-band (`11`). |
+
+---
+
+## 15. Build Record — Phase 4, Stages 1–2
+
+**Status: WIRED AND RUNNING.** `pytest tests/ -q` → **245 passed, 0 failed** (229 before, +16).
+
+### 15.1 What was wrong before this
+
+`agents/group/` was 11 modules, 229 passing tests, and **zero callers.** Verified by grep: nothing under `server/` imported it, no group tools existed in `tools/_schemas.py`, and `server/services/` had no group scheduler. A complete engine with no ignition.
+
+### 15.2 What shipped
+
+| File | Change |
+|---|---|
+| `server/store/group_registry.py` | **The folder is the registry.** Projects are discovered by scanning `STARK_PROJECTS_ROOT` for `*/PROJECT.md` — no index file to drift, and a folder copied in from another machine is found on the next scan. Builds the `ProjectContext` from the manifest and the project's *own* materialised agents |
+| `server/services/group_scheduler.py` | One thread for every project, 15s cadence, per-project `try/except` (RT-03). Boot does a **full rebuild** per project before the first tick |
+| `server/api_server.py` | Both schedulers start in `_lifespan` — so they also run under `uvicorn server.api_server:app` and `--reload` |
+| `tools/_schemas.py`, `tools/AddOnTool/groupTools.py`, `tools/__init__.py` | Six group tools visible to the orchestrator, descriptions written as routing policy |
+| `agents/workspace_registry.py` | The orchestrator scope gains the six tools |
+| `tests/fixtures/agent_registry_golden.json` | Updated — **the golden caught the scope change, as designed** |
+
+### 15.3 The real run
+
+The first project ever run for real: `D:\StarkProjects\hello-report`, one milestone, one item, one acceptance criterion, real LLM via `command` mode.
+
+```
+project.created → project.resumed → milestone.ready → item.ready → item.claimed
+→ item.progress (member:orchestrator) → item.done → milestone.done → project.closed
+```
+
+Artifact on disk: `'Hello there, and welcome — so glad you could join us!'`
+
+The item took **22 ticks of silence** while the model worked, then verified and closed. The whole chain — dispatch, run, collect, verify against criteria, milestone completion, project closure — ran unattended on a real model.
+
+### 15.4 What the real run found that 229 tests did not
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | **Nothing dispatched a project with no members.** `01` §5.3 says a project with no members runs with *the orchestrator as sole member*; nothing implemented it, so `_dispatch` found no member and returned 0. Every routing test passed, every supervisor test passed, and a real project sat still. | **Real gap, latent since Phase 1.** Added `ProjectContext.effective_members()`. The default maps to the **`general` workspace agent**, not the orchestrator node: the orchestrator is a coordinator whose node delegates, so using it as a runner target would be circular. |
+| 2 | **The budget ceiling could never fire.** `spend` stayed `$0.00` through a complete real run. `LocalRunner` read a `cost_usd` key that no agent node returns — cost lives in the **scoped `state_sync`** token usage, which is how delegation reads it (`delegation.py:739`). | **Real bug.** The runner now sets a scoped `active_state` per run and reads usage before the scope resets. Confirmed on a second real run: `spend $0.01/$1.00`. |
+| 3 | **A member working silently looked like a deadlock.** The item produced no events for 22 consecutive ticks. At the real 15s cadence that is 5.5 minutes; anything slower than the 50-tick threshold (~12 min) would be declared stalled *mid-work*. | **Real bug, found only by running.** An item `doing` with a live lease is now a legitimate wait — self-limiting, because lease expiry hands it to the reaper, and a blocked item is no longer exempt. |
+| 4 | **`add_item` silently dropped an item with no `id`.** The reducer cannot address a row without one, so the item vanished with no error at all. | Refused now, with a usable message, in both the toolkit and the tool. |
+| 5 | **`restore_tools()` was needed.** The offline `tools` stub installed by other suites was never restored, so a later test that imported the facade got the stub. | Fixed in `_util.py`. This trap was flagged in Phase 0 and finally bit here. |
+
+Findings 1–3 share a shape worth naming: **every one of them was invisible to a test suite that never ran the thing.** The tests asserted the board, the criteria, and the transitions correctly — and a real project still did nothing, for free, forever.
+
+### 15.5 Deliberately not done
+
+| Item | Why |
+|---|---|
+| Frontend board, approvals panel, member trace | Deferred by decision — API only for now (`05` §11 stays design) |
+| Telegram approval | After a UI panel exists |
+| `board`/`events` returning structured JSON | Text is enough to prove the reads work; a UI wants JSON |
+| D-1 `run_command` tier, D-11 concurrency cap | Neither bites with a single memberless project |
+
+### 15.6 Still open
+
+| Item | Where |
+|---|---|
+| `tests/run_all.py` reports false failures and CI runs it | `07` §11.2 — now the only red thing left |
+| `scratch/gen10_current.pid` tracked; `error_patterns.py` dormant | `07` §11.5 |
+| The stale D-cell table (blockers listed for built phases) | `06` §4 |
+| Real-LLM coverage for `LocalRunner` and the planner | no phase claims it — the real run is the evidence, and it is not repeatable in CI |

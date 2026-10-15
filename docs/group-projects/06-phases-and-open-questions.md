@@ -71,16 +71,15 @@ Each phase has a **test project** that must pass before the next begins. Test pr
 
 ---
 
-### Phase 4 — Surface
+### Phase 4 — Surface  🔨 INTEGRATION DONE, UI DEFERRED
 
-| | |
-|---|---|
-| **Scope** | Step 10. UI board, approvals panel, member activity, Telegram/voice approval with read-back, project switcher. |
-| **Why** | A multi-day project you cannot watch is a liability, not a feature. |
-| **Test project** | **`synthetic-report`** again, observed. |
-| **Gate** | Board renders live state. An approval can be granted from Telegram. A member's live trace is visible while it works. |
-| **Effort** | Medium. Mostly reuse (`05` §11). |
-| **Note** | Cannot be fully deferred. Phase 1 and 2 bugs are invisible without *some* observability. Recommend a minimal read-only board in Phase 1 and the full surface in Phase 4. |
+**Build record: `05-integration-map.md` §15.**
+
+**Status: wired and running.** `pytest tests/ -q` → **245 passed, 0 failed** (+16). The registry, the scheduler, the boot wiring and the tool registration all landed — group projects are now reachable from the running app. A **real project has been created and completed on a real model** (`D:\StarkProjects\hello-report`).
+
+**The real run found three bugs that 229 passing tests could not** (`05` §15.4): nothing dispatched a memberless project, the budget ceiling could never fire, and a member working silently was counted as a deadlock. All three were invisible to a suite that never ran the thing.
+
+**Deliberately deferred by decision:** the frontend board, the approvals panel, Telegram approval. `05` §11 remains the design.
 
 ---
 

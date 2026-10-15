@@ -850,13 +850,20 @@ class Supervisor:
         Without this, every project that pauses overnight for an approval — or
         while the orchestrator re-plans — would look like a failure.
 
-        Note the reasons are checked on the ITEM, not only on ``blocked``: a
-        manual acceptance criterion parks the item while it stays ``doing``,
-        because the work exists and is still ours. Checking status alone is how
-        a legitimate overnight wait gets mistaken for a deadlock.
+        Three cases, and the third is the one a real run taught us:
+
+        - an **invalidated** item: a re-plan is already open;
+        - a parked item (reason set): waiting on you, status unchanged;
+        - an item **actively running with a live lease**: a member emitting no
+          events is not idle. A real LLM item took 22 ticks of silence to
+          finish; without this, anything slower than the stall threshold
+          (50 ticks ≈ 12 min) would be declared deadlocked mid-work. The
+          exemption is self-limiting — when the lease expires the reaper
+          blocks the item, and a blocked item is no longer exempt.
         """
         return any(
             i["status"] == "invalidated"                              # re-plan open
             or i.get("blocked_reason") in WAITING_BLOCK_REASONS        # waiting on you
+            or (i["status"] == "doing" and i.get("lease_owner"))       # working
             for i in self.store.items(project_id)
         )

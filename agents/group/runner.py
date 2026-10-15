@@ -211,6 +211,12 @@ class LocalRunner(ItemRunner):
         ``module:function`` taking a state dict and returning outputs. Reading
         ``runtime`` from the *materialised* agent, not the registry, is what
         makes the folder self-contained (``01`` section 5).
+
+        The run is **scoped** on ``state_sync`` for the same reason delegation
+        scopes its jobs (``delegation.py:622-627``): the agent stack publishes
+        token usage into the current state, so without a scope the run both
+        pollutes the root state and loses its own cost — which would leave the
+        budget ceiling permanently reading zero.
         """
         runtime = str(ctx.member.get("runtime") or "")
         if not runtime or ":" not in runtime:
@@ -229,15 +235,38 @@ class LocalRunner(ItemRunner):
             "error_count": 0,
             "test_report": "",
         }
-        output = node(state) or {}
+
+        usage: dict = {}
+        token = None
+        try:
+            from sync.state_sync import active_state, new_scoped_state, safe_get_state
+            token = active_state.set(new_scoped_state({
+                "chat_id": ctx.chat_id,
+                "project_path": ctx.project_root,
+            }))
+            output = node(state) or {}
+            # Read usage BEFORE the scope resets, or the numbers are gone.
+            usage = dict((safe_get_state() or {}).get("token_usage") or {})
+        except Exception as exc:  # noqa: BLE001 - a failed run is a result
+            output = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if token is not None:
+                try:
+                    from sync.state_sync import active_state as _active
+                    _active.reset(token)
+                except Exception:  # noqa: BLE001, S110 - scope cleanup only
+                    pass
+
         report = str(output.get("agent_report") or output.get("content") or "")
+        tokens_in = int(usage.get("total_input_tokens") or 0)
+        tokens_out = int(usage.get("total_output_tokens") or 0)
         return RunResult(
             item_id=ctx.item["id"],
             ok=not output.get("error"),
             report=report,
             error=str(output.get("error") or ""),
-            cost_usd=float(output.get("cost_usd") or 0.0),
-            cost_tokens=int(output.get("cost_tokens") or 0),
+            cost_usd=float(usage.get("total_cost") or 0.0),
+            cost_tokens=tokens_in + tokens_out,
             artifact=str(output.get("artifact") or ""),
         )
 

@@ -229,38 +229,43 @@ Mitigation that already exists: the `never` tier removes tools from the material
 
 ## 4. Open Questions — Design
 
-| # | Question | Current lean | Blocks |
-|---|---|---|---|
-| D-1 | Is `run_command` `never` or `blocked` by default? (§3) | `never`, opt in | Phase 2 |
-| D-2 | Per-member cumulative conversation vs per-item? | Cumulative — continuity is the feature; `ProcessHistory` handles growth | Phase 2 |
-| D-3 | Does the orchestrator get re-planned automatically, or only when the human asks? | Auto on blocked-streaks + exhaustion; **not** per attempt (`03` §7) | Phase 3 |
-| D-4 | Should `llm` acceptance verdicts be able to hard-fail an item, or advisory only? | **Advisory** — overridable by the orchestrator (`02` §3.4) | Phase 2 |
-| D-5 | Stall threshold: is 50 idle ticks right? | Tunable; exempts legitimate approval waits | Phase 1 |
-| D-6 | Do `context/decisions.md` and `findings.md` need to be per-item, or is one per project enough? | One per project, tagged by item id | Phase 2 |
-| D-7 | Should the member prompt inline the acceptance criteria, or reference them? | **Inline** — a member that has to fetch its own success criteria will rationalise | Phase 2 |
-| D-8 | Does `plan_execution` need the tool-inventory/environment probe in its input? | Yes — the plan should only use tools that exist | Phase 3 |
-| D-9 | Telegram approval: inline `/approve <n>` or a fetched summary? | Fetched summary with a diff — approving blind is how mistakes happen (`04` §8) | Phase 4 |
-| D-10 | Does the completion predicate ever need to be LLM-judged ("is this good enough?")? | No. `llm` criteria are per-item; the project predicate stays deterministic | Phase 1 |
-| D-11 | Multi-project concurrency — how many projects may be live at once? | Needs a cap; the slot semaphore is shared | Phase 1 |
-| D-12 | When a member is `remove_member`, what happens to its in-flight item? | Lease released → `blocked(reassignment)`. Never silently reassigned | Phase 3 |
-| ~~D-13~~ | ~~Is the event `kind` vocabulary final?~~ **RESOLVED.** 37 kinds frozen in `agents/group/events.py`, grouped by concern, with `ITEM_STATUS_KIND`/`MILESTONE_STATUS_KIND` asserting the state↔kind correspondence (DM-19). Replaying an unimplemented kind raises `UnknownEventKind` rather than silently ignoring it, so a gap can only ever be loud. Adding kinds later is fine; renaming one is not. |
-| D-14 | How long should the invalidation re-plan window be before escalating to the human inbox? | 10 min default; tunable | Phase 2 |
-| D-15 | Does an invalidated item's successor reuse the id, or get a new one? | **New id.** Reusing makes the event log ambiguous — `item.invalidated` then `item.done` on the same id would look like a resurrection | Phase 1 |
-| D-16 | Should milestone `acceptance` exist, or is "all items done" enough? | Optional; useful for a phase-level manual checkpoint ("design approved") | Phase 2 |
-| D-17 | Do milestones ever reopen? | No — a `done` milestone is terminal. Reopening means a new milestone depending on it | Phase 1 |
-| D-18 | Should the events log be capped or rotated per project? | Never for state transitions. Tool-level events, if added, capped per item | Phase 5 |
+**Rewritten after Phase 4**, because the old table said "Blocks: Phase 2 / Phase 3" for phases that are now built and shipped. A blocker that silently stopped blocking is worse than no row at all — it reads as *handled* when it was merely passed. Each row now carries a **Status** instead.
+
+| # | Question | Status |
+|---|---|---|
+| D-1 | Is `run_command` `never` or `blocked` by default? (`06` §3) | **OPEN.** Never implemented. Does not bite while projects have no members; bites the moment one does, because a member with a shell defeats every other autonomy tier. |
+| D-2 | Per-member cumulative conversation vs per-item? | **RESOLVED BY BUILD.** Cumulative — `ProjectContext.member_chat_id` is deterministic per member, so continuity is the feature and `ProcessHistory` handles growth. |
+| D-3 | Is the orchestrator notified of failure streaks? | **PARTIAL.** It wakes on `item.failed` (exhaustion) and `item.blocked`, which are both in the wake set. It is **not** notified of the *first* failure — a retry emits `item.ready`, which is not a failure signal. `03` §7 specifies both; only exhaustion is wired. |
+| D-4 | Are `llm` verdicts advisory or final? | **RESOLVED, differently from the lean.** A failing verdict is final and triggers the normal retry ladder, not an advisory note. The override path is `group_update(invalidate_item)` — the orchestrator can reject a verdict, but has to say so explicitly rather than have the verdict auto-soften. |
+| D-5 | Stall threshold: is 50 idle ticks right? | **RESOLVED.** `STALL_TICKS = 50`, injectable per supervisor. Exemptions: invalidated, parked, and **an item `doing` with a live lease** — the last one added after the first real run, where an item worked silently for 22 ticks. |
+| D-6 | Are `context/decisions.md` and `findings.md` per-item or per-project? | **RESOLVED BY BUILD.** One per project, appended with a timestamp and optional source; the item id lives in the entry when relevant. |
+| D-7 | Inline the acceptance criteria, or reference them? | **RESOLVED BY BUILD.** Inlined (`runner.build_prompt`). A member that has to fetch its own success criteria will rationalise. |
+| D-8 | Does `plan_execution` need the environment inventory? | **RESOLVED BY BUILD.** It receives the agent, skill and MCP catalogues, so a plan only proposes things that exist. |
+| D-9 | Telegram approval: inline command or fetched summary? | **OPEN — deferred with the surface.** Lean unchanged: a fetched summary, because approving blind is how mistakes happen. |
+| D-10 | Is the completion predicate ever LLM-judged? | **RESOLVED.** No. `llm` criteria are per-item; the project predicate stays deterministic (`evaluate_completion`). |
+| D-11 | How many projects may be live at once? | **OPEN.** No cap. Irrelevant for one project, relevant the moment there are two — the slot semaphore is still per-delegation, not per-project. |
+| D-12 | What happens to a removed member's in-flight item? | **RESOLVED BY BUILD.** `remove_member` releases the lease and blocks the item with reason `reassignment`. Never silently reassigned. |
+| ~~D-13~~ | ~~Is the event vocabulary final?~~ | **RESOLVED.** Frozen in `agents/group/events.py`; the state↔kind correspondence is asserted (DM-19), and replaying an unimplemented kind raises `UnknownEventKind` rather than ignoring it. |
+| D-14 | Invalidation re-plan window before escalating to a human? | **OPEN.** Bursts are coalesced (RT-14) but never escalate — an invalidated item that nobody resolves sits there. The stall exemption makes it quiet, which is exactly the risk. |
+| D-15 | Does an invalidated item's successor reuse the id? | **RESOLVED BY CONVENTION.** New id. No successor is ever created automatically; the orchestrator supplies one. |
+| D-16 | Should milestone `acceptance` exist? | **OPEN — half-built.** The column exists and round-trips, but nothing evaluates it. Milestones complete on "all items done" only. |
+| D-17 | Do milestones ever reopen? | **RESOLVED BY ABSENCE.** There is no reopen path. A `done` milestone is terminal; reopening means a new milestone depending on it. |
+| D-18 | Should the events log be capped or rotated? | **OPEN — Phase 5.** Unbounded today. Correct for state transitions; would matter for tool-level events, which do not exist yet. |
 
 ---
 
 ## 5. Open Questions — Process
 
-| # | Question |
-|---|---|
-| P-1 | **Is the routing regression test in CI?** `.github/workflows/template-validate.yml` is currently the only workflow and runs `validate_templates.py` + `tests/run_all.py`. A routing test that needs a live model is expensive. Lean: a small offline fixture set in `tests/run_all.py`, full live routing checked manually. |
-| P-2 | Who writes the `PROJECT.md` prose? Authored by the human, drafted by the orchestrator, or both? Lean: orchestrator drafts, human edits. The `## Done when` section especially should be human-authored — it is intent, not data. |
-| P-3 | Does `docs/Structure.md` get a Zone Z5 for the supervisor? Lean yes, once Phase 1 lands — it is the de-facto architecture index. |
-| P-4 | What is the migration story for the existing `tasks_json` tasks (`chat_store.py:71`)? Lean: leave them. They are the `scheduled` shape and remain valid. |
-| P-5 | Does `fixed-concept.md` need amendment? It declares the three-tier shape (`fixed-concept.md` §2). A group project is not a fourth tier, so arguably not — but §5's concurrency claim needs the supervisor's single-writer rule added. **Recommend amending §5 once Phase 1 lands.** |
+| # | Question | Status |
+|---|---|---|
+| P-1 | Is the routing regression test in CI? | **RESOLVED.** `tests/test_group_routing.py` asserts the **deterministic classifier** in both directions — no model, so it runs offline and is in CI. A routing test that needed a model would not be run. |
+| P-2 | Who writes the `PROJECT.md` prose? | **RESOLVED BY BUILD.** The orchestrator renders it from structured arguments at creation (`groupTools._render_manifest`); the human edits it afterwards. The tool takes milestones and members, not markdown — a model hand-writing fenced YAML in one call gets it wrong sometimes. |
+| P-3 | Does `docs/Structure.md` get a Zone Z5? | **RESOLVED.** Z5 exists, marked DESIGNED, not built. Worth revisiting now that it *is* built. |
+| P-4 | Migration story for existing `tasks_json` tasks? | **UNCHANGED.** Leave them. They are the `scheduled` shape and remain valid. |
+| P-5 | Does `fixed-concept.md` need amendment? | **DONE.** §5 now carries the supervisor's single-writer rule and the one-thread decision. |
+| P-6 | ~~Where does the Phase 0 job store live?~~ | **RESOLVED.** `.deep_agents/jobs.db`; `JobStore` is one interface with two backings. `07` §6. |
+| P-7 | ~~Is the `state_sync` fix a blocker?~~ | **RESOLVED.** ~6 lines, pattern already at `delegation.py:622`. `07` §5. |
+| P-8 | Is `tests/run_all.py` still needed? | **NEW.** CI now uses pytest. `run_all.py` was fixed (repo root on `sys.path`; fixture tests SKIP instead of failing) and kept for the zero-dependency path. Decide whether to keep both or retire it. |
 | ~~P-6~~ | ~~Where does the Phase 0 job store live?~~ **RESOLVED.** New `.deep_agents/jobs.db`, not a table in `chats.db` and not the JSONL ledger. `JobStore` is one interface with two backings — harness-level in Phase 0, per-project in Phase 2. Rationale and rejected alternatives: `07-phase-0-implementation.md` §6. |
 | ~~P-7~~ | ~~Is the `state_sync` fix a blocker?~~ **RESOLVED.** No. It is a ~6-line fix using a pattern already proven at `delegation.py:622-627`; the scheduler simply never sets `active_state`. It is Phase 0, deliverable 3. Corrected in `05` §5. |
 

@@ -192,6 +192,32 @@ message-schema bridging.
 - Subagent spawns are bounded (a task-depth limit / usage limits); a runaway
   subagent must not kill the parent.
 
+### 5.1 Group projects — the single-writer rule (added with Phase 4)
+
+A group project is a long-lived board that outlives any one run, and every
+rule above is per-run. It therefore needs one more, and it is the rule that
+makes live mutation safe:
+
+- **One supervisor thread, one writer.** The supervisor applies every state
+  change; the orchestrator *submits operations* and never writes the board.
+  The guard is structural, not a lock per project — which is why parallelism
+  lives in member execution and never in the scheduler
+  (`agents/group/supervisor.py`, `docs/group-projects/02-runtime.md` §2).
+- **The supervisor makes no LLM calls.** Its control flow must be replayable
+  and cheap at a 15-second cadence. Judgement lives in members; if a tick
+  needs a decision, it emits an event that wakes the orchestrator (RT-01).
+- **Events are the only truth; every table is a projection.** One pure
+  reducer serves both the incremental write and `rebuild()`, so rebuild is
+  provably equivalent to the write path, and changing the projection model
+  later needs no migration (`docs/group-projects/01-concept-model.md` §7).
+- **No per-project threads.** They leak, they contend, and they destroy the
+  ordering guarantee that the single writer provides.
+
+These extend §5 rather than contradict it: `WorkspaceDeps` still isolates each
+run, `shared_state` is still not a source of truth, and a runaway member is
+still bounded — now by its lease, which expires whether or not the member
+cooperates.
+
 ---
 
 ## 6. Verification / "done" contract for each migration step

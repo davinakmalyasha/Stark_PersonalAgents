@@ -57,6 +57,7 @@ scratch/eval_runs*/
 scratch/eval_*.log
 scratch/eval_*.err.log
 scratch/eval_pid.txt
+scratch/*.pid
 scratch/*.png
 scratch/*.txt
 scratch/*.json

@@ -16,7 +16,11 @@ jobs:
         run: |
           pip install --quiet jinja2 pyyaml
           python scripts/validate_templates.py
-      - name: Test suite (renderer, apply_template, branch levels, gate installer, push matrix, tier contracts)
+      - name: Test suite
+        # pytest, not tests/run_all.py. run_all.py is a zero-dependency runner
+        # that cannot supply fixtures, so it SKIPs 23 fixture-based tests — and
+        # before it was fixed it also failed 46 tests it could not import.
+        # pytest is the runner that actually exercises everything.
         run: |
-          pip install --quiet jinja2 pyyaml
-          python tests/run_all.py
+          pip install --quiet jinja2 pyyaml pytest
+          python -m pytest tests/ -q

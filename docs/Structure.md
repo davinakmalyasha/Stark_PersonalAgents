@@ -81,10 +81,10 @@ you type "fix this bug"
   └───────────────────────────────────────────────────────────────────────────────┘
   Z4 ─ FRONTEND: hooks parse the TV feed into the trace UI (Part 4) / Telegram+Voice
   ═════════════════════════════════════════════════════════════════════════════════
-  Z5 ─ GROUP PROJECTS — durable multi-agent projects      (Part 5 · DESIGNED, not built)
+  Z5 ─ GROUP PROJECTS — durable multi-agent projects      (Part 5 · BUILT)
   ┌───────────────────────────────────────────────────────────────────────────────┐
-  │ PLANNED. No code yet - see docs/group-projects/00-vision.md before            │
-  │ assuming anything here exists.                                                │
+  │ BUILT. Phases 0-4 wired. 245 tests pass; a real project completed on a        │
+  │ real model. Design of record: docs/group-projects/                            │
   │                                                                               │
   │ a project folder is SELF-CONTAINED - it carries its own capability set:       │
   │                                                                               │
@@ -92,17 +92,18 @@ you type "fix this bug"
   │   agents/ (chosen)      skills/     tools/       mcp/ (creds by NAME)         │
   │   context/  inbox.md                                                          │
   │                                                                               │
-  │   you speak -> orchestrator: plan the DAG + pick the environment              │
-  │                              |    and MATERIALISE it into the folder          │
-  │                              v                                                │
+  │   you speak -> orchestrator: plan_execution -> shape=solo|group|scheduled     │
+  │                               |   then create_group_project MATERIALISES it   │
+  │                               v                                               │
   │                  supervisor.tick()   (no LLM, 11 phases)                      │
-  │                              |                                                │
-  │            milestones -> readiness -> lease -> dispatch                       │
+  │                               |                                               │
+  │            milestones -> readiness -> lease -> dispatch -> collect            │
   │            -> verify against acceptance criteria                              │
   │            -> invalidate (re-plan) -> budget/deadline/stall                   │
-  │                              |                                                │
+  │                               |                                               │
   │               events = the ONLY truth; the board is a projection              │
-  │                              |                                                │
+  │                               |                                               │
   │   provider: command . deepseek-v4.1-flash + mimo-v2.6-flash, both high        │
-  │   design, phases, cloud concept, open Qs: docs/group-projects/                │
+  │   entry points: tools/AddOnTool/groupTools.py (6 orchestrator tools)          │
+  │   registry: server/store/group_registry.py (the folder IS the registry)       │
   └───────────────────────────────────────────────────────────────────────────────┘

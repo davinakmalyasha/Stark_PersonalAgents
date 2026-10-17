@@ -5,6 +5,9 @@ declare global {
     antigravity?: {
       /** Open a native folder picker dialog (Electron). Returns path or null. */
       selectFolder: () => Promise<string | null>;
+      /** Reveal a project folder in the OS file manager. The main process
+       *  rejects any path outside the projects root. */
+      revealPath?: (target: string) => Promise<{ ok: boolean; error?: string }>;
       /** Toggle the floating voice overlay window (Electron). */
       voiceToggle?: () => Promise<boolean>;
       /** Subscribe to voice session events from the overlay.

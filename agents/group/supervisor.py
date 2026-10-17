@@ -732,6 +732,12 @@ class Supervisor:
 
         changed = 0
         for item in self.store.items(project_id, status="doing"):
+            if item.get("blocked_reason") == ev.AWAITING_APPROVAL:
+                # The member asked permission and returned anyway. Settling it
+                # here would mark the work done *behind the approval it just
+                # requested* — which is the exact thing the park exists to
+                # prevent. Only a human clears this (``resolve_approval``).
+                continue
             if not item.get("result") and not item.get("error"):
                 continue  # still running
             if item.get("error"):

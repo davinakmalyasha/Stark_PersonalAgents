@@ -545,3 +545,121 @@
   }
   .house-sidebar-backdrop, .ide-panel-enter { animation: none !important; }
 }
+
+/* ────────────────────────────────────────────────────────────────
+   Group projects — the board's panel and modal
+
+   Extends the task chip's vocabulary rather than inventing a parallel
+   one: `canvas-task-dot` already carries is-running / is-scheduled /
+   is-failed, so the missing project states are added here.
+
+   `is-waiting` is the only state that gets a glow. Everything else
+   stays quiet on purpose — a board where every row shouts is a board
+   nobody reads, and the one thing that must never be missed while you
+   are away is "this is waiting on you".
+   ──────────────────────────────────────────────────────────────── */
+
+.canvas-task-dot.is-done { background: #7ee0a8; }
+.canvas-task-dot.is-paused { background: #b3a0ff; }
+.canvas-task-dot.is-stalled,
+.canvas-task-dot.is-failed {
+  background: #fb7185;
+  box-shadow: 0 0 8px rgba(251, 113, 133, 0.55);
+}
+.canvas-task-dot.is-waiting {
+  background: #fbbf24;
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
+}
+
+/* A project row is one <button>, not a div with buttons inside: the whole
+   row opens the detail, so the whole row must be reachable by keyboard. */
+.gp-row {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.gp-row:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline-offset: 2px;
+}
+
+/* The one thing worth colouring in the panel. */
+.gp-waiting-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: rgba(251, 191, 36, 0.14);
+  color: #fcd34d;
+  font-size: 8px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* ── Modal ──
+   The header and footer are sticky, so a focused row can otherwise be
+   scrolled underneath them and become invisible to a keyboard user
+   (WCAG 2.2 "Focus Not Obscured"). scroll-margin keeps focus clear. */
+.gp-modal-scroll {
+  scroll-padding-top: 8px;
+  scroll-padding-bottom: 8px;
+}
+.gp-modal-scroll :is(button, [tabindex]):focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline-offset: 2px;
+  scroll-margin-top: 56px;
+  scroll-margin-bottom: 72px;
+}
+
+/* Status chips must never wrap to a second line — one wrapped chip breaks
+   the whole column's rhythm. Bound the label, keep the full text
+   reachable via title/aria rather than a hover-only tooltip. */
+.gp-chip {
+  flex: none;
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.07);
+  color: #a1a1aa;
+}
+.gp-chip.is-done { background: rgba(126, 224, 168, 0.13); color: #7ee0a8; }
+.gp-chip.is-doing { background: rgba(125, 211, 252, 0.13); color: #7dd3fc; }
+.gp-chip.is-blocked,
+.gp-chip.is-failed { background: rgba(251, 113, 133, 0.13); color: #fb7185; }
+.gp-chip.is-waiting { background: rgba(251, 191, 36, 0.14); color: #fcd34d; }
+.gp-chip.is-invalidated { background: rgba(179, 160, 255, 0.13); color: #b3a0ff; }
+
+/* Event log: monospace, so timestamps and seq numbers line up. */
+.gp-event-kind {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Loading skeleton ──
+   A modal that opens onto a blank panel reads as broken. */
+.gp-skeleton {
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.045) 25%,
+    rgba(255, 255, 255, 0.085) 37%,
+    rgba(255, 255, 255, 0.045) 63%
+  );
+  background-size: 400% 100%;
+  animation: gp-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes gp-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gp-skeleton { animation: none !important; }
+}
+

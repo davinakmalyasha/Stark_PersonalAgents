@@ -607,6 +607,32 @@ ipcMain.handle('select-folder', async () => {
   return result.filePaths[0];
 });
 
+// ── IPC: Reveal a project folder in the OS file manager ──
+// The path is validated against the projects root rather than opened
+// blindly: the renderer is the least trusted part of the app, and "open any
+// path you are handed" is a capability it has no business holding.
+ipcMain.handle('reveal-path', async (_event, target) => {
+  const root = process.env.STARK_PROJECTS_ROOT || 'D:\\StarkProjects';
+  if (typeof target !== 'string' || !target) return { ok: false, error: 'no path' };
+  let resolved;
+  let resolvedRoot;
+  try {
+    resolved = fs.realpathSync(path.resolve(target));
+    resolvedRoot = fs.realpathSync(path.resolve(root));
+  } catch {
+    return { ok: false, error: 'That folder does not exist.' };
+  }
+  const rel = path.relative(resolvedRoot, resolved);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { ok: false, error: 'That folder is outside the projects root.' };
+  }
+  if (!fs.statSync(resolved).isDirectory()) {
+    return { ok: false, error: 'That is not a folder.' };
+  }
+  const failure = await shell.openPath(resolved);
+  return failure ? { ok: false, error: failure } : { ok: true };
+});
+
 // ── Tray ──
 function setApiPid(pid) {
   apiPid = pid || null;

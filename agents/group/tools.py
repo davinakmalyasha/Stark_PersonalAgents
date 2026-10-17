@@ -318,6 +318,31 @@ class GroupToolkit:
                      data={"detail": detail})
         return ToolResult(True, f"{item_id} parked awaiting approval")
 
+    def resolve_approval(self, project_id: str, *, item_id: str, grant: bool,
+                         note: str = "") -> ToolResult:
+        """The human's answer to :meth:`request_approval`.
+
+        The other half of a pair that shipped half-built: ``request_approval``
+        parked an item and every reducer for the answer already existed
+        (``APPROVAL_GRANTED`` clears the block, ``APPROVAL_REJECTED`` blocks
+        the item and releases the lease) — but nothing ever emitted either
+        one, and the stall detector exempts ``AWAITING_APPROVAL``, so a
+        parked item was silent **forever**.
+
+        Deliberately NOT an orchestrator op and deliberately absent from
+        ``_OPS``: an approval the model can grant itself is not an approval.
+        The only caller is a person, through the board.
+        """
+        store, _context = self._handle(project_id)
+        if store.item(item_id) is None:
+            return ToolResult(False, f"unknown item {item_id!r}")
+        kind = ev.APPROVAL_GRANTED if grant else ev.APPROVAL_REJECTED
+        store.append(project_id, kind, "human", item_id=item_id,
+                     data={"note": note} if note else {})
+        if grant:
+            return ToolResult(True, f"{item_id} approved")
+        return ToolResult(True, f"{item_id} rejected — blocked awaiting a re-plan")
+
     def append_finding(self, project_id: str, *, text: str, source: str = "") -> ToolResult:
         """Append to ``context/findings.md``. Write down what you LEARNED."""
         _store, context = self._handle(project_id)

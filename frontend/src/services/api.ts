@@ -4,4 +4,5 @@ export * from './api/base';
 export * from './api/workspace';
 export * from './api/chat';
 export * from './api/tasks';
+export * from './api/groups';
 export * from './api/stream';

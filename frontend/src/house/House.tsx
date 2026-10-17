@@ -9,6 +9,8 @@ import CodingIDE from './CodingIDE';
 import NewProjectDialog from './NewProjectDialog';
 import SubagentSessionView from './SubagentSessionView';
 import AddTaskModal from '../components/Canvas/AddTaskModal';
+import GroupProjectModal from './GroupProjectModal';
+import { useGroupProjects } from './useGroupProjects';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import { useHouseChat } from './useHouseChat';
 import { useSessions, tabId } from './useSessions';
@@ -42,6 +44,13 @@ export default function House() {
 
   const activeTab = sessions.activeTab;
   const isCodingTab = activeTab?.type === 'coding';
+
+  // Group projects follow the active tab: a coding workspace sees only the
+  // projects started from its own folder, while General sees them all. The
+  // rule itself lives on the server — this only carries the id.
+  const [openProjectId, setOpenProjectId] = useState<string | null>(null);
+  const groupScopeId = activeTab?.workspaceId || chat.workspaceId || '';
+  const { projects, scoped: projectsScoped, refresh: refreshProjects } = useGroupProjects(groupScopeId);
 
   // IDE open/close transition: keep the exiting IDE mounted for the exit
   // animation so it feels like staying on the same page (only the IDE shows/
@@ -298,6 +307,9 @@ export default function House() {
         onOpenTasks={openTasks}
         onTaskStart={chat.handleTaskStart}
         onTaskDelete={chat.handleTaskDelete}
+        projects={projects}
+        projectsScoped={projectsScoped}
+        onOpenProject={setOpenProjectId}
       />
 
       <main className="relative z-10 flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -391,6 +403,14 @@ export default function House() {
           onClose={() => setTaskModalOpen(false)}
           onCreated={chat.handleTaskCreated}
           onStartNow={chat.handleTaskRunNow}
+        />
+      )}
+
+      {openProjectId && (
+        <GroupProjectModal
+          key={openProjectId}
+          projectId={openProjectId}
+          onClose={() => { setOpenProjectId(null); refreshProjects(); }}
         />
       )}
 

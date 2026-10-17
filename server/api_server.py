@@ -221,6 +221,8 @@ from server.routers.chats import router as chats_router
 app.include_router(chats_router)
 from server.routers.tasks import router as tasks_router
 app.include_router(tasks_router)
+from server.routers.groups import router as groups_router
+app.include_router(groups_router)
 from server.routers.runs import router as runs_router
 app.include_router(runs_router)
 from server.routers.voice import router as voice_router

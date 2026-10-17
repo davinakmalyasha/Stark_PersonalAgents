@@ -197,11 +197,17 @@ def create_group_project(goal: str, milestones: list, members: list | None = Non
                          skills: list | None = None,
                          mcp: list | None = None,
                          deps: dict | None = None,
-                         project_id: str = "") -> str:
+                         project_id: str = "",
+                         ctx: object = None) -> str:
     """Start a durable project that keeps working until it is done.
 
     Only after ``plan_execution`` returned ``shape=group`` and the human agreed
     the preview. Effects are queued; read ``group_board`` to follow progress.
+
+    ``ctx`` is the run's typed ``WorkspaceDeps``, injected by the tool layer
+    (``llm/native_tools.py`` and ``tools/_registry.py`` both bind any parameter
+    named ``ctx``/``deps``/``run_ctx``/``context``). It is how this tool learns
+    which workspace asked — the model never supplies it.
     """
     if not goal or not str(goal).strip():
         return f"{_TOOL_ERR} create_group_project needs a goal"
@@ -221,10 +227,23 @@ def create_group_project(goal: str, milestones: list, members: list | None = Non
     except Exception as exc:  # noqa: BLE001 - surfaced to the model
         return f"{_TOOL_ERR} create_group_project failed: {type(exc).__name__}: {exc}"
 
+    # Remember which workspace asked, in the HARNESS — never in the folder.
+    # The portability contract (``01`` §14) forbids writing a root into a
+    # project, and a project that loses this still resumes perfectly.
+    origin = ""
+    try:
+        origin = registry.workspace_id_for_path(
+            str(getattr(ctx, "project_path", "") or "")) or ""
+        if origin:
+            registry.set_origin_workspace(manifest.id, origin)
+    except Exception:  # noqa: BLE001 - an unrecorded origin is not a failed create
+        origin = ""
+
     return (f"[OK] created project {manifest.id}\n"
             f"path: {paths.project_dir}\n"
             f"milestones: {len(manifest.milestones)} · members: {len(manifest.members)}\n"
-            f"the supervisor will start dispatching within one tick (~15s).\n"
+            + (f"origin workspace: {origin}\n" if origin else "")
+            + f"the supervisor will start dispatching within one tick (~15s).\n"
             f"follow with group_board(project_id=\"{manifest.id}\")")
 
 

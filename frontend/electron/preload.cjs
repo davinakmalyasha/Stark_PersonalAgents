@@ -18,6 +18,7 @@ function _subscribe(channel, set, cb) {
 
 contextBridge.exposeInMainWorld('antigravity', {
   selectFolder: () => ipcRenderer.invoke('select-folder'),
+  revealPath: (target) => ipcRenderer.invoke('reveal-path', target),
   voiceToggle: () => ipcRenderer.invoke('voice-toggle'),
   voiceText: (text) => ipcRenderer.send('voice-text', text),
   voiceStatus: (status) => ipcRenderer.send('voice-status', status),

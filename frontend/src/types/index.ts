@@ -314,3 +314,92 @@ export interface UiState {
   pinned_chats?: string[];
   chats_filter?: ChatsFilter;
 }
+
+// ── Group projects (durable multi-agent projects) ───────────────────────────
+//
+// Mirrors `server/routers/groups.py`. The server sends the projection TABLES,
+// not `GroupToolkit.board()`'s formatted string — a UI that had to parse prose
+// back into state would make the rendering the source of truth.
+
+/** One row in the board's project list. */
+export interface GroupProjectRow {
+  id: string;
+  path: string;
+  title: string;
+  status: string;
+  spent_usd?: number | null;
+  /** The workspace it was created from; null means global. */
+  origin_workspace_id?: string | null;
+  milestones_done: number;
+  milestones_total: number;
+  items_done: number;
+  items_total: number;
+  awaiting_approval: number;
+}
+
+export interface GroupProjectList {
+  projects: GroupProjectRow[];
+  /** True when the board is filtered to one coding workspace. */
+  scoped: boolean;
+}
+
+export interface GroupEvent {
+  seq: number;
+  ts: number;
+  kind: string;
+  actor: string;
+  milestone_id?: string | null;
+  item_id?: string | null;
+  data?: Record<string, unknown>;
+}
+
+export interface GroupItem {
+  id: string;
+  project_id: string;
+  milestone_id?: string | null;
+  title: string;
+  detail?: string;
+  status: string;
+  attempts?: number;
+  max_attempts?: number;
+  owner_member?: string | null;
+  lease_owner?: string | null;
+  cost_tokens?: number;
+  cost_usd?: number;
+  result?: string | null;
+  error?: string | null;
+  blocked_reason?: string | null;
+  invalidated_reason?: string | null;
+  acceptance?: unknown[];
+  updated_at?: number;
+}
+
+export interface GroupMilestone {
+  id: string;
+  project_id: string;
+  title: string;
+  status: string;
+  depends_on?: string[];
+}
+
+export interface GroupProject {
+  status?: string;
+  goal?: string;
+  spent_usd?: number | null;
+  budget_usd?: number | null;
+  halt_reason?: string | null;
+  deadline?: string | number | null;
+  [key: string]: unknown;
+}
+
+export interface GroupProjectDetail {
+  id: string;
+  path: string;
+  project: GroupProject;
+  milestones: GroupMilestone[];
+  items: GroupItem[];
+  events: GroupEvent[];
+}
+
+/** The only ops the board may perform — see `groups.py` `UI_OPS`. */
+export type GroupOp = 'pause' | 'resume' | 'close';

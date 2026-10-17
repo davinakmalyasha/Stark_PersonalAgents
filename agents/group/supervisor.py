@@ -389,8 +389,10 @@ class Supervisor:
             if not tools:
                 raise OpRejected("attach_tool requires at least one tool")
             ceiling = context.member_ceiling(member) if context else None
+            deny = mat.never_tools(context.autonomy) if context else set()
             try:
-                agent = mat.set_member_tools(paths, member, tools, ceiling=ceiling)
+                agent = mat.set_member_tools(paths, member, tools,
+                                             ceiling=ceiling, deny=deny)
             except mat.MaterializationError as exc:
                 raise OpRejected(str(exc)) from exc
             self._capability_event(project_id, "tools", member,
@@ -413,10 +415,18 @@ class Supervisor:
                             thinking=str(payload.get("thinking") or ""),
                             tools=payload.get("tools"),
                             skills=list(payload.get("skills") or []),
-                            mcp=list(payload.get("mcp") or []))
+                            mcp=list(payload.get("mcp") or []),
+                            deny=mat.never_tools(context.autonomy) if context else set())
                          if spec is not None
-                         else mat.agent_from_profile(profile, name))
+                         else mat.agent_from_profile(
+                             profile, name,
+                             deny=mat.never_tools(context.autonomy) if context else set()))
                 mat.write_agent(agent, paths.agents_dir)
+                # Keep tools/bindings.json in step. Without this the new member
+                # has no entry, so the runner finds no allowlist for it — a
+                # member added mid-project would run un-narrowed while every
+                # member created with the project was bounded.
+                mat.set_member_tools(paths, name, list(agent.get("tools") or []))
             except mat.MaterializationError as exc:
                 raise OpRejected(str(exc)) from exc
             self._capability_event(project_id, "member", name,

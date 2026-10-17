@@ -238,8 +238,24 @@ class LocalRunner(ItemRunner):
 
         usage: dict = {}
         token = None
+        allow_token = None
         try:
             from sync.state_sync import active_state, new_scoped_state, safe_get_state
+            from tools._runtime import active_allowed_tools
+
+            # The member's materialised allowlist is the real ceiling on its
+            # tools (``04`` §5). Until this ran, ``tools/bindings.json`` was
+            # written at creation and never opened again — so a project that
+            # withheld a tool had that decision ignored at run time, which made
+            # the whole `never` tier decorative (D-1, ``06`` §3).
+            #
+            # Set here, inside the member's own thread, because ContextVars do
+            # not cross the boundary `start()` opened.
+            from . import materialize as mat
+            allow = mat.read_member_allow(ctx.project_root, ctx.member_name)
+            if allow is not None:
+                allow_token = active_allowed_tools.set(frozenset(allow))
+
             token = active_state.set(new_scoped_state({
                 "chat_id": ctx.chat_id,
                 "project_path": ctx.project_root,
@@ -250,6 +266,12 @@ class LocalRunner(ItemRunner):
         except Exception as exc:  # noqa: BLE001 - a failed run is a result
             output = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
+            if allow_token is not None:
+                try:
+                    from tools._runtime import active_allowed_tools as _allow
+                    _allow.reset(allow_token)
+                except Exception:  # noqa: BLE001, S110 - scope cleanup only
+                    pass
             if token is not None:
                 try:
                     from sync.state_sync import active_state as _active

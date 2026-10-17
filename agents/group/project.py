@@ -370,6 +370,9 @@ def create_group_project(root: str, manifest: Manifest, *,
     environment = manifest.environment
 
     # 1. members -> agents/*.json, with provenance (DM-09)
+    # The envelope's `never` tier is applied first, so a member can neither be
+    # given nor ask for a tool the project has withheld (D-1, ``06`` §3).
+    denied = mat.never_tools(manifest.autonomy)
     agents: list[dict] = []
     for member in manifest.members:
         name = str(member["name"])
@@ -384,6 +387,7 @@ def create_group_project(root: str, manifest: Manifest, *,
                 skills=list(member.get("skills") or []),
                 mcp=list(member.get("mcp") or []),
                 tool_caps=member.get("tool_caps"),
+                deny=denied,
             )
         elif profile_lookup is not None:
             profile = profile_lookup(derived_from)
@@ -391,7 +395,7 @@ def create_group_project(root: str, manifest: Manifest, *,
                 raise mat.MaterializationError(
                     f"member {name!r} derives from unknown agent {derived_from!r}"
                 )
-            agent = mat.agent_from_profile(profile, name)
+            agent = mat.agent_from_profile(profile, name, deny=denied)
         else:
             raise mat.MaterializationError(
                 f"member {name!r} derives from unknown agent {derived_from!r}"

@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -76,12 +77,16 @@ class Rig:
         from _util import real_tools
         self.tools = real_tools()
 
-    def create(self, project_id: str = "tiny-report", *, ctx=None) -> str:
+    def create(self, project_id: str = "tiny-report", *, ctx=None,
+               members: list | None = None, autonomy: dict | None = None) -> str:
         out = self.tools.create_group_project(
             goal="produce a tiny report", milestones=MILESTONES,
-            project_id=project_id, ctx=ctx)
+            members=members, autonomy=autonomy, project_id=project_id, ctx=ctx)
         assert out.startswith("[OK]"), out
         return project_id
+
+    def paths(self, project_id: str = "tiny-report"):
+        return self.registry.project_paths(project_id)
 
     def store(self, project_id: str = "tiny-report"):
         return self.registry.open_store(project_id)
@@ -551,3 +556,208 @@ def test_progress_survives_a_broken_project():
         from server.routers import groups
         progress = groups._progress("does-not-exist")
         assert progress["items_total"] == 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  The `never` tier — a withheld tool must be absent, not refused
+# ════════════════════════════════════════════════════════════════════════════
+#
+# D-1 (``06`` §3). Before this, ``tools/bindings.json`` was written at creation
+# and never opened again: the member's toolset came from its derived agent's
+# registry scope, so a project that withheld a tool had that decision ignored.
+# `never` and `blocked` were the same thing — a string in a prompt.
+
+MEMBER = [{"name": "researcher", "derived_from": "general"}]
+
+
+def _materialize():
+    from agents.group import materialize as mat
+    return mat
+
+
+def test_never_tools_defaults_to_withholding_a_shell():
+    mat = _materialize()
+    assert mat.never_tools({}) == {"run_command"}
+    # Other envelope keys do not turn a shell back on.
+    assert mat.never_tools(
+        {"project_folder": "autonomous", "external_write": "needs_approval"}
+    ) == {"run_command"}
+    # Case and whitespace are not a way to slip past it.
+    assert mat.never_tools({"run_command": "  NEVER "}) == {"run_command"}
+
+
+def test_the_envelope_can_opt_into_a_shell():
+    """Blocked and autonomous both keep the tool; only `never` removes it."""
+    mat = _materialize()
+    for tier in ("blocked", "autonomous"):
+        assert mat.never_tools({"run_command": tier}) == set(), tier
+
+
+def test_a_created_member_has_no_shell_by_default():
+    with Rig() as rig:
+        rig.create("tiny-report", members=MEMBER)
+        allow = _materialize().read_member_allow(
+            rig.paths().project_dir, "researcher")
+        assert allow is not None, "the member was never bound"
+        assert "run_command" not in allow, allow
+        # It keeps everything else it derives from `general`.
+        assert "read_pdf" in allow, allow
+
+        with open(os.path.join(rig.paths().project_dir, "agents", "researcher.json"),
+                  encoding="utf-8") as handle:
+            agent = json.load(handle)
+        assert "run_command" not in agent["tools"]
+
+
+def test_a_member_cannot_ask_for_a_withheld_tool():
+    """Asking for a `never` tool is a contradiction, not a silent drop."""
+    with Rig() as rig:
+        try:
+            rig.create("tiny-report", members=[
+                {"name": "researcher", "derived_from": "general",
+                 "tools": ["read_pdf", "run_command"]}])
+        except AssertionError as exc:
+            assert "never" in str(exc) and "run_command" in str(exc), exc
+        else:
+            raise AssertionError("a withheld tool was materialised anyway")
+
+
+def test_opting_in_keeps_the_shell():
+    """A project that needs builds and tests says so in its envelope."""
+    with Rig() as rig:
+        rig.create("opted-in", members=MEMBER, autonomy={
+            "project_folder": "autonomous",
+            "external_read": "autonomous",
+            "external_write": "needs_approval",
+            "run_command": "blocked",          # <- the opt-in
+        })
+        allow = _materialize().read_member_allow(
+            rig.paths("opted-in").project_dir, "researcher")
+        assert allow is not None
+        assert "run_command" in allow, (
+            "opting in did not keep the tool the envelope allowed"
+        )
+
+
+def test_read_member_allow_gives_three_different_answers():
+    """None, a list, and [] mean three different things."""
+    mat = _materialize()
+    with Rig() as rig:
+        rig.create("tiny-report", members=MEMBER)
+        root = rig.paths().project_dir
+
+        assert mat.read_member_allow(root, "researcher") is not None
+        # Listed others, but not this one: fail closed, not open.
+        assert mat.read_member_allow(root, "nobody") == []
+        # No bindings at all -> no narrowing (the synthetic sole member).
+        empty = os.path.join(rig._tmp.name, "empty-project")
+        os.makedirs(empty, exist_ok=True)
+        assert mat.read_member_allow(empty, "anyone") is None
+
+
+def test_the_runtime_narrows_the_toolset():
+    """The half that was missing: the allowlist is actually consulted."""
+    from tools._runtime import active_allowed_tools
+    from tools._schemas import get_native_tool_names
+
+    full = set(get_native_tool_names("general"))
+    assert "run_command" in full
+
+    token = active_allowed_tools.set(frozenset(full - {"run_command"}))
+    try:
+        narrowed = set(get_native_tool_names("general"))
+    finally:
+        active_allowed_tools.reset(token)
+
+    assert "run_command" not in narrowed
+    assert "read_pdf" in narrowed, "it removed more than the allowlist said"
+    assert set(get_native_tool_names("general")) == full, "the reset leaked"
+
+
+def test_the_allowlist_cannot_widen_the_scope():
+    """The scope map stays the ceiling (``04`` §5)."""
+    from tools._runtime import active_allowed_tools
+    from tools._schemas import _scope_allowed
+
+    token = active_allowed_tools.set(frozenset({"run_command", "not_a_real_tool"}))
+    try:
+        narrowed = _scope_allowed("general")
+    finally:
+        active_allowed_tools.reset(token)
+
+    assert "run_command" in narrowed
+    assert "not_a_real_tool" not in narrowed
+
+
+def test_attach_tool_cannot_hand_back_the_shell():
+    """Otherwise attach_tool would be a way around the envelope."""
+    with Rig() as rig:
+        rig.create("tiny-report", members=MEMBER)
+        out = rig.tools.group_update("tiny-report", "attach_tool", {
+            "member": "researcher", "tools": ["read_pdf", "run_command"]})
+        assert out.startswith("[OK]"), out
+        _supervisor(rig).tick("tiny-report")
+
+        store = rig.store("tiny-report")
+        rejected = [e for e in store.events("tiny-report") if e["kind"] == "op.rejected"]
+        assert rejected, "the op was not rejected"
+        allow = _materialize().read_member_allow(
+            rig.paths().project_dir, "researcher")
+        assert "run_command" not in allow, allow
+
+
+def test_a_member_added_mid_project_is_still_bound():
+    """add_member used to write the agent but no binding, so a member added
+    after creation escaped the allowlist that every other member was held to."""
+    with Rig() as rig:
+        rig.create("tiny-report")          # no members at creation
+        out = rig.tools.group_update("tiny-report", "add_member", {
+            "name": "late", "derived_from": "general"})
+        assert out.startswith("[OK]"), out
+        _supervisor(rig).tick("tiny-report")
+
+        allow = _materialize().read_member_allow(
+            rig.paths().project_dir, "late")
+        assert allow is not None, "the mid-project member was never bound"
+        assert "run_command" not in allow, allow
+
+
+def test_the_runner_applies_the_projects_allowlist():
+    """The integration proof: a real member run sees the narrowed toolset.
+
+    Everything above tests the pieces. This drives ``_execute_node`` with a
+    runtime that reports the tools it can actually see, which is the only way
+    to know the wiring holds end to end.
+    """
+    with Rig() as rig:
+        rig.create("tiny-report", members=MEMBER)
+        allow = _materialize().read_member_allow(
+            rig.paths().project_dir, "researcher")
+        assert allow is not None and "run_command" not in allow
+
+        probe = types.ModuleType("gp_tool_probe")
+
+        def run(_state):
+            from tools._schemas import get_native_tool_names
+            return {"agent_report": ",".join(sorted(get_native_tool_names("general")))}
+
+        probe.run = run
+        sys.modules["gp_tool_probe"] = probe
+        try:
+            from agents.group.runner import LocalRunner, RunContext
+            result = LocalRunner()._execute_node(RunContext(
+                project_id="tiny-report",
+                project_root=rig.paths().project_dir,
+                item={"id": "m1.i1", "title": "t"},
+                member={"runtime": "gp_tool_probe:run", "derived_from": "general"},
+                member_name="researcher", chat_id="c", autonomy={},
+            ))
+        finally:
+            sys.modules.pop("gp_tool_probe", None)
+
+        assert result.ok, result.error
+        seen = set(result.report.split(","))
+        assert "read_pdf" in seen, "the member lost tools its allowlist kept"
+        assert "run_command" not in seen, (
+            "the runner did not apply the project's allowlist"
+        )

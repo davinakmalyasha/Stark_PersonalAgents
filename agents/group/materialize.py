@@ -62,6 +62,45 @@ class MaterializationError(Exception):
     """A capability set could not be safely written."""
 
 
+# ── the `never` tier ────────────────────────────────────────────────────────
+#
+# ``04`` §2 defines four tiers. `never` is the strong one: the tool is not in
+# the member's toolset **at all**, so there is no call to refuse. Every other
+# tier is enforced at run time and therefore depends on the runtime noticing.
+#
+# ``run_command`` defaults to `never` — D-1, ``06`` §3. The reasoning there is
+# blunt and worth repeating: a member holding a shell can reach anywhere, so
+# every other tier becomes advisory. ``_cmdpolicy`` refuses known-dangerous
+# commands, but a denylist is a denylist — ``python -c "import shutil..."`` is
+# not an ``rm`` invocation.
+#
+# A project that genuinely needs builds and tests opts in by naming the tier
+# in its own envelope, which is a manifest edit you can read *before* the work
+# starts:
+#
+#     autonomy:
+#       run_command: blocked       # offered, refused at run time, attempt logged
+#       run_command: autonomous    # do it, log it
+
+#: Envelope key -> the tools that key controls entirely.
+NEVER_TIERS: dict[str, tuple[str, ...]] = {
+    "run_command": ("run_command",),
+}
+
+#: The tier an envelope key takes when the envelope does not name it.
+DEFAULT_TIER = "never"
+
+
+def never_tools(autonomy: dict | None) -> set[str]:
+    """Tools a member must not be offered at all, per the project's envelope."""
+    envelope = autonomy or {}
+    denied: set[str] = set()
+    for key, controlled in NEVER_TIERS.items():
+        if str(envelope.get(key) or DEFAULT_TIER).strip().lower() == "never":
+            denied.update(controlled)
+    return denied
+
+
 # ── agents ──────────────────────────────────────────────────────────────────
 
 
@@ -71,17 +110,32 @@ def agent_from_spec(spec: Any, name: str, *,
                     skills: list[str] | None = None,
                     mcp: list[str] | None = None,
                     tool_caps: dict | None = None,
+                    deny: Any = (),
                     version: str = HARNESS_VERSION) -> dict:
     """Resolve a registry ``WorkspaceSpec`` into a project-owned agent file.
 
     ``tools`` narrows the spec's allowlist — it can never widen it. That is the
     same intersection rule the runtime enforces (``04`` section 5), applied at
     write time so the file is honest about what the member may do.
+
+    ``deny`` is the `never` tier: tools removed before the narrowing is even
+    considered, so they cannot be reached by naming them. Asking for one is an
+    error rather than a silent drop — a member whose manifest requests a tool
+    the envelope forbids is a contradiction, and the message says how to
+    resolve it.
     """
-    base_tools = list(getattr(spec, "tools", ()) or ())
+    denied = {str(t) for t in deny}
+    base_tools = [t for t in (getattr(spec, "tools", ()) or ()) if t not in denied]
     if tools is None:
         resolved_tools = base_tools
     else:
+        blocked = sorted(set(tools) & denied)
+        if blocked:
+            raise MaterializationError(
+                f"tools {blocked} are `never` for this project's envelope. "
+                f"Add `{blocked[0]}: blocked` under `autonomy` in PROJECT.md to "
+                f"allow them, or drop them from the member."
+            )
         resolved_tools = [t for t in tools if t in base_tools]
         dropped = sorted(set(tools) - set(resolved_tools))
         if dropped:
@@ -114,8 +168,16 @@ def agent_from_spec(spec: Any, name: str, *,
 
 
 def agent_from_profile(profile: dict, name: str, *,
+                       deny: Any = (),
                        version: str = HARNESS_VERSION) -> dict:
-    """Resolve a specialist JSON profile (``agents/specialists/*.json``)."""
+    """Resolve a specialist JSON profile (``agents/specialists/*.json``).
+
+    ``deny`` is the same `never` tier ``agent_from_spec`` applies. A profile
+    is not exempt from the project's envelope, and leaving it out here would
+    have made the tier depend on which door a member came through.
+    """
+    denied = {str(t) for t in deny}
+    tools = [t for t in (profile.get("tools") or []) if t not in denied]
     return {
         "schema": SCHEMA,
         "name": name,
@@ -130,7 +192,7 @@ def agent_from_profile(profile: dict, name: str, *,
         "tier": str(profile.get("backend") or ""),
         "model": str(profile.get("model") or ""),
         "thinking": str(profile.get("thinking") or "inherit"),
-        "tools": list(profile.get("tools") or []),
+        "tools": tools,
         "tool_caps": dict(profile.get("tool_caps") or {}),
         "skills": list(profile.get("skills") or []),
         "mcp": list(profile.get("mcp") or []),
@@ -451,18 +513,28 @@ def remove_skill(paths: Any, name: str) -> bool:
 
 
 def set_member_tools(paths: Any, member: str, tools: list[str],
-                     *, ceiling: list[str] | None = None) -> dict:
+                     *, ceiling: list[str] | None = None,
+                     deny: Any = ()) -> dict:
     """Narrow or extend a member's tools — but never past the ceiling.
 
     ``ceiling`` is the scope map's allowlist for the member's ``derived_from``.
-    A project may only ever intersect it (``04`` section 5), so a hand-edited
-    binding cannot grant a tool the agent never had.
+    ``deny`` is the project envelope's `never` tier. Both bound the request,
+    and the envelope wins: an op that attaches a tool the envelope forbids is
+    refused outright, or ``attach_tool`` would be a way to hand back the shell
+    that D-1 exists to withhold.
     """
+    denied = {str(t) for t in deny}
+    wanted = list(tools)
+    blocked = sorted(set(wanted) & denied)
+    if blocked:
+        raise MaterializationError(
+            f"tools {blocked} are `never` for this project's envelope. Add "
+            f"`{blocked[0]}: blocked` under `autonomy` in PROJECT.md first."
+        )
     agent_path = os.path.join(paths.agents_dir, f"{member}.json")
     agent = read_json(agent_path)
     if not isinstance(agent, dict):
         raise MaterializationError(f"member {member!r} has no materialised agent")
-    wanted = list(tools)
     if ceiling is not None:
         allowed = [t for t in wanted if t in ceiling]
         dropped = sorted(set(wanted) - set(allowed))
@@ -487,6 +559,35 @@ def set_member_tools(paths: Any, member: str, tools: list[str],
     with open(bindings_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(dumps({"schema": SCHEMA, "agents": agents}))
     return agent
+
+
+def read_member_allow(project_root: str, member: str) -> list[str] | None:
+    """One member's materialised allowlist, or ``None`` when the folder is silent.
+
+    Read by the runner on every member run, which is what turns
+    ``tools/bindings.json`` from a file nobody opens into the member's actual
+    ceiling (``04`` §5). It is the mechanism behind the `never` tier: a tool
+    absent from this list is absent from the member's toolset.
+
+    Three answers, and the difference between them matters:
+
+    - ``None`` — no bindings file, or it lists nobody. This is the synthetic
+      sole member, which has no materialised agent at all. No narrowing.
+    - a list — the member's allowlist. Empty means no tools.
+    - ``[]`` — the file lists *other* members but not this one. The folder's
+      record is inconsistent, so the run gets no tools rather than no
+      restrictions: a member that cannot act is visible, a member that quietly
+      escaped its allowlist is not.
+    """
+    payload = read_json(os.path.join(project_root, "tools", "bindings.json"), {})
+    agents = (payload or {}).get("agents") if isinstance(payload, dict) else None
+    if not isinstance(agents, dict) or not agents:
+        return None
+    entry = agents.get(member)
+    if not isinstance(entry, dict):
+        return []
+    allow = entry.get("allow")
+    return [str(t) for t in allow] if isinstance(allow, list) else []
 
 
 def remove_agent(paths: Any, member: str) -> bool:

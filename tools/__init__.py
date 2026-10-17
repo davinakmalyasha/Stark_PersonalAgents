@@ -220,6 +220,7 @@ from ._runtime import (
     WORKSPACE,
     active_permissions,
     active_tool_caps,
+    active_allowed_tools,
     enforce_fs_permission,
     FilesystemPermission,
     _increment_cache_version,

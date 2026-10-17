@@ -30,6 +30,16 @@ active_permissions: ContextVar[Optional[list[FilesystemPermission]]] = ContextVa
 #: Consumed by _tool_cap; None = global defaults.
 active_tool_caps: ContextVar[Optional[dict]] = ContextVar("active_tool_caps", default=None)
 
+#: One member's materialised allowlist (``<project>/tools/bindings.json``),
+#: set by the group runner for the duration of that member's run. None = no
+#: narrowing beyond the scope ACL.
+#:
+#: This is what makes the ``never`` tier real (``04`` §2): a tool absent here
+#: is absent from the member's toolset altogether, so there is no call to
+#: refuse. ``blocked`` is the other half — the tool exists and is refused when
+#: used, which is a visible attempt rather than an impossible one.
+active_allowed_tools: ContextVar[Optional[frozenset]] = ContextVar("active_allowed_tools", default=None)
+
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

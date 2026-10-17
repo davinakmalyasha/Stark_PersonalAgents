@@ -718,7 +718,7 @@ TOOL_DEFINITIONS = [
                     "description": "Agents for this project. Each: {name, derived_from, model?, thinking?, tools?, skills?, mcp?}. Omit entirely for a single-agent project (the orchestrator does the work).",
                     "items": {"type": "object"}
                 },
-                "autonomy": {"type": "object", "description": "Permission envelope: project_folder / external_read / external_write / destructive, each autonomous | needs_approval | blocked."},
+                "autonomy": {"type": "object", "description": "Permission envelope. project_folder / external_read / external_write / destructive: autonomous | needs_approval | blocked. Also run_command: never | blocked | autonomous — never (the default) removes the shell from every member's toolset entirely, while blocked offers it and refuses dangerous commands at runtime. Set run_command to blocked or autonomous only for projects that genuinely need builds or tests; a member holding a shell can reach outside the project folder."},
                 "completion": {"type": "object", "description": "Machine-evaluated done-condition. Default: {kind: all_milestones_done, also_require: [no_item_status_failed]}."},
                 "budget_usd": {"type": "number", "description": "Hard spend ceiling. Enforced, not advisory."},
                 "deadline": {"type": "string", "description": "ISO timestamp after which dispatch halts."},
@@ -839,8 +839,30 @@ _TOOL_REQUIRED_ARGS: dict[str, set[str]] = {
 }
 
 
+def _member_allowed() -> set[str] | None:
+    """The active member's materialised allowlist, or None when none is set.
+
+    Set by the group runner from ``<project>/tools/bindings.json`` for the
+    duration of one member run. Imported lazily: ``_schemas`` is imported very
+    early, and the state module must not become a load-order dependency.
+    """
+    try:
+        from tools._runtime import active_allowed_tools
+    except Exception:  # noqa: BLE001 - no state module means no narrowing
+        return None
+    narrowed = active_allowed_tools.get()
+    return None if narrowed is None else set(narrowed)
+
+
 def _scope_allowed(scope: Optional[str]) -> set[str] | None:
-    """Scope ACL minus eval-only exclusions.
+    """Scope ACL minus eval-only exclusions, intersected with the member's own
+    materialised allowlist when one is active.
+
+    The order is the whole safety argument of ``04`` §5: the scope map is the
+    **ceiling**, and ``bindings.json`` may only narrow it. A hand-edited
+    binding therefore cannot grant a tool the agent never had, and a project
+    cannot widen what a scope allows — which is also what makes ``never``
+    (``04`` §2) real rather than decorative.
 
     Eval/benchmark runs (DEEP_AGENTS_EVAL_RUN=1) exercise the Developer as a
     headless coding agent: no human dock, no mode-switch, no plan review. The
@@ -859,7 +881,11 @@ def _scope_allowed(scope: Optional[str]) -> set[str] | None:
             allowed.difference_update({"ask_user", "propose_plan"})
             if os.environ.get("BSA_FULL_DEV_TOOLS", "0") != "1":
                 allowed.difference_update({"update_plan"})
-    return allowed
+
+    narrowed = _member_allowed()
+    if narrowed is None:
+        return allowed
+    return narrowed if allowed is None else (allowed & narrowed)
 
 
 _EVAL_BLOCKED_TOOLS = {"ask_user", "propose_plan"}
@@ -903,6 +929,10 @@ def get_native_tools(scope: Optional[str] = None) -> list[dict]:
         })
     try:
         from tools.mcp.mcp_bridge import mcp_tool_defs_for_scope
+        # Deliberately NOT narrowed by active_allowed_tools: bindings.json
+        # lists built-in tools only, so intersecting MCP names with it would
+        # drop every server. A member's MCP surface is governed by the
+        # project's own mcp/servers.json instead.
         tools.extend(mcp_tool_defs_for_scope(scope or ""))
     except Exception:
         pass

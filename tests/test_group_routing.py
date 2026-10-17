@@ -291,12 +291,16 @@ def test_capability_change_affects_only_its_own_project():
 
 def test_attach_tool_cannot_widen_past_the_scope_ceiling():
     with Rig() as rig:
-        # `run_command` IS in the ceiling, so this is allowed.
+        # `edit_file` IS in the ceiling and is not withheld by the envelope,
+        # so this is allowed. (`run_command` is also in the ceiling but is
+        # `never` by default — D-1, `06` §3 — so it would be refused earlier,
+        # by the envelope rather than by the ceiling. That path is covered in
+        # tests/test_group_surface.py.)
         rig.toolkit.attach_tool(rig.pid, member="researcher",
-                                tools=["read_file", "run_command"])
+                                tools=["read_file", "edit_file"])
         rig.sup.tick(rig.pid)
         agent = _read_json(os.path.join(rig.paths.agents_dir, "researcher.json"))
-        assert set(agent["tools"]) == {"read_file", "run_command"}
+        assert set(agent["tools"]) == {"read_file", "edit_file"}
 
         # `rm_rf` is not in the ceiling: refused at op level, folder untouched.
         rig.toolkit.attach_tool(rig.pid, member="researcher", tools=["read_file", "rm_rf"])

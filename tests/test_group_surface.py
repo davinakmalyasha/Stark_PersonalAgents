@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -332,6 +333,74 @@ def test_reject_blocks_the_item_and_releases_the_lease():
         assert item["lease_expires"] is None
         assert any(e["kind"] == "approval.rejected"
                    for e in store.events("tiny-report"))
+
+
+class WaitingRunner(FakeRunner):
+    """A member that asked permission and then stopped.
+
+    It never reports a result, which is the realistic shape and the only one
+    that exercises the reap path: ``item.progress`` CLEARS the lease
+    (``store.py``), so a runner that reports promptly would hide the very
+    expiry these tests are about.
+    """
+
+    def collect(self, project_id):
+        return []
+
+
+def test_an_item_waiting_on_a_human_survives_its_lease():
+    """AU-07 (``04`` §9).
+
+    `LEASE_SECONDS` is 30 minutes and nothing renews it, so before this a
+    request made at 11pm was reaped before morning: `_reap` rewrote the park as
+    `lease_expired`, the board stopped showing it as needing you, and the
+    approval you finally gave landed on an item blocked for a different reason.
+    """
+    with Rig(runner=WaitingRunner()) as rig:
+        rig.create("tiny-report")
+        supervisor, _toolkit = _park(rig)
+
+        # The lease expires, the way 30 minutes of you being asleep does.
+        store = rig.store("tiny-report")
+        assert store.item("m1.i1")["lease_expires"] is not None, (
+            "the item holds no lease, so this test proves nothing"
+        )
+        store._db.execute("UPDATE items SET lease_expires=? WHERE id='m1.i1'",
+                          (time.time() - 1,))
+        store._db.commit()
+
+        supervisor.tick("tiny-report")          # the reap phase runs here
+        item = store.item("m1.i1")
+        assert item["blocked_reason"] == "awaiting_approval", item
+        assert item["status"] == "doing", item
+
+
+def test_a_grant_hands_the_item_back_to_dispatch():
+    """The other half: clearing the reason is not enough.
+
+    The member's run ended when it parked, so the lease is stale. Leaving the
+    item `doing` with an expired lease means the next reap blocks it for
+    `lease_expired` — losing the approval it had just been given.
+    """
+    with Rig(runner=WaitingRunner()) as rig:
+        rig.create("tiny-report")
+        supervisor, toolkit = _park(rig)
+        store = rig.store("tiny-report")
+
+        store._db.execute("UPDATE items SET lease_expires=? WHERE id='m1.i1'",
+                          (time.time() - 1,))
+        store._db.commit()
+
+        toolkit.resolve_approval("tiny-report", item_id="m1.i1", grant=True)
+        item = store.item("m1.i1")
+        assert item["blocked_reason"] is None, item
+        assert item["status"] == "ready", item
+        assert item["lease_expires"] is None, item
+
+        # The next tick must not reap it for a lease nobody owns any more.
+        supervisor.tick("tiny-report")
+        item = store.item("m1.i1")
+        assert item["blocked_reason"] != "lease_expired", item
 
 
 def test_resolving_an_unknown_item_fails_cleanly():

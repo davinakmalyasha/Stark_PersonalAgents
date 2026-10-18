@@ -560,6 +560,13 @@ class Supervisor:
             expires = item.get("lease_expires")
             if expires is None or float(expires) > now:
                 continue
+            if item.get("blocked_reason") in WAITING_BLOCK_REASONS:
+                # Waiting on a human is not a dead member (AU-07, ``04`` §9).
+                # Reaping it would rewrite the park as `lease_expired`, so the
+                # board would stop showing it as needing you and a later
+                # approval would land on an item blocked for another reason.
+                # A wait is exempt from idle detection by design.
+                continue
             self.store.append(project_id, ev.LEASE_EXPIRED, "supervisor",
                               item_id=item["id"],
                               data={"lease_owner": item.get("lease_owner")})

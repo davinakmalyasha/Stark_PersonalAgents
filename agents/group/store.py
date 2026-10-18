@@ -460,9 +460,17 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
         return touched
 
     if kind == ev.APPROVAL_GRANTED:
+        # The member's run ENDED when it parked, so the lease it was holding is
+        # stale and the work has to go back to dispatch. Clearing the reason
+        # alone would leave a `doing` item with an expired lease that nothing
+        # owns — the next reap would block it for `lease_expired`, losing the
+        # approval it had just been given.
         entry = touch_item()
         if entry is not None:
+            entry["status"] = "ready"
             entry["blocked_reason"] = None
+            entry["lease_owner"] = None
+            entry["lease_expires"] = None
         return touched
 
     if kind == ev.APPROVAL_REJECTED:

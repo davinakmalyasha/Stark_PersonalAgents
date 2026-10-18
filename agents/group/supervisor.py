@@ -696,6 +696,7 @@ class Supervisor:
                 member_name=member_name or "",
                 chat_id=context.member_chat_id(member_name or ""),
                 autonomy=context.autonomy,
+                store=self.store,
             ))
             started += 1
         return started

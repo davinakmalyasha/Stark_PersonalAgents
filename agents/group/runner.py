@@ -25,10 +25,14 @@ This module supplies:
 from __future__ import annotations
 
 import importlib
+import os
 import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
+
+from . import events as ev
 
 #: Default parallel members. Deliberately small: every one is an LLM loop.
 MAX_WORKERS = 4
@@ -58,6 +62,153 @@ class RunContext:
     member_name: str
     chat_id: str
     autonomy: dict = field(default_factory=dict)
+    #: The project's store. Needed by the approval gate, which parks the item
+    #: and reads back the shapes a human has already approved.
+    store: Any = None
+
+
+# ── the approval gate (Phase 5) ─────────────────────────────────────────────
+#
+# ``04-autonomy-and-approvals.md`` §3–§5. The envelope used to be a paragraph
+# in the member's prompt: something the model was asked to respect. This turns
+# it into the thing that decides, and it is the difference between "refused"
+# and "asked" — before it, a member that needed to act outside its folder got
+# an error and there was no path to consent at all.
+#
+# All the policy is in :mod:`agents.group.policy`, which is pure. This module
+# supplies only the facts policy cannot know (where the project is, what its
+# envelope says, what a human has already approved) and records the question.
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def path_is_inside(root: str, path: str) -> bool:
+    """True when ``path`` is the project folder or something under it."""
+    if not root or not path:
+        return False
+    try:
+        root_n, path_n = _norm(root), _norm(path)
+    except Exception:  # noqa: BLE001 - an unresolvable path is not "inside"
+        return False
+    return path_n == root_n or path_n.startswith(root_n + os.sep)
+
+
+def _resolve(root: str, target: str) -> str:
+    """Resolve a tool's path argument the way the tool will.
+
+    Relative paths are relative to the project folder, because that is the
+    member's working directory in every way that matters.
+    """
+    if not target:
+        return _norm(root)
+    if not os.path.isabs(target):
+        target = os.path.join(root, target)
+    return _norm(target)
+
+
+def granted_shapes(store: Any, project_id: str) -> set[str]:
+    """Every action shape a human has approved for this project (AU-08).
+
+    Read once per run: a grant only ever arrives while no run is in flight,
+    because granting hands the item back to dispatch.
+    """
+    shapes: set[str] = set()
+    if store is None:
+        return shapes
+    try:
+        for event in store.events(project_id):
+            if event.get("kind") != ev.APPROVAL_GRANTED:
+                continue
+            shape = (event.get("data") or {}).get("shape")
+            if shape:
+                shapes.add(str(shape))
+    except Exception:  # noqa: BLE001 - unreadable history grants nothing
+        return set()
+    return shapes
+
+
+def requested_shape(store: Any, project_id: str, item_id: str) -> str | None:
+    """The shape of the question a member asked about this item, if any.
+
+    ``resolve_approval`` carries this onto the grant event, which is what lets
+    ``granted_shapes`` recognise the action when the item is re-dispatched —
+    without it the member would ask the same question forever.
+    """
+    if store is None:
+        return None
+    try:
+        events = store.events(project_id)
+    except Exception:  # noqa: BLE001
+        return None
+    for event in reversed(events):
+        if event.get("item_id") != item_id:
+            continue
+        if event.get("kind") != ev.APPROVAL_REQUESTED:
+            continue
+        shape = (event.get("data") or {}).get("shape")
+        if shape:
+            return str(shape)
+    return None
+
+
+def build_gate(store: Any, project_id: str, item_id: str, project_root: str,
+               autonomy: dict | None):
+    """The project envelope as a callable ``tools/`` can ask.
+
+    ``04`` §5, bullet 4: the envelope arrives as **data**. Nothing under
+    ``tools/`` imports this, or anything else in the group package — it calls a
+    function that takes two strings and returns a tier name.
+
+    When the answer is ``needs_approval`` the item is parked **here**, before
+    the caller raises, so the question exists on the board by the time the
+    member's run ends.
+    """
+    from . import policy
+
+    grants = granted_shapes(store, project_id)
+
+    def gate(kind: str, target: str) -> str | None:
+        resolved = _resolve(project_root, target)
+        outside = not path_is_inside(project_root, resolved)
+        action = policy.Action(
+            kind=str(kind or "fs"),
+            target=resolved,
+            # `_sanitize_path` is not told whether the caller means to read or
+            # write, so this assumes the write key. Being asked about too much
+            # is the safe direction to be wrong in.
+            write=True,
+            outside=outside,
+            dangerous=outside and policy.looks_like_credential(resolved),
+        )
+        tier = policy.classify(action, envelope=autonomy, grants=grants)
+        if tier == policy.NEEDS_APPROVAL:
+            _park(store, project_id, item_id, action, policy)
+        return tier
+
+    return gate
+
+
+def _park(store: Any, project_id: str, item_id: str, action: Any,
+          policy: Any) -> None:
+    """Record the question. Idempotent — one item, one open question."""
+    if store is None:
+        return
+    try:
+        item = store.item(item_id)
+        if item is not None and item.get("blocked_reason") == ev.AWAITING_APPROVAL:
+            return  # already asked; do not ask again
+        store.append(
+            project_id, ev.APPROVAL_REQUESTED, "member", item_id=item_id,
+            data={
+                "detail": (f"wants to write outside the project folder: "
+                           f"{action.target}"),
+                "shape": policy.shape_of(action),
+            },
+        )
+    except Exception:  # noqa: BLE001 - a failed park must not allow the action
+        return
 
 
 def build_prompt(ctx: RunContext) -> str:
@@ -239,9 +390,10 @@ class LocalRunner(ItemRunner):
         usage: dict = {}
         token = None
         allow_token = None
+        gate_token = None
         try:
             from sync.state_sync import active_state, new_scoped_state, safe_get_state
-            from tools._runtime import active_allowed_tools
+            from tools._runtime import active_allowed_tools, active_approval_gate
 
             # The member's materialised allowlist is the real ceiling on its
             # tools (``04`` §5). Until this ran, ``tools/bindings.json`` was
@@ -256,6 +408,12 @@ class LocalRunner(ItemRunner):
             if allow is not None:
                 allow_token = active_allowed_tools.set(frozenset(allow))
 
+            # And the envelope, so a member that needs to act outside its
+            # folder is ASKED rather than refused (``04`` §3-§5).
+            gate_token = active_approval_gate.set(build_gate(
+                ctx.store, ctx.project_id, str(ctx.item.get("id") or ""),
+                ctx.project_root, ctx.autonomy))
+
             token = active_state.set(new_scoped_state({
                 "chat_id": ctx.chat_id,
                 "project_path": ctx.project_root,
@@ -266,6 +424,12 @@ class LocalRunner(ItemRunner):
         except Exception as exc:  # noqa: BLE001 - a failed run is a result
             output = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
+            if gate_token is not None:
+                try:
+                    from tools._runtime import active_approval_gate as _gate
+                    _gate.reset(gate_token)
+                except Exception:  # noqa: BLE001, S110 - scope cleanup only
+                    pass
             if allow_token is not None:
                 try:
                     from tools._runtime import active_allowed_tools as _allow

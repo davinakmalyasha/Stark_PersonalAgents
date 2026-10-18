@@ -337,8 +337,16 @@ class GroupToolkit:
         if store.item(item_id) is None:
             return ToolResult(False, f"unknown item {item_id!r}")
         kind = ev.APPROVAL_GRANTED if grant else ev.APPROVAL_REJECTED
-        store.append(project_id, kind, "human", item_id=item_id,
-                     data={"note": note} if note else {})
+        payload: dict = {"note": note} if note else {}
+        if grant:
+            # Carry the SHAPE onto the grant (AU-08). This is what lets the
+            # re-dispatched member be told "yes" instead of asking again: the
+            # gate recognises a shape a human has already approved.
+            from .runner import requested_shape
+            shape = requested_shape(store, project_id, item_id)
+            if shape:
+                payload["shape"] = shape
+        store.append(project_id, kind, "human", item_id=item_id, data=payload)
         if grant:
             return ToolResult(True, f"{item_id} approved")
         return ToolResult(True, f"{item_id} rejected — blocked awaiting a re-plan")

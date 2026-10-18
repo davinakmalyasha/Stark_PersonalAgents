@@ -221,6 +221,8 @@ from ._runtime import (
     active_permissions,
     active_tool_caps,
     active_allowed_tools,
+    active_approval_gate,
+    ApprovalRequired,
     enforce_fs_permission,
     FilesystemPermission,
     _increment_cache_version,

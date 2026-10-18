@@ -10,7 +10,7 @@ import json
 import threading
 import time
 from contextvars import ContextVar
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 from sync.state_sync import shared_state
 try:
@@ -39,6 +39,47 @@ active_tool_caps: ContextVar[Optional[dict]] = ContextVar("active_tool_caps", de
 #: refuse. ``blocked`` is the other half — the tool exists and is refused when
 #: used, which is a visible attempt rather than an impossible one.
 active_allowed_tools: ContextVar[Optional[frozenset]] = ContextVar("active_allowed_tools", default=None)
+
+#: A group project's approval gate, set by its runner for one member run:
+#: ``gate(kind, target) -> tier | None``. None means "no envelope in force".
+#:
+#: The callable is supplied by ``agents.group`` and returns a plain string.
+#: That is the entire contract, which is why nothing here imports the group
+#: package or knows group projects exist — the envelope arrives as data
+#: (``04`` §5, bullet 4). Before group projects, this was always None and
+#: these guards behaved exactly as they still do with no gate.
+active_approval_gate: ContextVar[Optional[Callable[[str, str], Optional[str]]]] = ContextVar("active_approval_gate", default=None)
+
+#: Tier names, spelled out rather than imported. ``tools/`` must not depend on
+#: the group package, not even for a constant (``04`` §5, bullet 4).
+TIER_AUTONOMOUS = "autonomous"
+TIER_NEEDS_APPROVAL = "needs_approval"
+
+
+class ApprovalRequired(Exception):
+    """An envelope gates this action and a human has been asked.
+
+    Deliberately not a ``PermissionError``. The two mean different things to
+    the caller: ``PermissionError`` is *refused — stop*, while this is *gated —
+    the item is parked and will be handed back once someone answers*. Raising
+    this ends the member's run, which is correct: the work cannot proceed in
+    this run, and the item must not be settled in the meantime.
+    """
+
+
+def _authorize(kind: str, target: str) -> Optional[str]:
+    """Ask the active gate which tier applies, or None when none is in force.
+
+    A gate that fails for its own reasons is treated as ``needs_approval``: a
+    broken gate must not become an open door.
+    """
+    gate = active_approval_gate.get()
+    if gate is None:
+        return None
+    try:
+        return gate(kind, target) or None
+    except Exception:  # noqa: BLE001 - a failed gate denies, never allows
+        return TIER_NEEDS_APPROVAL
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -515,8 +556,29 @@ def _sanitize_path(path: str, deps: Any = None) -> str:
     ]
     allowed = any(real_path.lower().startswith(r.lower()) for r in allowed_roots)
     if not allowed:
-        raise ValueError(f"Path outside allowed roots: {real_path}")
-        
+        # A group project may reach outside its own folder — with permission
+        # (``04`` §5, bullet 3). The envelope decides; the group package owns
+        # that decision and this only asks.
+        #
+        # With no gate in force ``_authorize`` answers None and the hard
+        # refusal below is unchanged, so every non-group agent behaves exactly
+        # as it did before.
+        #
+        # Note this asks about reads as well as writes, using the write key:
+        # `_sanitize_path` is not told which the caller intends, and crossing
+        # the folder boundary is consequential either way. Asking too much is
+        # the safe direction to be wrong in.
+        tier = _authorize("fs", real_path)
+        if tier is None:
+            # No envelope in force: the original refusal, unchanged.
+            raise ValueError(f"Path outside allowed roots: {real_path}")
+        if tier == TIER_AUTONOMOUS:
+            return real_path
+        if tier == TIER_NEEDS_APPROVAL:
+            raise ApprovalRequired(f"{real_path} is outside the project folder")
+        raise PermissionError(
+            f"'{real_path}' is refused by this project's autonomy envelope.")
+
     return real_path
 
 def _check_and_request_approval(file_path: str, action: str, deps: Any = None):
@@ -561,3 +623,22 @@ def _check_and_request_approval(file_path: str, action: str, deps: Any = None):
     
     if is_core_config:
         raise PermissionError(f"Modification to core configuration file '{file_path}' is blocked without human approval.")
+
+    # The project's envelope, when one is in force (``04`` §5, bullet 2).
+    #
+    # After the core-config rule on purpose: protecting the harness's own files
+    # is not a project's decision to make, and no envelope softens it. What
+    # this adds is the paths that ARE in an allowed root but are not the
+    # project's — scratch, memories, another workspace. `_sanitize_path` gates
+    # the paths outside every root; this gates the rest.
+    #
+    # The path is passed unresolved. Deciding what counts as "inside the
+    # project" is the group package's business, so it gets the raw path and the
+    # context to resolve it rather than a guess made here.
+    tier = _authorize("fs", file_path)
+    if tier in (None, TIER_AUTONOMOUS):
+        return
+    if tier == TIER_NEEDS_APPROVAL:
+        raise ApprovalRequired(f"{file_path} is outside the project folder")
+    raise PermissionError(
+        f"'{file_path}' is refused by this project's autonomy envelope.")

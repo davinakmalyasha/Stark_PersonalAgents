@@ -357,6 +357,15 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
             entry["attempts"] = int(entry.get("attempts") or 0) + 1
             entry["lease_owner"] = data.get("lease_owner")
             entry["lease_expires"] = data.get("lease_expires")
+            # A new attempt starts clean. Without this the PREVIOUS attempt's
+            # result or error is still on the row when dispatch claims it, and
+            # `_harvest` — which runs later in the SAME tick — settles the item
+            # before the member has run at all. That silently turned every
+            # retry into an immediate re-failure, and every re-dispatch after
+            # an approval into a failure of the action that had just been
+            # allowed.
+            entry["result"] = None
+            entry["error"] = None
         return touched
 
     if kind == ev.ITEM_RELEASED:

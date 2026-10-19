@@ -598,6 +598,23 @@
   white-space: nowrap;
 }
 
+/* Informational, not urgent: a member with a shell can reach anywhere, so the
+   rest of the envelope is advisory. Deliberately muted so it never competes
+   with the amber "waiting on you" badge for attention. */
+.gp-shell-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #a1a1aa;
+  font-size: 8px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 /* ── Modal ──
    The header and footer are sticky, so a focused row can otherwise be
    scrolled underneath them and become invisible to a keyboard user

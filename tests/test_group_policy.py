@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -30,7 +31,23 @@ if REPO_ROOT not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import pytest
 from _util import agents_shim
+
+
+@pytest.fixture(autouse=True)
+def _real_tools_package():
+    """Guarantee the REAL ``tools`` package before any test imports it.
+
+    ``_util.tools_stub()`` replaces ``sys.modules['tools']`` with a plain
+    module and never restores it, and module-level imports in other suites can
+    install it during collection. Whichever tests run first then hit
+    ``'tools' is not a package`` — which is exactly what made one test here
+    pass alone and fail under ``-k``. Restoring once per test removes the
+    ordering dependency.
+    """
+    from _util import real_tools
+    real_tools()
 
 ENVELOPE = {
     "project_folder": "autonomous",
@@ -50,6 +67,13 @@ def _policy():
     with agents_shim("agents.group.policy"):
         from agents.group import policy
         return policy
+
+
+def _materialize():
+    """The materialize module, without executing ``agents/__init__.py``."""
+    with agents_shim("agents.group.manifest", "agents.group.materialize"):
+        from agents.group import materialize
+        return materialize
 
 
 def _action(outside=True, *, write=True, dangerous=False, target="X"):
@@ -220,12 +244,12 @@ class Rig:
         return False
 
 
-def _with_gate(rig):
+def _with_gate(rig, envelope: dict | None = None):
     """Install the project's gate the way the runner does."""
     from agents.group.runner import build_gate
     from tools._runtime import active_approval_gate
     gate = build_gate(rig.store(), rig.project_id, "m1.i1",
-                      rig.project_root, ENVELOPE)
+                      rig.project_root, envelope or ENVELOPE)
     return active_approval_gate.set(gate)
 
 
@@ -584,6 +608,152 @@ def test_the_whole_loop_through_the_supervisor():
             assert calls["n"] >= 2, "the member never got a second run"
         finally:
             sys.modules.pop("gp_loop_probe", None)
+
+
+def test_the_member_prompt_does_not_restate_enforced_policy():
+    """The envelope is enforced now (``04`` §5).
+
+    Restating it only invited the model to reason about policy instead of
+    acting — and the block named two tools a member does not have:
+    ``set_item_status`` and ``request_approval`` are in no scope at all, so a
+    member told to call them would simply error. Completion is decided by the
+    acceptance criteria, which the prompt inlines above.
+    """
+    with agents_shim("agents.group.events", "agents.group.runner"):
+        from agents.group.runner import RunContext, build_prompt
+        text = build_prompt(RunContext(
+            project_id="p", project_root="/proj",
+            item={"id": "m1.i1", "title": "t", "detail": "d",
+                  "acceptance": [{"kind": "check", "check": "file_exists",
+                                  "path": "context/artifacts/x.md"}]},
+            member={}, member_name="m", chat_id="c", autonomy=ENVELOPE,
+        ))
+
+    assert "What you may do without asking" not in text
+    assert "external_write" not in text, "the envelope is restated"
+    assert "set_item_status" not in text, "a tool the member does not have"
+    assert "request_approval" not in text, "a tool the member does not have"
+    # The honest part stays.
+    assert "acceptance criteria above decide" in text
+    assert "file_exists" in text, "the criteria were inlined before; keep it"
+
+
+def test_member_tools_are_still_unreachable():
+    """Guards the prompt: if these ever become real tools, the prompt should
+    mention them again and this test is the reminder."""
+    with agents_shim():
+        import agents.workspace_registry as registry
+
+    scopes = registry.scope_map()
+    for name in ("set_item_status", "request_approval", "claim_item"):
+        assert not any(name in tools for tools in scopes.values()), (
+            f"{name} is reachable now — the member prompt should say so again"
+        )
+
+
+def test_a_member_never_gets_ask_user():
+    """It blocks the RUN until a human answers, and dies with the run if they
+    do not. A member's ask is `request_approval`, which parks the ITEM — that
+    survives a restart and is answerable hours later."""
+    mat = _materialize()
+    assert "ask_user" in mat.never_tools({})
+    # Not an envelope choice: a permissive envelope must not hand it back.
+    assert "ask_user" in mat.never_tools({"run_command": "autonomous"})
+
+    spec = types.SimpleNamespace(key="general", tools=("read_pdf", "ask_user"))
+    try:
+        mat.agent_from_spec(spec, "x", tools=["read_pdf", "ask_user"],
+                            deny=mat.never_tools({}))
+    except mat.MaterializationError as exc:
+        assert "ask_user" in str(exc)
+    else:
+        raise AssertionError("a member was given ask_user")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MCP — the other dead end
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_mcp_without_a_gate_still_asks_the_chat(monkeypatch):
+    """The interactive path every ordinary agent uses. Must not have moved."""
+    with Rig():
+        from tools.mcp import mcp_bridge
+        seen = {}
+
+        def fake_confirm(server, tool, args):
+            seen["called"] = f"{server}/{tool}"
+            return True
+
+        monkeypatch.setattr(mcp_bridge, "_confirm", fake_confirm)
+        assert mcp_bridge._gate_mcp_call("sentry", "list_issues", {}) is True
+        assert seen.get("called") == "sentry/list_issues", (
+            "no gate in force, so _confirm should have been consulted"
+        )
+
+
+def test_mcp_in_a_project_parks_instead_of_dead_ending(monkeypatch):
+    """`_confirm` asks through the running chat. Unattended that times out and
+    answers "not approved", so the call could never succeed and the owner was
+    never asked — the same dead end `_sanitize_path` had."""
+    from tools._runtime import ApprovalRequired, active_approval_gate
+
+    with Rig() as rig:
+        from tools.mcp import mcp_bridge
+
+        def explode(*_a):
+            raise AssertionError("the ask_user path was used inside a project")
+
+        monkeypatch.setattr(mcp_bridge, "_confirm", explode)
+
+        token = _with_gate(rig)
+        try:
+            try:
+                mcp_bridge._gate_mcp_call("sentry", "create_issue", {})
+            except ApprovalRequired:
+                pass
+            else:
+                raise AssertionError("an MCP call was not gated")
+        finally:
+            active_approval_gate.reset(token)
+
+        item = rig.store().item("m1.i1")
+        assert item["blocked_reason"] == "awaiting_approval", item
+        asked = [e for e in rig.store().events(rig.project_id)
+                 if e["kind"] == "approval.requested"][-1]
+        assert "sentry/create_issue" in str(asked["data"].get("detail")), asked
+
+
+def test_mcp_is_always_outside_the_project(monkeypatch):
+    """`server/tool` is not a path, so it cannot be "inside" a folder — and it
+    must not be resolved as one."""
+    from tools._runtime import active_approval_gate
+    from tools.mcp import mcp_bridge
+
+    with Rig() as rig:
+        monkeypatch.setattr(mcp_bridge, "_confirm",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("used")))
+        token = _with_gate(rig, {**ENVELOPE, "external_write": "blocked"})
+        try:
+            assert mcp_bridge._gate_mcp_call("sentry", "x", {}) is False, (
+                "a blocked envelope still allowed the call"
+            )
+        finally:
+            active_approval_gate.reset(token)
+
+
+def test_mcp_is_autonomous_when_the_envelope_allows_it(monkeypatch):
+    from tools._runtime import active_approval_gate
+    from tools.mcp import mcp_bridge
+
+    with Rig() as rig:
+        monkeypatch.setattr(mcp_bridge, "_confirm",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("used")))
+        token = _with_gate(rig, {**ENVELOPE, "external_write": "autonomous"})
+        try:
+            assert mcp_bridge._gate_mcp_call("sentry", "x", {}) is True
+        finally:
+            active_approval_gate.reset(token)
 
 
 def test_a_credential_path_is_refused_even_when_approved():

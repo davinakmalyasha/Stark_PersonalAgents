@@ -90,11 +90,27 @@ NEVER_TIERS: dict[str, tuple[str, ...]] = {
 #: The tier an envelope key takes when the envelope does not name it.
 DEFAULT_TIER = "never"
 
+#: Tools no member is ever offered, whatever the envelope says.
+#:
+#: ``ask_user`` blocks the **run** until a human answers, and dies with the run
+#: if nobody does — an unattended member can only stall and time out. A member's
+#: way to ask is ``request_approval``, which parks the **item**: that survives a
+#: restart, appears on the board, and is answerable hours later.
+#:
+#: So this is not a policy the envelope should be able to loosen. The tool is
+#: inoperable in a group project, and offering it guarantees a stalled run and
+#: a member that concludes the request failed.
+ALWAYS_NEVER: tuple[str, ...] = ("ask_user",)
+
 
 def never_tools(autonomy: dict | None) -> set[str]:
-    """Tools a member must not be offered at all, per the project's envelope."""
+    """Tools a member must not be offered at all.
+
+    ``04`` §2's `never` tier, from two sources: the structural set above, and
+    whatever the project's own envelope withholds.
+    """
     envelope = autonomy or {}
-    denied: set[str] = set()
+    denied: set[str] = set(ALWAYS_NEVER)
     for key, controlled in NEVER_TIERS.items():
         if str(envelope.get(key) or DEFAULT_TIER).strip().lower() == "never":
             denied.update(controlled)

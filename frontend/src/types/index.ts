@@ -330,6 +330,9 @@ export interface GroupProjectRow {
   spent_usd?: number | null;
   /** The workspace it was created from; null means global. */
   origin_workspace_id?: string | null;
+  /** True when the project opted into a shell. A member with a shell can reach
+   *  anywhere, so the rest of the envelope is advisory — worth showing. */
+  shell_enabled?: boolean;
   milestones_done: number;
   milestones_total: number;
   items_done: number;
@@ -395,6 +398,8 @@ export interface GroupProject {
 export interface GroupProjectDetail {
   id: string;
   path: string;
+  /** Members hold a shell, so the rest of the envelope is advisory. */
+  shell_enabled?: boolean;
   project: GroupProject;
   milestones: GroupMilestone[];
   items: GroupItem[];

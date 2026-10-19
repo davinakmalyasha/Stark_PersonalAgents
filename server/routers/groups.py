@@ -124,9 +124,26 @@ async def get_group(project_id: str, events: int = EVENT_TAIL):
         limit = max(1, min(int(events or EVENT_TAIL), 500))
     except (TypeError, ValueError):
         limit = EVENT_TAIL
+
+    # Whether this project's members hold a shell. A shell reaches anywhere, so
+    # the rest of the envelope is advisory once one is opted in (``06`` §3) —
+    # the modal says so rather than letting the declaration imply more than it
+    # delivers.
+    shell_enabled = False
+    try:
+        from agents.group import manifest as manifest_mod
+        from agents.group import materialize as materialize_mod
+        shell_enabled = (
+            "run_command"
+            not in materialize_mod.never_tools(manifest_mod.load(paths.manifest).autonomy)
+        )
+    except Exception:  # noqa: BLE001, S110 - a broken manifest is data, not a crash
+        pass
+
     return JSONResponse(content={
         "id": project_id,
         "path": paths.project_dir,
+        "shell_enabled": shell_enabled,
         "project": store.project(project_id) or {},
         "milestones": store.milestones(project_id),
         "items": store.items(project_id),

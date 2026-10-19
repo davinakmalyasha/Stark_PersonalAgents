@@ -173,9 +173,19 @@ def list_projects() -> list[dict]:
             paths = project_paths(project_id)
             record = {"id": project_id, "path": paths.project_dir,
                       "title": "", "status": "unknown",
-                      "origin_workspace_id": origin_workspace(project_id)}
+                      "origin_workspace_id": origin_workspace(project_id),
+                      "shell_enabled": False}
             try:
-                record["title"] = manifest_mod.load(paths.manifest).title
+                manifest = manifest_mod.load(paths.manifest)
+                record["title"] = manifest.title
+                # A member holding a shell can reach anywhere, so every other
+                # tier becomes advisory once one is opted in (``06`` §3). That
+                # is a legitimate choice, but it should be visible where the
+                # project is looked at, not only inside PROJECT.md.
+                record["shell_enabled"] = (
+                    "run_command"
+                    not in materialize_mod.never_tools(manifest.autonomy)
+                )
             except Exception:  # noqa: BLE001, S110 - broken manifest is data
                 pass
             try:

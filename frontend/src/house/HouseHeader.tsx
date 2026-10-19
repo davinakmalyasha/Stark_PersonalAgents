@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Menu, Plus, ListTodo, Clock, FolderKanban, CircleAlert } from 'lucide-react';
+import { Menu, Plus, ListTodo, Clock, FolderKanban, CircleAlert, Terminal } from 'lucide-react';
 import type { AgentTask, SessionTab, GroupProjectRow } from '../types';
 import { formatRecurrence } from '../utils/recurrence';
 import TaskTabs from './TaskTabs';
@@ -259,6 +259,15 @@ export default function HouseHeader({
                         : ''}
                     </small>
                   </span>
+                  {p.shell_enabled && (
+                    <span
+                      className="gp-shell-badge"
+                      title="Members of this project can run shell commands, so the rest of its envelope is advisory"
+                    >
+                      <Terminal size={9} aria-hidden="true" />
+                      shell
+                    </span>
+                  )}
                   {p.awaiting_approval > 0 && (
                     <span className="gp-waiting-badge">
                       <CircleAlert size={9} aria-hidden="true" />

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   X, FolderOpen, Pause, Play, Check, AlertTriangle, Clock,
-  ChevronRight, CheckCircle2,
+  ChevronRight, CheckCircle2, Terminal,
 } from 'lucide-react';
 import type {
   GroupEvent, GroupItem, GroupMilestone, GroupOp, GroupProjectDetail,
@@ -260,6 +260,15 @@ export default function GroupProjectModal({ projectId, onClose }: Props) {
                 {(project.goal as string) || projectId}
               </span>
               <span className={statusChipClass(status)}>{status}</span>
+              {detail?.shell_enabled && (
+                <span
+                  className="gp-shell-badge"
+                  title="Members of this project can run shell commands, so the rest of its envelope is advisory"
+                >
+                  <Terminal size={9} aria-hidden="true" />
+                  shell
+                </span>
+              )}
             </div>
             <div className="text-[11px] text-zinc-500 mt-0.5 truncate">{projectId}</div>
           </div>

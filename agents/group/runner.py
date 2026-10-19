@@ -170,17 +170,27 @@ def build_gate(store: Any, project_id: str, item_id: str, project_root: str,
     grants = granted_shapes(store, project_id)
 
     def gate(kind: str, target: str) -> str | None:
-        resolved = _resolve(project_root, target)
-        outside = not path_is_inside(project_root, resolved)
+        kind = str(kind or "fs")
+        if kind == "fs":
+            resolved = _resolve(project_root, target)
+            outside = not path_is_inside(project_root, resolved)
+            dangerous = outside and policy.looks_like_credential(resolved)
+        else:
+            # Not a path, so there is nothing to resolve and nothing to check
+            # against the credential markers. An MCP tool reaches outward by
+            # definition — `server/tool` is not "inside" any folder.
+            resolved = str(target or "")
+            outside = True
+            dangerous = False
         action = policy.Action(
-            kind=str(kind or "fs"),
+            kind=kind,
             target=resolved,
-            # `_sanitize_path` is not told whether the caller means to read or
-            # write, so this assumes the write key. Being asked about too much
-            # is the safe direction to be wrong in.
+            # `_sanitize_path` and the MCP bridge are not told whether the
+            # caller means to read or write, so this assumes the write key.
+            # Being asked about too much is the safe direction to be wrong in.
             write=True,
             outside=outside,
-            dangerous=outside and policy.looks_like_credential(resolved),
+            dangerous=dangerous,
         )
         tier = policy.classify(action, envelope=autonomy, grants=grants)
         if tier == policy.NEEDS_APPROVAL:
@@ -243,21 +253,16 @@ def build_prompt(ctx: RunContext) -> str:
         "- Record decisions and their rejected alternatives in `context/decisions.md`.",
         f"- Your working directory is the project root: {ctx.project_root}",
         "",
-        "## What you may do without asking",
-    ]
-    autonomy = ctx.autonomy or {}
-    if autonomy:
-        for key in ("project_folder", "external_read", "external_write", "destructive"):
-            if key in autonomy:
-                lines.append(f"- {key}: {autonomy[key]}")
-    else:
-        lines.append("- project_folder: autonomous (default); nothing outside it")
-    lines += [
-        "",
         "## How to finish",
-        f"- Signal completion with `set_item_status` for item `{item['id']}`.",
-        "- If something leaves the project folder, call `request_approval` first;",
-        "  the item will park until a human answers, which is expected.",
+        # The envelope used to be restated here as four bullets. It is enforced
+        # now (``04`` §5), so listing it only invited the model to reason about
+        # policy instead of acting — and an instruction to call
+        # `request_approval` named a tool members do not have, which is worse
+        # than saying nothing.
+        "- Do the work, then stop. The acceptance criteria above decide whether",
+        "  this item is done; nothing you report changes that.",
+        "- If a previous attempt paused for the owner's approval, do the same",
+        "  thing again — the pause is not a failure, and the answer is recorded.",
         "- If the plan itself turns out to be wrong, say so and stop — do not",
         "  force the item through. It will be invalidated and re-planned.",
     ]

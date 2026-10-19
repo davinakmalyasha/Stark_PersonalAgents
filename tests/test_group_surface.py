@@ -645,21 +645,24 @@ def _materialize():
 
 
 def test_never_tools_defaults_to_withholding_a_shell():
+    """`run_command` is the ENVELOPE's tier. (`ask_user` is withheld too, but
+    structurally — see `test_a_created_member_never_gets_ask_user` — so these
+    assertions are about the key, not the whole set.)"""
     mat = _materialize()
-    assert mat.never_tools({}) == {"run_command"}
+    assert "run_command" in mat.never_tools({})
     # Other envelope keys do not turn a shell back on.
-    assert mat.never_tools(
+    assert "run_command" in mat.never_tools(
         {"project_folder": "autonomous", "external_write": "needs_approval"}
-    ) == {"run_command"}
+    )
     # Case and whitespace are not a way to slip past it.
-    assert mat.never_tools({"run_command": "  NEVER "}) == {"run_command"}
+    assert "run_command" in mat.never_tools({"run_command": "  NEVER "})
 
 
 def test_the_envelope_can_opt_into_a_shell():
     """Blocked and autonomous both keep the tool; only `never` removes it."""
     mat = _materialize()
     for tier in ("blocked", "autonomous"):
-        assert mat.never_tools({"run_command": tier}) == set(), tier
+        assert "run_command" not in mat.never_tools({"run_command": tier}), tier
 
 
 def test_a_created_member_has_no_shell_by_default():
@@ -789,6 +792,36 @@ def test_a_member_added_mid_project_is_still_bound():
             rig.paths().project_dir, "late")
         assert allow is not None, "the mid-project member was never bound"
         assert "run_command" not in allow, allow
+
+
+def test_a_created_member_never_gets_ask_user():
+    """It blocks the RUN; `request_approval` parks the ITEM. An unattended
+    member can only stall and time out, so the tool is never offered."""
+    with Rig() as rig:
+        rig.create("tiny-report", members=MEMBER)
+        allow = _materialize().read_member_allow(
+            rig.paths().project_dir, "researcher")
+        assert allow is not None
+        assert "ask_user" not in allow, allow
+
+
+def test_the_board_says_when_a_project_has_a_shell():
+    """A member holding a shell can reach anywhere, so the rest of the
+    envelope is advisory once one is opted in (``06`` §3). That is a
+    legitimate choice, but it should be visible where you look."""
+    with Rig() as rig:
+        rig.create("no-shell", members=MEMBER)
+        rig.create("with-shell", members=MEMBER, autonomy={
+            "project_folder": "autonomous", "external_read": "autonomous",
+            "external_write": "needs_approval", "run_command": "blocked"})
+
+        rows = {r["id"]: r for r in rig.registry.list_projects()}
+        assert rows["no-shell"]["shell_enabled"] is False
+        assert rows["with-shell"]["shell_enabled"] is True
+
+        # And the modal's own endpoint agrees, since it is opened by id.
+        assert _client().get("/api/groups/with-shell").json()["shell_enabled"] is True
+        assert _client().get("/api/groups/no-shell").json()["shell_enabled"] is False
 
 
 def test_the_runner_applies_the_projects_allowlist():

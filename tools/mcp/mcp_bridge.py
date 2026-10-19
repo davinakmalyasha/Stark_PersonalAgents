@@ -546,7 +546,7 @@ class McpManager:
             return f"Error: MCP server '{server}' not connected (status: {client.status}{': ' + client.error if client.error else ''})"
         if not self._scope_matches(client, scope):
             return f"Error: MCP tool '{fqname}' is not exposed to scope '{scope or 'agent'}'"
-        if client.cfg.get("approval") == "prompt" and not _confirm(server, tool, args):
+        if client.cfg.get("approval") == "prompt" and not _gate_mcp_call(server, tool, args):
             return f"Error: MCP tool call {server}/{tool} was not approved."
         try:
             result = client.call_tool(tool, args, timeout)
@@ -641,6 +641,35 @@ def get_manager() -> McpManager:
             if _manager is None:
                 _manager = McpManager()
     return _manager
+
+
+def _gate_mcp_call(server: str, tool: str, args: dict) -> bool:
+    """Decide a prompt-gated MCP call.
+
+    With a group project's envelope in force the decision is the envelope's.
+    ``_confirm`` asks the human **through the running chat**, which cannot work
+    for an unattended member: it blocks until the timeout, then answers "not
+    approved" — so the call could never succeed and the owner was never asked.
+    That is the same dead end ``_sanitize_path`` had before the gate existed.
+
+    The gate parks the ITEM instead, which outlives the process and shows up on
+    the board. With no gate — every ordinary agent — this is the interactive
+    path, unchanged.
+    """
+    from tools._runtime import (TIER_AUTONOMOUS, TIER_NEEDS_APPROVAL,
+                                ApprovalRequired, _authorize)
+
+    # An MCP tool is external by definition, and the bridge carries no
+    # read-only hint, so the stricter key is assumed.
+    tier = _authorize("mcp", f"{server}/{tool}")
+    if tier is None:
+        return _confirm(server, tool, args)
+    if tier == TIER_AUTONOMOUS:
+        return True
+    if tier == TIER_NEEDS_APPROVAL:
+        # The gate has already parked it; this ends the member's run.
+        raise ApprovalRequired(f"MCP tool {server}/{tool} is waiting for the owner")
+    return False
 
 
 def _confirm(server: str, tool: str, args: dict) -> bool:

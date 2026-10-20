@@ -222,6 +222,8 @@ from ._runtime import (
     active_tool_caps,
     active_allowed_tools,
     active_approval_gate,
+    active_write_ledger,
+    _perform_write,
     ApprovalRequired,
     enforce_fs_permission,
     FilesystemPermission,

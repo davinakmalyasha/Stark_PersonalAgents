@@ -548,12 +548,28 @@ class McpManager:
             return f"Error: MCP tool '{fqname}' is not exposed to scope '{scope or 'agent'}'"
         if client.cfg.get("approval") == "prompt" and not _gate_mcp_call(server, tool, args):
             return f"Error: MCP tool call {server}/{tool} was not approved."
+
+        # AU-05: the gate has allowed the call; the ledger decides whether this
+        # exact payload was already performed by an earlier attempt. With no
+        # ledger (every ordinary agent) `_perform_write` calls straight through.
+        from tools._runtime import WRITE_SKIPPED, ApprovalRequired, _perform_write
         try:
-            result = client.call_tool(tool, args, timeout)
+            result = _perform_write(
+                "mcp", f"{server}/{tool}", args,
+                lambda: client.call_tool(tool, args, timeout),
+            )
+        except ApprovalRequired:
+            # The ledger parked the item. Let the run end rather than turning
+            # "may or may not have been sent" into an ordinary tool error.
+            raise
         except TimeoutError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error: MCP call {server}/{tool} failed: {e}"
+
+        if result == WRITE_SKIPPED:
+            return result
+
         try:
             from tools._runtime import auto_offload_result, _tool_cap
             from tools.MainTool._shared import _log_tool

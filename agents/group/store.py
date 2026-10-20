@@ -313,6 +313,14 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
         # and replayable without raising.
         return touched
 
+    if kind in (ev.WRITE_RESERVED, ev.WRITE_DONE, ev.WRITE_SKIPPED):
+        # AU-05: the idempotency ledger is DERIVED by scanning these events,
+        # not projected onto a table (``04`` section 6). They exist so a retry
+        # can tell "already done" from "crashed halfway", and so the audit
+        # trail shows the write. Replaying them must never raise, exactly like
+        # ``capability.changed`` above.
+        return touched
+
     # ── milestones ───────────────────────────────────────────────────────
     if kind == ev.MILESTONE_CREATED:
         milestone = _new_milestone(

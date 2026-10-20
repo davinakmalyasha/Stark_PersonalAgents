@@ -17,6 +17,12 @@ Design rules
 
 Adding a kind later is allowed for genuinely new concerns. Renaming one is
 not — it breaks every stored project.
+
+**D-13 amendment (AU-05).** The external-write ledger added ``write.reserved``,
+``write.done`` and ``write.skipped``. They are audit-only kinds: the ledger is
+derived by scanning events, so the reducer treats them as no-ops exactly like
+``capability.changed``. The amendment is recorded in
+``docs/group-projects/06-phases-and-open-questions.md`` (D-13).
 """
 from __future__ import annotations
 
@@ -71,6 +77,22 @@ MEMBER_REMOVED = "member.removed"
 MEMBER_HALTED = "member.halted"
 CAPABILITY_CHANGED = "capability.changed"
 
+# ── external writes (AU-05; the deliberate D-13 amendment) ──────────────────
+#
+# The idempotency ledger is DERIVED from these events, not stored in a table
+# (``04`` section 6). ``write.reserved`` is written before the effect,
+# ``write.done`` after it succeeds, and ``write.skipped`` when a retry finds
+# the same key already done. A ``reserved`` with no later ``done`` is the crash
+# case: the action may or may not have happened, so the retry asks a human
+# instead of silently duplicating it.
+#
+# D-13 froze the vocabulary, so this is an explicit amendment rather than a
+# casual addition: three audit-only kinds, reduced as no-ops so old and new
+# projects replay through the same reducer.
+WRITE_RESERVED = "write.reserved"
+WRITE_DONE = "write.done"
+WRITE_SKIPPED = "write.skipped"
+
 
 #: Every kind the system may ever write. Used to validate on append.
 ALL_KINDS = frozenset({
@@ -84,6 +106,7 @@ ALL_KINDS = frozenset({
     APPROVAL_REQUESTED, APPROVAL_GRANTED, APPROVAL_REJECTED,
     MESSAGE_SENT, MESSAGE_READ,
     MEMBER_ADDED, MEMBER_REMOVED, MEMBER_HALTED, CAPABILITY_CHANGED,
+    WRITE_RESERVED, WRITE_DONE, WRITE_SKIPPED,
 })
 
 #: Kinds the reducer implements. Anything outside this set that is replayed
@@ -102,6 +125,10 @@ REDUCED_KINDS = frozenset({
     # reduced as a no-op so replay never raises, while remaining a first-class
     # event that the audit trail and the UI both see.
     CAPABILITY_CHANGED,
+    # AU-05's idempotency ledger is derived by scanning these events, so there
+    # is nothing to project. They are still events: the audit trail, the
+    # rebuild path, and a later reader all need to see them.
+    WRITE_RESERVED, WRITE_DONE, WRITE_SKIPPED,
 })
 
 #: A parked item keeps its status but carries this reason, so the stall

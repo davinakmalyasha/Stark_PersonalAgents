@@ -147,19 +147,29 @@ A multi-day project will retry a failed item. If the write is an email, the retr
 
 | Field | Notes |
 |---|---|
-| `key` | Deterministic: `"{op_type}:{entity_id}:{version}"`. Declared in `PROJECT.md`, defaulting to item id + attempt-independent content hash. |
-| `state` | `unknown` → `reserved` → `done` \| `skipped` |
-| Stored on | The approval row, **and** re-checked at perform time |
+| `key` | `"{item_id}:{shape}:{payload_sha}"`. `shape` from `policy.shape_of()`; `payload_sha` is SHA-256 of the canonical MCP `args` (JSON, sorted keys) or the command string. |
+| `state` | `fresh` → `reserved` → `done` \| `skipped`. A `reserved` with no later `done` is `unknown` — the crash case. |
+| Stored on | The **event log** (`write.reserved`, `write.done`, `write.skipped`). No table: every table is a projection, so a `writes` table would be a second source of truth. |
+
+Include `item_id` in the key: two items legitimately sending the same email are two events, not a duplicate. The key is **path-free by construction** — `shape` is `server/tool` or the command roots, and the payload is only ever a hash — because `check_portability()` does not scan `.gp/` (`06` §7).
+
+Only actions the envelope **gated** are deduped: tier `needs_approval`, including shapes already granted. An `autonomous` action is the project's own business and repeating it is often correct (re-running a build after a fix must not be suppressed). File writes are deliberately **not** deduped: writing the same path twice is naturally idempotent, and a key containing a resolved path would break portability.
+
+MCP calls are covered when the server config marks them `approval: "prompt"` (the existing per-tool setting); a server configured otherwise is not gated, so it is not deduped either. Group materialisation copies the catalogue's setting (`04` §7), so the catalogue owns that decision.
 
 ```
-perform_pending_write(key, payload):
-    if already_done(key):    emit write.skipped; return      # ← the dedupe
-    reserve(key)                                              # same txn
+perform_write(key, payload):
+    state = ledger(key)
+    if state == "done":    emit write.skipped; return "already performed; skipped"
+    if state == "unknown": park for a human ("may or may not have been sent")
+    emit write.reserved
     perform(payload)
-    mark_done(key)
+    emit write.done
 ```
 
-`reserve` and `mark_done` are separate transactions on purpose: a crash *between* the external call and `mark_done` leaves the key `reserved`, which surfaces to the human as *"this may or may not have sent — please check"* rather than silently duplicating. Honest about the ambiguity beats confidently wrong.
+`write.reserved` and `write.done` are separate commits on purpose: a crash *between* the external call and `write.done` leaves the key reserved, which surfaces to the human as *"this may or may not have been sent — please check"* rather than silently duplicating. Approving that question authorizes **one** retry; rejecting it blocks the item for a re-plan. Honest about the ambiguity beats confidently wrong.
+
+The three `write.*` kinds are an explicit amendment to D-13 (`06` §4): they are audit-only, and replaying them is a no-op in the same way `capability.changed` is.
 
 **Audit log is mandatory from day one.** Every `classify()` decision — autonomous or gated — appends an event with the tier that was applied (`01` §7). This is the log Grok Bot does not have (`00` §5), and it is what lets you answer "what did this project actually do while I was asleep?"
 

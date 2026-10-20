@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import time
+from typing import Any
 
 from sync.state_sync import safe_append_live_log
 
@@ -32,6 +33,7 @@ from ._cmdpolicy import (
     BLOCKED_PATTERNS,
     check_command,
     expected_nonzero,
+    is_read_only,
     is_server_like,
 )
 from ._procman import (
@@ -69,6 +71,29 @@ _UNSET = -1
 _REPEAT_MIN_RUN = 5
 
 _NONPRINT_RE = re.compile(r"[^\x09\x0a\x0d\x20-\x7e\u0080-\uffff]")
+
+
+def _command_target(decision: Any) -> str:
+    """A path-free, stable shape target for one command: its program roots.
+
+    ``gh pr create --body "D:\\project\\x"`` must not put an absolute path in
+    an approval shape or an idempotency key (``06`` §7). The roots are the
+    program basenames ``check_command`` already parsed; the full command is
+    hashed separately as the payload identity.
+    """
+    roots = [str(root) for root in (getattr(decision, "roots", None) or [])
+             if root]
+    return "+".join(sorted(set(roots))) or "shell"
+
+
+def _command_succeeded(result: Any) -> bool:
+    """Only ``[OK]`` means the shell completed a successful attempt.
+
+    ``[ERR]``, ``[TIMEOUT]`` and ``Error:`` leave the AU-05 reservation in
+    place, so a retry is parked as "may or may not have been sent" rather than
+    silently skipping a command that failed.
+    """
+    return isinstance(result, str) and result.lstrip().startswith("[OK]")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -582,11 +607,50 @@ def run_command(ctx: object = None, command: str = "", timeout=_UNSET, backgroun
         name = generate_name(command)
 
     backend = LocalShellBackend(root_dir=active_ws)
-    result = backend.execute(
-        command, timeout=timeout, background=background, name=name, shell=shell,
-        workdir=workdir, expect=expect, idle_timeout=idle_timeout, owner=owner,
-        ready_timeout=max(0, int(ready_timeout or 0)),
-    )
+
+    def execute() -> Any:
+        return backend.execute(
+            command, timeout=timeout, background=background, name=name,
+            shell=shell, workdir=workdir, expect=expect,
+            idle_timeout=idle_timeout, owner=owner,
+            ready_timeout=max(0, int(ready_timeout or 0)),
+        )
+
+    # Read-only commands cannot have an outward effect, so they do not need
+    # the envelope or the ledger. Everything else asks the gate (which parks
+    # the item on `needs_approval`) and then runs through AU-05's ledger.
+    read_only, _why = is_read_only(command)
+    if read_only:
+        result = execute()
+    else:
+        from tools._runtime import (
+            TIER_AUTONOMOUS,
+            TIER_NEEDS_APPROVAL,
+            WRITE_SKIPPED,
+            ApprovalRequired,
+            _authorize,
+            _perform_write,
+        )
+
+        target = _command_target(decision)
+        tier = _authorize("command", target)
+        if tier == TIER_NEEDS_APPROVAL:
+            # The gate has already parked the item; end the run rather than
+            # turning an approval wait into an ordinary tool error.
+            raise ApprovalRequired(
+                f"command {command!r} is waiting for the owner")
+        if tier not in (None, TIER_AUTONOMOUS):
+            raise PermissionError(
+                f"command {command!r} is refused by this project's autonomy "
+                f"envelope")
+
+        result = _perform_write(
+            "command", target, command, execute,
+            succeeded=_command_succeeded,
+        )
+        if result == WRITE_SKIPPED:
+            return result
+
     if isinstance(result, str):
         return _clean_terminal_output(result)
     return result

@@ -342,10 +342,17 @@ class GroupToolkit:
             # Carry the SHAPE onto the grant (AU-08). This is what lets the
             # re-dispatched member be told "yes" instead of asking again: the
             # gate recognises a shape a human has already approved.
-            from .runner import requested_shape
+            from .runner import requested_shape, requested_write_key
             shape = requested_shape(store, project_id, item_id)
             if shape:
                 payload["shape"] = shape
+            # AU-05: an ambiguous write (reserved, never completed) parks with
+            # a write_key. Carrying it onto the grant is how the ledger knows a
+            # human explicitly authorized one retry, rather than the original
+            # approval still being in force.
+            write_key = requested_write_key(store, project_id, item_id)
+            if write_key:
+                payload["write_key"] = write_key
         store.append(project_id, kind, "human", item_id=item_id, data=payload)
         if grant:
             return ToolResult(True, f"{item_id} approved")

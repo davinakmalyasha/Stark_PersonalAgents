@@ -50,10 +50,30 @@ active_allowed_tools: ContextVar[Optional[frozenset]] = ContextVar("active_allow
 #: these guards behaved exactly as they still do with no gate.
 active_approval_gate: ContextVar[Optional[Callable[[str, str], Optional[str]]]] = ContextVar("active_approval_gate", default=None)
 
+#: A group project's idempotency ledger, set by its runner for one member run:
+#: ``begin(kind, target, payload) -> "fresh" | "done" | "unknown" | None``.
+#: None means the envelope did not gate the action (or no ledger is in force).
+#:
+#: Same contract as the gate: supplied by ``agents.group``, consumed by tools
+#: as plain strings and methods. Nothing here imports the group package. With
+#: no ledger set — every ordinary agent — ``_perform_write`` calls the effect
+#: directly and behaviour is exactly as it was before AU-05.
+active_write_ledger: ContextVar[Optional[Any]] = ContextVar("active_write_ledger", default=None)
+
 #: Tier names, spelled out rather than imported. ``tools/`` must not depend on
 #: the group package, not even for a constant (``04`` §5, bullet 4).
 TIER_AUTONOMOUS = "autonomous"
 TIER_NEEDS_APPROVAL = "needs_approval"
+
+#: Ledger states, for the same reason the tiers are spelled out here.
+WRITE_FRESH = "fresh"
+WRITE_DONE = "done"
+WRITE_UNKNOWN = "unknown"
+
+#: What a skipped write returns to the caller. Deliberately a plain result, not
+#: an exception: the action already succeeded in a previous attempt, so from
+#: the member's point of view the work is done.
+WRITE_SKIPPED = "already performed; skipped"
 
 
 class ApprovalRequired(Exception):
@@ -80,6 +100,63 @@ def _authorize(kind: str, target: str) -> Optional[str]:
         return gate(kind, target) or None
     except Exception:  # noqa: BLE001 - a failed gate denies, never allows
         return TIER_NEEDS_APPROVAL
+
+
+def _perform_write(kind: str, target: str, payload: Any,
+                   perform: Callable[[], Any],
+                   succeeded: Optional[Callable[[Any], bool]] = None) -> Any:
+    """Run one external effect through the AU-05 ledger, if one is in force.
+
+    The flow is ``04`` §6: check the key; if it is already ``done``, emit
+    ``write.skipped`` and do not perform; if it is ``unknown`` (reserved with
+    no completion — the crash case), park for a human and do not perform; if
+    it is ``fresh``, reserve, perform, and mark done.
+
+    ``succeeded`` lets a caller keep a reservation when the effect reported a
+    failure (``run_command`` uses it for ``[ERR]`` / timeout output). Leaving
+    the reservation is the honest choice: the retry will ask, rather than
+    silently skipping a write that may never have happened.
+
+    With no ledger set this calls ``perform`` directly, which is every
+    non-group agent's path and must stay byte-for-byte identical.
+    """
+    ledger = active_write_ledger.get()
+    if ledger is None:
+        return perform()
+
+    try:
+        state = ledger.begin(kind, target, payload)
+    except Exception as exc:  # noqa: BLE001 - cannot verify means do not perform
+        try:
+            ledger.unknown(kind, target, payload)
+        except Exception:  # noqa: BLE001, S110 - the raise below is the signal
+            pass
+        raise ApprovalRequired(
+            f"could not verify whether {kind} {target} was already performed; "
+            f"not performing it again"
+        ) from exc
+
+    if state is None:
+        # The envelope did not gate this action: repeatable by design.
+        return perform()
+
+    if state == WRITE_DONE:
+        ledger.skipped(kind, target, payload)
+        return WRITE_SKIPPED
+
+    if state != WRITE_FRESH:
+        # ``unknown`` (and anything unrecognised) is genuine ambiguity. Never
+        # guess in the direction of a duplicate.
+        ledger.unknown(kind, target, payload)
+        raise ApprovalRequired(
+            f"{kind} {target} may or may not have been sent; "
+            f"check the destination before retrying"
+        )
+
+    result = perform()
+    if succeeded is None or succeeded(result):
+        ledger.finish(kind, target, payload)
+    return result
 
 _HARNESS_ROOT = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

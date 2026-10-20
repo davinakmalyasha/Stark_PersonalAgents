@@ -24,7 +24,9 @@ This module supplies:
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 import os
 import threading
 import uuid
@@ -153,6 +155,63 @@ def requested_shape(store: Any, project_id: str, item_id: str) -> str | None:
     return None
 
 
+def requested_write_key(store: Any, project_id: str, item_id: str) -> str | None:
+    """The write key of the latest question about this item, if it had one.
+
+    Only an *ambiguous* write asks with a key (``write.reserved`` with no
+    ``write.done``). Carrying it onto the grant is what lets the ledger see
+    that a human explicitly authorized **one** retry, instead of parking the
+    same ambiguity forever.
+    """
+    if store is None:
+        return None
+    try:
+        events = store.events(project_id)
+    except Exception:  # noqa: BLE001
+        return None
+    for event in reversed(events):
+        if event.get("item_id") != item_id:
+            continue
+        if event.get("kind") != ev.APPROVAL_REQUESTED:
+            continue
+        key = (event.get("data") or {}).get("write_key")
+        return str(key) if key else None
+    return None
+
+
+def _action_for(kind: str, target: str, project_root: str):
+    """The :class:`policy.Action` behind one call-site request.
+
+    Shared by the gate and the ledger so a grant and a dedupe key can never
+    disagree about what the action was.
+    """
+    from . import policy
+
+    kind = str(kind or "fs")
+    if kind == "fs":
+        resolved = _resolve(project_root, target)
+        outside = not path_is_inside(project_root, resolved)
+        dangerous = outside and policy.looks_like_credential(resolved)
+    else:
+        # Not a path, so there is nothing to resolve and nothing to check
+        # against the credential markers. An MCP tool or a shell command
+        # reaches outward by definition — `server/tool` and a command root are
+        # not "inside" any folder.
+        resolved = str(target or "")
+        outside = True
+        dangerous = False
+    return policy.Action(
+        kind=kind,
+        target=resolved,
+        # `_sanitize_path`, the MCP bridge and run_command are not told whether
+        # the caller means to read or write, so this assumes the write key.
+        # Being asked about too much is the safe direction to be wrong in.
+        write=True,
+        outside=outside,
+        dangerous=dangerous,
+    )
+
+
 def build_gate(store: Any, project_id: str, item_id: str, project_root: str,
                autonomy: dict | None):
     """The project envelope as a callable ``tools/`` can ask.
@@ -170,55 +229,210 @@ def build_gate(store: Any, project_id: str, item_id: str, project_root: str,
     grants = granted_shapes(store, project_id)
 
     def gate(kind: str, target: str) -> str | None:
-        kind = str(kind or "fs")
-        if kind == "fs":
-            resolved = _resolve(project_root, target)
-            outside = not path_is_inside(project_root, resolved)
-            dangerous = outside and policy.looks_like_credential(resolved)
-        else:
-            # Not a path, so there is nothing to resolve and nothing to check
-            # against the credential markers. An MCP tool reaches outward by
-            # definition — `server/tool` is not "inside" any folder.
-            resolved = str(target or "")
-            outside = True
-            dangerous = False
-        action = policy.Action(
-            kind=kind,
-            target=resolved,
-            # `_sanitize_path` and the MCP bridge are not told whether the
-            # caller means to read or write, so this assumes the write key.
-            # Being asked about too much is the safe direction to be wrong in.
-            write=True,
-            outside=outside,
-            dangerous=dangerous,
-        )
+        action = _action_for(kind, target, project_root)
         tier = policy.classify(action, envelope=autonomy, grants=grants)
         if tier == policy.NEEDS_APPROVAL:
-            _park(store, project_id, item_id, action, policy)
+            _park(
+                store, project_id, item_id, policy.shape_of(action),
+                f"wants to write outside the project folder: {action.target}",
+            )
         return tier
 
     return gate
 
 
-def _park(store: Any, project_id: str, item_id: str, action: Any,
-          policy: Any) -> None:
-    """Record the question. Idempotent — one item, one open question."""
+def _park(store: Any, project_id: str, item_id: str, shape: str, detail: str,
+          *, write_key: str | None = None) -> None:
+    """Record the question. Idempotent — one item, one open question.
+
+    ``write_key`` is only set for the ambiguous case (a reservation with no
+    completion). It rides on the grant so the ledger can tell "a human
+    explicitly authorized one retry" from "the original approval is still in
+    force".
+    """
     if store is None:
         return
     try:
         item = store.item(item_id)
         if item is not None and item.get("blocked_reason") == ev.AWAITING_APPROVAL:
             return  # already asked; do not ask again
+        data = {"detail": detail, "shape": shape}
+        if write_key:
+            data["write_key"] = write_key
         store.append(
             project_id, ev.APPROVAL_REQUESTED, "member", item_id=item_id,
-            data={
-                "detail": (f"wants to write outside the project folder: "
-                           f"{action.target}"),
-                "shape": policy.shape_of(action),
-            },
+            data=data,
         )
     except Exception:  # noqa: BLE001 - a failed park must not allow the action
         return
+
+
+# ── the idempotency ledger (AU-05) ──────────────────────────────────────────
+#
+# ``04`` §6. A retried item must not repeat an external effect. The ledger is
+# the EVENT LOG, not a table: a write is reserved before it happens, marked
+# done after it succeeds, and skipped when a retry finds the key already done.
+#
+# Only actions the envelope GATED are deduped. An autonomous action is the
+# project's own business and repeating it is often correct (re-running a build
+# after a fix must not be suppressed). File writes are deliberately excluded:
+# writing the same path twice is naturally idempotent, and a key containing a
+# resolved path would break portability (``06`` §7).
+
+FRESH = "fresh"
+DONE = "done"
+UNKNOWN = "unknown"
+
+
+def payload_sha(payload: Any) -> str:
+    """The content identity of one write, independent of attempt or path.
+
+    MCP arguments are canonicalised as sorted-key JSON; a command is its own
+    string. The digest is the only place the payload appears, so a command
+    containing an absolute path cannot leak one into the key.
+    """
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str,
+        )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_key(item_id: str, shape: str, payload: Any) -> str:
+    """``item_id:shape:payload_sha`` — AU-05's deterministic identity.
+
+    ``item_id`` is included on purpose: two items legitimately sending the same
+    email are two events, not a duplicate.
+    """
+    return f"{item_id}:{shape}:{payload_sha(payload)}"
+
+
+class WriteLedger:
+    """The events-as-truth ledger for one item.
+
+    ``shape_for(kind, target)`` returns ``None`` for actions the envelope did
+    not gate, and the stable shape otherwise. That is the whole "dedupe only
+    what was gated" rule; everything else is a scan of the project's events.
+    """
+
+    def __init__(self, store: Any, project_id: str, item_id: str,
+                 shape_for: Callable[[str, str], str | None]) -> None:
+        self._store = store
+        self._project_id = project_id
+        self._item_id = item_id
+        self._shape_for = shape_for
+        self._lock = threading.Lock()
+
+    def _identity(self, kind: str, target: str,
+                  payload: Any) -> tuple[str, str] | None:
+        shape = self._shape_for(kind, target)
+        if not shape:
+            return None
+        return shape, write_key(self._item_id, shape, payload)
+
+    def _state(self, key: str) -> str:
+        done = False
+        last_reserved = 0
+        last_grant = 0
+        for event in self._store.events(self._project_id):
+            if event.get("item_id") != self._item_id:
+                continue
+            kind = event.get("kind")
+            data = event.get("data") or {}
+            if kind == ev.APPROVAL_GRANTED and data.get("write_key") == key:
+                last_grant = int(event.get("seq") or 0)
+                continue
+            if data.get("key") != key:
+                continue
+            if kind in (ev.WRITE_DONE, ev.WRITE_SKIPPED):
+                done = True
+            elif kind == ev.WRITE_RESERVED:
+                last_reserved = int(event.get("seq") or 0)
+        if done:
+            return DONE
+        if last_reserved > last_grant:
+            # The crash case. Do not guess: the effect may have happened.
+            return UNKNOWN
+        return FRESH
+
+    def begin(self, kind: str, target: str, payload: Any) -> str | None:
+        """Reserve a fresh write, or report ``done`` / ``unknown``.
+
+        ``None`` means the envelope did not gate this action, so the caller
+        behaves exactly as it always did.
+        """
+        identity = self._identity(kind, target, payload)
+        if identity is None:
+            return None
+        shape, key = identity
+        with self._lock:
+            state = self._state(key)
+            if state == FRESH:
+                self._store.append(
+                    self._project_id, ev.WRITE_RESERVED, "member",
+                    item_id=self._item_id, data={"key": key, "shape": shape},
+                )
+            return state
+
+    def finish(self, kind: str, target: str, payload: Any) -> None:
+        identity = self._identity(kind, target, payload)
+        if identity is None:
+            return
+        _shape, key = identity
+        with self._lock:
+            self._store.append(
+                self._project_id, ev.WRITE_DONE, "member",
+                item_id=self._item_id, data={"key": key},
+            )
+
+    def skipped(self, kind: str, target: str, payload: Any) -> None:
+        identity = self._identity(kind, target, payload)
+        if identity is None:
+            return
+        _shape, key = identity
+        with self._lock:
+            self._store.append(
+                self._project_id, ev.WRITE_SKIPPED, "member",
+                item_id=self._item_id, data={"key": key},
+            )
+
+    def unknown(self, kind: str, target: str, payload: Any) -> None:
+        identity = self._identity(kind, target, payload)
+        if identity is None:
+            return
+        shape, key = identity
+        _park(
+            self._store, self._project_id, self._item_id, shape,
+            f"may or may not have been sent: {shape} ({key}). "
+            f"Check the destination before approving a retry.",
+            write_key=key,
+        )
+
+
+def build_ledger(store: Any, project_id: str, item_id: str, project_root: str,
+                 autonomy: dict | None) -> WriteLedger | None:
+    """The AU-05 ledger for one item run, or ``None`` when it cannot apply."""
+    if store is None or not item_id:
+        return None
+    from . import policy
+
+    def shape_for(kind: str, target: str) -> str | None:
+        action = _action_for(kind, target, project_root)
+        if action.kind == "fs":
+            # Writing the same path twice is idempotent, and a key would carry
+            # a resolved path (``06`` §7). Never dedupe file writes.
+            return None
+        # Classify WITHOUT the grants: an action is deduped because the
+        # envelope gated it, even when an approval has since made it
+        # autonomous. An action the envelope made autonomous from the start is
+        # not deduped.
+        if policy.classify(action, envelope=autonomy, grants=()) != policy.NEEDS_APPROVAL:
+            return None
+        return policy.shape_of(action)
+
+    return WriteLedger(store, project_id, str(item_id), shape_for)
 
 
 def build_prompt(ctx: RunContext) -> str:
@@ -396,9 +610,14 @@ class LocalRunner(ItemRunner):
         token = None
         allow_token = None
         gate_token = None
+        ledger_token = None
         try:
             from sync.state_sync import active_state, new_scoped_state, safe_get_state
-            from tools._runtime import active_allowed_tools, active_approval_gate
+            from tools._runtime import (
+                active_allowed_tools,
+                active_approval_gate,
+                active_write_ledger,
+            )
 
             # The member's materialised allowlist is the real ceiling on its
             # tools (``04`` §5). Until this ran, ``tools/bindings.json`` was
@@ -419,6 +638,14 @@ class LocalRunner(ItemRunner):
                 ctx.store, ctx.project_id, str(ctx.item.get("id") or ""),
                 ctx.project_root, ctx.autonomy))
 
+            # And the idempotency ledger (AU-05), so a retried item that
+            # already performed a gated external write does not repeat it
+            # (``04`` §6). It is set here, inside the member's own thread,
+            # because ContextVars do not cross the boundary `start()` opened.
+            ledger_token = active_write_ledger.set(build_ledger(
+                ctx.store, ctx.project_id, str(ctx.item.get("id") or ""),
+                ctx.project_root, ctx.autonomy))
+
             token = active_state.set(new_scoped_state({
                 "chat_id": ctx.chat_id,
                 "project_path": ctx.project_root,
@@ -429,6 +656,12 @@ class LocalRunner(ItemRunner):
         except Exception as exc:  # noqa: BLE001 - a failed run is a result
             output = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
+            if ledger_token is not None:
+                try:
+                    from tools._runtime import active_write_ledger as _ledger
+                    _ledger.reset(ledger_token)
+                except Exception:  # noqa: BLE001, S110 - scope cleanup only
+                    pass
             if gate_token is not None:
                 try:
                     from tools._runtime import active_approval_gate as _gate

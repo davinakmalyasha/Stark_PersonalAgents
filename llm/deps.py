@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -46,6 +46,9 @@ class WorkspaceDeps:
     compaction: Optional[dict] = None
     #: Per-agent tool output caps {tool_name: chars} (empty = global defaults).
     tool_caps: Optional[dict] = None
+    #: Exact chat model object for same-model compaction (set by the native run).
+    compaction_model: Any = None
+    compaction_model_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.project_path:

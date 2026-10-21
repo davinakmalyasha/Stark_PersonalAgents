@@ -303,7 +303,16 @@ def list_chats(workspace_path: str) -> list[dict]:
             pass
     # Lazy migration removed — chats.db + sessions/{kind}/ JSONL are canonical
     try:
-        cur = db.execute("SELECT id, title, model, created_at, updated_at, message_count, parent_chat_id, parent_workspace_id FROM chats WHERE workspace_id=? ORDER BY updated_at DESC", (ws_id,))
+        cur = db.execute(
+            "SELECT c.id, c.title, c.model, c.created_at, c.updated_at, c.message_count,"
+            " c.parent_chat_id, c.parent_workspace_id,"
+            " (SELECT m.content FROM messages m WHERE m.chat_id=c.id"
+            "  ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,"
+            " (SELECT m.role FROM messages m WHERE m.chat_id=c.id"
+            "  ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role"
+            " FROM chats c WHERE c.workspace_id=? ORDER BY c.updated_at DESC",
+            (ws_id,),
+        )
         rows = cur.fetchall()
         out = []
         for r in rows:
@@ -312,10 +321,25 @@ def list_chats(workspace_path: str) -> list[dict]:
                 item["parentChatId"] = r[6]
             if r[7]:
                 item["parentWorkspaceId"] = r[7]
+            if r[8]:
+                snippet = " ".join(str(r[8]).split())
+                item["lastMessage"] = snippet[:180]
+            if r[9]:
+                item["lastRole"] = r[9]
             out.append(item)
         return out
     except Exception:
         return []
+
+def get_chat_workspace_path(chat_id: str) -> str:
+    """Return the stored workspace path for one chat ("" for General)."""
+    if not chat_id:
+        return ""
+    _validate_chat_id(chat_id)
+    db = _get_db()
+    row = db.execute("SELECT workspace_path FROM chats WHERE id=?", (chat_id,)).fetchone()
+    return (row[0] or "") if row else ""
+
 
 def get_chat(workspace_path: str, chat_id: str, include_traces: bool = True, include_usage: bool = True) -> dict | None:
     if not chat_id:
@@ -328,9 +352,9 @@ def get_chat(workspace_path: str, chat_id: str, include_traces: bool = True, inc
         return None
     # Load messages
     if include_traces:
-        cur = db.execute("SELECT id, role, content, timestamp, is_trace, metadata_json FROM messages WHERE chat_id=? ORDER BY timestamp ASC", (chat_id,))
+        cur = db.execute("SELECT id, role, content, timestamp, is_trace, metadata_json FROM messages WHERE chat_id=? ORDER BY timestamp ASC, rowid ASC", (chat_id,))
     else:
-        cur = db.execute("SELECT id, role, content, timestamp, is_trace, metadata_json FROM messages WHERE chat_id=? AND is_trace=0 ORDER BY timestamp ASC", (chat_id,))
+        cur = db.execute("SELECT id, role, content, timestamp, is_trace, metadata_json FROM messages WHERE chat_id=? AND is_trace=0 ORDER BY timestamp ASC, rowid ASC", (chat_id,))
     msgs = []
     for mid, role, content, ts, is_trace, meta_json in cur.fetchall():
         try:
@@ -400,6 +424,31 @@ def save_chat(workspace_path: str, chat_id: str, data: dict) -> bool:
         db = _get_db()
         try:
             data["updatedAt"] = datetime.now().isoformat()
+            title = data.get("title", "Untitled")
+            model = data.get("model", "Automatic Fallback")
+            is_pinned = 1 if data.get("isPinned") else 0
+            tu_json = json.dumps(data.get("token_usage"), ensure_ascii=False) if data.get("token_usage") else None
+
+            # Safety guard: a chat loaded with include_traces=False does NOT
+            # contain the agent/trace messages. Rewriting messages from that
+            # view is how earlier replies used to disappear on every run. If
+            # the caller only has a partial view, update metadata only.
+            if data.get("_traces_loaded") is False:
+                if data.get("_usage_loaded") is False:
+                    db.execute(
+                        "UPDATE chats SET title=?, model=?, updated_at=?, pinned=?, tasks_json=? WHERE id=?",
+                        (title, model, data["updatedAt"], is_pinned,
+                         json.dumps(data.get("tasks", []), ensure_ascii=False), chat_id),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE chats SET title=?, model=?, updated_at=?, pinned=?, tasks_json=?, token_usage_json=? WHERE id=?",
+                        (title, model, data["updatedAt"], is_pinned,
+                         json.dumps(data.get("tasks", []), ensure_ascii=False), tu_json, chat_id),
+                    )
+                db.commit()
+                return True
+
             messages = data.get("messages", [])
             messages.sort(key=lambda m: m.get("timestamp", ""))
             for idx, m in enumerate(messages):
@@ -411,13 +460,14 @@ def save_chat(workspace_path: str, chat_id: str, data: dict) -> bool:
                     trace_messages.append(m)
                 else:
                     chat_messages.append(m)
-            # Update chats row
-            title = data.get("title", "Untitled")
-            model = data.get("model", "Automatic Fallback")
-            is_pinned = 1 if data.get("isPinned") else 0
-            tu_json = json.dumps(data.get("token_usage"), ensure_ascii=False) if data.get("token_usage") else None
-            db.execute("UPDATE chats SET title=?, model=?, updated_at=?, message_count=?, pinned=?, tasks_json=?, token_usage_json=? WHERE id=?", (title, model, data["updatedAt"], len(messages), is_pinned,
-                        json.dumps(data.get("tasks", []), ensure_ascii=False), tu_json, chat_id))
+            # Update chats row. When the caller loaded the chat without usage,
+            # preserve the existing token_usage_json instead of nulling it.
+            if data.get("_usage_loaded") is False:
+                db.execute("UPDATE chats SET title=?, model=?, updated_at=?, message_count=?, pinned=?, tasks_json=? WHERE id=?", (title, model, data["updatedAt"], len(messages), is_pinned,
+                            json.dumps(data.get("tasks", []), ensure_ascii=False), chat_id))
+            else:
+                db.execute("UPDATE chats SET title=?, model=?, updated_at=?, message_count=?, pinned=?, tasks_json=?, token_usage_json=? WHERE id=?", (title, model, data["updatedAt"], len(messages), is_pinned,
+                            json.dumps(data.get("tasks", []), ensure_ascii=False), tu_json, chat_id))
             if db.execute("SELECT changes()").fetchone()[0] == 0:
                 # Insert if not exists — preserve parent linkage (spawned-child
                 # grouping) instead of dropping it on this fallback path.
@@ -451,19 +501,152 @@ def save_chat(workspace_path: str, chat_id: str, data: dict) -> bool:
             print(f"[CHAT_STORE] save_chat {chat_id} failed: {e}")
             return False
 
+def update_chat_token_usage(workspace_path: str, chat_id: str, token_usage: dict) -> bool:
+    """Persist token usage without touching the message table.
+
+    The previous implementation loaded the chat with ``include_traces=False``
+    and called ``save_chat`` — a full message rewrite that silently deleted
+    every assistant/trace message on each run. Token accounting is a metadata
+    concern; it must never rewrite the conversation.
+    """
+    _validate_chat_id(chat_id)
+    with _chat_lock(chat_id):
+        db = _get_db()
+        try:
+            db.execute(
+                "UPDATE chats SET token_usage_json=?, updated_at=? WHERE id=?",
+                (json.dumps(token_usage or {}, ensure_ascii=False),
+                 datetime.now().isoformat(), chat_id),
+            )
+            db.commit()
+            return True
+        except Exception as e:
+            print(f"[CHAT_STORE] update_chat_token_usage {chat_id} failed: {e}")
+            return False
+
+
 def add_message(workspace_path: str, chat_id: str, role: str, content: str, metadata: dict = None) -> dict | None:
-    chat = get_chat(workspace_path, chat_id, include_traces=True, include_usage=False)
-    if chat is None:
+    """Atomically append one message (SQLite + JSONL).
+
+    The whole read-decide-write path holds the per-chat lock. Appending only
+    the new row (instead of rewriting every message) keeps concurrent writers
+    from losing messages and keeps long chats cheap.
+    """
+    _validate_chat_id(chat_id)
+    with _chat_lock(chat_id):
+        db = _get_db()
+        row = db.execute("SELECT title FROM chats WHERE id=?", (chat_id,)).fetchone()
+        if not row:
+            return None
+        now = datetime.now().isoformat()
+        msg = {
+            "id": f"msg-{uuid.uuid4().hex[:8]}",
+            "role": role,
+            "content": content,
+            "timestamp": now,
+        }
+        if metadata:
+            msg["metadata"] = metadata
+        is_trace = 1 if (metadata or {}).get("isTrace") else 0
+        title = row[0] or ""
+        new_title = title
+        if role == "user" and title in ("", "New Chat", "Untitled", "New Conversation"):
+            new_title = content[:60] + ("..." if len(content) > 60 else "")
+        try:
+            db.execute(
+                "INSERT INTO messages (id, chat_id, role, content, timestamp, is_trace, metadata_json) VALUES (?,?,?,?,?,?,?)",
+                (msg["id"], chat_id, role, content, now, is_trace, json.dumps(metadata or {})),
+            )
+            db.execute(
+                "UPDATE chats SET title=?, updated_at=?, message_count=COALESCE(message_count, 0) + 1 WHERE id=?",
+                (new_title, now, chat_id),
+            )
+            db.commit()
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[CHAT_STORE] add_message {chat_id} failed: {e}")
+            return None
+
+        # JSONL is the durable transcript; a failed append must not lose the
+        # SQLite write, so it stays best-effort.
+        try:
+            jpath = _jsonl_path(workspace_path or GENERAL_WORKSPACE_ID, chat_id)
+            _ensure_dir(os.path.dirname(jpath))
+            entry = {
+                "id": msg["id"], "role": role, "content": content,
+                "timestamp": now, "isTrace": bool(is_trace),
+                "metadata": metadata or {},
+            }
+            with open(jpath, "a", encoding="utf-8") as jf:
+                jf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[CHAT_STORE] add_message JSONL append {chat_id} failed: {e}")
+        return msg
+
+def truncate_from_message(workspace_path: str, chat_id: str, message_id: str) -> dict | None:
+    """Remove one message and everything after it.
+
+    Used by message-level rewind. The whole read/delete/JSONL rewrite holds the
+    per-chat lock, so a concurrent append cannot slip a message into the gap.
+    Returns the rewound message, the prompt text, and the removed rows.
+    """
+    _validate_chat_id(chat_id)
+    if not message_id:
         return None
-    msg = {"id": f"msg-{uuid.uuid4().hex[:8]}", "role": role, "content": content, "timestamp": datetime.now().isoformat()}
-    if metadata:
-        msg["metadata"] = metadata
-    chat.setdefault("messages", []).append(msg)
-    if role == "user" and chat.get("title") in ("", "New Chat", "Untitled"):
-        chat["title"] = content[:60] + ("..." if len(content) > 60 else "")
-    chat["updatedAt"] = datetime.now().isoformat()
-    save_chat(workspace_path, chat_id, chat)
-    return msg
+    with _chat_lock(chat_id):
+        db = _get_db()
+        rows = db.execute(
+            "SELECT rowid, id, role, content, timestamp, is_trace, metadata_json "
+            "FROM messages WHERE chat_id=? ORDER BY timestamp ASC, rowid ASC",
+            (chat_id,),
+        ).fetchall()
+        target_idx = next((i for i, r in enumerate(rows) if r[1] == message_id), None)
+        if target_idx is None:
+            return None
+        target = rows[target_idx]
+        keep = rows[:target_idx]
+        removed = rows[target_idx:]
+        now = datetime.now().isoformat()
+        try:
+            placeholders = ",".join("?" for _ in removed)
+            db.execute(
+                f"DELETE FROM messages WHERE chat_id=? AND id IN ({placeholders})",
+                (chat_id, *[r[1] for r in removed]),
+            )
+            db.execute(
+                "UPDATE chats SET updated_at=?, message_count=? WHERE id=?",
+                (now, len(keep), chat_id),
+            )
+            jpath = _jsonl_path(workspace_path or GENERAL_WORKSPACE_ID, chat_id)
+            _ensure_dir(os.path.dirname(jpath))
+            with open(jpath, "w", encoding="utf-8") as jf:
+                for r in keep:
+                    try:
+                        meta = json.loads(r[6]) if r[6] else {}
+                    except Exception:
+                        meta = {}
+                    jf.write(json.dumps({
+                        "id": r[1], "role": r[2], "content": r[3],
+                        "timestamp": r[4], "isTrace": bool(r[5]),
+                        "metadata": meta,
+                    }, ensure_ascii=False) + "\n")
+            db.commit()
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[CHAT_STORE] truncate_from_message {chat_id} failed: {e}")
+            return None
+        return {
+            "message": {"id": target[1], "role": target[2], "content": target[3]},
+            "prompt": target[3],
+            "removed": [{"id": r[1], "role": r[2]} for r in removed],
+        }
+
 
 def delete_chat(workspace_path: str, chat_id: str) -> bool:
     _validate_chat_id(chat_id)
@@ -491,59 +674,3 @@ def update_chat_title(workspace_path: str, chat_id: str, title: str) -> bool:
         return False
     chat["title"] = title
     return save_chat(workspace_path, chat_id, chat)
-
-def get_chat_tasks(workspace_path: str, chat_id: str) -> list[dict]:
-    """Read only the tasks metadata for a chat — no full message load.
-
-    Tasks live in the chats row's tasks_json column (SQLite is canonical).
-    Legacy chats saved before the migration keep their tasks inside the JSONL
-    transcript; fall back to a JSONL scan only for those (one-shot per chat).
-    """
-    _validate_chat_id(chat_id)
-    lock = _chat_lock(chat_id)
-    with lock:
-        db = _get_db()
-        row = db.execute(
-            "SELECT tasks_json FROM chats WHERE id=?",
-            (chat_id,),
-        ).fetchone()
-    if row is not None and row[0]:
-        try:
-            return json.loads(row[0])
-        except (TypeError, ValueError):
-            pass
-    # Legacy fallback: read tasks from the JSONL transcript (old format).
-    try:
-        with open(_jsonl_path(workspace_path or GENERAL_WORKSPACE_ID, chat_id), encoding="utf-8") as jf:
-            for line in jf:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                meta = entry.get("metadata", {}) or {}
-                if "tasks" in meta:
-                    return meta["tasks"]
-    except OSError:
-        pass
-    return []
-
-def save_chat_tasks(workspace_path: str, chat_id: str, tasks: list[dict]) -> bool:
-    """Persist only the tasks metadata — no full-chat rewrite."""
-    _validate_chat_id(chat_id)
-    lock = _chat_lock(chat_id)
-    with lock:
-        db = _get_db()
-        db.execute(
-            "UPDATE chats SET tasks_json=? WHERE id=?",
-            (json.dumps(tasks, ensure_ascii=False), chat_id),
-        )
-        db.commit()
-    try:
-        from server.services.task_scheduler import notify_tasks_changed
-        notify_tasks_changed(workspace_path or GENERAL_WORKSPACE_ID, chat_id)
-    except Exception:
-        pass
-    return True

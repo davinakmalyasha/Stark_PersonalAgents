@@ -103,6 +103,19 @@ async def get_history(limit: int = 20):
 
 @router.get("/api/state")
 async def get_state():
+    # Prefer the most recent active run's scoped snapshot. Root runs no longer
+    # write to the global shared_state, so reading that alone would be stale
+    # while an agent is working.
+    try:
+        from server.store.run_tracker import snapshot as _run_snapshot, latest_state
+        info = _run_snapshot()
+        runs = info.get("runs") or ([info] if info.get("running") else [])
+        for run in reversed(runs):
+            snap = latest_state(run.get("chat_id", ""))
+            if snap:
+                return JSONResponse(content=snap)
+    except Exception:
+        pass
     from sync.state_sync import safe_serialize_state
     return JSONResponse(content=__import__("json").loads(safe_serialize_state()))
 

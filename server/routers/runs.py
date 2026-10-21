@@ -14,7 +14,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from server.realtime.sse import format_sse as _format_sse, mirror_publish as _mirror_publish
-from server.store.run_tracker import set_active_run, clear_active_run
+from server.store.run_tracker import (
+    begin_run as _begin_run,
+    set_user_message_id as _set_run_user_message,
+    update_run_state as _update_run_state,
+    latest_state as _latest_run_state,
+    clear_active_run,
+)
 
 router = APIRouter(tags=["runs"])
 
@@ -22,10 +28,12 @@ _run_contexts: dict[str, dict] = {}
 _run_contexts_lock = threading.Lock()
 
 
-def _collect_run_artifacts(project_path: str, context: dict) -> dict:
+def _collect_run_artifacts(project_path: str, context: dict, chat_id: str = "") -> dict:
     """Build the file-change summary and review data for one agent run.
 
     Phase 7: extracted from api_server (git-diff delta + task tracker merge).
+    ``chat_id`` is passed explicitly so this never reads another run's scoped
+    state (concurrent workspaces are isolated now).
     """
     import os
     from server.api_server import (
@@ -45,7 +53,7 @@ def _collect_run_artifacts(project_path: str, context: dict) -> dict:
 
     try:
         from sync.sync_helpers import load_task_tracking
-        task_data = load_task_tracking(project_path, safe_get_state().get("chat_id", "")) or {}
+        task_data = load_task_tracking(project_path, chat_id) or {}
         artifacts = task_data.get("artifacts", {})
         for group in ("files_created", "files_modified", "files_deleted"):
             for path in artifacts.get(group, []) or []:
@@ -75,7 +83,7 @@ def _collect_run_artifacts(project_path: str, context: dict) -> dict:
     tests_passing = False
     try:
         from sync.sync_helpers import load_task_tracking
-        task_data = load_task_tracking(project_path, safe_get_state().get("chat_id", "")) or {}
+        task_data = load_task_tracking(project_path, chat_id) or {}
         tests_passing = bool((task_data.get("artifacts", {}) or {}).get("tests_passing"))
     except Exception:
         pass
@@ -191,55 +199,71 @@ async def run_pipeline(req: RunRequest, request: Request):
     """Run the agentic pipeline with SSE streaming of state updates."""
     import workspace_manager as wm
     from memory.chat_memory_manager import resolve_request_text
-    from sync.state_sync import reset_shared_state, safe_update_state, safe_serialize_state, safe_get_state
+    from sync.state_sync import new_scoped_state, safe_update_state, safe_serialize_state, safe_get_state
     from server.api_server import _capture_run_context
 
-    reset_shared_state()
-
-    safe_update_state({
-        "selected_model": req.model,
-        "selected_temp": req.temperature,
-        "is_general": not req.workspace_path,
-        "failed_models": [],
-        "token_usage": {
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
-            "total_cache_hit_tokens": 0,
-            "total_cache_miss_tokens": 0,
-            "total_cost": 0.0,
-            "calls": [],
-        }
-    })
-
-    attachment_note = ""
-    if req.attachments:
-        attachment_note = "\n\nAttached files for this request:\n" + "\n".join(
-            f"- {item.get('note') or item.get('name', 'attachment')} "
-            f"({item.get('path', item.get('url', 'uploaded file'))})"
-            for item in req.attachments
+    # One run per chat; different chats/workspaces may run concurrently.
+    # Claim the chat BEFORE writing the user message so a duplicate send cannot
+    # slip a second user turn into the same chat.
+    if not _begin_run(req.workspace_path, req.chat_id):
+        return JSONResponse(
+            status_code=409,
+            content={"error": "This chat already has a running agent. Wait for it to finish or stop it."},
         )
-        try:
-            _img_paths = [item.get("path") for item in req.attachments
-                          if item.get("isImage") and item.get("path")]
-            if _img_paths:
-                safe_update_state({"attachment_image_paths": [str(p) for p in _img_paths]})
-        except Exception:
-            pass
-    prompt_with_attachments = req.prompt + attachment_note
-    # Live screen frames reach the agent but are NOT persisted in the chat log
-    # (screenFrame) — otherwise every spoken sentence would add an image chip.
-    _stored_attachments = [a for a in req.attachments if not a.get("screenFrame")]
-    wm.add_message(
-        req.workspace_path, req.chat_id, "user", req.prompt,
-        {"attachments": _stored_attachments} if _stored_attachments else None,
-    )
-    resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
-    run_context = _capture_run_context(req.workspace_path, req.chat_id)
 
     try:
-        _workspace_ids_before_run = {w.get("id") for w in wm.list_workspaces()}
+        run_state = new_scoped_state({
+            "selected_model": req.model,
+            "selected_temp": req.temperature,
+            "is_general": not req.workspace_path,
+            "failed_models": [],
+            "project_path": req.workspace_path or "",
+            "chat_id": req.chat_id or "",
+            "token_usage": {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_cache_hit_tokens": 0,
+                "total_cache_miss_tokens": 0,
+                "total_cost": 0.0,
+                "calls": [],
+            },
+        })
+
+        attachment_note = ""
+        if req.attachments:
+            attachment_note = "\n\nAttached files for this request:\n" + "\n".join(
+                f"- {item.get('note') or item.get('name', 'attachment')} "
+                f"({item.get('path', item.get('url', 'uploaded file'))})"
+                for item in req.attachments
+            )
+            try:
+                _img_paths = [item.get("path") for item in req.attachments
+                              if item.get("isImage") and item.get("path")]
+                if _img_paths:
+                    run_state["attachment_image_paths"] = [str(p) for p in _img_paths]
+            except Exception:
+                pass
+        prompt_with_attachments = req.prompt + attachment_note
+        # Live screen frames reach the agent but are NOT persisted in the chat log
+        # (screenFrame) — otherwise every spoken sentence would add an image chip.
+        _stored_attachments = [a for a in req.attachments if not a.get("screenFrame")]
+        user_msg = wm.add_message(
+            req.workspace_path, req.chat_id, "user", req.prompt,
+            {"attachments": _stored_attachments} if _stored_attachments else None,
+        )
+        if user_msg and user_msg.get("id"):
+            run_state["user_message_id"] = user_msg["id"]
+            _set_run_user_message(req.chat_id, user_msg["id"])
+        resolved = resolve_request_text(prompt_with_attachments, workspace_path=req.workspace_path, chat_id=req.chat_id)
+        run_context = _capture_run_context(req.workspace_path, req.chat_id)
+
+        try:
+            _workspace_ids_before_run = {w.get("id") for w in wm.list_workspaces()}
+        except Exception:
+            _workspace_ids_before_run = set()
     except Exception:
-        _workspace_ids_before_run = set()
+        clear_active_run(chat_id=req.chat_id, workspace_path=req.workspace_path)
+        raise
 
     async def build_stream() -> AsyncGenerator[str, None]:
         done = False
@@ -249,6 +273,8 @@ async def run_pipeline(req: RunRequest, request: Request):
 
         def run_in_thread():
             nonlocal done, had_error
+            from sync.state_sync import active_state
+            state_token = active_state.set(run_state)
             try:
                 from routing.router import decide_route, stream_for_kind
                 decision = decide_route(
@@ -266,6 +292,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                 ):
                     aq.put_nowait(state_snapshot)
                 aq.put_nowait(None)
+                active_state.reset(state_token)
                 return
             except Exception as e:
                 import traceback as _tb
@@ -290,7 +317,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                 tb_text = traceback.format_exc()
                 _persist_run_crash(req.chat_id, req.workspace_path, req.prompt, tb_text)
                 try:
-                    err_state = json.loads(safe_serialize_state())
+                    err_state = json.loads(safe_serialize_state(run_state))
                 except Exception:
                     err_state = {}
                 err_state["error"] = str(e)
@@ -299,6 +326,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                 aq.put_nowait(None)
             finally:
                 done = True
+                active_state.reset(state_token)
 
         thread = threading.Thread(target=run_in_thread, daemon=True)
         thread.start()
@@ -379,6 +407,7 @@ async def run_pipeline(req: RunRequest, request: Request):
                     if item is None:
                         break
                     if isinstance(item, dict):
+                        _update_run_state(req.workspace_path, req.chat_id, item)
                         _mirror_publish(req.chat_id, "state", item)
                         yield _format_sse("state", item)
                         last_ver = item.get("state_version", 0)
@@ -403,27 +432,34 @@ async def run_pipeline(req: RunRequest, request: Request):
                     except Exception:
                         pass
                     if not done:
-                        snap = json.loads(safe_serialize_state())
+                        snap = json.loads(safe_serialize_state(run_state))
                         cur_ver = snap.get("state_version", 0)
                         if cur_ver > last_ver:
                             last_ver = cur_ver
                             snap["_intermediate"] = True
+                            _update_run_state(req.workspace_path, req.chat_id, snap)
                             _mirror_publish(req.chat_id, "state", snap)
                             yield _format_sse("state", snap)
             except asyncio.TimeoutError:
                 if not done:
-                    snap = json.loads(safe_serialize_state())
+                    snap = json.loads(safe_serialize_state(run_state))
                     cur_ver = snap.get("state_version", 0)
                     if cur_ver > last_ver:
                         last_ver = cur_ver
                         snap["_intermediate"] = True
+                        _update_run_state(req.workspace_path, req.chat_id, snap)
                         _mirror_publish(req.chat_id, "state", snap)
                         yield _format_sse("state", snap)
 
-        await asyncio.to_thread(_save_chat_token_usage, req.workspace_path, req.chat_id)
+        await asyncio.to_thread(_save_chat_token_usage, req.workspace_path, req.chat_id, run_state)
 
-        final_state = json.loads(safe_serialize_state())
-        final_state["artifacts"] = await asyncio.to_thread(_collect_run_artifacts, req.workspace_path, run_context)
+        final_state = json.loads(safe_serialize_state(run_state))
+        final_state["artifacts"] = await asyncio.to_thread(_collect_run_artifacts, req.workspace_path, run_context, req.chat_id)
+        try:
+            from tools.checkpoints import finalize_run as _finalize_checkpoint
+            _finalize_checkpoint(req.chat_id, req.workspace_path, final_state["artifacts"])
+        except Exception:
+            pass
 
         try:
             new_ids = {w.get("id") for w in wm.list_workspaces()} - _workspace_ids_before_run
@@ -433,8 +469,22 @@ async def run_pipeline(req: RunRequest, request: Request):
         except Exception:
             pass
 
+        _update_run_state(req.workspace_path, req.chat_id, final_state)
         _mirror_publish(req.chat_id, "state", final_state)
         yield _format_sse("state", final_state)
+        try:
+            from server.services.canvas_watch import notify_run_finished
+            report = (
+                (final_state.get("outputs") or {}).get("agent_report")
+                or final_state.get("agent_report")
+                or final_state.get("final_report")
+                or ""
+            )
+            notify_run_finished(
+                req.chat_id, str(report), "failed" if had_error else "completed"
+            )
+        except Exception:
+            pass
         _mirror_publish(req.chat_id, "done", {"status": "error" if had_error else "complete"})
         yield _format_sse("done", {"status": "error" if had_error else "complete"})
 
@@ -452,16 +502,18 @@ async def run_pipeline(req: RunRequest, request: Request):
             except Exception:
                 pass
 
-    set_active_run(req.workspace_path, req.chat_id)
     try:
-        from tools.checkpoints import begin_run
-        begin_run(req.chat_id, req.workspace_path)
+        from tools.checkpoints import begin_run as begin_checkpoint_run
+        begin_checkpoint_run(
+            req.chat_id, req.workspace_path,
+            user_message_id=run_state.get("user_message_id", ""),
+        )
     except Exception:
         pass
     return StreamingResponse(tracked_stream(), media_type="text/event-stream")
 
 
-def _save_chat_token_usage(workspace_path: str, chat_id: str):
+def _save_chat_token_usage(workspace_path: str, chat_id: str, run_state: dict | None = None):
     import workspace_manager as wm
     from sync.state_sync import safe_get_state
     if not chat_id:
@@ -472,7 +524,7 @@ def _save_chat_token_usage(workspace_path: str, chat_id: str):
     try:
         chat = wm.get_chat(workspace_path, chat_id, include_traces=False, include_usage=True)
         if chat:
-            run_stats = safe_get_state().get("token_usage", {})
+            run_stats = (run_state or safe_get_state()).get("token_usage", {})
             chat_stats = chat.get("token_usage") or {
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
@@ -491,8 +543,8 @@ def _save_chat_token_usage(workspace_path: str, chat_id: str):
             chat_stats["total_cache_miss_tokens"] += run_stats.get("total_cache_miss_tokens", 0)
             chat_stats["total_cost"] += run_stats.get("total_cost", 0.0)
             chat_stats["calls"] = chat_stats.get("calls", []) + run_stats.get("calls", [])
-            chat["token_usage"] = chat_stats
-            wm.save_chat(workspace_path, chat_id, chat)
+            from server.store.chat_store import update_chat_token_usage
+            update_chat_token_usage(workspace_path, chat_id, chat_stats)
     except Exception as e:
         print(f"Error saving token stats for chat {chat_id}: {e}")
 
@@ -508,7 +560,6 @@ async def stream_chat_events(chat_id: str, request: Request):
     """Subscribe to another client's run frames for one chat (live mirroring)."""
     from server.realtime.bus import subscribe as bus_subscribe, unsubscribe as bus_unsubscribe
     from server.store.run_tracker import snapshot as _run_snapshot
-    from sync.state_sync import safe_serialize_state
     q = bus_subscribe(chat_id)
 
     async def mirror_stream() -> AsyncGenerator[str, None]:
@@ -516,11 +567,9 @@ async def stream_chat_events(chat_id: str, request: Request):
             yield _format_sse("hello", {"chat_id": chat_id})
             run_info = _run_snapshot(chat_id=chat_id)
             if run_info.get("running"):
-                try:
-                    snap = json.loads(safe_serialize_state())
+                snap = _latest_run_state(chat_id)
+                if snap:
                     yield _format_sse("state", snap)
-                except Exception:
-                    pass
             while True:
                 if await request.is_disconnected():
                     break

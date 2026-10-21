@@ -2,11 +2,14 @@ import { useMemo } from 'react';
 import type { TokenUsage } from '../types';
 import type { BoardAgent, BoardAgentStatus } from '../types/board.types';
 import { delegationTarget, isDelegationToolName, parseLogToSteps } from '../utils/logParser';
+import type { TraceStep } from '../utils/logParser';
 
 interface Input {
   isRunning: boolean;
   liveLog: string | undefined;
   tokenUsage?: TokenUsage | null;
+  /** Persisted trace steps for the last completed run (no live log available). */
+  traceSteps?: TraceStep[];
 }
 
 const AGENT_ROSTER: { id: string; label: string; role: BoardAgent['role'] }[] = [
@@ -14,7 +17,6 @@ const AGENT_ROSTER: { id: string; label: string; role: BoardAgent['role'] }[] = 
   { id: 'Supervisor', label: 'Stark', role: 'Orchestrator' },
   { id: 'Dev', label: 'Developer Subagent', role: 'Subagent' },
   { id: 'General', label: 'General Subagent', role: 'Subagent' },
-  { id: 'Vision', label: 'Vision Agent', role: 'Subagent' },
 ];
 
 /** Map node ids to the agent names used in token call records */
@@ -26,7 +28,7 @@ function normalizeTokenAgent(nodeId: string): string[] {
     case 'devsecops': return ['devsecops', 'devops'];
     case 'analytics': return ['analytics', 'data'];
     case 'general': return ['general', 'freeagent', 'free agent'];
-    case 'vision': return ['vision', 'visual'];
+    case 'vision': return ['general', 'freeagent', 'free agent'];
     case 'designer': return ['designer', 'ui/ux'];
     default: return [lower];
   }
@@ -43,11 +45,11 @@ function getAgentTask(steps: ReturnType<typeof parseLogToSteps>['steps'], agentI
   return '';
 }
 
-export function useCanvasAgentState({ isRunning, liveLog, tokenUsage }: Input) {
+export function useCanvasAgentState({ isRunning, liveLog, tokenUsage, traceSteps }: Input) {
   const steps = useMemo(() => {
-    if (!liveLog) return [];
-    return parseLogToSteps(liveLog).steps;
-  }, [liveLog]);
+    if (liveLog) return parseLogToSteps(liveLog).steps;
+    return traceSteps ?? [];
+  }, [liveLog, traceSteps]);
 
   const activeAgent = useMemo(() => {
     if (!isRunning) return null;

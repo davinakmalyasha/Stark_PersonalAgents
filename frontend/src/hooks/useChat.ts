@@ -5,8 +5,8 @@
  * Legacy: `house/useHouseChat.ts` re-exports this.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, AgentTask, StreamDelta } from '../types';
-import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, fetchTasks, startTask, deleteTask, abortRun } from '../services/api';
+import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, StreamDelta } from '../types';
+import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, abortRun, rewindChat } from '../services/api';
 import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from '../house/houseChatService';
 import { getAssistantName } from '../house/assistant';
 import { parseLogToSteps } from '../utils/logParser';
@@ -25,16 +25,19 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
-  const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [liveState, setLiveState] = useState<AppState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [notification, setNotification] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   // Phase 8-V2 fix: voice runs execute in the overlay — track their live
   // activity here so the house chat streams the reply in real time.
   const [voiceActive, setVoiceActive] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // Synchronous guard: React state can still be stale for a second Enter
+  // press, which used to start two runs on the same chat.
+  const sendInFlightRef = useRef(false);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const liveStateRef = useRef<AppState | null>(null);
   const startedAtRef = useRef<number | null>(null);
@@ -76,11 +79,6 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     setChats(await fetchChats(ws.id).catch(() => []));
   }, []);
 
-  const refreshTasks = useCallback(async () => {
-    if (!generalWs || !activeChatId) { setTasks([]); return; }
-    setTasks(await fetchTasks(generalWs.id, activeChatId).catch(() => []));
-  }, [generalWs, activeChatId]);
-
   useEffect(() => {
     let cancelled = false;
     initHouseWorkspace(pinnedChatTitle, workspaceKind).then(({ ws, chats: c, initialMessages, initialChatId }) => {
@@ -103,11 +101,6 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     const el = threadRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, liveState, isRunning]);
-
-  useEffect(() => {
-    const id = window.setTimeout(() => { refreshTasks(); }, 0);
-    return () => window.clearTimeout(id);
-  }, [refreshTasks]);
 
   const syncVoiceChat = useCallback(() => {
     if (generalWs && activeChatId) {
@@ -243,6 +236,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   }, [generalWs, isRunning, activeChatId]);
 
   const handleCancel = useCallback(() => {
+    sendInFlightRef.current = false;
     abortRef.current?.abort();
     const ws = runWsRef.current;
     const chatId = runChatIdRef.current;
@@ -269,9 +263,30 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     resetStream();
   }, []);
 
+  const handleRewind = useCallback(async (message: ChatMessage) => {
+    if (!generalWs || !activeChatId || isRunning) return;
+    if (!window.confirm('Rewind to before this message? Files changed by it and every later message will be restored, and the text goes back to the prompt.')) return;
+    try {
+      const result = await rewindChat(generalWs.id, activeChatId, message.id);
+      const chat = await fetchChat(generalWs.id, activeChatId);
+      setMessages(chat.messages || []);
+      setTokenUsage(chat.token_usage ?? null);
+      setDraft(result.prompt || '');
+      if (result.restore?.conflicts?.length) {
+        setNotification(`Rewound, but ${result.restore.conflicts.length} file(s) could not be restored.`);
+      } else {
+        setNotification('Rewound. The message is back in the prompt.');
+      }
+      await refreshList(generalWs);
+    } catch (e) {
+      setNotification(e instanceof Error ? e.message : 'Rewind failed.');
+    }
+  }, [generalWs, activeChatId, isRunning, refreshList]);
+
   const handleSend = useCallback(async (prompt: string, files: File[]) => {
-    if (isRunning) return;
+    if (isRunning || sendInFlightRef.current) return;
     if (!prompt.trim() && !files.length) return;
+    sendInFlightRef.current = true;
     setNotification(null);
 
     let ws = generalWs;
@@ -282,9 +297,14 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         setGeneralWs(ws);
       } catch {
         setNotification('VIN could not reach the backend.');
+        sendInFlightRef.current = false;
         return;
       }
-      if (!ws) { setNotification('No general workspace available yet.'); return; }
+      if (!ws) {
+        setNotification('No general workspace available yet.');
+        sendInFlightRef.current = false;
+        return;
+      }
     }
 
     let chatId = activeChatId;
@@ -297,6 +317,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         await refreshList(ws);
       } catch {
         setNotification('Could not open the House conversation.');
+        sendInFlightRef.current = false;
         return;
       }
     } else if (!chatId) {
@@ -309,6 +330,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         await refreshList(ws);
       } catch {
         setNotification('Could not create a conversation.');
+        sendInFlightRef.current = false;
         return;
       }
     }
@@ -319,6 +341,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         attachments = await uploadChatAttachments(ws.id, chatId, files);
       } catch {
         setNotification('Your files could not be uploaded.');
+        sendInFlightRef.current = false;
         return;
       }
     }
@@ -351,11 +374,11 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           setMessages(updated);
           setChats(await fetchChats(ws.id));
           fetchChat(ws.id, chatId!).then((chat) => setTokenUsage(chat.token_usage ?? null)).catch(() => {});
-          await refreshTasks();
-        } catch { /* keep the live message visible if persistence fails */ }
+            } catch { /* keep the live message visible if persistence fails */ }
         resetStream();
         setIsRunning(false);
         setLiveState(null);
+        sendInFlightRef.current = false;
         onActive?.({ wsId: ws.id, chatId: chatId! });
       },
       (err) => {
@@ -363,35 +386,12 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         resetStream();
         setIsRunning(false);
         setLiveState(null);
+        sendInFlightRef.current = false;
       },
       workspaceKind,
       applyDelta,
     );
-  }, [isRunning, generalWs, activeChatId, pinnedChatTitle, refreshList, refreshTasks, onActive, applyDelta, resetStream]);
-
-  const handleTaskCreated = useCallback((task: AgentTask) => {
-    setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
-  }, []);
-
-  const handleTaskDelete = useCallback(async (taskId: string) => {
-    if (!generalWs || !activeChatId) return;
-    try {
-      await deleteTask(generalWs.id, activeChatId, taskId);
-      await refreshTasks();
-    } catch { setNotification('Could not delete task.'); }
-  }, [generalWs, activeChatId, refreshTasks]);
-
-  const handleTaskStart = useCallback(async (taskId: string) => {
-    if (!generalWs || !activeChatId || isRunning) return;
-    try {
-      await startTask(generalWs.id, activeChatId, taskId);
-      await refreshTasks();
-    } catch { setNotification('Could not start task.'); }
-  }, [generalWs, activeChatId, isRunning, refreshTasks]);
-
-  const handleTaskRunNow = useCallback(async (prompt: string, files: File[]) => {
-    await handleSend(prompt, files);
-  }, [handleSend]);
+  }, [isRunning, generalWs, activeChatId, pinnedChatTitle, refreshList, onActive, applyDelta, resetStream]);
 
   const liveLog = liveState?.live_terminal_log || '';
   const liveParsed = useMemo(() => parseLogToSteps(liveLog), [liveLog]);
@@ -446,7 +446,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
 
   return {
     workspaceId: generalWs?.id ?? null,
-    chats, activeChatId, displayMessages, isRunning, isLoading, notification, threadRef,
+    chats, activeChatId, displayMessages, liveState, isRunning, isLoading, notification, threadRef,
     isVoiceMode, toggleVoice,
     totalCost: combinedTokenUsage.total_cost,
     totalInput: combinedTokenUsage.total_input_tokens,
@@ -454,10 +454,9 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     totalCacheHitTokens: combinedTokenUsage.total_cache_hit_tokens || 0,
     activeContextTokens,
     combinedTokenUsage, lastModelName,
-    tasks,
     handleNewChat, handleSelectChat, handleRenameChat, handleDeleteChat,
-    handleSend, handleCancel,
-    handleTaskCreated, handleTaskDelete, handleTaskStart, handleTaskRunNow,
+    handleSend, handleCancel, handleRewind,
+    draft, clearDraft: () => setDraft(''),
   };
 }
 

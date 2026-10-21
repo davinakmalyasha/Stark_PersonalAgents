@@ -213,9 +213,9 @@ def _write_job_artifact(snapshot: dict) -> str:
                 f"cost={usage.get('total_cost', 0)}"
             )
         if snapshot.get("outcome"):
-            lines += ["", "## Outcome (from Sir's brief)", str(snapshot["outcome"])]
+            lines += ["", "## Outcome (from the user's brief)", str(snapshot["outcome"])]
         if snapshot.get("acceptance"):
-            lines += ["", "## Acceptance (from Sir's brief)", str(snapshot["acceptance"])]
+            lines += ["", "## Acceptance (from the user's brief)", str(snapshot["acceptance"])]
         lines += ["", "## Task", str(snapshot.get("task") or "(none)")]
         result = str(snapshot.get("result") or "")
         error = str(snapshot.get("error") or "")
@@ -895,7 +895,13 @@ def start_delegations(items: list, parent_chat_id: str, fallback_ws: str,
                         parent_ws_id = wm.find_chat_workspace_id(parent_chat_id or "")
                     except Exception:
                         parent_ws_id = ""
-                    chat = wm.create_chat(workspace, title=f"{title} · {display}", parent_chat_id=parent_chat_id or "", parent_workspace_id=parent_ws_id or "")
+                    # Avoid stacked agent suffixes like
+                    # "1+3 · General · General" when the task title already
+                    # names the specialist.
+                    chat_title = title
+                    if display and not chat_title.rstrip().lower().endswith(display.lower()):
+                        chat_title = f"{chat_title} · {display}"
+                    chat = wm.create_chat(workspace, title=chat_title, parent_chat_id=parent_chat_id or "", parent_workspace_id=parent_ws_id or "")
                     chat_id = chat.get("id", "")
             except Exception as e:
                 summaries.append({"ok": False, "error": f"chat setup failed: {e}"})

@@ -27,6 +27,9 @@ interface Props {
   selectedModel?: string;
   models?: ModelOption[];
   onModelChange?: (model: string) => void;
+  /** Restored text from a rewind; non-empty values populate the input once. */
+  draft?: string;
+  onDraftConsumed?: () => void;
 }
 
 const MAX_FILES = 8;
@@ -34,7 +37,7 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 const isImage = (file: File) => file.type.startsWith('image/');
 
-export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange }: Props) {
+export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, onDraftConsumed }: Props) {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [dragActive, setDragActive] = useState(false);
@@ -91,6 +94,11 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   }, [value]);
 
   useEffect(() => { if (isVoiceMode && voiceInputText !== undefined) setValue(voiceInputText); }, [voiceInputText, isVoiceMode]);
+  useEffect(() => {
+    if (!draft) return;
+    setValue(draft);
+    onDraftConsumed?.();
+  }, [draft, onDraftConsumed]);
   const addFiles = (incoming: FileList | File[]) => {
     const selected = Array.from(incoming);
     const valid = selected.filter((file) => file.size <= MAX_FILE_SIZE);

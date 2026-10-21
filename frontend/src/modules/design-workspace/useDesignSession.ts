@@ -31,15 +31,23 @@ function parseDesignHash(): { wsId: string; chatId: string } {
   }
 }
 
+export interface DesignSessionOptions {
+  /** When set, bind directly to this workspace (addon mode). */
+  workspaceId?: string;
+  chatId?: string;
+  /** Addon mode: do not rewrite the URL hash while binding. */
+  embedded?: boolean;
+}
+
 /**
- * Session state for the OpenDesign module room.
+ * Session state for the OpenDesign addon.
  *
- * Binds to a REAL project workspace (picked or deep-linked via
- * `#/design?ws=<id>&chat=<id>`), runs prompts with workspaceKind='design'
- * (straight to the UI design loop — never orchestrator/Dev), and tracks
- * the workspace's design files for preview.
+ * Binds to a REAL project workspace (picked, deep-linked, or passed by the
+ * workspace addon host), runs prompts with workspaceKind='design' (straight to
+ * the UI design loop — never orchestrator/Dev), and tracks the workspace's
+ * design files for preview.
  */
-export function useDesignSession() {
+export function useDesignSession(opts: DesignSessionOptions = {}) {
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [chatId, setChatId] = useState<string | null>(null);
@@ -81,8 +89,17 @@ export function useDesignSession() {
         const wsList = await fetchWorkspaces();
         if (cancelled) return;
         setWorkspaces(wsList);
-        const { wsId, chatId: deepChatId } = parseDesignHash();
-        const ws = wsList.find((w) => w.id === wsId) || null;
+        const linked = opts.workspaceId
+          ? { wsId: opts.workspaceId, chatId: opts.chatId || '' }
+          : parseDesignHash();
+        const { wsId, chatId: deepChatId } = linked;
+        const found = wsList.find((w) => w.id === wsId) || null;
+        // Design is an addon for real project folders. General/House/Personal/
+        // DFD are virtual workspaces with no filesystem root; showing the
+        // picker is more useful than binding to a 404.
+        const ws = found && found.path && !found.isGeneral && !found.isHouse && !found.isPersonal
+          ? found
+          : null;
         if (ws && deepChatId) {
           setWorkspace(ws);
           setChatId(deepChatId);
@@ -113,7 +130,7 @@ export function useDesignSession() {
     return () => {
       cancelled = true;
     };
-  }, [loadChat, refreshFiles]);
+  }, [loadChat, refreshFiles, opts.workspaceId, opts.chatId]);
 
   const bindWorkspace = useCallback(async (ws: WorkspaceInfo) => {
     setWorkspace(ws);
@@ -130,10 +147,12 @@ export function useDesignSession() {
       await loadChat(ws.id, target);
     }
     await refreshFiles(ws.id);
-    try {
-      window.history.replaceState(null, '', `#/design?ws=${encodeURIComponent(ws.id)}&chat=${encodeURIComponent(target)}`);
-    } catch { /* hash only */ }
-  }, [loadChat, refreshFiles]);
+    if (!opts.embedded) {
+      try {
+        window.history.replaceState(null, '', `#/design?ws=${encodeURIComponent(ws.id)}&chat=${encodeURIComponent(target)}`);
+      } catch { /* hash only */ }
+    }
+  }, [loadChat, refreshFiles, opts.embedded]);
 
   const send = useCallback(async (prompt: string, files: File[]) => {
     if (!workspace || !chatId || runningRef.current) return;

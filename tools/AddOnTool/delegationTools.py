@@ -128,7 +128,7 @@ def _resolve_job(job_id: str):
 
 
 def job_message(job_id: str, message: str) -> str:
-    """Steer a RUNNING delegation mid-flight (Sir added scope / changed direction).
+    """Steer a RUNNING delegation mid-flight (the user added scope / changed direction).
 
     Fresh jobs: the message is mirrored into the job's chat and queued on its
     steering channel (the child picks it up at its next step boundary).
@@ -160,7 +160,7 @@ def job_message(job_id: str, message: str) -> str:
         return f"[OK] Message queued for {e['id']} ({e.get('project', '')} durable Dev; FIFO)."
     try:
         import workspace_manager as wm
-        wm.add_message(e["workspace"], e["chat_id"], "user", f"[STEERED by Sir via orchestrator]\n{msg}", {
+        wm.add_message(e["workspace"], e["chat_id"], "user", f"[STEERED by the user via orchestrator]\n{msg}", {
             "delegated": True, "del_id": e["id"], "steered": True,
         })
     except Exception as ex:
@@ -174,7 +174,7 @@ def job_message(job_id: str, message: str) -> str:
 
 
 def job_cancel(job_id: str, reason: str = "") -> str:
-    """Cancel ONE running delegation (Sir said stop).
+    """Cancel ONE running delegation (the user said stop).
 
     Fresh jobs: cooperative abort of the job's chat (queued steering kept).
     Resume jobs: interrupt of the durable Dev child. Settles the entry as
@@ -187,7 +187,7 @@ def job_cancel(job_id: str, reason: str = "") -> str:
         return err
     if e.get("status") not in ("queued", "running"):
         return f"[OK] Job {e['id']} is already {e.get('status', 'unknown')} — nothing to cancel."
-    why = str(reason or "").strip() or "cancelled by Sir via orchestrator"
+    why = str(reason or "").strip() or "cancelled by the user via orchestrator"
     if e.get("status") == "running" and e.get("mode") == "resume":
         try:
             from agents.subagent_manager import interrupt as _interrupt

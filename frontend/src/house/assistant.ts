@@ -1,7 +1,6 @@
 // ── Assistant identity ──
-// Frontend-only display name. The JARVIS-style persona (including the "Sir"
-// address) lives in one place: the Orchestrator system prompt
-// (agents/orchestrator_agent.py).
+// Frontend-only display name. The assistant prompt lives in one place:
+// agents/orchestrator_agent.py.
 
 const NAME_KEY = 'stark.assistantName';
 

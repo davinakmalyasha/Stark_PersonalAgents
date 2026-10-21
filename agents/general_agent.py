@@ -130,9 +130,11 @@ def _build_zone2(task: str, chat_id: str) -> str:
     if chat_id:
         try:
             from server.context.chat_history import build_chat_context
+            from sync.state_sync import safe_get_state
 
             history = build_chat_context(
-                "_general", chat_id, max_messages=30, max_chars_per_msg=3000, exclude_traces=True
+                "_general", chat_id, max_messages=30, max_chars_per_msg=3000,
+                exclude_message_id=str(safe_get_state().get("user_message_id") or ""),
             )
             if history:
                 parts.append(f"## Recent Chat History\n{history}")
@@ -351,13 +353,17 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
 
                     before = est
                     history, _engine_info = compact_history_with_summary(
-                        history, project_path="", policy=compaction_policy
+                        history,
+                        project_path="",
+                        policy=compaction_policy,
+                        role=_AGENT_NAME,
+                        deps=run_deps,
                     )
                     after = estimate_history_tokens(history)
                     _log(
                         f"[{_AGENT_NAME.upper()}] Native checkpoint "
                         f"({before:,} -> {after:,} est. tokens; "
-                        f"chunks={_engine_info.get('chunks', 0)})"
+                        f"one_pass=True)"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")

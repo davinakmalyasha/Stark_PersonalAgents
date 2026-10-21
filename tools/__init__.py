@@ -111,6 +111,9 @@ from .AddOnTool import (
     interrupt_agent,
     report,
     create_project,
+    schedule,
+    give_note,
+    canvas_mode,
     _SUBAGENTS_REGISTRY,
     _TASK_DEPTH,
     _MAX_TASK_DEPTH,
@@ -131,6 +134,9 @@ from .AddOnTool.groupTools import (
     group_update,
     plan_execution,
 )
+
+create_coding_project = create_project
+create_group = create_group_project
 
 # DFD bridge tool (facade name == import name; registry resolves via TOOL_MAP)
 dfd_bridge = _dfd_bridge_impl

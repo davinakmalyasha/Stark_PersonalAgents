@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2 } from 'lucide-react';
 import iconUrl from '../../electron/icon.png';
 import HouseHeader from './HouseHeader';
@@ -8,21 +8,24 @@ import HousePortal from './HousePortal';
 import CodingIDE from './CodingIDE';
 import NewProjectDialog from './NewProjectDialog';
 import SubagentSessionView from './SubagentSessionView';
-import AddTaskModal from '../components/Canvas/AddTaskModal';
 import GroupProjectModal from './GroupProjectModal';
 import { useGroupProjects } from './useGroupProjects';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import { useHouseChat } from './useHouseChat';
 import { useSessions, tabId } from './useSessions';
 import { useSessionRunner } from './useSessionRunner';
+import { useCanvasAgentState } from '../hooks/useCanvasAgentState';
+import type { TraceStep } from '../utils/logParser';
+import { kindForWorkspace, sendCanvasChat } from '../canvas/canvasSend';
 import { addWorkspace, createChat, updateChatTitle, deleteChat } from '../services/api';
 import '../house/house.css';
+
+const CanvasStage = lazy(() => import('../canvas/CanvasStage'));
 
 export default function House() {
   const [transitioning, setTransitioning] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isStatsOpen, setIsStatsOpen] = useState(false);
-  const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
@@ -39,7 +42,6 @@ export default function House() {
     isLoading: chatLoading,
     handleSelectChat,
     handleSend: handleGeneralChatSend,
-    handleNewChat: handleGeneralNewChat,
   } = chat;
 
   const activeTab = sessions.activeTab;
@@ -89,6 +91,19 @@ export default function House() {
     refreshSessions();
   }, [refreshSessions]);
   const runner = useSessionRunner(isCodingTab && activeTab ? activeTab : null, handleRunFinished);
+  const lastTraceSteps = useMemo<TraceStep[]>(() => {
+    for (let i = chat.displayMessages.length - 1; i >= 0; i--) {
+      const steps = chat.displayMessages[i]?.metadata?.steps;
+      if (Array.isArray(steps) && steps.length > 0) return steps as TraceStep[];
+    }
+    return [];
+  }, [chat.displayMessages]);
+  const generalCanvasAgents = useCanvasAgentState({
+    isRunning: chat.isRunning,
+    liveLog: chat.liveState?.live_terminal_log,
+    tokenUsage: chat.liveState?.token_usage,
+    traceSteps: lastTraceSteps,
+  }).agents;
 
   // Room-workspace sidebars navigate home via #/?ws=<id>&chat=<id> — once the
   // session layer has booted, open that chat and clean the hash.
@@ -135,11 +150,6 @@ export default function House() {
       handleSelectChat(activeTabChatId, { silent: true });
     }
   }, [activeTabId, activeTabType, activeTabChatId, generalActiveChatId, chatRunning, chatLoading, handleSelectChat]);
-
-  const openTasks = useCallback(async () => {
-    if (!generalActiveChatId) await handleGeneralNewChat();
-    setTaskModalOpen(true);
-  }, [generalActiveChatId, handleGeneralNewChat]);
 
   // ── Session creation ──
   const handleNewSession = useCallback(() => {
@@ -250,8 +260,48 @@ export default function House() {
     [chat.chats, chat.activeChatId],
   );
 
+  const mainWorkspace = sessions.workspaces.find((w) => w.isGeneral) || sessions.workspaces[0] || null;
   const generalChatView = (
-    <div className="flex-1 min-h-0 flex flex-col">
+    <div className="relative flex-1 min-h-0">
+      <div className="absolute inset-0 overflow-y-auto house-thread px-3 pt-3 sm:px-5">
+        <Suspense fallback={null}>
+          <CanvasStage
+            key="main"
+            scope="main"
+            workspaces={sessions.workspaces}
+            chatsByWs={sessions.chatsByWs}
+            activeWorkspaceId={mainWorkspace?.id ?? null}
+            activeChatId={chat.activeChatId}
+            agents={generalCanvasAgents}
+            isRunning={chat.isRunning}
+            projects={projects}
+            onOpenChat={(wsId, chatId) => {
+              const ws = sessions.workspaces.find((w) => w.id === wsId);
+              if (ws && !ws.isGeneral && !ws.isHouse && !ws.isPersonal && !(ws as { isDfd?: boolean }).isDfd) {
+                window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(chatId)}`;
+              } else {
+                sessions.openChat(wsId, chatId);
+              }
+            }}
+            onOpenGroup={setOpenProjectId}
+            onOpenAddon={(wsId, addonId, chatId) => {
+              const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
+              window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
+            }}
+            onSendToChat={async (wsId, chatId, text) => {
+              const ws = sessions.workspaces.find((w) => w.id === wsId);
+              if (!ws) throw new Error('Workspace not found.');
+              if (wsId === mainWorkspace?.id && chatId === chat.activeChatId) {
+                handleGeneralSend(text, []);
+                return;
+              }
+              await sendCanvasChat(ws, chatId, text, kindForWorkspace(ws));
+              await sessions.forceRefresh();
+            }}
+          />
+        </Suspense>
+      </div>
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[60]">
       <HouseChat
         title={activeGeneralTitle}
         messages={chat.displayMessages}
@@ -272,7 +322,11 @@ export default function House() {
         onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
         workspaceId={chat.workspaceId}
         chatId={activeTabChatId}
+        onRewind={chat.handleRewind}
+        draft={chat.draft}
+        onDraftConsumed={chat.clearDraft}
       />
+      </div>
     </div>
   );
 
@@ -303,10 +357,6 @@ export default function House() {
         onCloseTab={sessions.closeTab}
         onNewSession={handleNewSession}
         onOpenSidebar={() => setSidebarOpen(true)}
-        tasks={chat.tasks}
-        onOpenTasks={openTasks}
-        onTaskStart={chat.handleTaskStart}
-        onTaskDelete={chat.handleTaskDelete}
         projects={projects}
         projectsScoped={projectsScoped}
         onOpenProject={setOpenProjectId}
@@ -365,8 +415,7 @@ export default function House() {
         activeTabId={sessions.activeTabId}
         runningTabId={sessions.runningTabId}
         pinnedChats={sessions.pinnedChats}
-        chatsFilter={sessions.chatsFilter}
-        onFilterChange={sessions.setChatsFilter}
+        chatsFilter="general"
         onTogglePin={sessions.togglePin}
         onOpenSession={handleOpenSession}
         onNewChat={handleNewSession}
@@ -394,17 +443,6 @@ export default function House() {
         tokenUsage={chat.combinedTokenUsage}
         lastModelName={chat.lastModelName}
       />
-
-      {taskModalOpen && (
-        <AddTaskModal
-          workspaceId={chat.workspaceId}
-          chatId={chat.activeChatId}
-          isRunning={chat.isRunning}
-          onClose={() => setTaskModalOpen(false)}
-          onCreated={chat.handleTaskCreated}
-          onStartNow={chat.handleTaskRunNow}
-        />
-      )}
 
       {openProjectId && (
         <GroupProjectModal

@@ -16,7 +16,7 @@ deepseek  Direct DeepSeek API billing.
               specialists:  free pool
 opencode  Identical matrix, billed through the OpenCode Go gateway.
 command   Command Code Provider API (OpenAI-compatible).
-               orchestrator: xiaomi/mimo-v2.6-flash, thinking low
+               orchestrator: deepseek/deepseek-v4.1-flash, thinking high
               workspace:    deepseek/deepseek-v4.1-flash, thinking high
               specialists:  poolside/laguna-s-2.1-free (free slot)
 
@@ -54,7 +54,7 @@ MODES = ("free", "deepseek", "opencode", "command")
 _CANONICAL_VISION = "deepseek-v4.1-flash"
 _CANONICAL_FLASH = "deepseek-v4.1-flash"
 
-_COMMAND_ORCH_MODEL_DEFAULT = "xiaomi/mimo-v2.6-flash"
+_COMMAND_ORCH_MODEL_DEFAULT = "deepseek/deepseek-v4.1-flash"
 _COMMAND_LIGHT_MODEL_DEFAULT = "poolside/laguna-s-2.1-free"
 
 MODE_MATRIX: dict[str, dict[str, dict]] = {
@@ -105,7 +105,7 @@ AGENT_MODELS: dict[str, dict[str, str | None]] = {
     "general": {"free": None, "deepseek": "deepseek-v4.1-flash", "opencode": "deepseek-v4.1-flash", "command": "deepseek-v4.1-flash"},
     "house": {"free": None, "deepseek": "deepseek-v4.1-flash", "opencode": "deepseek-v4.1-flash", "command": "deepseek-v4.1-flash"},
     "dfd": {"free": None, "deepseek": None, "opencode": None, "command": None},
-    "orchestrator": {"free": None, "deepseek": None, "opencode": None, "command": None},
+    "orchestrator": {"free": None, "deepseek": None, "opencode": None, "command": "deepseek/deepseek-v4.1-flash"},
 }
 
 

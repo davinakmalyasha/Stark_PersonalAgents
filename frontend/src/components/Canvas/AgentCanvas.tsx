@@ -1,11 +1,15 @@
-import { useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { useCanvasAgentState } from '../../hooks/useCanvasAgentState';
-import CanvasWorkspace from './CanvasWorkspace';
+import { useGroupProjects } from '../../house/useGroupProjects';
+import GroupProjectModal from '../../house/GroupProjectModal';
+import type { CanvasAddonId } from '../../canvas/canvasTypes';
+import { kindForWorkspace, sendCanvasChat } from '../../canvas/canvasSend';
 import SubagentSessionView from '../../house/SubagentSessionView';
 import ChatView from '../Workspace/ChatView';
-import type { AppState, ChatMessage, ModelOption } from '../../types';
-import type { AgentTask } from '../../types';
-import { deleteTask, fetchTasks, startTask, updateTaskStatus } from '../../services/api';
+import type { AppState, ChatMessage, ChatSummary, ModelOption, WorkspaceInfo } from '../../types';
+import { fetchChats } from '../../services/api';
+
+const CanvasStage = lazy(() => import('../../canvas/CanvasStage'));
 
 interface Props {
   messages: ChatMessage[];
@@ -19,7 +23,6 @@ interface Props {
   notification: string | null;
   chatMode?: 'plan' | 'build';
   onSend: (message: string, files?: File[]) => void;
-  onRunTask: (task: AgentTask) => boolean;
   onCancel: () => void;
   onModelChange: (model: string) => void;
   onClearNotification: () => void;
@@ -31,6 +34,11 @@ interface Props {
   onOpenStats: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
+  onOpenChat?: (workspaceId: string, chatId: string) => void;
+  onOpenAddon?: (addonId: CanvasAddonId) => void;
+  onRewind?: (message: ChatMessage) => void;
+  draft?: string;
+  onDraftConsumed?: () => void;
   totalCost: number;
   totalInput: number;
   totalOutput: number;
@@ -45,91 +53,93 @@ export default function AgentCanvas(props: Props) {
     tokenUsage: props.state?.token_usage,
   });
 
-  const [tasks, setTasks] = useState<AgentTask[]>([]);
-  const [taskModalOpen, setTaskModalOpen] = useState(false);
-  const [editingTask, setEditingTask] = useState<AgentTask | null>(null);
-  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
+  const [openGroupId, setOpenGroupId] = useState<string | null>(null);
+  const [workspaceChats, setWorkspaceChats] = useState<ChatSummary[]>([]);
+  const { projects } = useGroupProjects(props.workspaceId || '');
 
-  // Track when the current run started so running cards show a live elapsed clock.
-  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
-  const prevRunningRef = useRef(false);
   useEffect(() => {
-    if (props.isRunning && !prevRunningRef.current) setRunStartedAt(Date.now());
-    prevRunningRef.current = props.isRunning;
-  }, [props.isRunning]);
-
-  const chatKey = props.workspaceId && props.chatId ? `${props.workspaceId}:${props.chatId}` : '';
-  const [loadedChatKey, setLoadedChatKey] = useState('');
-  useEffect(() => {
-    if (!chatKey) return;
+    if (!props.workspaceId) { setWorkspaceChats([]); return; }
     let cancelled = false;
-    const refresh = () => fetchTasks(props.workspaceId!, props.chatId!)
-      .then((next) => { if (!cancelled) { setTasks(next); setLoadedChatKey(chatKey); } })
+    const load = () => fetchChats(props.workspaceId!)
+      .then((list) => { if (!cancelled) setWorkspaceChats(list); })
       .catch(() => {});
-    refresh();
-    const timer = window.setInterval(refresh, 5000);
+    load();
+    const timer = window.setInterval(load, 15000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [chatKey]);
+  }, [props.workspaceId, props.chatId]);
 
-  const visibleTasks = chatKey && loadedChatKey === chatKey ? tasks : [];
+  const workspace: WorkspaceInfo | null = props.workspaceId ? {
+    id: props.workspaceId,
+    name: props.workspaceName || 'Workspace',
+    path: props.state?.project_path || '',
+    exists: true,
+    chatCount: workspaceChats.length,
+    addedAt: '',
+    isGeneral: false,
+    workspaceKind: 'project',
+  } : null;
 
-  const refreshTasks = () => {
-    if (props.workspaceId && props.chatId) fetchTasks(props.workspaceId, props.chatId).then(setTasks).catch(() => {});
-  };
-
-  const handleStartTask = (task: AgentTask) => {
-    if (!props.workspaceId || !props.chatId) return;
-    startTask(props.workspaceId, props.chatId, task.id).then(async (started) => {
-      setTasks((current) => current.map((item) => item.id === task.id ? started : item));
-      const accepted = props.onRunTask(started);
-      if (!accepted) {
-        const reverted = await updateTaskStatus(props.workspaceId!, props.chatId!, task.id, 'ready').catch(() => task);
-        setTasks((current) => current.map((item) => item.id === task.id ? reverted : item));
-      }
-    }).catch(() => {});
-  };
-
-  const handleDeleteTask = (task: AgentTask) => {
-    if (props.workspaceId && props.chatId) deleteTask(props.workspaceId, props.chatId, task.id).then(refreshTasks).catch(() => {});
-  };
-
-  const handleStatusChange = (task: AgentTask, status: AgentTask['status']) => {
-    if (!props.workspaceId || !props.chatId) return;
-    const prev = task.status;
-    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status } : item));
-    updateTaskStatus(props.workspaceId, props.chatId, task.id, status)
-      .then((updated) => setTasks((current) => current.map((item) => item.id === updated.id ? updated : item)))
-      .catch(() => setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: prev } : item)));
-  };
+  const boardChats = (() => {
+    if (!props.workspaceId) return {};
+    const list = [...workspaceChats];
+    if (props.chatId && !list.some((c) => c.id === props.chatId)) {
+      const last = [...props.messages].reverse().find((m) => m.content?.trim());
+      list.unshift({
+        id: props.chatId,
+        title: props.chatTitle || 'Current chat',
+        messageCount: props.messages.length,
+        model: props.selectedModel,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        lastMessage: last?.content?.slice(0, 180),
+        lastRole: last?.role,
+      });
+    }
+    return { [props.workspaceId]: list };
+  })();
 
   return (
     <div className="relative flex flex-1 min-w-0 h-full overflow-hidden border-l border-zinc-800/80 bg-[#0a0a0c]">
-      <CanvasWorkspace
-        tasks={visibleTasks}
-        agents={agents}
-        isRunning={props.isRunning}
-        runStartedAt={runStartedAt}
-        selectedAgent={selectedAgent}
-        onSelectAgent={setSelectedAgent}
-        onStartTask={handleStartTask}
-        onEditTask={(task) => { setEditingTask(task); setTaskModalOpen(true); }}
-        onDeleteTask={handleDeleteTask}
-        onStatusChange={handleStatusChange}
-        onOpenTaskModal={() => { setEditingTask(null); setTaskModalOpen(true); }}
-        taskModalOpen={taskModalOpen}
-        editingTask={editingTask}
-        onCloseTaskModal={() => { setEditingTask(null); setTaskModalOpen(false); }}
-        onTaskCreated={(task) => setTasks((current) => [task, ...current])}
-        onTaskUpdated={(updated) => { setTasks((current) => current.map((item) => item.id === updated.id ? updated : item)); setEditingTask(null); }}
-        onStartNow={(prompt, files) => props.onSend(prompt, files)}
-        workspaceId={props.workspaceId}
-        chatId={props.chatId}
-      />
+      <div className="absolute inset-0 overflow-y-auto house-thread px-3 pt-3">
+        <Suspense fallback={null}>
+          <CanvasStage
+            key={props.workspaceId || 'main'}
+            scope={props.workspaceId ? `ws:${props.workspaceId}` : 'main'}
+            workspaces={workspace ? [workspace] : []}
+            chatsByWs={boardChats}
+            activeWorkspaceId={props.workspaceId}
+            activeChatId={props.chatId}
+            agents={agents}
+            isRunning={props.isRunning}
+            projects={projects}
+            onOpenChat={(wsId, chatId) => props.onOpenChat?.(wsId, chatId)}
+            onOpenGroup={setOpenGroupId}
+            onOpenAddon={(_wsId, addonId) => props.onOpenAddon?.(addonId)}
+            onSendToChat={async (_wsId, chatId, text) => {
+              if (!workspace) throw new Error('Workspace not found.');
+              if (chatId === props.chatId) {
+                props.onSend(text);
+                return;
+              }
+              await sendCanvasChat(workspace, chatId, text, kindForWorkspace(workspace));
+              fetchChats(props.workspaceId!).then(setWorkspaceChats).catch(() => {});
+            }}
+          />
+        </Suspense>
+      </div>
 
-      <ChatView {...props} traceSteps={steps} onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })} />
+      <div className="pointer-events-none absolute inset-x-0 bottom-2 z-[60]">
+        <div className="pointer-events-auto">
+          <ChatView
+            {...props}
+            variant="docked"
+            traceSteps={steps}
+            onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
+          />
+        </div>
+      </div>
 
-      {/* Subagent session drawer — child-keyed, read-only transcript */}
       {subagentView && (
         <div className="absolute top-0 right-0 h-full w-[440px] bg-[#0c0c0f] border-l border-zinc-800 shadow-2xl flex flex-col z-50">
           <div className="flex-1 min-h-0 px-3 pt-1 pb-3">
@@ -143,6 +153,14 @@ export default function AgentCanvas(props: Props) {
             />
           </div>
         </div>
+      )}
+
+      {openGroupId && (
+        <GroupProjectModal
+          key={openGroupId}
+          projectId={openGroupId}
+          onClose={() => setOpenGroupId(null)}
+        />
       )}
     </div>
   );

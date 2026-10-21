@@ -138,8 +138,7 @@ def render_history_blocks(history: list[ModelMessage]) -> list[str]:
 
     Used by compaction: the summarizer must see everything, including tool
     arguments/results and reasoning that ``history_to_debug_text`` truncates.
-    Blocks are the chunking unit, so a message is never split unless it alone
-    exceeds the compactor window.
+    A message is never split.
     """
     blocks: list[str] = []
     for message in history:

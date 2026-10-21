@@ -318,17 +318,18 @@ def _as_user_content(content: Any):
 
 
 def _split_user_prompt(history: list[ModelMessage]) -> tuple[Any, list[ModelMessage]]:
-    """Extract the first user part as the pydantic-ai ``user_prompt``.
+    """Extract the LAST user part as the pydantic-ai ``user_prompt``.
 
     pydantic-ai appends ``user_prompt`` as a user message when it is not None,
-    and an empty string still hits gateways that reject empty content. We pull
-    the first ``UserPromptPart`` out of the converted history so the prompt is
-    non-empty and the history keeps its full context. Returns ``(prompt, history)``
-    with the first user message removed from history.
+    and an empty string still hits gateways that reject empty content. Callers
+    now seed multi-turn history, so the newest request is the last
+    ``UserPromptPart`` — taking the first one would re-run an older turn.
+    Returns ``(prompt, history)`` with the selected user message removed.
     """
     if not history:
         return "", history
-    for i, m in enumerate(history):
+    for i in range(len(history) - 1, -1, -1):
+        m = history[i]
         if isinstance(m, ModelRequest):
             for p in m.parts:
                 if isinstance(p, UserPromptPart):

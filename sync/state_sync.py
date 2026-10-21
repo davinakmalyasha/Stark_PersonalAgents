@@ -65,10 +65,15 @@ def safe_get_state() -> dict:
             copied["thoughts"] = dict(current["thoughts"])
         return copied
 
-def safe_update_state(updates: dict):
-    """Safely update the current run's state under the shared lock."""
+def safe_update_state(updates: dict, state: dict | None = None):
+    """Safely update one run's state under the shared lock.
+
+    ``state`` lets a caller target an explicit run state (used by the API run
+    pipeline, whose async stream loop runs outside the worker thread that owns
+    the ContextVar). Omit it to keep the legacy ContextVar/shared behavior.
+    """
     with state_lock:
-        target = _target_state()
+        target = state if state is not None else _target_state()
         for k, v in updates.items():
             if k == "outputs" and isinstance(v, dict):
                 target.setdefault("outputs", {}).update(v)
@@ -86,10 +91,10 @@ def safe_update_state(updates: dict):
                 target[k] = v
         target["state_version"] = int(target.get("state_version", 0)) + 1
 
-def safe_serialize_state() -> str:
-    """Safely serialize the current run's state under the lock."""
+def safe_serialize_state(state: dict | None = None) -> str:
+    """Safely serialize one run's state under the lock."""
     with state_lock:
-        return json.dumps(_target_state())
+        return json.dumps(state if state is not None else _target_state())
 
 
 # Cap for live_terminal_log — keeps the SSE snapshots and frontend re-parses bounded

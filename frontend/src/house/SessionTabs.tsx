@@ -1,7 +1,7 @@
 import { Bot, Code2, MessageSquare, Plus, X } from 'lucide-react';
 import type { SessionTab } from '../types';
 
-interface TaskTabsProps {
+interface SessionTabsProps {
   tabs: SessionTab[];
   activeTabId: string | null;
   runningTabId: string | null;
@@ -18,10 +18,10 @@ interface TaskTabsProps {
  * shows its type icon, title, a pulsing dot while its pipeline runs,
  * and a close button (closes the tab, never deletes the chat).
  */
-export default function TaskTabs({
+export default function SessionTabs({
   tabs, activeTabId, runningTabId,
   onActivateTab, onCloseTab, onNewSession,
-}: TaskTabsProps) {
+}: SessionTabsProps) {
   return (
     <div className="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto no-scrollbar" data-testid="session-tabs">
       {tabs.map((tab) => {

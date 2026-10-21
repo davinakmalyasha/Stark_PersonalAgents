@@ -66,6 +66,41 @@ export async function addChatMessage(
   return res.json();
 }
 
+export interface RewindResult {
+  ok: boolean;
+  prompt: string;
+  removed: { id: string; role: string }[];
+  restore: {
+    ok: boolean;
+    restored: string[];
+    removed: string[];
+    conflicts: string[];
+  };
+}
+
+export async function rewindChat(
+  workspaceId: string,
+  chatId: string,
+  messageId: string,
+  opts: { restoreFiles?: boolean; force?: boolean } = {},
+): Promise<RewindResult> {
+  const res = await fetch(
+    `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/rewind`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message_id: messageId,
+        restore_files: opts.restoreFiles !== false,
+        force: !!opts.force,
+      }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || `Rewind failed (HTTP ${res.status})`);
+  return data as RewindResult;
+}
+
 export async function uploadChatAttachments(workspaceId: string, chatId: string, files: File[]): Promise<ChatAttachment[]> {
   const body = new FormData();
   files.forEach((file) => body.append('files', file, file.name));

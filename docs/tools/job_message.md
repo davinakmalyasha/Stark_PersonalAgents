@@ -1,6 +1,6 @@
 # job_message
 
-- **Description:** Steer a RUNNING delegation mid-flight when Sir adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.
+- **Description:** Steer a RUNNING delegation mid-flight when the user adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** False

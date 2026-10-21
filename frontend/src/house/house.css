@@ -159,8 +159,9 @@
 /* ── Main workspace chat card (translucent — shares the premium-surface
    token with the coding overlay; Phase 8-D removed the opaque fill) ── */
 .house-chat-card {
-  background: rgba(16, 16, 19, 0.55);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+  background: rgba(13, 13, 16, 0.94);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
 }
 
 /* Child sessions are a drill-in surface, not another transcript in the

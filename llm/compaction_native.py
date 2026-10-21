@@ -1,11 +1,10 @@
-"""compaction_native.py — ProcessHistory processor for native ModelMessage history (A7).
+"""compaction_native.py — ProcessHistory processor for native ModelMessage history.
 
-The processor is invoked before each model request; when the token estimate
-crosses the checkpoint trigger it delegates to the shared Codex-parity engine
-(``memory.compaction_engine``): the ENTIRE transcript is summarized (chunked
-and rolled when the pinned compactor window cannot fit it in one request), the
-project.md checker runs, and the map is re-anchored fresh. History is rebuilt
-Codex-style — repo context, then retained user asks, then the summary LAST.
+The processor runs before each model request. When the token estimate crosses
+the checkpoint trigger it asks the SAME model that is driving the chat for one
+handoff summary, then rebuilds history Codex-style — repo context, retained
+user asks, then the summary LAST. There is no separate compactor model and no
+multi-pass ledger.
 """
 from __future__ import annotations
 
@@ -22,8 +21,8 @@ def policy_for_deps(deps: Any):
 
     Precedence: shared policy keyed by the real role name (specialists keep
     their own key), then the registry spec's ``compaction`` overrides, then a
-    window clamp (75% trigger / 85% hard) so a sub-400k model compacts before
-    the provider rejects the request (a 256k laguna specialist triggers ~196k).
+    window clamp (75% trigger / 85% hard) so a smaller-context model compacts
+    before the provider rejects the request.
     """
     from memory.context_compaction import CompactionPolicy, get_compaction_policy
 
@@ -187,11 +186,9 @@ async def native_history_processor(
         est = estimate_history_tokens(messages)
         if est < policy.checkpoint_trigger and est < policy.hard_limit:
             return messages
-        # Over threshold — compact through the shared Codex-parity engine:
-        # full-transcript render (no caps), chunked/rolled summary when the
-        # compactor window cannot fit everything, project.md checker, and the
-        # map sidecar refresh in parallel. project.md and the map are never
-        # summarized; they are re-anchored fresh below.
+        # Over threshold — one summary request from the same chat model.
+        # project.md and the map are never summarized; they are re-anchored
+        # fresh below.
         try:
             _pp = str(getattr(getattr(ctx, "deps", None), "project_path", "") or "")
         except Exception:
@@ -199,17 +196,23 @@ async def native_history_processor(
 
         from memory.compaction_engine import run_compaction_summary
 
-        engine = await run_compaction_summary(messages, _pp)
+        engine = await run_compaction_summary(
+            messages,
+            _pp,
+            policy=policy,
+            role=str(getattr(_deps, "role", "") or "developer"),
+            deps=_deps,
+            model=getattr(_deps, "compaction_model", None),
+            model_id=str(getattr(_deps, "compaction_model_id", "") or ""),
+        )
         summary = str(engine.get("summary") or "")
         if not summary:
             summary = "[Native compaction — earlier turns summarized due to length]"
         if engine.get("chunks"):
+            _window = int(engine.get("window") or 0)
             print(
-                f"[COMPACTION] {engine['chunks']} chunk(s), "
-                f"{engine.get('ledgers', 0)} ledger(s), "
-                f"overlap={engine.get('overlap_tokens', 0):,} tok, "
-                f"trimmed={engine.get('trimmed', 0)} via {engine.get('model')} "
-                f"(window {engine.get('window'):,})"
+                f"[COMPACTION] one-pass summary via {engine.get('model')} "
+                f"(window {_window:,})"
             )
         # Re-anchor the LATEST project map: a fresh full rebuild beats the
         # stale copy embedded in old history (post-anchor edits existed only

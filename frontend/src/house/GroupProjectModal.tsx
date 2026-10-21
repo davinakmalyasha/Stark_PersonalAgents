@@ -7,6 +7,7 @@ import type {
   GroupEvent, GroupItem, GroupMilestone, GroupOp, GroupProjectDetail,
 } from '../types';
 import { fetchGroupProject, groupProjectOp, resolveGroupApproval } from '../services/api';
+import NotesButton from '../components/Notes/NotesButton';
 
 interface Props {
   projectId: string;
@@ -272,6 +273,7 @@ export default function GroupProjectModal({ projectId, onClose }: Props) {
             </div>
             <div className="text-[11px] text-zinc-500 mt-0.5 truncate">{projectId}</div>
           </div>
+          <NotesButton scopeType="group" scopeId={projectId} />
           <button
             ref={closeRef}
             type="button"

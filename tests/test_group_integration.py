@@ -297,7 +297,7 @@ def test_group_tools_are_in_the_registry():
     import tools._schemas as schemas
 
     names = {d["name"] for d in schemas.TOOL_DEFINITIONS}
-    required = {"plan_execution", "create_group_project", "group_board",
+    required = {"create_group", "group_board",
                 "group_item_detail", "group_events", "group_update"}
     assert required <= names, f"missing schemas: {sorted(required - names)}"
     assert required <= set(schemas._TOOL_DOCS), "missing doc one-liners"
@@ -309,7 +309,7 @@ def test_group_tools_are_in_the_registry():
 def test_group_tools_resolve_through_the_facade():
     from _util import real_tools
     facade = real_tools()
-    for name in ("plan_execution", "create_group_project", "group_board",
+    for name in ("create_group", "group_board",
                  "group_item_detail", "group_events", "group_update"):
         assert callable(getattr(facade, name, None)), f"{name} is not on the facade"
 

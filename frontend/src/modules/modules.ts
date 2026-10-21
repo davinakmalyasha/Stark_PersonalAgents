@@ -6,9 +6,9 @@
  * workspace itself.
  *
  * - `ide`         → coding surface bound to the Dev agent context.
- * - `open-design` → design-iteration surface bound straight to the UI
- *                   subagent loop (workspace_kind="design"). Prompts in the
- *                   module never pass through orchestrator/Dev.
+ * - `open-design` → design addon bound straight to the UI subagent loop
+ *                   (workspace_kind="design"). It opens inside the coding
+ *                   workspace, not as a separate workspace route.
  */
 export type ModuleId = 'ide' | 'open-design';
 
@@ -38,7 +38,7 @@ export const MODULES: ModuleDef[] = [
     detail:
       'OpenDesign — agent-led UI design iteration for this workspace (straight to the UI subagent loop)',
     icon: 'palette',
-    route: '#/design',
+    route: '#/coding?addon=design',
   },
 ];
 

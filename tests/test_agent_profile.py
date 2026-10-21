@@ -101,8 +101,7 @@ def test_workspace_thinking_registry_values():
     assert get_profile("DFD")["thinking"] == "high"
     assert get_profile("General")["thinking"] == "low"
     assert get_profile("House")["thinking"] == "low"
-    # Orchestrator passes its own mode-driven effort; registry stays inherit.
-    assert get_profile("Orchestrator")["thinking"] == "inherit"
+    assert get_profile("Orchestrator")["thinking"] == "high"
 
 
 def test_registry_thinking_resolver_byte_compat():
@@ -114,9 +113,8 @@ def test_registry_thinking_resolver_byte_compat():
     assert _registry_thinking("DFD") == "high"
     assert _registry_thinking("General") == "low"
     assert _registry_thinking("House") == "low"
-    assert _registry_thinking("Orchestrator") is None
+    assert _registry_thinking("Orchestrator") == "high"
     assert _registry_thinking("DevOps") == "high"
-    assert _registry_thinking("Compactor") is None
     assert _registry_thinking("unknown-role") is None
 
 
@@ -141,7 +139,7 @@ def test_policy_for_deps_registry_overrides_and_window_clamp():
     )
     pol = policy_for_deps(deps)
     assert pol.checkpoint_trigger == int(262144 * 0.75)
-    assert pol.hard_limit == min(440_000, int(262144 * 0.85))
+    assert pol.hard_limit == min(550_000, int(262144 * 0.85))
     assert pol.summary_output_tokens == 6144
 
 
@@ -150,12 +148,12 @@ def test_policy_for_deps_specialist_role_passthrough():
     from llm.deps import WorkspaceDeps
 
     pol = policy_for_deps(WorkspaceDeps(role="DevOps"))
-    assert pol.checkpoint_trigger == 400_000  # shared default; no role remap
+    assert pol.checkpoint_trigger == 500_000  # shared default; no role remap
     # An explicit spec override beats the shared default without a window.
     pol2 = policy_for_deps(WorkspaceDeps(role="DevOps",
                                          compaction={"checkpoint_tokens": 150_000}))
     assert pol2.checkpoint_trigger == 150_000
-    assert pol2.hard_limit == 440_000
+    assert pol2.hard_limit == 550_000
 
 
 def test_tool_caps_contextvar_and_env_precedence(monkeypatch):
@@ -219,7 +217,7 @@ def test_maybe_compact_free_triggers_and_replaces(monkeypatch):
     monkeypatch.setattr(mh, "estimate_history_tokens", lambda msgs: 10 ** 7)
     monkeypatch.setattr(mh, "compact_history_native", lambda history, **kw: ["COMPACTED"])
 
-    async def fake_engine(messages, project_path):
+    async def fake_engine(messages, project_path, **kwargs):
         return {"summary": "SUM", "chunks": 1, "model": "fake", "window": 200000}
 
     monkeypatch.setattr(ce, "run_compaction_summary", fake_engine)
@@ -266,8 +264,8 @@ def test_free_path_passes_prefer_reasoning(monkeypatch):
 
     st._specialist_call_backend("DevOps", [])
     assert calls["DevOps"]["prefer_reasoning"] is True
-    st._specialist_call_backend("Compactor", [])
-    assert calls["Compactor"]["prefer_reasoning"] is None
+    st._specialist_call_backend("UnknownRole", [])
+    assert calls["UnknownRole"]["prefer_reasoning"] is None
 
 
 def test_spec_from_json_normalizes_profile_fields():
@@ -294,7 +292,7 @@ def test_spec_from_json_normalizes_profile_fields():
     assert spec.skills == ("deploy-gate",)
     # A non-internal spec with no tools is rejected (registry hygiene).
     assert _spec_from_json({"name": "Broken", "tools": []}) is None
-    # Internal specs may have no tools (Compactor).
+    # Internal specs may have no tools.
     assert _spec_from_json({"name": "Internal", "tools": [], "internal": True}) is not None
 
 
@@ -351,3 +349,48 @@ def test_spec_validation_valid_config_untouched():
     assert spec.thinking == "high"
     assert spec.compaction == {"summary_output_tokens": 6144}
     assert spec.tool_caps == {"run_command": 12000}
+
+
+def test_orchestrator_and_tool_text_have_no_persona():
+    from agents.orchestrator_agent import _ORCHESTRATOR_SYSTEM_TEMPLATE
+    from tools._schemas import TOOL_DEFINITIONS
+
+    text = _ORCHESTRATOR_SYSTEM_TEMPLATE + "\n" + "\n".join(
+        str(d.get("description") or "") for d in TOOL_DEFINITIONS
+    )
+    lowered = text.lower()
+    for marker in ("sir", "jarvis", "right-hand", "chief of staff"):
+        assert marker not in lowered, f"persona marker remains: {marker}"
+
+
+def test_compaction_uses_one_same_model_summary(monkeypatch):
+    import asyncio
+
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    import memory.compaction_engine as ce
+
+    calls = []
+
+    async def fake_request(model, messages, prompt_text, max_tokens):
+        calls.append((model, messages, prompt_text, max_tokens))
+        return "[SUMMARY]\nDONE\n[PROJECT.MD]\nNO_CHANGE", "same-model"
+
+    monkeypatch.setattr(ce, "_request", fake_request)
+    monkeypatch.setattr(
+        ce,
+        "_resolve_model",
+        lambda *args, **kwargs: ("MODEL", "same-model", 1_000_000),
+    )
+
+    history = [ModelRequest(parts=[UserPromptPart(content="hello")])]
+    result = asyncio.run(
+        ce.run_compaction_summary(history, "", role="Developer")
+    )
+
+    assert len(calls) == 1
+    assert result["chunks"] == 1
+    assert result["ledgers"] == 0
+    assert result["model"] == "same-model"
+    assert result["served_models"] == ["same-model"]
+    assert result["summary"].startswith(ce.SUMMARY_PREFIX)

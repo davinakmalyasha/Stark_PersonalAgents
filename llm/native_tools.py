@@ -819,6 +819,72 @@ def build_agent(
     return agent
 
 
+def build_native_model(
+    role: str,
+    model: Any = None,
+    *,
+    deps: Optional[WorkspaceDeps] = None,
+    temp: float = 0.2,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[Any, str, int]:
+    """Build the provider-backed model for a role and return its window.
+
+    A concrete model object is returned unchanged. String/None inputs use the
+    same provider resolution as ``arun_native_agent``. This is the single
+    model builder used by both chat turns and same-model compaction.
+    """
+    from llm.pai_transport import _resolve_provider_cfg, _model_name
+    from llm.pai_transport import _build_model_settings, _model_profile_for
+
+    deps = deps or WorkspaceDeps.from_shared_state(role=role)
+    if model is not None and not isinstance(model, str):
+        mid = str(getattr(model, "model_name", "") or "")
+        window = int(getattr(deps, "context_window", 0) or 0)
+        if window <= 0 and mid:
+            try:
+                from llm.model_history import window_for_model
+
+                window = int(window_for_model(mid) or 0)
+            except Exception:
+                window = 0
+        return model, mid, window
+
+    cfg = deps.llm_provider or _resolve_provider_cfg()
+    base_url = base_url or str(cfg.get("base") or "")
+    api_key = api_key or str(cfg.get("key") or "")
+    if model is None:
+        model_id = _model_name("deepseek:v4.1-flash")
+    else:
+        model_id = _model_name(model)
+    if reasoning_effort is None:
+        reasoning_effort = _registry_thinking(role)
+    settings = _build_model_settings(role, model_id, temp, reasoning_effort, reasoning_budget)
+    profile = _model_profile_for(model_id)
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+    if profile:
+        model_obj = OpenAIChatModel(
+            model_name=model_id, provider=provider, settings=settings, profile=profile
+        )
+    else:
+        model_obj = OpenAIChatModel(
+            model_name=model_id, provider=provider, settings=settings
+        )
+    window = 0
+    try:
+        from llm.model_history import window_for_model
+
+        window = int(window_for_model(model_id) or 0)
+    except Exception:
+        window = 0
+    return model_obj, model_id, window
+
+
 async def arun_native_agent(
     role: str,
     messages: list,
@@ -849,50 +915,25 @@ async def arun_native_agent(
     """
     from pydantic_ai import Agent
     from pydantic_ai.exceptions import UnexpectedModelBehavior
-    from llm.pai_transport import _resolve_provider_cfg, _model_name, _emit_stream
-    from llm.pai_transport import _build_model_settings, _model_profile_for
+    from llm.pai_transport import _emit_stream
 
     deps = deps or WorkspaceDeps.from_shared_state(role=role)
-    model_id = ""
-
-    if model is None or isinstance(model, str):
-        cfg = deps.llm_provider or _resolve_provider_cfg()
-        base_url = base_url or str(cfg.get("base") or "")
-        api_key = api_key or str(cfg.get("key") or "")
-        if model is None:
-            model_id = _model_name("deepseek:v4.1-flash")
-        else:
-            # Bare gateway slug (e.g. command-mode light slot
-            # "poolside/laguna-s-2.1-free") — build the provider-backed model
-            # here instead of letting pydantic-ai infer it (it requires
-            # "provider:model" and would raise UserError).
-            model_id = _model_name(model)
-        if reasoning_effort is None:
-            # Registry profile when the caller passes no explicit effort;
-            # "inherit" -> None keeps the legacy per-role bucket mapping.
-            reasoning_effort = _registry_thinking(role)
-        settings = _build_model_settings(role, model_id, temp, reasoning_effort, reasoning_budget)
-        profile = _model_profile_for(model_id)
-        from pydantic_ai.models.openai import OpenAIChatModel
-        from pydantic_ai.providers.openai import OpenAIProvider
-        provider = OpenAIProvider(base_url=base_url, api_key=api_key)
-        if profile:
-            model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings, profile=profile)
-        else:
-            model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
-
-    # Window-aware compaction: publish the resolved model's context window on
-    # deps so the ProcessHistory processor clamps its trigger below the model
-    # limit (a 256k laguna specialist must compact around ~200k, not 400k).
-    try:
-        from llm.model_history import window_for_model
-
-        if not getattr(deps, "context_window", 0) and isinstance(model_id, str) and model_id:
-            _win = window_for_model(model_id)
-            if _win > 0:
-                deps.context_window = int(_win)
-    except Exception:
-        pass
+    model, model_id, _window = build_native_model(
+        role,
+        model,
+        deps=deps,
+        temp=temp,
+        reasoning_effort=reasoning_effort,
+        reasoning_budget=reasoning_budget,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if _window > 0 and not getattr(deps, "context_window", 0):
+        deps.context_window = int(_window)
+    # Expose the exact chat model to the ProcessHistory processor so
+    # compaction uses the same model as the turn.
+    deps.compaction_model = model
+    deps.compaction_model_id = model_id
 
     # ── Per-request profiler (PAI_REQ_PROFILE=1) ─────────────────────────────
     # Wraps the model's request methods so EVERY model request records:

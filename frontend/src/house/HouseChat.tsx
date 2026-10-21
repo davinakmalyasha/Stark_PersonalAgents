@@ -3,6 +3,8 @@ import type { MutableRefObject } from 'react';
 import { ChevronDown, ChevronUp, ExternalLink, X } from 'lucide-react';
 import PromptDock from '../components/Workspace/PromptDock';
 import MessageStream from '../components/Workspace/MessageStream';
+import NotesButton from '../components/Notes/NotesButton';
+import CanvasModeBadge from '../components/Canvas/CanvasModeBadge';
 import type { ChatMessage } from '../types';
 import '../house/house.css';
 
@@ -36,6 +38,9 @@ interface Props {
   /** Session ids — power the live running/done status of spawn blocks. */
   workspaceId?: string | null;
   chatId?: string | null;
+  onRewind?: (message: ChatMessage) => void;
+  draft?: string;
+  onDraftConsumed?: () => void;
 }
 
 /**
@@ -56,6 +61,9 @@ export default function HouseChat({
   onOpenSubagent,
   workspaceId,
   chatId,
+  onRewind,
+  draft,
+  onDraftConsumed,
 }: Props) {
   const [minimized, setMinimized] = useState(defaultMinimized);
 
@@ -85,6 +93,8 @@ export default function HouseChat({
           <X size={14} />
         </button>
       )}
+      <CanvasModeBadge key={chatId ?? 'none'} chatId={chatId ?? null} />
+      {workspaceId && chatId && <NotesButton scopeType="chat" scopeId={chatId} />}
       <button
         onClick={() => setMinimized((m) => !m)}
         title={minimized ? 'Expand conversation' : 'Collapse conversation'}
@@ -106,7 +116,7 @@ export default function HouseChat({
       }}
       aria-hidden={minimized}
     >
-      <div ref={threadRef} className="flex-1 min-h-[160px] overflow-y-auto">
+      <div ref={threadRef} className="flex-1 min-h-[80px] overflow-y-auto">
         {isLoading ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-500 py-6">
             <div className="flex gap-1.5">
@@ -124,6 +134,7 @@ export default function HouseChat({
             onOpenSubagentSession={onOpenSubagent}
             workspaceId={workspaceId}
             chatId={chatId}
+            onRewind={onRewind}
           />
         )}
       </div>
@@ -151,6 +162,8 @@ export default function HouseChat({
         totalOutput={totalOutput}
         totalCacheHitTokens={totalCacheHitTokens}
         activeContextTokens={activeContextTokens}
+        draft={draft}
+        onDraftConsumed={onDraftConsumed}
       />
     </div>
   );
@@ -182,8 +195,8 @@ export default function HouseChat({
   // max-height animation, so the dock never gets displaced mid-transition),
   // bottom-anchored, capped at the workspace height.
   return (
-    <div className="flex flex-col justify-end h-full min-h-0 w-full max-w-[1400px] mx-auto px-4 sm:px-8 lg:px-10 pt-2 pb-3">
-      <div className="house-chat-card flex flex-col min-h-0 max-h-full rounded-2xl border house-hairline px-3 pt-2.5 pb-1 overflow-hidden">
+    <div className="flex flex-col justify-end w-full max-w-[680px] mx-auto px-3 pt-2 pb-3">
+      <div className="house-chat-card pointer-events-auto flex flex-col min-h-0 max-h-[70vh] rounded-2xl border house-hairline px-3 pt-2.5 pb-1 overflow-hidden">
         {header}
         {messagesArea}
         {notificationBar}

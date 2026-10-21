@@ -5,6 +5,8 @@ import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
 import PlanDock from './PlanDock';
 import MessageStream from './MessageStream';
+import NotesButton from '../Notes/NotesButton';
+import CanvasModeBadge from '../Canvas/CanvasModeBadge';
 import { getChatSnapshots, restoreRun, type SnapshotGroup } from '../../services/api';
 
 interface Props {
@@ -36,8 +38,13 @@ interface Props {
   chatId: string | null;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
+  onRewind?: (message: ChatMessage) => void;
+  draft?: string;
+  onDraftConsumed?: () => void;
   /** Session-keyed subagent drill-in (delegation rows carrying childId). */
   onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
+  /** 'floating' overlays the workspace; 'docked' sits in a flex column below the canvas. */
+  variant?: 'floating' | 'docked';
 }
 
 export default function ChatView({
@@ -45,7 +52,8 @@ export default function ChatView({
   hasActiveChat, notification, chatMode = 'build',
   onSend, onCancel, onClearNotification,
   isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
-  selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession,
+  selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession, onRewind, draft, onDraftConsumed,
+  variant = 'floating',
 }: Props) {
   const [minimized, setMinimized] = useState(false);
   const [activeSubagent, setActiveSubagent] = useState<string | null>(null);
@@ -79,9 +87,13 @@ export default function ChatView({
 
   return (
     <div 
-      className="absolute bottom-6 left-3 right-3 z-40 w-auto max-w-none flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/50 backdrop-blur-md shadow-2xl transition-all duration-300 premium-surface"
+      className={`${
+        variant === 'docked'
+          ? 'relative w-full max-w-[680px] mx-auto flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/60 bg-[#0c0c0f] shadow-2xl'
+          : 'absolute bottom-6 left-3 right-3 z-40 w-auto max-w-none flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/50 backdrop-blur-md shadow-2xl transition-all duration-300 premium-surface'
+      }`}
       style={{
-        maxHeight: '80vh',
+        maxHeight: variant === 'docked' ? '70vh' : '80vh',
       }}
     >
       {/* Floating minimize/expand button (icon only, proper bg color, bigger icon) */}
@@ -103,10 +115,12 @@ export default function ChatView({
 
       {/* Chat toolbar: mode badge + search + export + rewind (right of the minimize button) */}
       <div className="absolute top-3.5 right-[52px] z-50 flex items-center gap-1.5">
+        <CanvasModeBadge key={chatId ?? 'none'} chatId={chatId} />
+        {workspaceId && chatId && <NotesButton scopeType="chat" scopeId={chatId} />}
         {chatMode === 'plan' && (
           <span
             className="pressable px-2 py-1 bg-amber-900/60 border border-amber-700/60 text-amber-200 rounded-lg text-[11px] font-semibold tracking-wide shadow-xl"
-            title="Plan mode: read-only. The agent can research and propose_plan, but cannot edit. Type /build to leave plan mode."
+            title="Plan mode: read-only. The agent can research, but cannot edit. Type /build to leave plan mode."
           >
             PLAN
           </span>
@@ -155,11 +169,17 @@ export default function ChatView({
         </div>
       )}
 
+      {variant === 'docked' && (
+        <div className="flex h-10 shrink-0 items-center px-3">
+          <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Conversation</span>
+        </div>
+      )}
+
       {/* Collapsible Area */}
       <div 
         className="flex-1 flex flex-col overflow-y-auto transition-all duration-300 ease-in-out"
         style={{
-          maxHeight: minimized ? '0px' : '480px',
+          maxHeight: minimized ? '0px' : variant === 'docked' ? 'none' : '480px',
           opacity: minimized ? 0 : 1,
         }}
       >
@@ -186,13 +206,14 @@ export default function ChatView({
           onCloseSubagent={() => setActiveSubagent(null)}
           onOpenProject={onOpenProject}
           onRetry={onRetry}
+          onRewind={onRewind}
         />
       </div>
 
       {/* Always visible Bottom Prompt Dock */}
       <div className="border-t border-zinc-800/50 flex-shrink-0">
         <PlanDock plan={state?.plan} />
-        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} />
+        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} onDraftConsumed={onDraftConsumed} />
       </div>
     </div>
   );

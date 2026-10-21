@@ -177,8 +177,13 @@ async def _lifespan(app):
     # task scheduler used to be __main__-only, which meant it silently did not
     # run in exactly the modes people debug in — a scheduler that is not
     # running looks identical to a project that is stalled.
-    from server.services.task_scheduler import start_task_scheduler
-    start_task_scheduler()
+    from server.services.schedule_scheduler import start_schedule_scheduler
+    start_schedule_scheduler()
+    try:
+        from server.services.agent_wake import start_wake_worker
+        start_wake_worker()
+    except Exception as _exc:
+        print(f"[API] wake worker not started: {_exc}", flush=True)
     try:
         from server.services.group_scheduler import start_group_scheduler
         start_group_scheduler()
@@ -190,6 +195,16 @@ async def _lifespan(app):
         try:
             from server.services.group_scheduler import stop_group_scheduler
             stop_group_scheduler()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from server.services.schedule_scheduler import stop_schedule_scheduler
+            stop_schedule_scheduler()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from server.services.agent_wake import stop_wake_worker
+            stop_wake_worker()
         except Exception:  # noqa: BLE001
             pass
         _shutdown_voice()
@@ -219,8 +234,10 @@ from server.routers.workspaces import router as workspaces_router
 app.include_router(workspaces_router)
 from server.routers.chats import router as chats_router
 app.include_router(chats_router)
-from server.routers.tasks import router as tasks_router
-app.include_router(tasks_router)
+from server.routers.notes import router as notes_router
+app.include_router(notes_router)
+from server.routers.canvas import router as canvas_router
+app.include_router(canvas_router)
 from server.routers.groups import router as groups_router
 app.include_router(groups_router)
 from server.routers.runs import router as runs_router
@@ -566,9 +583,9 @@ if __name__ == "__main__":
     # Schedulers start in _lifespan (above), so they run under uvicorn and
     # --reload too, not only under __main__. Kept here as a no-op call for the
     # direct `python server/api_server.py` path, where lifespan still fires —
-    # start_task_scheduler() is idempotent.
-    from server.services.task_scheduler import start_task_scheduler as _start_task_scheduler
-    _start_task_scheduler()
+    # Schedule/wake workers are idempotent.
+    from server.services.schedule_scheduler import start_schedule_scheduler as _start_schedule_scheduler
+    _start_schedule_scheduler()
 
     # NOTE: The embedding model (fastembed bge-large ~1.3GB) is deliberately
     # NOT warmed at boot - it is lazy-loaded on first embed() call in
@@ -587,9 +604,8 @@ if __name__ == "__main__":
     def _warm_llm() -> None:
         try:
             from llm.pai_transport import pai_native_turn
-            from llm.provider_modes import MODE_MATRIX
-            orch = MODE_MATRIX.get("command", {}).get("orchestrator") or {}
-            model = orch.get("model") if isinstance(orch, dict) else "xiaomi/mimo-v2.6-flash"
+            from llm.provider_modes import get_role_plan
+            model = get_role_plan("Orchestrator").get("model") or "deepseek/deepseek-v4.1-flash"
             pai_native_turn(
                 role="Orchestrator",
                 messages=[{"role": "user", "content": "Reply with the single word: ready"}],

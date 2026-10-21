@@ -200,7 +200,7 @@ def _infer_project_path(client_request: str, fallback: str) -> tuple[str, str]:
     name = os.path.basename(target) or "project"
     directive = (
         f"[PROJECT CHECK] The folder '{target}' does not exist yet. "
-        f"Call create_project(name='{name}', concept=<one-line goal>) FIRST to "
+        f"Call create_coding_project(name='{name}', concept=<one-line goal>) FIRST to "
         f"create it, THEN delegate the actual task to Dev in that new workspace."
     )
     return target, directive
@@ -302,6 +302,7 @@ def _build_graph() -> GraphBuilder:
         if inferred_path:
             state.project_path = inferred_path
 
+        current_user_message_id = ""
         try:
             deps.append_log(f"[ORCHESTRATOR] Analyzing request...")
             if deps.build_prompt is not None:
@@ -314,17 +315,41 @@ def _build_graph() -> GraphBuilder:
                 task_message += f"\n\n{directive}"
             if state.project_path and os.path.isdir(state.project_path):
                 task_message = f"## WORKSPACE\n{state.project_path}\n\n" + task_message
+            # Prior conversation as real user/assistant turns. The old path
+            # rendered history as one text block and skipped every assistant
+            # trace, so the model effectively only saw the latest user message.
+            current_user_message_id = ""
+            prior_history: list = []
+            native_history_ok = False
             try:
-                from server.context.chat_history import build_chat_context
-                from sync.state_sync import shared_state
-                ctx_path = "_general" if shared_state.get("is_general", False) else project_path
-                chat_history_str = build_chat_context(
-                    ctx_path, chat_id, max_messages=30, max_chars_per_msg=3000, exclude_traces=True
+                from server.context.chat_history import build_chat_history_messages
+                from sync.state_sync import safe_get_state
+                current = safe_get_state()
+                current_user_message_id = str(current.get("user_message_id") or "")
+                ctx_path = "_general" if current.get("is_general", False) else project_path
+                prior_history = build_chat_history_messages(
+                    ctx_path, chat_id, max_messages=30, max_chars_per_msg=3000,
+                    exclude_message_id=current_user_message_id,
                 )
-                if chat_history_str:
-                    task_message += f"\n\n## Recent Chat History\n{chat_history_str}"
+                native_history_ok = True
             except Exception as e:
                 deps.append_log(f"[ORCHESTRATOR] Error loading chat history: {e}")
+
+            # Fallback only when native turns could not be built.
+            if not native_history_ok:
+                try:
+                    from server.context.chat_history import build_chat_context
+                    from sync.state_sync import safe_get_state
+                    current = safe_get_state()
+                    ctx_path = "_general" if current.get("is_general", False) else project_path
+                    chat_history_str = build_chat_context(
+                        ctx_path, chat_id, max_messages=30, max_chars_per_msg=3000,
+                        exclude_message_id=current_user_message_id,
+                    )
+                    if chat_history_str:
+                        task_message += f"\n\n## Recent Chat History\n{chat_history_str}"
+                except Exception as e:
+                    deps.append_log(f"[ORCHESTRATOR] Error loading chat history fallback: {e}")
             try:
                 from agents.delegation import recent_jobs_block
                 jb = recent_jobs_block(10)
@@ -338,7 +363,13 @@ def _build_graph() -> GraphBuilder:
                 task_message += f"\n\n{_block}"
 
             from llm.model_history import build_initial_history
-            state.history = build_initial_history(static_system, task_message)
+            try:
+                from pydantic_ai.messages import ModelRequest, UserPromptPart
+                state.history = build_initial_history(static_system, "")
+                state.history.extend(prior_history)
+                state.history.append(ModelRequest(parts=[UserPromptPart(content=task_message)]))
+            except Exception:
+                state.history = build_initial_history(static_system, task_message)
 
             try:
                 from tools.vision_channel import drain_attachment_images_native
@@ -351,7 +382,15 @@ def _build_graph() -> GraphBuilder:
 
         if deps.orch_sess is not None:
             try:
-                deps.orch_sess.append_message("user", client_req, source="user")
+                existing = (
+                    deps.orch_sess.get_entry(current_user_message_id)
+                    if current_user_message_id else None
+                )
+                if existing is None:
+                    deps.orch_sess.append_message(
+                        "user", client_req, source="user",
+                        entry_id=current_user_message_id or None,
+                    )
             except Exception:
                 pass
         return "call_llm"
@@ -438,7 +477,7 @@ def _build_graph() -> GraphBuilder:
         for c in calls:
             state.tool_call_log.append({"tool": c.get("tool"), "args": c.get("args"), "id": c.get("id")})
         state.delegated_work = state.delegated_work or any(
-            c.get("tool") in ("delegate", "create_project")
+            c.get("tool") in ("delegate", "create_coding_project")
             for c in calls
         )
         return "decide"
@@ -535,11 +574,11 @@ def _build_graph() -> GraphBuilder:
                     board = "(job board unavailable)"
                 check = (
                     "Long wait — stop and check yourself before waiting again:\n"
-                    "1. Is what Sir asked already satisfied?\n"
+                    "1. Is what the user asked already satisfied?\n"
                     "2. Are the jobs making progress, or is one looping or stuck?\n"
                     "3. What is the next assignment for each unfinished job?\n"
                     "If a job looks stuck: steer it (job_message) or cancel it (job_cancel). "
-                    "If something is missing, delegate it now. Give Sir an honest status update."
+                    "If something is missing, delegate it now. Give the user an honest status update."
                 )
                 state.history.append(ModelRequest(parts=[UserPromptPart(
                     content=_render_delivery("PROGRESS CHECK", [check, board])

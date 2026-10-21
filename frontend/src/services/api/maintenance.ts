@@ -1,46 +1,4 @@
-import type { ChatAttachment, AgentTask, TaskSchedule } from '../../types';
 import { API_BASE } from './base';
-
-export async function fetchTasks(workspaceId: string, chatId: string): Promise<AgentTask[]> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks`);
-  if (!res.ok) return [];
-  return res.json();
-}
-
-export async function createTask(workspaceId: string, chatId: string, payload: { prompt: string; attachments: ChatAttachment[]; mode: 'saved' | 'scheduled'; schedule?: TaskSchedule }): Promise<AgentTask> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error('Failed to create task');
-  return res.json();
-}
-
-export async function startTask(workspaceId: string, chatId: string, taskId: string): Promise<AgentTask> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}/start`, { method: 'POST' });
-  if (!res.ok) throw new Error('Failed to start task');
-  return res.json();
-}
-
-export async function updateTaskStatus(workspaceId: string, chatId: string, taskId: string, status: AgentTask['status']): Promise<AgentTask> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }),
-  });
-  if (!res.ok) throw new Error('Failed to update task');
-  return res.json();
-}
-
-export async function updateTask(workspaceId: string, chatId: string, taskId: string, payload: Partial<Pick<AgentTask, 'prompt' | 'attachments' | 'mode' | 'schedule' | 'status'>>): Promise<AgentTask> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error('Failed to update task');
-  return res.json();
-}
-
-export async function deleteTask(workspaceId: string, chatId: string, taskId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
-  if (!res.ok) throw new Error('Failed to delete task');
-}
 
 export async function undoRun(runId: string): Promise<{ status: string; conflicts?: string[] }> {
   const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/undo`, { method: 'POST' });

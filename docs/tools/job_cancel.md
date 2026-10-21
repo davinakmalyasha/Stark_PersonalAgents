@@ -1,6 +1,6 @@
 # job_cancel
 
-- **Description:** Cancel ONE running delegation when Sir says stop. Fresh jobs: cooperative abort of the job chat. Resume jobs: interrupt of the durable Dev child. Settles the entry as CANCELLED and reports back as a [DELEGATION RESULT]. Already-settled jobs are a no-op.
+- **Description:** Cancel ONE running delegation when the user says stop. Fresh jobs: cooperative abort of the job chat. Resume jobs: interrupt of the durable Dev child. Settles the entry as CANCELLED and reports back as a [DELEGATION RESULT]. Already-settled jobs are a no-op.
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** False
@@ -13,7 +13,7 @@
 ## Parameters (JSON Schema)
 
   - `job_id` (string, required): Job id (del-xxxx) from delegate or delegation_status.
-  - `reason` (string, optional): One-clause reason shown in the wrap-up (default: cancelled by Sir).
+  - `reason` (string, optional): One-clause reason shown in the wrap-up (default: cancelled by the user).
 
 ## How to recreate
 

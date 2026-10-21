@@ -182,6 +182,9 @@ export interface ChatSummary {
   updatedAt: string;
   parentChatId?: string;
   parentWorkspaceId?: string;
+  /** Short preview of the newest message (server-side, display only). */
+  lastMessage?: string;
+  lastRole?: string;
 }
 
 export interface ChatData {
@@ -237,31 +240,6 @@ export interface SubagentSessionEntry {
 export interface SubagentSession {
   info: SubagentInfo & { parent_chat_id?: string; session_file?: string };
   entries: SubagentSessionEntry[];
-}
-
-export type TaskMode = 'immediate' | 'saved' | 'scheduled';
-export type TaskStatus = 'ready' | 'scheduled' | 'running' | 'completed' | 'failed';
-export type TaskRecurrence = 'none' | 'daily' | 'weekly' | 'monthly' | `interval-${number}`;
-
-export interface TaskSchedule {
-  nextRunAt?: string;
-  recurrence: TaskRecurrence;
-}
-
-export interface AgentTask {
-  id: string;
-  workspaceId: string;
-  chatId: string;
-  prompt: string;
-  attachments: ChatAttachment[];
-  mode: TaskMode;
-  status: TaskStatus;
-  schedule?: TaskSchedule;
-  createdAt: string;
-  updatedAt: string;
-  lastRunAt?: string;
-  completedAt?: string;
-  error?: string;
 }
 
 export interface UserProfile {
@@ -408,3 +386,19 @@ export interface GroupProjectDetail {
 
 /** The only ops the board may perform — see `groups.py` `UI_OPS`. */
 export type GroupOp = 'pause' | 'resume' | 'close';
+
+export interface AgentNoteTodo {
+  text: string;
+  done: boolean;
+}
+
+export interface AgentNote {
+  id: string;
+  scopeType: 'chat' | 'group';
+  scopeId: string;
+  title: string;
+  body: string;
+  todos: AgentNoteTodo[];
+  createdAt: string;
+  updatedAt: string;
+}

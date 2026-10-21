@@ -31,7 +31,7 @@ from typing import Any
 from agents.group.runner import LocalRunner
 from agents.group.supervisor import Supervisor
 
-#: Same cadence as ``task_scheduler``. One number, two loops.
+#: Same cadence as the wake scheduler. One number, two loops.
 TICK_SECONDS = 15.0
 
 #: Boot recovery is a full rebuild per project; log if it takes a while.

@@ -34,6 +34,9 @@ export default function Sidebar({
   const [newWsName, setNewWsName] = useState('');
   const [projectsOpen, setProjectsOpen] = useState(true);
   const [chatsOpen, setChatsOpen] = useState(true);
+  // The coding workspace is project-first; keep the old chat view behind a
+  // flag instead of rendering it (main chats live in the main workspace).
+  const [showGeneralChats] = useState(false);
   const [editingGeneralChatId, setEditingGeneralChatId] = useState<string | null>(null);
   const [generalChatName, setGeneralChatName] = useState('');
   const [loading, setLoading] = useState(true);
@@ -47,7 +50,7 @@ export default function Sidebar({
 
   // Split into General and Projects
   const generalWs = workspaces.find((w) => w.isGeneral);
-  const projectWs = workspaces.filter((w) => !w.isGeneral);
+  const projectWs = workspaces.filter((w) => !w.isGeneral && !w.isHouse && !w.isPersonal && !(w as { isDfd?: boolean }).isDfd);
 
   useEffect(() => {
     if (activeWorkspaceId && activeChatId && activeChatTitle) {
@@ -265,6 +268,9 @@ export default function Sidebar({
         </div>
       ) : (
         <div className="flex flex-col h-full overflow-hidden">
+          {/* The coding workspace is project-first: main chats live in the main workspace. */}
+          {showGeneralChats && (
+          <>
           {/* ── General Chat Section (always expanded) ── */}
           <div className="group flex items-center justify-between" style={{ padding: '18px 14px 8px' }}>
             <button onClick={() => setChatsOpen((open) => !open)} className="flex items-center gap-1 text-[11px] font-bold text-zinc-500 uppercase tracking-widest hover:text-zinc-300 transition-colors" title={chatsOpen ? 'Collapse chats' : 'Expand chats'}>
@@ -397,6 +403,9 @@ export default function Sidebar({
               </div>
             </div>
             </div></div>
+          )}
+
+          </>
           )}
 
           {/* ── Separator ── */}

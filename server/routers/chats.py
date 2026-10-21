@@ -10,6 +10,7 @@ from server.store.workspace_registry import get_workspace
 from server.store.chat_store import (
     list_chats, get_chat, create_chat, delete_chat, add_message,
     update_chat_title as store_update_chat_title, save_chat,
+    truncate_from_message,
 )
 
 router = APIRouter(tags=["chats"])
@@ -109,6 +110,76 @@ async def add_message_endpoint(workspace_id: str, chat_id: str, req: Request):
     if not msg:
         return JSONResponse(content={"error": "Chat not found"}, status_code=404)
     return JSONResponse(content=msg)
+
+
+@router.post("/api/workspaces/{workspace_id}/chats/{chat_id}/rewind")
+async def rewind_chat(workspace_id: str, chat_id: str, req: Request):
+    """Rewind to before one user message: files first, then the transcript.
+
+    The file restore is attempted before truncation and a conflict aborts the
+    whole operation (unless force), so a partial restore never silently drops
+    the conversation tail.
+    """
+    ws = get_workspace(workspace_id)
+    if not ws:
+        return JSONResponse(content={"error": "Workspace not found"}, status_code=404)
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse(content={"error": "invalid json"}, status_code=400)
+    message_id = str(body.get("message_id") or "")
+    force = bool(body.get("force", False))
+    restore_files = body.get("restore_files", True) is not False
+    if not message_id:
+        return JSONResponse(content={"error": "message_id is required"}, status_code=400)
+
+    try:
+        from server.store.run_tracker import snapshot as run_snapshot
+        if run_snapshot(chat_id=chat_id).get("running"):
+            return JSONResponse(
+                content={"error": "This chat is still running. Stop it before rewinding."},
+                status_code=409,
+            )
+    except Exception:
+        pass
+
+    chat = get_chat(ws["path"], chat_id)
+    if not chat:
+        return JSONResponse(content={"error": "Chat not found"}, status_code=404)
+    messages = chat.get("messages", [])
+    idx = next((i for i, m in enumerate(messages) if m.get("id") == message_id), None)
+    if idx is None:
+        return JSONResponse(content={"error": "Message not found"}, status_code=404)
+    removed_messages = messages[idx:]
+    user_message_ids = [m.get("id") for m in removed_messages
+                        if m.get("role") == "user" and m.get("id")]
+
+    restore = {"ok": True, "restored": [], "removed": [], "conflicts": []}
+    if restore_files and user_message_ids:
+        try:
+            from tools.checkpoints import restore_checkpoint
+            restore = restore_checkpoint(chat_id, ws["path"], user_message_ids, force=force)
+        except Exception as exc:  # noqa: BLE001 - report, never half-rewind silently
+            restore = {"ok": False, "restored": [], "removed": [],
+                       "conflicts": [f"file restore failed: {exc}"]}
+        if not restore.get("ok") and not force:
+            return JSONResponse(
+                content={
+                    "error": "Some files changed after this checkpoint. Retry with force=true to overwrite them.",
+                    "restore": restore,
+                },
+                status_code=409,
+            )
+
+    truncated = truncate_from_message(ws["path"], chat_id, message_id)
+    if not truncated:
+        return JSONResponse(content={"error": "Could not rewind this message"}, status_code=500)
+    return JSONResponse(content={
+        "ok": True,
+        "prompt": truncated.get("prompt", ""),
+        "removed": truncated.get("removed", []),
+        "restore": restore,
+    })
 
 
 @router.post("/api/workspaces/{workspace_id}/chats/{chat_id}/attachments")

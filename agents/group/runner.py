@@ -571,6 +571,15 @@ class LocalRunner(ItemRunner):
         except Exception as exc:  # noqa: BLE001 - a failed run is a result
             result = RunResult(item_id=ctx.item["id"], ok=False,
                                error=f"{type(exc).__name__}: {exc}")
+        try:
+            from server.services.canvas_watch import notify_run_finished
+            notify_run_finished(
+                str(getattr(ctx, "chat_id", "") or ""),
+                result.report if result.ok else result.error,
+                "completed" if result.ok else "failed",
+            )
+        except Exception:
+            pass
         with self._lock:
             self._results.setdefault(ctx.project_id, []).append(result)
 

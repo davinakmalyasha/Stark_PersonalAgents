@@ -157,7 +157,6 @@ _register(
             "ask_user",
             "update_plan",
             "browser_act",
-            "propose_plan",
             "files_changed",
             "look_at_screen",
             "set_screen_share",
@@ -192,7 +191,6 @@ _register(
             "browser_act",
             "ask_user",
             "update_plan",
-            "propose_plan",
         ),
         tier="workspace",
         history_ns="_general",
@@ -213,11 +211,10 @@ _register(
         tools=(
             "dfd_bridge",
             "create_client",
-            "create_project",
+            "create_coding_project",
             "run_command",
             "ask_user",
             "update_plan",
-            "propose_plan",
             "files_changed",
         ),
         tier="workspace",
@@ -234,25 +231,24 @@ _register(
         key="orchestrator",
         display="Orchestrator",
         tools=(
-            "create_project",
+            "create_coding_project",
             "ask_user",
             "delegate",
             "delegation_status",
             "job_message",
             "job_cancel",
-            "propose_plan",
-            # Group projects (Phase 4). `plan_execution` decides the SHAPE of a
-            # request; `group_update` is the single mutation entry point so the
-            # orchestrator's tool list does not grow by one per operation.
-            "plan_execution",
-            "create_group_project",
+            "create_group",
             "group_board",
             "group_item_detail",
             "group_events",
             "group_update",
+            "schedule",
+            "give_note",
+            "canvas_mode",
         ),
         tier="orchestrator",
         history_ns="",
+        thinking="high",
         description="Orchestrator — routes tasks to workspace agents",
         delegatable=False,
     )
@@ -483,7 +479,7 @@ def scope_map() -> dict[str, list[str]]:
 
     tools/_schemas._SCOPE_MAP is derived from this, so agent → tool ACLs live
     here only (adding/removing a tool for an agent changes one place).
-    Internal specs (Compactor) are excluded — they never execute warehouse tools.
+    Internal specs are excluded — they never execute warehouse tools.
     """
     out: dict[str, list[str]] = {}
     for key, spec in _all().items():

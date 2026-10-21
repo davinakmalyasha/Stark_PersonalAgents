@@ -33,8 +33,20 @@ function isShot(f: WorkspaceFileEntry): boolean {
   return f.type === 'file' && IMG_EXTS.has(extOf(f.path));
 }
 
-export default function DesignWorkspace() {
-  const session = useDesignSession();
+interface DesignWorkspaceProps {
+  /** Render inside the coding workspace instead of as a top-level route. */
+  embedded?: boolean;
+  initialWorkspaceId?: string;
+  initialChatId?: string;
+  onClose?: () => void;
+}
+
+export default function DesignWorkspace({ embedded = false, initialWorkspaceId, initialChatId, onClose }: DesignWorkspaceProps = {}) {
+  const session = useDesignSession({
+    workspaceId: initialWorkspaceId,
+    chatId: initialChatId,
+    embedded,
+  });
   const {
     workspaces, workspace, chatId, messages, isRunning,
     notification, files, usage, booted, bindWorkspace, send, cancel,
@@ -105,6 +117,10 @@ export default function DesignWorkspace() {
     : null;
 
   const goHome = () => {
+    if (embedded) {
+      onClose?.();
+      return;
+    }
     window.location.hash = '#/';
   };
   const openInCoding = () => {
@@ -179,7 +195,7 @@ export default function DesignWorkspace() {
           Design sessions write real files. Pick the project the UI work belongs to.
         </p>
         <div className="flex flex-col gap-1.5 w-full max-w-sm max-h-[40vh] overflow-y-auto">
-          {workspaces.map((w) => (
+          {workspaces.filter((w) => w.path && !w.isGeneral && !w.isHouse && !w.isPersonal).map((w) => (
             <button
               key={w.id}
               type="button"
@@ -210,7 +226,7 @@ export default function DesignWorkspace() {
   const hasProjectMemory = !!projectMemory;
 
   return (
-    <div className="fixed inset-0 flex min-h-0 bg-[#0a0a0d] text-zinc-200 select-none">
+    <div className={`${embedded ? 'absolute inset-0 z-50' : 'fixed inset-0'} flex min-h-0 bg-[#0a0a0d] text-zinc-200 select-none`}>
       {/* ── Left rail: versions + brand ── */}
       <aside className="w-[236px] shrink-0 border-r house-hairline bg-[#0d0d11]/70 flex flex-col min-h-0">
         <div className="flex items-center gap-1.5 px-2.5 pt-2.5 pb-2 shrink-0">

@@ -111,7 +111,7 @@ def restore_tools() -> None:
     """
     global _TOOLS_STUB
     current = sys.modules.get("tools")
-    if current is None or current is _TOOLS_STUB:
+    if current is None or current is _TOOLS_STUB or not hasattr(current, "__path__"):
         # Drop the stub and anything imported through it (e.g. a submodule the
         # stub briefly satisfied) so the real package re-imports cleanly.
         for name in [n for n in list(sys.modules)

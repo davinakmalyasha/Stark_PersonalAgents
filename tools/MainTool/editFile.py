@@ -543,7 +543,7 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
     # is silent and does NOT block the write (the existing git/dirty
     # path is the fallback for users who haven't enabled snapshots).
     try:
-        from tools.checkpoints import pre_write_snapshot
+        from tools.checkpoints import pre_write_snapshot, record_created
         from sync.state_sync import safe_get_state
         _state = safe_get_state() or {}
         _chat_id = _state.get("chat_id", "") or ""
@@ -552,14 +552,37 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
         _ws = _state.get("project_path") or WORKSPACE
         if ctx is not None:
             _ws = getattr(ctx, "project_path", None) or _ws
-        if _chat_id and file_path:
-            _rel = file_path
+
+        def _rel_of(path: str) -> str:
+            path = path or ""
             try:
-                if os.path.isabs(file_path) and _ws and str(file_path).startswith(str(_ws)):
-                    _rel = os.path.relpath(file_path, _ws)
+                if os.path.isabs(path) and _ws and str(path).startswith(str(_ws)):
+                    return os.path.relpath(path, _ws)
             except (OSError, ValueError):
-                _rel = file_path
-            pre_write_snapshot(_chat_id, _ws, _rel)
+                pass
+            return path
+
+        if _chat_id and _ws:
+            if file_path:
+                _rel = _rel_of(file_path)
+                _abs = file_path if os.path.isabs(file_path) else os.path.join(_ws, _rel)
+                if os.path.isfile(_abs):
+                    pre_write_snapshot(_chat_id, _ws, _rel)
+                else:
+                    record_created(_chat_id, _ws, _rel)
+            if diff:
+                for _kind, _raw_path, _body in _parse_patch_sections(diff):
+                    if not _raw_path:
+                        continue
+                    if _kind == "add":
+                        record_created(_chat_id, _ws, _rel_of(_raw_path))
+                    elif _kind in ("update", "delete"):
+                        pre_write_snapshot(_chat_id, _ws, _rel_of(_raw_path))
+                    elif _kind == "move":
+                        pre_write_snapshot(_chat_id, _ws, _rel_of(_raw_path))
+                        _dest = _body[0] if isinstance(_body, tuple) and _body else ""
+                        if _dest:
+                            record_created(_chat_id, _ws, _rel_of(str(_dest)))
     except Exception:
         pass
 

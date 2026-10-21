@@ -24,8 +24,6 @@ from server.store.chat_store import (
     delete_chat,
     add_message,
     update_chat_title,
-    get_chat_tasks,
-    save_chat_tasks,
 )
 from server.store.workspace_registry import (
     REGISTRY_PATH,
@@ -56,6 +54,6 @@ __all__ = [
     "cleanup_orphaned_chat_dirs", "init_default_workspace", "probe_environment",
     "get_workspace_rules_and_profile", "get_client_name",
     "list_chats", "create_chat", "get_chat", "find_chat_workspace_id", "save_chat", "delete_chat", "add_message",
-    "update_chat_title", "get_chat_tasks", "save_chat_tasks",
+    "update_chat_title",
     "get_mode",
 ]

@@ -370,7 +370,7 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "create_project",
+        "name": "create_coding_project",
         "description": "Create a NEW project: creates the folder (under D:\\MyProject, or under parent_root if given), registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background. The DFD agent MUST pass parent_root (the client folder under D:\\MyProject\\DFDClientProjects) so client projects always live inside the client root.",
         "parameters": {
             "type": "object",
@@ -425,39 +425,11 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "propose_plan",
-        "description": "Present the plan for the CURRENT plan-mode review. Plan mode is user-initiated via the prompt dock ONLY — never call this to start planning on your own, never suggest switching modes. Outside plan mode this is a no-op (use update_plan and keep working). The agent CANNOT change plan/build mode in either direction.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "explanation": {"type": "string", "description": "Short note shown above the plan (e.g. 'Here is the plan to fix the crash'). Keep to one line."},
-                "rationale": {"type": "string", "description": "Why this approach (1-3 sentences). Shown in the plan-review UI."},
-                "plan": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step": {"type": "string", "minLength": 1, "description": "Short, human-readable step. For settled jobs, prefix the reason when not successful."},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"]
-                            }
-                        },
-                        "required": ["step", "status"],
-                        "additionalProperties": False
-                    }
-                }
-            },
-            "required": ["plan"]
-        }
-    },
-    {
         "name": "delegate",
         "description": (
             f"Spawn one or more workspace agents ({_DELEGATE_AGENTS_TEXT}) IN PARALLEL. "
             "Every item gets its own visible chat; final replies arrive as [DELEGATION RESULT] events while you keep coordinating.\n\n"
-            "BRIEF — you define WHAT, never HOW. Each item carries outcome (what Sir gets when it is done, in Sir's terms) and acceptance (how success will be judged — observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if Sir named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each — if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\n"
+            "BRIEF — you define WHAT, never HOW. Each item carries outcome (what the user gets when it is done, in the user's terms) and acceptance (how success will be judged — observable evidence). Never prescribe libraries, frameworks, architecture, step lists, file-by-file plans, or design direction; the specialist is the pro and owns the method (it may deviate and must report deviations). Name a command in acceptance only if the user named it or it is the project's standard entry point; otherwise describe the behavior and let the specialist choose the proof. One or two lines each — if they get long, you are doing the specialist's job. Method reminders are added to the task automatically; do not write them yourself.\n\n"
             "BATCHING — per user turn: put EVERY independent job from the current request into a SINGLE delegate(items=[...]) call. "
             f"Any agent mix is allowed and runs in parallel — solo scope ({_DELEGATE_SOLO}) or mixed ({_DELEGATE_MIXED}). "
             "The sole batching criterion is independence. If job B needs job A's output, do NOT bundle B with A: delegate A first, wait for its [DELEGATION RESULT], then delegate B with A's result in the task. Never split a single request across multiple delegate calls for tidiness or sequencing — one call, all independent items.\n\n"
@@ -478,8 +450,8 @@ TOOL_DEFINITIONS = [
                         "properties": {
                             "agent": {"type": "string", "enum": _DELEGATE_ENUM, "description": _DELEGATE_AGENT_DESC},
                             "task": {"type": "string", "description": "Complete, self-contained instruction: goal, relevant paths/targets, constraints. The agent sees only this text. Context, not method — do not prescribe step-by-step process (use outcome/acceptance for the WHAT)."},
-                            "outcome": {"type": "string", "description": "What Sir gets when this job is done — the visible result, in Sir's terms, 1-2 sentences. WHAT, never HOW: no libraries, frameworks, architecture, step lists, or design direction. Real paths Sir named are fine as targets; invented ones are not."},
-                            "acceptance": {"type": "string", "description": "How success will be judged — observable evidence (a behavior, a result, something that must exist or respond). Not internals. Name a command only if Sir named it or it is the project's standard entry point. The specialist chooses how to meet and prove it."},
+                            "outcome": {"type": "string", "description": "What the user gets when this job is done — the visible result, in the user's terms, 1-2 sentences. WHAT, never HOW: no libraries, frameworks, architecture, step lists, or design direction. Real paths the user named are fine as targets; invented ones are not."},
+                            "acceptance": {"type": "string", "description": "How success will be judged — observable evidence (a behavior, a result, something that must exist or respond). Not internals. Name a command only if the user named it or it is the project's standard entry point. The specialist chooses how to meet and prove it."},
                             "timeout": {"type": "integer", "minimum": 0, "description": "Wall-clock seconds before the job is aborted and marked FAILED (default 3600; 0 = no limit). Fresh jobs only."},
                             "title": {"type": "string", "description": "Short label for the delegation chat (e.g. 'Space game · Dev')."},
                             "chat_id": {"type": "string", "description": "Omit for a new chat. Set ONLY with a chat_id surfaced by an earlier [DELEGATION RESULT] in this session — never guess. Unknown ids silently start a new chat."},
@@ -529,7 +501,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "job_message",
-        "description": "Steer a RUNNING delegation mid-flight when Sir adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.",
+        "description": "Steer a RUNNING delegation mid-flight when the user adds scope or changes direction. Fresh jobs: mirrored into the job chat + queued on its steering channel. Resume jobs: queued on the durable Dev child (FIFO). Only works while the job is running — otherwise delegate a follow-up. Never blocks.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -541,12 +513,12 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "job_cancel",
-        "description": "Cancel ONE running delegation when Sir says stop. Fresh jobs: cooperative abort of the job chat. Resume jobs: interrupt of the durable Dev child. Settles the entry as CANCELLED and reports back as a [DELEGATION RESULT]. Already-settled jobs are a no-op.",
+        "description": "Cancel ONE running delegation when the user says stop. Fresh jobs: cooperative abort of the job chat. Resume jobs: interrupt of the durable Dev child. Settles the entry as CANCELLED and reports back as a [DELEGATION RESULT]. Already-settled jobs are a no-op.",
         "parameters": {
             "type": "object",
             "properties": {
                 "job_id": {"type": "string", "description": "Job id (del-xxxx) from delegate or delegation_status."},
-                "reason": {"type": "string", "description": "One-clause reason shown in the wrap-up (default: cancelled by Sir)."}
+                "reason": {"type": "string", "description": "One-clause reason shown in the wrap-up (default: cancelled by the user)."}
             },
             "required": ["job_id"]
         }
@@ -666,39 +638,12 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "plan_execution",
-        "description": (
-            "Decide the SHAPE of a request before starting anything: solo, group, or "
-            "scheduled. Use when a request might be more than one self-contained "
-            "action — several dependent steps, more than one kind of expertise, or "
-            "work that should continue after this conversation ends. Typical signals: "
-            "'sort out', 'reconcile', 'audit', 'end to end', 'get this done by Friday', "
-            "'figure out why ... and fix it'. "
-            "Do NOT use for a single self-contained request ('rename these files') or "
-            "for recurring work ('every morning check X') — the first is `solo`, the "
-            "second is `scheduled` and belongs to the task scheduler. "
-            "Always call this BEFORE create_group_project. Returns the shape, a "
-            "rationale, a proposed environment, and a plan preview."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "goal": {"type": "string", "description": "What the user wants, in their words."},
-                "horizon": {"type": "string", "enum": ["minutes", "hours", "days"], "description": "How long the work is expected to take."},
-                "reversible": {"type": "boolean", "description": "Can every step be undone inside the project folder?"},
-                "needs_human": {"type": "boolean", "description": "Will any step need a decision only the user can make?"},
-                "constraints": {"type": "string", "description": "Deadline, budget, or anything that must not be touched."}
-            },
-            "required": ["goal"]
-        }
-    },
-    {
-        "name": "create_group_project",
+        "name": "create_group",
         "description": (
             "Start a durable project that keeps working until it is done, across "
             "sessions and restarts, with its own folder, agents, tasks and board. "
-            "Use ONLY after plan_execution returned shape=group and the user agreed "
-            "to the preview. Do NOT use for a single self-contained request or for "
+            "Use when the goal is genuinely durable and multi-step. "
+            "Do NOT use for a single self-contained request or for "
             "recurring work. "
             "Pass structured milestones and members — do not hand-write a manifest. "
             "Returns the project id and folder path; the effects are queued, so "
@@ -789,6 +734,72 @@ TOOL_DEFINITIONS = [
             "required": ["project_id", "op"]
         }
     },
+    {
+        "name": "schedule",
+        "description": (
+            "Create a time-triggered wake for THIS orchestrator chat. When due, it appends "
+            "a scheduled message and wakes the orchestrator even if the user has not spoken. "
+            "Use for one-off alarms ('check the agents at 3pm') and recurring checks. "
+            "This is the only way to create a schedule; there is no manual task UI."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "cancel"], "default": "create"},
+                "name": {"type": "string", "description": "Short label, e.g. 'check agent work'."},
+                "at": {"type": "string", "description": "ISO timestamp or HH:MM for the first run."},
+                "prompt": {"type": "string", "description": "Instruction delivered to the orchestrator; defaults to name."},
+                "recurrence": {"type": "string", "description": "none | daily | weekly | monthly | interval-<minutes>"},
+                "schedule_id": {"type": "string", "description": "For cancel."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "give_note",
+        "description": (
+            "Create or maintain a sticky note for a chat or group project. Notes are "
+            "orchestrator-owned memory and UI checklists, not work items. Use todos for "
+            "a checklist. Target is chat:<id> or group:<id>; omit it to use this chat."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "update", "remove", "list"], "default": "create"},
+                "target": {"type": "string", "description": "chat:<chat_id> or group:<project_id>."},
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "todos": {"type": "array", "items": {"type": "string"}, "description": "Checklist items."},
+                "note_id": {"type": "string", "description": "Existing note id for update/remove."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "canvas_mode",
+        "description": (
+            "Watch selected agent chats and wake the orchestrator when one finishes or fails. "
+            "The orchestrator can choose one chat, several, or all agent chats. While active, "
+            "a completion arrives as [CANVAS EVENT]; use canvas_mode read for the work snapshot "
+            "and canvas_mode message to send a follow-up to a watched chat. Exit when done. "
+            "This reads work state, never card coordinates."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["available", "enter", "status", "read", "message", "exit"], "default": "status"},
+                "mode": {"type": "string", "enum": ["single", "multiple", "all"], "default": "all"},
+                "targets": {"type": "array", "items": {"type": "string"}, "description": "Chat ids or group:<id> values."},
+                "wake_on": {"type": "array", "items": {"type": "string"}, "description": "completed, failed, approval, stalled"},
+                "max_actions": {"type": "integer", "default": 20},
+                "until": {"type": "string", "description": "Optional ISO expiry."},
+                "target": {"type": "string", "description": "Chat id for action=message."},
+                "message": {"type": "string", "description": "Follow-up text for action=message."}
+            },
+            "required": []
+        }
+    },
+
 ]
 
 _TOOL_DOCS = {
@@ -813,10 +824,13 @@ _TOOL_DOCS = {
     "delegation_status": "delegation_status(id?, wait_seconds?, status?) — Board of this session's delegations (queued/running/done/failed/cancelled) with chats and elapsed time; id=<del-id> drills into one job's full evidence (task, outcome, acceptance, full artifact report, recent chat, file digest).",
     "job_message": "job_message(job_id, message) — Steer a RUNNING delegation mid-flight (fresh: steering channel; resume: durable Dev FIFO). Running jobs only; never blocks.",
     "job_cancel": "job_cancel(job_id, reason?) — Cancel ONE running delegation (fresh: abort; resume: interrupt). Reports back as [DELEGATION RESULT] CANCELLED.",
+    "schedule": "schedule(action?, name?, at?, prompt?, recurrence?, schedule_id?) — Create/list/cancel a time-triggered wake for this orchestrator chat. When due it appends a scheduled message and wakes the orchestrator. recurrence: none|daily|weekly|monthly|interval-<minutes>. No manual task UI.",
+    "give_note": "give_note(action?, target?, title?, body?, todos?, note_id?) — Orchestrator-owned sticky note/checklist for chat:<id> or group:<id>. Actions create/update/remove/list. Notes are memory, not work items.",
+    "canvas_mode": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) — Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching.",
     "call_subagent": "call_subagent(name, task, action?, child_id?, message?, wait_seconds?) — Specialist subagent lifecycle: run (block) / spawn (background) / status / message / stop / list (e.g. UI for browser verification).",
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
     "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
-    "create_project": "create_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
+    "create_coding_project": "create_coding_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
     "update_plan": "update_plan(explanation?, plan?, ops?) — Maintain the task plan. FULL replacement: always send every step (at most one in_progress), or patch small tweaks via ops=[{op: add|set_status|rename|remove, match?, step?, status?}] (mutually exclusive with plan).",
     "house_get_state": "house_get_state() — Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question.",
     "house_get_device": "house_get_device(device_id) — One device's state, capabilities, room, online status.",
@@ -825,8 +839,7 @@ _TOOL_DOCS = {
     "house_get_history": "house_get_history(device_id, hours?) — Mock hourly kWh usage series for a device (max 168h).",
     "dfd_bridge": "dfd_bridge(action?, id?, orderId?, payload?, path?, method?, url?, timeout?) — Call the DFD Agency API bridge (NON-MONEY): leads, orders, milestones, notes, activities, client requests, projects, articles, whatsapp. Named actions (lead_list, order_get, milestone_create, note_create, activity_create, request_update, project_update, article_create, whatsapp_send) or raw method+url.",
     "create_client": "create_client(business_name, vertical, features?, whatsapp?, domain?, approved_by?, order_id?) — Create client scaffold under D:\\MyProject\\DFDClientProjects\\<slug>\\ (client.json + progress.md + mem/). REQUIRES explicit owner approval (approved_by).",
-    "plan_execution": "plan_execution(goal, horizon?, reversible?, needs_human?, constraints?) — Decide the SHAPE of a request: solo | group | scheduled, with a rationale, a proposed environment and a plan preview. Call BEFORE create_group_project. NOT for a single self-contained request (solo) or recurring work (scheduled).",
-    "create_group_project": "create_group_project(goal, milestones, members?, autonomy?, completion?, budget_usd?, deadline?, skills?, mcp?, project_id?) — Start a durable project that runs until done, across restarts. Only after plan_execution returned shape=group and the user agreed. Every item needs acceptance criteria. Queued; follow with group_board.",
+    "create_group": "create_group(goal, milestones, members?, autonomy?, completion?, budget_usd?, deadline?, skills?, mcp?, project_id?) — Start a durable project that runs until done, across restarts. Create only when the goal is genuinely durable; the orchestrator decides with high reasoning. Every item needs acceptance criteria. Queued; follow with group_board.",
     "group_board": "group_board(project_id) — Milestones, items, statuses, spend, and what is waiting on a human. Read-only, immediate.",
     "group_item_detail": "group_item_detail(project_id, item_id) — One item in full: attempts, latest result, and its acceptance criteria (why it passed or failed).",
     "group_events": "group_events(project_id, since?, limit?) — The project's event log in order: every state change, actor, and time. Use to explain what happened while the user was away.",
@@ -874,11 +887,11 @@ def _scope_allowed(scope: Optional[str]) -> set[str] | None:
     if scope and scope.lower() in _SCOPE_MAP:
         allowed = set(_SCOPE_MAP[scope.lower()])
         if os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1" and scope.lower() == "developer":
-            # Headless eval has no human dock: ask_user/propose_plan are always
+            # Headless eval has no human dock: ask_user is always
             # removed. update_plan is the production planning surface and stays
             # available in long-horizon mode (BSA_FULL_DEV_TOOLS=1) where the
             # completion gate keys off the LLM-maintained plan.
-            allowed.difference_update({"ask_user", "propose_plan"})
+            allowed.difference_update({"ask_user"})
             if os.environ.get("BSA_FULL_DEV_TOOLS", "0") != "1":
                 allowed.difference_update({"update_plan"})
 
@@ -888,7 +901,7 @@ def _scope_allowed(scope: Optional[str]) -> set[str] | None:
     return narrowed if allowed is None else (allowed & narrowed)
 
 
-_EVAL_BLOCKED_TOOLS = {"ask_user", "propose_plan"}
+_EVAL_BLOCKED_TOOLS = {"ask_user"}
 
 
 def _eval_blocked(name: str) -> bool:

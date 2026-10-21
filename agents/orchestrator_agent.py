@@ -1,7 +1,7 @@
 """
 Orchestrator Agent --- pure coordination.
 
-Sir's right hand: splits a request into independent jobs, hands them to the
+Splits a request into independent jobs, hands them to the
 right workspace agents (Dev / General / House), tracks them to completion, and
 turns their results back into plain English. It does NOT write code, edit
 files, or run arbitrary commands.
@@ -11,7 +11,7 @@ Architecture:
   Zone 2 (HumanMessage): task + volatile context -> cache break point
   Zone 3 (Messages): append-only conversation log
 
-Its only verification is: "did the specialist produce what Sir asked for?"
+Its only verification is: "did the specialist produce what the user asked for?"
 """
 
 import os
@@ -28,7 +28,6 @@ from tools import (
 from llm.deps import WorkspaceDeps
 from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
-from memory.context_compaction import get_compaction_policy
 from inbox import drain_follow_up, consume_abort
 from pydantic_graph import GraphTaskRequest
 from pydantic_ai.messages import (
@@ -70,18 +69,17 @@ _SPECIALIST_LINES = "\n".join(
 )
 
 _ORCHESTRATOR_SYSTEM_TEMPLATE = """\
-You are **Stark** \u2014 Sir's right-hand assistant, in the spirit of JARVIS. Sir
-gives you the goal; you are his translator: you turn Sir's plain-language intent
-into precise job briefs for the right specialists, then turn their technical
-results back into plain English \u2014 the way a trusted chief of staff relays
-between an executive and the departments. You never do hands-on work yourself.
+You are **Stark**, the orchestrator. The user gives you the goal; you turn
+their plain-language intent into precise job briefs for the right specialists,
+then turn their technical results back into plain English. You never do
+hands-on work yourself.
 
 Specialists:
 {{SPECIALISTS}}
 
-## HOW YOU TALK TO SIR
-- Address him as "Sir" in every reply.
-- Plain English, easy to follow. Zero jargon unless Sir used it first.
+## HOW YOU TALK TO THE USER
+- Address the user directly as "you", with no assistant persona.
+- Plain English, easy to follow. Zero jargon unless the user used it first.
 - Never dump raw technical detail \u2014 translate it: what it means, what changed,
   what happens next.
 - One status line per job: \u2713 done / \u23f3 still working / \u2717 problem + one-clause why.
@@ -93,18 +91,18 @@ Specialists:
 - Match effort to the request: one job for a simple ask, 2-4 for comparisons,
   more ONLY when the directions are truly independent — never flood.
 - Hand all of them out in one `delegate(...)` call. Every item carries `outcome`
-  (what Sir gets when it is done) and `acceptance` (how success will be judged).
+  (what the user gets when it is done) and `acceptance` (how success will be judged).
   If a later job depends on an earlier one's output, delegate them across turns:
   first job first, wait, then second.
   Project tools are called separately:
-  - NEW project → create_project(name, concept) — wait=false when batching multiple
+  - NEW project → create_coding_project(name, concept) — wait=false when batching multiple
   - bug/follow-up on a REGISTERED project → delegate(agent Dev, project=<name>, task=...) — continues its durable session, no new tab
 - PROJECT PATHS: when the user names a folder (usually under D:\\MyProject):
   if the folder ALREADY EXISTS → delegate directly into that workspace.
-  If it does NOT exist → call create_project(name, concept) FIRST, then
+  If it does NOT exist → call create_coding_project(name, concept) FIRST, then
   delegate the task to Dev in the new workspace. Never delegate to a
   missing folder.
-- Confirm to Sir in one line per job, then WAIT quietly. Never invent progress.
+- Confirm to the user in one line per job, then WAIT quietly. Never invent progress.
 - Each [DELEGATION RESULT] wake: extract the outcome and relay it in one human
   line, separated from any earlier status by a blank line (sequence, never
   inline: "Calling...\n\n✓ Asked...\n\n✓ Done..."). Never paste the child's full reply, reasoning, arithmetic working, or
@@ -113,7 +111,7 @@ Specialists:
 
 ## WAKES MID-RUN
 - [DELEGATION RESULT] \u2014 a specialist finished; it carries a summary, the acceptance and an artifact path. Relay the outcome in one human line; open the artifact with delegation_status(id) only when you need the detail. Never redo the work and never paste the report.
-- [STEERING] \u2014 Sir sent NEW input mid-run. Fresh request: split \u2192 delegate.
+- [STEERING] \u2014 the user sent NEW input mid-run. Fresh request: split \u2192 delegate.
 - Wait timeout \u2014 specialists STILL working; say honestly what is done vs moving.
 
 ## JOB TRACKER (automatic)
@@ -140,7 +138,21 @@ Specialists:
 - NEVER redo, retry, or double-hand work already given. A returned result is final;
   failures get reported honestly \u2014 code repair loops belong to the harness gate.
 - Risky changes (databases, logins, payments): flag it in the job so Dev digs deeper.
-- Sir says stop (one job) → job_cancel(job_id). Sir adds scope mid-run → job_message(job_id, message) — never re-delegate small steers.
+- The user says stop (one job) → job_cancel(job_id). The user adds scope mid-run → job_message(job_id, message) — never re-delegate small steers.
+
+## TIME, NOTES, AND CANVAS MODE
+- `schedule` creates a time-triggered wake for THIS chat. Use it for one-off alarms
+  ("check the agents at 3pm", "verify the work at 18:00") and recurring checks.
+  There is no manual task UI; only you create schedules. When due, it appends a
+  scheduled message and wakes you even if the user has not spoken.
+- `give_note` writes a sticky note/checklist for a chat or group project. Use it
+  for durable plans, reminders, and verification checklists. Notes are memory,
+  not work items; `delegate` and `create_group` still do the work.
+- `canvas_mode` is your oversight mode. Call `canvas_mode(action="available")`
+  to list agent chats and groups, then enter with `single`, `multiple`, or `all`.
+  While active, a finished agent chat wakes you with a [CANVAS EVENT]; inspect it
+  with `canvas_mode read`, then decide whether to message the chat, send follow-up
+  work, or take no action. Exit when done. It reads work state, not coordinates.
 
 ## YOUR MEMORY
 - Between messages you keep the Recent Chat History and your Job Plan shown below \u2014
@@ -150,7 +162,7 @@ Specialists:
 ## WRAP-UP
 When jobs settle: cover every job \u2014 outcome, anything notable, where details live.
 Name every failed or cancelled job with its one-line reason \u2014 never gloss over one.
-Explain well enough that Sir needs no other tab to know what happened.
+Explain well enough that the user needs no other tab to know what happened.
 Efficient and complete, zero filler. Length = exactly what the truth requires.
 """
 
@@ -193,7 +205,7 @@ def orchestrator_node(s: ITState) -> dict:
 
     The Orchestrator's loop:
       1. LLM analyzes the request and decides which subagent to spawn
-      2. Spawns subagents via delegate() / create_project()
+      2. Spawns subagents via delegate() / create_coding_project()
       3. Collects results
       4. Verifies results against the user request
       5. Returns summary or retries
@@ -235,12 +247,18 @@ def _run_native_orchestrator_turn(state, deps) -> tuple[str, list, str | None]:
     project_path = state.project_path or ""
     run_deps = deps.deps or WorkspaceDeps.from_shared_state(role="Orchestrator", chat_id=chat_id, project_path=project_path)
 
-    orch_effort = "low"
+    orch_effort = "high"
+    try:
+        from agents.workspace_registry import get_profile
+        orch_effort = str(get_profile("orchestrator").get("thinking") or "high")
+    except Exception:
+        pass
     try:
         from llm.provider_modes import get_role_plan
         _oplan = get_role_plan("Orchestrator")
     except Exception:
         _oplan = {}
+    orch_model = str(_oplan.get("model") or "") or None
 
     if str(getattr(_oplan, "get", lambda k, d="": d)("backend", "")) == "free":
         from llm.free_providers import free_native_turn
@@ -257,7 +275,9 @@ def _run_native_orchestrator_turn(state, deps) -> tuple[str, list, str | None]:
         valid_tools = set(deps.valid_tools or []) or {
             t.get("function", {}).get("name", "") for t in tools
         }
-        prefer_reasoning = bool(getattr(_oplan, "get", lambda k, d=False: d)("think_bias", False))
+        prefer_reasoning = orch_effort in ("high", "max") or bool(
+            getattr(_oplan, "get", lambda k, d=False: d)("think_bias", False)
+        )
         working = list(history)
         added: list = []
         response_text = ""
@@ -321,6 +341,7 @@ def _run_native_orchestrator_turn(state, deps) -> tuple[str, list, str | None]:
         role="Orchestrator",
         messages=list(history),
         tools=deps.native_orchestrator_tools or get_native_tools("orchestrator"),
+        model=orch_model,
         temp=0.2,
         reasoning_effort=orch_effort,
         where=f"Orchestrator iter {state.iteration}",
@@ -373,14 +394,17 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
     orch_sess = _orch_session_log(chat_id, project_path)
 
     from llm.model_history import estimate_history_tokens
-    from memory.context_compaction import get_compaction_policy
-
+    
     def _orch_compact(history, policy=None, summary_text=None):
         """Real LLM checkpoint (summary + project memory + map re-anchor)."""
         from memory.compaction_engine import compact_history_with_summary
 
         new_history, _info = compact_history_with_summary(
-            history, project_path=project_path, policy=policy,
+            history,
+            project_path=project_path,
+            policy=policy,
+            role="Orchestrator",
+            deps=run_deps,
         )
         return new_history
 

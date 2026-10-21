@@ -16,12 +16,13 @@ interface Props {
   onCloseSubagent?: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
+  onRewind?: (message: ChatMessage) => void;
   /** Kept for compat — empty state is now fixed to "What to do Boss?" */
   emptyTitle?: string;
   emptyHint?: string;
 }
 
-export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
+export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
@@ -134,9 +135,9 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
             <p className="text-[19px] font-medium tracking-tight text-white">What to do Boss?</p>
           </div>
         ) : (
-          <div ref={contentRef} className="max-w-[1100px] mx-auto min-h-[60vh] flex flex-col justify-start" style={{ width: '100%' }}>
+          <div ref={contentRef} className="max-w-[1100px] mx-auto flex flex-col justify-start" style={{ width: '100%' }}>
             {orderedMessages.map((msg) => (
-              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} />
+              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} onRewind={onRewind} />
             ))}
           </div>
         )}

@@ -1,10 +1,9 @@
 """Compaction policy (single shared budget) — P0-LLM.
 
-The old single-checkpoint engine (select_tail_indices / checkpoint_compact /
-compact_history / free-pool compactor) is deleted: agents now use
-``llm.model_history.compact_history_native`` + ``llm.compaction_native``
-(ProcessHistory capability). This module keeps only the shared policy knobs
-plus ``truncation_note`` for clipped tool outputs.
+Agents use ``llm.model_history.compact_history_native`` +
+``llm.compaction_native`` (ProcessHistory capability) with one same-model
+summary. This module keeps only the shared policy knobs plus
+``truncation_note`` for clipped tool outputs.
 """
 import os
 import re
@@ -15,13 +14,13 @@ from dataclasses import dataclass
 class CompactionPolicy:
     """One append-only/checkpoint budget shared by all agents.
 
-    Defaults: trigger 400k / hard gate 440k / summary 4096. Env overrides:
+    Defaults: trigger 500k / hard gate 550k / summary 4096. Env overrides:
     COMPACTION_* or <ROLE>_COMPACTION_*.
     """
 
     role: str = "developer"
-    checkpoint_trigger: int = 400_000
-    hard_limit: int = 440_000
+    checkpoint_trigger: int = 500_000
+    hard_limit: int = 550_000
     summary_output_tokens: int = 4_096
 
 
@@ -47,8 +46,8 @@ def get_compaction_policy(role: str = "developer") -> CompactionPolicy:
 
     return CompactionPolicy(
         role=role,
-        checkpoint_trigger=setting("CHECKPOINT_TOKENS", 400_000),
-        hard_limit=setting("HARD_LIMIT", 440_000),
+        checkpoint_trigger=setting("CHECKPOINT_TOKENS", 500_000),
+        hard_limit=setting("HARD_LIMIT", 550_000),
         summary_output_tokens=setting("SUMMARY_OUTPUT_TOKENS", 4_096),
     )
 

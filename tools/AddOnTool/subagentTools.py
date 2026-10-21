@@ -594,7 +594,9 @@ def _maybe_compact_free(name: str, messages: list, backend: str) -> None:
         from tools import shared_state
 
         project_path = str(shared_state.get("project_path") or "")
-        engine = _run_coro_blocking(run_compaction_summary(list(messages), project_path)) or {}
+        engine = _run_coro_blocking(run_compaction_summary(
+            list(messages), project_path, role=str(name or "developer"), backend="free"
+        )) or {}
         summary = str(engine.get("summary") or "")
         if not summary:
             print(f"[SUBAGENT] {name}: compaction produced no summary — keeping transcript")
@@ -610,7 +612,7 @@ def _maybe_compact_free(name: str, messages: list, backend: str) -> None:
         messages[:] = compacted
         print(
             f"[SUBAGENT] {name}: compacted transcript "
-            f"({engine.get('chunks', 0)} chunk(s), via {engine.get('model')}, "
+            f"(one-pass via {engine.get('model')}, "
             f"window {engine.get('window')})"
         )
     except Exception as e:

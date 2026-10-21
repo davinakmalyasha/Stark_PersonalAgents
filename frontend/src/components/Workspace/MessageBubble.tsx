@@ -21,6 +21,7 @@ interface Props {
   onCloseSubagent?: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: () => void;
+  onRewind?: (message: ChatMessage) => void;
 }
 
 /** Pick an icon for tool calls based on the tool name */
@@ -209,7 +210,7 @@ function ThinkingPlaceholder() {
   );
 }
 
-export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
+export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -239,6 +240,8 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
   const showTrace = !!message.metadata?.isTrace && (activitySegments.length > 0 || hasRenderableTraceSteps);
   const wasStopped = !!message.metadata?.stopped;
   const usageMeta = message.metadata?.usage as { total_input_tokens?: number; total_output_tokens?: number; total_cost?: number } | undefined;
+  const isScheduledWake = !!message.metadata?.scheduledWake;
+  const isCanvasEvent = !!message.metadata?.canvasEvent;
 
   return (
     <div className={`group ${isUser ? 'msg-user-enter' : isAgent ? 'msg-agent-enter' : 'animate-fade-in'}`} style={{ marginBottom: '24px' }}>
@@ -251,6 +254,11 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             className="max-w-[85%] text-[15.5px] text-zinc-100 leading-relaxed user-message-premium"
             style={{ padding: '10px 16px', borderRadius: '14px' }}
           >
+            {(isScheduledWake || isCanvasEvent) && (
+              <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-amber-300/80">
+                {isScheduledWake ? 'Scheduled wake' : 'Canvas event'}
+              </div>
+            )}
             {message.content && <Markdown content={message.content} />}
             {Array.isArray(message.metadata?.attachments) && <div className="message-attachments">
               {(message.metadata.attachments as ChatAttachment[]).map((file) => <div className="message-attachment" key={file.id}>
@@ -258,6 +266,19 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
               </div>)}
             </div>}
           </div>
+        </div>
+      )}
+      {isUser && onRewind && (
+        <div className="flex justify-end -mt-2 mb-1">
+          <button
+            type="button"
+            onClick={() => onRewind(message)}
+            title="Rewind to before this message — restores files and puts the text back in the prompt"
+            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-zinc-600 opacity-0 transition-opacity hover:text-zinc-300 hover:bg-white/[0.06] group-hover:opacity-100 cursor-pointer"
+          >
+            <RotateCcw size={10} />
+            Rewind here
+          </button>
         </div>
       )}
 

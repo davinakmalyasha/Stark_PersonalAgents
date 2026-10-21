@@ -34,8 +34,8 @@ function containsText(segments: StreamSegment[], text: string): boolean {
  * Keep that data readable without pretending it was two backend messages.
  */
 function splitHandoffText(text: string): { handoff: string; answer: string } | null {
-  // Codex-style boundary: allow "Done, Sir —", "Done —", "Completed: ..." etc.
-  const match = text.match(/(?:✓\s*)?(?:done|completed)\b[^—–:\n]{0,30}[—–:\-]/i);
+  // Codex-style boundary: allow "Done —", "Completed: ..." etc.
+  const match = text.match(/(?:✓\s*)?(?:done|completed)\b[^—–:\n]{0,30}[—–:-]/i);
   if (!match || typeof match.index !== 'number' || match.index <= 0) return null;
 
   const handoff = text.slice(0, match.index).trim();
@@ -59,9 +59,9 @@ export function formatFinalSequence(text: string): string {
   }
   let out = (text || '').trim();
   if (!out) return out;
-  // "Sir.✓ Asked" / "lands, Sir.✓ Done" -> blank line before ✓
+  // "Asked.✓ Done" / "Working.✓ Done" -> blank line before ✓
   out = out.replace(/(?<!\n)\s*(✓\s*(?:asked|done|completed|handed|sent|relayed|working|waiting)\b)/gi, '\n\n$1');
-  // Fallback when no ✓: "..., Sir. Done, Sir — ..." -> break before Done/Completed
+  // Fallback when no ✓: "..., done. Done — ..." -> break before Done/Completed
   if (!/✓/.test(out)) {
     out = out.replace(/([.!?]["”']?\s+)(Done\b[^.!?]*?[—–:-])/g, '$1\n\n$2');
   }

@@ -106,7 +106,7 @@ def _resolve_llm_provider() -> dict:
             "flash": os.getenv("COMMAND_CODE_MODEL_FLASH", "deepseek/deepseek-v4.1-flash"),
             "pro": os.getenv("COMMAND_CODE_MODEL_PRO", "deepseek/deepseek-v4.1-flash"),
             "vision": os.getenv("COMMAND_CODE_MODEL_VISION", "deepseek/deepseek-v4.1-flash"),
-            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "xiaomi/mimo-v2.6-flash"),
+            "orch": os.getenv("COMMAND_CODE_MODEL_ORCH", "deepseek/deepseek-v4.1-flash"),
             "light": os.getenv("COMMAND_CODE_MODEL_LIGHT", "poolside/laguna-s-2.1-free"),
             "audio": os.getenv("COMMAND_CODE_MODEL_AUDIO", "xiaomi/mimo-v2.5"),
         }

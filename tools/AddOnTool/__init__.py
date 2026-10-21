@@ -91,6 +91,10 @@ from .delegationTools import (
     job_cancel,
 )
 
+from .scheduleTools import schedule
+from .noteTools import give_note
+from .canvasTools import canvas_mode
+
 from .dfdBridge import dfd_bridge
 
 from .screenTools import look_at_screen, set_screen_share
@@ -164,6 +168,9 @@ __all__ = [
     'delegation_status',
     'job_message',
     'job_cancel',
+    'schedule',
+    'give_note',
+    'canvas_mode',
     'dfd_bridge',
     'look_at_screen',
     'set_screen_share',

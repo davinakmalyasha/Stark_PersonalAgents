@@ -846,12 +846,15 @@ def developer_node(s: ITState) -> dict:
             est = estimate_history_tokens(history)
             if est >= compaction_policy.checkpoint_trigger:
                 before = est
-                # Codex-parity compaction: full-transcript LLM summary (chunked
-                # to fit the pinned compactor window), project.md checker, map
-                # re-anchor. Never raises; deterministic fallback on failure.
+                # One same-model handoff summary; project.md and the map are
+                # re-anchored fresh. Never raises; deterministic fallback on failure.
                 from memory.compaction_engine import compact_history_with_summary
                 history, _engine_info = compact_history_with_summary(
-                    history, project_path=project_path, policy=compaction_policy
+                    history,
+                    project_path=project_path,
+                    policy=compaction_policy,
+                    role="Developer",
+                    deps=run_deps,
                 )
                 after = estimate_history_tokens(history)
                 compaction_info = {
@@ -860,14 +863,12 @@ def developer_node(s: ITState) -> dict:
                     "before": before,
                     "after": after,
                     "map_refreshed": bool(_engine_info.get("full_map")),
-                    "summary_chunks": int(_engine_info.get("chunks") or 0),
+                    "summary_chunks": 1,
                 }
                 _log(
                     f"[DEVELOPER] Native checkpoint "
                     f"({before:,} -> {after:,} est. tokens; "
-                    f"chunks={_engine_info.get('chunks', 0)} "
-                    f"ledgers={_engine_info.get('ledgers', 0)} "
-                    f"trimmed={_engine_info.get('trimmed', 0)}; "
+                    f"one_pass=True; "
                     f"map_refreshed={bool(_engine_info.get('full_map'))})"
                 )
         except Exception as e:

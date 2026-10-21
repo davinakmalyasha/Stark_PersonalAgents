@@ -4,10 +4,11 @@ Just plumbing: load workspace context → run agent → stream output.
 """
 import os
 
-from sync.state_sync import shared_state, safe_update_state, safe_get_state, state_lock, safe_append_live_log
+from sync.state_sync import safe_update_state, safe_get_state, safe_append_live_log
 
 
-def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: str = "", cancel_event=None):
+def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: str = "", cancel_event=None,
+                       force_orchestrator: bool = False):
     """Runs the agentic graph and yields shared_state after each step.
     The caller already resolves "continue" etc. — we just load context and run."""
     from sync.sync_helpers import (
@@ -19,12 +20,13 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
     # Dev direct bypass (zero relay tokens); creation still goes to orchestrator LLM.
     # House/Personal hints are ignored here (Telegram uses workspace_path only).
     try:
-        from routing.router import decide_route
-        decision = decide_route(client_request, workspace_path or "", chat_id or "", "")
-        if decision.get("kind") == "project_dev" and decision.get("project"):
-            from agents.project_router import stream_direct
-            yield from stream_direct(decision["project"], client_request, workspace_path or "", chat_id or "")
-            return
+        if not force_orchestrator:
+            from routing.router import decide_route
+            decision = decide_route(client_request, workspace_path or "", chat_id or "", "")
+            if decision.get("kind") == "project_dev" and decision.get("project"):
+                from agents.project_router import stream_direct
+                yield from stream_direct(decision["project"], client_request, workspace_path or "", chat_id or "")
+                return
         # For Telegram/sync callers, fallback is orchestrator — house/general via API only
     except Exception as e:
         print(f"[SYNC] Project routing error (falling back to orchestrator): {e}")
@@ -119,35 +121,27 @@ def run_and_sync_graph(client_request: str, workspace_path: str = "", chat_id: s
         from agents.orchestrator_agent import orchestrator_node
         res = orchestrator_node(init_state)
         if res:
-            with state_lock:
-                shared_state["active_node"] = "agent"
-
-                for key in output_keys:
-                    if key in res:
-                        shared_state["outputs"][key] = res[key]
-
-                if "project_path" in res:
-                    shared_state["project_path"] = res["project_path"]
-
-                shared_state["failed_models"] = []
-
-                if "code_updated" in res:
-                    shared_state["code_updated"] = res["code_updated"]
-                if "requirements_updated" in res:
-                    shared_state["requirements_updated"] = res["requirements_updated"]
-                if "tech_spec_updated" in res:
-                    shared_state["tech_spec_updated"] = res["tech_spec_updated"]
-                if "error" in res and res["error"]:
-                    shared_state["error"] = res["error"]
-
-                nxt = res.get("next_agent", "")
-                if nxt:
-                    shared_state["next_agent"] = nxt
-                if nxt == "finish":
-                    shared_state["thoughts"]["agent"] = "Work complete."
-
-                if "agent" not in shared_state["completed_nodes"]:
-                    shared_state["completed_nodes"].append("agent")
+            updates: dict = {"active_node": "agent", "failed_models": []}
+            outputs = {key: res[key] for key in output_keys if key in res}
+            if outputs:
+                updates["outputs"] = outputs
+            for key in ("project_path", "code_updated", "requirements_updated",
+                        "tech_spec_updated", "error"):
+                if key in res and res[key]:
+                    updates[key] = res[key]
+            nxt = res.get("next_agent", "")
+            if nxt:
+                updates["next_agent"] = nxt
+            current = safe_get_state()
+            if nxt == "finish":
+                thoughts = dict(current.get("thoughts") or {})
+                thoughts["agent"] = "Work complete."
+                updates["thoughts"] = thoughts
+            completed = list(current.get("completed_nodes") or [])
+            if "agent" not in completed:
+                completed.append("agent")
+            updates["completed_nodes"] = completed
+            safe_update_state(updates)
 
             yield safe_get_state()
     except Exception as e:

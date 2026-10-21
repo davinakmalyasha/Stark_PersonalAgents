@@ -25,15 +25,28 @@ function extOf(path: string): string {
 function isHtml(f: WorkspaceFileEntry): boolean {
   return f.type === 'file' && extOf(f.path) === 'html';
 }
-function isDesignMd(f: WorkspaceFileEntry): boolean {
-  return f.type === 'file' && f.name.toLowerCase() === 'design.md';
+function isProjectMemory(f: WorkspaceFileEntry): boolean {
+  return f.type === 'file' &&
+    f.path.replace(/\\/g, '/').toLowerCase().endsWith('.agent-memory/project.md');
 }
 function isShot(f: WorkspaceFileEntry): boolean {
   return f.type === 'file' && IMG_EXTS.has(extOf(f.path));
 }
 
-export default function DesignWorkspace() {
-  const session = useDesignSession();
+interface DesignWorkspaceProps {
+  /** Render inside the coding workspace instead of as a top-level route. */
+  embedded?: boolean;
+  initialWorkspaceId?: string;
+  initialChatId?: string;
+  onClose?: () => void;
+}
+
+export default function DesignWorkspace({ embedded = false, initialWorkspaceId, initialChatId, onClose }: DesignWorkspaceProps = {}) {
+  const session = useDesignSession({
+    workspaceId: initialWorkspaceId,
+    chatId: initialChatId,
+    embedded,
+  });
   const {
     workspaces, workspace, chatId, messages, isRunning,
     notification, files, usage, booted, bindWorkspace, send, cancel,
@@ -42,7 +55,7 @@ export default function DesignWorkspace() {
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [previewFailed, setPreviewFailed] = useState(false);
-  const [subagentView, setSubagentView] = useState<{ childId: string; label: string } | null>(null);
+  const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
   const [annotate, setAnnotate] = useState(false);
   const [draft, setDraft] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const [note, setNote] = useState('');
@@ -53,7 +66,7 @@ export default function DesignWorkspace() {
   const knownHtml = useRef<Set<string>>(new Set());
 
   const htmlFiles = useMemo(() => files.filter(isHtml), [files]);
-  const designMd = useMemo(() => files.find(isDesignMd) || null, [files]);
+  const projectMemory = useMemo(() => files.find(isProjectMemory) || null, [files]);
   const shots = useMemo(() => files.filter(isShot), [files]);
 
   // Default + auto-select newly appeared artifacts (e.g. right after a run).
@@ -65,7 +78,7 @@ export default function DesignWorkspace() {
       setPreviewPath(fresh.path);
     } else if (!previewPath && htmlFiles.length > 0) {
       setPreviewPath(htmlFiles[0].path);
-    } else if (!previewPath && !designMd && files.length > 0) {
+    } else if (!previewPath && !projectMemory && files.length > 0) {
       const first = files.find((f) => f.type === 'file');
       if (first) setPreviewPath(first.path);
     }
@@ -104,6 +117,10 @@ export default function DesignWorkspace() {
     : null;
 
   const goHome = () => {
+    if (embedded) {
+      onClose?.();
+      return;
+    }
     window.location.hash = '#/';
   };
   const openInCoding = () => {
@@ -178,7 +195,7 @@ export default function DesignWorkspace() {
           Design sessions write real files. Pick the project the UI work belongs to.
         </p>
         <div className="flex flex-col gap-1.5 w-full max-w-sm max-h-[40vh] overflow-y-auto">
-          {workspaces.map((w) => (
+          {workspaces.filter((w) => w.path && !w.isGeneral && !w.isHouse && !w.isPersonal).map((w) => (
             <button
               key={w.id}
               type="button"
@@ -206,10 +223,10 @@ export default function DesignWorkspace() {
 
   const hasArtifact = htmlFiles.length > 0;
   const hasShot = shots.length > 0;
-  const hasDesignMd = !!designMd;
+  const hasProjectMemory = !!projectMemory;
 
   return (
-    <div className="fixed inset-0 flex min-h-0 bg-[#0a0a0d] text-zinc-200 select-none">
+    <div className={`${embedded ? 'absolute inset-0 z-50' : 'fixed inset-0'} flex min-h-0 bg-[#0a0a0d] text-zinc-200 select-none`}>
       {/* ── Left rail: versions + brand ── */}
       <aside className="w-[236px] shrink-0 border-r house-hairline bg-[#0d0d11]/70 flex flex-col min-h-0">
         <div className="flex items-center gap-1.5 px-2.5 pt-2.5 pb-2 shrink-0">
@@ -234,7 +251,7 @@ export default function DesignWorkspace() {
           {[
             { label: 'Artifact', ok: hasArtifact },
             { label: 'Shot', ok: hasShot },
-            { label: 'DESIGN.md', ok: hasDesignMd },
+            { label: 'project.md', ok: hasProjectMemory },
           ].map((c) => (
             <span
               key={c.label}
@@ -268,20 +285,20 @@ export default function DesignWorkspace() {
             </button>
           ))}
           <p className="px-2 pt-2 pb-1 text-[9.5px] font-bold tracking-widest uppercase text-zinc-600">Brand</p>
-          {designMd ? (
+          {projectMemory ? (
             <button
-              key={designMd.path}
+              key={projectMemory.path}
               type="button"
-              onClick={() => setPreviewPath(designMd.path)}
+              onClick={() => setPreviewPath(projectMemory.path)}
               className={`w-full flex items-center gap-1.5 px-2 py-[5px] text-left text-[12px] rounded-md cursor-pointer ${
-                previewPath === designMd.path ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:bg-white/[0.05] hover:text-zinc-300'
+                previewPath === projectMemory.path ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:bg-white/[0.05] hover:text-zinc-300'
               }`}
             >
               <FileText size={12} className="shrink-0 text-zinc-600" />
-              <span className="truncate flex-1 font-mono">DESIGN.md</span>
+              <span className="truncate flex-1 font-mono">project.md</span>
             </button>
           ) : (
-            <p className="px-2 text-[11px] text-zinc-600 leading-5">No DESIGN.md yet — it lands here at finalize.</p>
+            <p className="px-2 text-[11px] text-zinc-600 leading-5">No project.md `## Design` section yet — it lands here at finalize.</p>
           )}
           <p className="px-2 pt-2 pb-1 text-[9.5px] font-bold tracking-widest uppercase text-zinc-600">Shots</p>
           {shots.length === 0 && (
@@ -464,7 +481,7 @@ export default function DesignWorkspace() {
           onOpenStats={() => {}}
           onOpenInWorkspace={openInCoding}
           onCloseIde={goHome}
-          onOpenSubagent={(childId, label) => setSubagentView({ childId, label })}
+          onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
           workspaceId={workspace.id}
           chatId={chatId}
         />
@@ -479,11 +496,12 @@ export default function DesignWorkspace() {
         <div className="absolute inset-0 z-40 bg-[#0c0c0f] flex flex-col px-4 sm:px-8 lg:px-12 py-4">
           <div className="max-w-[1100px] w-full mx-auto flex-1 min-h-0 flex flex-col">
             <SubagentSessionView
-              workspaceId={workspace.id}
+              workspaceId={subagentView.workspaceId || workspace.id}
               childId={subagentView.childId}
               label={subagentView.label}
               parentTitle="OpenDesign"
               onBack={() => setSubagentView(null)}
+              onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
             />
           </div>
         </div>

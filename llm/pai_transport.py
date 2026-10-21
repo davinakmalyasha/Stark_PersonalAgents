@@ -117,7 +117,7 @@ def _model_name(model: str) -> str:
         from llm.llm import _map_model
         return _map_model(model or "")
     except Exception:
-        return model or "deepseek-chat"
+        return model or "deepseek-v4.1-flash"
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -318,17 +318,18 @@ def _as_user_content(content: Any):
 
 
 def _split_user_prompt(history: list[ModelMessage]) -> tuple[Any, list[ModelMessage]]:
-    """Extract the first user part as the pydantic-ai ``user_prompt``.
+    """Extract the LAST user part as the pydantic-ai ``user_prompt``.
 
     pydantic-ai appends ``user_prompt`` as a user message when it is not None,
-    and an empty string still hits gateways that reject empty content. We pull
-    the first ``UserPromptPart`` out of the converted history so the prompt is
-    non-empty and the history keeps its full context. Returns ``(prompt, history)``
-    with the first user message removed from history.
+    and an empty string still hits gateways that reject empty content. Callers
+    now seed multi-turn history, so the newest request is the last
+    ``UserPromptPart`` — taking the first one would re-run an older turn.
+    Returns ``(prompt, history)`` with the selected user message removed.
     """
     if not history:
         return "", history
-    for i, m in enumerate(history):
+    for i in range(len(history) - 1, -1, -1):
+        m = history[i]
         if isinstance(m, ModelRequest):
             for p in m.parts:
                 if isinstance(p, UserPromptPart):
@@ -382,6 +383,9 @@ def _pai_usage_to_stats(
     reasoning_effort: str | None,
     reasoning_budget: int | None,
     reasoning_chars: int = 0,
+    backend: str | None = None,
+    cost_override: float | None = None,
+    extra: dict | None = None,
 ) -> None:
     try:
         from llm.llm_stats import update_token_stats
@@ -407,6 +411,9 @@ def _pai_usage_to_stats(
         reasoning_chars=reasoning_chars,
         reasoning_effort=reasoning_effort,
         reasoning_budget=reasoning_budget,
+        cost_override=cost_override,
+        backend=backend,
+        extra=extra,
     )
 
 
@@ -416,6 +423,30 @@ def _emit_stream(role: str, kind: str, text: str, where: str) -> None:
         from llm.llm import _stream_emit
         from llm.llm import _effective_stream_chat_id
         _stream_emit(_effective_stream_chat_id(), kind, text, agent=role, model="")
+    except Exception:
+        pass
+
+
+def _emit_tool_frame(role: str, kind: str, tool: str, args_json: str = "",
+                     ok: bool | None = None, ms: int = 0, preview: str = "",
+                     chat_id: str = "") -> None:
+    """Structured tool-lifecycle frame (tool_started/tool_finished) for the
+    Codex-style step pills. Best-effort: never raises, no-ops without a chat."""
+    try:
+        from server.realtime.bus import emit_event as _bus_emit_event
+        from llm.llm import _effective_stream_chat_id
+        cid = chat_id or _effective_stream_chat_id()
+        if not cid:
+            return
+        _bus_emit_event(cid, {
+            "kind": kind,
+            "tool": str(tool or ""),
+            "args": str(args_json or ""),
+            "ok": ok,
+            "ms": int(ms or 0),
+            "text": str(preview or "")[:300],
+            "agent": role or "",
+        })
     except Exception:
         pass
 
@@ -446,7 +477,7 @@ def pai_native_turn(
     role: str,
     messages: list,
     tools: list[dict] | None = None,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     reasoning_effort: str | None = None,
     reasoning_budget: int | None = None,
@@ -490,7 +521,7 @@ async def apai_native_turn(
     role: str,
     messages: list,
     tools: list[dict] | None = None,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     reasoning_effort: str | None = None,
     reasoning_budget: int | None = None,
@@ -643,7 +674,7 @@ async def apai_native_turn(
                     return event
 
                 _hooks = Hooks(event=_on_event)
-                from llm.native_tools import DEFAULT_USAGE_LIMITS
+                from llm.native_tools import _default_usage_limits
 
                 use_iter = os.getenv("PAI_USE_ITER", "1") != "0"
                 resp = None
@@ -656,7 +687,7 @@ async def apai_native_turn(
                             user_prompt,
                             message_history=msg_history,
                             deps=deps or WorkspaceDeps.from_shared_state(role=role),
-                            usage_limits=DEFAULT_USAGE_LIMITS,
+                            usage_limits=_default_usage_limits(),
                             cancellation_token=cancellation_token,
                             capabilities=[_hooks],
                         ) as run:
@@ -688,7 +719,7 @@ async def apai_native_turn(
                     async with agent.run_stream(
                         user_prompt,
                         message_history=msg_history,
-                        usage_limits=DEFAULT_USAGE_LIMITS,
+                        usage_limits=_default_usage_limits(),
                         deps=deps or WorkspaceDeps.from_shared_state(role=role),
                         cancellation_token=cancellation_token,
                         capabilities=[_hooks],
@@ -729,11 +760,11 @@ async def apai_native_turn(
                             }
                         )
             else:
-                from llm.native_tools import DEFAULT_USAGE_LIMITS
+                from llm.native_tools import _default_usage_limits
                 res = agent.run_sync(
                     user_prompt,
                     message_history=msg_history,
-                    usage_limits=DEFAULT_USAGE_LIMITS,
+                    usage_limits=_default_usage_limits(),
                     deps=deps or WorkspaceDeps.from_shared_state(role=role),
                 )
                 text, call_parts, reasoning = _result_to_native(res.output.parts, res)
@@ -847,7 +878,7 @@ async def apai_native_turn(
             reasoning = "".join(reasoning_acc).strip() or None
             usage = None
         else:
-            resp = llm.request(msg_history_full, settings, req_params)
+            resp = await llm.request(msg_history_full, settings, req_params)
             text, call_parts, reasoning = _result_to_native(resp.parts, resp)
             usage = getattr(resp, "usage", None)
             if not text and reasoning and not call_parts:
@@ -863,7 +894,7 @@ async def apai_native_turn(
 def pai_structured(
     messages: list,
     result_type: type,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     where: str | None = None,
     base_url: str | None = None,
@@ -896,7 +927,7 @@ def pai_structured(
 async def apai_structured(
     messages: list,
     result_type: type,
-    model: str = "deepseek:v4-flash",
+    model: str = "deepseek:v4.1-flash",
     temp: float = 0.2,
     where: str | None = None,
     base_url: str | None = None,

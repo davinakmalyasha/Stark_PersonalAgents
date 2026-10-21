@@ -20,9 +20,16 @@ name: Staging  # TIER 2 — push to {{ staging_branch | default('staging') }} �
 #   • Caches: one shared ~/.venv-fast key (+restore-keys prefix), k6 tarball exact-key
 #   • Probe paths configurable: health_path / ready_path (default /health, /ready)
 #   • Kill switches: vars.STAGING_NO_DB_DRILLS / STAGING_NO_K6 / STAGING_NO_LIVE /
-#     STAGING_NO_ROTATION = 'true' · STAGING_INTERNAL_DNS=true tolerates split-horizon DNS
+#     STAGING_NO_ROTATION / STAGING_NO_CHAOS / STAGING_NO_DAST = 'true' ·
+#     STAGING_INTERNAL_DNS=true tolerates split-horizon DNS
 #   • Configurable thresholds: k6_vus, k6_duration_s, k6_p95_ms, k6_error_rate_pct,
+#     k6_scenario (smoke|load|soak|spike|breakpoint; vars.K6_SCENARIO overrides),
+#     k6_target_rps, k6_ramp_s, k6_hold_s, k6_soak_minutes, k6_spike_mult,
 #     tls_min_days, rotation_days, pg_version
+#   • Chaos drill: a disposable DB is killed mid-flight — /ready must flip to
+#     503 and recover without an app restart (ephemeral only, never a live URL)
+#   • DAST: OWASP ZAP baseline (passive) against the live staging URL; fails on
+#     alerts after the baseline rules file silences known CDN/static noise
 #   • staging-summary emits a $GITHUB_STEP_SUMMARY results table; anything not
 #     success/skipped fails the gate (cancelled included)
 #
@@ -598,7 +605,139 @@ jobs:
           if [ "$fail" != "0" ]; then echo "FAIL: one or more external targets 5xx/unreachable"; exit 1; fi
           echo "External smoke OK"
 
-  # ── #20 k6 load — configurable thresholds, cached binary, ephemeral fallback ──
+  # ── #21 chaos drill — dependency kill + recovery, ephemeral DB only (never live) ──
+  chaos-drill:
+    name: chaos-drill
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: vars.STAGING_NO_CHAOS != 'true' && hashFiles('**/main.py') != '' && needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Cache venv (shared key)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.venv-fast
+          key: {% raw %}venv-fast-${{ runner.os }}-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}{% endraw %}
+          restore-keys: {% raw %}venv-fast-${{ runner.os }}-{% endraw %}
+      - name: Chaos drill — kill the DB, prove /ready flips and recovers
+        run: |
+          READY_PATH="{{ ready_path | default('/ready') }}"
+          HEALTH_PATH="{{ health_path | default('/health') }}"
+          if ! grep -rqE "DATABASE_URL|POSTGRES_|asyncpg|psycopg|sqlalchemy" --include='*.py' .; then
+            echo "no DB dependency detected in Python sources — chaos drill skipped"
+            exit 0
+          fi
+          docker run -d --name chaos-db \
+            -e POSTGRES_USER=chaos -e POSTGRES_PASSWORD=chaos -e POSTGRES_DB=chaos \
+            -p 55432:5432 "postgres:{{ pg_version | default('16-alpine') }}"
+          for i in $(seq 1 30); do
+            docker exec chaos-db pg_isready -U chaos -d chaos >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec chaos-db pg_isready -U chaos -d chaos >/dev/null 2>&1 || { echo "FAIL: disposable DB never became ready"; exit 1; }
+          VENV=$HOME/.venv-fast
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --upgrade pip
+          fi
+          "$VENV/bin/pip" install --quiet fastapi uvicorn
+          [ -f requirements.txt ] && "$VENV/bin/pip" install -r requirements.txt --quiet || true
+          PKG=$(find . -maxdepth 1 -type d ! -name '.*' ! -name tests ! -name venv* ! -name node_modules ! -name scratch | sed 's|^\./||' | grep -v '^\.$' | head -1)
+          [ -n "$PKG" ] && [ -f "$PKG/main.py" ] || { echo "no runnable main.py — chaos drill skipped"; exit 0; }
+          export DATABASE_URL="postgresql://chaos:chaos@127.0.0.1:55432/chaos"
+          export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_DB=chaos POSTGRES_USER=chaos POSTGRES_PASSWORD=chaos
+          "$VENV/bin/python" -m uvicorn "$PKG.main:app" --host 127.0.0.1 --port 8000 > /tmp/chaos-server.log 2>&1 &
+          APP_PID=$!
+          trap 'kill $APP_PID 2>/dev/null || true; docker rm -f chaos-db >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do curl -sf "http://127.0.0.1:8000$HEALTH_PATH" >/dev/null 2>&1 && break; sleep 1; done
+          curl -sf "http://127.0.0.1:8000$HEALTH_PATH" >/dev/null || { echo "FAIL: app never became live"; tail -n 40 /tmp/chaos-server.log; exit 1; }
+          DB_USED=""
+          for i in $(seq 1 45); do
+            CONNS=$(docker exec -e PGAPPNAME=chaos-probe chaos-db psql -U chaos -d chaos -tAc \
+              "select count(*) from pg_stat_activity where datname='chaos' and application_name <> 'chaos-probe'" 2>/dev/null || echo 0)
+            [ "${CONNS:-0}" -gt 0 ] && DB_USED=1 && break
+            sleep 1
+          done
+          [ -n "$DB_USED" ] || { echo "app never dialed the drill DB — chaos skipped (not DB-backed via DATABASE_URL/POSTGRES_*)"; exit 0; }
+          READY=""
+          for i in $(seq 1 45); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:8000$READY_PATH" || true)
+            if [ "$CODE" = "200" ]; then READY=1; break; fi
+            [ "$CODE" = "404" ] && { echo "no $READY_PATH probe (404) — chaos skipped (add a ready probe to enable)"; exit 0; }
+            sleep 1
+          done
+          [ -n "$READY" ] || { echo "FAIL: $READY_PATH never reached 200 with the dependency up"; tail -n 40 /tmp/chaos-server.log; exit 1; }
+          echo "baseline: $READY_PATH 200 with dependency up"
+          docker stop chaos-db >/dev/null
+          FLIPPED=""
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:8000$READY_PATH" || true)
+            if [ "$CODE" != "200" ] && [ "$CODE" != "000" ]; then FLIPPED=1; break; fi
+            sleep 1
+          done
+          [ -n "$FLIPPED" ] || { echo "FAIL: $READY_PATH stayed 200 after the DB was stopped (dependency failure not surfaced)"; exit 1; }
+          echo "dependency down -> $READY_PATH reports $CODE"
+          kill -0 "$APP_PID" 2>/dev/null || { echo "FAIL: app died when the dependency went away (not crash-resilient)"; exit 1; }
+          docker start chaos-db >/dev/null
+          RECOVERED=""
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:8000$READY_PATH" || true)
+            if [ "$CODE" = "200" ]; then RECOVERED=1; break; fi
+            sleep 1
+          done
+          [ -n "$RECOVERED" ] || { echo "FAIL: $READY_PATH did not recover after the DB came back (no self-healing)"; tail -n 40 /tmp/chaos-server.log; exit 1; }
+          curl -sf "http://127.0.0.1:8000$HEALTH_PATH" >/dev/null || { echo "FAIL: liveness lost after recovery"; exit 1; }
+          if grep -q "Traceback" /tmp/chaos-server.log 2>/dev/null; then
+            echo "NOTE: tracebacks logged while the dependency was down:"
+            tail -n 20 /tmp/chaos-server.log
+          fi
+          echo "CHAOS-DRILL OK — $READY_PATH flipped and recovered without an app restart"
+
+  # ── #22 DAST — OWASP ZAP baseline (passive) against the live staging URL ──
+  dast-baseline:
+    name: dast-baseline
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes }}
+    if: vars.STAGING_NO_DAST != 'true' && (vars.STAGING_URL != '' || inputs.staging_url != '')
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve live target URL
+        id: target
+        env:
+          STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
+          INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
+        run: |
+{{ URL_PROLOGUE | indent(10, true) }}
+          if [ -z "$URL" ] || [ "$URL" = "" ]; then
+            echo "no live URL resolved — dast-baseline skipped"
+            exit 0
+          fi
+          echo "target=$URL" >> "$GITHUB_OUTPUT"
+      - name: Write ZAP baseline rules (silence known CDN/static noise)
+        run: |
+          mkdir -p .zap
+          cat > .zap/rules.tsv << 'TSV'
+          10015	IGNORE	# Missing or insecure cache-control header (CDN-dependent)
+          10049	IGNORE	# Non-storable content (static cache heuristic)
+          10109	IGNORE	# Modern Web Application (informational)
+          10112	IGNORE	# Session management response identified (informational)
+          TSV
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: {% raw %}${{ steps.target.outputs.target }}{% endraw %}
+          rules_file_name: .zap/rules.tsv
+          allow_issue_writing: false
+          artifact_name: zap-baseline-T2
+          fail_action: true
+
+  # ── #20 k6 load — scenario pack (smoke|load|soak|spike|breakpoint) + capacity report ──
   k6-load:
     name: k6-load
     needs: [changes]
@@ -625,6 +764,8 @@ jobs:
           STAGING_URL: {% raw %}${{ vars.STAGING_URL }}{% endraw %}
           INPUT_URL: {% raw %}${{ inputs.staging_url }}{% endraw %}
           NO_LIVE: {% raw %}${{ vars.STAGING_NO_LIVE || '' }}{% endraw %}
+          SCENARIO: {% raw %}${{ vars.K6_SCENARIO || '' }}{% endraw %}
+          TARGET_RPS: {% raw %}${{ vars.K6_TARGET_RPS || '' }}{% endraw %}
         run: |
 {{ URL_PROLOGUE | indent(10, true) }}
           if [ "$NO_LIVE" = "true" ] && [ -n "$URL" ]; then
@@ -663,10 +804,112 @@ jobs:
           K6=/tmp/k6-v{{ k6_version | default('0.54.0') }}-linux-amd64/k6
           chmod +x "$K6"
 
+          SCENARIO="${SCENARIO:-smoke}"
+          case "$SCENARIO" in
+            smoke|load|soak|spike|breakpoint) ;;
+            *) echo "unknown K6_SCENARIO '$SCENARIO' — falling back to smoke"; SCENARIO=smoke ;;
+          esac
           SCRIPT=""
           for c in k6/script.js tests/k6.js load/k6.js; do [ -f "$c" ] && SCRIPT="$c" && break; done
           if [ -z "$SCRIPT" ]; then
-            cat > /tmp/k6-smoke.js << 'JS'
+            case "$SCENARIO" in
+              load)
+                cat > /tmp/k6-scenario.js << 'JS'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          const VUS = Number(__ENV.VUS);
+          export const options = {
+            stages: [
+              { duration: __ENV.RAMP, target: VUS },
+              { duration: __ENV.HOLD, target: VUS },
+              { duration: '10s', target: 0 },
+            ],
+            thresholds: {
+              http_req_failed: [`rate<${Number(__ENV.ERR_PCT) / 100}`],
+              http_req_duration: [`p(95)<${Number(__ENV.P95_MS)}`],
+            },
+          };
+          export default function () {
+            const r = http.get(`${__ENV.TARGET_URL}{{ health_path | default('/health') }}`);
+            check(r, { '200': (x) => x.status === 200 });
+            sleep(0.1);
+          }
+          JS
+                ;;
+              soak)
+                cat > /tmp/k6-scenario.js << 'JS'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          export const options = {
+            vus: Number(__ENV.VUS),
+            duration: __ENV.SOAK,
+            thresholds: {
+              http_req_failed: [`rate<${Number(__ENV.ERR_PCT) / 100}`],
+              http_req_duration: [`p(95)<${Number(__ENV.P95_MS)}`],
+            },
+          };
+          export default function () {
+            const r = http.get(`${__ENV.TARGET_URL}{{ health_path | default('/health') }}`);
+            check(r, { '200': (x) => x.status === 200 });
+            sleep(0.1);
+          }
+          JS
+                ;;
+              spike)
+                cat > /tmp/k6-scenario.js << 'JS'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          const VUS = Number(__ENV.VUS);
+          const SPIKE = VUS * Number(__ENV.SPIKE_MULT);
+          export const options = {
+            stages: [
+              { duration: '10s', target: VUS },
+              { duration: '10s', target: SPIKE },
+              { duration: __ENV.HOLD, target: SPIKE },
+              { duration: '10s', target: VUS },
+              { duration: '10s', target: 0 },
+            ],
+            thresholds: {
+              http_req_failed: [`rate<${Number(__ENV.ERR_PCT) / 100}`],
+            },
+          };
+          export default function () {
+            const r = http.get(`${__ENV.TARGET_URL}{{ health_path | default('/health') }}`);
+            check(r, { '200': (x) => x.status === 200 });
+            sleep(0.1);
+          }
+          JS
+                ;;
+              breakpoint)
+                cat > /tmp/k6-scenario.js << 'JS'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          const START = Number(__ENV.VUS);
+          export const options = {
+            scenarios: {
+              breakpoint: {
+                executor: 'ramping-arrival-rate',
+                timeUnit: '1s',
+                startRate: START,
+                preAllocatedVUs: START,
+                maxVUs: START * 20,
+                stages: [
+                  { duration: __ENV.RAMP, target: START * 2 },
+                  { duration: __ENV.HOLD, target: START * 4 },
+                  { duration: __ENV.RAMP, target: START * 8 },
+                ],
+              },
+            },
+          };
+          export default function () {
+            const r = http.get(`${__ENV.TARGET_URL}{{ health_path | default('/health') }}`);
+            check(r, { '200': (x) => x.status === 200 });
+            sleep(0.05);
+          }
+          JS
+                ;;
+              *)
+                cat > /tmp/k6-scenario.js << 'JS'
           import http from 'k6/http';
           import { check, sleep } from 'k6';
           export const options = {
@@ -683,15 +926,75 @@ jobs:
             sleep(0.1);
           }
           JS
-            SCRIPT=/tmp/k6-smoke.js
+                ;;
+            esac
+            SCRIPT=/tmp/k6-scenario.js
           fi
-          echo "k6 script: $SCRIPT (vus={{ k6_vus | default(10) }} dur={{ k6_duration_s | default(30) }}s p95={{ k6_p95_ms | default(500) }}ms err={{ k6_error_rate_pct | default(1) }}%)"
-          TARGET_URL="$URL" VUS='{{ k6_vus | default(10) }}' DURATION='{{ k6_duration_s | default(30) }}s' P95_MS='{{ k6_p95_ms | default(500) }}' ERR_PCT='{{ k6_error_rate_pct | default(1) }}' "$K6" run "$SCRIPT" || { echo "FAIL: k6 thresholds breached"; exit 1; }
+          echo "k6 script: $SCRIPT (scenario=$SCENARIO vus={{ k6_vus | default(10) }} p95={{ k6_p95_ms | default(500) }}ms err={{ k6_error_rate_pct | default(1) }}%)"
+          mkdir -p _gate
+          TARGET_URL="$URL" VUS='{{ k6_vus | default(10) }}' DURATION='{{ k6_duration_s | default(30) }}s' SOAK='{{ k6_soak_minutes | default(30) }}m' RAMP='{{ k6_ramp_s | default(30) }}s' HOLD='{{ k6_hold_s | default(120) }}s' SPIKE_MULT='{{ k6_spike_mult | default(5) }}' P95_MS='{{ k6_p95_ms | default(500) }}' ERR_PCT='{{ k6_error_rate_pct | default(1) }}' SCENARIO="$SCENARIO" "$K6" run --summary-export=_gate/k6-summary.json "$SCRIPT" || { echo "FAIL: k6 thresholds breached ($SCENARIO)"; exit 1; }
           if [ -f /tmp/k6-server.log ] && grep -q "Traceback" /tmp/k6-server.log 2>/dev/null; then
             echo "FAIL: Tracebacks in ephemeral k6 target:"
             tail -n 40 /tmp/k6-server.log; exit 1
           fi
-          echo "k6 load OK"
+          echo "k6 load OK ($SCENARIO)"
+
+      - name: k6 capacity report (vs K6_TARGET_RPS)
+        if: always() && !cancelled()
+        env:
+          SCENARIO: {% raw %}${{ vars.K6_SCENARIO || '' }}{% endraw %}
+          TARGET_RPS: {% raw %}${{ vars.K6_TARGET_RPS || '' }}{% endraw %}
+        run: |
+          SCENARIO="${SCENARIO:-smoke}"
+          if [ ! -f _gate/k6-summary.json ]; then
+            echo "no k6 summary export — capacity report skipped"
+            exit 0
+          fi
+          SCENARIO="$SCENARIO" TARGET_RPS="$TARGET_RPS" python3 - << 'PY'
+          import json, os, sys
+          d = json.load(open("_gate/k6-summary.json"))
+          m = d.get("metrics") or {}
+          def g(name, key):
+              return (m.get(name) or {}).get(key) or 0
+          rate = float(g("http_reqs", "rate"))
+          doc = {
+              "schema": "k6-capacity/v1",
+              "scenario": os.environ.get("SCENARIO", ""),
+              "target_rps": float(os.environ.get("TARGET_RPS") or 0),
+              "avg_rps": round(rate, 2),
+              "p95_ms": round(float(g("http_req_duration", "p(95)")), 1),
+              "error_rate_pct": round(float(g("http_req_failed", "rate")) * 100, 3),
+              "requests": int(g("http_reqs", "count")),
+          }
+          doc["headroom_pct"] = (round((doc["avg_rps"] / doc["target_rps"] - 1) * 100, 1)
+                                 if doc["target_rps"] else None)
+          with open("_gate/k6-capacity.json", "w") as f:
+              json.dump(doc, f, indent=2)
+          print("k6-capacity:", json.dumps(doc))
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as f:
+                  f.write("| k6 ({}) | {} rps | p95 {} ms | err {}% |\n".format(
+                      doc["scenario"], doc["avg_rps"], doc["p95_ms"], doc["error_rate_pct"]))
+          if doc["scenario"] in ("load", "soak", "spike") and doc["target_rps"] > 0:
+              if doc["avg_rps"] < doc["target_rps"] * 0.9:
+                  print("FAIL: capacity shortfall — {} rps < 90% of target {} rps".format(
+                      doc["avg_rps"], doc["target_rps"]))
+                  sys.exit(1)
+              print("capacity OK — {} rps vs target {} rps (headroom {}%)".format(
+                  doc["avg_rps"], doc["target_rps"], doc["headroom_pct"]))
+          if doc["scenario"] == "breakpoint":
+              print("breakpoint: read avg_rps/p95/error_rate for the sustainable knee (exploratory)")
+          PY
+
+      - name: Upload k6 capacity report
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: k6-capacity-T2
+          path: _gate/k6-capacity.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   # ── Staging live smoke — /ready semantic matrix (200·404·503-aware) ──
   staging-smoke:
@@ -835,7 +1138,7 @@ jobs:
     name: staging-summary
     runs-on: ubuntu-latest
     timeout-minutes: {{ job_timeout_minutes }}
-    needs: [changes, backup-drill, n-minus-one, rotation-check, multi-worker, dns-preflight, tls-check, external-smoke, k6-load, staging-smoke, keploy-replay]
+    needs: [changes, backup-drill, n-minus-one, rotation-check, multi-worker, chaos-drill, dns-preflight, tls-check, external-smoke, dast-baseline, k6-load, staging-smoke, keploy-replay]
     if: always() && !cancelled()
     steps:
       - name: Staging gate summary
@@ -845,9 +1148,11 @@ jobs:
           R_N1: {% raw %}${{ needs.n-minus-one.result }}{% endraw %}
           R_ROT: {% raw %}${{ needs.rotation-check.result }}{% endraw %}
           R_WORK: {% raw %}${{ needs.multi-worker.result }}{% endraw %}
+          R_CHAOS: {% raw %}${{ needs.chaos-drill.result }}{% endraw %}
           R_DNS: {% raw %}${{ needs.dns-preflight.result }}{% endraw %}
           R_TLS: {% raw %}${{ needs.tls-check.result }}{% endraw %}
           R_EXT: {% raw %}${{ needs.external-smoke.result }}{% endraw %}
+          R_DAST: {% raw %}${{ needs.dast-baseline.result }}{% endraw %}
           R_K6: {% raw %}${{ needs.k6-load.result }}{% endraw %}
           R_SMOKE: {% raw %}${{ needs.staging-smoke.result }}{% endraw %}
           R_KEPLOY: {% raw %}${{ needs.keploy-replay.result }}{% endraw %}
@@ -859,9 +1164,11 @@ jobs:
           echo "n-1:       $R_N1"
           echo "rotation:  $R_ROT"
           echo "workers:   $R_WORK"
+          echo "chaos:     $R_CHAOS"
           echo "dns:       $R_DNS"
           echo "tls:       $R_TLS"
           echo "external:  $R_EXT"
+          echo "dast:      $R_DAST"
           echo "k6:        $R_K6"
           echo "smoke:     $R_SMOKE"
           echo "=============================================="
@@ -876,9 +1183,11 @@ jobs:
             echo "| n-minus-one | $R_N1 |"
             echo "| rotation-check | $R_ROT |"
             echo "| multi-worker | $R_WORK |"
+            echo "| chaos-drill | $R_CHAOS |"
             echo "| dns-preflight | $R_DNS |"
             echo "| tls-check | $R_TLS |"
             echo "| external-smoke | $R_EXT |"
+            echo "| dast-baseline | $R_DAST |"
             echo "| k6-load | $R_K6 |"
           echo "| keploy-replay | $R_KEPLOY |"
             echo "| staging-smoke | $R_SMOKE |"
@@ -895,9 +1204,11 @@ jobs:
               ("n-minus-one", "R_N1"),
               ("rotation-check", "R_ROT"),
               ("multi-worker", "R_WORK"),
+              ("chaos-drill", "R_CHAOS"),
               ("dns-preflight", "R_DNS"),
               ("tls-check", "R_TLS"),
               ("external-smoke", "R_EXT"),
+              ("dast-baseline", "R_DAST"),
               ("k6-load", "R_K6"),
               ("staging-smoke", "R_SMOKE"),
               ("keploy-replay", "R_KEPLOY"),
@@ -927,7 +1238,7 @@ jobs:
           PY
 
           fail=0
-          for r in "$R_CHANGES" "$R_BACKUP" "$R_N1" "$R_ROT" "$R_WORK" "$R_DNS" "$R_TLS" "$R_EXT" "$R_K6" "$R_SMOKE" "$R_KEPLOY"; do
+          for r in "$R_CHANGES" "$R_BACKUP" "$R_N1" "$R_ROT" "$R_WORK" "$R_CHAOS" "$R_DNS" "$R_TLS" "$R_EXT" "$R_DAST" "$R_K6" "$R_SMOKE" "$R_KEPLOY"; do
             # skipped = infra absent (fine); anything that is not success/skipped fails
             if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then fail=1; break; fi
           done

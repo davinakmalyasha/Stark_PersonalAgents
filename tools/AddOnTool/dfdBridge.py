@@ -85,9 +85,9 @@ def _request(method: str, url: str, key: str, payload: dict | None, timeout: flo
             raw = resp.read().decode("utf-8", errors="replace")
             try:
                 data = json.loads(raw)
-                return json.dumps(data, ensure_ascii=False)[:4000]
+                return json.dumps(data, ensure_ascii=False)
             except Exception:
-                return raw[:4000]
+                return raw
     except urllib.error.HTTPError as e:
         detail = ""
         try:

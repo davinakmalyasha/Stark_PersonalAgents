@@ -3,6 +3,10 @@ import json
 import contextvars
 
 active_store = contextvars.ContextVar("active_store", default=None)
+# Optional per-thread state used by delegated workspace agents.  The root run
+# continues to use ``shared_state``; a child gets a private snapshot so its
+# log/output/token updates cannot overwrite the parent's live chat.
+active_state = contextvars.ContextVar("active_state", default=None)
 
 state_lock = threading.Lock()
 
@@ -30,52 +34,67 @@ shared_state = {
     }
 }
 
+def _target_state() -> dict:
+    """Return the current context's state target."""
+    return active_state.get() or shared_state
+
+
 def safe_get_state() -> dict:
-    """Returns a thread-safe shallow-copied snapshot of shared_state."""
+    """Return a thread-safe snapshot of the current run's state."""
     with state_lock:
-        copied = shared_state.copy()
-        copied["outputs"] = shared_state["outputs"].copy()
-        if "token_usage" in shared_state:
+        current = _target_state()
+        copied = current.copy()
+        copied["outputs"] = (current.get("outputs") or {}).copy()
+        if "token_usage" in current:
             copied["token_usage"] = {
-                "total_input_tokens": shared_state["token_usage"]["total_input_tokens"],
-                "total_output_tokens": shared_state["token_usage"]["total_output_tokens"],
-                "total_cache_hit_tokens": shared_state["token_usage"].get("total_cache_hit_tokens", 0),
-                "total_cache_miss_tokens": shared_state["token_usage"].get("total_cache_miss_tokens", 0),
-                "total_cost": shared_state["token_usage"]["total_cost"],
-                "calls": list(shared_state["token_usage"]["calls"])
+                "total_input_tokens": current["token_usage"].get("total_input_tokens", 0),
+                "total_output_tokens": current["token_usage"].get("total_output_tokens", 0),
+                "total_cache_hit_tokens": current["token_usage"].get("total_cache_hit_tokens", 0),
+                "total_cache_miss_tokens": current["token_usage"].get("total_cache_miss_tokens", 0),
+                "total_cost": current["token_usage"].get("total_cost", 0),
+                "calls": list(current["token_usage"].get("calls", []))
             }
-        if isinstance(shared_state.get("plan"), dict):
+        if isinstance(current.get("plan"), dict):
             copied["plan"] = {
                 k: [dict(it) for it in v] if isinstance(v, list) else v
-                for k, v in shared_state["plan"].items()
+                for k, v in current["plan"].items()
             }
-        if isinstance(shared_state.get("mcp_servers"), list):
-            copied["mcp_servers"] = list(shared_state["mcp_servers"])
+        if isinstance(current.get("mcp_servers"), list):
+            copied["mcp_servers"] = list(current["mcp_servers"])
+        if isinstance(current.get("thoughts"), dict):
+            copied["thoughts"] = dict(current["thoughts"])
         return copied
 
-def safe_update_state(updates: dict):
-    """Safely updates shared_state under lock."""
+def safe_update_state(updates: dict, state: dict | None = None):
+    """Safely update one run's state under the shared lock.
+
+    ``state`` lets a caller target an explicit run state (used by the API run
+    pipeline, whose async stream loop runs outside the worker thread that owns
+    the ContextVar). Omit it to keep the legacy ContextVar/shared behavior.
+    """
     with state_lock:
+        target = state if state is not None else _target_state()
         for k, v in updates.items():
             if k == "outputs" and isinstance(v, dict):
-                shared_state["outputs"].update(v)
+                target.setdefault("outputs", {}).update(v)
             elif k == "token_usage" and isinstance(v, dict):
-                shared_state["token_usage"] = {
-                    "total_input_tokens": v.get("total_input_tokens", shared_state["token_usage"]["total_input_tokens"]),
-                    "total_output_tokens": v.get("total_output_tokens", shared_state["token_usage"]["total_output_tokens"]),
-                    "total_cache_hit_tokens": v.get("total_cache_hit_tokens", shared_state["token_usage"].get("total_cache_hit_tokens", 0)),
-                    "total_cache_miss_tokens": v.get("total_cache_miss_tokens", shared_state["token_usage"].get("total_cache_miss_tokens", 0)),
-                    "total_cost": v.get("total_cost", shared_state["token_usage"]["total_cost"]),
-                    "calls": list(v.get("calls", shared_state["token_usage"]["calls"]))
+                previous = target.setdefault("token_usage", {})
+                target["token_usage"] = {
+                    "total_input_tokens": v.get("total_input_tokens", previous.get("total_input_tokens", 0)),
+                    "total_output_tokens": v.get("total_output_tokens", previous.get("total_output_tokens", 0)),
+                    "total_cache_hit_tokens": v.get("total_cache_hit_tokens", previous.get("total_cache_hit_tokens", 0)),
+                    "total_cache_miss_tokens": v.get("total_cache_miss_tokens", previous.get("total_cache_miss_tokens", 0)),
+                    "total_cost": v.get("total_cost", previous.get("total_cost", 0)),
+                    "calls": list(v.get("calls", previous.get("calls", [])))
                 }
             else:
-                shared_state[k] = v
-        shared_state["state_version"] += 1
+                target[k] = v
+        target["state_version"] = int(target.get("state_version", 0)) + 1
 
-def safe_serialize_state() -> str:
-    """Safely serializes shared_state to a JSON string under lock."""
+def safe_serialize_state(state: dict | None = None) -> str:
+    """Safely serialize one run's state under the lock."""
     with state_lock:
-        return json.dumps(shared_state)
+        return json.dumps(state if state is not None else _target_state())
 
 
 # Cap for live_terminal_log — keeps the SSE snapshots and frontend re-parses bounded
@@ -91,13 +110,45 @@ def safe_append_live_log(msg: str, newline: bool = True) -> None:
     lines that already carry their own trailing newline.
     """
     with state_lock:
-        cur = shared_state.get("live_terminal_log", "")
+        target = _target_state()
+        cur = target.get("live_terminal_log", "")
         text = msg + ("\n" if newline else "")
         if LIVE_LOG_CAP and len(cur) + len(text) > LIVE_LOG_CAP:
             keep = LIVE_LOG_CAP - len(text)
             cur = cur[-keep:] if keep > 0 else ""
-        shared_state["live_terminal_log"] = cur + text
-        shared_state["state_version"] += 1
+        target["live_terminal_log"] = cur + text
+        target["state_version"] = int(target.get("state_version", 0)) + 1
+
+
+def new_scoped_state(overrides: dict | None = None) -> dict:
+    """Create an isolated child-run state from the current root snapshot.
+
+    Provider/model settings are retained, while output/log/plan/token fields
+    are reset so a child can use the existing agent code without publishing
+    its transcript into the parent run.
+    """
+    state = safe_get_state()
+    state.update({
+        "state_version": 0,
+        "live_terminal_log": "",
+        "outputs": {
+            "requirements": "", "tech_spec": "", "code": "",
+            "agent_report": "", "test_report": "",
+        },
+        "thoughts": {},
+        "plan": {},
+        "token_usage": {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cache_hit_tokens": 0,
+            "total_cache_miss_tokens": 0,
+            "total_cost": 0.0,
+            "calls": [],
+        },
+    })
+    if overrides:
+        state.update(overrides)
+    return state
 
 
 

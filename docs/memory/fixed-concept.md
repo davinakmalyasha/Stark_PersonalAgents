@@ -1,4 +1,4 @@
-# Fixed Concept — LangChain Workspace Agents
+# Fixed Concept — Workspace Agents
 
 Status: **FIXED CONCEPT — the migration contract.** Everything below is the
 spec that the current refactor must converge on. When in doubt about an
@@ -76,9 +76,10 @@ MCP / workspace" are first-class requirements.
 ### Roles & boundaries
 
 - **Orchestrator** is NOT a coder. Its only "verification" is: did the
-  workspace agent produce what the user asked? It tracks jobs via a plan
-  tracker and job ledger; it can call `delegate`/`delegation_status`,
-  `create_project`/`resume_project`, `ask_user`, plan tools.
+  workspace agent produce what the user asked? Its job tracker is built
+  automatically from the real delegations (no manual plan writing); it can call
+  `delegate`/`delegation_status`/`job_message`/`job_cancel`, `create_project`,
+  `ask_user`, `propose_plan`.
 - **Workspace agents** are single-agent loops: they call tools, get results,
   iterate until the task is done or they hit a limit. They own their
   conversation history, compaction, and session persistence.
@@ -98,20 +99,34 @@ Tools are stored "in a warehouse" instead of being hand-wired per agent.
 1. **Implementation**: a plain Python function (the `execute` body) lives in
    `tools/` (or `tools/AddOnTool/`), with its docstring/params as the schema.
 2. **Registry**: `agents/workspace_registry.py` is the **single source of
-   truth** mapping agent key → allowed tool names, MCP scopes, tier, history
-   namespace. Adding a new agent = adding one `WorkspaceSpec`.
+   truth** for every agent — workspace agents are code entries (`WorkspaceSpec`),
+   specialists are config files (`agents/specialists/*.json`) loaded by the same
+   module. One spec carries: tools/MCP scope, tier + `provider_tier`, model pin,
+   thinking profile, compaction budget, per-agent tool caps, runtime node
+   entrypoint, prompt module, aliases, delegatability, history namespace.
+   Adding an agent = adding one spec (JSON for specialists, one entry for
+   workspace agents) — consumers derive from it, no hardcoded name lists.
 3. **Selection at build time**: an agent gets its tools by looking up the
    registry (scope ACL), never by hand-listing tools in the agent file.
-4. **Per-run scoping**: `WorkspaceDeps` carries the concrete allowlist for a
-   run; pydantic-ai `FilteredToolset` enforces it at tool-build time.
-5. **MCP servers**: scoped per agent via `mcp_scopes` in the spec; MCP tools
-   are first-class tools in the same warehouse model.
+4. **Per-run scoping**: `WorkspaceDeps` carries the concrete allowlist,
+   compaction overrides, tool caps and resolved context window for a run;
+   pydantic-ai `FilteredToolset` enforces the allowlist at tool-build time and
+   the ProcessHistory processor clamps compaction below the model window.
+5. **MCP servers**: scoped per agent via `scopes` in
+   `.deep_agents/mcp_servers.json`; MCP tools are first-class tools in the
+   same warehouse model. The registry does not duplicate MCP config.
+6. **Consumers read the registry, never name lists**: `tools/_schemas` (scope
+   map + delegate prose), `tools/AddOnTool/subagentTools` (runtime registry +
+   node dispatch), `agents/delegation` (delegatable set, display, node call),
+   `llm/provider_modes` (tier/backend/model), `agents/orchestrator_agent`
+   (specialists block), `agents/subagent_context` (plan scope).
 
 ### What "scale" means here
 
-- New workspace/app = new `WorkspaceSpec` (maybe a new `WorkspaceDeps`
-  factory for its workspace bindings) + system prompt. No touching the
-  orchestrator or other agents.
+- New workspace agent = one `WorkspaceSpec` + its node/prompt modules (runtime
+  behavior stays code; the registry points at it).
+- New specialist = one `agents/specialists/<name>.json` — prompt, tools,
+  skills, model, thinking, compaction, caps, tier. Zero consumer edits.
 - New tool = new function + register it; adding it to an agent = one tuple
   entry in that agent's spec.
 - New MCP server = register it; exposing it to an agent = add its scope to
@@ -177,6 +192,32 @@ message-schema bridging.
 - Subagent spawns are bounded (a task-depth limit / usage limits); a runaway
   subagent must not kill the parent.
 
+### 5.1 Group projects — the single-writer rule (added with Phase 4)
+
+A group project is a long-lived board that outlives any one run, and every
+rule above is per-run. It therefore needs one more, and it is the rule that
+makes live mutation safe:
+
+- **One supervisor thread, one writer.** The supervisor applies every state
+  change; the orchestrator *submits operations* and never writes the board.
+  The guard is structural, not a lock per project — which is why parallelism
+  lives in member execution and never in the scheduler
+  (`agents/group/supervisor.py`, `docs/group-projects/02-runtime.md` §2).
+- **The supervisor makes no LLM calls.** Its control flow must be replayable
+  and cheap at a 15-second cadence. Judgement lives in members; if a tick
+  needs a decision, it emits an event that wakes the orchestrator (RT-01).
+- **Events are the only truth; every table is a projection.** One pure
+  reducer serves both the incremental write and `rebuild()`, so rebuild is
+  provably equivalent to the write path, and changing the projection model
+  later needs no migration (`docs/group-projects/01-concept-model.md` §7).
+- **No per-project threads.** They leak, they contend, and they destroy the
+  ordering guarantee that the single writer provides.
+
+These extend §5 rather than contradict it: `WorkspaceDeps` still isolates each
+run, `shared_state` is still not a source of truth, and a runaway member is
+still bounded — now by its lease, which expires whether or not the member
+cooperates.
+
 ---
 
 ## 6. Verification / "done" contract for each migration step
@@ -196,7 +237,7 @@ A step is done when:
 ## 7. Known "how it actually works" details to preserve
 
 - **Provider/model resolution**: use the `command` provider for model tests
-  (`https://api.commandcode.ai/provider/v1`, `flash: deepseek/deepseek-v4-flash`),
+  (`https://api.commandcode.ai/provider/v1`, `flash: deepseek/deepseek-v4.1-flash`),
   resolved via `.deep_agents/llm_provider.json` + `_resolve_llm_provider()`.
 - **Parallel tool calls**: pydantic-ai runs tools in parallel by default; the
   read/stuff class of tools (read_file, search_code, browser_act, ...) must
@@ -208,6 +249,14 @@ A step is done when:
 - **Session store**: the server-side session JSONL (`server/session/log.py`)
   is the durable transcript; agent loops append to it; it is NOT the model
   history source.
+- **Authored project memory**: `.agent-memory/project.md` is LLM-authored
+  (CLAUDE.md-style), not generated: `## Identity` (written by Dev on the
+  first task of a project that has none, updated only on a real pivot) and
+  `## Design` (written by the UI specialist on design lock/redesign). The
+  harness only reads/parses/projects it — its own message below the system
+  prompt, re-anchored fresh at every compaction — and the compaction LLM may
+  refresh it within the same single summarize request. No status gate, no
+  drift appends, no auto-detection.
 - **Free-pool providers** (`llm/free_providers.py`) are a separate,
   self-contained feature; if/when ported to a custom `Provider`, behavior
   (rate limits, retries, provider rotation) must be preserved.

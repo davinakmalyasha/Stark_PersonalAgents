@@ -46,8 +46,9 @@ def test_project_map_is_bounded():
     for i in range(100):
         with open(os.path.join(d, f"module_{i}.py"), "w", encoding="utf-8") as f:
             f.write(f"def function_{i}(value):\n    return value\n")
-    code_map = RepoMapGenerator(d).generate_map()
-    assert len(code_map) <= 6000
+    gen = RepoMapGenerator(d)
+    code_map = gen.generate_map()
+    assert len(code_map) <= gen.max_chars
 
 
 def test_project_map_context_uses_full_anchor_then_delta():
@@ -602,53 +603,69 @@ def test_truncation_reports_omitted_count():
     assert "lines omitted" in code_map
 
 
-def test_identity_projection_freezes_at_head():
-    """Drift appends ([updated:] / [identity stabilized:]) must never change
-    the injected identity bytes; the stability gate still reads the full file."""
-    from memory.memory_manager import (
-        _card_last_status,
-        _format_compact_project_identity,
+def test_project_memory_parse_and_update():
+    """The authored doc parses into Identity/Design bullets; updates are
+    section-scoped and atomic (absent sections are preserved)."""
+    from memory.memory_manager import load_project_memory, update_project_memory
+
+    d = _make_sandbox()
+    doc = (
+        "# Project\n\n"
+        "## Identity\n- project: MyApp\n- purpose: demo\n- stack: Python\n\n"
+        "## Design\n- direction: Minimal\n- palette: primary #533afd\n"
     )
+    with open(os.path.join(d, ".agent-memory", "project.md"), "w", encoding="utf-8") as f:
+        f.write(doc)
 
-    head = (
-        "# Project\nname: MyApp\ndescription: Demo\npurpose: Build things\n"
-        "stack: Python\nversion: unpinned\nstatus: draft\n"
+    loaded = load_project_memory(d)
+    assert "## Identity" in loaded and "- project: MyApp" in loaded
+    assert "## Design" in loaded and "- direction: Minimal" in loaded
+
+    assert update_project_memory(
+        d, "## Design\n- direction: Editorial\n- palette: primary #111111\n"
     )
-    drifted = (
-        head
-        + "\n[identity stabilized: 2026-08-26 10:00 UTC]\nstatus: stable\n"
-        + "\n[updated: 2026-09-01 10:00 UTC]\nstack: Python, FastAPI, Redis\n"
+    after = load_project_memory(d)
+    assert "- direction: Editorial" in after
+    assert "- project: MyApp" in after  # Identity preserved
+
+    # Invalid input (no known section) is ignored.
+    assert not update_project_memory(d, "just prose, no sections")
+    assert load_project_memory(d) == after
+
+
+def test_project_memory_tolerant_parse_last_section_wins():
+    from memory.memory_manager import load_project_memory
+
+    d = _make_sandbox()
+    doc = (
+        "# Project\n\n"
+        "## Identity\n- project: First\n\n"
+        "some prose that is ignored\n\n"
+        "## Identity\n- project: Second\n- purpose: current\n"
     )
+    with open(os.path.join(d, ".agent-memory", "project.md"), "w", encoding="utf-8") as f:
+        f.write(doc)
 
-    before = _format_compact_project_identity(head, "")
-    after = _format_compact_project_identity(drifted, "")
-    assert before == after
-    assert "- stack: Python\n" in before
-    assert "FastAPI" not in after
-    assert _card_last_status(drifted) == "stable"
+    loaded = load_project_memory(d)
+    assert "- project: Second" in loaded
+    assert "First" not in loaded
 
 
-def test_system_prompt_bytes_stable_across_card_drift():
-    """Regression: card drift appends between turns must not change a single
-    SystemMessage byte (today that wipes the entire cached prefix)."""
+def test_system_prompt_stable_while_project_memory_changes():
+    """The authored doc lives in its own message, so memory edits never
+    change a single SystemMessage byte."""
     from agents.developer_agent import _build_system_prompt
 
     d = _make_sandbox()
     card_path = os.path.join(d, ".agent-memory", "project.md")
     with open(card_path, "w", encoding="utf-8") as f:
-        f.write(
-            "# Project\nname: MyApp\ndescription: D\npurpose: P\n"
-            "stack: Python\nversion: unpinned\nstatus: draft\n"
-            "\n[identity stabilized: t]\nstatus: stable\n"
-        )
+        f.write("# Project\n\n## Identity\n- project: MyApp\n")
     with open(os.path.join(d, "app.py"), "w", encoding="utf-8") as f:
         f.write("print(1)\n")
 
     s1, _ = _build_system_prompt("## Task\ndo it", d)
-    assert "Project Overview" in s1  # still injected, per design
-
-    with open(card_path, "a", encoding="utf-8") as f:
-        f.write("\n[updated: t2]\nstack: Python, Redis\n")
+    with open(card_path, "w", encoding="utf-8") as f:
+        f.write("# Project\n\n## Identity\n- project: Renamed\n")
     s2, _ = _build_system_prompt("## Task\ndo it", d)
     assert s1 == s2
 

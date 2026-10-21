@@ -38,7 +38,6 @@ def load_existing_specs(workspace_path: str = "") -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 PLAN_STATUSES = ("pending", "in_progress", "completed")
-MAX_PLAN_STEPS = 20
 MAX_STEP_CHARS = 200
 
 
@@ -73,8 +72,12 @@ def save_task_tracking(task_data: dict, workspace_path: str = "", chat_id: str =
     task_path = os.path.join(_tasks_dir(), filename)
     try:
         task_data["updated_at"] = datetime.now().isoformat()
-        with open(task_path, "w", encoding="utf-8") as f:
+        # Atomic write: readers (plan dock, agent re-injection, parallel job
+        # tracker syncs) must never observe a torn/truncated JSON file.
+        tmp_path = task_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(task_data, f, indent=2)
+        os.replace(tmp_path, task_path)
         return True
     except Exception as e:
         print(f"Error saving task tracking: {e}")

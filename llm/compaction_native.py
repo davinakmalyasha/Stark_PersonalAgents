@@ -1,143 +1,254 @@
-"""compaction_native.py — ProcessHistory processor for native ModelMessage history (A7).
+"""compaction_native.py — ProcessHistory processor for native ModelMessage history.
 
-Replaces manual compact_history loop with pydantic-ai ProcessHistory capability.
-The processor is invoked before each model request; it checks token estimate
-and truncates via compact_history_native when over threshold.
+The processor runs before each model request. When the token estimate crosses
+the checkpoint trigger it asks the SAME model that is driving the chat for one
+handoff summary, then rebuilds history Codex-style — repo context, retained
+user asks, then the summary LAST. There is no separate compactor model and no
+multi-pass ledger.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import Any
 
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.tools import RunContext
 
 
-async def native_history_processor(*args: Any, **kwargs: Any) -> list[ModelMessage]:
+def policy_for_deps(deps: Any):
+    """Compaction policy for one run's deps.
+
+    Precedence: shared policy keyed by the real role name (specialists keep
+    their own key), then the registry spec's ``compaction`` overrides, then a
+    window clamp (75% trigger / 85% hard) so a smaller-context model compacts
+    before the provider rejects the request.
+    """
+    from memory.context_compaction import CompactionPolicy, get_compaction_policy
+
+    role = getattr(deps, "role", "") or "developer"
+    policy = get_compaction_policy(str(role) or "developer")
+
+    overrides = getattr(deps, "compaction", None) or {}
+    if overrides:
+        def _ov(name: str, fallback: int) -> int:
+            try:
+                value = int(overrides.get(name) or 0)
+                return value if value > 0 else fallback
+            except Exception:
+                return fallback
+
+        policy = CompactionPolicy(
+            role=policy.role,
+            checkpoint_trigger=_ov("checkpoint_tokens", policy.checkpoint_trigger),
+            hard_limit=_ov("hard_limit", policy.hard_limit),
+            summary_output_tokens=_ov("summary_output_tokens", policy.summary_output_tokens),
+        )
+
+    return clamp_policy(policy, int(getattr(deps, "context_window", 0) or 0))
+
+
+def clamp_policy(policy, window: int):
+    """Clamp a compaction policy below a model window (75% trigger / 85% hard)."""
+    window = int(window or 0)
+    if window <= 0:
+        return policy
+    from memory.context_compaction import CompactionPolicy
+
+    return CompactionPolicy(
+        role=policy.role,
+        checkpoint_trigger=min(policy.checkpoint_trigger, max(4096, int(window * 0.75))),
+        hard_limit=min(policy.hard_limit, max(8192, int(window * 0.85))),
+        summary_output_tokens=policy.summary_output_tokens,
+    )
+
+
+def _trim_stale_thinking(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Drop old chain-of-thought from history while keeping the API contract.
+
+    Reasoning models bill prior thinking as cached input on every later request
+    (DeepSeek re-sends ``reasoning_content`` in each assistant turn). Every
+    major harness (Codex reasoning summaries, Anthropic ephemeral thinking,
+    OpenCode compaction) keeps old CoT OUT of active context — the actions it
+    produced already live in the tool results. This mirrors that: only the
+    LATEST assistant response keeps its thinking verbatim (it is the one the
+    model is still acting on); older ThinkingParts are emptied. The part stays
+    so the provider's field contract holds — pydantic-ai itself backfills the
+    field with an empty string for DeepSeek, so empty is API-legal.
+    """
+    try:
+        last_thinking_idx = -1
+        for i, m in enumerate(messages):
+            if isinstance(m, ModelResponse):
+                for p in getattr(m, "parts", []) or []:
+                    if getattr(p, "part_kind", "") == "thinking" and getattr(p, "content", ""):
+                        last_thinking_idx = i
+                        break
+        if last_thinking_idx < 0:
+            return messages
+        out = list(messages)
+        for i in range(last_thinking_idx):
+            m = out[i]
+            if not isinstance(m, ModelResponse):
+                continue
+            for j, p in enumerate(m.parts):
+                if getattr(p, "part_kind", "") == "thinking" and getattr(p, "content", ""):
+                    try:
+                        m.parts[j] = dataclasses.replace(p, content="")
+                    except Exception:
+                        pass
+        return out
+    except Exception:
+        return messages
+
+
+async def native_history_processor(
+    ctx: RunContext[Any],
+    messages: list[ModelMessage] | None = None,
+    *args: Any,
+    **kwargs: Any,
+) -> list[ModelMessage]:
     """HistoryProcessor for ProcessHistory — truncates when over checkpoint.
 
-    Accepts both (ctx, messages) and (messages) calling conventions to be
-    robust to pydantic-ai's takes_run_context detection.
+    First parameter is typed ``RunContext`` so pydantic-ai's
+    takes_run_context detection passes it for real; legacy direct callers
+    that pass ``(messages,)`` are still tolerated below.
     """
-    # Normalize args: handle (ctx, messages) or (messages)
-    ctx: Any = None
-    messages: list[ModelMessage] | None = None
-    if len(args) == 2:
-        # Could be (ctx, messages) or (messages, ctx) — detect by deps attr
-        if hasattr(args[0], "deps") and isinstance(args[1], list):
-            ctx, messages = args[0], args[1]
-        elif hasattr(args[1], "deps") and isinstance(args[0], list):
-            messages, ctx = args[0], args[1]
-        else:
-            # Assume (ctx, messages)
-            ctx, messages = args[0], args[1]
-    elif len(args) == 1:
-        if isinstance(args[0], list):
-            messages = args[0]
-            ctx = kwargs.get("ctx")
-        else:
-            ctx = args[0]
-            messages = kwargs.get("messages") or kwargs.get("history")
-    else:
-        messages = kwargs.get("messages") or kwargs.get("history") or []
-        ctx = kwargs.get("ctx")
+    if isinstance(ctx, list):
+        # Legacy direct call: native_history_processor(messages)
+        messages = ctx
+        ctx = kwargs.get("ctx") or None
     if messages is None:
-        messages = []
+        messages = kwargs.get("messages") or kwargs.get("history") or []
+    if not isinstance(messages, list):
+        messages = list(messages)
+    if args:
+        if isinstance(args[-1], list) and messages is kwargs.get("messages"):
+            messages = args[-1]
+    # Thinking trimming is OPT-IN (PAI_TRIM_THINKING=1) and OFF by default:
+    # benchmark evidence showed it BACKFIRES on DeepSeek pricing. Re-sending
+    # the unchanged prefix is billed as a cache READ (~$0.0028/M); trimming
+    # old ThinkingParts shifts the prefix on every request, which fragments
+    # the provider cache and converts ~50x-cheaper reads into misses (miss
+    # ratio doubled 776k -> 1.6M on the same 175 tasks). Keep the prefix
+    # byte-stable; old thinking is effectively free to resend.
+    if os.getenv("PAI_TRIM_THINKING", "0") == "1":
+        try:
+            messages = _trim_stale_thinking(messages)
+        except Exception:
+            pass
+    # ── Live projectMap+ deltas (PAI_LIVE_MAP=1, default) ──────────────
+    # A mutating tool call sets deps._map_stale in the tool hook. Before the
+    # NEXT model request we rescan once and append the capped delta as a
+    # <current-context> user message, so edits inside a single AgentRun stay
+    # visible to the model. Byte-identical re-sends are provider cache-hits
+    # after their first appearance (end-of-user-input prefix unit). Runs
+    # before the size check so it fires on every request, not just compactions.
+    if os.getenv("PAI_LIVE_MAP", "1") != "0":
+        try:
+            _ldeps = getattr(ctx, "deps", None) if ctx is not None else None
+            if _ldeps is not None and getattr(_ldeps, "_map_stale", False):
+                _proj = str(getattr(_ldeps, "project_path", "") or "")
+                if _proj:
+                    try:
+                        from memory.memory_manager import force_delta_refresh
+                        _d = force_delta_refresh(_proj)
+                        _ldeps._map_stale = False  # state now matches disk
+                        if _d:
+                            _ldeps._map_live = int(getattr(_ldeps, "_map_live", 0) or 0) + 1
+                            _block = "<current-context>\n%s\n</current-context>" % _d
+                            _dup = False
+                            for _m in reversed(messages):
+                                for _p in getattr(_m, "parts", []) or []:
+                                    if getattr(_p, "part_kind", "") == "user-prompt":
+                                        if str(getattr(_p, "content", "") or "") == _block:
+                                            _dup = True
+                                        break
+                                else:
+                                    continue
+                                break
+                            if not _dup:
+                                from pydantic_ai.messages import UserPromptPart as _UP
+                                from pydantic_ai.messages import ModelRequest as _MR
+                                messages = [*messages, _MR(parts=[_UP(content=_block)])]
+                    except Exception:
+                        try:
+                            _ldeps._map_stale = False
+                        except Exception:
+                            pass
+        except Exception:
+            pass
     try:
         from llm.model_history import compact_history_native, estimate_history_tokens
-        from memory.context_compaction import get_compaction_policy
 
-        role = getattr(getattr(ctx, "deps", None), "role", "") or "developer"
-        # Normalize role: Orchestrator -> orchestrator, Developer -> developer, etc.
-        role_key = str(role).lower() if isinstance(role, str) else "developer"
-        # Map WorkspaceDeps roles to policy keys
-        if role_key not in ("developer", "orchestrator", "general", "house", "dfd"):
-            role_key = "developer"
-        policy = get_compaction_policy(role_key)
+        _deps = getattr(ctx, "deps", None)
+        policy = policy_for_deps(_deps)
         est = estimate_history_tokens(messages)
         if est < policy.checkpoint_trigger and est < policy.hard_limit:
             return messages
-        # Over threshold — compact. Try semantic summary via direct.model_request + FallbackModel (P2-1)
-        summary = None
-        if os.getenv("PAI_COMPACTION_LLM", "1") != "0":
-            try:
-                import asyncio
-                from llm.model_history import history_to_debug_text
-                from pydantic_ai import direct as _direct
+        # Over threshold — one summary request from the same chat model.
+        # project.md and the map are never summarized; they are re-anchored
+        # fresh below.
+        try:
+            _pp = str(getattr(getattr(ctx, "deps", None), "project_path", "") or "")
+        except Exception:
+            _pp = ""
 
-                async def _summarize():
-                    try:
-                        from llm.free_provider import build_free_fallback
-                    except Exception:
-                        return None
-                    # Build fallback model for compaction (prefer non-reasoning, large context)
-                    try:
-                        fb = build_free_fallback(capability="compaction", prefer_reasoning=False, max_context_tokens=1000000)
-                    except Exception:
-                        try:
-                            fb = build_free_fallback(capability="coding", prefer_reasoning=False)
-                        except Exception:
-                            return None
-                    if fb is None:
-                        return None
-                    debug = history_to_debug_text(messages)
-                    # Truncate to 30k chars to keep prompt manageable (~7k tokens)
-                    if len(debug) > 30000:
-                        debug = debug[:15000] + "\n...[truncated]...\n" + debug[-15000:]
-                    prompt = (
-                        "Summarize the following agent conversation for context compaction. "
-                        "Preserve key decisions, tool calls, file modifications, and remaining tasks. "
-                        "Be concise (<=400 words).\n\n" + debug
-                    )
-                    from pydantic_ai.messages import ModelRequest, UserPromptPart
+        from memory.compaction_engine import run_compaction_summary
 
-                    req = [ModelRequest(parts=[UserPromptPart(content=prompt)])]
-                    try:
-                        # 8s timeout to avoid blocking processor
-                        resp = await asyncio.wait_for(
-                            _direct.model_request(fb, req, model_settings={"temperature": 0.2}),
-                            timeout=8.0,
-                        )
-                        # Extract text from ModelResponse
-                        txt = ""
-                        for p in getattr(resp, "parts", []) or []:
-                            if getattr(p, "part_kind", "") == "text":
-                                txt += str(getattr(p, "content", "") or "")
-                        txt = txt.strip()
-                        if txt:
-                            return txt[:2000]
-                    except asyncio.TimeoutError:
-                        return None
-                    except Exception:
-                        return None
-                    return None
-
-                # Only run summarizer if we are in async context and not already over hard limit by too much
-                # Use asyncio.wait_for with fallback to placeholder if no loop or timeout
-                try:
-                    # If already in running loop, await directly; else skip (processor is async so loop exists)
-                    summary = await _summarize()
-                except Exception:
-                    summary = None
-            except Exception:
-                summary = None
-        if summary is None:
+        engine = await run_compaction_summary(
+            messages,
+            _pp,
+            policy=policy,
+            role=str(getattr(_deps, "role", "") or "developer"),
+            deps=_deps,
+            model=getattr(_deps, "compaction_model", None),
+            model_id=str(getattr(_deps, "compaction_model_id", "") or ""),
+        )
+        summary = str(engine.get("summary") or "")
+        if not summary:
             summary = "[Native compaction — earlier turns summarized due to length]"
-        # Preserve full project map if present in history (look for <current-context>)
-        full_map = None
-        for m in messages:
-            for p in getattr(m, "parts", []) or []:
-                try:
-                    from pydantic_ai.messages import UserPromptPart
-                    if isinstance(p, UserPromptPart) and isinstance(p.content, str) and "<current-context>" in p.content:
-                        # Extract map block
-                        full_map = p.content
-                        break
-                except Exception:
-                    continue
-        return compact_history_native(messages, policy=policy, full_project_map=full_map, summary_text=summary)
+        if engine.get("chunks"):
+            _window = int(engine.get("window") or 0)
+            print(
+                f"[COMPACTION] one-pass summary via {engine.get('model')} "
+                f"(window {_window:,})"
+            )
+        # Re-anchor the LATEST project map: a fresh full rebuild beats the
+        # stale copy embedded in old history (post-anchor edits existed only
+        # as deltas). Falls back to the in-history <current-context> block.
+        full_map = str(engine.get("full_map") or "") or None
+        if not full_map:
+            for m in messages:
+                for p in getattr(m, "parts", []) or []:
+                    try:
+                        from pydantic_ai.messages import UserPromptPart
+                        if isinstance(p, UserPromptPart) and isinstance(p.content, str) and "<current-context>" in p.content:
+                            _body = p.content.split("<current-context>", 1)[1].rsplit("</current-context>", 1)[0].strip()
+                            if _body.startswith("projectMap"):
+                                full_map = _body
+                                break
+                    except Exception:
+                        continue
+                if full_map:
+                    break
+        return compact_history_native(
+            messages,
+            policy=policy,
+            full_project_map=full_map,
+            summary_text=summary,
+            project_memory_text=str(engine.get("project_memory") or ""),
+            user_messages=list(engine.get("user_messages") or []),
+        )
     except Exception:
         # Never break the run on compaction error
         return messages
+
+
+def _split_compaction_blocks(text: str) -> tuple[str, str]:
+    """Compatibility wrapper — the parser now lives in the shared engine."""
+    from memory.compaction_engine import split_compaction_blocks
+    return split_compaction_blocks(text)
 
 
 def get_process_history_capability():

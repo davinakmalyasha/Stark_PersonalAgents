@@ -1,10 +1,10 @@
 """Design-loop drill (Phase 0 validation).
 
 Runs the REAL pipeline (orchestrator -> Dev -> UI subagent) on a design
-brief that points at .agents/skills/ui-ux-design/SKILL.md.
+brief that points at .agents/skills/ui-ux-pro-max/SKILL.md.
 
 - ask_user is served by a scripted provider that logs every question and
-  auto-picks the Linear/dark direction (mechanics validation, not taste).
+  auto-picks the first option (mechanics validation, not taste).
 - All artifacts must land in scratch/agents_works/design/ only.
 - Logs: ask_log.jsonl, drill_snapshots.jsonl (both next to this file).
 
@@ -88,24 +88,23 @@ _uq_bare.register_provider("drill-auto", drill_provider)
 BRIEF = (
     "Design drill — follow instructions exactly, do NOT create any project, "
     "do NOT touch anything outside the folders named below.\n\n"
-    "1. Read the file D:\\MyProject\\LangChain\\.agents\\skills\\ui-ux-design\\SKILL.md "
+    "1. Read the file D:\\MyProject\\LangChain\\.agents\\skills\\ui-ux-pro-max\\SKILL.md "
     "(absolute path — repo-relative paths resolve against the project "
-    "folder, not the repo root) and follow its loop end-to-end "
-    "(direction-lock via ask_user, build, self-critique, visual verify, "
-    "finalize). The shared catalog is at "
-    "D:\\MyProject\\LangChain\\design-references\\INDEX.md (absolute path).\n"
+    "folder, not the repo root), generate the design system for this brief "
+    "with its search script, then build the artifact following the returned "
+    "tokens and the pre-delivery checklist.\n"
     "2. The design brief: a landing page for a fictional coffee subscription "
     "called 'North Roast' (hero, 3 pricing tiers, footer).\n"
-    "3. Work ONLY inside scratch/agents_works/design/ (repo-relative). You "
-    "may READ design-references/INDEX.md and design-references/*.md. Write "
+    "3. Work ONLY inside scratch/agents_works/design/ (repo-relative). Write "
     "the artifact HTML, any screenshot evidence notes, and the final "
-    "DESIGN.md into scratch/agents_works/design/ only.\n"
+    "`## Design` section into scratch/agents_works/design/.agent-memory/project.md "
+    "only.\n"
     "4. Keep it to ONE iterate pass max after the first render, then "
     "finalize. When done, report: files written, winning direction, "
     "screenshot path.\n"
     "5. TURN DISCIPLINE: never end a turn with text-only until the "
-    "artifact HTML, the screenshot verification, and DESIGN.md all "
-    "exist. After each ask_user answer, continue with tools in the "
+    "artifact HTML, the screenshot verification, and the `## Design` "
+    "section all exist. After each ask_user answer, continue with tools in the "
     "same turn. Narrate only in the final report."
 )
 

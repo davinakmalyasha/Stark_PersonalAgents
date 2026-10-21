@@ -16,7 +16,15 @@ jobs:
         run: |
           pip install --quiet jinja2 pyyaml
           python scripts/validate_templates.py
-      - name: Test suite (renderer, apply_template, branch levels, gate installer, push matrix, tier contracts)
+      - name: Test suite
+        # pytest, not tests/run_all.py. run_all.py is a zero-dependency runner
+        # that cannot supply fixtures, so it SKIPs 23 fixture-based tests — and
+        # before it was fixed it also failed 46 tests it could not import.
+        #
+        # The suite imports the REAL runtime (`tools` -> `agents` -> `llm`), so
+        # a bare jinja2+pyyaml install cannot even collect it: it dies on
+        # `No module named 'dotenv'`. requirements-test.txt is the runtime set
+        # minus the voice stack, fastembed and tree-sitter-languages.
         run: |
-          pip install --quiet jinja2 pyyaml
-          python tests/run_all.py
+          pip install --quiet -r requirements-test.txt
+          python -m pytest tests/ -q

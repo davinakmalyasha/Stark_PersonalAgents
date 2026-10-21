@@ -27,7 +27,6 @@ from llm.model_history import (
     load_history,
     load_history_python,
     dump_history_python,
-    compact_history_native,
     append_user_history,
 )
 from agents.developer_prompt import _STATIC_SYSTEM_TEMPLATE
@@ -42,26 +41,6 @@ from pydantic_ai.messages import (
     TextPart,
     ThinkingPart,
 )
-
-
-def _bound_tool_result(tool_name: str, tool_args: dict, result) -> str:
-    """Keep a tool result small while preserving a VFS path to the full output."""
-    # Lazy import avoids the tools -> AddOnTool -> agents -> developer_agent
-    # initialization cycle. The helper runs only after the package is loaded.
-    from tools import auto_offload_result, _tool_cap
-
-    result_text = str(result)
-    site = tool_name
-    if tool_name == "run_command" and str(tool_args.get("process_action", "")).lower() == "logs":
-        site = "logs"
-    cap = _tool_cap(site)
-    lower = result_text.lower()
-    # run_command and the registry may already have created a retrievable
-    # preview. Re-wrapping that preview would waste a second scratch file.
-    already_offloaded = "offloaded" in lower and "/scratch/" in lower
-    if len(result_text) <= cap or already_offloaded:
-        return result_text
-    return auto_offload_result(result_text, tool_name, max_chars=cap)
 
 
 def _execute_one_tool_call(tool_call: dict, deps: object = None) -> str:
@@ -93,32 +72,31 @@ def _build_dynamic_context(
 ) -> tuple[str, str]:
     """Build the stable prefix and the latest context tail.
 
-    Only project-identity data and fixed capability pointers belong in the
-    SystemMessage. The repository map is refreshed before the request and a
-    full snapshot or compact delta is placed in the latest HumanMessage so a
-    new map cannot invalidate older conversation history. ``task``,
-    ``context``, and ``is_fixing`` remain in the signature for callers that
-    still pass them; they are intentionally not rendered as generic context
-    blocks.
+    Only fixed capability pointers and the workspace root belong in the
+    SystemMessage. The authored project memory (project.md) is injected as its
+    own message below the system prompt by ``developer_node``, and the
+    repository map is refreshed before the request and placed in the latest
+    HumanMessage so a new map cannot invalidate older conversation history.
+    ``task``, ``context``, and ``is_fixing`` remain in the signature for
+    callers that still pass them; they are intentionally not rendered as
+    generic context blocks.
     """
     del task, context, is_fixing
     safe_path = project_path or "."
     workspace_root = project_path or (
         os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__))
     )
-
-    stable_parts = [f"## Workspace Root\n{workspace_root}"]
-    current_parts = []
-
-    # project.md is a small, stable identity card. It is intentionally kept in
-    # the cached prefix; code navigation belongs in the current tail below.
-    try:
-        from memory.memory_manager import load_cached_project_identity
-        project_card = load_cached_project_identity(safe_path)
-        if project_card:
-            stable_parts.append(f"## Project Overview\n{project_card}")
-    except Exception as e:
-        print(f"Error loading project identity: {e}")
+    # Eval-only layout (DEEP_AGENTS_EVAL_RUN=1): keep the SystemMessage
+    # byte-identical across tasks by moving the per-task workspace root into
+    # the request tail (<current-context>), which is fresh content anyway.
+    # Production (env unset) keeps root in the stable prefix.
+    eval_layout = os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1"
+    if eval_layout:
+        stable_parts = []
+        current_parts = [f"## Workspace Root\n{workspace_root}"]
+    else:
+        stable_parts = [f"## Workspace Root\n{workspace_root}"]
+        current_parts = []
 
     # Refresh only the cache file before assembling this request. Do not mutate
     # an already-running message list: the new snapshot starts the next tail.
@@ -148,7 +126,9 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
     """
     Build the system prompt with a cache-friendly message layout.
 
-    Stable SystemMessage: base prompt, workspace root, and project identity.
+    Stable SystemMessage: base prompt and workspace root.
+    Authored project memory (project.md): its own message right below the
+    system prompt (fresh per run; re-anchored at compaction).
     Append-only history: prior task/tool turns remain byte-stable.
     Current tail: the first full projectMap or a later projectMap+ delta and
     the current request are appended after history, so only the tail is new
@@ -182,11 +162,28 @@ def _build_system_prompt(task: str, project_path: str, context: str = "", valid_
         if _catalog:
             static_system_parts.append(
                 "## SUBAGENTS\n"
-                "Specialist work outside routine coding is delegated, not done inline:\n"
+                "Delegated, not done inline — one line per specialist; work it "
+                "marks as not-for stays with you:\n"
                 f"{_catalog}\n"
-                "Delegate with `call_subagent(name, task)` — a complete instruction "
-                "with goal, targets, and acceptance check. Its final report is "
-                "the result."
+                "- Delegate with `call_subagent(name, task)`. A task = goal + "
+                "targets (files/URLs/repo) + acceptance check + constraints; its "
+                "final report is the result.\n"
+                "- Give context, not method: never prescribe design direction, "
+                "palette, typography, or step-by-step process — specialists own "
+                "their craft.\n"
+                "- Frontend design (greenfield UI, redesign, design system, visual "
+                "direction) belongs to UI: delegate it, keep working, then wire and "
+                "verify. UI's `## Design` decisions stand until the human overrides.\n"
+                "- Feature work inside an existing design system stays with you "
+                "(follow `## Design`).\n"
+                "- Verification + go-live, production hardening, the CI/security gate, branch "
+                "ladder/protection, or deploy configs belong to DevOps: delegate it "
+                "with repo/host + acceptance check in the task, keep coding.\n"
+                "- Codebase recon — where something lives or is used, a cross-file "
+                "flow trace, an unfamiliar subsystem, pre-plan evidence — belongs to "
+                "Explore: spawn it with one focused question and keep working; it is "
+                "read-only and returns file:line evidence. Read directly only for "
+                "small, known targets."
             )
     except Exception as e:
         print(f"Error rendering subagent catalog: {e}")
@@ -273,7 +270,7 @@ def _has_full_project_map(messages: list) -> bool:
         content = _get_message_text(message)
         if not isinstance(content, str):
             continue
-        if re.search(r"(?m)^projectMap:\s*$", content):
+        if re.search(r"(?m)^projectMap:(?:\s+v\d+)?\s*$", content):
             return True
     return False
 
@@ -298,7 +295,7 @@ def _task_tail_parts(
     """
     parts = []
     if current_context and (
-        messages is None or _latest_current_context(history) != current_context
+        messages is None or _latest_current_context(messages) != current_context
     ):
         parts.append(current_context)
     parts.append(f"## Task\n{task}")
@@ -348,6 +345,18 @@ def _plan_block_complete(plan_block: str) -> bool:
         return done > 0 and done >= total
     except Exception:
         return False
+
+
+def _open_plan_steps(plan_block: str) -> int:
+    """Number of incomplete steps reported by a plan block header, or 0."""
+    try:
+        inner = plan_block.split("\n", 1)[0].split("(", 1)[-1]
+        done_s, rest = inner.split("/", 1)
+        total_s = rest.split(" ", 1)[0]
+        done, total = int(done_s.strip()), int(total_s.strip())
+        return max(0, total - done)
+    except Exception:
+        return 0
 
 
 def _apply_plan_reinjection(messages: list, plan_block: str) -> None:
@@ -545,7 +554,7 @@ def developer_node(s: ITState) -> dict:
                 if task_data.get("status") == "completed":
                     is_completed = True
                 
-                if not is_completed:
+                if not is_completed or keep_session:
                     try:
                         dumped_history = dump_history(history)
                     except Exception:
@@ -570,6 +579,7 @@ def developer_node(s: ITState) -> dict:
     requirements = s.get("requirements", "")
     test_report = s.get("test_report", "")
     is_fixing = bool(test_report)
+    keep_session = os.environ.get("BSA_KEEP_DEV_SESSION") == "1"
     project_path = s.get("project_path", "") or (os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.abspath(__file__)))
     err_count = s.get("error_count", 0)
     chat_id = s.get("chat_id", "")
@@ -711,6 +721,26 @@ def developer_node(s: ITState) -> dict:
         # map without pinning the task that originally followed it.
         # A6b: native ModelMessage history
         history = build_initial_history(static_system, "")
+        # Authored project memory (project.md): its own message right below the
+        # system prompt, fresh from disk. When missing, the init hint triggers
+        # the first-task authoring of the `## Identity` section (content LLM).
+        try:
+            from memory.memory_manager import load_project_memory
+            _project_memory = load_project_memory(project_path)
+        except Exception as e:
+            _project_memory = ""
+            print(f"[DEVELOPER] Error loading project memory: {e}")
+        if _project_memory:
+            history.append(ModelRequest(parts=[UserPromptPart(
+                content="<project-memory>\n" + _project_memory + "\n</project-memory>"
+            )]))
+        else:
+            history.append(ModelRequest(parts=[UserPromptPart(content=(
+                "[PROJECT MEMORY INIT] .agent-memory/project.md has no authored memory "
+                "yet. On this first task, author the `## Identity` section (project, "
+                "purpose, stack, goals) with edit_file before finishing — compact "
+                "bullets only. Never edit `## Design` (owned by the UI specialist)."
+            ))]))
         _init_parts = _task_tail_parts(current_context, task_message)
         for part in _init_parts:
             history.append(ModelRequest(parts=[UserPromptPart(content=part)]))
@@ -721,6 +751,52 @@ def developer_node(s: ITState) -> dict:
         tracked_files_created = []
         tracked_files_modified = []
     verification_nudged = False
+    # Long-horizon completion gate counters (advisory nudges, generously capped
+    # so a genuinely stuck agent can still hand back an honest report).
+    plan_nudges = 0
+    verify_nudges = 0
+
+    def _completion_gate_nudge():
+        """Return a continue-nudge when the agent tries to finish with open plan
+        steps or a failing last verification; None when finishing is legitimate.
+
+        The plan is LLM-owned (update_plan full replacement) and the verification
+        signal is the ordered tool-execution log, so this gate never second-guesses
+        correctness — it only refuses an early stop while work is declared open.
+        """
+        nonlocal plan_nudges, verify_nudges
+        try:
+            plan_block = get_plan_for_context("developer")
+        except Exception:
+            plan_block = ""
+        if plan_block:
+            open_steps = _open_plan_steps(plan_block)
+            if open_steps > 0 and plan_nudges < 10:
+                plan_nudges += 1
+                return (
+                    f"[PLAN GATE] Your plan still has {open_steps} incomplete step(s). "
+                    "Keep working — and keep the plan current with update_plan (full "
+                    "replacement, one step in_progress). Do not finish while any step is open."
+                )
+        try:
+            seq = getattr(run_deps, "_tool_seq", None) or []
+        except Exception:
+            seq = []
+        last_cmd = None
+        for entry in reversed(seq):
+            if entry.get("t") == "run_command":
+                last_cmd = entry
+                break
+        if last_cmd is not None and last_cmd.get("f") and verify_nudges < 25:
+            preview = str(last_cmd.get("p") or "")[:300]
+            verify_nudges += 1
+            return (
+                "[VERIFY GATE] Your most recent check FAILED"
+                + ((":\n" + preview) if preview else ".")
+                + "\nDiagnose the root cause and fix it, then re-run the check. "
+                "Do not finish while your last verification is failing."
+            )
+        return None
 
     # Vision: inject user-attached images (from the API stash) before the loop
     # starts — applies to both fresh starts and repair/resume cycles (a new
@@ -764,23 +840,21 @@ def developer_node(s: ITState) -> dict:
 
         # Append-only below the single checkpoint threshold. At the threshold,
         # refresh the full map and commit one native transcript rebuild atomically.
-        # A6b: native compaction — estimate_history_tokens + compact_history_native
+        # A6b: native compaction — estimate_history_tokens + shared engine.
         compaction_info: dict = {"checkpoint": False}
         try:
             est = estimate_history_tokens(history)
             if est >= compaction_policy.checkpoint_trigger:
                 before = est
-                full_map = None
-                try:
-                    from memory.memory_manager import load_cached_code_map
-                    full_map = load_cached_code_map(project_path).strip() or None
-                except Exception:
-                    full_map = None
-                history = compact_history_native(
+                # One same-model handoff summary; project.md and the map are
+                # re-anchored fresh. Never raises; deterministic fallback on failure.
+                from memory.compaction_engine import compact_history_with_summary
+                history, _engine_info = compact_history_with_summary(
                     history,
+                    project_path=project_path,
                     policy=compaction_policy,
-                    full_project_map=full_map,
-                    summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                    role="Developer",
+                    deps=run_deps,
                 )
                 after = estimate_history_tokens(history)
                 compaction_info = {
@@ -788,12 +862,14 @@ def developer_node(s: ITState) -> dict:
                     "trigger": "checkpoint" if before < compaction_policy.hard_limit else "hard_guard",
                     "before": before,
                     "after": after,
-                    "map_refreshed": bool(full_map),
+                    "map_refreshed": bool(_engine_info.get("full_map")),
+                    "summary_chunks": 1,
                 }
                 _log(
                     f"[DEVELOPER] Native checkpoint "
                     f"({before:,} -> {after:,} est. tokens; "
-                    f"tail={compaction_policy.tail_budget_tokens:,}; map_refreshed={bool(full_map)})"
+                    f"one_pass=True; "
+                    f"map_refreshed={bool(_engine_info.get('full_map'))})"
                 )
         except Exception as e:
             _log(f"[DEVELOPER] Context checkpoint unavailable: {e}")
@@ -851,7 +927,6 @@ def developer_node(s: ITState) -> dict:
                     _dev_plan = get_role_plan("Developer")
                 except Exception:
                     _dev_plan = {}
-                reasoning_effort = "high"
                 reasoning_budget = None
 
                 if str(_dev_plan.get("backend")) == "free":
@@ -877,7 +952,6 @@ def developer_node(s: ITState) -> dict:
                         messages=list(run_messages),
                         tools=native_dev_tools,
                         temp=0.2,
-                        reasoning_effort=reasoning_effort,
                         reasoning_budget=reasoning_budget,
                         where=where_tag,
                         deps=run_deps,
@@ -1026,6 +1100,14 @@ def developer_node(s: ITState) -> dict:
                 continue
 
             # No native tool call — the model has chosen to finish.
+            # Long-horizon completion gate: refuse an early finish while the plan
+            # has open steps or the last executed verification failed.
+            _gate = _completion_gate_nudge()
+            if _gate:
+                _log("[DEVELOPER] Completion gate — continuing instead of finishing.")
+                history.append(ModelRequest(parts=[UserPromptPart(content=_gate)]))
+                _native_finish = False
+                continue
             _log(f"[DEVELOPER] No tool call parsed from response (len={len(response_text)}). Preview: {repr(response_text[:300])}")
             clean_response = _extract_text_response(response_text)
             _log(f"\n[DEVELOPER] âœ… Agent finished after {iteration} iterations")
@@ -1043,7 +1125,7 @@ def developer_node(s: ITState) -> dict:
             # Spec compliance, Coordination needed. If the LLM didn't produce
             # a proper summary, synthesize one from tool_call_log.
             if clean_response and len(clean_response.strip()) >= 60:
-                report = clean_response[:1000]
+                report = clean_response
             else:
                 files_created = [t for t in tool_call_log if t.get("tool") in ("edit_file",)]
                 report_lines = ["## Dev Summary"]
@@ -1061,7 +1143,7 @@ def developer_node(s: ITState) -> dict:
                 "thoughts": {"developer": "Execution failed due to blocking error: " + clean_response[:100] if is_error else "Implementation complete."},
                 "developer_tool_log": tool_log_val,
                 "outputs": {
-                    "code": f"// ERROR: {clean_response[:1000]}" if is_error else "Code successfully implemented.",
+                    "code": f"// ERROR: {clean_response}" if is_error else "Code successfully implemented.",
                     "agent_report": report
                 }
             })
@@ -1086,15 +1168,19 @@ def developer_node(s: ITState) -> dict:
                         task_tracking_data["status"] = "completed"
                         # Context isolation at task granularity: clear
                         # developer_state so the next task starts fresh.
-                        if "developer_state" in task_tracking_data:
+                        # Long-horizon mode (BSA_KEEP_DEV_SESSION=1) keeps the
+                        # session so a repair round CONTINUES this transcript
+                        # instead of restarting cold (cache-warm, no re-derivation).
+                        if "developer_state" in task_tracking_data and not keep_session:
                             save_task_tracking({k: v for k, v in task_tracking_data.items() if k != "developer_state"}, project_path, chat_id)
                             del task_tracking_data["developer_state"]
                         # A finished checklist must not resurrect in the UI
                         # state mirror; the model declared it done via
                         # update_plan and the thread is being retired.
-                        plans = task_tracking_data.get("plan")
-                        if isinstance(plans, dict):
-                            plans.pop("developer", None)
+                        if not keep_session:
+                            plans = task_tracking_data.get("plan")
+                            if isinstance(plans, dict):
+                                plans.pop("developer", None)
                     save_task_tracking(task_tracking_data, project_path, chat_id)
             except Exception as e:
                 print(f"[DEVELOPER] Error updating task tracking: {e}")
@@ -1141,11 +1227,11 @@ def developer_node(s: ITState) -> dict:
                     out.append("```text")
                     out.append(tail or "(no error output captured)")
                     out.append("```")
-                return "\n".join(out)[:1000]  # 1000-char report cap — matches _HANDOFF_MAX_CHARS
+                return "\n".join(out)  # uncapped: the 1000-char cap sliced reports mid-sentence, which made the orchestrator re-prompt in a loop; the hidden test is the gate, not prose length
 
             if is_error:
                 return make_return({
-                    "code": f"// ERROR: {clean_response[:1000]}",
+                    "code": f"// ERROR: {clean_response}",
                     "agent_report": _build_dev_report(clean_response, True),
                     "test_report": f"STATUS: FAIL\nDeveloper reported error: {clean_response[:300]}",
                     "project_path": project_path,
@@ -1250,8 +1336,6 @@ def developer_node(s: ITState) -> dict:
             elif tool_name == "search_code":
                 pat = str(tool_args.get("pattern", ""))[:60]
                 tool_label = f"search \"{pat}\""
-            elif tool_name == "start_async_task":
-                tool_label = f"async {str(tool_args.get('name', ''))[:40]}"
             else:
                 tool_label = f"{tool_name}"
 

@@ -2,7 +2,7 @@
 
 - **Description:** Ask the caller structured questions and wait for answers. Use on material ambiguity, a decision only the caller can make, or plan approval. Each question needs 2-4 options (use multiSelect=true if more than one may apply). For plan-approval flows, set intent.kind="plan-review" on the question and put the approving option's label in intent.approve.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer, orchestrator, general, house, dfd
+- **Scopes (from _SCOPE_MAP):** developer, general, house, dfd, orchestrator, deploy, ui
 - **Parallel-safe (PARALLEL_SAFE):** False
 - **Compact doc:** ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).
 - **Required args (validated):** questions

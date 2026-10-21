@@ -6,11 +6,12 @@ fallback natively. Each FreeProvider instance represents one free gateway
 (openrouter, groq, etc.) and reuses its base_url / api_key / model.
 
 The routing order (provider_priority*100 + model_priority, reasoning_bias,
-dedup, cooldown) is preserved by the FallbackModel's sequential try; rate-limit
-state is kept inside each ProviderClient and checked before each request.
+dedup) is preserved by the FallbackModel's sequential try. Note: this
+pydantic-ai adapter does NOT consult the pool's rate-limit tracker — that
+lives on the hand-rolled path (``free_providers.free_native_turn``).
 
 Usage:
-    from llm.free_provider import build_free_fallback, free_provider_names
+    from llm.free_provider import build_free_fallback
     fallback = build_free_fallback(capability="coding", prefer_reasoning=False)
     agent = Agent(model=fallback, toolsets=[...], deps_type=WorkspaceDeps)
 """
@@ -80,46 +81,23 @@ class FreeProvider(OpenAIProvider):
         return self._free_model_id
 
 
-def free_provider_names(capability: str = "text") -> list[str]:
-    """List configured free provider names sorted by priority for capability."""
-    try:
-        from llm.free_providers import _get_models_for_capability, PROVIDER_CONFIGS
-        # Use routing helper to get ordered providers
-        models = _get_models_for_capability(capability)
-        seen = []
-        for m in models:
-            p = m.get("provider")
-            if p and p not in seen and p in (PROVIDER_CONFIGS or {}):
-                # Check that we have a key (or optional)
-                cfg = PROVIDER_CONFIGS[p]
-                if cfg.get("api_key_optional"):
-                    seen.append(p)
-                else:
-                    key = os.getenv(cfg.get("env_key", ""), "")
-                    if key:
-                        seen.append(p)
-        return seen
-    except Exception:
-        # Fallback: all configured providers with keys
-        out = []
-        for name, cfg in (PROVIDER_CONFIGS or {}).items():
-            if cfg.get("api_key_optional"):
-                out.append(name)
-            else:
-                if os.getenv(cfg.get("env_key", ""), ""):
-                    out.append(name)
-        return out
-
-
 def build_free_fallback(
     capability: str = "coding",
     prefer_reasoning: bool | None = None,
     max_context_tokens: int | None = None,
+    min_context_tokens: int | None = None,
+    prefer_context: bool = False,
+    preferred_model: str = "",
 ) -> Any:
     """Build a FallbackModel from free providers ordered for capability.
 
     The returned FallbackModel can be passed directly to `Agent(model=...)`
     or `OpenAIChatModel`. Each entry is an OpenAIChatModel with a FreeProvider.
+
+    ``min_context_tokens`` excludes models that cannot fit the request;
+    ``prefer_context`` sorts largest-context first. ``preferred_model`` moves
+    the matching catalog entry (biggest window variant) to the front while the
+    remaining pool stays as fallback.
     """
     try:
         from pydantic_ai.models.openai import OpenAIChatModel
@@ -136,11 +114,25 @@ def build_free_fallback(
             kwargs["prefer_reasoning"] = prefer_reasoning
         if max_context_tokens is not None:
             kwargs["max_context_tokens"] = max_context_tokens
+        if min_context_tokens is not None:
+            kwargs["min_context_tokens"] = min_context_tokens
+        if prefer_context:
+            kwargs["prefer_context"] = prefer_context
         # _get_models_for_capability returns sorted models
         try:
             models = _get_models_for_capability(capability, **kwargs)
         except TypeError:
             models = _get_models_for_capability(capability)
+        if preferred_model:
+            def _norm(value: Any) -> str:
+                return str(value or "").strip().lower().replace(":free", "-free")
+
+            want = _norm(preferred_model)
+            pinned = [m for m in models if _norm(m.get("id") or m.get("name")) == want]
+            rest = [m for m in models if m not in pinned]
+            # Biggest window first so the pinned chain starts at its best variant.
+            pinned.sort(key=lambda m: -int(m.get("context", 0) or 0))
+            models = pinned + rest
         providers: list[Any] = []
         seen_providers: set[str] = set()
         for m in models:
@@ -169,6 +161,14 @@ def build_free_fallback(
             return None
         if len(providers) == 1:
             return providers[0]
-        return FallbackModel(*providers)
+        # Free gateways fail in many ways beyond HTTP errors: malformed bodies
+        # (`UnexpectedModelBehavior`), missing models, quota messages. The
+        # pydantic-ai default only falls back on ModelAPIError, so one flaky
+        # provider (e.g. cline) would abort the whole chain even when a later
+        # provider works. Fall back on any exception.
+        try:
+            return FallbackModel(*providers, fallback_on=Exception)
+        except TypeError:
+            return FallbackModel(*providers)
     except Exception:
         return None

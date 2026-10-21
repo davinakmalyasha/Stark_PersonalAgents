@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
+import time
 from typing import Any, Optional
 
 from decimal import Decimal
@@ -44,6 +46,11 @@ try:
     _NATIVE_LIMITER = ConcurrencyLimiter(max_running=max(1, _max), max_queued=_queued_v, name="native-agent-pool")
 except Exception:
     _NATIVE_LIMITER = None  # type: ignore
+
+#: Structured exit frame emitted by run_command: "[OK] Exit 0 (1234ms)".
+#: Group 1 is the status tag — exit codes alone are ambiguous because
+#: grep/find/diff exit 1 is a normal negative answer.
+_EXIT_RE = re.compile(r"\[(OK|ERR)\]\s+Exit\s+(-?\d+)", re.IGNORECASE)
 
 
 def _tool_map() -> dict[str, Any]:
@@ -148,7 +155,77 @@ async def _wrap_tool_execute(
         raise
     except Exception:
         pass
+    import time as _time
+    _t0 = _time.perf_counter()
     result = await handler(args)
+    try:
+        _ms = int((_time.perf_counter() - _t0) * 1000)
+        _deps = ctx.deps
+        _tl = getattr(_deps, "_tool_timings", None)
+        if _tl is None:
+            _tl = {}
+            _deps._tool_timings = _tl
+        _tl[call.tool_name] = _tl.get(call.tool_name, 0) + _ms
+        _tc = getattr(_deps, "_tool_counts", None)
+        if _tc is None:
+            _tc = {}
+            _deps._tool_counts = _tc
+        _tc[call.tool_name] = _tc.get(call.tool_name, 0) + 1
+        # Ordered execution log {t: tool, f: failed} for natural-repair metrics:
+        # a fix cycle = an edit_file that follows an observed failure. Same
+        # failure heuristic the eval harness uses for hidden-test mapping.
+        _tq = getattr(_deps, "_tool_seq", None)
+        if _tq is None:
+            _tq = []
+            _deps._tool_seq = _tq
+        if len(_tq) < 2000:
+            try:
+                _txt = result if isinstance(result, str) else str(result or "")
+                _entry = {"t": call.tool_name, "f": False}
+                _head = _txt.lstrip()[:400]
+                # Structured failure signals only — a loose "FAIL" substring used
+                # to false-positive on passing test output that merely mentions FAIL.
+                _failed = (
+                    _head.startswith("Error")
+                    or _head.startswith("[Error")
+                    or "Traceback (most recent call last)" in _txt[:800]
+                )
+                if call.tool_name == "run_command":
+                    # run_command frames results as "[OK] Exit 0 (ms)" /
+                    # "[ERR] Exit N (ms)"; the tag is authoritative, so
+                    # grep/find/diff exit-1 negative answers stay non-errors.
+                    _m = _EXIT_RE.match(_head)
+                    if _m:
+                        _entry["exit_code"] = int(_m.group(2))
+                        _failed = _failed or _m.group(1).upper() == "ERR"
+                    if "[TIMEOUT]" in _txt or "exit 124" in _head:
+                        _entry["timed_out"] = True
+                        _failed = True
+                    if not _failed and _m is None:
+                        _low = _head.lower()
+                        _failed = any(k in _low for k in (
+                            "command not found", "econnrefused", "errno",
+                        ))
+                _entry["f"] = bool(_failed)
+                if _failed:
+                    _entry["p"] = _txt[:200]
+            except Exception:
+                _entry = {"t": call.tool_name, "f": False}
+                _txt = ""
+            _tq.append(_entry)
+        # Live map: mutating tools make the projectMap stale; the ProcessHistory
+        # processor appends a fresh projectMap+ delta before the next request.
+        try:
+            from tools.plan_mode_guard import WRITE_CLASS_TOOLS as _WC
+        except Exception:
+            _WC = ("edit_file", "create_project")
+        if call.tool_name in _WC:
+            try:
+                _deps._map_stale = True
+            except Exception:
+                pass
+    except Exception:
+        pass
     # Map legacy "Error..." strings to ToolFailed so the model sees is_error=True
     # and retry budget is not consumed (terminal failure).
     try:
@@ -172,7 +249,7 @@ def _after_tool_execute(
     args: dict,
     result: Any,
 ) -> Any:
-    """Post-execution: secret redact + 80k offload to VFS (registry post_hook).
+    """Post-execution: secret redact + per-tool cap offload to VFS (registry post_hook).
 
     Offloaded results return a rich ``ToolReturn`` so history/evals get the
     offload path + line/char counts in ``metadata`` while the model-visible
@@ -186,9 +263,14 @@ def _after_tool_execute(
             text = redact_secrets(text)
         except Exception:
             pass
-    # Offload >80k to /scratch — unified with tools/_runtime.auto_offload_result
-    # (both use VFS /scratch + _create_budgeted_preview so preview budgets match).
-    if len(text) > 80000 and tool_name != "read_file":
+    # Offload past the tool's character cap — unified with
+    # tools/_runtime.auto_offload_result (same VFS /scratch + shared preview).
+    try:
+        from tools._runtime import _tool_cap
+        _cap = _tool_cap(str(tool_name))
+    except Exception:
+        _cap = 16000
+    if len(text) > _cap:
         try:
             import uuid
             # Use shared VFS router path (same backend as auto_offload_result)
@@ -207,7 +289,7 @@ def _after_tool_execute(
                 from tools import _write_file as _legacy_write
                 _legacy_write(file_path=vfs_path, content=text)
             try:
-                preview = _shared_preview(text)
+                preview = _shared_preview(text, max(1, min(8000, _cap)))
             except Exception:
                 preview = _create_budgeted_preview(text)
             model_text = (
@@ -283,6 +365,22 @@ def _before_tool_validate(
     return args
 
 
+def _registry_thinking(role: str) -> Optional[str]:
+    """Registry thinking profile for a role (None = built-in role buckets).
+
+    Byte-compat: the registry specs carry today's literal values
+    (Developer/DFD high, General/House low); an explicit caller effort always
+    wins, and any lookup failure falls back to `_build_model_settings` buckets.
+    """
+    try:
+        from agents.workspace_registry import get_profile
+
+        value = str(get_profile(role).get("thinking") or "inherit").strip().lower()
+        return None if value in ("", "inherit") else value
+    except Exception:
+        return None
+
+
 def _on_model_request_error(ctx: RunContext[WorkspaceDeps], *, request_context: Any, error: Exception) -> Any:
     """P0-5: surface 429/retry_after for logging; let tenacity/HTTPX handle retry."""
     try:
@@ -296,6 +394,33 @@ def _on_model_request_error(ctx: RunContext[WorkspaceDeps], *, request_context: 
                 from llm.llm import log_terminal
 
                 log_terminal(f"[model_request_error:{ctx.deps.role}] retryable={err_str[:200]} retry_after={retry_after}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Context-window overflow diagnostics: the window-aware ProcessHistory
+    # trigger should keep requests below the limit; when a provider still
+    # rejects, say exactly why so the run fails loudly instead of silently.
+    try:
+        from llm.free_providers import _is_context_window_error
+        from llm.model_history import estimate_history_tokens
+
+        err_str = str(error) or str(getattr(error, "body", "") or "")
+        if _is_context_window_error(error):
+            est = 0
+            try:
+                est = estimate_history_tokens(getattr(ctx, "messages", []) or [])
+            except Exception:
+                pass
+            try:
+                from llm.llm import log_terminal
+
+                log_terminal(
+                    f"[context-overflow:{ctx.deps.role}] estimated={est:,} tok "
+                    f"window={getattr(ctx.deps, 'context_window', 0):,} — "
+                    f"compaction will fire on the next request if history fits; "
+                    f"error={err_str[:200]}"
+                )
             except Exception:
                 pass
     except Exception:
@@ -511,6 +636,15 @@ def build_agent(
         if n:
             passed_names.add(n)
     scope_allowed = set(deps.allowed_tools or _allowed_for(role))
+    # MCP tools are a per-scope dynamic surface (tools/mcp/mcp_bridge.py) and
+    # cannot live in the static spec allow-list; union them so the second gate
+    # does not silently drop mcp__* defs the caller passed in.
+    try:
+        from tools.mcp.mcp_bridge import mcp_tool_names_for_scope
+
+        scope_allowed |= set(mcp_tool_names_for_scope(role))
+    except Exception:
+        pass
     allowed = scope_allowed & passed_names if scope_allowed else set()
     if not allowed and passed_names:
         allowed = passed_names
@@ -569,6 +703,17 @@ def build_agent(
         _ph = get_process_history_capability()
         if _ph is not None:
             capabilities.append(_ph)
+    except Exception:
+        pass
+    # Vision: tools execute INSIDE the native run, so images they queue
+    # (look_at_screen / read_file on images / browser screenshots) must be
+    # injected before the NEXT model request — not after the run returns.
+    try:
+        from tools.vision_channel import get_vision_history_capability
+
+        _vh = get_vision_history_capability()
+        if _vh is not None:
+            capabilities.append(_vh)
     except Exception:
         pass
     # P2-2: WebSearch + MCP native capabilities (env-gated)
@@ -674,6 +819,72 @@ def build_agent(
     return agent
 
 
+def build_native_model(
+    role: str,
+    model: Any = None,
+    *,
+    deps: Optional[WorkspaceDeps] = None,
+    temp: float = 0.2,
+    reasoning_effort: Optional[str] = None,
+    reasoning_budget: Optional[int] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[Any, str, int]:
+    """Build the provider-backed model for a role and return its window.
+
+    A concrete model object is returned unchanged. String/None inputs use the
+    same provider resolution as ``arun_native_agent``. This is the single
+    model builder used by both chat turns and same-model compaction.
+    """
+    from llm.pai_transport import _resolve_provider_cfg, _model_name
+    from llm.pai_transport import _build_model_settings, _model_profile_for
+
+    deps = deps or WorkspaceDeps.from_shared_state(role=role)
+    if model is not None and not isinstance(model, str):
+        mid = str(getattr(model, "model_name", "") or "")
+        window = int(getattr(deps, "context_window", 0) or 0)
+        if window <= 0 and mid:
+            try:
+                from llm.model_history import window_for_model
+
+                window = int(window_for_model(mid) or 0)
+            except Exception:
+                window = 0
+        return model, mid, window
+
+    cfg = deps.llm_provider or _resolve_provider_cfg()
+    base_url = base_url or str(cfg.get("base") or "")
+    api_key = api_key or str(cfg.get("key") or "")
+    if model is None:
+        model_id = _model_name("deepseek:v4.1-flash")
+    else:
+        model_id = _model_name(model)
+    if reasoning_effort is None:
+        reasoning_effort = _registry_thinking(role)
+    settings = _build_model_settings(role, model_id, temp, reasoning_effort, reasoning_budget)
+    profile = _model_profile_for(model_id)
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+    if profile:
+        model_obj = OpenAIChatModel(
+            model_name=model_id, provider=provider, settings=settings, profile=profile
+        )
+    else:
+        model_obj = OpenAIChatModel(
+            model_name=model_id, provider=provider, settings=settings
+        )
+    window = 0
+    try:
+        from llm.model_history import window_for_model
+
+        window = int(window_for_model(model_id) or 0)
+    except Exception:
+        window = 0
+    return model_obj, model_id, window
+
+
 async def arun_native_agent(
     role: str,
     messages: list,
@@ -704,25 +915,117 @@ async def arun_native_agent(
     """
     from pydantic_ai import Agent
     from pydantic_ai.exceptions import UnexpectedModelBehavior
-    from llm.pai_transport import _resolve_provider_cfg, _model_name, _emit_stream
-    from llm.pai_transport import _build_model_settings, _model_profile_for
+    from llm.pai_transport import _emit_stream
 
     deps = deps or WorkspaceDeps.from_shared_state(role=role)
+    model, model_id, _window = build_native_model(
+        role,
+        model,
+        deps=deps,
+        temp=temp,
+        reasoning_effort=reasoning_effort,
+        reasoning_budget=reasoning_budget,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if _window > 0 and not getattr(deps, "context_window", 0):
+        deps.context_window = int(_window)
+    # Expose the exact chat model to the ProcessHistory processor so
+    # compaction uses the same model as the turn.
+    deps.compaction_model = model
+    deps.compaction_model_id = model_id
 
-    if model is None:
-        cfg = deps.llm_provider or _resolve_provider_cfg()
-        base_url = base_url or str(cfg.get("base") or "")
-        api_key = api_key or str(cfg.get("key") or "")
-        model_id = _model_name("deepseek:v4-flash")
-        settings = _build_model_settings(role, model_id, temp, reasoning_effort, reasoning_budget)
-        profile = _model_profile_for(model_id)
-        from pydantic_ai.models.openai import OpenAIChatModel
-        from pydantic_ai.providers.openai import OpenAIProvider
-        provider = OpenAIProvider(base_url=base_url, api_key=api_key)
-        if profile:
-            model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings, profile=profile)
-        else:
-            model = OpenAIChatModel(model_name=model_id, provider=provider, settings=settings)
+    # ── Per-request profiler (PAI_REQ_PROFILE=1) ─────────────────────────────
+    # Wraps the model's request methods so EVERY model request records:
+    #   (a) the real byte composition of the messages about to be sent,
+    #       bucketed by part kind (system-prompt / user-prompt / text /
+    #       thinking / tool-call / tool-return ...) — i.e. WHAT each request
+    #       actually contains, and
+    #   (b) the provider's per-request token usage (input / cache_read /
+    #       cache_write / output) — i.e. how much of that request was a miss.
+    # The eval report then attributes cache-miss per request from real data.
+    # Telemetry-only; off by default; fully guarded — never fails the run.
+    if os.getenv("PAI_REQ_PROFILE", "0") == "1":
+        try:
+            _req_log = getattr(deps, "_req_log", None)
+            if _req_log is None:
+                _req_log = []
+                deps._req_log = _req_log
+
+            def _msg_bytes(messages) -> dict:
+                buckets: dict = {}
+                for _m in messages:
+                    for _p in getattr(_m, "parts", []) or []:
+                        _kind = str(getattr(_p, "part_kind", "?") or "?")
+                        _c = getattr(_p, "content", "") or ""
+                        _n = len(_c) if isinstance(_c, str) else len(str(_c))
+                        _a = getattr(_p, "args", None)
+                        if _a is not None:
+                            _n += len(_a) if isinstance(_a, str) else len(str(_a))
+                        buckets[_kind] = buckets.get(_kind, 0) + _n
+                        buckets["_parts"] = buckets.get("_parts", 0) + 1
+                return buckets
+
+            _orig_req = model.request
+            _orig_req_stream = getattr(model, "request_stream", None)
+
+            async def _prof_req(*args, **kwargs):
+                _messages = args[0] if args else (kwargs.get("messages") or [])
+                _res, _u = await _orig_req(*args, **kwargs)
+                try:
+                    _row = {"i": len(_req_log), "b": _msg_bytes(_messages)}
+                    if _u is not None:
+                        _row.update({
+                            "in": getattr(_u, "input_tokens", 0) or 0,
+                            "cr": getattr(_u, "cache_read_tokens", 0) or 0,
+                            "cw": getattr(_u, "cache_write_tokens", 0) or 0,
+                            "out": getattr(_u, "output_tokens", 0) or 0,
+                        })
+                    _req_log.append(_row)
+                except Exception:
+                    pass
+                return _res, _u
+
+            class _ProfStreamCM:
+                """Async-context-manager proxy: records the request's byte
+                composition at call time and the provider usage once the
+                streamed response has been consumed (resp.usage)."""
+
+                def __init__(self, inner_cm, messages, log):
+                    self._cm = inner_cm
+                    self._msgs = messages
+                    self._log = log
+
+                async def __aenter__(self):
+                    self._resp = await self._cm.__aenter__()
+                    return self._resp
+
+                async def __aexit__(self, *exc):
+                    _r = await self._cm.__aexit__(*exc)
+                    try:
+                        _u = getattr(self._resp, "usage", None)
+                        _row = {"i": len(self._log), "b": _msg_bytes(self._msgs), "stream": True}
+                        if _u is not None:
+                            _row.update({
+                                "in": getattr(_u, "input_tokens", 0) or 0,
+                                "cr": getattr(_u, "cache_read_tokens", 0) or 0,
+                                "cw": getattr(_u, "cache_write_tokens", 0) or 0,
+                                "out": getattr(_u, "output_tokens", 0) or 0,
+                            })
+                        self._log.append(_row)
+                    except Exception:
+                        pass
+                    return _r
+
+            def _prof_req_stream(*args, **kwargs):
+                _messages = args[0] if args else (kwargs.get("messages") or [])
+                return _ProfStreamCM(_orig_req_stream(*args, **kwargs), _messages, _req_log)
+
+            model.request = _prof_req  # type: ignore[method-assign]
+            if _orig_req_stream is not None:
+                model.request_stream = _prof_req_stream  # type: ignore[method-assign]
+        except Exception:
+            pass
 
     # A6b: accept both LangChain messages and native ModelMessage history.
     # Detect native history by checking for ModelRequest/ModelResponse instances.
@@ -739,16 +1042,69 @@ async def arun_native_agent(
 
     events_log: list[dict] = []
     _text_start_seen_nt: dict[int, str] = {}
+    # tool_call_id -> (start_monotonic, tool_name, args_json) for ms + finish matching
+    _tool_start_nt: dict[str, tuple] = {}
+    _tel_debug_on = os.getenv("PAI_TEL_DEBUG", "0") == "1"
+
+    def _tel_dbg():
+        try:
+            d = getattr(deps, "_tel_dbg", None)
+            if d is None:
+                d = {"think_start_chars": 0, "think_delta_chars": 0, "deltas_after_start": 0}
+                deps._tel_dbg = d
+            return d
+        except Exception:
+            return None
 
     def _on_event(ctx, event):
+        from llm.pai_transport import _emit_tool_frame
         from pydantic_ai.messages import (
             PartStartEvent, PartDeltaEvent, TextPart, ThinkingPart,
             TextPartDelta, ThinkingPartDelta,
+            FunctionToolCallEvent, FunctionToolResultEvent, ToolReturnPart,
         )
         try:
-            if isinstance(event, PartStartEvent):
+            if isinstance(event, FunctionToolCallEvent):
+                part = event.part
+                cid = event.tool_call_id or ""
+                tname = str(getattr(part, "tool_name", "") or "")
+                try:
+                    import json as _json
+                    pargs = getattr(part, "args", {})
+                    args_json = pargs if isinstance(pargs, str) else _json.dumps(pargs or {}, default=str)
+                except Exception:
+                    args_json = ""
+                _tool_start_nt[cid] = (time.monotonic(), tname, args_json[:500])
+                if stream_emit:
+                    _emit_tool_frame(role, "tool_started", tname, args_json[:500],
+                                     chat_id=getattr(deps, "chat_id", "") or "")
+            elif isinstance(event, FunctionToolResultEvent):
+                part = event.part
+                cid = getattr(part, "tool_call_id", "") or ""
+                started = _tool_start_nt.pop(cid, None)
+                ms = int((time.monotonic() - started[0]) * 1000) if started else 0
+                tname = started[1] if started else str(getattr(part, "tool_name", "") or "")
+                args_json = started[2] if started else ""
+                if isinstance(part, ToolReturnPart):
+                    content = part.content
+                    preview = content if isinstance(content, str) else str(content or "")
+                    bad = preview.lstrip().startswith(
+                        ("Error:", "Error ", "[ERR]", "[ERROR]", "[BLOCKED]"))
+                    ok: bool | None = not bad
+                else:
+                    preview = str(getattr(part, "content", "") or "") or "validation retry requested"
+                    ok = False
+                if stream_emit:
+                    _emit_tool_frame(role, "tool_finished", tname, args_json,
+                                     ok=ok, ms=ms, preview=preview[:300],
+                                     chat_id=getattr(deps, "chat_id", "") or "")
+            elif isinstance(event, PartStartEvent):
                 if isinstance(event.part, ThinkingPart):
                     c = event.part.content or ""
+                    if _tel_debug_on:
+                        dbg = _tel_dbg()
+                        if dbg is not None:
+                            dbg["think_start_chars"] += len(c)
                     if c:
                         events_log.append({"kind": "reasoning", "text": c})
                         if stream_emit:
@@ -773,6 +1129,11 @@ async def arun_native_agent(
                             _emit_stream(role, "text", c, where or "")
                 elif isinstance(d, ThinkingPartDelta):
                     c = d.content_delta or ""
+                    if _tel_debug_on and c:
+                        dbg = _tel_dbg()
+                        if dbg is not None:
+                            dbg["think_delta_chars"] += len(c)
+                            dbg["deltas_after_start"] += 1
                     if c:
                         events_log.append({"kind": "reasoning", "text": c})
                         if stream_emit:
@@ -791,7 +1152,7 @@ async def arun_native_agent(
         extra_capabilities=[hooks],
     )
 
-    from llm.native_tools import DEFAULT_USAGE_LIMITS
+    from llm.native_tools import _default_usage_limits as _fresh_limits
 
     # P1-1: prefer Agent.iter (single AgentRun, correct usage/cancellation,
     # no per-turn Agent rebuild). Falls back to run_stream on error.
@@ -805,7 +1166,7 @@ async def arun_native_agent(
                 user_prompt,
                 message_history=history,
                 deps=deps,
-                usage_limits=DEFAULT_USAGE_LIMITS,
+                usage_limits=_fresh_limits(),
                 cancellation_token=cancellation_token,
             ) as run:
                 async for node in run:
@@ -841,7 +1202,7 @@ async def arun_native_agent(
                 user_prompt,
                 message_history=history,
                 deps=deps,
-                usage_limits=DEFAULT_USAGE_LIMITS,
+                usage_limits=_fresh_limits(),
                 cancellation_token=cancellation_token,
             ) as sres:
                 async for _resp in sres.stream_response(debounce_by=None):
@@ -897,6 +1258,88 @@ async def arun_native_agent(
     # reverse-convert path _pai_to_lc is deleted).
     prior_ids = {id(m) for m in history}
     new_msgs = [m for m in all_msgs if id(m) not in prior_ids]
+    # ── Usage aggregation (telemetry honesty) ──────────────────────────────
+    # run_stream's facade can report only the LAST request (observed: requests=1
+    # and tool_calls_total=0 for a 53-tool run). The complete aggregate is
+    # derivable from each ModelResponse's RequestUsage in the message slice, so
+    # build it here and prefer it unless the facade has more requests.
+    _agg_tool_calls = 0
+    try:
+        from pydantic_ai.usage import RunUsage as _RunUsage
+        _agg = None
+        for _m in all_msgs:
+            if isinstance(_m, ModelResponse):
+                _u = getattr(_m, "usage", None)
+                if _u is not None:
+                    if _agg is None:
+                        _agg = _RunUsage()
+                    try:
+                        _agg.incr(_u)
+                    except Exception:
+                        pass
+                for _p in getattr(_m, "parts", []) or []:
+                    if isinstance(_p, ToolCallPart):
+                        _agg_tool_calls += 1
+        if _agg is not None:
+            _fb_requests = int(getattr(result_usage, "requests", 0) or 0) if result_usage is not None else 0
+            if _fb_requests <= int(getattr(_agg, "requests", 0) or 0):
+                result_usage = _agg
+    except Exception:
+        pass
+    # Telemetry (shared prod+eval path): report PydanticAI RunUsage into the
+    # shared token stats. Telemetry-only — never affects the run; guarded so
+    # it cannot fail the agent turn.
+    try:
+        from llm.pai_transport import _pai_usage_to_stats
+        try:
+            _tel_model = model_id
+        except NameError:
+            _tel_model = getattr(model, "model_name", "") or ""
+        _extra = {}
+        try:
+            _u = result_usage
+            _extra["requests"] = getattr(_u, "requests", None)
+            _extra["tool_calls_total"] = getattr(_u, "tool_calls", None)
+        except Exception:
+            pass
+        try:
+            _tl = getattr(deps, "_tool_timings", None)
+            _tc = getattr(deps, "_tool_counts", None)
+            _tq = getattr(deps, "_tool_seq", None)
+            _rq = getattr(deps, "_req_log", None)
+            _ml = getattr(deps, "_map_live", None)
+            if _tl:
+                _extra["tool_ms"] = dict(_tl)
+            if _tc:
+                _extra["tool_counts"] = dict(_tc)
+            if _tq:
+                _extra["tool_seq"] = list(_tq)
+            if _rq:
+                _extra["req_log"] = list(_rq)
+            if _ml:
+                _extra["map_live_deltas"] = int(_ml)
+            # tool_calls_total must match what actually executed.
+            _tc_sum = sum(v for v in (_tc or {}).values() if isinstance(v, int))
+            _extra["tool_calls_total"] = max(
+                int(_extra.get("tool_calls_total") or 0), _tc_sum, _agg_tool_calls)
+        except Exception:
+            pass
+        if _tel_debug_on:
+            try:
+                dbg = getattr(deps, "_tel_dbg", None)
+                if dbg:
+                    _extra["tel_dbg"] = dict(dbg)
+            except Exception:
+                pass
+        _pai_usage_to_stats(
+            role, _tel_model, result_usage, where,
+            reasoning_effort, reasoning_budget,
+            reasoning_chars=len(reasoning or ""),
+            backend="paid",
+            extra=_extra or None,
+        )
+    except Exception:
+        pass
     return text, new_msgs, reasoning
 
 
@@ -974,7 +1417,23 @@ def run_native_agent(
 
 
 def _default_usage_limits() -> UsageLimits:
-    """P0-3: cost/per-request guards. Env-overridable for A/B."""
+    """P0-3: cost/per-request guards. Env-overridable for A/B.
+
+    PAI_UNLIMITED=1 removes every pydantic-ai limit (request/tool/token/cost)
+    for long-horizon runs: the agent + the external gate decide when the work
+    is done, not an arbitrary counter.
+    """
+    if os.getenv("PAI_UNLIMITED", "0") == "1":
+        return UsageLimits(
+            request_limit=None,
+            tool_calls_limit=None,
+            input_tokens_limit=None,
+            output_tokens_limit=None,
+            total_tokens_limit=None,
+            per_request_input_tokens_limit=None,
+            cost_limit=None,
+            count_tokens_before_request=False,
+        )
     try:
         cost_val = os.getenv("PAI_COST_LIMIT", "2.00").strip()
         cost = Decimal(cost_val) if cost_val else None
@@ -1008,8 +1467,6 @@ def _default_usage_limits() -> UsageLimits:
         count_tokens_before_request=count_before,
     )
 
-
-DEFAULT_USAGE_LIMITS = _default_usage_limits()
 
 import threading as _threading
 

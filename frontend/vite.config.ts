@@ -14,8 +14,8 @@ export default defineConfig({
       injectRegister: 'auto',
       includeAssets: ['icons/pwa-192.png', 'icons/pwa-512.png'],
       manifest: {
-        name: 'VinCode — AI Workspace',
-        short_name: 'VinCode',
+        name: 'Stark — AI Workspace',
+        short_name: 'Stark',
         description: 'Multi-agent AI desktop workspace, remotely controllable from your phone.',
         theme_color: '#0c0c0e',
         background_color: '#0c0c0e',

@@ -113,7 +113,7 @@ def main() -> int:
         os.environ["PAI_NATIVE_TOOLS"] = "0"
         try:
             text1, calls1, reasoning1 = await apai_native_turn(
-                "Developer", msgs, tools=tools, model="deepseek:v4-flash", temp=0.2,
+                "Developer", msgs, tools=tools, model="deepseek:v4.1-flash", temp=0.2,
                 where="cmp-registry", deps=deps, base_url=base, api_key="k",
             )
         finally:
@@ -127,7 +127,7 @@ def main() -> int:
             SEEN_TOOL_CALL["made"] = False
             captured.clear()
             text2, calls2, reasoning2 = await apai_native_turn(
-                "Developer", msgs, tools=tools, model="deepseek:v4-flash", temp=0.2,
+                "Developer", msgs, tools=tools, model="deepseek:v4.1-flash", temp=0.2,
                 where="cmp-native", deps=deps, base_url=base, api_key="k",
             )
             print("NATIVE path: text=%r calls=%s" % (text2, calls2))

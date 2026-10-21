@@ -1,6 +1,5 @@
 import type { TokenUsage } from '../../types';
 import { TokenSummary } from './TokenSummary';
-import { EfficiencyInsights } from './EfficiencyInsights';
 import { CallList } from './CallList';
 
 interface TokenStatsProps {
@@ -18,14 +17,13 @@ export function TokenStats({ tokenUsage, lastModelName }: TokenStatsProps) {
   }
 
   return (
-    <div className="token-analytics grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.9fr)] items-start" style={{ gap: '18px' }}>
-      {/* Summary and insights stay together in the left column. */}
-      <div className="flex min-w-0 flex-col" style={{ gap: '14px' }}>
+    <div className="token-analytics grid grid-cols-1 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)] items-start" style={{ gap: '16px' }}>
+      {/* Overview: totals + input / output / cache hit / cache miss. */}
+      <div className="min-w-0">
         <TokenSummary tokenUsage={tokenUsage} lastModelName={lastModelName} />
-        <EfficiencyInsights tokenUsage={tokenUsage} />
       </div>
 
-      {/* The execution log gets its own taller column. */}
+      {/* Per-request breakdown. */}
       <div className="min-w-0">
         <CallList calls={tokenUsage.calls} />
       </div>

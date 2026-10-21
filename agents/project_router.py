@@ -390,7 +390,7 @@ _README_TEMPLATE = """# {name}
 
 ## Getting started
 
-This project was scaffolded by the LangChain agent harness. Replace this
+This project was scaffolded by the agent harness. Replace this
 README with project-specific setup, usage, and architecture notes.
 """
 
@@ -489,7 +489,11 @@ def create_project(name: str, concept: str, chat_id: str = "", wait: bool = True
 
             import workspace_manager as wm
             ws = wm.add_workspace(path, safe)
-            chat = wm.create_chat(path, title=f"{safe} — Dev Session")
+            try:
+                parent_ws_id = wm.find_chat_workspace_id(chat_id or "")
+            except Exception:
+                parent_ws_id = ""
+            chat = wm.create_chat(path, title=f"{safe} — Dev Session", parent_chat_id=chat_id or "", parent_workspace_id=parent_ws_id or "")
         except Exception as e:
             return {"error": f"Failed to set up project '{safe}': {e}"}
 

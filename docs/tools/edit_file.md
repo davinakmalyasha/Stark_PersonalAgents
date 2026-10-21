@@ -1,10 +1,10 @@
 # edit_file
 
-- **Description:** Edit or create files via exact replacement.
+- **Description:** Edit or create files. Mode A — targeted change: old_string -> new_string (must match exactly and uniquely; identical strings error). Mode B — create or overwrite a WHOLE file: file_path + new_string only. Mode C — batch/multi-file diff: '*** Add File: p' / '*** Update File: p' / '*** Delete File: p' / '*** Move to: p' headers, optionally wrapped in '*** Begin Patch' / '*** End Patch'. Update bodies use @@ hunks: lines prefixed '-' are removed, '+' are added, and ' ' (space) are unchanged context lines that anchor the hunk — line numbers are optional and ignored, so hunks tolerate drift (preferred over SEARCH/REPLACE for multi-hunk and multi-file edits). Applied transactionally with [OK]/[ERROR] summary. verify = 'py_compile' | 'tsc' | shell command, runs after the write.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** developer
+- **Scopes (from _SCOPE_MAP):** developer, deploy, ui
 - **Parallel-safe (PARALLEL_SAFE):** False
-- **Compact doc:** edit_file(file_path, old_string?, new_string?, diff?, verify?) — The ONE file tool: new_string only (no old_string) = create/overwrite; old_string+new_string = targeted replace; diff = batch SEARCH/REPLACE blocks. Opt-in verify=py_compile|tsc|shell runs after write. Write every new file by hand — no template tool.
+- **Compact doc:** edit_file(file_path, old_string?, new_string?, diff?, verify?) — A: old_string+new_string = targeted unique replace; B: new_string only = create/overwrite whole file; C: diff = '*** Add/Update/Delete/Move File' headers (optional *** Begin Patch/End Patch) with @@ hunks: '-' removed, '+' added, ' ' context anchors (numbers optional). verify=py_compile|tsc|shell after write.
 - **Required args (validated):** file_path
 - **Deps-migrated:** True (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema | approval via Hooks.before_tool_execute (plan-mode + core-config veto)
@@ -13,9 +13,9 @@
 ## Parameters (JSON Schema)
 
   - `file_path` (string, required): 
-  - `old_string` (string, optional): Exact existing text.
-  - `new_string` (string, optional): Replacement; omit old_string to create/overwrite.
-  - `diff` (string, optional): Batch mode. (1) SEARCH/REPLACE blocks: <<<<<<< SEARCH\n[old]\n=======\n[new]\n>>>>>>> REPLACE; (2) unified diff (git @@ hunks, uses file_path); (3) multi-file patch: '*** Add File: path', '*** Update File: path', '*** Delete File: path', '*** Move to: path' headers — applied per-file transactionally with [OK]/[ERROR] summary.
+  - `old_string` (string, optional): Exact existing text (Mode A).
+  - `new_string` (string, optional): Replacement (Mode A) or full file content (Mode B: omit old_string).
+  - `diff` (string, optional): Mode C payload: '*** File:' headers (optional *** Begin Patch / *** End Patch envelope) with @@ hunks — '-' removed, '+' added, ' ' context anchors; line numbers optional and ignored. Legacy SEARCH/REPLACE blocks and numbered unified diffs are also accepted.
   - `verify` (string, optional): 'py_compile' | 'tsc' | shell command — runs after write.
 
 ## How to recreate

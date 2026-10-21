@@ -30,6 +30,9 @@ function toSessionTab(ws: WorkspaceInfo, chat: ChatSummary): SessionTab {
     workspacePath: ws.path,
     chatId: chat.id,
     updatedAt: chat.updatedAt,
+    parentChatId: (chat as ChatSummary).parentChatId,
+    parentWorkspaceId: (chat as ChatSummary).parentWorkspaceId,
+    isSpawned: Boolean((chat as ChatSummary).parentChatId),
   };
 }
 
@@ -41,6 +44,8 @@ function summaryOf(chat: ChatData): ChatSummary {
     model: chat.model || 'Automatic Fallback',
     createdAt: chat.createdAt,
     updatedAt: chat.updatedAt,
+    parentChatId: (chat as ChatData).parentChatId,
+    parentWorkspaceId: (chat as ChatData).parentWorkspaceId,
   };
 }
 
@@ -74,6 +79,39 @@ export function useSessions() {
     const byWs: Record<string, ChatSummary[]> = {};
     for (const [id, chats] of pairs) byWs[id] = chats;
     return { wsList, byWs };
+  }, []);
+
+  const forceRefresh = useCallback(async () => {
+    const { wsList, byWs } = await refreshSessions().catch(() => ({ wsList: [] as WorkspaceInfo[], byWs: {} as Record<string, ChatSummary[]> }));
+    if (wsList.length === 0) return;
+    const json = JSON.stringify({ w: wsList.map((w) => ({ id: w.id, name: w.name, path: w.path, isGeneral: w.isGeneral, exists: w.exists })), c: byWs });
+    lastSessionsJsonRef.current = json;
+    setWorkspaces(wsList);
+    setChatsByWs(byWs);
+    const known = new Set<string>();
+    for (const ws of wsList) for (const c of byWs[ws.id] ?? []) known.add(tabId(ws.id, c.id));
+    knownChatIdsRef.current = known;
+    setOpenTabIds((prev) => prev.filter((id) => known.has(id)));
+    setPinnedChats((prev) => prev.filter((id) => known.has(id)));
+  }, [refreshSessions]);
+
+  const removeChatLocal = useCallback((workspaceId: string, chatId: string) => {
+    const sid = tabId(workspaceId, chatId);
+    setChatsByWs((prev) => ({
+      ...prev,
+      [workspaceId]: (prev[workspaceId] ?? []).filter((c) => c.id !== chatId),
+    }));
+    setOpenTabIds((prev) => prev.filter((id) => id !== sid));
+    setPinnedChats((prev) => prev.filter((id) => id !== sid));
+    knownChatIdsRef.current.delete(sid);
+  }, []);
+
+  const renameChatLocal = useCallback((workspaceId: string, chatId: string, title: string) => {
+    const now = new Date().toISOString();
+    setChatsByWs((prev) => ({
+      ...prev,
+      [workspaceId]: (prev[workspaceId] ?? []).map((c) => (c.id === chatId ? { ...c, title, updatedAt: now } : c)),
+    }));
   }, []);
 
   // ── Boot: load sessions + restore persisted layout ──
@@ -173,7 +211,11 @@ export function useSessions() {
           if (!knownChatIdsRef.current.has(cid)) {
             // Auto-open new project chats (coding tasks); General/House/Personal chats only
             // open when the user creates them explicitly.
-            if (!ws.isGeneral && !(ws as any).isHouse && !(ws as any).isPersonal) fresh.push(cid);
+            // Spawned children (orchestrator → agent) never auto-open as top-bar
+            // tabs — they live nested inside their parent (sidebar nest /
+            // delegation card / drawer) to avoid flat sibling spam.
+            const spawned = Boolean((c as ChatSummary).parentChatId);
+            if (!ws.isGeneral && !(ws as any).isHouse && !(ws as any).isPersonal && !spawned) fresh.push(cid);
           }
         }
       }
@@ -301,6 +343,6 @@ export function useSessions() {
     runningTabId, isGlobalRunning, activeRun,
     pinnedChats, togglePin, chatsFilter, setChatsFilter,
     openTab, closeTab, activateTab, openChat,
-    newSession, newChatIn, refreshSessions, booted,
+    newSession, newChatIn, refreshSessions, forceRefresh, removeChatLocal, renameChatLocal, booted,
   };
 }

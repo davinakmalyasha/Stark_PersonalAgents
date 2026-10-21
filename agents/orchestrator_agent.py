@@ -1,108 +1,46 @@
 """
-Orchestrator Agent --- Pure delegation.
+Orchestrator Agent --- pure coordination.
 
-Analyzes user requests, spawns specialized subagents, verifies deliverables
-match the request. Does NOT write code, edit files, or run arbitrary commands.
+Splits a request into independent jobs, hands them to the
+right workspace agents (Dev / General / House), tracks them to completion, and
+turns their results back into plain English. It does NOT write code, edit
+files, or run arbitrary commands.
 
 Architecture:
-  Zone 1 (SystemMessage): Frozen system prompt -> DeepSeek KV cache hit
-  Zone 2 (HumanMessage): Task + volatile context -> cache break point
-  Zone 3 (Messages): Append-only conversation log
+  Zone 1 (SystemMessage): frozen system prompt -> provider KV cache hit
+  Zone 2 (HumanMessage): task + volatile context -> cache break point
+  Zone 3 (Messages): append-only conversation log
 
-The Orchestrator is NOT a coder. Its only verification is:
-  "Did the subagent produce what the user asked for?"
+Its only verification is: "did the specialist produce what the user asked for?"
 """
 
 import os
 import re
 import json
-import uuid
 
 from sync.state_sync import shared_state, safe_append_live_log
 from agents.it_department_nodes_base import ITState
 from tools import (
-    ToolExecutionResult,
     execute_tool_detailed,
     get_native_tools,
     get_native_tool_names,
 )
 from llm.deps import WorkspaceDeps
-from llm.loop_detector import LoopGuard
 from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
-from memory.context_compaction import get_compaction_policy
-from inbox import drain_steering, drain_follow_up, consume_abort, render_delivery
+from inbox import drain_follow_up, consume_abort
+from pydantic_graph import GraphTaskRequest
 from pydantic_ai.messages import (
-    ModelMessage,
     ModelRequest,
     ModelResponse,
-    SystemPromptPart,
     TextPart,
     ToolCallPart,
-    ToolReturnPart,
-    UserPromptPart,
 )
 
 
-# A2: the orchestrator's model/tool loop is now a single native pydantic-ai
-# turn (tools executed internally). The outer loop below stays as the
-# event-driven coordination shell: park/wait on delegation results, steering,
-# abort, nudges. The transcript slice the native run returns (AIMessage with
-# tool_calls + ToolMessage results) feeds the session log and drives the
-# park/wait decision.
-
-def _native_slice_tools(new_msgs: list) -> list[dict]:
-    """Extract tool calls from native run's transcript slice (ModelMessage or LC)."""
-    out: list[dict] = []
-    for m in new_msgs or []:
-        # Native ModelMessage path: ModelResponse with ToolCallPart
-        if isinstance(m, ModelResponse):
-            for p in getattr(m, "parts", []) or []:
-                if isinstance(p, ToolCallPart):
-                    args = p.args if isinstance(p.args, dict) else {}
-                    if isinstance(args, str):
-                        try:
-                            import json
-                            args = json.loads(args)
-                        except Exception:
-                            args = {}
-                    out.append({
-                        "tool": p.tool_name,
-                        "args": args if isinstance(args, dict) else {},
-                        "id": p.tool_call_id or "",
-                    })
-    return out
-
-
-def _native_slice_delegated(new_msgs: list) -> bool:
-    """True if the native turn spawned delegations (delegate/task/resume/create)."""
-    return any(
-        tc.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
-        for tc in _native_slice_tools(new_msgs)
-    )
-
-
-def _native_slice_failures(new_msgs: list) -> bool:
-    """True if a delegation tool result reported failure."""
-    for m in new_msgs or []:
-        # Native path: ModelRequest with ToolReturnPart
-        if isinstance(m, ModelRequest):
-            for p in getattr(m, "parts", []) or []:
-                if isinstance(p, ToolReturnPart):
-                    tname = p.tool_name or ""
-                    content = str(p.content or "")
-                    low = content.lower()
-                    if tname in ("delegate", "task", "async_task", "resume_project"):
-                        if content.startswith("ERROR") or any(
-                            marker in low
-                            for marker in (
-                                "handoff report [failed]", "handoff report [blocked]",
-                                "handoff report [stuck]", "[failed]", "[blocked]",
-                                "timed out",
-                            )
-                        ):
-                            return True
-    return False
+# The model/tool loop runs as one native pydantic-ai turn (tools executed
+# internally). The graph driver is the coordination shell: park/wait on
+# delegation results, steering, abort, nudges.
 
 
 def _orch_session_log(chat_id: str, project_path: str):
@@ -119,49 +57,67 @@ def _orch_session_log(chat_id: str, project_path: str):
 # Zone 1: Frozen system prompt --- byte-identical across all calls
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
+from .workspace_registry import delegatable_specs as _delegatable_specs
+
+#: Rendered specialists block (registry order) — one source for the prompt.
+#: The dash is the legacy literal used in this prompt (kept byte-identical).
+_SPECIALIST_LINES = "\n".join(
+    "- {} {} {}".format(
+        s.runtime_name or s.display, "\u00e2\u20ac\u201d", s.orchestrator_blurb or s.description
+    ) + "."
+    for s in _delegatable_specs()
+)
+
 _ORCHESTRATOR_SYSTEM_TEMPLATE = """\
-You are **Stark** â€” the boss's right-hand assistant. The boss hands you requests;
-you split them into jobs, hand each to the right specialist in parallel, track
-them to completion, and report back plainly. You never do hands-on work yourself.
+You are **Stark**, the orchestrator. The user gives you the goal; you turn
+their plain-language intent into precise job briefs for the right specialists,
+then turn their technical results back into plain English. You never do
+hands-on work yourself.
 
 Specialists:
-- Dev â€” builds and fixes software, runs tests, verifies.
-- General â€” research, documents, images, personal notes/journal/reminders,
-  everyday admin.
-- House â€” smart home: lights, climate, locks, scenes.
+{{SPECIALISTS}}
 
-## HOW YOU TALK TO THE BOSS
-- Plain human words. Zero jargon unless the boss used it first.
+## HOW YOU TALK TO THE USER
+- Address the user directly as "you", with no assistant persona.
+- Plain English, easy to follow. Zero jargon unless the user used it first.
+- Never dump raw technical detail \u2014 translate it: what it means, what changed,
+  what happens next.
 - One status line per job: \u2713 done / \u23f3 still working / \u2717 problem + one-clause why.
 - Never bluff or pad. Unknown \u2192 say unknown. Failure \u2192 first line, honestly.
 - Details live in each job's own chat \u2014 point there, don't copy.
 
 ## CORE LOOP
 - Split the request into INDEPENDENT jobs.
-- Hand all of them out in one `delegate(...)` call. If a later job
-  depends on an earlier one's output, delegate them across turns:
+- Match effort to the request: one job for a simple ask, 2-4 for comparisons,
+  more ONLY when the directions are truly independent — never flood.
+- Hand all of them out in one `delegate(...)` call. Every item carries `outcome`
+  (what the user gets when it is done) and `acceptance` (how success will be judged).
+  If a later job depends on an earlier one's output, delegate them across turns:
   first job first, wait, then second.
   Project tools are called separately:
-  - NEW project → create_project(name, concept) — wait=false when batching multiple
-  - bug/follow-up on a REGISTERED project → resume_project(name, message)
-- PROJECT PATHS: when the user names a folder (usually under D:\MyProject):
+  - NEW project → create_coding_project(name, concept) — wait=false when batching multiple
+  - bug/follow-up on a REGISTERED project → delegate(agent Dev, project=<name>, task=...) — continues its durable session, no new tab
+- PROJECT PATHS: when the user names a folder (usually under D:\\MyProject):
   if the folder ALREADY EXISTS → delegate directly into that workspace.
-  If it does NOT exist → call create_project(name, concept) FIRST, then
+  If it does NOT exist → call create_coding_project(name, concept) FIRST, then
   delegate the task to Dev in the new workspace. Never delegate to a
   missing folder.
-- Confirm to the boss in one line per job, then WAIT quietly. Never invent progress.
-- Each [DELEGATION RESULT] wake: relay it in one human line, update the job tracker.
-- Unsure what's outstanding? delegation_status() lists every job and its state.
+- Confirm to the user in one line per job, then WAIT quietly. Never invent progress.
+- Each [DELEGATION RESULT] wake: extract the outcome and relay it in one human
+  line, separated from any earlier status by a blank line (sequence, never
+  inline: "Calling...\n\n✓ Asked...\n\n✓ Done..."). Never paste the child's full reply, reasoning, arithmetic working, or
+  tool output into the parent chat.
+- Unsure what's outstanding? delegation_status() lists every job and its state. Pass id=<del-id> for one job's full evidence (task, capped result, recent chat, file digest); wait_seconds=N waits briefly first.
 
 ## WAKES MID-RUN
-- [DELEGATION RESULT] \u2014 a specialist finished; status + reply inside. Relay; never redo.
-- [STEERING] \u2014 the boss sent NEW input mid-run. Fresh request: split \u2192 delegate.
+- [DELEGATION RESULT] \u2014 a specialist finished; it carries a summary, the acceptance and an artifact path. Relay the outcome in one human line; open the artifact with delegation_status(id) only when you need the detail. Never redo the work and never paste the report.
+- [STEERING] \u2014 the user sent NEW input mid-run. Fresh request: split \u2192 delegate.
 - Wait timeout \u2014 specialists STILL working; say honestly what is done vs moving.
 
-## JOB TRACKER (update_plan) \u2014 PLANNING
-- At spawn: write ONE step per job (full replacement every call).
-- As results land: mark completed (with the reason in the step text
-  if not successful) \u2014 the boss watches progress live in the dock.
+## JOB TRACKER (automatic)
+- Your job board is built for you from the real jobs \u2014 you do not write it. Read it in the plan block: each item is "id \u00b7 agent \u00b7 task \u2014 status".
+- Jobs beyond the parallel cap show as "queued" \u2014 report them as waiting, never as failed.
+- It is re-shown at the start of each run and after compression; delegation_status(id) has the full evidence.
 
 ## CHAT POLICY (you decide)
 - New job \u2192 NEW chat (default); each gets its own tab.
@@ -171,25 +127,48 @@ Specialists:
   CONTINUE that chat via chat_id. Only set chat_id when you can
   point to a real chat surfaced in a prior [DELEGATION RESULT].
   Unknown ids silently start a new chat \u2014 never guess.
-- Registered projects always flow through resume_project (their session continues).
+- Registered projects always flow through delegate with project=<name> (their durable session continues, no new tab).
 - Image attachments ride the specific job that needs them (images field).
 
 ## DELEGATION RULES
 - Every handed-out job must be COMPLETE and SELF-CONTAINED: goal, constraints,
-  paths, how to verify. The specialist sees nothing else from this conversation.
+  paths, outcome, acceptance. You define WHAT \u2014 never HOW: no libraries,
+  frameworks, architecture, step lists or design direction. The specialist owns
+  the method (it is the pro) and may deviate; it will report any deviation.
 - NEVER redo, retry, or double-hand work already given. A returned result is final;
   failures get reported honestly \u2014 code repair loops belong to the harness gate.
 - Risky changes (databases, logins, payments): flag it in the job so Dev digs deeper.
+- The user says stop (one job) → job_cancel(job_id). The user adds scope mid-run → job_message(job_id, message) — never re-delegate small steers.
+
+## TIME, NOTES, AND CANVAS MODE
+- `schedule` creates a time-triggered wake for THIS chat. Use it for one-off alarms
+  ("check the agents at 3pm", "verify the work at 18:00") and recurring checks.
+  There is no manual task UI; only you create schedules. When due, it appends a
+  scheduled message and wakes you even if the user has not spoken.
+- `give_note` writes a sticky note/checklist for a chat or group project. Use it
+  for durable plans, reminders, and verification checklists. Notes are memory,
+  not work items; `delegate` and `create_group` still do the work.
+- `canvas_mode` is your oversight mode. Call `canvas_mode(action="available")`
+  to list agent chats and groups, then enter with `single`, `multiple`, or `all`.
+  While active, a finished agent chat wakes you with a [CANVAS EVENT]; inspect it
+  with `canvas_mode read`, then decide whether to message the chat, send follow-up
+  work, or take no action. Exit when done. It reads work state, not coordinates.
 
 ## YOUR MEMORY
-- Between messages you keep only the Recent Chat History shown below \u2014 your internal
-  tool calls are not stored across turns. Anything that matters must be said in a reply.
+- Between messages you keep the Recent Chat History and your Job Plan shown below \u2014
+  your internal tool calls are not stored across turns. Anything that matters must
+  be said in a reply.
 
 ## WRAP-UP
 When jobs settle: cover every job \u2014 outcome, anything notable, where details live.
-Explain well enough that the boss needs no other tab to know what happened.
+Name every failed or cancelled job with its one-line reason \u2014 never gloss over one.
+Explain well enough that the user needs no other tab to know what happened.
 Efficient and complete, zero filler. Length = exactly what the truth requires.
 """
+
+_ORCHESTRATOR_SYSTEM_TEMPLATE = _ORCHESTRATOR_SYSTEM_TEMPLATE.replace(
+    "{{SPECIALISTS}}", _SPECIALIST_LINES
+)
 
 # Orchestrator Agent Node
 
@@ -226,7 +205,7 @@ def orchestrator_node(s: ITState) -> dict:
 
     The Orchestrator's loop:
       1. LLM analyzes the request and decides which subagent to spawn
-      2. Spawns subagents via task() / async_task(action="start") / resume_project()
+      2. Spawns subagents via delegate() / create_coding_project()
       3. Collects results
       4. Verifies results against the user request
       5. Returns summary or retries
@@ -258,57 +237,111 @@ def orchestrator_node(s: ITState) -> dict:
 def _run_native_orchestrator_turn(state, deps) -> tuple[str, list, str | None]:
     """One native pydantic-ai orchestrator turn (used by the graph's call_llm step).
 
-    Mirrors the legacy loop's LLM-call block exactly: free-pool backend uses
-    free_native_turn; otherwise run_native_agent. Returns (text, native_msgs, reasoning).
+    Free-pool backend uses free_native_turn; otherwise run_native_agent
+    (module-level import so tests can patch it). Returns
+    (text, native_msgs, reasoning).
     """
-    from llm.native_tools import run_native_agent
-
     static_system = deps.build_prompt() if deps.build_prompt is not None else _build_orchestrator_prompt()
     history = state.history or []
     chat_id = state.chat_id or ""
     project_path = state.project_path or ""
     run_deps = deps.deps or WorkspaceDeps.from_shared_state(role="Orchestrator", chat_id=chat_id, project_path=project_path)
 
-    orch_effort = "low"
+    orch_effort = "high"
+    try:
+        from agents.workspace_registry import get_profile
+        orch_effort = str(get_profile("orchestrator").get("thinking") or "high")
+    except Exception:
+        pass
     try:
         from llm.provider_modes import get_role_plan
         _oplan = get_role_plan("Orchestrator")
     except Exception:
         _oplan = {}
+    orch_model = str(_oplan.get("model") or "") or None
 
     if str(getattr(_oplan, "get", lambda k, d="": d)("backend", "")) == "free":
         from llm.free_providers import free_native_turn
-        response_text, native_tool_calls, reasoning = free_native_turn(
-            "Orchestrator",
-            list(history),
-            tools=deps.native_orchestrator_tools or get_native_tools("orchestrator"),
-            capability="text",
-            prefer_reasoning=bool(getattr(_oplan, "get", lambda k, d=False: d)("think_bias", False)),
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            ToolCallPart,
+            ToolReturnPart,
         )
-        # Materialize a native ModelResponse slice for free pool (matches legacy)
-        from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
-        parts = []
-        if response_text:
-            parts.append(TextPart(content=response_text))
-        for ci, tc in enumerate(native_tool_calls or []):
-            if not isinstance(tc, dict):
-                continue
-            tname = tc.get("tool") or tc.get("name") or ""
-            targs = tc.get("args") or {}
-            if isinstance(targs, str):
-                try:
-                    targs = json.loads(targs)
-                except Exception:
+        from tools import execute_tool_detailed
+
+        tools = deps.native_orchestrator_tools or get_native_tools("orchestrator")
+        valid_tools = set(deps.valid_tools or []) or {
+            t.get("function", {}).get("name", "") for t in tools
+        }
+        prefer_reasoning = orch_effort in ("high", "max") or bool(
+            getattr(_oplan, "get", lambda k, d=False: d)("think_bias", False)
+        )
+        working = list(history)
+        added: list = []
+        response_text = ""
+        # Manual tool loop: free_native_turn returns tool calls only; execute
+        # them here (the paid path executes tools inside pydantic-ai).
+        for _round in range(50):
+            text, raw_calls, _reasoning = free_native_turn(
+                "Orchestrator",
+                working,
+                tools=tools,
+                capability="text",
+                prefer_reasoning=prefer_reasoning,
+            )
+            response_text = text or ""
+            raw_calls = [tc for tc in (raw_calls or []) if isinstance(tc, dict)]
+            if not raw_calls:
+                if response_text:
+                    msg = ModelResponse(parts=[TextPart(content=response_text)])
+                    added.append(msg)
+                break
+            parts: list = []
+            if response_text:
+                parts.append(TextPart(content=response_text))
+            calls: list[tuple[str, dict, str]] = []
+            for ci, tc in enumerate(raw_calls):
+                tname = str(tc.get("tool") or tc.get("name") or "")
+                targs = tc.get("args") or {}
+                if isinstance(targs, str):
+                    try:
+                        targs = json.loads(targs)
+                    except Exception:
+                        targs = {}
+                if not isinstance(targs, dict):
                     targs = {}
-            parts.append(ToolCallPart(tool_name=tname, args=targs if isinstance(targs, dict) else {},
-                                      tool_call_id=tc.get("id") or f"orch-call-{state.iteration}-{ci}"))
-        native_msgs = [ModelResponse(parts=parts)] if parts else []
-        return response_text or "", native_msgs, None
+                cid = str(tc.get("id") or f"orch-call-{state.iteration}-{_round}-{ci}")
+                parts.append(ToolCallPart(tool_name=tname, args=targs, tool_call_id=cid))
+                calls.append((tname, targs, cid))
+            assistant_msg = ModelResponse(parts=parts)
+            added.append(assistant_msg)
+            working.append(assistant_msg)
+            for tname, targs, cid in calls:
+                if tname not in valid_tools:
+                    result_str = (
+                        f"[BLOCKED] Tool '{tname}' is not available to Orchestrator. "
+                        f"Available: {', '.join(sorted(t for t in valid_tools if t))}"
+                    )
+                else:
+                    try:
+                        execution = execute_tool_detailed(tname, targs, deps=run_deps)
+                        result_str = str(execution.content)
+                    except Exception as e:
+                        result_str = f"ERROR: {str(e)[:300]}"
+                ret = ModelRequest(parts=[ToolReturnPart(
+                    tool_name=tname, content=result_str, tool_call_id=cid,
+                )])
+                added.append(ret)
+                working.append(ret)
+        return response_text or "", added, None
 
     response_text, native_msgs, reasoning = run_native_agent(
         role="Orchestrator",
         messages=list(history),
         tools=deps.native_orchestrator_tools or get_native_tools("orchestrator"),
+        model=orch_model,
         temp=0.2,
         reasoning_effort=orch_effort,
         where=f"Orchestrator iter {state.iteration}",
@@ -321,11 +354,11 @@ def _run_native_orchestrator_turn(state, deps) -> tuple[str, list, str | None]:
 def _orchestrator_graph_driver(s: ITState) -> dict:
     """Run the orchestrator through the pydantic-graph driver (canonical path).
 
-    Mirrors the legacy loop's semantics using the typed graph:
-      analyze → call_llm → decide → (park | nudge | verify → end)
+    Graph flow: analyze → call_llm → decide → (park | verify → end).
 
-    The driver iterates the graph step-by-step; at the ``park`` node it waits on
-    the inbox and injects the next task via ``GraphRun.override_next``.
+    The driver iterates the graph step-by-step and persists resume state at
+    each step boundary; the ``park`` step itself owns the inbox wait (off-loop)
+    and injects results/steering/progress checks into history.
     """
     import asyncio
 
@@ -360,8 +393,20 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
     run_deps = WorkspaceDeps.from_shared_state(role="Orchestrator", chat_id=chat_id, project_path=project_path)
     orch_sess = _orch_session_log(chat_id, project_path)
 
-    from llm.model_history import compact_history_native, estimate_history_tokens
-    from memory.context_compaction import get_compaction_policy
+    from llm.model_history import estimate_history_tokens
+    
+    def _orch_compact(history, policy=None, summary_text=None):
+        """Real LLM checkpoint (summary + project memory + map re-anchor)."""
+        from memory.compaction_engine import compact_history_with_summary
+
+        new_history, _info = compact_history_with_summary(
+            history,
+            project_path=project_path,
+            policy=policy,
+            role="Orchestrator",
+            deps=run_deps,
+        )
+        return new_history
 
     graph_deps = GraphDeps(
         deps=run_deps,
@@ -375,7 +420,7 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
         drain_follow_up=drain_follow_up,
         consume_abort=consume_abort,
         park_wait=_park_wait,
-        compact_history=compact_history_native,
+        compact_history=_orch_compact,
         estimate_tokens=estimate_history_tokens,
         append_log=_log,
     )
@@ -392,43 +437,47 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
             ) as graph_run:
                 # If resuming from a crash, inject the pending task first.
                 if state.pending_task_request:
-                    from pydantic_graph import GraphTaskRequest
-                    pending = [GraphTaskRequest(node_id=req["node_id"], inputs=req.get("inputs")) for req in state.pending_task_request]
+                    pending = [
+                        GraphTaskRequest(
+                            node_id=req["node_id"],
+                            inputs=req.get("inputs"),
+                            fork_stack=tuple(req.get("fork_stack") or ()),
+                        )
+                        for req in state.pending_task_request
+                    ]
                     graph_run.override_next(pending)
                     state.pending_task_request = None
 
                 async for event in graph_run:
+                    # next_task is a task list while the graph is running, but
+                    # an EndMarker/ErrorMarker once it settles — never assume
+                    # it is subscriptable (that was the
+                    # "'EndMarker' object is not subscriptable" driver crash).
+                    nt = graph_run.next_task
+                    tasks = list(nt) if isinstance(nt, (list, tuple)) else []
                     # Persist state at every step boundary (hand-rolled resume).
                     try:
                         state.pending_task_request = [
                             {"node_id": t.node_id, "inputs": getattr(t, "inputs", None)}
-                            for t in (graph_run.next_task or [])
+                            for t in tasks
                             if getattr(t, "node_id", "") not in ("__end__",)
                         ]
                         save_state(state, project_path)
                     except Exception:
                         pass
 
-                    # At the park node, wait on the inbox then inject the next task.
-                    if graph_run.next_task and graph_run.next_task[0].node_id == "park":
-                        # park_wait is blocking; run in a thread so the event loop stays free.
-                        import concurrent.futures
-                        loop = asyncio.get_running_loop()
-                        wait = await loop.run_in_executor(None, lambda: park_wait(chat_id))
-                        if wait.get("aborted"):
-                            graph_run.override_next([type(graph_run.next_task[0])(node_id="end")])
-                        elif wait.get("events") or wait.get("steering"):
-                            graph_run.override_next([type(graph_run.next_task[0])(node_id="call_llm")])
-                        elif wait.get("timed_out"):
-                            graph_run.override_next([type(graph_run.next_task[0])(node_id="park")])
-                        else:
-                            graph_run.override_next([type(graph_run.next_task[0])(node_id="call_llm")])
+                    # The graph's park step owns inbox waiting + payload
+                    # injection (results, steering, progress checks, partial
+                    # reports) — no driver interception here.
 
                     if graph_run.output is not None:
                         return graph_run.output
         except Exception as e:
             import traceback
-            _log(f"[ORCHESTRATOR GRAPH] driver error: {e}\n{traceback.format_exc()}")
+            # Full traceback goes to the server log only — the live terminal
+            # log is user-facing, so it gets a one-line summary (never a dump).
+            print(f"[ORCHESTRATOR GRAPH] driver error: {e}\n{traceback.format_exc()}", flush=True)
+            _log(f"[ORCHESTRATOR GRAPH] driver error: {e}")
             return {
                 "messages": [],
                 "agent_report": f"ERROR: Orchestrator graph driver: {e}",
@@ -470,6 +519,11 @@ def _orchestrator_graph_driver(s: ITState) -> dict:
     finally:
         try:
             _stop_watch()
+        except Exception:
+            pass
+        try:
+            from server.realtime.enqueue_bridge import unregister_active_ctx
+            unregister_active_ctx(chat_id)
         except Exception:
             pass
         try:

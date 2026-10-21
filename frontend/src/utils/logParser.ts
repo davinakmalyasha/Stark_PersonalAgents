@@ -1,4 +1,4 @@
-// Log parser utility for Antigravity trace visualization
+// Log parser utility for Stark trace visualization
 
 export interface TraceStep {
   id: string;
@@ -14,8 +14,10 @@ export interface TraceStep {
   childId?: string;
   /** Short display label for the spawned child (task-derived). */
   label?: string;
-  /** The spawned agent type (UI, Deploy…) — distinct from step.agent (the caller). */
+  /** The spawned agent type (UI, DevOps…) — distinct from step.agent (the caller). */
   childName?: string;
+  /** Workspace id the child runs in (e.g. _general) — fresh delegations include it. */
+  childWorkspace?: string;
 }
 
 export interface GroupedTraceStep {
@@ -35,8 +37,45 @@ export function normalizeAgentName(name: string): string {
   if (n === 'developer' || n === 'dev') return 'Dev';
   if (n === 'analytics') return 'Analytics';
   if (n === 'designer' || n === 'ui/ux designer') return 'Designer';
-  if (n === 'supervisor' || n === 'orchestrator') return 'Supervisor';
+  // 'supervisor' is the legacy label for Stark in old traces — never displayed.
+  if (n === 'supervisor' || n === 'orchestrator' || n === 'stark') return 'Stark';
   return name;
+}
+
+/**
+ * Tool names that spawn subagent child sessions. `task` is the legacy name,
+ * `call_subagent` the async variant, `delegate` the orchestrator's parallel
+ * fan-out tool. Every render/matching gate must use this helper — never
+ * hard-code a subset — otherwise delegated children detach from their call
+ * site and fall back to the top-hoisted card.
+ */
+const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'call_subagent', 'delegate']);
+
+export function isDelegationToolName(name: string | undefined): boolean {
+  return !!name && DELEGATION_TOOL_NAMES.has(name);
+}
+
+/**
+ * Extracts the {name, task} delegation target from tool args. Supports both
+ * shapes: task/call_subagent ({name, task}) and delegate
+ * ({items: [{agent, task, ...}]} — one item per parallel child).
+ */
+export function delegationTarget(args?: string): { name: string; task: string } {
+  if (!args) return { name: '', task: '' };
+  try {
+    const parsed = JSON.parse(args) as Record<string, unknown>;
+    if (typeof parsed.name === 'string' || typeof parsed.task === 'string') {
+      return { name: normalizeAgentName(String(parsed.name || '')), task: String(parsed.task || '') };
+    }
+    const items = parsed.items;
+    const first = Array.isArray(items) ? (items[0] as Record<string, unknown> | undefined) : undefined;
+    if (first && typeof first === 'object') {
+      return { name: normalizeAgentName(String(first.agent || first.name || '')), task: String(first.task || '') };
+    }
+  } catch {
+    // Best effort — args are display-only.
+  }
+  return { name: '', task: '' };
 }
 
 /**
@@ -87,7 +126,7 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
   let assistantResponse: string | null = null;
   let currentStep: TraceStep | null = null;
   let stepCounter = 0;
-  let activeAgent = 'Supervisor';
+  let activeAgent = 'Stark';
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -157,12 +196,23 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         // Try to parse as JSON for cleaner field extraction and specialized task titles
         try {
           const parsed = JSON.parse(args);
-          if ((tool === 'task' || tool === 'start_async_task') && parsed.name) {
-            parsed.name = normalizeAgentName(parsed.name);
-            const subagentName = parsed.name;
-            displayTitle = tool === 'task'
-              ? `Delegating to ${subagentName}`
-              : `Spawning async ${subagentName}`;
+          if (isDelegationToolName(tool)) {
+            if (tool === 'delegate') {
+              // Parallel fan-out: one item per child ({agent, task, ...}).
+              const items = Array.isArray(parsed.items) ? parsed.items : [];
+              if (items.length === 1) {
+                const subagentName = normalizeAgentName(String(items[0]?.agent || items[0]?.name || ''));
+                if (subagentName) displayTitle = `Delegating to ${subagentName}`;
+              } else if (items.length > 1) {
+                displayTitle = `Delegating to ${items.length} agents`;
+              }
+            } else if (parsed.name) {
+              parsed.name = normalizeAgentName(parsed.name);
+              const subagentName = parsed.name;
+              displayTitle = tool === 'task'
+                ? `Delegating to ${subagentName}`
+                : `Subagent ${subagentName}`;
+            }
           }
           args = JSON.stringify(parsed);
         } catch {
@@ -181,22 +231,29 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         steps.push(currentStep);
       }
     } else if (trimmed.startsWith('[SUBAGENT]')) {
-      // [SUBAGENT] child=<id> name=<Agent> label=<short task label>
-      // Links the spawn to its durable session → clickable drill-in block.
-      const match = trimmed.match(/^\[SUBAGENT\]\s+child=(\S+)\s+name=(\S+)\s+label=(.*)$/);
-      if (match) {
-        const [, childId, spawnName, spawnLabel] = match;
-        const label = spawnLabel.trim();
-        const isDelegationStep = !!currentStep && (
-          currentStep.toolName === 'task'
-          || currentStep.toolName === 'call_subagent'
-          || currentStep.toolName === 'start_async_task'
-          || currentStep.toolName === 'async_task'
-        );
-        if (isDelegationStep && currentStep) {
+      // [SUBAGENT] child=<id> name=<Agent> [ws=<workspace>] [chat=<chat_id>] label=<short task label>
+      // New delegations include ws/chat (which chat Stark is talking in / checking);
+      // old traces omit them — parser tolerates both shapes.
+      let childId = '', spawnName = '', spawnLabel = '', spawnWs = '';
+      const m2: RegExpMatchArray | null = trimmed.match(/^\[SUBAGENT\]\s+child=(\S+)\s+name=(\S+)\s+ws=(\S+)\s+chat=(\S+)\s+label=(.*?)(?:\s+del=\S+)?\s*$/);
+      if (m2) {
+        childId = m2[1]; spawnName = m2[2]; spawnWs = m2[3]; spawnLabel = (m2[5] || '').trim();
+      } else {
+        const m3 = trimmed.match(/^\[SUBAGENT\]\s+child=(\S+)\s+name=(\S+)\s+label=(.*?)(?:\s+del=\S+)?\s*$/);
+        if (!m3) { /* unparseable SUBAGENT line */ } else { childId = m3[1]; spawnName = m3[2]; spawnLabel = (m3[3] || '').trim(); }
+      }
+      if (childId) {
+        const label = spawnLabel.trim().replace(/\s+del=del-\S+$/, '');
+        const isDelegationStep = !!currentStep && isDelegationToolName(currentStep.toolName);
+        // Attach the child to its delegation tool step so it renders inline
+        // at the call site. A parallel `delegate` fan-out emits one [SUBAGENT]
+        // line per item — once the step already owns a child, extra children
+        // become standalone steps (never overwrite) so no child is lost.
+        if (isDelegationStep && currentStep && !currentStep.childId) {
           currentStep.childId = childId;
           currentStep.label = label || currentStep.title;
           currentStep.childName = normalizeAgentName(spawnName);
+          if (spawnWs) currentStep.childWorkspace = spawnWs;
         } else {
           currentStep = {
             id: `step-${stepCounter++}`,
@@ -207,6 +264,7 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
             childId,
             label,
             childName: normalizeAgentName(spawnName),
+            ...(spawnWs ? { childWorkspace: spawnWs } : {}),
           };
           steps.push(currentStep);
         }
@@ -222,21 +280,21 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
           currentStep.content = truncateContent(resultPreview, MAX_TOOL_CONTENT);
         }
       }
-    } else if (
-      trimmed.startsWith('[ORCH Iteration') ||
-      trimmed.startsWith('[ORCHESTRATOR]') ||
-      trimmed.startsWith('[Orchestrator]') ||
-      trimmed.startsWith('[THINKING] Supervisor:')
-    ) {
-      currentStep = null;
-    } else if (trimmed.startsWith('[ASSISTANT]')) {
-      assistantResponse = trimmed.slice(12).trim();
-      currentStep = null;
     } else if (trimmed.startsWith('[ORCHESTRATOR] Summary:')) {
       assistantResponse = trimmed.slice(23).trim();
       currentStep = null;
     } else if (trimmed.startsWith('[DEVELOPER] Summary:')) {
       assistantResponse = trimmed.slice(20).trim();
+      currentStep = null;
+    } else if (
+      trimmed.startsWith('[ORCH Iteration') ||
+      trimmed.startsWith('[ORCHESTRATOR]') ||
+      trimmed.startsWith('[Orchestrator]') ||
+      (trimmed.startsWith('[THINKING] Supervisor:') || trimmed.startsWith('[THINKING] Stark:')) // legacy token tolerated
+    ) {
+      currentStep = null;
+    } else if (trimmed.startsWith('[ASSISTANT]')) {
+      assistantResponse = trimmed.slice(12).trim();
       currentStep = null;
     } else if (trimmed.startsWith('[USER]') || trimmed.startsWith('[SESSION]')) {
       currentStep = null;
@@ -274,7 +332,7 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
   for (const step of steps) {
     if (step.type === 'tool') {
       // Delegation calls must never be grouped as exploration — treat as standalone
-      const isDelegation = step.toolName === 'task' || step.toolName === 'start_async_task';
+      const isDelegation = isDelegationToolName(step.toolName);
       if (isDelegation) {
         currentGroup = {
           id: step.id,
@@ -333,20 +391,21 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
  * Orchestrator-only steps for the main chat.
  *
  * The main chat should only display orchestrator-level actions:
- * delegation (task / start_async_task), supervisor thoughts, and
+ * delegation (task / call_subagent / delegate), supervisor thoughts, and
  * final summaries. Subagent tool calls (read_file, write_file, run_command,
  * search_code, etc.) belong in the canvas subagent drawer, not the main chat.
  *
- * Steps from the Supervisor/Orchestrator agent + any task delegation
+ * Steps from Stark (the orchestrator) + any task delegation
  * tool call are kept; everything else is stripped.
  */
 export function filterOrchestratorSteps(steps: TraceStep[]): TraceStep[] {
   return steps.filter((s) => {
-    // Always keep Supervisor / Orchestrator thoughts
-    if (s.agent === 'Supervisor' || s.agent === 'Orchestrator') return true;
+    // Always keep Stark / orchestrator thoughts ('Supervisor' is the legacy label)
+    if (s.agent === 'Stark' || s.agent === 'Supervisor' || s.agent === 'Orchestrator') return true;
 
     // Keep delegation calls regardless of which agent issued them
-    if (s.toolName === 'task' || s.toolName === 'start_async_task') return true;
+    // ('task' is the legacy delegation tool name in old traces)
+    if (isDelegationToolName(s.toolName)) return true;
 
     // Subagent internals — drop
     return false;

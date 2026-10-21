@@ -12,7 +12,7 @@ Entry points share ONE core loop (:func:`_house_events`):
 - API direct mode -> :func:`run_house_direct` (generator yielding
   serialized state snapshots, same contract as the General mode).
 
-Backend: ``deepseek:v4-flash`` with native function calling (same transport
+Backend: ``deepseek:v4.1-flash`` with native function calling (same transport
 as the General agent).
 """
 
@@ -96,10 +96,12 @@ def _build_zone2(task: str, chat_id: str) -> str:
 
     if chat_id:
         try:
-            from memory.chat_context import build_chat_context
+            from server.context.chat_history import build_chat_context
+            from sync.state_sync import safe_get_state
 
             history = build_chat_context(
-                "_general", chat_id, max_messages=20, max_chars_per_msg=2500, exclude_traces=True
+                "_house", chat_id, max_messages=20, max_chars_per_msg=2500,
+                exclude_message_id=str(safe_get_state().get("user_message_id") or ""),
             )
             if history:
                 parts.append(f"## Recent Chat History\n{history}")
@@ -158,8 +160,8 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
     Raises on total failure.
 
     Backend resolution follows the active provider mode's workspace-tier plan
-    (free pool or the paid gateway path); REASONING_SUBAGENT_ROUTINE env still
-    overrides the mode's thinking default.
+    (free pool or the paid gateway path); thinking effort comes from the
+    static per-role mapping in pai_transport._build_model_settings.
     """
     plan: dict = {}
     try:
@@ -189,7 +191,6 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         messages=list(history),
         tools=native_tools,
         temp=0.2,
-        reasoning_effort="low",  # static per-role: house=low
         where=where_tag,
         deps=deps,
         system_prompt=system_prompt,
@@ -273,19 +274,21 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
             try:
                 est = estimate_history_tokens(history)
                 if est >= compaction_policy.checkpoint_trigger:
-                    from llm.model_history import compact_history_native
+                    from memory.compaction_engine import compact_history_with_summary
 
                     before = est
-                    history = compact_history_native(
+                    history, _engine_info = compact_history_with_summary(
                         history,
+                        project_path="",
                         policy=compaction_policy,
-                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                        role=_AGENT_NAME,
+                        deps=run_deps,
                     )
                     after = estimate_history_tokens(history)
                     _log(
                         f"[{_AGENT_NAME.upper()}] Native checkpoint "
                         f"({before:,} -> {after:,} est. tokens; "
-                        f"tail={compaction_policy.tail_budget_tokens:,})"
+                        f"one_pass=True)"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")
@@ -384,14 +387,6 @@ def _house_events(task: str, chat_id: str = "", images: list | None = None):
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"
 
-            try:
-                from tools import _tool_cap, auto_offload_result
-
-                result_str = auto_offload_result(result_str, tname, max_chars=_tool_cap("subagent"))
-            except Exception:
-                if len(result_str) > 4000:
-                    result_str = result_str[:2000] + "\n... (truncated middle) ...\n" + result_str[-2000:]
-
             if guard and guard[0] == "WARNING":
                 result_str += "\n" + guard[1]
 
@@ -479,9 +474,10 @@ def run_house_direct(prompt: str, chat_id: str = "", images: list | None = None)
     except Exception as e:
         import traceback
 
+        print(f"[{_AGENT_NAME} Error] {e}\n{traceback.format_exc()}", flush=True)
         safe_update_state({
             "error": str(e),
-            "live_terminal_log": f"[{_AGENT_NAME} Error] {e}\n{traceback.format_exc()}",
+            "live_terminal_log": f"[{_AGENT_NAME} Error] {e}",
         })
         yield json.loads(safe_serialize_state())
 
@@ -517,7 +513,8 @@ def house_node(s: ITState) -> dict:
         import traceback
 
         tb = traceback.format_exc()
-        _log(f"[{_AGENT_NAME.upper()} CRASH] {e}\n{tb}")
+        print(f"[{_AGENT_NAME.upper()} CRASH] {e}\n{tb}", flush=True)
+        _log(f"[{_AGENT_NAME.upper()} CRASH] {e}")
         safe_append_live_log(f"\n[{_AGENT_NAME.upper()} CRASH] {e}")
         return {
             "messages": [],

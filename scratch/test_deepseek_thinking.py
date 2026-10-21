@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 
 key = os.getenv("DEEPSEEK_API_KEY")
 client = ChatOpenAI(
-    model="deepseek-v4-flash",
+    model="deepseek-v4.1-flash",
     api_key=key,
     base_url="https://api.deepseek.com",
     temperature=0.1,

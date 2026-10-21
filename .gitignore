@@ -24,6 +24,7 @@ Dockerfile*
 PromptFor*.txt
 *_Report.txt
 *Requirements.txt
+!requirements.txt
 *TechnicalSpec.txt
 *DevOpsConfig.txt
 *QA_TestReport.txt
@@ -56,6 +57,7 @@ scratch/eval_runs*/
 scratch/eval_*.log
 scratch/eval_*.err.log
 scratch/eval_pid.txt
+scratch/*.pid
 scratch/*.png
 scratch/*.txt
 scratch/*.json
@@ -73,6 +75,27 @@ server_port.json
 # Scratch working dirs (browser profile temp junk, never commit)
 scratch/agents_works/design/.tmp-chrome/
 scratch/agents_works/design/.tmp-c2/
+scratch/_sim_*/
+scratch/_review_profile/
+scratch/compaction_reports/
+Testing_Log/Log/
 .commandcode/
 scratch/eval_tmp/
+_house/
+.playwright-mcp/
+
+# Large local documentation binaries
+docs/paper_stark_v2.docx
+
+# Local agent plans
+.opencode/plans/
+
+# Nested eval-run artifacts — the scratch/*.json glob above does not cross
+# directories, so nested run output leaked through. Never commit eval output.
+scratch/gen10_runs*/
+scratch/gen10_crashed_smoke/
+
+# Machine-specific electron root hint — generated per install, holds an
+# absolute local path. main.cjs:21 already has a default fallback.
+frontend/electron/stark-root.txt
 

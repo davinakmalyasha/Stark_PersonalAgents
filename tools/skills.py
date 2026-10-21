@@ -3,7 +3,7 @@ Skills warehouse.
 
 Stage 1 of the mature-harness gap mega-plan. Per the user's direction:
 "warehouse... but don't wire to anything yet, because i want to fill it later
-since skill is going to be use by subagents (anything below dev, ui, deploy
+since skill is going to be use by subagents (anything below dev, ui, devops
 subagents, so ui subagents later will get a skill stuff)".
 
 What this module does:
@@ -29,8 +29,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 # Conventional discovery roots, in priority order (workspace > user > first-party).
-# These mirror the existing per-workspace / per-user / first-party split that
-# `general_profile.json` and `subagents.json` already use.
+# These mirror the existing per-workspace / per-user / first-party split.
 _WORKSPACE_SKILLS_GLOB = os.path.join(".deep_agents", "skills", "*", "SKILL.md")
 _USER_SKILLS_GLOB = os.path.join(".deep_agents", "skills", "*", "SKILL.md")
 _FIRSTPARTY_SKILLS_GLOB = os.path.join(".agents", "skills", "*", "SKILL.md")
@@ -184,6 +183,46 @@ def discover_skills(
             continue
         out[skill.name] = skill.to_dict()
     return out
+
+
+def skill_pointer_block(
+    skill_names: Optional[Iterable[str]] = None,
+    workspace_path: Optional[str] = None,
+    harness_root: Optional[str] = None,
+    max_desc: int = 400,
+) -> str:
+    """Compact progressive-disclosure block for prompt injection.
+
+    Only each skill's name, one-line description and ABSOLUTE source path go
+    in-context; the agent reads the full SKILL.md on demand when the task
+    matches its description. Returns "" when no named skill is discovered.
+    """
+    names = [str(n).strip() for n in (skill_names or []) if str(n).strip()]
+    if not names:
+        return ""
+    if harness_root is None:
+        harness_root = os.environ.get("HARNESS_ROOT") or ""
+    found = discover_skills(workspace_path=workspace_path, harness_root=harness_root)
+    lines: list[str] = []
+    for name in names:
+        skill = found.get(name)
+        if not skill:
+            continue
+        desc = " ".join(str(skill.get("description") or "").split())
+        if max_desc and len(desc) > max_desc:
+            desc = desc[:max_desc].rstrip() + "…"
+        lines.append(f"- {name} — {desc}")
+        source = str(skill.get("source") or "")
+        if source:
+            lines.append(f"  Full skill (read by absolute path when it applies): {source}")
+    if not lines:
+        return ""
+    return (
+        "## Skills\n"
+        "Read a skill file before doing that kind of work; it is context for "
+        "how to execute, not an override of the task.\n"
+        + "\n".join(lines)
+    )
 
 
 if __name__ == "__main__":

@@ -1,19 +1,22 @@
 import { useMemo } from 'react';
 import type { TokenUsage } from '../types';
 import type { BoardAgent, BoardAgentStatus } from '../types/board.types';
-import { parseLogToSteps } from '../utils/logParser';
+import { delegationTarget, isDelegationToolName, parseLogToSteps } from '../utils/logParser';
+import type { TraceStep } from '../utils/logParser';
 
 interface Input {
   isRunning: boolean;
   liveLog: string | undefined;
   tokenUsage?: TokenUsage | null;
+  /** Persisted trace steps for the last completed run (no live log available). */
+  traceSteps?: TraceStep[];
 }
 
 const AGENT_ROSTER: { id: string; label: string; role: BoardAgent['role'] }[] = [
-  { id: 'Supervisor', label: 'Supervisor', role: 'Orchestrator' },
+  // id stays 'Supervisor' to match legacy trace labels; the UI shows "Stark".
+  { id: 'Supervisor', label: 'Stark', role: 'Orchestrator' },
   { id: 'Dev', label: 'Developer Subagent', role: 'Subagent' },
   { id: 'General', label: 'General Subagent', role: 'Subagent' },
-  { id: 'Vision', label: 'Vision Agent', role: 'Subagent' },
 ];
 
 /** Map node ids to the agent names used in token call records */
@@ -22,11 +25,10 @@ function normalizeTokenAgent(nodeId: string): string[] {
   switch (lower) {
     case 'supervisor': return ['supervisor', 'orchestrator', 'director'];
     case 'dev': return ['dev', 'developer', 'coder'];
-    case 'sdet': return ['sdet', 'tester', 'qa'];
     case 'devsecops': return ['devsecops', 'devops'];
     case 'analytics': return ['analytics', 'data'];
     case 'general': return ['general', 'freeagent', 'free agent'];
-    case 'vision': return ['vision', 'visual'];
+    case 'vision': return ['general', 'freeagent', 'free agent'];
     case 'designer': return ['designer', 'ui/ux'];
     default: return [lower];
   }
@@ -36,34 +38,26 @@ function normalizeTokenAgent(nodeId: string): string[] {
 function getAgentTask(steps: ReturnType<typeof parseLogToSteps>['steps'], agentId: string): string {
   for (let i = steps.length - 1; i >= 0; i--) {
     const s = steps[i];
-    if (s.toolName !== 'task' && s.toolName !== 'start_async_task') continue;
-    try {
-      const parsed = JSON.parse(s.args || '{}');
-      if (parsed.name === agentId && typeof parsed.task === 'string') return parsed.task;
-    } catch {
-      // Not a delegation step we can read.
-    }
+    if (!isDelegationToolName(s.toolName)) continue;
+    const target = delegationTarget(s.args);
+    if (target.name === agentId && target.task) return target.task;
   }
   return '';
 }
 
-export function useCanvasAgentState({ isRunning, liveLog, tokenUsage }: Input) {
+export function useCanvasAgentState({ isRunning, liveLog, tokenUsage, traceSteps }: Input) {
   const steps = useMemo(() => {
-    if (!liveLog) return [];
-    return parseLogToSteps(liveLog).steps;
-  }, [liveLog]);
+    if (liveLog) return parseLogToSteps(liveLog).steps;
+    return traceSteps ?? [];
+  }, [liveLog, traceSteps]);
 
   const activeAgent = useMemo(() => {
     if (!isRunning) return null;
     if (steps.length === 0) return 'Supervisor';
     const lastStep = steps[steps.length - 1];
-    if (lastStep.toolName === 'task' || lastStep.toolName === 'start_async_task') {
-      try {
-        const parsed = JSON.parse(lastStep.args || '{}');
-        if (parsed.name) return parsed.name;
-      } catch {
-        // Malformed delegation args — fall through to the agent field.
-      }
+    if (isDelegationToolName(lastStep.toolName)) {
+      const target = delegationTarget(lastStep.args);
+      if (target.name) return target.name;
     }
     return lastStep.agent || 'Supervisor';
   }, [isRunning, steps]);

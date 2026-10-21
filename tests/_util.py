@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import json
 import os
 import shutil
 import subprocess
@@ -96,6 +95,71 @@ def attach_real_apply_template():
     stub = tools_stub()
     stub.apply_template = template_tools().apply_template
     return stub
+
+
+def restore_tools() -> None:
+    """Evict the ``tools`` stub so the REAL package imports again.
+
+    :func:`tools_stub` replaces ``sys.modules['tools']`` with a minimal module
+    and (deliberately) never restores it, because the suites that use it need
+    it for their whole module. Any LATER test that wants the real facade must
+    therefore evict it first — otherwise ``import tools`` silently yields the
+    stub and every attribute lookup fails with a confusing ``AttributeError``.
+
+    Clearing the cached stub means the next :func:`tools_stub` call rebuilds
+    and reinstalls it, so this is safe to call in either order.
+    """
+    global _TOOLS_STUB
+    current = sys.modules.get("tools")
+    if current is None or current is _TOOLS_STUB or not hasattr(current, "__path__"):
+        # Drop the stub and anything imported through it (e.g. a submodule the
+        # stub briefly satisfied) so the real package re-imports cleanly.
+        for name in [n for n in list(sys.modules)
+                     if n == "tools" or n.startswith("tools.")]:
+            sys.modules.pop(name, None)
+    _TOOLS_STUB = None
+
+
+def real_tools():
+    """The real ``tools`` package, evicting the stub if one is installed."""
+    restore_tools()
+    import tools
+    return tools
+
+
+@contextlib.contextmanager
+def agents_shim(*module_names):
+    """Import ``agents.<x>`` submodules WITHOUT executing ``agents/__init__.py``.
+
+    ``agents/__init__.py`` pulls the whole agent stack (``developer_agent`` ->
+    ``from tools import ...``). This suite replaces ``sys.modules['tools']``
+    with a stub via :func:`tools_stub` and never restores it, so a plain
+    ``import agents.foo`` raises ``ImportError: cannot import name
+    'ToolExecutionResult' from 'tools'`` depending on test order. A path-only
+    package object sidesteps the ``__init__`` entirely — and is ~12s faster
+    than importing the real stack.
+
+    Yields ``{module_name: module}``. Every touched ``sys.modules`` entry is
+    restored on exit, with ``agents`` restored last so the tree is never left
+    half-swapped.
+    """
+    names = ["agents", *module_names]
+    saved = {name: sys.modules.get(name) for name in names}
+
+    pkg = types.ModuleType("agents")
+    pkg.__path__ = [os.path.join(REPO_ROOT, "agents")]
+    sys.modules["agents"] = pkg
+    try:
+        yield {name: importlib.import_module(name) for name in module_names}
+    finally:
+        # Submodules first, then the package itself, so `agents` is never a
+        # shim pointing at a restored child (or vice versa).
+        for name in sorted(saved, key=lambda n: n == "agents"):
+            module = saved[name]
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 # ── env isolation ───────────────────────────────────────────────────────────

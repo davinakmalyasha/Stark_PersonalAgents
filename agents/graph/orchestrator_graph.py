@@ -21,6 +21,7 @@ orchestrator path. ``ORCH_GRAPH=0`` is retained purely as a documented gate
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ from typing import Any
 
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
 
-from pydantic_graph import GraphBuilder, GraphRunContext, StepContext
+from pydantic_graph import GraphBuilder, StepContext
 
 from llm.deps import WorkspaceDeps
 
@@ -38,6 +39,9 @@ from llm.deps import WorkspaceDeps
 @dataclass
 class OrchestratorState:
     """Mutable state shared across graph steps (typed replacement for dict-spread)."""
+
+    #: Bumped when serialized shape/semantics change — old resumes are discarded.
+    SCHEMA_VERSION = 2
 
     client_request: str = ""
     project_path: str = ""
@@ -66,6 +70,8 @@ class OrchestratorState:
         from pydantic_ai import ModelMessagesTypeAdapter
 
         return {
+            "schema_version": self.SCHEMA_VERSION,
+            "prompt_fingerprint": _prompt_fingerprint(),
             "client_request": self.client_request,
             "project_path": self.project_path,
             "chat_id": self.chat_id,
@@ -194,10 +200,79 @@ def _infer_project_path(client_request: str, fallback: str) -> tuple[str, str]:
     name = os.path.basename(target) or "project"
     directive = (
         f"[PROJECT CHECK] The folder '{target}' does not exist yet. "
-        f"Call create_project(name='{name}', concept=<one-line goal>) FIRST to "
+        f"Call create_coding_project(name='{name}', concept=<one-line goal>) FIRST to "
         f"create it, THEN delegate the actual task to Dev in that new workspace."
     )
     return target, directive
+
+
+# ── Job-plan re-anchoring (orchestrator memory that survives compaction) ──────
+
+_PROMPT_FINGERPRINT_CACHE: str | None = None
+
+
+def _prompt_fingerprint() -> str:
+    """Hash of the orchestrator prompt + tool surface (resume compatibility)."""
+    global _PROMPT_FINGERPRINT_CACHE
+    if _PROMPT_FINGERPRINT_CACHE is not None:
+        return _PROMPT_FINGERPRINT_CACHE
+    try:
+        import hashlib
+
+        from agents.orchestrator_agent import _build_orchestrator_prompt
+        from tools import get_native_tool_names
+
+        payload = _build_orchestrator_prompt() + "|" + ",".join(
+            sorted(get_native_tool_names("orchestrator"))
+        )
+        _PROMPT_FINGERPRINT_CACHE = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        _PROMPT_FINGERPRINT_CACHE = ""
+    return _PROMPT_FINGERPRINT_CACHE
+
+
+def _job_plan_block(chat_id: str) -> list[str]:
+    """Current orchestrator job-plan block(s) for context (best-effort).
+
+    The plan is built automatically from real delegations (agents/delegation.py)
+    — it is the orchestrator's memory of which agents were called with what.
+    """
+    parts: list[str] = []
+    try:
+        from tools import get_plan_for_context
+
+        pb = get_plan_for_context("orchestrator", chat_id=chat_id)
+        if pb:
+            parts.append(pb)
+    except Exception:
+        pass
+    return parts
+
+
+def _unmentioned_settled_failures(state: "OrchestratorState") -> list[str]:
+    """Failed/cancelled jobs (this chat) whose id/title is missing from the reply."""
+    try:
+        from agents.delegation import _DELEGATIONS, _LOCK
+    except Exception:
+        return []
+    text = str(state.response_text or "").lower()
+    try:
+        with _LOCK:
+            entries = [dict(e) for e in _DELEGATIONS.values()]
+    except Exception:
+        return []
+    out: list[str] = []
+    for e in entries:
+        if e.get("parent") != (state.chat_id or ""):
+            continue
+        if e.get("status") not in ("failed", "cancelled"):
+            continue
+        eid = str(e.get("id", "")).lower()
+        title = str(e.get("title", "")).lower()
+        if (eid and eid in text) or (title and title in text):
+            continue
+        out.append(f"{e.get('id', '')} '{e.get('title', '')}' ({e.get('status')})")
+    return out[:5]
 
 
 # ── Steps ────────────────────────────────────────────────────────────────────
@@ -227,6 +302,7 @@ def _build_graph() -> GraphBuilder:
         if inferred_path:
             state.project_path = inferred_path
 
+        current_user_message_id = ""
         try:
             deps.append_log(f"[ORCHESTRATOR] Analyzing request...")
             if deps.build_prompt is not None:
@@ -239,17 +315,41 @@ def _build_graph() -> GraphBuilder:
                 task_message += f"\n\n{directive}"
             if state.project_path and os.path.isdir(state.project_path):
                 task_message = f"## WORKSPACE\n{state.project_path}\n\n" + task_message
+            # Prior conversation as real user/assistant turns. The old path
+            # rendered history as one text block and skipped every assistant
+            # trace, so the model effectively only saw the latest user message.
+            current_user_message_id = ""
+            prior_history: list = []
+            native_history_ok = False
             try:
-                from memory.chat_context import build_chat_context
-                from sync.state_sync import shared_state
-                ctx_path = "_general" if shared_state.get("is_general", False) else project_path
-                chat_history_str = build_chat_context(
-                    ctx_path, chat_id, max_messages=30, max_chars_per_msg=3000, exclude_traces=True
+                from server.context.chat_history import build_chat_history_messages
+                from sync.state_sync import safe_get_state
+                current = safe_get_state()
+                current_user_message_id = str(current.get("user_message_id") or "")
+                ctx_path = "_general" if current.get("is_general", False) else project_path
+                prior_history = build_chat_history_messages(
+                    ctx_path, chat_id, max_messages=30, max_chars_per_msg=3000,
+                    exclude_message_id=current_user_message_id,
                 )
-                if chat_history_str:
-                    task_message += f"\n\n## Recent Chat History\n{chat_history_str}"
+                native_history_ok = True
             except Exception as e:
                 deps.append_log(f"[ORCHESTRATOR] Error loading chat history: {e}")
+
+            # Fallback only when native turns could not be built.
+            if not native_history_ok:
+                try:
+                    from server.context.chat_history import build_chat_context
+                    from sync.state_sync import safe_get_state
+                    current = safe_get_state()
+                    ctx_path = "_general" if current.get("is_general", False) else project_path
+                    chat_history_str = build_chat_context(
+                        ctx_path, chat_id, max_messages=30, max_chars_per_msg=3000,
+                        exclude_message_id=current_user_message_id,
+                    )
+                    if chat_history_str:
+                        task_message += f"\n\n## Recent Chat History\n{chat_history_str}"
+                except Exception as e:
+                    deps.append_log(f"[ORCHESTRATOR] Error loading chat history fallback: {e}")
             try:
                 from agents.delegation import recent_jobs_block
                 jb = recent_jobs_block(10)
@@ -257,9 +357,19 @@ def _build_graph() -> GraphBuilder:
                     task_message += f"\n\n{jb}"
             except Exception:
                 pass
+            # Job-plan re-anchor: the orchestrator's own tracker, built from real
+            # jobs, re-shown at run start.
+            for _block in _job_plan_block(chat_id):
+                task_message += f"\n\n{_block}"
 
             from llm.model_history import build_initial_history
-            state.history = build_initial_history(static_system, task_message)
+            try:
+                from pydantic_ai.messages import ModelRequest, UserPromptPart
+                state.history = build_initial_history(static_system, "")
+                state.history.extend(prior_history)
+                state.history.append(ModelRequest(parts=[UserPromptPart(content=task_message)]))
+            except Exception:
+                state.history = build_initial_history(static_system, task_message)
 
             try:
                 from tools.vision_channel import drain_attachment_images_native
@@ -272,7 +382,15 @@ def _build_graph() -> GraphBuilder:
 
         if deps.orch_sess is not None:
             try:
-                deps.orch_sess.append_message("user", client_req, source="user")
+                existing = (
+                    deps.orch_sess.get_entry(current_user_message_id)
+                    if current_user_message_id else None
+                )
+                if existing is None:
+                    deps.orch_sess.append_message(
+                        "user", client_req, source="user",
+                        entry_id=current_user_message_id or None,
+                    )
             except Exception:
                 pass
         return "call_llm"
@@ -285,8 +403,9 @@ def _build_graph() -> GraphBuilder:
         state.iteration += 1
         deps.append_log(f"\n[ORCH Iteration {state.iteration}]")
 
-        # Compaction at iteration boundaries (native ModelMessage history)
-        if state.iteration > 1 and deps.compact_history is not None:
+        # Compaction at iteration boundaries (native ModelMessage history).
+        # Runs whenever the policy trigger is hit, including the first turn.
+        if deps.compact_history is not None:
             try:
                 est = deps.estimate_tokens(state.history) if deps.estimate_tokens is not None else 0
                 if est >= (deps.compaction_policy.checkpoint_trigger if deps.compaction_policy else 1 << 30):
@@ -300,6 +419,13 @@ def _build_graph() -> GraphBuilder:
                     deps.append_log(
                         f"[ORCHESTRATOR] Native checkpoint ({before:,} -> {after:,} est. tokens)"
                     )
+                    # Re-anchor the job plan after the summary — the tracker
+                    # must survive context compression.
+                    _blocks = _job_plan_block(state.chat_id)
+                    if _blocks:
+                        state.history.append(ModelRequest(parts=[UserPromptPart(
+                            content="[RE-ANCHOR]\n" + "\n\n".join(_blocks)
+                        )]))
             except Exception as e:
                 deps.append_log(f"[ORCHESTRATOR] Native compaction error (non-fatal): {e}")
 
@@ -313,10 +439,25 @@ def _build_graph() -> GraphBuilder:
         state.response_text = text or ""
         state.reasoning_content = reasoning
         state.native_msgs = native_msgs or []
+        if state.native_msgs and not isinstance(
+            state.native_msgs[0], (ModelRequest, ModelResponse)
+        ):
+            # Stream-fallback transcripts (LangChain/dict shapes) are converted
+            # so tool calls are detected and history stays typed ModelMessages.
+            try:
+                from llm.pai_transport import _messages_to_pai
 
-        # Extract tool calls from native transcript slice
+                state.native_msgs = _messages_to_pai(state.native_msgs)
+            except Exception:
+                pass
+        if state.native_msgs:
+            # Merge the executed turn into history so the next iteration sees
+            # its own assistant/tool turns (parity with the workspace agents).
+            state.history.extend(state.native_msgs)
+
+        # Extract tool calls from the (possibly converted) transcript slice
         calls: list[dict] = []
-        for m in (native_msgs or []):
+        for m in (state.native_msgs or []):
             if isinstance(m, ModelResponse):
                 for p in getattr(m, "parts", []) or []:
                     if getattr(p, "part_kind", "") == "tool-call":
@@ -335,8 +476,8 @@ def _build_graph() -> GraphBuilder:
         state.tool_calls = calls
         for c in calls:
             state.tool_call_log.append({"tool": c.get("tool"), "args": c.get("args"), "id": c.get("id")})
-        state.delegated_work = any(
-            c.get("tool") in ("delegate", "task", "async_task", "resume_project", "create_project")
+        state.delegated_work = state.delegated_work or any(
+            c.get("tool") in ("delegate", "create_coding_project")
             for c in calls
         )
         return "decide"
@@ -362,26 +503,32 @@ def _build_graph() -> GraphBuilder:
             except Exception:
                 pass
 
-        # Park while children run
+        # Park while children run — or while a settled job's wake is still in
+        # flight (undelivered), so results are never skipped.
         if state.delegated_work or (state.tool_calls and not state.native_msgs):
             try:
                 from agents import delegation as _dlg
                 pending = _dlg.running_count(state.chat_id) if state.chat_id else 0
+                undelivered = _dlg.undelivered_count(state.chat_id) if state.chat_id else 0
             except Exception:
-                pending = 0
-            if pending > 0:
+                pending = undelivered = 0
+            if pending > 0 or undelivered > 0:
                 deps.append_log(f"[ORCHESTRATOR] {pending} delegation(s) running — parking for events")
                 return "park"
         return "verify"
 
     @g.step
     async def park(ctx: StepContext[OrchestratorState, GraphDeps, str]) -> Any:
-        """Wait on the inbox; the driver injects the next task via override_next."""
+        """Wait on the inbox (off-loop); inject results/steering, then coordinate."""
         state = ctx.state
         deps = ctx.deps
         wait = {"events": [], "steering": [], "aborted": False, "timed_out": True}
         if deps.park_wait is not None:
-            wait = deps.park_wait(state.chat_id)
+            try:
+                loop = asyncio.get_running_loop()
+                wait = await loop.run_in_executor(None, deps.park_wait, state.chat_id)
+            except Exception:
+                wait = {"events": [], "steering": [], "aborted": False, "timed_out": True}
         if wait.get("aborted"):
             try:
                 from agents import delegation as _dlg
@@ -415,6 +562,28 @@ def _build_graph() -> GraphBuilder:
                 ]))]))
                 state.park_timeouts = 0
                 return "call_llm"
+            if state.park_timeouts == 2:
+                # Magentic-One-style progress check: after the second long wait,
+                # force a structured self-check + the live board before waiting again.
+                deps.append_log("[ORCHESTRATOR] Long wait — injecting a PROGRESS CHECK.")
+                board = ""
+                try:
+                    from agents.delegation import status_table
+                    board = status_table()
+                except Exception:
+                    board = "(job board unavailable)"
+                check = (
+                    "Long wait — stop and check yourself before waiting again:\n"
+                    "1. Is what the user asked already satisfied?\n"
+                    "2. Are the jobs making progress, or is one looping or stuck?\n"
+                    "3. What is the next assignment for each unfinished job?\n"
+                    "If a job looks stuck: steer it (job_message) or cancel it (job_cancel). "
+                    "If something is missing, delegate it now. Give the user an honest status update."
+                )
+                state.history.append(ModelRequest(parts=[UserPromptPart(
+                    content=_render_delivery("PROGRESS CHECK", [check, board])
+                )]))
+                return "call_llm"
             deps.append_log(f"[ORCHESTRATOR] Wait timeout #{state.park_timeouts} — re-parking (children alive)")
             return "park"
         return "call_llm"
@@ -432,6 +601,19 @@ def _build_graph() -> GraphBuilder:
             state.history.append(ModelRequest(parts=[UserPromptPart(content="[NUDGE] That response was too brief. Summarize what was accomplished and offer a next step the user might want.")]))
             return "call_llm"
 
+        # Wrap-up honesty guard: a final reply must name every failed/cancelled
+        # job (bounded — never blocks the exit forever).
+        if state.delegated_work and state.nudge_count < 2:
+            missing = _unmentioned_settled_failures(state)
+            if missing:
+                state.nudge_count += 1
+                deps.append_log(f"[ORCHESTRATOR] Wrap-up misses {len(missing)} failed/cancelled job(s) — nudging.")
+                state.history.append(ModelRequest(parts=[UserPromptPart(content=_render_delivery("WRAP-UP CHECK", [
+                    "Your reply does not name these settled jobs: " + "; ".join(missing),
+                    "Name each one with its one-line reason before finishing.",
+                ]))]))
+                return "call_llm"
+
         follow_msgs = []
         if deps.drain_follow_up is not None:
             try:
@@ -442,6 +624,20 @@ def _build_graph() -> GraphBuilder:
             deps.append_log(f"[ORCHESTRATOR] Follow-up queued ({len(follow_msgs)}) — continuing")
             state.history.append(ModelRequest(parts=[UserPromptPart(content=_render_delivery("FOLLOW-UP", follow_msgs))]))
             return "call_llm"
+
+        # Never exit with results still in flight (settled but undelivered) or
+        # children still running.
+        try:
+            from agents import delegation as _dlg
+            inflight = (
+                _dlg.running_count(state.chat_id) + _dlg.undelivered_count(state.chat_id)
+                if state.chat_id else 0
+            )
+        except Exception:
+            inflight = 0
+        if state.delegated_work and inflight > 0:
+            deps.append_log("[ORCHESTRATOR] Results still in flight — re-parking.")
+            return "park"
 
         state.final_report = clean
         deps.append_log(f"\n[ORCHESTRATOR] Agent finished after {state.iteration} iterations")
@@ -487,6 +683,7 @@ def _build_graph() -> GraphBuilder:
         g.edge_from(verify).to(
             g.decision()
             .branch(g.match(str, matches=lambda s: s == "call_llm").to(call_llm))
+            .branch(g.match(str, matches=lambda s: s == "park").to(park))
             .branch(g.match(str).to(end))
         ),
         g.edge_from(end).to(g.end_node),
@@ -513,15 +710,6 @@ def get_graph():
     if _GRAPH is None:
         _GRAPH = _build_graph().build()
     return _GRAPH
-
-
-def graph_enabled() -> bool:
-    """ORCH_GRAPH gate (retained for documentation; graph path is the only path).
-
-    Default ON (1). The legacy loop is deleted, so this is informational only —
-    setting it to 0 no longer selects a fallback.
-    """
-    return os.environ.get("ORCH_GRAPH", "1").strip() not in ("0", "false", "no", "off")
 
 
 # ── Resume helpers ───────────────────────────────────────────────────────────
@@ -552,6 +740,14 @@ def load_state(chat_id: str, project_path: str) -> OrchestratorState | None:
             return None
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # Versioned resume: a state saved under an older prompt/tool surface (or
+        # an older schema) must not resume — start fresh instead.
+        if data.get("schema_version") != OrchestratorState.SCHEMA_VERSION:
+            return None
+        saved_fp = str(data.get("prompt_fingerprint") or "")
+        current_fp = _prompt_fingerprint()
+        if current_fp and saved_fp and saved_fp != current_fp:
+            return None
         return OrchestratorState.from_json(data)
     except Exception:
         return None

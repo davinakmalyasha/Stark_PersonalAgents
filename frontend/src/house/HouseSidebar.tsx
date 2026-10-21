@@ -1,14 +1,22 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Plus, MessageSquare, Pencil, Trash2, Check, Code2, Home, ShieldCheck, User, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, ChevronUp, Palette,
+  Plus, MessageSquare, Pencil, Trash2, Check, Code2, ChevronRight,
+  ChevronDown, Search, Pin, PinOff, LayoutGrid, Bot, CornerDownRight,
 } from 'lucide-react';
 import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
+import { cleanChatTitle } from '../utils/chatTitle';
+import WorkspaceSwitcher from './WorkspaceSwitcher';
+import {
+  buildGlobalLookup,
+  collectSpawnedChildrenOf,
+  groupWorkspaceChats,
+  isSpawnedChat,
+} from '../utils/chatHierarchy';
 
 interface Props {
-  /** 'full' = main workspace (source dropdown + adaptive +). 'room' = House/
-   * Personal workspace hamburger: search + all chats + workspaces, no dropdown. */
+  /** 'full' = main workspace chat history. 'room' = House/Personal workspace
+   *  hamburger: search + all chats + workspaces. */
   variant?: 'full' | 'room';
   open: boolean;
   onClose: () => void;
@@ -17,7 +25,7 @@ interface Props {
   activeTabId: string | null;
   runningTabId: string | null;
   pinnedChats: string[];
-  /** Full variant: active source filter + its callbacks. */
+  /** Kept for compatibility; the main sidebar now always shows main chats. */
   chatsFilter?: ChatsFilter;
   onFilterChange?: (filter: ChatsFilter) => void;
   onTogglePin: (sessionTabId: string) => void;
@@ -33,21 +41,19 @@ interface Props {
   onLaunchCoding: () => void;
   onLaunchHouse: () => void;
   onLaunchAdmin: () => void;
-  /** Optional: design-module launcher (Main workspace only — rooms omit it). */
-  onLaunchDesign?: () => void;
 }
 
 interface RowChat extends ChatSummary {
   sid: string; // session tab id
   ws: WorkspaceInfo;
+  /** Nesting depth for same-workspace parent chains (0 = top-level). */
+  depth?: number;
+  /** Cross-workspace parent info for the "from X" badge. */
+  parentTitle?: string;
+  parentWsName?: string;
+  /** Which top-level parent this spawned row is nested under (for keys). */
+  nestParentSid?: string;
 }
-
-const FILTERS: { key: ChatsFilter; label: string; icon: typeof MessageSquare }[] = [
-  { key: 'general', label: 'General', icon: MessageSquare },
-  { key: 'coding', label: 'Coding', icon: Code2 },
-  { key: 'house', label: 'House', icon: Home },
-  { key: 'personal', label: 'Personal', icon: User },
-];
 
 function relativeTime(iso: string): string {
   if (!iso) return '';
@@ -60,6 +66,25 @@ function relativeTime(iso: string): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
+/** Render caps — keeps the sidebar DOM light when a workspace has hundreds of
+ * chats. The full list stays in memory (tabs resolve from it); only the visible
+ * rows are capped, with a Load more button per section. */
+const GENERAL_PAGE = 15;
+const PROJECT_PAGE = 7;
+const ROOM_PAGE = 15;
+
+function LoadMoreButton({ remaining, onClick }: { remaining: number; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="w-full mb-1.5 py-1.5 rounded-lg text-[11px] font-medium text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.04] transition-colors cursor-pointer"
+    >
+      Load more ({remaining})
+    </button>
+  );
+}
+
 /**
  * Chat management sidebar. Full variant (main workspace): a source dropdown
  * (General / Coding / House / Personal) switches which chats are listed; the
@@ -70,30 +95,103 @@ function relativeTime(iso: string): string {
 export default function HouseSidebar({
   variant = 'full',
   open, onClose, workspaces, chatsByWs,
-  activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
-  onOpenSession, onNewChat, onNewProject, onNewChatInProject, onOpenRoom,
+  activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onTogglePin,
+  onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
-  onLaunchPersonal, onLaunchCoding, onLaunchHouse, onLaunchAdmin, onLaunchDesign,
+  onLaunchPersonal, onLaunchCoding, onLaunchHouse, onLaunchAdmin,
 }: Props) {
   const [editing, setEditing] = useState<{ sid: string; title: string } | null>(null);
   const [confirmDeleteSid, setConfirmDeleteSid] = useState<string | null>(null);
+  const [deletingSid, setDeletingSid] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
   const [collapsedWs, setCollapsedWs] = useState<Set<string>>(new Set());
-  const [filterOpen, setFilterOpen] = useState(false);
-  const filterRef = useRef<HTMLDivElement | null>(null);
   const deleteTimer = useRef<number | null>(null);
-
+  const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
+  const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
+  const [generalLimit, setGeneralLimit] = useState(GENERAL_PAGE);
+  const [roomLimit, setRoomLimit] = useState(ROOM_PAGE);
+  const [projectLimits, setProjectLimits] = useState<Record<string, number>>({});
+  /** Collapsed spawn-nests: parent session-tab-id -> collapsed. Default expanded. */
+  const [collapsedSpawns, setCollapsedSpawns] = useState<Set<string>>(new Set());
   const isPinned = (sid: string) => pinnedChats.includes(sid);
   const general = workspaces.find((w) => w.isGeneral);
   const projects = workspaces.filter((w) => !w.isGeneral);
-  const activeFilter = FILTERS.find((f) => f.key === chatsFilter) ?? FILTERS[0];
-
   const withWs = (ws: WorkspaceInfo, c: ChatSummary): RowChat => ({ ...c, sid: tabId(ws.id, c.id), ws });
   const pinnedSort = useCallback(
     (rows: RowChat[]): RowChat[] =>
       [...rows].sort((a, b) => Number(pinnedChats.includes(b.sid)) - Number(pinnedChats.includes(a.sid))),
     [pinnedChats],
   );
+
+  /** Global chat lookup so a spawned child can name its parent anywhere. */
+  const globalLookup = useMemo(
+    () => buildGlobalLookup(workspaces, chatsByWs),
+    [workspaces, chatsByWs],
+  );
+
+  const withParentInfo = useCallback((row: RowChat): RowChat => {
+    const parentId = (row as ChatSummary).parentChatId;
+    if (!parentId) return row;
+    const hit = globalLookup.get(parentId);
+    if (!hit) return row;
+    return { ...row, parentTitle: hit.title, parentWsName: hit.wsName };
+  }, [globalLookup]);
+
+  /** Nests the user explicitly expanded — auto-collapse seeding never touches these. */
+  const userExpanded = useRef<Set<string>>(new Set());
+  const toggleSpawnCollapsed = useCallback((sid: string) => {
+    setCollapsedSpawns((prev) => {
+      const next = new Set(prev);
+      if (next.has(sid)) {
+        next.delete(sid);
+        userExpanded.current.add(sid);
+      } else {
+        next.add(sid);
+        userExpanded.current.delete(sid);
+      }
+      return next;
+    });
+  }, []);
+
+  // Default-collapsed spawn nests: seed every parent that has spawned children
+  // as collapsed so lower agents live inside their parent instead of reading
+  // as flat siblings. User expands explicitly; seeding only ever adds.
+  useEffect(() => {
+    const parents = new Set<string>();
+    const byId = new Set<string>();
+    for (const ws of workspaces) {
+      for (const c of chatsByWs[ws.id] ?? []) byId.add(c.id);
+    }
+    for (const ws of workspaces) {
+      for (const c of chatsByWs[ws.id] ?? []) {
+        const p = (c as ChatSummary).parentChatId;
+        if (p && byId.has(p)) parents.add(tabId(workspaces.find((w) => (chatsByWs[w.id] ?? []).some((x) => x.id === p))?.id ?? ws.id, p));
+      }
+    }
+    // Cross-workspace children (orchestrator → project) nest under general parents.
+    if (general) {
+      const lookup = buildGlobalLookup(workspaces, chatsByWs);
+      for (const c of chatsByWs[general.id] ?? []) {
+        const hasKids = (collectSpawnedChildrenOf(c.id, workspaces, chatsByWs, lookup) ?? []).length > 0;
+        if (hasKids) parents.add(tabId(general.id, c.id));
+      }
+    }
+    if (parents.size === 0) return;
+    setCollapsedSpawns((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const sid of parents) {
+        // Only auto-collapse on first sight — never re-collapse a nest the
+        // user explicitly expanded this session.
+        if (!next.has(sid) && !userExpanded.current.has(sid)) {
+          next.add(sid);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaces, chatsByWs]);
 
   // ── Rows for the active filter ──
   const generalRows = useMemo(
@@ -141,9 +239,14 @@ export default function HouseSidebar({
 
   const handleDelete = (row: RowChat) => {
     if (confirmDeleteSid === row.sid) {
-      onDeleteChat(row.ws.id, row.id);
+      if (deletingSid) return;
+      setDeletingSid(row.sid);
       setConfirmDeleteSid(null);
       if (deleteTimer.current) window.clearTimeout(deleteTimer.current);
+      window.setTimeout(() => {
+        onDeleteChat(row.ws.id, row.id);
+        setDeletingSid(null);
+      }, 220);
     } else {
       setConfirmDeleteSid(row.sid);
       if (deleteTimer.current) window.clearTimeout(deleteTimer.current);
@@ -161,27 +264,41 @@ export default function HouseSidebar({
     });
   };
 
-  const closeFilterDropdown = (e: MouseEvent) => {
-    if (filterRef.current && !filterRef.current.contains(e.target as Node)) setFilterOpen(false);
-  };
-
   // ── One chat row (shared by every view) ──
-  const renderRow = (row: RowChat, showWs: boolean) => {
+  // Hierarchy: spawned chats (orchestrator → workspace agents, workspace →
+  // sub-delegations) render indented with a connector + Bot icon + "from X"
+  // badge so they never read as plain top-level chats.
+  const renderRow = (row: RowChat, showWs: boolean, opts?: { depth?: number; hideParentBadge?: boolean }) => {
     const isEditing = editing?.sid === row.sid;
     const isConfirming = confirmDeleteSid === row.sid;
+    const isDeleting = deletingSid === row.sid;
     const isActive = row.sid === activeTabId;
     const isRunning = row.sid === runningTabId;
     const pinned = isPinned(row.sid);
-    const Icon = row.ws.isGeneral ? MessageSquare : Code2;
+    const spawned = isSpawnedChat(row);
+    const displayTitle = cleanChatTitle(row.title);
+    const depth = Math.min(opts?.depth ?? row.depth ?? 0, 4);
+    const Icon = spawned ? Bot : row.ws.isGeneral ? MessageSquare : Code2;
+    const parentLabel = row.parentTitle
+      ? `Spawned from “${row.parentTitle}”${row.parentWsName ? ` (${row.parentWsName})` : ''}`
+      : spawned
+        ? 'Auto-spawned by a higher agent'
+        : showWs ? `${row.title || 'Untitled'} — ${row.ws.name}` : row.title || 'Untitled';
     return (
       <div
         key={row.sid}
-        onClick={() => { if (!isEditing) { onOpenSession(row.ws.id, row.id); onClose(); } }}
-        className={`house-sidebar-row group relative flex items-center gap-2.5 rounded-lg mb-1 pl-3 pr-2 py-2 cursor-pointer ${
+        onClick={() => { if (!isEditing && !isDeleting) { onOpenSession(row.ws.id, row.id); onClose(); } }}
+        className={`house-sidebar-row group relative flex items-center gap-2 rounded-lg mb-1 pr-2 py-2 cursor-pointer ${
           isActive ? 'is-active' : ''
-        }`}
-        title={showWs ? `${row.title || 'Untitled'} — ${row.ws.name}` : row.title || 'Untitled'}
+        } ${isDeleting ? 'is-deleting' : ''} ${spawned ? 'is-spawned' : ''}`}
+        style={{ paddingLeft: 12 + depth * 14 }}
+        title={parentLabel}
       >
+        {depth > 0 && (
+          <span className="pointer-events-none absolute left-0 top-0 bottom-0" style={{ left: 12 + (depth - 1) * 14 }} aria-hidden="true">
+            <span className="block h-full w-px bg-white/[0.08]" />
+          </span>
+        )}
         {isEditing ? (
           <input
             autoFocus
@@ -197,16 +314,30 @@ export default function HouseSidebar({
           />
         ) : (
           <>
+            {depth > 0 && <CornerDownRight size={11} className="flex-shrink-0 text-zinc-600" />}
             {isRunning ? (
               <span className="session-run-dot shrink-0" title="Running" />
             ) : (
-              <Icon size={12} className={`flex-shrink-0 ${row.ws.isGeneral ? 'text-zinc-600' : 'text-zinc-500'}`} />
+              <Icon size={12} className={`flex-shrink-0 ${spawned ? 'text-violet-300/80' : row.ws.isGeneral ? 'text-zinc-600' : 'text-zinc-500'}`} />
             )}
-            <span className={`flex-1 min-w-0 truncate text-[12.5px] ${isActive ? 'text-white' : 'text-zinc-400'}`}>
-              {row.title || 'Untitled'}
+            <span className="flex-1 min-w-0">
+              <span className={`block truncate text-[12.5px] ${isActive ? 'text-white' : 'text-zinc-400'}`}>
+                {displayTitle}
+              </span>
+              {spawned && !opts?.hideParentBadge && (
+                <span className="mt-0.5 flex items-center gap-1 min-w-0">
+                  <span className="inline-flex items-center rounded-full border border-violet-400/20 bg-violet-400/[0.08] px-1.5 py-px text-[9px] font-medium text-violet-200/80">
+                    auto
+                  </span>
+                  <span className="truncate text-[10px] text-zinc-600">
+                    {row.parentTitle ? `from ${row.parentTitle}` : 'spawned by agent'}
+                    {showWs && row.ws?.name ? ` · ${row.ws.name}` : ''}
+                  </span>
+                </span>
+              )}
             </span>
             {pinned && <Pin size={10} className="text-zinc-500 shrink-0 rotate-45" />}
-            {showWs && <span className="text-[9.5px] text-zinc-600 shrink-0 truncate max-w-[64px]">{row.ws.name}</span>}
+            {showWs && !spawned && <span className="text-[9.5px] text-zinc-600 shrink-0 truncate max-w-[64px]">{row.ws.name}</span>}
             <span className="text-[10px] text-zinc-600 flex-shrink-0 tabular-nums">{relativeTime(row.updatedAt)}</span>
             <div className="absolute right-1 hidden group-hover:flex items-center gap-0.5 bg-[#18181d] rounded-md border border-white/[0.06] px-0.5 py-0.5">
               <button
@@ -241,17 +372,92 @@ export default function HouseSidebar({
     );
   };
 
+  /** Nested subagent leaves (workspace agent → specialists) under a chat. */
+  /** One spawned child chat row. Subagent sessions live in the canvas/chat,
+   *  not the sidebar — only the durable child chat is listed here. */
+  const renderKidLeaves = (kid: RowChat, depth: number) => (
+    <div
+      key={kid.sid}
+      onClick={() => { onOpenSession(kid.ws.id, kid.id); onClose(); }}
+      className="group/sub relative flex items-center gap-1.5 rounded-lg pr-2 py-1.5 cursor-pointer hover:bg-white/[0.04]"
+      style={{ paddingLeft: 12 + (depth + 1) * 14 }}
+      title={`${kid.title || 'Untitled'} — opens child chat`}
+    >
+      <CornerDownRight size={10} className="flex-shrink-0 text-zinc-700" />
+      <Bot size={11} className="flex-shrink-0 text-zinc-600" />
+      <span className="flex-1 min-w-0 truncate text-[11.5px] text-zinc-500">
+        {cleanChatTitle(kid.title)}
+      </span>
+    </div>
+  );
+
   const renderBody = () => {
-    // Room variant: one flat list of every chat (title or workspace match).
+    // Room variant: nested-collapsed — spawned chats live inside their parent
+    // instead of flat siblings. Search stays flat so children are findable.
     if (variant === 'room') {
+      const annotate = (rows: RowChat[]) => rows.map(withParentInfo);
       if (searching) {
-        const hits = allRows.filter((r) =>
-          (r.title || 'untitled').toLowerCase().includes(q) || r.ws.name.toLowerCase().includes(q));
+        const hits = annotate(allRows).filter((r) =>
+          (r.title || 'untitled').toLowerCase().includes(q) || r.ws.name.toLowerCase().includes(q)
+          || (r.parentTitle || '').toLowerCase().includes(q));
         if (hits.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats match “{filter.trim()}”.</div>;
-        return hits.map((row) => renderRow(row, !row.ws.isGeneral));
+        return hits.map((row) => renderRow(row, !row.ws.isGeneral, { depth: isSpawnedChat(row) ? 1 : 0 }));
       }
       if (allRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
-      return allRows.map((row) => renderRow(row, !row.ws.isGeneral));
+      const annotated = annotate(allRows);
+      const byId = new Map(annotated.map((r) => [r.id, r]));
+      const tops: RowChat[] = [];
+      const kidsByParent = new Map<string, RowChat[]>();
+      for (const row of annotated) {
+        const p = (row as ChatSummary).parentChatId;
+        if (p && byId.has(p)) {
+          const arr = kidsByParent.get(p) || [];
+          arr.push({ ...row, depth: 1 });
+          kidsByParent.set(p, arr);
+        } else {
+          tops.push(row);
+        }
+      }
+      for (const arr of kidsByParent.values()) {
+        arr.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      }
+      const visibleTops = tops.slice(0, roomLimit);
+      const remainingRows = tops.length - visibleTops.length;
+      return (
+        <>
+          {visibleTops.map((parent) => {
+            const kids = kidsByParent.get(parent.id) ?? [];
+            const collapsed = kids.length > 0 && collapsedSpawns.has(parent.sid);
+            return (
+              <div key={parent.sid} className="mb-0.5">
+                <div className="flex items-center gap-0.5">
+                  {kids.length > 0 ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleSpawnCollapsed(parent.sid); }}
+                      title={collapsed ? `Expand ${kids.length} spawned` : 'Collapse spawned'}
+                      aria-label={collapsed ? 'Expand spawned chats' : 'Collapse spawned chats'}
+                      className="grid place-items-center w-5 h-5 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+                    >
+                      {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                    </button>
+                  ) : (
+                    <span className="w-5 shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">{renderRow(parent, !parent.ws.isGeneral)}</div>
+                </div>
+                {!collapsed && kids.map((kid) => (
+                  <div key={kid.sid} className="flex-1 min-w-0">
+                    {renderKidLeaves(kid, 0)}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          {remainingRows > 0 && (
+            <LoadMoreButton remaining={remainingRows} onClick={() => setRoomLimit((n) => n + ROOM_PAGE)} />
+          )}
+        </>
+      );
     }
 
     if (chatsFilter === 'house' || chatsFilter === 'personal') {
@@ -272,20 +478,114 @@ export default function HouseSidebar({
 
     if (searching) {
       if (searchRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats match “{filter.trim()}”.</div>;
-      return searchRows.map((row) => renderRow(row, chatsFilter === 'coding'));
+      return searchRows.map((r) => {
+        const row = withParentInfo(r);
+        return renderRow(row, chatsFilter === 'coding', { depth: isSpawnedChat(row) ? 1 : 0 });
+      });
     }
 
     if (chatsFilter === 'general') {
-      if (generalRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
-      return generalRows.map((row) => renderRow(row, false));
+      if (!general) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
+      // Same-workspace chains nest here too (e.g. 1+3 spawned from New
+      // Conversation): spawned chats are leaves inside their parent, never
+      // purple top-level siblings.
+      const generalRaw = (chatsByWs[general.id] ?? []).map((c) => ({ ...c }));
+      const { tops: generalTops, childrenByParent: generalKids } = groupWorkspaceChats(general, generalRaw, globalLookup);
+      const generalTopRows: RowChat[] = pinnedSort(generalTops.map((t) => {
+        const base = generalRows.find((r) => r.id === t.id);
+        const row: RowChat = { ...(base ?? withWs(general, t)), depth: 0 };
+        return withParentInfo(row);
+      }));
+      if (generalTopRows.length === 0) return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No chats yet.</div>;
+      const visibleRows = generalTopRows.slice(0, generalLimit);
+      const remainingRows = generalTopRows.length - visibleRows.length;
+      return (
+        <>
+          {visibleRows.map((parent) => {
+            // Same-workspace children first (leaves, not purple rows).
+            const sameWsKids: RowChat[] = (generalKids.get(parent.id) ?? []).map((k) => {
+              const base = generalRows.find((r) => r.id === k.id);
+              const row: RowChat = { ...(base ?? withWs(general, k)), depth: 0, parentTitle: k.parentTitle, parentWsName: k.parentWsName };
+              return withParentInfo(row);
+            });
+            // Orchestrator → workspace agents: cross-workspace children nest
+            // here under their true parent chat (same-ws ones handled above).
+            const kids = collectSpawnedChildrenOf(parent.id, workspaces, chatsByWs, globalLookup)
+              .filter((k) => k.workspaceId !== general.id)
+              .map((k) => {
+                const ws = workspaces.find((w) => w.id === k.workspaceId);
+                if (!ws) return null;
+                const row: RowChat = { ...k, sid: tabId(ws.id, k.id), ws, nestParentSid: parent.sid };
+                return row;
+              })
+              .filter((r): r is RowChat => r !== null);
+            const allKids = [...sameWsKids, ...kids];
+            const collapsed = collapsedSpawns.has(parent.sid);
+            const totalNested = allKids.length;
+            return (
+              <div key={parent.sid} className="mb-0.5">
+                <div className="flex items-center gap-0.5">
+                  {totalNested > 0 ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleSpawnCollapsed(parent.sid); }}
+                      title={collapsed ? `Expand ${totalNested} spawned` : 'Collapse spawned'}
+                      aria-label={collapsed ? 'Expand spawned chats' : 'Collapse spawned chats'}
+                      className="grid place-items-center w-5 h-5 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+                    >
+                      {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                    </button>
+                  ) : (
+                    <span className="w-5 shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">{renderRow(parent, false)}</div>
+                </div>
+                {!collapsed && totalNested > 0 && (
+                  <div className="flex flex-col gap-0.5" role="group" aria-label={`Spawned from ${parent.title}`}>
+                    {sameWsKids.map((kid) => (
+                      <div key={kid.sid}>
+                        {renderKidLeaves(kid, 0)}
+                      </div>
+                    ))}
+                    {kids.map((kid) => {
+                      const kidWsId = (kid as unknown as { workspaceId?: string }).workspaceId ?? kid.ws.id;
+                      const wsOfKid = workspaces.find((w) => w.id === kidWsId) ?? kid.ws;
+                      const showWsKid: RowChat = { ...kid, ws: wsOfKid };
+                      return (
+                        <div key={showWsKid.sid}>
+                          {renderKidLeaves(showWsKid, showWsKid.depth ?? 1)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {remainingRows > 0 && (
+            <LoadMoreButton remaining={remainingRows} onClick={() => setGeneralLimit((n) => n + GENERAL_PAGE)} />
+          )}
+        </>
+      );
     }
 
-    // Coding: collapsible per-project groups
+    // Coding: collapsible per-project groups with spawn hierarchy.
+    // Same-workspace delegations nest under their parent; cross-workspace
+    // children (orchestrator → this project) show a "from X" badge.
     if (codingGroups.length === 0) {
       return <div className="px-3 py-3 text-[11.5px] text-zinc-600">No projects yet — use + to add one.</div>;
     }
     return codingGroups.map(({ ws, rows }) => {
       const collapsed = collapsedWs.has(ws.id);
+      const rawChats = (chatsByWs[ws.id] ?? []).map((c) => ({ ...c }));
+      const { tops, childrenByParent } = groupWorkspaceChats(ws, rawChats, globalLookup);
+      const topRows: RowChat[] = pinnedSort(tops.map((t) => {
+        const base = rows.find((r) => r.id === t.id);
+        const row: RowChat = { ...(base ?? withWs(ws, t)), depth: 0 };
+        return withParentInfo(row);
+      }));
+      const limit = projectLimits[ws.id] ?? PROJECT_PAGE;
+      const visibleTops = topRows.slice(0, limit);
+      const remainingRows = topRows.length - visibleTops.length;
       return (
         <div key={ws.id} className="mb-2.5">
           <div className="w-full flex items-center gap-1.5 px-1 pb-1 select-none">
@@ -305,10 +605,55 @@ export default function HouseSidebar({
           </div>
           {!collapsed && (
             <div>
-              {rows.length === 0 ? (
+              {topRows.length === 0 ? (
                 <div className="px-3 py-1.5 text-[11px] text-zinc-700">No chats yet</div>
               ) : (
-                rows.map((row) => renderRow(row, false))
+                <>
+                  {visibleTops.map((top) => {
+                    const kids = (childrenByParent.get(top.id) ?? []).map((k) => {
+                      const base = rows.find((r) => r.id === k.id);
+                      const row: RowChat = { ...(base ?? withWs(ws, k)), depth: k.depth, parentTitle: k.parentTitle, parentWsName: k.parentWsName };
+                      return withParentInfo(row);
+                    });
+                    const spawnCollapsed = collapsedSpawns.has(top.sid);
+                    const nestedTotal = kids.length;
+                    return (
+                      <div key={top.sid} className="mb-0.5">
+                        <div className="flex items-center gap-0.5">
+                          {nestedTotal > 0 ? (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); toggleSpawnCollapsed(top.sid); }}
+                              title={spawnCollapsed ? `Expand ${nestedTotal} nested` : 'Collapse nested'}
+                              aria-label={spawnCollapsed ? 'Expand nested chats' : 'Collapse nested chats'}
+                              className="grid place-items-center w-5 h-5 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+                            >
+                              {spawnCollapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                            </button>
+                          ) : (
+                            <span className="w-5 shrink-0" />
+                          )}
+                          <div className="flex-1 min-w-0">{renderRow(top, false, { depth: 0 })}</div>
+                        </div>
+                        {!spawnCollapsed && nestedTotal > 0 && (
+                          <div className="flex flex-col gap-0.5" role="group" aria-label={`Nested under ${top.title}`}>
+                            {kids.map((kid) => (
+                              <div key={kid.sid} className="flex items-center gap-0.5">
+                                <span className="w-5 shrink-0" />
+                                <div className="flex-1 min-w-0">{renderKidLeaves(kid, Math.max(0, (kid.depth ?? 1) - 1))}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {remainingRows > 0 && (
+                    <LoadMoreButton
+                      remaining={remainingRows}
+                      onClick={() => setProjectLimits((prev) => ({ ...prev, [ws.id]: (prev[ws.id] ?? PROJECT_PAGE) + PROJECT_PAGE }))}
+                    />
+                  )}
+                </>
               )}
             </div>
           )}
@@ -332,57 +677,19 @@ export default function HouseSidebar({
           open ? 'translate-x-0' : '-translate-x-full'
         }`}
         aria-label="Chat management"
-        onMouseDown={(e) => { if (filterOpen) closeFilterDropdown(e.nativeEvent); }}
       >
         {/* ── Header: source dropdown + adaptive + (full variant only) ── */}
         {variant === 'full' && (
           <div className="px-3.5 pt-4 pb-2 flex items-center gap-1.5">
-          <div ref={filterRef} className="relative flex-1 min-w-0">
+            <span className="flex-1 text-[10px] uppercase tracking-widest font-semibold text-zinc-500">Chats</span>
             <button
-              onClick={() => setFilterOpen((v) => !v)}
-              title="Switch chat source"
-              aria-label="Switch chat source"
-              className="flex items-center gap-1 text-left cursor-pointer group"
+              onClick={() => onNewChat?.()}
+              title="New chat"
+              aria-label="New chat"
+              className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
             >
-              <span className="text-[10px] uppercase tracking-widest font-semibold text-zinc-500 group-hover:text-zinc-300 transition-colors">
-                {activeFilter.label}
-              </span>
-              {filterOpen ? <ChevronUp size={11} className="text-zinc-500" /> : <ChevronDown size={11} className="text-zinc-500" />}
+              <Plus size={13} />
             </button>
-            {filterOpen && (
-              <div className="absolute left-0 top-[calc(100%+6px)] z-50 w-[190px] rounded-xl border house-hairline bg-[#141419]/95 backdrop-blur-xl shadow-2xl overflow-hidden session-flow-enter">
-                {FILTERS.map(({ key, label, icon: Icon }) => (
-                  <button
-                    key={key}
-                    onClick={() => { onFilterChange?.(key); setFilterOpen(false); }}
-                    className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition-colors cursor-pointer ${
-                      key === chatsFilter ? 'bg-white/[0.08] text-white' : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-200'
-                    }`}
-                  >
-                    <Icon size={12} className="shrink-0" />
-                    <span className="flex-1 text-[12px]">{label}</span>
-                    {key === chatsFilter && <Check size={11} className="shrink-0" />}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          <button
-            onClick={() => {
-              if (chatsFilter === 'general') onNewChat?.();
-              else if (chatsFilter === 'coding') onNewProject?.();
-              else onOpenRoom?.(chatsFilter);
-            }}
-            title={
-              chatsFilter === 'general' ? 'New chat'
-                : chatsFilter === 'coding' ? 'New project'
-                  : `Open ${chatsFilter === 'house' ? 'House' : 'Personal'} Workspace`
-            }
-            aria-label="New"
-            className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
-          >
-            <Plus size={13} />
-          </button>
           </div>
         )}
 
@@ -392,7 +699,7 @@ export default function HouseSidebar({
           <input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder={variant === 'room' ? 'Search all chats…' : `Search ${activeFilter.label.toLowerCase()} chats…`}
+            placeholder={variant === 'room' ? 'Search all chats…' : 'Search chats…'}
             className="flex-1 min-w-0 bg-transparent text-[11.5px] text-zinc-300 placeholder:text-zinc-600 focus:outline-none"
           />
           {searching && (
@@ -405,95 +712,35 @@ export default function HouseSidebar({
           {renderBody()}
         </div>
 
-        {/* ── Workspaces ── */}
-        <div className="border-t house-hairline px-4 pt-3.5 pb-2 mt-2 text-[10px] uppercase tracking-widest font-semibold text-zinc-600">
-          Workspaces
+        {/* ── Workspaces trigger (bottom) ── */}
+        <div className="border-t house-hairline mt-2 px-3 py-3 shrink-0">
+          <button
+            ref={workspaceTriggerRef}
+            onClick={() => setWorkspaceModalOpen((v) => !v)}
+            aria-expanded={workspaceModalOpen}
+            aria-haspopup="dialog"
+            className={`w-full flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 border transition-colors cursor-pointer ${
+              workspaceModalOpen
+                ? 'bg-white/[0.06] border-white/[0.08] text-white'
+                : 'bg-white/[0.02] border-white/[0.05] text-zinc-400 hover:bg-white/[0.05] hover:border-white/[0.08] hover:text-zinc-200'
+            }`}
+          >
+            <span className="grid place-items-center w-7 h-7 rounded-lg bg-white/[0.04] border border-white/[0.06] shrink-0">
+              <LayoutGrid size={13} />
+            </span>
+            <span className="flex-1 text-left text-[11px] font-semibold tracking-widest uppercase">Workspaces</span>
+            <ChevronRight size={12} className={`text-zinc-500 transition-transform ${workspaceModalOpen ? 'rotate-90' : ''}`} />
+          </button>
         </div>
-        <div className="px-3 pb-3.5 flex flex-col gap-1.5">
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchPersonal}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchPersonal(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <User size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">Personal Workspace</div>
-              <div className="text-[10px] text-zinc-500">Personal tools & life admin</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchCoding}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchCoding(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <Code2 size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">Coding Workspace</div>
-              <div className="text-[10px] text-zinc-500">Multi-agent software development</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchHouse}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchHouse(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <Home size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">House Workspace</div>
-              <div className="text-[10px] text-zinc-500">Smart home control & monitoring</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={onLaunchAdmin}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchAdmin(); } }}
-            className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-          >
-            <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-              <ShieldCheck size={15} />
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-[12.5px] font-medium text-zinc-200">Agents Admin</div>
-              <div className="text-[10px] text-zinc-500">Proxy fleet — super-operator only</div>
-            </div>
-            <ChevronRight size={13} className="text-zinc-600" />
-          </div>
-          {onLaunchDesign && (
-            <div
-              role="button"
-              tabIndex={0}
-              onClick={onLaunchDesign}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onLaunchDesign(); } }}
-              className="house-sidebar-row flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 cursor-pointer"
-              title="OpenDesign — agent-led UI design iteration for a workspace (straight to the UI subagent loop)"
-            >
-              <span className="house-room-icon grid place-items-center w-8 h-8 rounded-lg text-zinc-200">
-                <Palette size={15} />
-              </span>
-              <div className="flex-1 min-w-0">
-                <div className="text-[12.5px] font-medium text-zinc-200">OpenDesign Module</div>
-                <div className="text-[10px] text-zinc-500">Agent-led UI design iteration</div>
-              </div>
-              <ChevronRight size={13} className="text-zinc-600" />
-            </div>
-          )}
-        </div>
+        <WorkspaceSwitcher
+          open={workspaceModalOpen && open}
+          onClose={() => setWorkspaceModalOpen(false)}
+          anchorRef={workspaceTriggerRef}
+          onLaunchPersonal={onLaunchPersonal}
+          onLaunchCoding={onLaunchCoding}
+          onLaunchHouse={onLaunchHouse}
+          onLaunchAdmin={onLaunchAdmin}
+        />
       </aside>
     </>
   );

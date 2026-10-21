@@ -1,16 +1,25 @@
 """Zero-dependency test runner for tests/test_*.py.
 
+**pytest is the canonical runner** (``python -m pytest tests/ -q``). This one
+exists for a zero-dependency path and for driving a single module by name, and
+it deliberately SKIPS any test that needs a fixture rather than failing it —
+it cannot supply arguments, so reporting ``TypeError: missing 1 required
+positional argument`` as a FAIL was a lie about the code. Run pytest to
+actually exercise those.
+
 Usage:
-    python tests/run_all.py              # everything
+    python tests/run_all.py              # everything runnable without fixtures
     python tests/run_all.py test_branch_levels test_ci_gate_push   # subset
 
 Each test file exposes plain `test_*()` functions. A test:
     - returns normally            -> PASS
     - raises Skip                 -> SKIP
+    - takes any required argument -> SKIP (needs pytest fixtures)
     - raises anything else        -> FAIL
 Exit code: 0 iff no FAIL.
 """
 import importlib.util
+import inspect
 import os
 import sys
 import time
@@ -18,6 +27,29 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+# The repo root must be importable too: a test module that does `import agents`
+# or `from tools import ...` fails without it. Previously this only worked by
+# accident — whichever module imported `_util` first added it as a side effect,
+# so the alphabetically earlier modules failed and the later ones passed.
+REPO_ROOT = os.path.dirname(HERE)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+
+def _fixture_params(fn) -> list[str]:
+    """Names of parameters this runner cannot supply."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return []
+    missing = []
+    for param in signature.parameters.values():
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        if param.default is inspect.Parameter.empty:
+            missing.append(param.name)
+    return missing
 
 
 def discover():
@@ -46,6 +78,14 @@ def run_module(modname):
             continue
         fn = getattr(mod, name)
         if not callable(fn):
+            continue
+        needs = _fixture_params(fn)
+        if needs:
+            # Cannot be driven from here. Skipping is honest; reporting the
+            # TypeError as a FAIL claimed the test was broken when it was the
+            # runner that was.
+            results.append((f"{modname}.{name}", "SKIP",
+                            f"needs fixtures ({', '.join(needs)}) — run pytest", 0))
             continue
         t0 = time.time()
         try:

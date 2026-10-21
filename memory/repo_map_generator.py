@@ -3,12 +3,13 @@ Repository Map Generator — Compiles codebases into a token-efficient signature
 Uses tree-sitter AST parsing for Python, PHP, TypeScript, and JavaScript.
 Falls back to robust regex signature extraction for Dart and parse failures.
 """
+import hashlib
 import itertools
 import os
 import re
 import subprocess
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Tuple
 
 # Reconfigure console output encoding to UTF-8
 try:
@@ -129,6 +130,12 @@ def _extract_ast_signatures(content: str, lang: str, with_lines: bool = False) -
                 "class_declaration", "method_definition", "function_declaration",
                 "interface_declaration", "type_alias_declaration", "property_signature",
             )
+            # `export const fn = (...) => {}` / `const fn = function() {}` are
+            # lexical declarations, not function_declarations — without this
+            # the dominant arrow-function idiom is invisible to the map.
+            if not is_target and node_type == "lexical_declaration" and depth == 0:
+                span = content_bytes[node.start_byte:node.end_byte][:400]
+                is_target = b"=>" in span or b"function" in span
         elif lang == "php":
             is_target = node_type in ("class_declaration", "method_declaration")
             
@@ -428,6 +435,31 @@ def _format_compact(entries: List[Tuple[str, int, bool]]) -> str:
     return " ".join(out)
 
 
+def _symbol_display_name(sig: str, kind: str) -> str:
+    """One compact display token per symbol: `name()` for functions, `Name`
+    for classes/interfaces/type aliases, bare name for properties."""
+    try:
+        if kind in ("class", "interface"):
+            name = _compact_class(sig, kind).rstrip("{")
+        elif kind == "type_alias":
+            name = _compact_class(sig, "type_alias")
+        elif kind == "function":
+            name = _compact_fn(sig).split("(", 1)[0].strip() + "()"
+        else:
+            name = _compact_property(sig)
+    except Exception:
+        return ""
+    name = name.strip()
+    if not name or name == "?" or " " in name.split("(", 1)[0].strip():
+        return ""
+    return name[:40]
+
+
+def _base_symbol_name(display: str) -> str:
+    """Reference-scan form of a display token: `foo()` -> `foo`."""
+    return display[:-2] if display.endswith("()") else display
+
+
 # Generic low-architecture-value helpers (imported everywhere, say little
 # about where to edit) get their ranking score multiplied by
 # MAP_UTILITY_PENALTY. Matched on stem segments (token boundaries) so real
@@ -499,10 +531,13 @@ class RepoMapGenerator:
     }
     SUPPORTED_EXTS = {".py", ".php", ".ts", ".tsx", ".js", ".jsx", ".dart"}
     MAP_MARKER = "projectMap:"
+    # v2 header carries the format version so pre-v2 caches invalidate cleanly
+    # (they lack per-file symbols and the richer delta grammar).
+    MAP_HEADER = "projectMap: v2"
 
     def __init__(self, project_path: str) -> None:
         self.project_path = os.path.normpath(os.path.abspath(project_path))
-        self.max_chars = max(2000, int(os.environ.get("MAP_MAX_CHARS", "6000")))
+        self.max_chars = max(2000, int(os.environ.get("MAP_MAX_CHARS", "10000")))
 
     def _files(self) -> list[str]:
         files: list[str] = []
@@ -515,13 +550,18 @@ class RepoMapGenerator:
                 files.append(path.replace("\\", "/"))
         return sorted(files)[:int(os.environ.get("MAP_MAX_FILES", "600"))]
 
-    def _imports(self, rel_path: str) -> list[str]:
+    def _read_source(self, rel_path: str) -> str:
         try:
             with open(os.path.join(self.project_path, rel_path), "r", encoding="utf-8", errors="replace") as f:
-                source = f.read()
+                return f.read()
         except Exception:
-            return []
+            return ""
 
+    @staticmethod
+    def _body_hash_of(content: str) -> str:
+        return hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _imports_from_source(self, source: str) -> list[str]:
         targets: list[str] = []
         # Python module imports.
         targets.extend(re.findall(r"(?m)^\s*from\s+([A-Za-z_][\w.]*)\s+import\s", source))
@@ -532,6 +572,9 @@ class RepoMapGenerator:
             source,
         ))
         return list(dict.fromkeys(targets))
+
+    def _imports(self, rel_path: str) -> list[str]:
+        return self._imports_from_source(self._read_source(rel_path))
 
     @staticmethod
     def _candidate_paths(source: str, target: str) -> list[str]:
@@ -562,6 +605,119 @@ class RepoMapGenerator:
                         break
         return graph
 
+    def _top_level_symbols_from_content(self, content: str, ext: str) -> list[str]:
+        """Top-level symbol display tokens for one file body.
+
+        Uses the same tree-sitter/regex signature extraction as the project
+        map, but keeps only depth 0 (module-level functions and classes) so
+        the delta reference scan stays on names that wiring flags care about.
+        """
+        lang_map = {
+            ".py": "python", ".php": "php", ".ts": "typescript",
+            ".tsx": "tsx", ".js": "javascript", ".jsx": "javascript",
+        }
+        entries: list = []
+        if ext in lang_map and HAS_TREE_SITTER:
+            try:
+                entries = _extract_ast_signatures(content, lang_map[ext])
+            except Exception:
+                entries = _extract_regex_signatures(content, ext)
+        else:
+            entries = _extract_regex_signatures(content, ext)
+        out: list[str] = []
+        for sig, depth, _doc in entries:
+            if depth != 0:
+                continue
+            name = _symbol_display_name(sig, _classify_sig(sig))
+            if name and name not in out:
+                out.append(name)
+            if len(out) >= 40:
+                break
+        return out
+
+    def _module_doc(self, content: str, ext: str) -> str:
+        """One-line module description from its docstring / leading comment."""
+        for line in content.splitlines()[:12]:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith(('"""', "'''")):
+                doc = s.strip('"\' ').strip()
+                return doc[:100]
+            if s.startswith("#!"):
+                continue
+            if s.startswith("//") or s.startswith("#"):
+                doc = s.lstrip("/#").strip()
+                if doc.startswith("-*-"):
+                    continue
+                return doc[:100]
+            if s.startswith("/*"):
+                doc = s.lstrip("/*").strip().lstrip("*").strip()
+                return doc[:100]
+            break
+        return ""
+
+    def _file_facts(self, rel_path: str, summaries: dict | None = None) -> tuple[str, list[str]]:
+        """(summary_or_doc, top-level symbols) for one file.
+
+        A summary from the LLM sidecar is used only when its stored body hash
+        still matches the file exactly — otherwise the deterministic docstring
+        fallback wins, so a stale summary can never be injected as fact.
+        """
+        content = self._read_source(rel_path)
+        summary = ""
+        entry = (summaries or {}).get(rel_path)
+        if isinstance(entry, dict) and content:
+            if entry.get("hash") == self._body_hash_of(content):
+                summary = str(entry.get("summary") or "").strip()[:140]
+        doc = "" if summary else self._module_doc(content, os.path.splitext(rel_path)[1].lower())
+        symbols = self._top_level_symbols_from_content(
+            content, os.path.splitext(rel_path)[1].lower()
+        )
+        return (summary or doc), symbols
+
+    def snapshot(self, previous: dict | None = None) -> dict:
+        """Current topology + top-level symbols + body hashes.
+
+        Bodies are read once per file; symbol extraction re-runs only for
+        files whose body hash changed since ``previous`` (tree-sitter parsing
+        is the expensive part). Callers that only need the import graph keep
+        using topology_snapshot()/generate_map().
+        """
+        files = self._files()
+        known = set(files)
+        prev_symbols = previous.get("symbols") if isinstance(previous, dict) else {}
+        prev_hashes = previous.get("hashes") if isinstance(previous, dict) else {}
+        prev_symbols = prev_symbols if isinstance(prev_symbols, dict) else {}
+        prev_hashes = prev_hashes if isinstance(prev_hashes, dict) else {}
+
+        topology: dict[str, list[str]] = {}
+        symbols: dict[str, list[str]] = {}
+        hashes: dict[str, str] = {}
+
+        for source in files:
+            content = self._read_source(source)
+            body_hash = self._body_hash_of(content)
+            hashes[source] = body_hash
+            targets: set[str] = set()
+            for target in self._imports_from_source(content):
+                for candidate in self._candidate_paths(source, target):
+                    if candidate in known and candidate != source:
+                        targets.add(candidate)
+                        break
+            topology[source] = sorted(targets)
+            cached = prev_symbols.get(source)
+            if (
+                prev_hashes.get(source) == body_hash
+                and isinstance(cached, list)
+            ):
+                symbols[source] = list(cached)
+            else:
+                symbols[source] = self._top_level_symbols_from_content(
+                    content, os.path.splitext(source)[1].lower()
+                )
+        return {"topology": topology, "symbols": symbols, "hashes": hashes}
+
     def topology_snapshot(self) -> dict[str, list[str]]:
         """Return the current file-relation graph for change detection.
 
@@ -573,20 +729,171 @@ class RepoMapGenerator:
         graph = self._graph(files)
         return {path: sorted(graph.get(path, set())) for path in files}
 
-    def generate_delta(self, changes: dict[str, list[str]]) -> str:
-        """Describe changed topology as compact current adjacency lines."""
-        files = self._files()
-        graph = self._graph(files)
-        current = set(files)
+    def _is_entry_like(self, path: str) -> bool:
+        stem = os.path.splitext(os.path.basename(path))[0].lower()
+        return stem in self.ENTRY_STEMS
+
+    def _reference_hits(
+        self, names: list[str], files: list[str], per_name: int = 2
+    ) -> dict[str, list[tuple[str, int]]]:
+        """Name-level reference scan for changed symbols.
+
+        Grep-grade, not a call graph: word-boundary matches across supported
+        files. Good enough to flag a brand-new symbol nothing calls yet and a
+        removed symbol that still has callers.
+        """
+        bases = sorted({
+            _base_symbol_name(n) for n in names
+            if n and len(_base_symbol_name(n)) >= 3
+        })
+        if not bases:
+            return {}
+        pattern = re.compile(r"\b(?:" + "|".join(re.escape(b) for b in bases) + r")\b")
+        hits: dict[str, list[tuple[str, int]]] = {b: [] for b in bases}
+        for rel in files:
+            content = self._read_source(rel)
+            if not content:
+                continue
+            for lineno, line in enumerate(content.splitlines(), 1):
+                for match in pattern.finditer(line):
+                    found = match.group(0)
+                    bucket = hits.get(found)
+                    if bucket is not None and len(bucket) < per_name:
+                        bucket.append((rel, lineno))
+        return hits
+
+    def _symbol_delta_lines(
+        self,
+        path: str,
+        added: list[str],
+        removed: list[str],
+        hits: dict[str, list[tuple[str, int]]],
+    ) -> list[str]:
+        """Indented wiring lines for one file: new/removed top-level symbols
+        with a reference verdict (unreferenced / still referenced)."""
         lines: list[str] = []
+        shown = 0
+        budget = 6
+        for name in sorted(added):
+            if shown >= budget:
+                break
+            base = _base_symbol_name(name)
+            own = [h for h in hits.get(base, []) if h[0] == path]
+            remaining = len(hits.get(base, [])) - (1 if own else 0)
+            tag = " [unreferenced]" if remaining <= 0 else ""
+            lines.append(f"  + {name}{tag}")
+            shown += 1
+        for name in sorted(removed):
+            if shown >= budget:
+                break
+            base = _base_symbol_name(name)
+            found = hits.get(base, [])
+            tag = f" [still referenced by {found[0][0]}:{found[0][1]}]" if found else ""
+            lines.append(f"  - {name}{tag}")
+            shown += 1
+        extra = (len(added) + len(removed)) - shown
+        if extra > 0:
+            lines.append(f"  +{extra} more symbol changes")
+        return lines
+
+    def generate_delta(
+        self,
+        changes: dict,
+        current: dict | None = None,
+        previous: dict | None = None,
+    ) -> str:
+        """Describe changed files as compact adjacency + blast-radius lines.
+
+        Grammar (one base line per changed file, indented extras):
+          + path -> targets            added file (new outgoing links)
+          ~ path -> targets            outgoing links changed
+          - path (still imported by x) removed file with live importers
+            <- importers                blast radius of a modified file
+            + name() [unreferenced]     new symbol nothing references yet
+            - name() [still referenced by file:line]
+        ``current`` is a snapshot() result; when omitted it is rebuilt
+        (symbols parsed only when the caller had no cached state).
+        """
+        if current is None:
+            current = self.snapshot(previous=previous)
+        topology = current.get("topology") or {}
+        files = sorted(topology)
+        current_set = set(files)
+        importers: dict[str, list[str]] = {}
+        for source in files:
+            for target in topology.get(source, []):
+                importers.setdefault(target, []).append(source)
+        for key in importers:
+            importers[key] = sorted(set(importers[key]))
+
+        # A removed file no longer resolves importers in the current
+        # topology, so the actionable "who still imports it" comes from the
+        # previous snapshot — those callers are the ones that break.
+        prev_importers: dict[str, list[str]] = {}
+        if isinstance(previous, dict) and isinstance(previous.get("topology"), dict):
+            for source, targets in previous["topology"].items():
+                if not isinstance(targets, (list, tuple, set)):
+                    continue
+                for target in targets:
+                    prev_importers.setdefault(target, []).append(source)
+        for key in prev_importers:
+            prev_importers[key] = sorted(set(prev_importers[key]))
+
+        symbol_added = changes.get("symbol_added") or {}
+        symbol_removed = changes.get("symbol_removed") or {}
+        scan_names: list[str] = []
+        for path in set(symbol_added) | set(symbol_removed):
+            scan_names.extend(symbol_added.get(path) or [])
+            scan_names.extend(symbol_removed.get(path) or [])
+        hits = self._reference_hits(scan_names, files) if scan_names else {}
+
+        lines: list[str] = []
+        seen: set[str] = set()
+
+        def _importers_suffix(path: str) -> str:
+            who = importers.get(path, []) or prev_importers.get(path, [])
+            if not who:
+                return ""
+            shown = who[:4]
+            extra = ", ..." if len(who) > 4 else ""
+            return f" (still imported by {', '.join(shown)}{extra})"
+
         for status, prefix in (("added", "+"), ("modified", "~"), ("removed", "-")):
             for path in sorted(changes.get(status, [])):
-                if status == "removed" or path not in current:
-                    lines.append(f"{prefix} {path} -> none [removed]")
+                seen.add(path)
+                if status == "removed" or path not in current_set:
+                    suffix = _importers_suffix(path) or " [removed]"
+                    lines.append(f"- {path}{suffix}")
                     continue
-                links = sorted(graph.get(path, set()))[:6]
+                links = sorted(topology.get(path, []))[:6]
                 targets = ", ".join(links) if links else "none"
-                lines.append(f"{prefix} {path} -> {targets}")
+                line = f"{prefix} {path} -> {targets}"
+                if status == "added" and not links and not importers.get(path) and not self._is_entry_like(path):
+                    line += " [orphan]"
+                lines.append(line)
+                if status == "modified":
+                    who = importers.get(path, [])
+                    if who:
+                        shown = who[:4]
+                        extra = ", ..." if len(who) > 4 else ""
+                        lines.append(f"  <- {', '.join(shown)}{extra}")
+
+        for path in sorted(set(symbol_added) | set(symbol_removed)):
+            if path not in current_set:
+                continue
+            if path not in seen:
+                lines.append(f"~ {path}")
+                who = importers.get(path, [])
+                if who:
+                    shown = who[:4]
+                    extra = ", ..." if len(who) > 4 else ""
+                    lines.append(f"  <- {', '.join(shown)}{extra}")
+            lines.extend(self._symbol_delta_lines(
+                path,
+                list(symbol_added.get(path) or []),
+                list(symbol_removed.get(path) or []),
+                hits,
+            ))
         return "\n".join(lines)
 
     def _pagerank_scores(self, files: list[str], graph: dict[str, set[str]]) -> dict[str, float]:
@@ -808,8 +1115,60 @@ class RepoMapGenerator:
                 out.append(f"{os.path.basename(primary)}{arrow}{','.join(refs)}")
         return out
 
-    def generate_map(self) -> str:
-        """Return a bounded, deterministic relationship-oriented map."""
+    def _select_key_files(
+        self,
+        files: list[str],
+        graph: dict[str, set[str]],
+        incoming: dict[str, int],
+        ranked: list[str],
+    ) -> list[str]:
+        """Top-12 Key-files with the generic-utility cap applied."""
+        # Hard guarantee on top of the score multiplier: however extreme the
+        # fan-in, generic utilities can never hold more than
+        # MAP_MAX_UTILITY_FILES of the 12 Key-files slots.
+        try:
+            max_utilities = max(0, int(os.environ.get("MAP_MAX_UTILITY_FILES", "3")))
+        except ValueError:
+            max_utilities = 3
+        eligible = [p for p in ranked if incoming.get(p) or graph.get(p) or self._is_entry_like(p)]
+        key_files: list[str] = []
+        utilities = 0
+        for path in eligible:
+            if _is_utility_file(path):
+                if utilities >= max_utilities:
+                    continue
+                utilities += 1
+            key_files.append(path)
+            if len(key_files) == 12:
+                break
+        return key_files or files[:12]
+
+    def key_files(self) -> list[str]:
+        """The Key-files ranking alone (used by compaction to decide which
+        files get LLM summaries without building the whole map text)."""
+        try:
+            files = self._files()
+        except Exception:
+            return []
+        if not files:
+            return []
+        graph = self._graph(files)
+        incoming = {path: 0 for path in files}
+        for targets in graph.values():
+            for target in targets:
+                incoming[target] += 1
+        scores = self._pagerank_scores(files, graph)
+        ranked = sorted(files, key=lambda p: (-scores.get(p, 0.0), p))
+        return self._select_key_files(files, graph, incoming, ranked)
+
+    def generate_map(self, include_summaries: bool = False) -> str:
+        """Return a bounded, deterministic relationship-oriented map.
+
+        ``include_summaries`` is used ONLY by the compaction re-anchor path:
+        it overlays hash-matched LLM one-liners from the sidecar onto Key-file
+        lines. Fresh runs and the canonical cache always call it with the
+        default False, so injected fresh bytes never depend on LLM output.
+        """
         try:
             files = self._files()
         except Exception as e:
@@ -836,30 +1195,7 @@ class RepoMapGenerator:
             area_mass[area] = area_mass.get(area, 0.0) + scores.get(path, 0.0)
         ranked = sorted(files, key=lambda p: (-scores.get(p, 0.0), p))
 
-        def _entry_like(path: str) -> bool:
-            stem = os.path.splitext(os.path.basename(path))[0].lower()
-            return stem in self.ENTRY_STEMS
-
-        # Hard guarantee on top of the score multiplier: however extreme the
-        # fan-in, generic utilities can never hold more than
-        # MAP_MAX_UTILITY_FILES of the 12 Key-files slots.
-        try:
-            max_utilities = max(0, int(os.environ.get("MAP_MAX_UTILITY_FILES", "3")))
-        except ValueError:
-            max_utilities = 3
-        eligible = [p for p in ranked if incoming[p] or graph[p] or _entry_like(p)]
-        key_files: list[str] = []
-        utilities = 0
-        for path in eligible:
-            if _is_utility_file(path):
-                if utilities >= max_utilities:
-                    continue
-                utilities += 1
-            key_files.append(path)
-            if len(key_files) == 12:
-                break
-        if not key_files:
-            key_files = files[:12]
+        key_files = self._select_key_files(files, graph, incoming, ranked)
 
         top_areas = sorted(area_mass.items(), key=lambda item: (-item[1], item[0]))[:8]
         key_set = set(key_files)
@@ -907,11 +1243,28 @@ class RepoMapGenerator:
                 )
         cross_refs = self._min_unique_refs(cross_vocab)
 
+        summaries: dict = {}
+        if include_summaries:
+            try:
+                from memory.repo_summaries import load_summaries
+                summaries = load_summaries(self.project_path) or {}
+            except Exception:
+                summaries = {}
+
         body: list[str] = ["Areas: " + "; ".join(area for area, _ in top_areas), "Key files:"]
         for path in key_files:
             role = self._role(path)
             # The default label carries no signal — omit it entirely.
-            body.append(f"- {path}" + (f" — {role}" if role != "source module" else ""))
+            desc, symbols = self._file_facts(path, summaries)
+            if not desc and role != "source module":
+                desc = role
+            syms = " ".join(symbols[:6])
+            if len(symbols) > 6:
+                syms += f" +{len(symbols) - 6}"
+            text = desc
+            if syms:
+                text = (text + " " if text else "") + "[" + syms + "]"
+            body.append(f"- {path}" + (f" — {text}" if text else ""))
         if co_items:
             body.append("Co-change hints:")
             body.extend(self._group_edges(co_items, cross_refs))
@@ -920,4 +1273,4 @@ class RepoMapGenerator:
             body.extend(self._group_edges(conn_items, cross_refs))
         else:
             body.append("No internal connections; use search_code.")
-        return self._bounded([self.MAP_MARKER, *body])
+        return self._bounded([self.MAP_HEADER, *body])

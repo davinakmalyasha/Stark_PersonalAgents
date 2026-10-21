@@ -31,10 +31,10 @@ def browser_navigate(url: str, wait_ms: int = 5000) -> str:
     # Let page settle
     time.sleep(min(wait_ms / 1000, 3))
     # Get snapshot + title
-    snapshot = _browser_cmd(["snapshot", "-i", "--max-output", "15000"], timeout_sec=20)
+    snapshot = _browser_cmd(["snapshot", "-i", "--max-output", "24000"], timeout_sec=20)
     title = _browser_cmd(["get", "title"], timeout_sec=5)
     title_str = title if "empty" not in title.lower() and "error" not in title.lower() else ""
-    return f"[BROWSER] {url}\nTitle: {title_str}\n\nAccessibility Tree:\n{snapshot[:15000]}"
+    return f"[BROWSER] {url}\nTitle: {title_str}\n\nAccessibility Tree:\n{snapshot[:24000]}"
 
 def _browser_cmd(args: list[str], timeout_sec: int = 30) -> str:
     """Run an agent-browser CLI command. Daemon starts/stops automatically."""

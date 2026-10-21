@@ -1,4 +1,4 @@
-// ── Antigravity IDE Type Definitions ──
+// ── Stark IDE Type Definitions ──
 
 export interface TokenCall {
   agent: string;
@@ -63,11 +63,17 @@ export interface ProjectRef {
 
 /** P10: live token delta frame from the backend SSE stream. */
 export interface StreamDelta {
-  kind: 'text' | 'reasoning' | 'usage' | 'end';
+  kind: 'text' | 'reasoning' | 'usage' | 'end' | 'tool_started' | 'tool_finished';
   text: string;
   agent?: string;
   model?: string;
   ts?: number;
+  /** tool_started/tool_finished only: tool name + JSON-encoded args. */
+  tool?: string;
+  args?: string;
+  /** tool_finished only. */
+  ok?: boolean;
+  ms?: number;
 }
 
 export interface PlanItem {
@@ -174,6 +180,11 @@ export interface ChatSummary {
   model: string;
   createdAt: string;
   updatedAt: string;
+  parentChatId?: string;
+  parentWorkspaceId?: string;
+  /** Short preview of the newest message (server-side, display only). */
+  lastMessage?: string;
+  lastRole?: string;
 }
 
 export interface ChatData {
@@ -184,6 +195,8 @@ export interface ChatData {
   updatedAt: string;
   messages: ChatMessage[];
   token_usage?: TokenUsage;
+  parentChatId?: string;
+  parentWorkspaceId?: string;
 }
 
 export interface ChatMessage {
@@ -229,31 +242,6 @@ export interface SubagentSession {
   entries: SubagentSessionEntry[];
 }
 
-export type TaskMode = 'immediate' | 'saved' | 'scheduled';
-export type TaskStatus = 'ready' | 'scheduled' | 'running' | 'completed' | 'failed';
-export type TaskRecurrence = 'none' | 'daily' | 'weekly' | 'monthly' | `interval-${number}`;
-
-export interface TaskSchedule {
-  nextRunAt?: string;
-  recurrence: TaskRecurrence;
-}
-
-export interface AgentTask {
-  id: string;
-  workspaceId: string;
-  chatId: string;
-  prompt: string;
-  attachments: ChatAttachment[];
-  mode: TaskMode;
-  status: TaskStatus;
-  schedule?: TaskSchedule;
-  createdAt: string;
-  updatedAt: string;
-  lastRunAt?: string;
-  completedAt?: string;
-  error?: string;
-}
-
 export interface UserProfile {
   user_info: {
     name: string;
@@ -280,6 +268,10 @@ export interface SessionTab {
   workspacePath: string;
   chatId: string;
   updatedAt: string;
+  /** Spawned by a higher agent — used to nest/group instead of flat siblings. */
+  parentChatId?: string;
+  parentWorkspaceId?: string;
+  isSpawned?: boolean;
 }
 
 /** Live pipeline status from GET /api/runs/active. */
@@ -299,4 +291,114 @@ export interface UiState {
   active_tab?: string | null;
   pinned_chats?: string[];
   chats_filter?: ChatsFilter;
+}
+
+// ── Group projects (durable multi-agent projects) ───────────────────────────
+//
+// Mirrors `server/routers/groups.py`. The server sends the projection TABLES,
+// not `GroupToolkit.board()`'s formatted string — a UI that had to parse prose
+// back into state would make the rendering the source of truth.
+
+/** One row in the board's project list. */
+export interface GroupProjectRow {
+  id: string;
+  path: string;
+  title: string;
+  status: string;
+  spent_usd?: number | null;
+  /** The workspace it was created from; null means global. */
+  origin_workspace_id?: string | null;
+  /** True when the project opted into a shell. A member with a shell can reach
+   *  anywhere, so the rest of the envelope is advisory — worth showing. */
+  shell_enabled?: boolean;
+  milestones_done: number;
+  milestones_total: number;
+  items_done: number;
+  items_total: number;
+  awaiting_approval: number;
+}
+
+export interface GroupProjectList {
+  projects: GroupProjectRow[];
+  /** True when the board is filtered to one coding workspace. */
+  scoped: boolean;
+}
+
+export interface GroupEvent {
+  seq: number;
+  ts: number;
+  kind: string;
+  actor: string;
+  milestone_id?: string | null;
+  item_id?: string | null;
+  data?: Record<string, unknown>;
+}
+
+export interface GroupItem {
+  id: string;
+  project_id: string;
+  milestone_id?: string | null;
+  title: string;
+  detail?: string;
+  status: string;
+  attempts?: number;
+  max_attempts?: number;
+  owner_member?: string | null;
+  lease_owner?: string | null;
+  cost_tokens?: number;
+  cost_usd?: number;
+  result?: string | null;
+  error?: string | null;
+  blocked_reason?: string | null;
+  invalidated_reason?: string | null;
+  acceptance?: unknown[];
+  updated_at?: number;
+}
+
+export interface GroupMilestone {
+  id: string;
+  project_id: string;
+  title: string;
+  status: string;
+  depends_on?: string[];
+}
+
+export interface GroupProject {
+  status?: string;
+  goal?: string;
+  spent_usd?: number | null;
+  budget_usd?: number | null;
+  halt_reason?: string | null;
+  deadline?: string | number | null;
+  [key: string]: unknown;
+}
+
+export interface GroupProjectDetail {
+  id: string;
+  path: string;
+  /** Members hold a shell, so the rest of the envelope is advisory. */
+  shell_enabled?: boolean;
+  project: GroupProject;
+  milestones: GroupMilestone[];
+  items: GroupItem[];
+  events: GroupEvent[];
+}
+
+/** The only ops the board may perform — see `groups.py` `UI_OPS`. */
+export type GroupOp = 'pause' | 'resume' | 'close';
+
+export interface AgentNoteTodo {
+  text: string;
+  done: boolean;
+}
+
+export interface AgentNote {
+  id: string;
+  scopeType: 'chat' | 'group';
+  scopeId: string;
+  title: string;
+  body: string;
+  todos: AgentNoteTodo[];
+  createdAt: string;
+  updatedAt: string;
 }

@@ -51,7 +51,8 @@ from .HouseTool import (
 from .MainTool import (
     _clean_terminal_output, _fmt_args, _log_tool,
     _apply_diff, apply_search_replace, apply_unified_diff, _edit_snippet,
-    edit_file, _write_file, read_file, search_code, run_command,
+    edit_file, _write_file, read_file, search_code, ast_search, run_command,
+    LocalShellBackend,
     update_plan, get_plan_for_context,
 )
 # Stage 4: propose_plan is the agent-callable plan proposal tool.
@@ -104,26 +105,38 @@ from .AddOnTool import (
     task,
     call_subagent,
     subagent_catalog,
-    _ASYNC_TASKS,
-    start_async_task,
-    check_async_task,
-    list_async_tasks,
-    async_task,
     ask_user,
     send_message,
     list_agents,
     interrupt_agent,
     report,
     create_project,
-    resume_project,
+    schedule,
+    give_note,
+    canvas_mode,
     _SUBAGENTS_REGISTRY,
     _TASK_DEPTH,
+    _MAX_TASK_DEPTH,
     _load_subagents,
     delegate,
     delegation_status,
+    job_message,
+    job_cancel,
 )
 from .AddOnTool.dfdBridge import dfd_bridge as _dfd_bridge_impl
 from agents.client_manager import create_client as _create_client_impl
+from .AddOnTool.screenTools import look_at_screen, set_screen_share
+from .AddOnTool.groupTools import (
+    create_group_project,
+    group_board,
+    group_events,
+    group_item_detail,
+    group_update,
+    plan_execution,
+)
+
+create_coding_project = create_project
+create_group = create_group_project
 
 # DFD bridge tool (facade name == import name; registry resolves via TOOL_MAP)
 dfd_bridge = _dfd_bridge_impl
@@ -212,7 +225,14 @@ from ._runtime import (
     _TOOL_MTIME_MAP,
     WORKSPACE,
     active_permissions,
+    active_tool_caps,
+    active_allowed_tools,
+    active_approval_gate,
+    active_write_ledger,
+    _perform_write,
+    ApprovalRequired,
     enforce_fs_permission,
+    FilesystemPermission,
     _increment_cache_version,
     auto_offload_result,
     _tool_cap,

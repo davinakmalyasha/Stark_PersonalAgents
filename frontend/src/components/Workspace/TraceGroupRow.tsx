@@ -7,7 +7,7 @@ interface Props {
   group: GroupedTraceStep;
   isLastActive: boolean;
   onOpenSubagent?: (name: string, task: string) => void;
-  onOpenSubagentSession?: (childId: string, label: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
   activeSubagent?: string | null;
   allTraceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -89,11 +89,14 @@ export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, onO
 
   return (
     <div className={`trace-group trace-${group.type} ${isLastActive ? 'is-active' : ''}`}>
-      {/* Header Row */}
+      {/* Header Row — whole row clickable, not just the chevron/icon */}
       <div
+        role="button"
+        tabIndex={0}
         onClick={() => setExpanded(!expanded)}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(!expanded); } }}
         style={{ marginBottom: expanded ? '8px' : '0px' }}
-        className="trace-group-header"
+        className="trace-group-header w-full cursor-pointer"
       >
         <span className="trace-group-icon">{group.type === 'thought' ? <BrainCircuit size={13}/> : group.type === 'edit' ? <FilePenLine size={13}/> : <FolderSearch size={13}/>}</span>
         <span>{getTitle()}</span>

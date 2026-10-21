@@ -1,5 +1,5 @@
 import { useRef, useEffect, useMemo, useState } from 'react';
-import { Zap, ArrowDown } from 'lucide-react';
+import { ArrowDown } from 'lucide-react';
 import type { ChatMessage } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import MessageBubble from './MessageBubble';
@@ -8,7 +8,7 @@ interface Props {
   messages: ChatMessage[];
   hasActiveChat: boolean;
   onOpenSubagent: (name: string, task: string) => void;
-  onOpenSubagentSession?: (childId: string, label: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
   activeSubagent?: string | null;
   traceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -16,12 +16,13 @@ interface Props {
   onCloseSubagent?: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
-  /** Override the empty-state copy (defaults to the coding-workspace hint). */
+  onRewind?: (message: ChatMessage) => void;
+  /** Kept for compat — empty state is now fixed to "What to do Boss?" */
   emptyTitle?: string;
   emptyHint?: string;
 }
 
-export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, emptyTitle = 'VinCode Supervisor', emptyHint }: Props) {
+export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
@@ -130,23 +131,13 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
         style={{ paddingLeft: '40px', paddingRight: '40px', paddingTop: '16px', paddingBottom: '16px' }}
       >
         {isEmpty ? (
-          <div className="flex flex-col items-center justify-center min-h-[220px] h-full text-center max-w-md mx-auto px-4 py-8">
-            <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-zinc-900 border border-zinc-800 mb-4 flex-shrink-0">
-              <Zap size={22} className="text-yellow-400" />
-            </div>
-            <h2 className="text-md font-bold text-zinc-200 mb-1">{emptyTitle}</h2>
-            <p className="text-[12.5px] text-zinc-400 leading-relaxed mb-4">
-              {emptyHint ?? 'Supervisor + Developer multi-agent pipeline.'}
-            </p>
-            <div className="flex flex-col gap-1.5 text-left text-[11px] text-zinc-500 max-w-xs">
-              <div>• Start typing below to consult the Supervisor</div>
-              <div>• Developer agent uses file tools to read/write code</div>
-            </div>
+          <div className="flex items-center justify-center min-h-[60vh] h-full">
+            <p className="text-[19px] font-medium tracking-tight text-white">What to do Boss?</p>
           </div>
         ) : (
-          <div ref={contentRef} className="max-w-[1100px] mx-auto" style={{ width: '100%' }}>
+          <div ref={contentRef} className="max-w-[1100px] mx-auto flex flex-col justify-start" style={{ width: '100%' }}>
             {orderedMessages.map((msg) => (
-              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} />
+              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} onRewind={onRewind} />
             ))}
           </div>
         )}

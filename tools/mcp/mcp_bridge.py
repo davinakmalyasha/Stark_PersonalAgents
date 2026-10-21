@@ -20,6 +20,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -29,12 +30,14 @@ import urllib.request
 from sync.state_sync import safe_update_state, safe_append_live_log
 
 _MCP_PROTOCOL_VERSION = "2025-06-18"
-_CLIENT_INFO = {"name": "vincode-harness", "version": "2.0.0"}
+_CLIENT_INFO = {"name": "stark-harness", "version": "2.0.0"}
 _CONFIG_FILE = "mcp_servers.json"
 _MAX_TOOLS_PER_SERVER = 500
 _INSTRUCTIONS_CAP = 512
 
-_HR = os.environ.get("HARNESS_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_HR = os.environ.get("HARNESS_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
@@ -105,6 +108,9 @@ class _StdioTransport:
     def connect(self, timeout: float) -> None:
         if not self._cmd:
             raise ValueError("stdio MCP server requires 'command'")
+        # Windows CreateProcess does not apply PATHEXT, so bare "npx"/"uvx"
+        # must resolve to the .cmd/.exe shim before Popen.
+        cmd = shutil.which(self._cmd) or self._cmd
         env = dict(os.environ)
         # env_clear-style whitelist, but always keep the minimal Windows vars
         # CreateProcess/Python need (an empty block raises WinError 87, and
@@ -121,7 +127,7 @@ class _StdioTransport:
         env.update(self._env)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._proc = subprocess.Popen(
-            [self._cmd] + self._args,
+            [cmd] + self._args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -540,21 +546,40 @@ class McpManager:
             return f"Error: MCP server '{server}' not connected (status: {client.status}{': ' + client.error if client.error else ''})"
         if not self._scope_matches(client, scope):
             return f"Error: MCP tool '{fqname}' is not exposed to scope '{scope or 'agent'}'"
-        if client.cfg.get("approval") == "prompt" and not _confirm(server, tool, args):
+        if client.cfg.get("approval") == "prompt" and not _gate_mcp_call(server, tool, args):
             return f"Error: MCP tool call {server}/{tool} was not approved."
+
+        # AU-05: the gate has allowed the call; the ledger decides whether this
+        # exact payload was already performed by an earlier attempt. With no
+        # ledger (every ordinary agent) `_perform_write` calls straight through.
+        from tools._runtime import WRITE_SKIPPED, ApprovalRequired, _perform_write
         try:
-            result = client.call_tool(tool, args, timeout)
+            result = _perform_write(
+                "mcp", f"{server}/{tool}", args,
+                lambda: client.call_tool(tool, args, timeout),
+            )
+        except ApprovalRequired:
+            # The ledger parked the item. Let the run end rather than turning
+            # "may or may not have been sent" into an ordinary tool error.
+            raise
         except TimeoutError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error: MCP call {server}/{tool} failed: {e}"
+
+        if result == WRITE_SKIPPED:
+            return result
+
         try:
             from tools._runtime import auto_offload_result, _tool_cap
             from tools.MainTool._shared import _log_tool
             bounded = auto_offload_result(result, "mcp", max_chars=_tool_cap("mcp"))
             _log_tool(fqname, args, bounded)
         except Exception:
-            bounded = result[:6000]
+            try:
+                bounded = result[: _tool_cap("mcp")]
+            except Exception:
+                bounded = result[:25000]
         return bounded
 
     # status / management (API endpoints) ──
@@ -632,6 +657,35 @@ def get_manager() -> McpManager:
             if _manager is None:
                 _manager = McpManager()
     return _manager
+
+
+def _gate_mcp_call(server: str, tool: str, args: dict) -> bool:
+    """Decide a prompt-gated MCP call.
+
+    With a group project's envelope in force the decision is the envelope's.
+    ``_confirm`` asks the human **through the running chat**, which cannot work
+    for an unattended member: it blocks until the timeout, then answers "not
+    approved" — so the call could never succeed and the owner was never asked.
+    That is the same dead end ``_sanitize_path`` had before the gate existed.
+
+    The gate parks the ITEM instead, which outlives the process and shows up on
+    the board. With no gate — every ordinary agent — this is the interactive
+    path, unchanged.
+    """
+    from tools._runtime import (TIER_AUTONOMOUS, TIER_NEEDS_APPROVAL,
+                                ApprovalRequired, _authorize)
+
+    # An MCP tool is external by definition, and the bridge carries no
+    # read-only hint, so the stricter key is assumed.
+    tier = _authorize("mcp", f"{server}/{tool}")
+    if tier is None:
+        return _confirm(server, tool, args)
+    if tier == TIER_AUTONOMOUS:
+        return True
+    if tier == TIER_NEEDS_APPROVAL:
+        # The gate has already parked it; this ends the member's run.
+        raise ApprovalRequired(f"MCP tool {server}/{tool} is waiting for the owner")
+    return False
 
 
 def _confirm(server: str, tool: str, args: dict) -> bool:

@@ -25,9 +25,13 @@ export async function fetchChat(workspaceId: string, chatId: string): Promise<Ch
 }
 
 export async function deleteChat(workspaceId: string, chatId: string): Promise<void> {
-  await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}`, {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}`, {
     method: 'DELETE',
   });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(body || `Failed to delete chat (HTTP ${res.status})`);
+  }
 }
 
 export async function fetchChatSubagents(workspaceId: string, chatId: string): Promise<SubagentInfo[]> {
@@ -62,6 +66,41 @@ export async function addChatMessage(
   return res.json();
 }
 
+export interface RewindResult {
+  ok: boolean;
+  prompt: string;
+  removed: { id: string; role: string }[];
+  restore: {
+    ok: boolean;
+    restored: string[];
+    removed: string[];
+    conflicts: string[];
+  };
+}
+
+export async function rewindChat(
+  workspaceId: string,
+  chatId: string,
+  messageId: string,
+  opts: { restoreFiles?: boolean; force?: boolean } = {},
+): Promise<RewindResult> {
+  const res = await fetch(
+    `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/rewind`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message_id: messageId,
+        restore_files: opts.restoreFiles !== false,
+        force: !!opts.force,
+      }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || `Rewind failed (HTTP ${res.status})`);
+  return data as RewindResult;
+}
+
 export async function uploadChatAttachments(workspaceId: string, chatId: string, files: File[]): Promise<ChatAttachment[]> {
   const body = new FormData();
   files.forEach((file) => body.append('files', file, file.name));
@@ -74,7 +113,7 @@ export async function uploadChatAttachments(workspaceId: string, chatId: string,
 }
 
 export async function updateChatTitle(workspaceId: string, chatId: string, title: string): Promise<void> {
-  await fetch(
+  const res = await fetch(
     `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/title`,
     {
       method: 'PUT',
@@ -82,4 +121,8 @@ export async function updateChatTitle(workspaceId: string, chatId: string, title
       body: JSON.stringify({ title }),
     },
   );
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(body || `Failed to rename chat (HTTP ${res.status})`);
+  }
 }

@@ -1,16 +1,19 @@
 import { useState } from 'react';
-import { Copy, AlertTriangle, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink, Loader2 } from 'lucide-react';
+import { Copy, AlertTriangle, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
+import type { StreamSegment } from '../../utils/streamAccum';
+import { presentStream, stripDelegationNarration } from '../../utils/streamPresentation';
 import { undoRun } from '../../services/api';
 import TraceAccordion from './TraceAccordion';
+import ActivityTimeline from './ActivityTimeline';
 import Markdown from './Markdown';
 import DiffView from './DiffView';
 
 interface Props {
   message: ChatMessage;
   onOpenSubagent: (name: string, task: string) => void;
-  onOpenSubagentSession?: (childId: string, label: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
   activeSubagent?: string | null;
   traceSteps?: TraceStep[];
   workspaceId?: string | null;
@@ -18,6 +21,7 @@ interface Props {
   onCloseSubagent?: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: () => void;
+  onRewind?: (message: ChatMessage) => void;
 }
 
 /** Pick an icon for tool calls based on the tool name */
@@ -186,44 +190,27 @@ function RoutedProjectCard({ projectRef, onOpenProject }: { projectRef: ProjectR
   );
 }
 
-/** P10: live reasoning/thinking block — fills as DeepSeek streams reasoning
- * tokens; collapses to a one-line summary after the run finishes. */
-function StreamingThinking({ reasoning, rate, active }: { reasoning: string; rate: number; active: boolean }) {
-  const [open, setOpen] = useState(true);
-  const [userToggled, setUserToggled] = useState(false);
-  const isOpen = userToggled ? open : active;
-
+/** Lightweight "Thinking" placeholder shown right after send, before any
+ * reasoning deltas arrive. Fades in/out and disappears once the first
+ * reasoning segment appears. */
+function ThinkingPlaceholder() {
   return (
-    <div className="rounded-lg border border-amber-500/15 bg-amber-500/[0.03] overflow-hidden mb-2">
-      <button
-        type="button"
-        onClick={() => { setUserToggled(true); setOpen((v) => !v); }}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left cursor-pointer"
-      >
-        <span className="relative flex h-2 w-2 flex-shrink-0">
-          {active && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-60" />}
-          <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
-        </span>
-        <span className="text-[11.5px] font-bold text-amber-300/90 uppercase tracking-wider flex-1">
-          {active ? 'Thinking…' : `Thought for ${reasoning.length > 0 ? `${Math.round(reasoning.length / 4)} tokens` : 'a moment'}`}
-        </span>
-        {active && rate > 0 && <span className="text-[10.5px] text-amber-200/60 font-mono">{rate} tok/s</span>}
-        <ChevronDown size={13} className={`text-amber-400/70 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
-      </button>
-      {isOpen && (
-        <div className="thinking-collapse is-open">
-          <div>
-            <div className={`px-3.5 pb-3 text-[13px] text-amber-100/70 leading-relaxed whitespace-pre-wrap font-mono max-h-[240px] overflow-y-auto ${active ? 'thinking-live-fade' : ''}`}>
-              {reasoning || '…'}
-            </div>
-          </div>
-        </div>
-      )}
+    <div className="animate-[thinkingFadeIn_220ms_ease-out] flex items-center gap-2 text-[13px] text-zinc-500 mb-2">
+      <span className="relative flex h-1.5 w-1.5 flex-shrink-0">
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-25" />
+        <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-zinc-400" />
+      </span>
+      <span className="tracking-wide animate-pulse">Thinking</span>
+      <span className="inline-flex gap-0.5 ml-0.5">
+        <span className="w-1 h-1 rounded-full bg-zinc-500 animate-[thinkingDot_1.1s_ease-in-out_infinite]" style={{ animationDelay: '0ms' }} />
+        <span className="w-1 h-1 rounded-full bg-zinc-500 animate-[thinkingDot_1.1s_ease-in-out_infinite]" style={{ animationDelay: '160ms' }} />
+        <span className="w-1 h-1 rounded-full bg-zinc-500 animate-[thinkingDot_1.1s_ease-in-out_infinite]" style={{ animationDelay: '320ms' }} />
+      </span>
     </div>
   );
 }
 
-export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry }: Props) {
+export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -231,9 +218,30 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
   const isTool = isAgent && isToolCall(message.content);
   const showAgentName = !!message.agentName;
   const streamingActive = !!message.metadata?.isStreaming;
-  const streamingReasoning = (message.metadata?.streamingReasoning as string | undefined) || '';
-  const streamRate = (message.metadata?.streamRate as number | undefined) || 0;
+  const persistedThinking = (message.metadata?.thinking as string | undefined) || '';
+  // Unified timeline: live uses streaming.segments, history uses persisted liveTimeline
+  // Fallback to synthesized reasoning segment when only thinking string exists (old messages)
+  const rawTimeline = (message.metadata?.liveTimeline as StreamSegment[] | undefined) || [];
+  const timelineSegments: StreamSegment[] = rawTimeline.length
+    ? rawTimeline
+    : persistedThinking
+      ? [{ type: 'reasoning' as const, text: persistedThinking }]
+      : [];
+  const streamPresentation = presentStream(timelineSegments, message.content);
+  const delegationSteps = Array.isArray(message.metadata?.steps) ? message.metadata.steps as TraceStep[] : [];
+  const responseContent = stripDelegationNarration(streamPresentation.finalText || message.content, delegationSteps);
+  const activitySegments = streamPresentation.activitySegments;
+  // The "Worked for" block owns reasoning/tool history only. Plain Q&A has
+  // neither, so render no collapsible at all — the answer below stays the
+  // single, always-visible copy and the usage chip stays pinned beneath it.
+  const hasRenderableTraceSteps = delegationSteps.some((s) =>
+    !!s.childId || s.type === 'tool' || s.type === 'command' || !!s.content?.trim(),
+  );
+  const showTrace = !!message.metadata?.isTrace && (activitySegments.length > 0 || hasRenderableTraceSteps);
+  const wasStopped = !!message.metadata?.stopped;
   const usageMeta = message.metadata?.usage as { total_input_tokens?: number; total_output_tokens?: number; total_cost?: number } | undefined;
+  const isScheduledWake = !!message.metadata?.scheduledWake;
+  const isCanvasEvent = !!message.metadata?.canvasEvent;
 
   return (
     <div className={`group ${isUser ? 'msg-user-enter' : isAgent ? 'msg-agent-enter' : 'animate-fade-in'}`} style={{ marginBottom: '24px' }}>
@@ -246,6 +254,11 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             className="max-w-[85%] text-[15.5px] text-zinc-100 leading-relaxed user-message-premium"
             style={{ padding: '10px 16px', borderRadius: '14px' }}
           >
+            {(isScheduledWake || isCanvasEvent) && (
+              <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-amber-300/80">
+                {isScheduledWake ? 'Scheduled wake' : 'Canvas event'}
+              </div>
+            )}
             {message.content && <Markdown content={message.content} />}
             {Array.isArray(message.metadata?.attachments) && <div className="message-attachments">
               {(message.metadata.attachments as ChatAttachment[]).map((file) => <div className="message-attachment" key={file.id}>
@@ -253,6 +266,19 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
               </div>)}
             </div>}
           </div>
+        </div>
+      )}
+      {isUser && onRewind && (
+        <div className="flex justify-end -mt-2 mb-1">
+          <button
+            type="button"
+            onClick={() => onRewind(message)}
+            title="Rewind to before this message — restores files and puts the text back in the prompt"
+            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-zinc-600 opacity-0 transition-opacity hover:text-zinc-300 hover:bg-white/[0.06] group-hover:opacity-100 cursor-pointer"
+          >
+            <RotateCcw size={10} />
+            Rewind here
+          </button>
         </div>
       )}
 
@@ -290,35 +316,30 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             </div>
           )}
 
-          {/* P10: live token streaming — thinking block + generating badge */}
-          {streamingActive && (
-            <>
-              {!!streamingReasoning && (
-                <StreamingThinking
-                  reasoning={streamingReasoning}
-                  rate={streamRate}
-                  active={message.duration === 'active'}
-                />
-              )}
-              {!streamingReasoning && !message.content && (
-                <div className="flex items-center gap-2 text-[11.5px] text-zinc-500 mb-2">
-                  <Loader2 size={12} className="animate-spin text-indigo-400" />
-                  Generating…
-                  {streamRate > 0 && (
-                    <span className="font-mono text-zinc-600">{streamRate} tok/s</span>
-                  )}
-                </div>
-              )}
-            </>
+          {/* Timeline — live shown inline; history timeline is inside "Worked for" dropdown */}
+          {message.duration === 'active' && (
+            activitySegments.length ? (
+              <ActivityTimeline
+                segments={activitySegments.slice(-18)}
+                isActive
+                delegationSteps={delegationSteps}
+                onOpenSubagentSession={onOpenSubagentSession}
+              />
+            ) : !responseContent ? (
+              <ThinkingPlaceholder />
+            ) : null
           )}
 
-          {/* Trace status above the response so duration reads first */}
-              {!!message.metadata?.isTrace && Array.isArray(message.metadata.steps) && (
+          {/* Trace status owns the complete chronological activity history.
+              Delegation cards are rendered by its ordered timeline, so a
+              child chat never appears as a second, detached projection. */}
+              {showTrace && (
                 <div className="agent-message-trace">
                   <TraceAccordion
-                  steps={message.metadata.steps as TraceStep[]}
+                  steps={(message.metadata?.steps as TraceStep[]) || []}
                   isActive={message.duration === 'active'}
                   duration={message.metadata?.duration as string || message.duration}
+                  timeline={activitySegments}
                   onOpenSubagent={onOpenSubagent}
                   onOpenSubagentSession={onOpenSubagentSession}
                   activeSubagent={activeSubagent}
@@ -332,6 +353,11 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
 
           {/* P9: routed-to-project replies render as a compact card (the full
               reply lives in the project's own chat). */}
+          {wasStopped && !streamingActive && (
+            <div className="inline-flex items-center gap-1.5 mt-1.5 px-2 py-0.5 rounded-md bg-zinc-500/10 border border-zinc-500/20 text-[11px] font-semibold text-zinc-400">
+              Stopped — partial response kept
+            </div>
+          )}
           {!!message.metadata?.project_ref && (
             <div className="mb-2">
               <RoutedProjectCard
@@ -342,17 +368,20 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
           )}
 
           {/* Main response text content */}
-          {message.content && message.content !== '(Execution Trace)' && !message.metadata?.project_ref && (
+          {responseContent && responseContent !== '(Execution Trace)' && !message.metadata?.project_ref && (
             <div className="agent-message-response text-[15.5px] text-zinc-200 leading-relaxed">
+              {activitySegments.length > 0 && (
+                <div className="agent-response-kicker">Final response</div>
+              )}
               {streamingActive ? (
                 // Phase 8-E1: incremental streaming markdown. Parse the stable
                 // prefix (everything before the last unfinished fence/emphasis)
                 // as Markdown so headings/bullets/links render live, and render
                 // only the trailing incomplete fragment as plain text — no
                 // mid-fence breakage, no per-delta full re-parse.
-                <StreamingMarkdown content={message.content} />
+                <StreamingMarkdown content={responseContent} />
               ) : (
-                <Markdown content={message.content} />
+                <Markdown content={responseContent} />
               )}
               {streamingActive && message.duration === 'active' && (
                 <span className="stream-caret" aria-hidden="true">▍</span>
@@ -362,7 +391,7 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
 
           {/* P10: per-message usage chip (tokens + cost for this run) */}
           {!!usageMeta && !streamingActive && (
-            <div className="flex items-center gap-3 mt-2 text-[10.5px] font-mono text-zinc-600">
+            <div className="agent-message-footer flex items-center gap-3 mt-2 text-[10.5px] font-mono text-zinc-600">
               <span title="Input tokens">↑{((usageMeta.total_input_tokens) || 0).toLocaleString()}</span>
               <span title="Output tokens">↓{((usageMeta.total_output_tokens) || 0).toLocaleString()}</span>
               <span title="Cost">${((usageMeta.total_cost) || 0).toFixed(5)}</span>
@@ -371,11 +400,13 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
           )}
 
           {!!message.metadata?.artifacts && (
-            <ArtifactSummary artifacts={message.metadata.artifacts as RunArtifacts} />
+            <div className="agent-message-footer">
+              <ArtifactSummary artifacts={message.metadata.artifacts as RunArtifacts} />
+            </div>
           )}
 
           {/* Inline action icons — right-aligned, revealed on hover */}
-          <div className="flex items-center justify-end gap-0.5 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+          <div className="agent-message-footer flex items-center justify-end gap-0.5 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
             {onRetry && !streamingActive && (
               <button
                 className="pressable p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
@@ -388,7 +419,7 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             <button
               className="pressable p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded-md transition-colors"
               title="Copy to clipboard"
-              onClick={() => navigator.clipboard?.writeText(message.content)}
+               onClick={() => navigator.clipboard?.writeText(responseContent)}
             >
               <Copy size={13} />
             </button>

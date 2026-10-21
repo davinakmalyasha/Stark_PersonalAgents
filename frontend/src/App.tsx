@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { lazy, Suspense, useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, FolderGit2, Palette } from 'lucide-react';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
@@ -6,17 +6,21 @@ import AgentCanvas from './components/Canvas/AgentCanvas';
 import TokenStatsModal from './components/Layout/TokenStatsModal';
 import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
+const DesignWorkspace = lazy(() => import('./modules/design-workspace/DesignWorkspace'));
 import { usePipeline } from './hooks/usePipeline';
-import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, updateTaskStatus, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun } from './services/api';
+import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun, abortRun, rewindChat } from './services/api';
 const API_BASE = '/api';
-import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment, AgentTask } from './types';
+import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment } from './types';
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
+
+const isProjectWorkspace = (w: WorkspaceInfo): boolean =>
+  !w.isGeneral && !w.isHouse && !w.isPersonal && !(w as { isDfd?: boolean }).isDfd;
 
 const WELCOME_MESSAGES: ChatMessage[] = [
   {
     id: 'welcome-1',
     role: 'system',
-    content: 'Connected to VinCode v3 — Supervisor + Developer agent online. Add a workspace folder to get started.',
+    content: 'Connected to Stark v3 — orchestrator online, workspace agents ready. Add a workspace folder to get started.',
     timestamp: new Date().toISOString(),
   },
 ];
@@ -32,6 +36,7 @@ export default function App() {
     workspaceId: string;
     chatId: string;
     startedAt: number;
+    runSeq?: number;
   } | null>(null);
   const [isPersisting, setIsPersisting] = useState(false);
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -43,10 +48,12 @@ export default function App() {
   const [temperature] = useState(0.7);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
   const [chatModeState, setChatModeState] = useState<'plan' | 'build'>('build');
   const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
+  const [designOpen, setDesignOpen] = useState(false);
 
   // ── Top-bar tabs (opencode-style) for the legacy coding workspace ──
   // Persisted separately from the main-workspace ui_state (cw_ prefix avoids collision).
@@ -77,7 +84,17 @@ export default function App() {
 
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
-  const activeTaskRef = useRef<string | null>(null);
+  // Stop bookkeeping: the persist effect below runs after cancel() already
+  // cleared the stream, so capture "was this a Stop" + partial thinking here.
+  const cancelledRef = useRef(false);
+  const cancelThinkingRef = useRef('');
+  const cancelTextRef = useRef('');
+  const lastStreamingRef = useRef(streaming);
+  useEffect(() => {
+    if (streaming.reasoning || streaming.segments.length || streaming.text) {
+      lastStreamingRef.current = streaming;
+    }
+  }, [streaming]);
   // Live mirroring (mobile/remote): remember which run instance we already
   // attached to so the poll doesn't re-attach to a finished run.
   const mirroredRunStart = useRef('');
@@ -90,6 +107,9 @@ export default function App() {
     const params = new URLSearchParams(hashQuery);
     let targetWsId: string | null = params.get('ws');
     let targetChatId: string | null = params.get('chat');
+    if (window.location.hash.startsWith('#/design') || params.get('addon') === 'design') {
+      setDesignOpen(true);
+    }
     // Restore last tab if no deep-link is present
     if (!targetWsId && !targetChatId && cwActiveKey) {
       const sep = cwActiveKey.indexOf(':');
@@ -102,10 +122,13 @@ export default function App() {
     fetchModels().then((m) => { if (m.length) setModels(m); }).catch(() => {});
     fetchWorkspaces().then(async (ws) => {
       if (ws.length === 0) return;
-      let initialWs = ws.find((w) => w.isGeneral) || ws[0];
+      let initialWs = ws.find(isProjectWorkspace) || ws.find((w) => w.isGeneral) || ws[0];
       if (targetWsId) {
-        initialWs = ws.find((w) => w.id === targetWsId) ?? initialWs;
+        const requested = ws.find((w) => w.id === targetWsId);
+        if (requested && isProjectWorkspace(requested)) initialWs = requested;
       }
+      const nonProjectIds = new Set(ws.filter((w) => !isProjectWorkspace(w)).map((w) => w.id));
+      setCwTabs((prev) => prev.filter((t) => !nonProjectIds.has(t.workspaceId)));
       setActiveWorkspace(initialWs);
       try {
         const chats = await fetchChats(initialWs.id);
@@ -155,10 +178,14 @@ export default function App() {
       if (state?.error) {
         return;
       }
-      if (activeTaskRef.current && activeWorkspace && activeChat) {
-        updateTaskStatus(activeWorkspace.id, activeChat.id, activeTaskRef.current, 'completed').catch(() => {});
-        activeTaskRef.current = null;
-      }
+      // Stop (not done): keep the partial, marked stopped. Capture + reset
+      // here — cancel() already cleared the live stream by the time we run.
+      const wasStopped = cancelledRef.current;
+      const stoppedThinking = cancelThinkingRef.current;
+      const stoppedText = cancelTextRef.current;
+      cancelledRef.current = false;
+      cancelThinkingRef.current = '';
+      cancelTextRef.current = '';
       if (activeWorkspace && activeChat) {
         // Mirrored run: the initiating client persists the trace — just reload.
         if (runMode === 'mirror') {
@@ -178,7 +205,9 @@ export default function App() {
               const { steps, assistantResponse } = parseLogToSteps(log);
               // General mode stores the final text in outputs rather than the
               // terminal log. Use it as the same unified trace response.
-              const finalResponse = assistantResponse || state?.outputs?.agent_report || '';
+              // On Stop, the visible streamed partial wins (it never lands in
+              // the log).
+              const finalResponse = stoppedText.trim() || assistantResponse || state?.outputs?.agent_report || '';
               const duration = runStartTime.current
                 ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
                 : undefined;
@@ -189,12 +218,17 @@ export default function App() {
               const chatSteps = filterOrchestratorSteps(steps);
 
               // Save a single unified agent message with trace metadata
+              // Wire streaming reasoning on success too (was only on Stop) — otherwise past reasoning vanishes.
+              // Use lastStreamingRef because usePipeline resets streaming before this effect fires.
+              const live = lastStreamingRef.current;
+              const successThinking = (live.reasoning || streaming.reasoning || '').trim();
+              const successTimeline = live.segments?.length ? [...live.segments] : streaming.segments?.length ? [...streaming.segments] : [];
               await addChatMessage(
                 activeWorkspace.id,
                 activeChat.id,
                 'agent',
                 finalResponse,
-                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined }
+                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined, thinking: (stoppedThinking || successThinking) || undefined, liveTimeline: successTimeline.length ? successTimeline : undefined, ...(wasStopped ? { stopped: true } : {}) }
               );
             }
             // Now re-fetch to sync messages and token stats
@@ -220,12 +254,15 @@ export default function App() {
   // While idle, watch /api/runs/active: when a run starts for THIS chat from
   // another client (phone or second browser), attach to its event stream so
   // both screens show the identical live session.
+  // Suppressed while a voice session owns this chat — the overlay's SSE is
+  // the working stream; attaching a second one is the stream-then-gone bug.
   useEffect(() => {
     if (isRunning || !activeChat) return;
     let cancelled = false;
     const tick = async () => {
       if (cancelled || document.hidden) return;
       try {
+        if (Date.now() - lastVoiceEventAt.current < 30000) return;
         const run = await fetchActiveRun();
         if (cancelled || !run.running) return;
         if (run.chat_id === activeChat.id && run.started_at && run.started_at !== mirroredRunStart.current) {
@@ -241,10 +278,6 @@ export default function App() {
 
   useEffect(() => {
     if (!error) return;
-    if (activeTaskRef.current && activeWorkspace && activeChat) {
-      updateTaskStatus(activeWorkspace.id, activeChat.id, activeTaskRef.current, 'failed').catch(() => {});
-      activeTaskRef.current = null;
-    }
     const errMsg: ChatMessage = { id: `error-${Date.now()}`, role: 'error', content: error, timestamp: new Date().toISOString() };
     setMessages((prev) => [...prev, errMsg]);
     if (activeWorkspace && activeChat) {
@@ -313,7 +346,7 @@ export default function App() {
     // Resolve workspace — auto-select General or first available
     let ws = activeWorkspace;
 
-    if (!ws) {
+    if (!ws || !isProjectWorkspace(ws)) {
       console.log('[App.handleSend] no active workspace, fetching...');
       try {
         const workspaces = await fetchWorkspaces();
@@ -322,9 +355,9 @@ export default function App() {
           setNotification('No chat available. Try restarting the server.');
           return;
         }
-        // Prefer General workspace for non-folder chat
-        const general = workspaces.find((w) => w.isGeneral);
-        ws = general || workspaces[0];
+        // The coding workspace is project-first; fall back to General only
+        // when no project folder exists.
+        ws = workspaces.find(isProjectWorkspace) || workspaces.find((w) => w.isGeneral) || workspaces[0];
         setActiveWorkspace(ws);
         console.log('[App.handleSend] auto-selected workspace:', ws);
       } catch (err) {
@@ -433,27 +466,18 @@ export default function App() {
     run(prompt, model, temperature, ws.path, chat.id, attachments, kind);
   }, [run, model, temperature, activeWorkspace, activeChat, isRunning]);
 
-  const handleRunTask = useCallback((task: AgentTask) => {
-    if (!activeWorkspace || !activeChat || isRunning) return false;
-    activeTaskRef.current = task.id;
-    const userMsg: ChatMessage = {
-      id: `task-${task.id}-${Date.now()}`,
-      role: 'user',
-      content: task.prompt,
-      timestamp: new Date().toISOString(),
-      metadata: { taskId: task.id, attachments: task.attachments },
-    };
-    setMessages((prev) => [...prev, userMsg]);
-    runStartTime.current = Date.now();
-    run(task.prompt, model, temperature, activeWorkspace.path, activeChat.id, task.attachments, (activeWorkspace as any).workspaceKind || '');
-    return true;
-  }, [activeWorkspace, activeChat, isRunning, run, model, temperature]);
   // ── Voice mode: driven by the floating overlay window (voice.html) ──
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   // Phase 8-V2: live STT from the overlay shows in the main window's dock,
   // and token deltas stream into the voice-live agent bubble.
   const [voiceInputText, setVoiceInputText] = useState('');
   const voiceStreamRef = useRef({ text: '', reasoning: '' });
+  // Single voice-trace owner: the overlay's run is canonical. runSeq from
+  // pipeline-start lets stale done/state/delta frames fall through instead of
+  // wiping the live run. lastVoiceEventAt suppresses the mirror poll while a
+  // voice session owns this chat (the mirror is the broken duplicate stream).
+  const voiceRunSeqRef = useRef(0);
+  const lastVoiceEventAt = useRef(0);
 
   const toggleVoice = useCallback(() => {
     (window as any).antigravity?.voiceToggle?.();
@@ -506,29 +530,59 @@ export default function App() {
         setIsVoiceMode(false);
       }
       if (ev?.type === 'pipeline-start') {
+        lastVoiceEventAt.current = Date.now();
         voiceStreamRef.current = { text: '', reasoning: '' };
+        const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : voiceRunSeqRef.current + 1;
+        voiceRunSeqRef.current = seq;
+        const prompt = typeof (ev as any)?.prompt === 'string' ? (ev as any).prompt : '';
+        // Replace the live-input ghost with the single canonical user bubble
+        // so one utterance never stacks Hello x N.
+        if (prompt) {
+          setMessages((prev) => {
+            const withoutLive = prev.filter((m) => m.id !== 'voice-live-input');
+            const last = withoutLive[withoutLive.length - 1];
+            if (last && last.role === 'user' && last.content === prompt) return withoutLive;
+            return [...withoutLive, { id: `voice-user-${Date.now()}`, role: 'user', content: prompt, timestamp: new Date().toISOString() }];
+          });
+        }
         setVoiceLiveRun({
           state: null,
           active: true,
           workspaceId: ev.workspaceId || '',
           chatId: ev.chatId || '',
           startedAt: Date.now(),
+          runSeq: seq,
         });
       } else if (ev?.type === 'pipeline-state') {
-        setVoiceLiveRun((current) => ({
-          state: ev.state as AppState,
-          active: true,
-          workspaceId: ev.workspaceId || current?.workspaceId || '',
-          chatId: ev.chatId || current?.chatId || '',
-          startedAt: current?.startedAt || Date.now(),
-        }));
+        lastVoiceEventAt.current = Date.now();
+        const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : undefined;
+        if (seq === undefined || seq === voiceRunSeqRef.current) {
+          setVoiceLiveRun((current) => ({
+            state: ev.state as AppState,
+            active: true,
+            workspaceId: ev.workspaceId || current?.workspaceId || '',
+            chatId: ev.chatId || current?.chatId || '',
+            startedAt: current?.startedAt || Date.now(),
+            runSeq: current?.runSeq ?? voiceRunSeqRef.current,
+          }));
+        }
       } else if (ev?.type === 'pipeline-done') {
-        setVoiceLiveRun((current) => current ? {
-          ...current,
-          state: (ev.state as AppState | null) || current.state,
-          active: false,
-        } : null);
+        lastVoiceEventAt.current = Date.now();
+        const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : undefined;
+        // Stale/superseded runs (mic-off abort, watchdog of an old run) must
+        // not wipe the live run's trace. Aborted frames never clear either —
+        // the run continues server-side and its later frames still arrive.
+        const fresh = seq === undefined || seq === voiceRunSeqRef.current;
+        const completed = (ev as any)?.status !== 'aborted';
+        if (fresh && completed) {
+          setVoiceLiveRun((current) => current ? {
+            ...current,
+            state: (ev.state as AppState | null) || current.state,
+            active: false,
+          } : null);
+        }
       } else if (ev?.type === 'delta' && ev.text) {
+        lastVoiceEventAt.current = Date.now();
         // Phase 8-V2: live tokens from the voice run stream into the overlay.
         const kind = ev.kind === 'reasoning' ? 'reasoning' : 'text';
         voiceStreamRef.current[kind] += String(ev.text);
@@ -536,9 +590,12 @@ export default function App() {
       }
       if (ev?.type === 'opened') syncVoiceChat();
       if (ev?.type === 'reply') {
+        lastVoiceEventAt.current = Date.now();
         voiceStreamRef.current = { text: '', reasoning: '' };
+        // Ordered clear: refresh first, THEN drop the trace. Clearing before
+        // the fetch resolves was the answer-flash-then-Thinking bug.
         refreshActiveChat();
-        setVoiceLiveRun(null);
+        window.setTimeout(() => setVoiceLiveRun(null), 800);
       }
       // Live input streaming: the overlay streams STT words as they are heard —
       // append them to the chat in real time (one live user bubble).
@@ -575,12 +632,19 @@ export default function App() {
   }, [isRunning, refreshActiveChat]);
 
   // ── Keyboard shortcuts: Esc cancels a running pipeline, "?" opens help ──
+  const handleCancelPipeline = useCallback(() => {
+    cancelledRef.current = true;
+    cancelThinkingRef.current = streaming.reasoning || '';
+    cancelTextRef.current = streaming.text || '';
+    if (activeChat) abortRun(activeChat.id).catch(() => {});
+    cancel();
+  }, [cancel, streaming.reasoning, streaming.text, activeChat]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       const typing = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
       if (e.key === 'Escape' && isRunning && !typing) {
-        cancel();
+        handleCancelPipeline();
       } else if (e.key === '?' && !isRunning && !typing) {
         e.preventDefault();
         setShowShortcuts((v) => !v);
@@ -588,7 +652,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isRunning, cancel]);
+  }, [isRunning, handleCancelPipeline]);
 
   const handleSelectWorkspace = useCallback((ws: WorkspaceInfo) => {
     setActiveWorkspace(ws);
@@ -687,6 +751,25 @@ export default function App() {
     }).catch(() => {});
   }, []);
 
+  const handleRewind = useCallback(async (message: ChatMessage) => {
+    if (!activeWorkspace || !activeChat || isRunning) return;
+    if (!window.confirm('Rewind to before this message? Files changed by it and every later message will be restored, and the text goes back to the prompt.')) return;
+    try {
+      const result = await rewindChat(activeWorkspace.id, activeChat.id, message.id);
+      const chat = await fetchChat(activeWorkspace.id, activeChat.id);
+      setMessages(chat.messages || []);
+      setDraft(result.prompt || '');
+      setNotification(
+        result.restore?.conflicts?.length
+          ? `Rewound, but ${result.restore.conflicts.length} file(s) could not be restored.`
+          : 'Rewound. The message is back in the prompt.',
+      );
+      setSidebarRefreshTick((t) => t + 1);
+    } catch (e) {
+      setNotification(e instanceof Error ? e.message : 'Rewind failed.');
+    }
+  }, [activeWorkspace, activeChat, isRunning]);
+
   const voiceTraceMatchesActiveChat = !!voiceLiveRun
     && (!voiceLiveRun.workspaceId || voiceLiveRun.workspaceId === activeWorkspace?.id)
     && (!voiceLiveRun.chatId || voiceLiveRun.chatId === activeChat?.id);
@@ -694,9 +777,12 @@ export default function App() {
   const renderState = showVoiceTrace ? voiceLiveRun?.state : state;
   const renderIsRunning = isRunning || (showVoiceTrace && !!voiceLiveRun?.active);
 
+  const liveParsed = useMemo(() => parseLogToSteps(state?.live_terminal_log ?? ''), [state?.live_terminal_log]);
+  const voiceLiveParsed = useMemo(() => parseLogToSteps(voiceLiveRun?.state?.live_terminal_log ?? ''), [voiceLiveRun?.state?.live_terminal_log]);
+
   const displayMessages = [...messages];
-  if ((isRunning || isPersisting) && state?.live_terminal_log) {
-    const { steps, assistantResponse } = parseLogToSteps(state.live_terminal_log);
+  if (isRunning || isPersisting) {
+    const { steps, assistantResponse } = liveParsed;
     const elapsed = runStartTime.current
       ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
       : 'active';
@@ -721,11 +807,12 @@ export default function App() {
         isStreaming: isRunning && streaming.active,
         streamingReasoning: streaming.active ? streaming.reasoning : '',
         streamRate: isRunning ? streaming.rate : 0,
+        liveTimeline: streaming.segments,
       },
     });
   }
   if (showVoiceTrace && voiceLiveRun?.state) {
-    const { steps, assistantResponse } = parseLogToSteps(voiceLiveRun.state.live_terminal_log || '');
+    const { steps, assistantResponse } = voiceLiveParsed;
     const elapsed = voiceLiveRun.active
       ? 'active'
       : Math.round((Date.now() - voiceLiveRun.startedAt) / 1000) + 's';
@@ -802,8 +889,7 @@ export default function App() {
           notification={notification}
           chatMode={chatModeState}
           onSend={handleSend}
-          onRunTask={handleRunTask}
-          onCancel={cancel}
+          onCancel={handleCancelPipeline}
           onModelChange={setModel}
           onClearNotification={() => setNotification(null)}
           workspaceId={activeWorkspace?.id ?? null}
@@ -813,7 +899,12 @@ export default function App() {
           voiceInputText={voiceInputText}
           onOpenStats={() => setIsTokenStatsOpen(true)}
           onOpenProject={handleOpenProject}
+          onOpenChat={handleCwActivate}
+          onOpenAddon={(addonId) => { if (addonId === 'design') setDesignOpen(true); }}
           onRetry={handleSend}
+          onRewind={handleRewind}
+          draft={draft}
+          onDraftConsumed={() => setDraft('')}
           totalCost={combinedTokenUsage.total_cost}
           totalInput={combinedTokenUsage.total_input_tokens}
           totalOutput={combinedTokenUsage.total_output_tokens}
@@ -856,12 +947,9 @@ export default function App() {
       {/* OpenDesign module launcher — opens the design room bound to this workspace/chat */}
       <button
         type="button"
-        onClick={() => {
-          const ws = activeWorkspace?.id ? `?ws=${encodeURIComponent(activeWorkspace.id)}&chat=${encodeURIComponent(activeChat?.id || '')}` : '';
-          window.location.hash = `#/design${ws}`;
-        }}
+        onClick={() => setDesignOpen(true)}
         className="fixed left-2 top-1/2 -translate-y-1/2 z-[85] flex flex-col items-center gap-1 px-1.5 py-3 rounded-xl bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shadow-xl"
-        title="OpenDesign — agent-led UI design iteration for this workspace (straight to the UI subagent loop)"
+        title="OpenDesign addon — agent-led UI design iteration for this workspace (straight to the UI subagent loop)"
         style={{ writingMode: 'vertical-rl' }}
       >
         <Palette size={15} />
@@ -879,6 +967,16 @@ export default function App() {
         <span className="text-[9.5px] font-bold tracking-widest uppercase">Files</span>
       </button>
       {showFiles && <FileExplorer workspaceId={activeWorkspace?.id ?? null} onClose={() => setShowFiles(false)} />}
+      {designOpen && (
+        <Suspense fallback={null}>
+          <DesignWorkspace
+            embedded
+            initialWorkspaceId={activeWorkspace?.id}
+            initialChatId={activeChat?.id}
+            onClose={() => setDesignOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

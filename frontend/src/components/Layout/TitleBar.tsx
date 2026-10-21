@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Smartphone, X } from 'lucide-react';
 import PairingModal from './PairingModal';
 
@@ -29,6 +29,27 @@ function wsColor(name: string): string {
 export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseTab, onDropTab }: TitleBarProps) {
   const [pairingOpen, setPairingOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [liveChatIds, setLiveChatIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      if (document.hidden) return;
+      try {
+        const res = await fetch('/api/runs/active');
+        const data = await res.json();
+        const ids = new Set<string>();
+        for (const r of (Array.isArray((data as any)?.runs) ? (data as any).runs : data?.running ? [data] : [])) {
+          if (r.chat_id) ids.add(String(r.chat_id));
+        }
+        if (!cancelled) setLiveChatIds(ids);
+      } catch {}
+    };
+    poll();
+    const id = window.setInterval(poll, 2500);
+    const onVis = () => { if (!document.hidden) poll(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { cancelled = true; window.clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
+  }, []);
 
   return (
     <header
@@ -60,22 +81,24 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
         {tabs.map((t) => {
           const key = `${t.workspaceId}:${t.chatId}`;
           const isActive = key === activeKey;
+          const isLive = liveChatIds.has(t.chatId);
           return (
             <div
               key={key}
               onClick={() => onActivateTab?.(t.workspaceId, t.chatId)}
-              title={`${t.title} — ${t.workspaceName}`}
+              title={`${t.title} — ${t.workspaceName}${isLive ? ' · Stark working…' : ''}`}
               className={`group flex items-center gap-1.5 pl-2 pr-1 py-1 rounded-md cursor-pointer select-none shrink-0 max-w-[180px] border text-[11px] transition-colors ${
                 isActive
                   ? 'bg-white/[0.09] border-white/15 text-white'
                   : 'bg-white/[0.03] border-transparent text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.06] hover:border-white/10'
-              }`}
+              } ${isLive ? 'ring-1 ring-emerald-500/30' : ''}`}
             >
               <span
-                className="grid place-items-center w-5 h-5 rounded text-[10px] font-bold text-white shrink-0"
+                className="grid place-items-center w-5 h-5 rounded text-[10px] font-bold text-white shrink-0 relative"
                 style={{ background: wsColor(t.workspaceName) }}
               >
                 {(t.workspaceName?.[0] || 'C').toUpperCase()}
+                {isLive && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-400 animate-pulse ring-2 ring-[#0c0c0e]" />}
               </span>
               <span className="truncate">{t.title || 'Untitled'}</span>
               <button

@@ -53,6 +53,8 @@ class Snapshot:
 # On startup the index is rebuilt from disk by `load_index`.
 _INDEX: dict[str, list[dict]] = {}
 _ACTIVE_RUN: dict[str, str] = {}  # chat_id -> run_id
+_ACTIVE_RUN_MESSAGE: dict[str, str] = {}  # chat_id -> user message id
+_ACTIVE_MANIFEST: dict[str, dict] = {}  # chat_id -> run checkpoint manifest
 
 
 # ── public API ─────────────────────────────────────────────────────────────
@@ -66,6 +68,31 @@ def _index_path(workspace_path: str, chat_id: str) -> str:
     return os.path.join(workspace_path, ".deep_agents", "snapshots", chat_id, "_index.json")
 
 
+def _runs_dir(workspace_path: str, chat_id: str) -> str:
+    return os.path.join(workspace_path, ".deep_agents", "snapshots", chat_id, "runs")
+
+
+def _manifest_path(workspace_path: str, chat_id: str, run_id: str) -> str:
+    return os.path.join(_runs_dir(workspace_path, chat_id), f"{run_id}.json")
+
+
+def _save_manifest(manifest: dict) -> None:
+    """Persist one run manifest. Best-effort — a checkpoint must never block a write."""
+    try:
+        path = _manifest_path(manifest["workspace_path"], manifest["chat_id"], manifest["run_id"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _manifest_for(chat_id: str) -> dict | None:
+    return _ACTIVE_MANIFEST.get(chat_id)
+
+
 def _set_active_run(chat_id: str, run_id: str) -> None:
     _ACTIVE_RUN[chat_id] = run_id
 
@@ -74,11 +101,23 @@ def _get_active_run(chat_id: str) -> str:
     return _ACTIVE_RUN.get(chat_id, f"orphan-{uuid.uuid4().hex[:8]}")
 
 
-def begin_run(chat_id: str, workspace_path: str) -> str:
+def begin_run(chat_id: str, workspace_path: str, user_message_id: str = "") -> str:
     """Allocate a new run_id and record it as the active run for this chat.
     Returns the run_id. Called by the API server at the start of every prompt."""
     run_id = f"run-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     _set_active_run(chat_id, run_id)
+    if user_message_id:
+        _ACTIVE_RUN_MESSAGE[chat_id] = user_message_id
+    manifest = {
+        "run_id": run_id,
+        "chat_id": chat_id,
+        "workspace_path": workspace_path,
+        "user_message_id": user_message_id or "",
+        "created_at": time.time(),
+        "files": {},
+    }
+    _ACTIVE_MANIFEST[chat_id] = manifest
+    _save_manifest(manifest)
     return run_id
 
 
@@ -151,7 +190,33 @@ def pre_write_snapshot(
     })
     _enforce_cap(chat_id, workspace_path)
     _save_index(workspace_path, chat_id)
+    manifest = _manifest_for(chat_id)
+    if manifest is not None:
+        entry = manifest.setdefault("files", {}).setdefault(rel_path, {})
+        # A file created earlier in this same run must be deleted on rewind,
+        # not restored to the in-run content.
+        if not entry.get("created"):
+            entry.update({
+                "snapshot_id": snap.snap_id,
+                "before_sha": sha,
+                "existed": True,
+                "created": False,
+            })
+            _save_manifest(manifest)
     return snap
+
+
+def record_created(chat_id: str, workspace_path: str, rel_path: str) -> None:
+    """Mark a path as created by this run so rewind deletes it."""
+    if not chat_id or not rel_path:
+        return
+    manifest = _manifest_for(chat_id)
+    if manifest is None:
+        return
+    entry = manifest.setdefault("files", {}).setdefault(rel_path, {})
+    if not entry.get("snapshot_id"):
+        entry.update({"created": True, "existed": False})
+        _save_manifest(manifest)
 
 
 def list_snapshots(chat_id: str, workspace_path: str, limit: int = 100) -> list[dict]:
@@ -247,6 +312,128 @@ def restore_run(chat_id: str, workspace_path: str, run_id: str) -> tuple[bool, l
         if not ok and "changed since snapshot" in msg:
             all_ok = False
     return all_ok, msgs
+
+
+def _safe_path(root: str, rel_path: str) -> str | None:
+    if not root or not rel_path:
+        return None
+    try:
+        real_root = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(real_root, rel_path))
+        if os.path.commonpath([real_root, target]) != real_root:
+            return None
+        return target
+    except (OSError, ValueError):
+        return None
+
+
+def _sha_file(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def finalize_run(chat_id: str, workspace_path: str, artifacts: dict | None = None) -> dict | None:
+    """Close the active checkpoint manifest and reconcile it with run artifacts.
+
+    ``artifacts["files"]`` is the run-end change summary (created/modified/
+    deleted). It turns shell-created files into deletable checkpoints and marks
+    changed paths we never snapshotted as unrestorable instead of pretending.
+    """
+    manifest = _ACTIVE_MANIFEST.pop(chat_id, None)
+    if manifest is None:
+        return None
+    files = manifest.setdefault("files", {})
+    for item in (artifacts or {}).get("files", []) or []:
+        path = str(item.get("path") or "").replace("\\", "/")
+        if not path:
+            continue
+        entry = files.setdefault(path, {})
+        if item.get("status") == "added":
+            entry["created"] = True
+            entry["existed"] = False
+        elif not entry.get("snapshot_id") and not entry.get("created"):
+            entry["unrestorable"] = True
+    for path, entry in list(files.items()):
+        target = _safe_path(workspace_path, path)
+        entry["after_sha"] = _sha_file(target) if target and os.path.isfile(target) else ""
+    manifest["finalized_at"] = time.time()
+    _save_manifest(manifest)
+    return manifest
+
+
+def load_manifests(chat_id: str, workspace_path: str) -> list[dict]:
+    """Read every run checkpoint manifest for a chat. Never raises."""
+    out: list[dict] = []
+    directory = _runs_dir(workspace_path, chat_id)
+    if not os.path.isdir(directory):
+        return out
+    for name in os.listdir(directory):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("run_id"):
+                out.append(data)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def restore_checkpoint(chat_id: str, workspace_path: str, message_ids: list[str],
+                       force: bool = False) -> dict:
+    """Restore every run started at/after the given user messages, newest first.
+
+    Newest-first is what makes stacked edits correct: each run's snapshot is the
+    state immediately before that run, so applying them in reverse order walks
+    the workspace back to the moment before the first rewound message.
+    """
+    wanted = {str(m) for m in (message_ids or []) if m}
+    manifests = [m for m in load_manifests(chat_id, workspace_path)
+                 if str(m.get("user_message_id") or "") in wanted]
+    manifests.sort(key=lambda m: float(m.get("created_at") or 0), reverse=True)
+    load_index(workspace_path, chat_id)
+    restored: list[str] = []
+    removed: list[str] = []
+    conflicts: list[str] = []
+    for manifest in manifests:
+        for path, entry in (manifest.get("files") or {}).items():
+            target = _safe_path(workspace_path, path)
+            if target is None:
+                conflicts.append(f"{path}: outside workspace")
+                continue
+            current_sha = _sha_file(target) if os.path.isfile(target) else ""
+            expected_sha = str(entry.get("after_sha") or "")
+            if expected_sha and current_sha != expected_sha and not force:
+                conflicts.append(f"{path}: changed since the run")
+                continue
+            if entry.get("created"):
+                if os.path.isfile(target):
+                    try:
+                        os.remove(target)
+                        removed.append(path)
+                    except OSError as e:
+                        conflicts.append(f"{path}: {e}")
+                continue
+            snapshot_id = entry.get("snapshot_id")
+            if snapshot_id:
+                ok, msg = restore_snapshot(chat_id, workspace_path, snapshot_id)
+                if ok:
+                    restored.append(path)
+                else:
+                    conflicts.append(f"{path}: {msg}")
+            else:
+                conflicts.append(f"{path}: no snapshot (shell/untracked change)")
+    return {
+        "ok": not conflicts,
+        "restored": restored,
+        "removed": removed,
+        "conflicts": conflicts,
+        "runs": [m.get("run_id") for m in manifests],
+    }
 
 
 # ── index persistence ──────────────────────────────────────────────────────

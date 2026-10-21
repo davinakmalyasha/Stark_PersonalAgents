@@ -88,10 +88,21 @@ export function startHousePipeline(
   );
 }
 
-export async function finishHouseMessage(ws: WorkspaceInfo, chatId: string, state: AppState | null, durationSec?: number): Promise<ChatMessage[]> {
+export interface FinishMessageOpts {
+  /** Streamed reasoning to persist so thought survives history (bug: it vanished). */
+  thinking?: string;
+  /** Interleaved reasoning/tool segments (Codex-like timeline) persisted for history. */
+  liveTimeline?: any[];
+  /** Stop (not done): keep the partial as-is and mark it stopped. */
+  stopped?: boolean;
+  /** Partial streamed text wins over the log-derived response (Stop path). */
+  textOverride?: string;
+}
+
+export async function finishHouseMessage(ws: WorkspaceInfo, chatId: string, state: AppState | null, durationSec?: number, opts: FinishMessageOpts = {}): Promise<ChatMessage[]> {
   const log = state?.live_terminal_log || '';
   const { steps, assistantResponse } = parseLogToSteps(log);
-  const finalResponse = assistantResponse || state?.outputs?.agent_report || '';
+  const finalResponse = (opts.textOverride || '').trim() || assistantResponse || state?.outputs?.agent_report || '';
   await addChatMessage(ws.id, chatId, 'agent', finalResponse, {
     isTrace: true,
     // Full step list (incl. [SUBAGENT] spawns) — powers the subagent blocks.
@@ -102,6 +113,9 @@ export async function finishHouseMessage(ws: WorkspaceInfo, chatId: string, stat
     artifacts: state?.artifacts,
     usage: state?.token_usage,
     project_ref: (state as any)?.project_ref,
+    ...(opts.thinking?.trim() ? { thinking: opts.thinking } : {}),
+    ...(opts.liveTimeline && opts.liveTimeline.length ? { liveTimeline: opts.liveTimeline } : {}),
+    ...(opts.stopped ? { stopped: true } : {}),
   });
   const chat = await fetchChat(ws.id, chatId);
   return chat.messages || [];

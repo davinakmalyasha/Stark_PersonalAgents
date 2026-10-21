@@ -6,9 +6,12 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('voiceBridge', {
   sendEvent: (payload) => ipcRenderer.send('voice-session-event', payload),
   close: () => ipcRenderer.send('voice-close'),
-  resize: (w, h) => ipcRenderer.send('voice-resize', w, h),
+  resize: (w, h, animate) => ipcRenderer.send('voice-resize', w, h, !!animate),
   onSetChat: (cb) => {
     ipcRenderer.on('voice-set-chat', (_event, payload) => cb(payload));
   },
   getStarkPort: () => process.env.STARK_PORT || '8123',
+  listScreenSources: () => ipcRenderer.invoke('voice-screen-sources'),
+  selectScreenSource: (id) => ipcRenderer.invoke('voice-screen-select', id),
+  setScreenProtection: (on) => ipcRenderer.send('voice-screen-protect', !!on),
 });

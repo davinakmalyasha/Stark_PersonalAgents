@@ -5,7 +5,7 @@ interface Props {
   steps: TraceStep[];
   isActive?: boolean;
   onOpenSubagent?: (name: string, task: string) => void;
-  onOpenSubagentSession?: (childId: string, label: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
   activeSubagent?: string | null;
   allTraceSteps?: TraceStep[];
   workspaceId?: string | null;

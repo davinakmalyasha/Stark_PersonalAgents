@@ -159,8 +159,185 @@
 /* ── Main workspace chat card (translucent — shares the premium-surface
    token with the coding overlay; Phase 8-D removed the opaque fill) ── */
 .house-chat-card {
-  background: rgba(16, 16, 19, 0.55);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+  background: rgba(13, 13, 16, 0.94);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+
+/* Child sessions are a drill-in surface, not another transcript in the
+   parent chat. Keep the parent visible underneath while the child opens here. */
+@keyframes subagent-drawer-in {
+  from { opacity: 0; transform: translateX(18px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.subagent-session-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 45;
+  width: min(440px, calc(100vw - 48px));
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #0c0c0f;
+  border-left: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: -24px 0 60px rgba(0, 0, 0, 0.38);
+  animation: subagent-drawer-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Child chat surface: a real secondary conversation with its own history
+   viewport and composer, not a blocked placeholder panel. */
+.subagent-session-view {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  background: #0c0c0f;
+}
+.subagent-session-view-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 52px;
+  padding: 0 14px;
+  border-bottom: 1px solid rgba(255,255,255,.075);
+  background: rgba(12,12,15,.94);
+  flex-shrink: 0;
+}
+.subagent-session-back {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 0;
+  border-radius: 8px;
+  color: #8e9098;
+  background: transparent;
+  cursor: pointer;
+  transition: color .18s ease, background .18s ease;
+}
+.subagent-session-back:hover { color: #f4f4f5; background: rgba(255,255,255,.07); }
+.subagent-session-back:focus-visible { outline: 1px solid rgba(255,255,255,.65); outline-offset: 2px; }
+.subagent-session-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: #62646d;
+  font-size: 12px;
+}
+.subagent-session-parent {
+  max-width: 132px;
+  overflow: hidden;
+  border: 0;
+  padding: 0;
+  color: #777982;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.subagent-session-parent:hover { color: #c4c5ca; }
+.subagent-session-breadcrumb strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #e1e1e5;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-session-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  color: #858790;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+.subagent-session-view-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.subagent-session-view-body > .relative {
+  width: 100%;
+  min-height: 0;
+}
+.subagent-session-legacy-thread {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  padding: 18px 20px 24px;
+}
+.subagent-session-state {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 180px;
+  padding: 24px;
+  color: #70727b;
+  font-size: 12px;
+  text-align: center;
+}
+.subagent-session-retry {
+  border: 0;
+  padding: 0;
+  color: #c7c8ce;
+  background: transparent;
+  font: inherit;
+  font-size: 11.5px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.subagent-session-retry:hover { color: #fff; }
+.subagent-session-view-dock {
+  flex: none;
+  border-top: 1px solid rgba(255,255,255,.07);
+  background: #0c0c0f;
+}
+.subagent-session-view-dock > .subagent-session-notice {
+  margin: 8px 16px 0;
+  padding: 7px 9px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 8px;
+  color: #a4a5ad;
+  background: rgba(255,255,255,.035);
+  font-size: 11px;
+}
+.subagent-session-view-dock .prompt-dock { padding-bottom: 12px; }
+.subagent-session-legacy-dock {
+  margin: 12px 16px 16px;
+  padding: 11px 12px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 11px;
+  color: #777982;
+  background: rgba(255,255,255,.025);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .subagent-session-drawer {
+    width: min(100%, 440px);
+  }
 }
 
 /* ── Subagent spawn block (chat pill) ── */
@@ -344,6 +521,20 @@
 }
 .house-sidebar-row:hover { background: rgba(255, 255, 255, 0.04); }
 .house-sidebar-row.is-active { background: rgba(255, 255, 255, 0.09); }
+/* Spawned chats (orchestrator → workspace agents → sub-delegations): a faint
+   violet wash so auto-created rows never read as plain user chats. */
+.house-sidebar-row.is-spawned { background: rgba(139, 92, 246, 0.05); }
+.house-sidebar-row.is-spawned:hover { background: rgba(139, 92, 246, 0.10); }
+.house-sidebar-row.is-spawned.is-active { background: rgba(139, 92, 246, 0.16); }
+.house-sidebar-row.is-deleting {
+  animation: house-row-out 220ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  pointer-events: none;
+  overflow: hidden;
+}
+@keyframes house-row-out {
+  from { opacity: 1; transform: translateX(0); max-height: 40px; }
+  to { opacity: 0; transform: translateX(-8px); max-height: 0; margin: 0; padding-top: 0; padding-bottom: 0; }
+}
 
 /* ── Reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
@@ -355,3 +546,138 @@
   }
   .house-sidebar-backdrop, .ide-panel-enter { animation: none !important; }
 }
+
+/* ────────────────────────────────────────────────────────────────
+   Group projects — the board's panel and modal
+
+   Extends the task chip's vocabulary rather than inventing a parallel
+   one: `canvas-task-dot` already carries is-running / is-scheduled /
+   is-failed, so the missing project states are added here.
+
+   `is-waiting` is the only state that gets a glow. Everything else
+   stays quiet on purpose — a board where every row shouts is a board
+   nobody reads, and the one thing that must never be missed while you
+   are away is "this is waiting on you".
+   ──────────────────────────────────────────────────────────────── */
+
+.canvas-task-dot.is-done { background: #7ee0a8; }
+.canvas-task-dot.is-paused { background: #b3a0ff; }
+.canvas-task-dot.is-stalled,
+.canvas-task-dot.is-failed {
+  background: #fb7185;
+  box-shadow: 0 0 8px rgba(251, 113, 133, 0.55);
+}
+.canvas-task-dot.is-waiting {
+  background: #fbbf24;
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.7);
+}
+
+/* A project row is one <button>, not a div with buttons inside: the whole
+   row opens the detail, so the whole row must be reachable by keyboard. */
+.gp-row {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.gp-row:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline-offset: 2px;
+}
+
+/* The one thing worth colouring in the panel. */
+.gp-waiting-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: rgba(251, 191, 36, 0.14);
+  color: #fcd34d;
+  font-size: 8px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* Informational, not urgent: a member with a shell can reach anywhere, so the
+   rest of the envelope is advisory. Deliberately muted so it never competes
+   with the amber "waiting on you" badge for attention. */
+.gp-shell-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #a1a1aa;
+  font-size: 8px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* ── Modal ──
+   The header and footer are sticky, so a focused row can otherwise be
+   scrolled underneath them and become invisible to a keyboard user
+   (WCAG 2.2 "Focus Not Obscured"). scroll-margin keeps focus clear. */
+.gp-modal-scroll {
+  scroll-padding-top: 8px;
+  scroll-padding-bottom: 8px;
+}
+.gp-modal-scroll :is(button, [tabindex]):focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline-offset: 2px;
+  scroll-margin-top: 56px;
+  scroll-margin-bottom: 72px;
+}
+
+/* Status chips must never wrap to a second line — one wrapped chip breaks
+   the whole column's rhythm. Bound the label, keep the full text
+   reachable via title/aria rather than a hover-only tooltip. */
+.gp-chip {
+  flex: none;
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.07);
+  color: #a1a1aa;
+}
+.gp-chip.is-done { background: rgba(126, 224, 168, 0.13); color: #7ee0a8; }
+.gp-chip.is-doing { background: rgba(125, 211, 252, 0.13); color: #7dd3fc; }
+.gp-chip.is-blocked,
+.gp-chip.is-failed { background: rgba(251, 113, 133, 0.13); color: #fb7185; }
+.gp-chip.is-waiting { background: rgba(251, 191, 36, 0.14); color: #fcd34d; }
+.gp-chip.is-invalidated { background: rgba(179, 160, 255, 0.13); color: #b3a0ff; }
+
+/* Event log: monospace, so timestamps and seq numbers line up. */
+.gp-event-kind {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Loading skeleton ──
+   A modal that opens onto a blank panel reads as broken. */
+.gp-skeleton {
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.045) 25%,
+    rgba(255, 255, 255, 0.085) 37%,
+    rgba(255, 255, 255, 0.045) 63%
+  );
+  background-size: 400% 100%;
+  animation: gp-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes gp-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gp-skeleton { animation: none !important; }
+}
+

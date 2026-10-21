@@ -15,7 +15,7 @@ Two entry points share ONE core loop (:func:`general_loop`):
 Dual LLM backend via ``GENERAL_MODEL_BACKEND``:
 
 - ``deepseek`` (default): invoke_messages_with_fallback_stream on
-  ``deepseek:v4-flash`` with native function calling.
+  ``deepseek:v4.1-flash`` with native function calling.
 - ``free``: routes every turn through the multi-provider FreeAgent client
   (OpenRouter/Groq/Gemini/Mistral/NVIDIA/Cloudflare/...) â€” zero cost, same
   OpenAI-native tool protocol.
@@ -129,10 +129,12 @@ def _build_zone2(task: str, chat_id: str) -> str:
 
     if chat_id:
         try:
-            from memory.chat_context import build_chat_context
+            from server.context.chat_history import build_chat_context
+            from sync.state_sync import safe_get_state
 
             history = build_chat_context(
-                "_general", chat_id, max_messages=30, max_chars_per_msg=3000, exclude_traces=True
+                "_general", chat_id, max_messages=30, max_chars_per_msg=3000,
+                exclude_message_id=str(safe_get_state().get("user_message_id") or ""),
             )
             if history:
                 parts.append(f"## Recent Chat History\n{history}")
@@ -210,8 +212,7 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         )
         return reply, calls, []
 
-    # Paid path — static per-role thinking: General=low.
-    effort_override = "low"
+    # Paid path — thinking comes from the agent registry (General: low).
 
     # Native agent (Track B): pydantic-ai executes tools internally (default).
     # A4: the legacy single-turn registry path (PAI_NATIVE_TOOLS=0) is removed;
@@ -221,7 +222,6 @@ def _call_backend(history: list, native_tools: list[dict], where_tag: str, syste
         messages=list(history),
         tools=native_tools,
         temp=0.2,
-        reasoning_effort=effort_override,
         where=where_tag,
         deps=deps,
         system_prompt=system_prompt,
@@ -344,24 +344,26 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
             except Exception:
                 pass
 
-        # A6b/A7: native compaction — estimate_history_tokens + compact_history_native
+        # A6b/A7: native compaction — Codex-parity LLM handoff summary.
         if iteration > 1:
             try:
                 est = estimate_history_tokens(history)
                 if est >= compaction_policy.checkpoint_trigger:
-                    from llm.model_history import compact_history_native
+                    from memory.compaction_engine import compact_history_with_summary
 
                     before = est
-                    history = compact_history_native(
+                    history, _engine_info = compact_history_with_summary(
                         history,
+                        project_path="",
                         policy=compaction_policy,
-                        summary_text="[Native compaction checkpoint — earlier turns summarized]",
+                        role=_AGENT_NAME,
+                        deps=run_deps,
                     )
                     after = estimate_history_tokens(history)
                     _log(
                         f"[{_AGENT_NAME.upper()}] Native checkpoint "
                         f"({before:,} -> {after:,} est. tokens; "
-                        f"tail={compaction_policy.tail_budget_tokens:,})"
+                        f"one_pass=True)"
                     )
             except Exception as e:
                 _log(f"[{_AGENT_NAME.upper()}] Compaction error (non-fatal): {e}")
@@ -484,15 +486,6 @@ def _general_events(task: str, chat_id: str = "", images: list | None = None):
                     result_str = str(execution.content)
                 except Exception as e:
                     result_str = f"ERROR: {str(e)[:300]}"
-
-            # Offload oversized results to VFS; keep the transcript compact.
-            try:
-                from tools import _tool_cap, auto_offload_result
-
-                result_str = auto_offload_result(result_str, tname, max_chars=_tool_cap("subagent"))
-            except Exception:
-                if len(result_str) > 4000:
-                    result_str = result_str[:2000] + "\n... (truncated middle) ...\n" + result_str[-2000:]
 
             if guard and guard[0] == "WARNING":
                 result_str += "\n" + guard[1]
@@ -617,9 +610,10 @@ def run_general_direct(prompt: str, chat_id: str = "", images: list | None = Non
     except Exception as e:
         import traceback
 
+        print(f"[{_AGENT_NAME} Error] {e}\n{traceback.format_exc()}", flush=True)
         safe_update_state({
             "error": str(e),
-            "live_terminal_log": f"[{_AGENT_NAME} Error] {e}\n{traceback.format_exc()}",
+            "live_terminal_log": f"[{_AGENT_NAME} Error] {e}",
         })
         yield json.loads(safe_serialize_state())
 
@@ -655,7 +649,8 @@ def general_node(s: ITState) -> dict:
         import traceback
 
         tb = traceback.format_exc()
-        _log(f"[{_AGENT_NAME.upper()} CRASH] {e}\n{tb}")
+        print(f"[{_AGENT_NAME.upper()} CRASH] {e}\n{tb}", flush=True)
+        _log(f"[{_AGENT_NAME.upper()} CRASH] {e}")
         safe_append_live_log(f"\n[{_AGENT_NAME.upper()} CRASH] {e}")
         return {
             "messages": [],

@@ -5,11 +5,12 @@
  * Legacy: `house/useHouseChat.ts` re-exports this.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, AgentTask, StreamDelta } from '../types';
-import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, fetchTasks, startTask, deleteTask } from '../services/api';
+import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, StreamDelta } from '../types';
+import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, abortRun, rewindChat } from '../services/api';
 import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from '../house/houseChatService';
 import { getAssistantName } from '../house/assistant';
 import { parseLogToSteps } from '../utils/logParser';
+import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
 
 export interface UseChatProps {
   onActive?: (payload: { wsId: string; chatId: string }) => void;
@@ -24,55 +25,45 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
-  const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [liveState, setLiveState] = useState<AppState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [notification, setNotification] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   // Phase 8-V2 fix: voice runs execute in the overlay — track their live
   // activity here so the house chat streams the reply in real time.
   const [voiceActive, setVoiceActive] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // Synchronous guard: React state can still be stale for a second Enter
+  // press, which used to start two runs on the same chat.
+  const sendInFlightRef = useRef(false);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const liveStateRef = useRef<AppState | null>(null);
   const startedAtRef = useRef<number | null>(null);
-  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
-  const streamRef = useRef({ text: '', reasoning: '', agent: '' });
-  const rateRef = useRef({ lastTs: 0, lastChars: 0, ema: 0 });
+  // Owning run target for Stop: persist the partial into the same chat.
+  const runWsRef = useRef<WorkspaceInfo | null>(null);
+  const runChatIdRef = useRef<string | null>(null);
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
+  const streamRef = useRef(emptyStreamAccum());
+  const rateRef = useRef(emptyRateAccum());
 
   const applyDelta = useCallback((delta: StreamDelta) => {
-    const now = performance.now();
-    if (delta.kind === 'reasoning') {
-      streamRef.current.reasoning += delta.text;
-    } else if (delta.kind === 'text') {
-      const chars = delta.text.length;
-      const r = rateRef.current;
-      if (r.lastTs > 0) {
-        const dt = Math.max(16, now - r.lastTs) / 1000;
-        const rate = (chars / 4) / dt;
-        r.ema = r.ema === 0 ? rate : r.ema * 0.8 + rate * 0.2;
-      }
-      r.lastTs = now;
-      r.lastChars = chars;
-      streamRef.current.text += delta.text;
-    } else if (delta.kind === 'end') {
-      rateRef.current.ema = 0;
-    }
-    if (delta.agent) streamRef.current.agent = delta.agent;
+    const rate = applyDeltaToAccum(streamRef.current, rateRef.current, delta, performance.now());
     setStreaming({
       text: streamRef.current.text,
       reasoning: streamRef.current.reasoning,
       agent: streamRef.current.agent,
+      segments: [...streamRef.current.segments],
       active: true,
-      rate: Math.round(rateRef.current.ema),
+      rate,
     });
   }, []);
 
   const resetStream = useCallback(() => {
-    streamRef.current = { text: '', reasoning: '', agent: '' };
-    rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
-    setStreaming({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+    streamRef.current = emptyStreamAccum();
+    rateRef.current = emptyRateAccum();
+    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
   }, []);
 
   const refreshMessages = useCallback(async () => {
@@ -87,11 +78,6 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const refreshList = useCallback(async (ws: WorkspaceInfo) => {
     setChats(await fetchChats(ws.id).catch(() => []));
   }, []);
-
-  const refreshTasks = useCallback(async () => {
-    if (!generalWs || !activeChatId) { setTasks([]); return; }
-    setTasks(await fetchTasks(generalWs.id, activeChatId).catch(() => []));
-  }, [generalWs, activeChatId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,11 +102,6 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, liveState, isRunning]);
 
-  useEffect(() => {
-    const id = window.setTimeout(() => { refreshTasks(); }, 0);
-    return () => window.clearTimeout(id);
-  }, [refreshTasks]);
-
   const syncVoiceChat = useCallback(() => {
     if (generalWs && activeChatId) {
       window.antigravity?.setVoiceChat?.({ wsId: generalWs.id, wsPath: generalWs.path ?? '', chatId: activeChatId });
@@ -142,16 +123,15 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       if (ev?.type === 'reply') {
         setIsVoiceMode(false);
         setVoiceActive(false);
-        streamRef.current = { text: '', reasoning: '', agent: '' };
-        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '' }));
-        refreshMessages();
+        streamRef.current = emptyStreamAccum();
+        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '', segments: [] }));        refreshMessages();
       }
       // Phase 8-V2 fix: a voice run started — begin the live bubble.
       if (ev?.type === 'pipeline-start') {
         setVoiceActive(true);
-        streamRef.current = { text: '', reasoning: '', agent: '' };
-        rateRef.current = { lastTs: 0, lastChars: 0, ema: 0 };
-        setStreaming({ text: '', reasoning: '', agent: '', active: false, rate: 0 });
+        streamRef.current = emptyStreamAccum();
+        rateRef.current = emptyRateAccum();
+        setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
       }
       // Phase 8-V2: live tokens from a voice run stream into the house chat —
       // merge them into the same streaming bubble as local runs.
@@ -164,6 +144,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           text: streamRef.current.text,
           reasoning: streamRef.current.reasoning,
           agent: streamRef.current.agent,
+          segments: [...streamRef.current.segments],
           active: true,
           rate: s.rate,
         }));
@@ -179,13 +160,15 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           return [...prev, { id: 'voice-live-input', role: 'user', content: t, timestamp: new Date().toISOString() }];
         });
       }
-      // When run starts, replace live input bubble with persisted user message (avoid duplicate)
+      // When run starts, replace live input bubble with the single canonical
+      // user message (avoid duplicate Hello x N stacking).
       if (ev?.type === 'pipeline-start' && (ev as any).prompt) {
+        const prompt = String((ev as any).prompt);
         setMessages((prev) => {
-          const hasLive = prev.some(m => m.id === 'voice-live-input');
-          if (!hasLive) return prev;
-          // Keep live bubble until run completes — will be replaced on refresh
-          return prev;
+          const withoutLive = prev.filter((m) => m.id !== 'voice-live-input');
+          const last = withoutLive[withoutLive.length - 1];
+          if (last && last.role === 'user' && last.content === prompt) return withoutLive;
+          return [...withoutLive, { id: `voice-user-${Date.now()}`, role: 'user', content: prompt, timestamp: new Date().toISOString() }];
         });
       }
     });
@@ -253,14 +236,57 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   }, [generalWs, isRunning, activeChatId]);
 
   const handleCancel = useCallback(() => {
+    sendInFlightRef.current = false;
     abortRef.current?.abort();
+    const ws = runWsRef.current;
+    const chatId = runChatIdRef.current;
+    // Actually cancel server-side too — detaching the fetch alone leaves the
+    // run burning tokens (the orphan-run bug).
+    if (chatId) abortRun(chatId).catch(() => {});
+    const partialText = streamRef.current.text;
+    const partialReasoning = streamRef.current.reasoning;
+    const log = liveStateRef.current?.live_terminal_log || '';
+    const hasPartial = !!(partialText.trim() || partialReasoning.trim() || log.trim());
     setIsRunning(false);
     setLiveState(null);
+    if (ws && chatId && hasPartial) {
+      // Keep the partial: same persist path as completion, marked stopped.
+      const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
+      const snap = liveStateRef.current;
+      finishHouseMessage(ws, chatId, snap, duration, {
+        thinking: partialReasoning,
+        liveTimeline: [...streamRef.current.segments],
+        stopped: true,
+        textOverride: partialText,
+      }).then(setMessages).catch(() => {});
+    }
+    resetStream();
   }, []);
 
+  const handleRewind = useCallback(async (message: ChatMessage) => {
+    if (!generalWs || !activeChatId || isRunning) return;
+    if (!window.confirm('Rewind to before this message? Files changed by it and every later message will be restored, and the text goes back to the prompt.')) return;
+    try {
+      const result = await rewindChat(generalWs.id, activeChatId, message.id);
+      const chat = await fetchChat(generalWs.id, activeChatId);
+      setMessages(chat.messages || []);
+      setTokenUsage(chat.token_usage ?? null);
+      setDraft(result.prompt || '');
+      if (result.restore?.conflicts?.length) {
+        setNotification(`Rewound, but ${result.restore.conflicts.length} file(s) could not be restored.`);
+      } else {
+        setNotification('Rewound. The message is back in the prompt.');
+      }
+      await refreshList(generalWs);
+    } catch (e) {
+      setNotification(e instanceof Error ? e.message : 'Rewind failed.');
+    }
+  }, [generalWs, activeChatId, isRunning, refreshList]);
+
   const handleSend = useCallback(async (prompt: string, files: File[]) => {
-    if (isRunning) return;
+    if (isRunning || sendInFlightRef.current) return;
     if (!prompt.trim() && !files.length) return;
+    sendInFlightRef.current = true;
     setNotification(null);
 
     let ws = generalWs;
@@ -271,9 +297,14 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         setGeneralWs(ws);
       } catch {
         setNotification('VIN could not reach the backend.');
+        sendInFlightRef.current = false;
         return;
       }
-      if (!ws) { setNotification('No general workspace available yet.'); return; }
+      if (!ws) {
+        setNotification('No general workspace available yet.');
+        sendInFlightRef.current = false;
+        return;
+      }
     }
 
     let chatId = activeChatId;
@@ -286,6 +317,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         await refreshList(ws);
       } catch {
         setNotification('Could not open the House conversation.');
+        sendInFlightRef.current = false;
         return;
       }
     } else if (!chatId) {
@@ -298,6 +330,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         await refreshList(ws);
       } catch {
         setNotification('Could not create a conversation.');
+        sendInFlightRef.current = false;
         return;
       }
     }
@@ -308,12 +341,13 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         attachments = await uploadChatAttachments(ws.id, chatId, files);
       } catch {
         setNotification('Your files could not be uploaded.');
+        sendInFlightRef.current = false;
         return;
       }
     }
 
     const userMsg: ChatMessage = {
-      id: `usr-${Date.now()}`,
+      id: `usr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       role: 'user',
       content: prompt.trim() || `Attached ${attachments.length} file${attachments.length > 1 ? 's' : ''}`,
       timestamp: new Date().toISOString(),
@@ -324,6 +358,8 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     setLiveState(null);
     resetStream();
     startedAtRef.current = Date.now();
+    runWsRef.current = ws;
+    runChatIdRef.current = chatId;
 
     abortRef.current = startHousePipeline(
       prompt.trim(),
@@ -334,15 +370,15 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       async () => {
         try {
           const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
-          const updated = await finishHouseMessage(ws, chatId!, liveStateRef.current, duration);
+          const updated = await finishHouseMessage(ws, chatId!, liveStateRef.current, duration, { thinking: streamRef.current.reasoning, liveTimeline: [...streamRef.current.segments] });
           setMessages(updated);
           setChats(await fetchChats(ws.id));
           fetchChat(ws.id, chatId!).then((chat) => setTokenUsage(chat.token_usage ?? null)).catch(() => {});
-          await refreshTasks();
-        } catch { /* keep the live message visible if persistence fails */ }
+            } catch { /* keep the live message visible if persistence fails */ }
         resetStream();
         setIsRunning(false);
         setLiveState(null);
+        sendInFlightRef.current = false;
         onActive?.({ wsId: ws.id, chatId: chatId! });
       },
       (err) => {
@@ -350,41 +386,20 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         resetStream();
         setIsRunning(false);
         setLiveState(null);
+        sendInFlightRef.current = false;
       },
       workspaceKind,
       applyDelta,
     );
-  }, [isRunning, generalWs, activeChatId, pinnedChatTitle, refreshList, refreshTasks, onActive, applyDelta, resetStream]);
-
-  const handleTaskCreated = useCallback((task: AgentTask) => {
-    setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
-  }, []);
-
-  const handleTaskDelete = useCallback(async (taskId: string) => {
-    if (!generalWs || !activeChatId) return;
-    try {
-      await deleteTask(generalWs.id, activeChatId, taskId);
-      await refreshTasks();
-    } catch { setNotification('Could not delete task.'); }
-  }, [generalWs, activeChatId, refreshTasks]);
-
-  const handleTaskStart = useCallback(async (taskId: string) => {
-    if (!generalWs || !activeChatId || isRunning) return;
-    try {
-      await startTask(generalWs.id, activeChatId, taskId);
-      await refreshTasks();
-    } catch { setNotification('Could not start task.'); }
-  }, [generalWs, activeChatId, isRunning, refreshTasks]);
-
-  const handleTaskRunNow = useCallback(async (prompt: string, files: File[]) => {
-    await handleSend(prompt, files);
-  }, [handleSend]);
+  }, [isRunning, generalWs, activeChatId, pinnedChatTitle, refreshList, onActive, applyDelta, resetStream]);
 
   const liveLog = liveState?.live_terminal_log || '';
-  const liveParsed = parseLogToSteps(liveLog);
+  const liveParsed = useMemo(() => parseLogToSteps(liveLog), [liveLog]);
   const liveText = streaming.active && streaming.text ? streaming.text : (liveParsed.assistantResponse || liveState?.outputs?.agent_report || '');
   const displayMessages = [...messages];
-  if ((isRunning || voiceActive) && (liveText.trim() || streaming.active || messages.length === 0 || liveParsed.steps.length > 0)) {
+  // Show the live bubble immediately on send so the "Thinking" placeholder
+  // appears before the first reasoning delta (the blank-wait bug).
+  if (isRunning || voiceActive) {
     displayMessages.push({
       id: 'house-live', role: 'agent', agentName: streaming.agent || getAssistantName(), content: liveText,
       timestamp: new Date().toISOString(), duration: 'active',
@@ -393,26 +408,45 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         isStreaming: streaming.active,
         streamingReasoning: streaming.reasoning,
         streamRate: streaming.rate,
+        liveTimeline: streaming.segments,
       },
     });
   }
 
   const liveUsage = liveState?.token_usage;
+  // Fallback for chats created before token_usage_json existed — sum per-message usage
+  const messagesUsage = useMemo<TokenUsage | null>(() => {
+    if (tokenUsage) return null;
+    let agg: TokenUsage | null = null;
+    for (const m of messages) {
+      const u = (m.metadata as any)?.usage as TokenUsage | undefined;
+      if (!u) continue;
+      if (!agg) agg = { total_input_tokens: 0, total_output_tokens: 0, total_cache_hit_tokens: 0, total_cache_miss_tokens: 0, total_cost: 0, calls: [] };
+      agg.total_input_tokens += u.total_input_tokens || 0;
+      agg.total_output_tokens += u.total_output_tokens || 0;
+      agg.total_cache_hit_tokens += (u as any).total_cache_hit_tokens || 0;
+      agg.total_cache_miss_tokens += (u as any).total_cache_miss_tokens || 0;
+      agg.total_cost += u.total_cost || 0;
+      agg.calls.push(...(u.calls || []));
+    }
+    return agg;
+  }, [messages, tokenUsage]);
+  const effectiveTokenUsage = tokenUsage || messagesUsage;
   const combinedTokenUsage = useMemo<TokenUsage>(() => ({
-    total_input_tokens: (tokenUsage?.total_input_tokens || 0) + (liveUsage?.total_input_tokens || 0),
-    total_output_tokens: (tokenUsage?.total_output_tokens || 0) + (liveUsage?.total_output_tokens || 0),
-    total_cache_hit_tokens: (tokenUsage?.total_cache_hit_tokens || 0) + (liveUsage?.total_cache_hit_tokens || 0),
-    total_cache_miss_tokens: (tokenUsage?.total_cache_miss_tokens || 0) + (liveUsage?.total_cache_miss_tokens || 0),
-    total_cost: (tokenUsage?.total_cost || 0) + (liveUsage?.total_cost || 0),
-    calls: [...(tokenUsage?.calls || []), ...(liveUsage?.calls || [])],
-  }), [tokenUsage, liveUsage]);
+    total_input_tokens: (effectiveTokenUsage?.total_input_tokens || 0) + (liveUsage?.total_input_tokens || 0),
+    total_output_tokens: (effectiveTokenUsage?.total_output_tokens || 0) + (liveUsage?.total_output_tokens || 0),
+    total_cache_hit_tokens: (effectiveTokenUsage?.total_cache_hit_tokens || 0) + (liveUsage?.total_cache_hit_tokens || 0),
+    total_cache_miss_tokens: (effectiveTokenUsage?.total_cache_miss_tokens || 0) + (liveUsage?.total_cache_miss_tokens || 0),
+    total_cost: (effectiveTokenUsage?.total_cost || 0) + (liveUsage?.total_cost || 0),
+    calls: [...(effectiveTokenUsage?.calls || []), ...(liveUsage?.calls || [])],
+  }), [effectiveTokenUsage, liveUsage]);
   const lastCall = combinedTokenUsage.calls[combinedTokenUsage.calls.length - 1];
   const lastModelName = lastCall?.model || 'Automatic Fallback';
   const activeContextTokens = lastCall?.input || 0;
 
   return {
     workspaceId: generalWs?.id ?? null,
-    chats, activeChatId, displayMessages, isRunning, isLoading, notification, threadRef,
+    chats, activeChatId, displayMessages, liveState, isRunning, isLoading, notification, threadRef,
     isVoiceMode, toggleVoice,
     totalCost: combinedTokenUsage.total_cost,
     totalInput: combinedTokenUsage.total_input_tokens,
@@ -420,10 +454,9 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     totalCacheHitTokens: combinedTokenUsage.total_cache_hit_tokens || 0,
     activeContextTokens,
     combinedTokenUsage, lastModelName,
-    tasks,
     handleNewChat, handleSelectChat, handleRenameChat, handleDeleteChat,
-    handleSend, handleCancel,
-    handleTaskCreated, handleTaskDelete, handleTaskStart, handleTaskRunNow,
+    handleSend, handleCancel, handleRewind,
+    draft, clearDraft: () => setDraft(''),
   };
 }
 

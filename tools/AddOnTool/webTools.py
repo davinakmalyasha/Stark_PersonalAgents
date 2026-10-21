@@ -83,6 +83,6 @@ def web_search(query, max_results=5):
                 clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
                 output += chr(10) + str(i) + '. ' + clean_title + chr(10) + '   ' + clean_snippet
             return output
-        return "Search: " + chr(34) + query + chr(34) + chr(10) + result[:5000]
+        return "Search: " + chr(34) + query + chr(34) + chr(10) + result[:10000]
     except Exception as e:
         return "Search error: " + str(e)

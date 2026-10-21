@@ -17,8 +17,8 @@ deps = WorkspaceDeps.from_shared_state(role="Developer", chat_id="probe-1",
                                        project_path=TARGET)
 
 for label, args in [
-    ("repo-relative skill", {"file_path": ".agents/skills/ui-ux-design/SKILL.md"}),
-    ("abs skill", {"file_path": os.path.join(ROOT, ".agents", "skills", "ui-ux-design", "SKILL.md")}),
+    ("repo-relative skill", {"file_path": ".agents/skills/ui-ux-pro-max/SKILL.md"}),
+    ("abs skill", {"file_path": os.path.join(ROOT, ".agents", "skills", "ui-ux-pro-max", "SKILL.md")}),
     ("drill-local probe", {"file_path": "scratch/agents_works/design/nonexistent.txt"}),
 ]:
     try:

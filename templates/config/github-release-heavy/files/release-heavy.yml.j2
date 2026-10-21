@@ -1,10 +1,15 @@
 name: Release Heavy  # TIER 3 — prod-level pushes + tags v* , deterministic (no live URL, dev-triggered only)
 
-# ── TIER 3 — release-heavy: image/SBOM/license/env-audit/zizmor + migration/schema/config/endpoint/contract/perf/build — deterministic, no live URL ──
+# ── TIER 3 — release-heavy: image/SBOM/license/env-audit/zizmor + migration/schema/config/endpoint/contract/perf/build — deterministic ──
 # Requires: Tier 1 fast (dev/feature pushes) → Tier 2 staging (staging-level push) → Tier 3 release-heavy
 # (this file: push to prod-level branches OR tags v*). Universal: single file (no 3 copies) — add a stack =
 # one hashFiles branch, like Tier 1. All jobs SHA-pinned, hashFiles-gated (0s skip when absent), caches for
 # trivy/zizmor/oasdiff/pip/npm/go. No schedule.
+# release-summary also prints the PUBLIC-LAUNCH CHECKLIST: pipeline rows derived from job results plus the
+# human sign-off rows (capacity, pentest, release watch, legal, status page/on-call, flags, a11y).
+# POST-RELEASE lane (opt-in, deliberately OUTSIDE the deterministic gate graph): release-watch polls the
+# live health/ready endpoints after a green release-summary and can auto-rollback via the deploy provider.
+# Repo vars: RELEASE_WATCH_ENABLED / DEPLOY_PROVIDER / WATCH_URL / AUTO_ROLLBACK; secrets: provider tokens.
 
 {%- set PROD_CSV = ((prod_branches | default('main,master')).split(',') | map('trim') | select | unique | join("', '")) %}
 permissions:
@@ -1482,6 +1487,27 @@ jobs:
             echo ""
             echo "skipped = stack not present or graceful-skip; never a failure"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo ""
+            echo "## Public-launch checklist"
+            echo ""
+            echo "| item | owner | status |"
+            echo "|---|---|---|"
+            echo "| container / SBOM / license | pipeline | $R_CONTAINER / $R_SBOM / $R_LICENSE |"
+            echo "| env audit + workflow security | pipeline | $R_ENV / $R_ZIZMOR |"
+            echo "| endpoint + contract + graceful shutdown | pipeline | $R_ENDPOINT / $R_CONTRACT / $R_GRACEFUL |"
+            echo "| tests + perf + build integrity | pipeline | $R_TESTS / $R_PERF / $R_BUILD |"
+            echo "| rollback readiness | pipeline | $R_ROLLBACK |"
+            echo "| DAST baseline + /ready + chaos drill | pipeline (T2) | see the latest staging run |"
+            echo "| load/soak capacity sign-off | human | sign off the k6-capacity-T2 artifact |"
+            echo "| pentest (strix) | human | dispatch T3 with STRIX_ENABLED=true |"
+            echo "| release watch armed | human | set RELEASE_WATCH_ENABLED + WATCH_URL + DEPLOY_PROVIDER |"
+            echo "| privacy policy / ToS / cookie consent | human | publish before real traffic |"
+            echo "| status page + on-call + rollback rehearsal | human | ready before launch |"
+            echo "| feature flags / kill switches | human | ship dark, enable gradually |"
+            echo "| accessibility pass | human | WCAG spot-check on key flows (UI owns) |"
+          } >> "$GITHUB_STEP_SUMMARY"
           mkdir -p _gate
           GATE_TIER=T3 python3 - << 'PY'
           import json, os
@@ -1523,6 +1549,15 @@ jobs:
               "jobs": jobs,
               "failed_jobs": failed,
               "notes": ["skipped = stack not present or graceful-skip; never a failure"],
+              "launch_checklist_human": [
+                  "load/soak capacity sign-off (k6-capacity-T2)",
+                  "pentest (strix, opt-in dispatch)",
+                  "release watch armed (RELEASE_WATCH_ENABLED + WATCH_URL + DEPLOY_PROVIDER)",
+                  "privacy policy / ToS / cookie consent",
+                  "status page + on-call + rollback rehearsal",
+                  "feature flags / kill switches",
+                  "accessibility pass (UI)",
+              ],
           }
           for cp in ("_gate-in/coverage.json", "_gate/coverage.json"):
               if os.path.exists(cp):
@@ -1577,5 +1612,120 @@ jobs:
         with:
           name: gate-summary-T3
           path: _gate/gate-summary.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ── post-release watch (opt-in) — live SLO smoke + provider rollback ──
+  # Runs AFTER a green release-summary; deliberately OUTSIDE the summary graph so
+  # a watch failure never rewrites the release verdict. `secrets` must not appear
+  # in `if:` — gate on vars (RELEASE_WATCH_ENABLED / DEPLOY_PROVIDER / AUTO_ROLLBACK)
+  # and inject tokens through env only.
+  release-watch:
+    name: release-watch
+    runs-on: ubuntu-latest
+    timeout-minutes: {{ job_timeout_minutes | default('15') }}
+    needs: [release-summary]
+    if: vars.RELEASE_WATCH_ENABLED == 'true' && vars.DEPLOY_PROVIDER != '' && needs.release-summary.result == 'success'
+    steps:
+      - name: Resolve watch URL
+        id: url
+        env:
+          WATCH_URL: {% raw %}${{ vars.WATCH_URL }}{% endraw %}
+          EXTERNAL_SMOKE_URLS: {% raw %}${{ vars.EXTERNAL_SMOKE_URLS }}{% endraw %}
+        run: |
+          URL="${WATCH_URL:-${EXTERNAL_SMOKE_URLS%%,*}}"
+          if [ -z "$URL" ]; then
+            echo "FAIL: set repo variable WATCH_URL (or EXTERNAL_SMOKE_URLS) to arm the release watch"
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+      - name: Watch live health/ready (SLO smoke window)
+        id: watch
+        env:
+          URL: {% raw %}${{ steps.url.outputs.url }}{% endraw %}
+          HEALTH_PATH: {{ health_path | default('/health') }}
+          READY_PATH: {{ ready_path | default('/ready') }}
+          WATCH_MINUTES: {% raw %}${{ vars.WATCH_MINUTES || '5' }}{% endraw %}
+          INTERVAL_S: {% raw %}${{ vars.WATCH_INTERVAL_S || '30' }}{% endraw %}
+          FAIL_STREAK: {% raw %}${{ vars.WATCH_FAIL_STREAK || '3' }}{% endraw %}
+        run: |
+          mkdir -p _gate
+          deadline=$(( $(date +%s) + WATCH_MINUTES * 60 ))
+          fails=0; max_fail=0; checks=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            for p in "$HEALTH_PATH" "$READY_PATH"; do
+              checks=$((checks + 1))
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL$p" || true)
+              if [ "$code" != "200" ]; then
+                fails=$((fails + 1))
+                [ "$fails" -gt "$max_fail" ] && max_fail=$fails
+                echo "not-ok ($code) $URL$p [streak $fails/$FAIL_STREAK]"
+              else
+                fails=0
+              fi
+            done
+            [ "$fails" -ge "$FAIL_STREAK" ] && break
+            sleep "$INTERVAL_S"
+          done
+          CHECK_COUNT="$checks" MAX_FAIL="$max_fail" python3 - << 'PY'
+          import json, os
+          max_fail = int(os.environ.get("MAX_FAIL", "0"))
+          doc = {
+              "schema": "release-watch/v1",
+              "url": os.environ.get("URL", ""),
+              "checks": int(os.environ.get("CHECK_COUNT", "0")),
+              "max_fail_streak": max_fail,
+              "window_minutes": int(os.environ.get("WATCH_MINUTES", "0")),
+              "status": ("failure"
+                         if max_fail >= int(os.environ.get("FAIL_STREAK", "3"))
+                         else "success"),
+          }
+          with open("_gate/release-watch.json", "w") as f:
+              json.dump(doc, f, indent=2)
+          print("release-watch:", json.dumps(doc))
+          PY
+          if [ "$max_fail" -ge "$FAIL_STREAK" ]; then
+            echo "FAIL: release watch breached — $max_fail consecutive non-200 checks"
+            exit 1
+          fi
+          echo "RELEASE-WATCH OK — $checks checks over ${WATCH_MINUTES}m"
+      - name: Roll back on breach (provider-specific)
+        if: failure() && steps.watch.outcome == 'failure' && vars.AUTO_ROLLBACK == 'true'
+        env:
+          DEPLOY_PROVIDER: {% raw %}${{ vars.DEPLOY_PROVIDER }}{% endraw %}
+          VERCEL_TOKEN: {% raw %}${{ secrets.VERCEL_TOKEN }}{% endraw %}
+          VERCEL_ORG_ID: {% raw %}${{ vars.VERCEL_ORG_ID }}{% endraw %}
+          VERCEL_PROJECT_ID: {% raw %}${{ vars.VERCEL_PROJECT_ID }}{% endraw %}
+          CLOUDFLARE_API_TOKEN: {% raw %}${{ secrets.CLOUDFLARE_API_TOKEN }}{% endraw %}
+          RENDER_API_KEY: {% raw %}${{ secrets.RENDER_API_KEY }}{% endraw %}
+          RENDER_SERVICE_ID: {% raw %}${{ vars.RENDER_SERVICE_ID }}{% endraw %}
+        run: |
+          echo "AUTO_ROLLBACK=true — rolling back provider '$DEPLOY_PROVIDER'"
+          case "$DEPLOY_PROVIDER" in
+            vercel)
+              [ -n "$VERCEL_TOKEN" ] || { echo "FAIL: VERCEL_TOKEN secret missing"; exit 1; }
+              npx --yes vercel rollback --yes --token "$VERCEL_TOKEN"
+              ;;
+            cloudflare)
+              [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "FAIL: CLOUDFLARE_API_TOKEN secret missing"; exit 1; }
+              printf 'y\n' | npx --yes wrangler rollback
+              ;;
+            render)
+              echo "render: no rollback API/CLI is exposed — roll back in the Render dashboard"
+              echo "(service ${RENDER_SERVICE_ID:-unset}) or deploy the previous commit again."
+              exit 1
+              ;;
+            *)
+              echo "unknown DEPLOY_PROVIDER '$DEPLOY_PROVIDER' — no rollback performed"
+              exit 1
+              ;;
+          esac
+          echo "ROLLBACK issued for $DEPLOY_PROVIDER — verify the live URL after the platform settles"
+      - name: Upload release-watch report
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-watch-report
+          path: _gate/release-watch.json
           if-no-files-found: ignore
           retention-days: 30

@@ -108,6 +108,76 @@ def estimate_history_tokens(history: list[ModelMessage]) -> int:
     return max(1, total_chars // 4)
 
 
+def _content_to_text(value: Any) -> str:
+    """Full-fidelity part content for the compaction renderer.
+
+    No character caps: the whole point of v2 compaction is that the summarizer
+    sees everything. Only binary payloads are replaced by placeholders.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        out = [_content_to_text(item) for item in value]
+        return "\n".join(part for part in out if part)
+    if isinstance(value, dict):
+        kind = str(value.get("type") or "")
+        if "image" in kind or "audio" in kind or "file" in kind:
+            name = value.get("filename") or value.get("name") or ""
+            return f"[Attached {kind or 'media'}{': ' + str(name) if name else ''}]"
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value or "")
+
+
+def render_history_blocks(history: list[ModelMessage]) -> list[str]:
+    """Render the FULL transcript as one block per message, uncapped.
+
+    Used by compaction: the summarizer must see everything, including tool
+    arguments/results and reasoning that ``history_to_debug_text`` truncates.
+    A message is never split.
+    """
+    blocks: list[str] = []
+    for message in history:
+        lines: list[str] = []
+        for part in getattr(message, "parts", []) or []:
+            kind = getattr(part, "part_kind", "")
+            if kind == "system-prompt":
+                lines.append("[SYSTEM]\n" + _content_to_text(getattr(part, "content", "")))
+            elif kind == "user-prompt":
+                lines.append("[USER]\n" + _content_to_text(getattr(part, "content", "")))
+            elif kind == "text":
+                lines.append("[ASSISTANT]\n" + _content_to_text(getattr(part, "content", "")))
+            elif kind == "thinking":
+                lines.append("[ASSISTANT REASONING]\n" + _content_to_text(getattr(part, "content", "")))
+            elif kind == "tool-call":
+                name = getattr(part, "tool_name", "") or ""
+                args = getattr(part, "args", "")
+                lines.append(f"[TOOL CALL {name}]\n" + _content_to_text(args))
+            elif kind == "tool-return":
+                name = getattr(part, "tool_name", "") or ""
+                lines.append(f"[TOOL RESULT {name}]\n" + _content_to_text(getattr(part, "content", "")))
+            elif kind == "retry-prompt":
+                lines.append("[RETRY]\n" + _content_to_text(getattr(part, "content", "")))
+            else:
+                content = getattr(part, "content", "")
+                rendered = _content_to_text(content)
+                if rendered:
+                    lines.append(f"[{kind.upper() or 'PART'}]\n{rendered}")
+        block = "\n\n".join(line for line in lines if line)
+        if block.strip():
+            blocks.append(block)
+    return blocks
+
+
+def render_full_history(history: list[ModelMessage]) -> str:
+    """The entire transcript as plain text (no caps) for the summarizer."""
+    return "\n\n".join(render_history_blocks(history))
+
+
 def history_to_debug_text(history: list[ModelMessage]) -> str:
     """Render history as plain text for logging / compaction summary."""
     lines: list[str] = []
@@ -137,63 +207,33 @@ def history_to_debug_text(history: list[ModelMessage]) -> str:
 
 # ── Native compaction helpers (A6b/A7) ────────────────────────────────────
 
-def _estimate_single(msg: ModelMessage) -> int:
-    """Token estimate for one ModelMessage (4 chars/token)."""
-    total = 0
-    for p in getattr(msg, "parts", []) or []:
-        c = getattr(p, "content", "") or ""
-        if isinstance(c, str):
-            total += len(c)
-        elif isinstance(c, (list, dict)):
-            total += len(json.dumps(c))
-        args = getattr(p, "args", None)
-        if isinstance(args, dict):
-            total += len(json.dumps(args))
-        elif isinstance(args, str):
-            total += len(args)
-        # ToolReturnPart.content may be large
-        if isinstance(p, ToolReturnPart):
-            total += len(str(p.content or ""))
-    return max(1, total // 4)
+#: Paid canonical models with their known context windows.
+_PAID_WINDOWS = {
+    "deepseek-v4.1-flash": 1_000_000,
+    "deepseek-v4.1-vision": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+}
 
 
-def select_tail_history(
-    history: list[ModelMessage],
-    budget_tokens: int = 20000,
-    keep_recent_turns: int = 2,
-    min_keep_messages: int = 3,
-) -> list[int]:
-    """Select tail indices for native history (mirrors context_compaction.select_tail_indices).
+def window_for_model(model_id: str) -> int:
+    """Best-effort context window for a model id (0 = unknown, no clamp).
 
-    Never includes index 0 (system). Keeps whole messages as atomic units
-    (ModelMessage already groups ToolCall/ToolReturn correctly).
+    Free-pool models resolve from config/free_catalog.json; paid canonical
+    slugs use the static map above. Callers clamp the compaction trigger to
+    this value so a 256k model compacts long before the provider rejects.
     """
-    if len(history) <= 2:
-        return list(range(len(history)))
-    # Exclude system prompt at 0
-    body_start = 1
-    if len(history) <= body_start:
-        return list(range(len(history)))
-    # Greedy from end while budget allows
-    selected: list[int] = []
-    total = 0
-    for idx in range(len(history) - 1, body_start - 1, -1):
-        est = _estimate_single(history[idx])
-        if total + est <= budget_tokens or len(selected) < min_keep_messages:
-            selected.append(idx)
-            total += est
-            if len(selected) >= keep_recent_turns and total >= budget_tokens:
-                break
-        elif total + est > budget_tokens and len(selected) >= min_keep_messages:
-            break
-        else:
-            selected.append(idx)
-            total += est
-    selected.sort()
-    # Ensure at least min_keep_messages if possible
-    if len(selected) < min_keep_messages and len(history) > 1:
-        selected = list(range(max(1, len(history) - min_keep_messages), len(history)))
-    return selected
+    m = str(model_id or "").strip().lower()
+    if not m:
+        return 0
+    for key, win in _PAID_WINDOWS.items():
+        if key in m:
+            return int(win)
+    try:
+        from llm.free_providers import model_context_window
+
+        return int(model_context_window(m, 0) or 0)
+    except Exception:
+        return 0
 
 
 def compact_history_native(
@@ -202,33 +242,41 @@ def compact_history_native(
     policy=None,
     full_project_map: str | None = None,
     summary_text: str | None = None,
+    project_memory_text: str | None = None,
+    user_messages: list[str] | None = None,
 ) -> list[ModelMessage]:
-    """Native counterpart to checkpoint_compact for ModelMessage history.
+    """Rebuild history in the Codex compaction shape:
 
-    Rebuilds [System, <current-context>fullMap?, summary, tail] when history
-    exceeds policy tail budget. Used by ProcessHistory or manual compaction.
+        [System, project-memory, <current-context>map, ...user messages..., summary]
+
+    The summary is LAST because the model is trained to continue from a
+    handoff summary in last position. Only user asks are retained verbatim
+    (bounded by ``COMPACT_USER_MESSAGE_MAX_TOKENS`` upstream); assistant and
+    tool turns live on inside the summary. project.md and the map are always
+    re-anchored fresh and are never summarized.
     """
     if len(history) <= 2:
         return history
-    # Resolve policy
-    try:
-        from memory.context_compaction import get_compaction_policy
-        pol = policy or get_compaction_policy("developer")
-    except Exception:
-        pol = None
-    tail_budget = getattr(pol, "tail_budget_tokens", 20000) if pol else 20000
-    tail_indices = select_tail_history(history, budget_tokens=tail_budget)
-    # Tail messages (exclude system + project map)
-    tail = [history[i] for i in tail_indices if i != 0]
-    # System prompt (preserve)
     system_msg = history[0] if history and isinstance(history[0], ModelRequest) else None
     compacted: list[ModelMessage] = []
     if system_msg is not None:
         compacted.append(system_msg)
+    if project_memory_text:
+        compacted.append(ModelRequest(parts=[UserPromptPart(content=(
+            "<project-memory>\n" + project_memory_text + "\n</project-memory>"
+        ))]))
     if full_project_map:
         compacted.append(ModelRequest(parts=[UserPromptPart(content=f"<current-context>\n{full_project_map}\n</current-context>")]))
-    # Summary
+    if user_messages is None:
+        try:
+            from memory.compaction_engine import collect_retained_user_messages
+            user_messages = collect_retained_user_messages(history)
+        except Exception:
+            user_messages = []
+    for text in user_messages or []:
+        if str(text or "").strip():
+            compacted.append(ModelRequest(parts=[UserPromptPart(content=str(text))]))
+    # Summary LAST (Codex: the resuming model continues from the handoff).
     summary = summary_text or "[Conversation truncated for length — earlier turns summarized]"
-    compacted.append(ModelRequest(parts=[UserPromptPart(content=f"[COMPACTION SUMMARY]\n{summary}")]))
-    compacted.extend(tail)
+    compacted.append(ModelRequest(parts=[UserPromptPart(content=summary)]))
     return compacted

@@ -39,7 +39,7 @@ text, calls, reasoning = pai_native_turn(
     role="Smoke",
     messages=msgs,
     tools=TOOLS,
-    model="deepseek:v4-flash",
+    model="deepseek:v4.1-flash",
     temp=0.2,
     reasoning_effort="disabled",
     where="smoke test",
@@ -67,7 +67,7 @@ msgs2 = [
     HumanMessage(content="What is the weather in Jakarta? Temperature about 30C, sunny."),
 ]
 res = pai_structured(
-    msgs2, WeatherResult, model="deepseek:v4-flash",
+    msgs2, WeatherResult, model="deepseek:v4.1-flash",
     where="smoke structured", base_url=BASE, api_key=KEY,
 )
 print("structured:", res)

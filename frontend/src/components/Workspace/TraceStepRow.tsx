@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { FileText, File, Folder, ArrowUpRight, Bot, Check, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 import type { TraceStep } from '../../utils/logParser';
+import { delegationTarget, isDelegationToolName } from '../../utils/logParser';
 import SubagentActivityPanel from './SubagentActivityPanel';
 import DiffView from './DiffView';
 
@@ -8,7 +9,7 @@ interface Props {
   step: TraceStep;
   onOpenSubagent?: (name: string, task: string) => void;
   /** Session-keyed drill-in (steps carrying childId) → opens the subagent view. */
-  onOpenSubagentSession?: (childId: string, label: string) => void;
+  onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
   activeSubagent?: string | null;
   allTraceSteps?: TraceStep[];
   isActive?: boolean;
@@ -278,41 +279,40 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'task' || step.toolName === 'start_async_task') {
-    let name = 'Subagent';
-    let taskDesc = '';
-    if (step.args) {
-      try {
-        const parsed = JSON.parse(step.args);
-        name = parsed.name || 'Subagent';
-        taskDesc = parsed.task || '';
-      } catch { /* args are best-effort display only */ }
-    }
-    const isAsync = step.toolName === 'start_async_task';
+  if (isDelegationToolName(step.toolName)) {
+    const { name: targetName, task: targetTask } = delegationTarget(step.args);
+    const name = targetName || 'Subagent';
+    const taskDesc = targetTask;
+    const isAsync = (step.toolName === 'call_subagent' || step.toolName === 'delegate') && !!step.childId;
 
     // Session-keyed spawn (new traces): opens the read-only drill-in view.
+    // Whole card is clickable per UX request — not just the Open text.
     if (step.childId) {
-      const label = step.label || taskDesc.slice(0, 42) || name;
+      const label = step.label || taskDesc.slice(0, 80) || name;
+      const displayLabel = label.length > 90 ? label.slice(0, 90) + '…' : label;
+      const wsHint = step.childWorkspace ? String(step.childWorkspace).replace(/^_/, '') : '';
       return (
-        <div className={`subagent-live-card ${isActive ? 'is-working' : ''}`}>
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => onOpenSubagentSession?.(step.childId!, label, step.childWorkspace)}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpenSubagentSession?.(step.childId!, label, step.childWorkspace); } }}
+          className={`subagent-live-card w-full text-left cursor-pointer hover:border-zinc-700/60 transition-colors ${isActive ? 'is-working' : ''}`}
+        >
           <div className="subagent-card-top">
             <span className="subagent-avatar">{isActive ? <Bot size={14} /> : <Check size={14} />}</span>
             <div className="min-w-0 flex-1">
-              <div className="subagent-name">{name} <span>subagent</span></div>
+              <div className="subagent-name">{name} <span>subagent</span>{wsHint ? <span className="opacity-60"> · {wsHint}</span> : null}</div>
               <div className={`subagent-state ${isActive ? 'is-working' : 'is-complete'}`}>
                 {isActive ? <Loader2 size={10} /> : <Check size={10} />}
-                {isActive ? (isAsync ? 'Running asynchronously' : 'Working on delegated task') : (isAsync ? 'Async task completed' : 'Delegated task completed')}
+                {isActive ? (isAsync ? 'Running asynchronously' : 'Stark → working in this chat') : (isAsync ? 'Async task completed' : 'Delegated task completed')}
               </div>
             </div>
-            <button
-              type="button"
-              className="subagent-open"
-              onClick={() => onOpenSubagentSession?.(step.childId!, label)}
-            >
-              Open session <ArrowUpRight size={12} />
-            </button>
+            <span className="subagent-open pointer-events-none">
+              Open <ArrowUpRight size={12} />
+            </span>
           </div>
-          {label && label !== name && <p className="subagent-task">{label}</p>}
+          {displayLabel && displayLabel !== name && <p className="subagent-task line-clamp-2">{displayLabel}</p>}
         </div>
       );
     }

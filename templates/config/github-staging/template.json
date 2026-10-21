@@ -1,7 +1,7 @@
 {
   "_comment": "TIER 2 — staging: live integration proof that Tier 1 (fast) + Tier 3 (release-heavy) cannot do — covers out-of-scope items #3 backup drill, #4 N-1 compat, #6 rotation age, #10 multi-worker, #17 TLS, #18 DNS, #19 external smoke, #20 k6 load (#14 cosign / #15 canary belong to the deploy tier). Every job spins a real service or hits a real URL and graceful-skips when staging infra is absent. Dev-triggered only: push to the staging-level branch (default 'staging', override via .harness-ci.json) or workflow_dispatch. No schedule.",
   "name": "github-staging",
-  "description": "TIER 2 — staging: 10 live integration jobs distinct from Tier 1 fast (~18s) + Tier 3 release-heavy (deterministic): backup drill, N-1 compat, rotation age, multi-worker, DNS/TLS preflight, external smoke, k6 load, and live staging smoke. All jobs graceful-skip when staging URL/secrets are absent; none block PRs.",
+  "description": "TIER 2 — staging: live integration jobs distinct from Tier 1 fast (~18s) + Tier 3 release-heavy (deterministic): backup drill, N-1 compat, rotation age, multi-worker, chaos drill (DB kill + recovery), DNS/TLS preflight, external smoke, ZAP DAST baseline, k6 scenarios (smoke/load/soak/spike/breakpoint) with a capacity report, and live staging smoke. All jobs graceful-skip when staging URL/secrets are absent; none block PRs.",
   "category": "config",
   "variables": [
     {
@@ -53,6 +53,36 @@
       "description": "k6 max error rate (%) — breach fails the gate"
     },
     {
+      "name": "k6_ramp_s",
+      "type": "string",
+      "default": "30",
+      "description": "k6 ramp-up stage duration (seconds) for load/spike/breakpoint scenarios"
+    },
+    {
+      "name": "k6_hold_s",
+      "type": "string",
+      "default": "120",
+      "description": "k6 steady/spike hold stage duration (seconds)"
+    },
+    {
+      "name": "k6_soak_minutes",
+      "type": "string",
+      "default": "30",
+      "description": "k6 soak scenario duration (minutes) — keep <= runner budget; long soaks belong to dispatch runs"
+    },
+    {
+      "name": "k6_spike_mult",
+      "type": "string",
+      "default": "5",
+      "description": "Spike multiplier over k6_vus for the spike scenario"
+    },
+    {
+      "name": "k6_target_rps",
+      "type": "string",
+      "default": "0",
+      "description": "Capacity target (req/s): load/soak/spike fail below 90% of it; 0 disables the capacity assertion"
+    },
+    {
       "name": "health_path",
       "type": "string",
       "default": "/health",
@@ -89,7 +119,7 @@
       "dest": ".github/workflows/staging.yml"
     }
   ],
-  "notes": "TIER 2 — staging golden standard (dev-triggered only — no schedule). Distinct from Tier 1 fast (~18s) and Tier 3 release-heavy (deterministic image/SBOM/zizmor/oasdiff on prod pushes/tags). Every staging job spins a real service or hits a real URL. Golden semantics: /ready 200=pass, 404=WARN (probe not implemented), 503=FAIL (DB down); backup drill verifies DATA round-trip via MD5 checksum restored into a FRESH db with ON_ERROR_STOP; N-1 asserts alembic current==heads after forward upgrade. Speed: one shared `changes` diff-gate job feeds every worker via needs — service containers never boot on non-backend pushes; live-only jobs (dns/tls/external) skip at JOB level when unwired (vars/inputs URL); one shared ~/.venv-fast cache key + restore-keys prefix; k6 tarball cached; probe paths configurable via health_path/ready_path, postgres via pg_version. Impact: multi-worker/k6/smoke assert no Tracebacks under load; backup checksum, N-1 head assert. Flexibility: kill switches vars.STAGING_NO_DB_DRILLS / STAGING_NO_K6 / STAGING_NO_LIVE / STAGING_NO_ROTATION='true' (NO_LIVE forces ephemeral targets everywhere) · STAGING_INTERNAL_DNS=true tolerates split-horizon DNS; thresholds k6_vus/k6_duration_s/k6_p95_ms/k6_error_rate_pct/tls_min_days/rotation_days/pg_version/health_path/ready_path; .staging-smoke.txt for extra external targets; workflow_dispatch input staging_url override. staging-summary writes a results table to $GITHUB_STEP_SUMMARY; anything not success/skipped fails the gate. Promotion: PR -> Tier 1 -> merge to {{staging_branch}} -> this gate (push staging-level branch or dispatch) -> prod push or tag v* -> Tier 3 -> prod. No nightly.",
+  "notes": "TIER 2 — staging golden standard (dev-triggered only — no schedule). Distinct from Tier 1 fast (~18s) and Tier 3 release-heavy (deterministic image/SBOM/zizmor/oasdiff on prod pushes/tags). Every staging job spins a real service or hits a real URL. Golden semantics: /ready 200=pass, 404=WARN (probe not implemented), 503=FAIL (DB down); backup drill verifies DATA round-trip via MD5 checksum restored into a FRESH db with ON_ERROR_STOP; N-1 asserts alembic current==heads after forward upgrade. Speed: one shared `changes` diff-gate job feeds every worker via needs — service containers never boot on non-backend pushes; live-only jobs (dns/tls/external) skip at JOB level when unwired (vars/inputs URL); one shared ~/.venv-fast cache key + restore-keys prefix; k6 tarball cached; probe paths configurable via health_path/ready_path, postgres via pg_version. Impact: multi-worker/k6/smoke assert no Tracebacks under load; backup checksum, N-1 head assert. Flexibility: kill switches vars.STAGING_NO_DB_DRILLS / STAGING_NO_K6 / STAGING_NO_LIVE / STAGING_NO_ROTATION / STAGING_NO_CHAOS / STAGING_NO_DAST='true' (NO_LIVE forces ephemeral targets everywhere) · STAGING_INTERNAL_DNS=true tolerates split-horizon DNS; thresholds k6_vus/k6_duration_s/k6_p95_ms/k6_error_rate_pct/k6_ramp_s/k6_hold_s/k6_soak_minutes/k6_spike_mult/k6_target_rps/tls_min_days/rotation_days/pg_version/health_path/ready_path; repo var K6_SCENARIO selects the scenario; chaos-drill runs only when DB markers exist and skips (not fails) non-DB apps; ZAP baseline runs only with a live URL; .staging-smoke.txt for extra external targets; workflow_dispatch input staging_url override. staging-summary writes a results table to $GITHUB_STEP_SUMMARY; anything not success/skipped fails the gate. Promotion: PR -> Tier 1 -> merge to {{staging_branch}} -> this gate (push staging-level branch or dispatch) -> prod push or tag v* -> Tier 3 -> prod. No nightly.",
   "sample_vars": {
     "staging_branch": "staging",
     "staging_url": "",
@@ -99,6 +129,11 @@
     "k6_duration_s": "30",
     "k6_p95_ms": "500",
     "k6_error_rate_pct": "1",
+    "k6_ramp_s": "30",
+    "k6_hold_s": "120",
+    "k6_soak_minutes": "30",
+    "k6_spike_mult": "5",
+    "k6_target_rps": "0",
     "tls_min_days": "30",
     "health_path": "/health",
     "ready_path": "/ready",

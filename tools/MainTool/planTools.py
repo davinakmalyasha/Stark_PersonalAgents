@@ -12,10 +12,10 @@ from ._shared import _log_tool
 
 from sync.sync_helpers import (
     PLAN_STATUSES,
-    MAX_PLAN_STEPS,
     MAX_STEP_CHARS,
     save_plan,
     plan_state,
+    load_plan,
 )
 
 
@@ -68,8 +68,6 @@ def _normalize_plan(plan) -> tuple[list[dict], list[str]]:
             errors.append(f"invalid status '{status}' (must be pending|in_progress|completed)")
             continue
         items.append({"step": step[:MAX_STEP_CHARS], "status": status})
-        if len(items) >= MAX_PLAN_STEPS:
-            break
     if not items:
         return [], errors or ["plan must contain at least one step"]
     in_progress = [i for i in items if i["status"] == "in_progress"]
@@ -81,25 +79,93 @@ def _normalize_plan(plan) -> tuple[list[dict], list[str]]:
         )
     return items, errors
 
+def _clean_status(value, notes: list) -> str:
+    status = str(value or "pending").strip().lower()
+    if status not in PLAN_STATUSES:
+        notes.append(f"invalid status '{value}' (want pending|in_progress|completed) — used pending")
+        return "pending"
+    return status
 
-def update_plan(explanation: str = "", plan: list = None, ctx: object = None) -> str:
-    """Update the task plan (codex-style full replacement).
 
-    Provide an optional explanation and the entire plan array. At most one step
-    may be `in_progress`; extras are demoted to `pending`.
+def _apply_ops(current: list[dict], ops) -> tuple[list[dict], list[str]]:
+    """Patch loaded plan items with incremental ops. Returns (items, notes)."""
+    working = [dict(it) for it in (current or []) if isinstance(it, dict)]
+    notes: list[str] = []
+    for op in (ops or []):
+        if not isinstance(op, dict):
+            notes.append("skipped a non-object op")
+            continue
+        kind = str(op.get("op", "")).strip().lower()
+        if kind == "add":
+            step = str(op.get("step", "")).strip()
+            if not step:
+                notes.append("add needs 'step'")
+                continue
+            working.append({"step": step[:MAX_STEP_CHARS],
+                            "status": _clean_status(op.get("status", "pending"), notes)})
+            continue
+        if kind in ("set_status", "rename", "remove"):
+            match = str(op.get("match", "")).strip().lower()
+            if not match:
+                notes.append(f"{kind} needs 'match'")
+                continue
+            targets = [it for it in working if match in str(it.get("step", "")).lower()]
+            if not targets:
+                notes.append(f"no step matches '{op.get('match', '')}'")
+                continue
+            if kind == "remove":
+                working = [it for it in working if not any(it is t for t in targets)]
+            elif kind == "set_status":
+                status = _clean_status(op.get("status"), notes)
+                for t in targets:
+                    t["status"] = status
+            else:
+                new_step = str(op.get("step", "")).strip()
+                if not new_step:
+                    notes.append("rename needs 'step' (new text)")
+                    continue
+                for t in targets:
+                    t["step"] = new_step[:MAX_STEP_CHARS]
+            continue
+        notes.append(f"unknown op '{op.get('op', '')}' (want add|set_status|rename|remove)")
+    return working, notes
+
+
+def update_plan(explanation: str = "", plan: list = None, ops: list = None, ctx: object = None) -> str:
+    """Update the task plan (codex-style full replacement) or patch it (ops).
+
+    Full mode: provide the entire plan array. At most one step may be
+    `in_progress`; extras are demoted to `pending`.
+    Incremental mode: pass ops instead of plan — [{op, match?, step?, status?}]
+    with op = add (needs step) | set_status (needs match+status) |
+    rename (needs match+step) | remove (needs match). match is a
+    case-insensitive substring of the step text. Small tweaks cost a fraction
+    of a full rewrite; use full mode when the plan shape itself changes.
     """
     from tools import shared_state, WORKSPACE
     from sync.state_sync import safe_update_state, safe_append_live_log
 
-    scope = _resolve_scope(ctx)
-    items, errors = _normalize_plan(plan)
-    if not items:
-        return "Error: update_plan requires a non-empty plan" + (
-            f": {'; '.join(errors)}" if errors else " with valid steps"
-        )
+    if plan is not None and ops is not None:
+        return "Error: pass either plan (full replacement) or ops (incremental), not both."
 
+    scope = _resolve_scope(ctx)
     project_path = shared_state.get("project_path") or WORKSPACE
     chat_id = _resolve_chat(ctx) or shared_state.get("chat_id") or ""
+
+    if ops is not None:
+        patched, patch_notes = _apply_ops(load_plan(project_path, chat_id, scope), ops)
+        items, errors = _normalize_plan(patched)
+        errors = patch_notes + errors
+        if not items:
+            return "Error: ops left the plan empty" + (
+                f": {'; '.join(errors)}" if errors else "")
+    else:
+        items, errors = _normalize_plan(plan)
+        if not items:
+            return "Error: update_plan requires a non-empty plan" + (
+                f": {'; '.join(errors)}" if errors else " with valid steps"
+            )
+
     save_plan(items, project_path, chat_id, scope)
 
     completed = sum(1 for it in items if it["status"] == "completed")

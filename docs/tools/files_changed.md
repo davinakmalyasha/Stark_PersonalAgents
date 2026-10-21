@@ -2,7 +2,7 @@
 
 - **Description:** Stage 5 (advisory): list the most recent external file changes in the active workspace. The agent can call this to notice when the user (or another tool outside this run) edits a file. Does NOT invalidate the read cache or interrupt a running tool. Requires the optional `watchfiles` package; if not installed, returns a friendly 'not available' string.
 - **Exposed to model:** True
-- **Scopes (from _SCOPE_MAP):** orchestrator, general, dfd
+- **Scopes (from _SCOPE_MAP):** general, dfd
 - **Parallel-safe (PARALLEL_SAFE):** True
 - **Compact doc:** (none)
 - **Required args (validated):** (none)

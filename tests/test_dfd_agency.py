@@ -181,7 +181,7 @@ def test_dfd_scope_schema():
     check("dfd scope defined", bool(scope))
     check("dfd scope has dfd_bridge", "dfd_bridge" in scope)
     check("dfd scope has create_client", "create_client" in scope)
-    check("dfd scope has create_project", "create_project" in scope)
+    check("dfd scope has create_coding_project", "create_coding_project" in scope)
     check("dfd scope has NO money tools", not ({"payment", "invoice"} & set(scope)))
     defs = [d["name"] for d in schemas.TOOL_DEFINITIONS]
     check("dfd_bridge defined in TOOL_DEFINITIONS", "dfd_bridge" in defs)

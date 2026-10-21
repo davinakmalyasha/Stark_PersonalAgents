@@ -1,10 +1,10 @@
 # delegation_status
 
-- **Description:** List all delegations spawned this session with live statuses (running / done / failed) and their chat ids. Call when you need to know what is still outstanding — typically before a wrap-up summary, after a long wait, or when you are unsure whether everything has settled.
+- **Description:** List all delegations spawned this session with live statuses (queued / running / done / failed / cancelled) and their chat ids. Call when you need to know what is still outstanding — typically before a wrap-up summary, after a long wait, or when you are unsure whether everything has settled. Pass id for ONE job's full evidence bundle (task, outcome, acceptance, full report, recent chat, file digest); wait_seconds (0-300) waits briefly for a job first; status filters the board.
 - **Exposed to model:** True
 - **Scopes (from _SCOPE_MAP):** orchestrator
 - **Parallel-safe (PARALLEL_SAFE):** True
-- **Compact doc:** delegation_status() — List this session's delegations with live statuses and chats.
+- **Compact doc:** delegation_status(id?, wait_seconds?, status?) — Board of this session's delegations (queued/running/done/failed/cancelled) with chats and elapsed time; id=<del-id> drills into one job's full evidence (task, outcome, acceptance, full artifact report, recent chat, file digest).
 - **Required args (validated):** (none)
 - **Deps-migrated:** False (accepts ctx=WorkspaceDeps via registry shim)
 - **Native equivalent (pydantic-ai 2.36):** Tool.from_schema(TOOL_DEFINITIONS) | Hooks.before/after_tool_execute (cache/guard/redact/offload) | Tool(args_validator, max_retries) | FilteredToolset(allowed_tools)
@@ -12,7 +12,9 @@
 
 ## Parameters (JSON Schema)
 
-  - (none)
+  - `id` (string, optional): Job id (del-xxxx) for the full evidence bundle of one job. Omit for the board.
+  - `wait_seconds` (integer, optional): Wait up to this long for a job before answering (default 0 = answer now).
+  - `status` (string, optional): Board filter: only show jobs in this state.
 
 ## How to recreate
 

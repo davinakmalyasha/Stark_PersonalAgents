@@ -121,74 +121,92 @@ def apply_search_replace(content: str, diff: str) -> tuple[str, list[str]]:
     return final_content, []
 
 
+def _window_matches(content_lines: list, start: int, old: list) -> bool:
+    """True when content_lines[start:start+len(old)] equals the hunk's removed/context lines."""
+    if start < 0 or start + len(old) > len(content_lines):
+        return False
+    return content_lines[start:start + len(old)] == old
+
+
 def apply_unified_diff(content: str, diff: str) -> tuple[str, list[str]]:
-    lines = content.replace('\r\n', '\n').split('\n')
+    """Apply @@-hunk diffs with codex-style tolerance: line numbers optional.
+
+    Hunks are matched against the ORIGINAL file by their removed ('-') and
+    context (' ') lines, in listed order (git/codex semantics). Each hunk's
+    window must start at or after the previous hunk's window, so numbered,
+    bare '@@', and drift-tolerated hunks coexist; '@@' headers may carry any
+    trailing text (ignored). Pure-addition hunks without numbers append at
+    the end of the file. Returns ('', errors) with NO partial edits on error.
+    """
+    content_lines = content.replace('\r\n', '\n').split('\n')
     diff_lines = diff.replace('\r\n', '\n').split('\n')
-    
+
     hunks = []
-    current_hunk = None
-    
+    current = None
     for line in diff_lines:
         if line.startswith('@@'):
-            if current_hunk:
-                hunks.append(current_hunk)
-            m = re.match(r'@@ -(\d+),?(\d+)? \+(\d+),?(\d+)? @@', line)
-            if m:
-                old_start = int(m.group(1))
-                current_hunk = {'old_start': old_start, 'lines': []}
-            else:
-                current_hunk = None
-        elif current_hunk is not None:
-            if line.startswith('-') or line.startswith('+') or line.startswith(' '):
-                current_hunk['lines'].append(line)
-                
-    if current_hunk:
-        hunks.append(current_hunk)
-        
+            if current is not None:
+                hunks.append(current)
+            m = re.search(r'-(\d+)', line)
+            current = {'old_start': (int(m.group(1)) - 1 if m else None), 'lines': []}
+        elif current is not None and line[:1] in ('+', '-', ' '):
+            current['lines'].append(line)
+    if current is not None:
+        hunks.append(current)
+
     if not hunks:
-        return "", ["No unified diff hunks found (missing @@ header or matching lines)."]
-        
-    hunks.sort(key=lambda h: h['old_start'], reverse=True)
-    
+        return "", ["No hunks found. Use '@@' headers with '-' removed lines, '+' added lines, and ' ' context lines."]
+
+    parsed = []
+    for h in hunks:
+        parsed.append({
+            'old_start': h['old_start'],
+            'old': [ln[1:] for ln in h['lines'] if ln.startswith('-') or ln.startswith(' ')],
+            'new': [ln[1:] for ln in h['lines'] if ln.startswith('+') or ln.startswith(' ')],
+        })
+
+    n = len(content_lines)
     errors = []
-    new_lines = list(lines)
-    for hunk in hunks:
-        start_idx = hunk['old_start'] - 1
-        hunk_old_lines = [l[1:] for l in hunk['lines'] if l.startswith('-') or l.startswith(' ')]
-        hunk_new_lines = [l[1:] for l in hunk['lines'] if l.startswith('+') or l.startswith(' ')]
-        
-        match = True
-        for i, old_line in enumerate(hunk_old_lines):
-            target_idx = start_idx + i
-            if target_idx >= len(new_lines) or new_lines[target_idx] != old_line:
-                match = False
-                break
-                
-        if not match:
-            found = False
-            for offset in range(-10, 11):
-                test_idx = start_idx + offset
-                if test_idx < 0:
-                    continue
-                match = True
-                for i, old_line in enumerate(hunk_old_lines):
-                    target_idx = test_idx + i
-                    if target_idx >= len(new_lines) or new_lines[target_idx] != old_line:
-                        match = False
-                        break
-                if match:
-                    start_idx = test_idx
-                    found = True
+    result = []
+    cursor = 0  # original-file index: everything below it has been consumed
+
+    for h in parsed:
+        o = h['old']
+        start = None
+        # 1) exact-numbered position first (when the model supplied numbers)
+        if h['old_start'] is not None and o:
+            cand = h['old_start']
+            if cand >= cursor and _window_matches(content_lines, cand, o):
+                start = cand
+        # 2) context-only search forward from the previous hunk's window
+        if start is None and o:
+            for i in range(max(cursor, 0), n - len(o) + 1):
+                if _window_matches(content_lines, i, o):
+                    start = i
                     break
-            if not found:
-                errors.append(f"Hunk starting at line {hunk['old_start']} failed to match context lines.")
-                continue
-                
-        new_lines[start_idx : start_idx + len(hunk_old_lines)] = hunk_new_lines
-        
+        # 3) pure-addition hunks (no removed/context lines)
+        if start is None and not o:
+            if h['old_start'] is not None:
+                start = max(cursor, min(h['old_start'], n))
+            else:
+                start = n  # no anchor: append at the end of the file
+        if start is None:
+            errors.append(
+                "Hunk failed to match the file. Add 2-4 unchanged lines prefixed with ' ' "
+                "(space) around the edit to anchor the hunk; line numbers are optional."
+            )
+            continue
+        result.extend(content_lines[cursor:start])
+        result.extend(h['new'])
+        cursor = start + len(o)
+
     if errors:
         return "", errors
-    return '\n'.join(new_lines), []
+    result.extend(content_lines[cursor:])
+    final = '\n'.join(result)
+    if '\r\n' in content:
+        final = final.replace('\n', '\r\n')
+    return final, []
 
 
 def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
@@ -230,7 +248,7 @@ def _apply_diff(file_path: str = "", diff: str = "", ctx: object = None) -> str:
         raise ToolFailed(f"Error applying diff to {file_path}: {e}")
 
 
-_PATCH_MARKER_RE = re.compile(r'^\*\*\* (Add File|Update File|Delete File|Move to): (.*?)\s*$')
+_PATCH_MARKER_RE = re.compile(r'^\s*\*\*\*\s*(Add File|Update File|Delete File|Move to):\s*(.*?)\s*$')
 _PATCH_KIND_MAP = {"Add File": "add", "Update File": "update", "Delete File": "delete"}
 
 
@@ -280,6 +298,11 @@ def _parse_patch_sections(diff: str):
                 flush()
                 cur_kind = _PATCH_KIND_MAP[kind]
                 cur_path = path
+            i += 1
+            continue
+        stripped = line.strip()
+        if stripped == "*** Begin Patch" or stripped == "*** End Patch":
+            # codex-style envelope: pure grouping markers, carry no content.
             i += 1
             continue
         if line.startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ "):
@@ -478,7 +501,7 @@ def _run_verify(verify: str, file_path: str, diff: str = None) -> str:
                 if r.returncode == 0:
                     out_lines.append(f"  {t}: OK")
                 else:
-                    out_lines.append(f"  {t}: FAIL\n{r.stderr.strip()[:500] or r.stdout.strip()[:500]}")
+                    out_lines.append(f"  {t}: FAIL\n{r.stderr.strip()[:2000] or r.stdout.strip()[:2000]}")
             if not out_lines:
                 return "\n[VERIFY py_compile] No .py targets"
             status = "passed" if all("OK" in l for l in out_lines) else "failed"
@@ -490,11 +513,11 @@ def _run_verify(verify: str, file_path: str, diff: str = None) -> str:
             r = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, timeout=30)
             if r.returncode == 0:
                 return f"\n[VERIFY {v} passed]"
-            return f"\n[VERIFY {v} failed]\n{r.stdout.strip()[:1000]}\n{r.stderr.strip()[:1000]}"
+            return f"\n[VERIFY {v} failed]\n{r.stdout.strip()[:4000]}\n{r.stderr.strip()[:4000]}"
         else:
             # Custom shell command
             r = subprocess.run(v, shell=True, capture_output=True, text=True, timeout=30)
-            out = (r.stdout.strip() + "\n" + r.stderr.strip()).strip()[:1500]
+            out = (r.stdout.strip() + "\n" + r.stderr.strip()).strip()[:6000]
             status = "passed" if r.returncode == 0 else f"failed (exit {r.returncode})"
             return f"\n[VERIFY {v} {status}]\n{out}" if out else f"\n[VERIFY {v} {status}]"
     except Exception as e:
@@ -520,7 +543,7 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
     # is silent and does NOT block the write (the existing git/dirty
     # path is the fallback for users who haven't enabled snapshots).
     try:
-        from tools.checkpoints import pre_write_snapshot
+        from tools.checkpoints import pre_write_snapshot, record_created
         from sync.state_sync import safe_get_state
         _state = safe_get_state() or {}
         _chat_id = _state.get("chat_id", "") or ""
@@ -529,14 +552,37 @@ def edit_file(ctx: object = None, file_path: str = "", old_string: str = None, n
         _ws = _state.get("project_path") or WORKSPACE
         if ctx is not None:
             _ws = getattr(ctx, "project_path", None) or _ws
-        if _chat_id and file_path:
-            _rel = file_path
+
+        def _rel_of(path: str) -> str:
+            path = path or ""
             try:
-                if os.path.isabs(file_path) and _ws and str(file_path).startswith(str(_ws)):
-                    _rel = os.path.relpath(file_path, _ws)
+                if os.path.isabs(path) and _ws and str(path).startswith(str(_ws)):
+                    return os.path.relpath(path, _ws)
             except (OSError, ValueError):
-                _rel = file_path
-            pre_write_snapshot(_chat_id, _ws, _rel)
+                pass
+            return path
+
+        if _chat_id and _ws:
+            if file_path:
+                _rel = _rel_of(file_path)
+                _abs = file_path if os.path.isabs(file_path) else os.path.join(_ws, _rel)
+                if os.path.isfile(_abs):
+                    pre_write_snapshot(_chat_id, _ws, _rel)
+                else:
+                    record_created(_chat_id, _ws, _rel)
+            if diff:
+                for _kind, _raw_path, _body in _parse_patch_sections(diff):
+                    if not _raw_path:
+                        continue
+                    if _kind == "add":
+                        record_created(_chat_id, _ws, _rel_of(_raw_path))
+                    elif _kind in ("update", "delete"):
+                        pre_write_snapshot(_chat_id, _ws, _rel_of(_raw_path))
+                    elif _kind == "move":
+                        pre_write_snapshot(_chat_id, _ws, _rel_of(_raw_path))
+                        _dest = _body[0] if isinstance(_body, tuple) and _body else ""
+                        if _dest:
+                            record_created(_chat_id, _ws, _rel_of(str(_dest)))
     except Exception:
         pass
 

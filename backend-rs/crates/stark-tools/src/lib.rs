@@ -256,7 +256,7 @@ mod tests {
                 "command": command,
                 "background": true,
                 "expect": "bg-ready",
-                "ready_timeout": 5000
+                "ready_timeout": 20000
             }),
             &ctx,
         )

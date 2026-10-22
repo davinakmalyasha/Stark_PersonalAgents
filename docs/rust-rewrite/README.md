@@ -33,7 +33,7 @@ conflicts with these docs, update the doc first, then the code.
 
 | # | Document | What it answers |
 |---|---|---|
-| 00 | [Current System](./00-current-system.md) | What exists today: tiers, features, 42 tool definitions (+ plan-mode `propose_plan`), API, persistence, invariants |
+| 00 | [Current System](./00-current-system.md) | What exists today: tiers, features, 42 registered tools, API, persistence, invariants |
 | 01 | [Codex Reference](./01-codex-reference.md) | How Codex is built; what to copy; what not to copy; license |
 | 02 | [Architecture](./02-architecture.md) | Target workspace, crates, dependency direction, concurrency, data flow |
 | 03 | [Tech Stack](./03-tech-stack.md) | Exact crates/versions, build profiles, lints, toolchain |

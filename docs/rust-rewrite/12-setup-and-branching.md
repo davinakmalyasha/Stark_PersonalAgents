@@ -7,7 +7,11 @@ branch, reference checkout, and workspace bootstrap.
 
 ## 1. Install Rust (Windows)
 
-### 1.1 MSVC build tools (required)
+> **Executed choice:** local Phase 0 uses **GNU on D:** (`1.99.1`,
+> `x86_64-pc-windows-gnu`, WinLibs). C: stays untouched. CI uses MSVC. The
+> MSVC instructions below are the alternative/CI path.
+
+### 1.1 MSVC build tools (CI / alternative)
 
 Rust on Windows uses the MSVC linker. Install Visual Studio Build Tools with
 the C++ workload:
@@ -81,28 +85,33 @@ Enable format-on-save with `rustfmt`; use `clippy` as the default check.
 
 ## 2. Repo state before branching
 
-Verified on the current checkout:
+Safety sequence completed on 2026-10-22:
 
 | Fact | Value |
 |---|---|
-| Current branch | `development` |
-| Tracking | `origin/development`, **1 commit ahead** |
-| vs `master` | **46 ahead, 1 behind** |
-| Dirty entries | **101** (71 modified, 9 deleted, 21 untracked) |
+| Current branch | `rust-phase-0` (from `rust-rewrite`) |
+| Tracking | `origin/rust-phase-0` |
+| Base | `rust-rewrite` = `master` = `8b40ce4` |
+| Dirty entries | 0 before Phase 0 work |
 | Default branch | `master` (no `main`) |
 | `.env` | ignored, untracked (safe) |
-| Latest commit | `408c075 feat(group): stop retries from repeating gated external writes (AU-05)` |
+| `pre-rust-rewrite` tag | `8b40ce4` |
+| Python suite | **328 passed** |
+| Frontend build | passed |
+| Rust toolchain | **1.99.1 GNU** on D:, WinLibs MinGW on D:, C: ~41 GB free |
 
-The working tree contains a coherent feature set: canvas, notes, schedules,
-agent wakes, chat continuity, and related UI. It should be snapshotted before
-the rewrite.
+The working tree was snapshotted as `ca6b8a0`, docs as `b09fd4d`, and merged to
+`master` as `8b40ce4`. No content was left uncommitted.
 
 **Important:** there is no `main` branch. Treat **`master` as main** unless you
 decide to rename it.
 
 ---
 
-## 3. Safety sequence (run after approving the docs)
+## 3. Safety sequence (executed 2026-10-22; keep for reference)
+
+> Do not re-run this blindly. It is the historical sequence that produced the
+> current branches and tag.
 
 ```bash
 git fetch --all --prune
@@ -178,39 +187,34 @@ Use them to compare design, not as dependencies.
 
 ## 5. Bootstrap the Rust workspace
 
-From the repo root, on `rust-rewrite`:
+Phase 0 deliberately creates **only `stark-contract`**. Providers, core, tools,
+policy, store, agents, groups, memory, server, and CLI are added in Phase 1+
+when they have code. Empty crates add compile time and hide dependency drift.
+
+From the repo root, on `rust-phase-0`:
 
 ```bash
-mkdir -p backend-rs/crates
-cd backend-rs
-cargo new --lib crates/stark-contract
-cargo new --lib crates/stark-providers
-cargo new --lib crates/stark-core
-cargo new --lib crates/stark-tools
-cargo new --lib crates/stark-policy
-cargo new --lib crates/stark-store
-cargo new --lib crates/stark-agents
-cargo new --lib crates/stark-groups
-cargo new --lib crates/stark-memory
-cargo new --bin crates/stark-server
-cargo new --bin crates/stark-cli
-mkdir -p specs tests/parity
+mkdir -p backend-rs/crates/stark-contract/src backend-rs/specs backend-rs/tests/parity
 ```
 
-Minimum `backend-rs/Cargo.toml`:
+`backend-rs/Cargo.toml`:
 
 ```toml
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/stark-contract"]
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
 version = "0.1.0"
+rust-version = "1.99"
 
 [workspace.dependencies]
-# See docs/rust-rewrite/03-tech-stack.md
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# schemars, ts-rs, uuid, chrono are added when the generated types need them.
 ```
 
 `rust-toolchain.toml`:
@@ -219,9 +223,10 @@ version = "0.1.0"
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy", "rust-analyzer"]
-targets = ["x86_64-pc-windows-msvc"]
 profile = "minimal"
 ```
+
+Do not pin a target here: local GNU and CI MSVC must both work.
 
 `.gitignore` additions:
 
@@ -230,6 +235,10 @@ profile = "minimal"
 backend-rs/target/
 target/
 **/*.rs.bk
+
+# Keep the generated contract despite the global specs/ ignore
+!backend-rs/specs/
+!backend-rs/specs/**
 ```
 
 Commit `Cargo.lock` (it is a binary workspace).
@@ -238,17 +247,19 @@ Commit `Cargo.lock` (it is a binary workspace).
 
 ## 6. Tool spec export
 
-Add `scripts/export_tool_specs.py` (Python, read-only import of
-`tools._schemas`):
+`scripts/export_tool_specs.py` loads `tools/_schemas.py` by file path and
+writes the frozen 42-tool/8-scope contract. It needs the project venv
+(`requirements-test.txt` in CI) because the registry imports `llm`:
 
 ```bash
-python scripts/export_tool_specs.py
+venv/Scripts/python.exe -B scripts/export_tool_specs.py
 # writes backend-rs/specs/tool-specs.json
-python scripts/export_tool_specs.py --check
-# exits non-zero if the embedded/checked copy differs
+venv/Scripts/python.exe -B scripts/export_tool_specs.py --check
+# exits non-zero if the checked-in copy differs
 ```
 
-Commit `backend-rs/specs/tool-specs.json`.
+Commit `backend-rs/specs/tool-specs.json`. CI installs `requirements-test.txt`
+and runs the same `--check`.
 
 ---
 
@@ -259,7 +270,7 @@ Commit `backend-rs/specs/tool-specs.json`.
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p stark-server
+# cargo run -p stark-server   # Phase 1; not present in Phase 0
 
 # Watch mode
 cargo watch -x "test --workspace"
@@ -304,15 +315,16 @@ Keep secrets in `.env` (ignored). Never log keys.
 
 ## 10. First-day checklist
 
-- [ ] Rust stable installed and verified
-- [ ] `hello-rust` runs
-- [ ] Codex cloned to `D:\ref\codex`
-- [ ] Python tests run (note failures, if any)
-- [ ] Current work committed on `development`
-- [ ] `development` pushed
-- [ ] `master` merged/pushed (or branch created from `development` if red)
-- [ ] `pre-rust-rewrite` tag pushed
-- [ ] `rust-rewrite` branch created and pushed
-- [ ] `backend-rs` workspace created
-- [ ] `tool-specs.json` exported and committed
-- [ ] `cargo test` passes
+- [x] Rust stable installed and verified (`1.99.1` GNU on D:)
+- [x] `hello-rust` runs
+- [ ] Codex cloned to `D:\ref\codex` (reference read; next)
+- [x] Python tests run (328 passed)
+- [x] Current work committed on `development`
+- [x] `development` pushed
+- [x] `master` merged/pushed
+- [x] `pre-rust-rewrite` tag pushed
+- [x] `rust-rewrite` branch created and pushed
+- [x] `rust-phase-0` branch created and pushed
+- [x] `backend-rs` workspace created (`stark-contract` only)
+- [x] `tool-specs.json` exported (`42` tools, `8` scopes)
+- [x] `cargo test --workspace` passes (2 tests)

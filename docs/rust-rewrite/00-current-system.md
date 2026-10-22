@@ -171,16 +171,16 @@ Graph details: `agents/graph/orchestrator_graph.py`, `agents/delegation.py`.
 
 ---
 
-## 6. Tool inventory (42 definitions + `propose_plan`)
+## 6. Tool inventory (42 registered definitions)
 
 The authoritative definitions are `tools/_schemas.py` (`TOOL_DEFINITIONS`, 42
 entries) and per-tool docs in `docs/tools/*.md`. Descriptions are prompt API:
 copy verbatim.
 
-`propose_plan` is a 43rd agent-callable tool implemented in
-`tools/MainTool/proposePlan.py` and listed in `_SCOPE_MAP.md`, but it is **not**
-in `TOOL_DEFINITIONS`; it is exposed by plan mode. Verify its exposure path
-before porting (the exporter must include it or document why it is absent).
+`propose_plan` is implemented in `tools/MainTool/proposePlan.py` and allowed by
+the plan-mode guard, but it is **not** in `TOOL_DEFINITIONS` or the runtime
+`_SCOPE_MAP`; the native tool schema never exposes it. It is not part of the
+frozen 42-tool contract. Revisit it deliberately in Phase 4 (plan mode).
 
 | Group | Tool | One-line purpose |
 |---|---|---|
@@ -194,7 +194,6 @@ before porting (the exporter must include it or document why it is absent).
 | Docs | `create_xlsx` | Create an Excel sheet from headers/rows |
 | Interaction | `ask_user` | Structured questions/options; waits for the answer |
 | Interaction | `update_plan` | Replace the plan dock contents |
-| Interaction | `propose_plan` | Propose a plan for approval (plan-mode only; not in `TOOL_DEFINITIONS`) |
 | Interaction | `files_changed` | List recent external file changes |
 | Browser | `browser_act` | Navigate/click/fill/type/press/extract/screenshot/close |
 | Browser | `browser_navigate` | Open URL and return an accessibility snapshot |
@@ -230,18 +229,19 @@ before porting (the exporter must include it or document why it is absent).
 
 ### 6.1 Scope ACL
 
-Source: `docs/tools/_SCOPE_MAP.md`.
+Source: runtime `_SCOPE_MAP` in `tools/_schemas.py`, exported to
+`backend-rs/specs/tool-specs.json`.
 
 | Scope | Tools |
 |---|---|
 | `developer` | `read_file`, `edit_file`, `run_command`, `search_code`, `ask_user`, `update_plan`, `call_subagent` |
-| `general` | `run_command`, `read_pdf`, `create_docx`, `create_xlsx`, `ask_user`, `update_plan`, `browser_act`, `propose_plan`, `files_changed`, `look_at_screen`, `set_screen_share` |
-| `house` | `house_get_state`, `house_get_device`, `house_set_device`, `house_run_scene`, `house_get_history`, `run_command`, `browser_act`, `ask_user`, `update_plan`, `propose_plan` |
-| `dfd` | `dfd_bridge`, `create_client`, `create_project`, `run_command`, `ask_user`, `update_plan`, `propose_plan`, `files_changed` |
-| `orchestrator` | `create_project`, `ask_user`, `delegate`, `delegation_status`, `job_message`, `job_cancel`, `propose_plan` |
-| `deploy` | `github_apply_gate`, `run_command`, `read_file`, `edit_file`, `search_code`, `ask_user` |
+| `general` | `run_command`, `read_pdf`, `create_docx`, `create_xlsx`, `ask_user`, `update_plan`, `browser_act`, `files_changed`, `look_at_screen`, `set_screen_share` |
+| `house` | `house_get_state`, `house_get_device`, `house_set_device`, `house_run_scene`, `house_get_history`, `run_command`, `browser_act`, `ask_user`, `update_plan` |
+| `dfd` | `dfd_bridge`, `create_client`, `create_coding_project`, `run_command`, `ask_user`, `update_plan`, `files_changed` |
+| `orchestrator` | `create_coding_project`, `ask_user`, `delegate`, `delegation_status`, `job_message`, `job_cancel`, `create_group`, `group_board`, `group_item_detail`, `group_events`, `group_update`, `schedule`, `give_note`, `canvas_mode` |
+| `devops` | `github_apply_gate`, `run_command`, `read_file`, `edit_file`, `search_code`, `update_plan` |
 | `explore` | `read_file`, `search_code`, `run_command` |
-| `ui` | `browser_act`, `read_file`, `search_code`, `run_command`, `edit_file`, `ask_user` |
+| `ui` | `browser_act`, `read_file`, `search_code`, `run_command`, `edit_file`, `ask_user`, `update_plan` |
 
 Tools outside a listed scope are warehouse-only until explicitly assigned.
 

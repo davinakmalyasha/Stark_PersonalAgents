@@ -13,8 +13,8 @@ Stark's non-coding tools. Versions are the ones Codex pins in
 |---|---|
 | Rust | stable **1.99.x** (1.99.1 at time of writing); `rustup update stable` |
 | Edition | **2024** |
-| Target | `x86_64-pc-windows-msvc` |
-| Linker | MSVC via Visual Studio Build Tools |
+| Target | CI: `x86_64-pc-windows-msvc`; local Phase 0: `x86_64-pc-windows-gnu` |
+| Linker | CI: MSVC via Visual Studio Build Tools; local: WinLibs MinGW-w64 |
 | Build system | **Cargo only** (no Bazel) |
 | Formatter/linter | `rustfmt`, `clippy -D warnings` |
 | TS bindings | `ts-rs` |
@@ -27,12 +27,24 @@ Stark's non-coding tools. Versions are the ones Codex pins in
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy", "rust-analyzer"]
-targets = ["x86_64-pc-windows-msvc"]
 profile = "minimal"
 ```
 
-Pin the exact patch version in CI (`1.99.1`) for reproducibility; developers
-may use newer stable.
+Do not force a target in `rust-toolchain.toml`: the host selects GNU locally
+and MSVC in CI. Pin the exact patch version in CI (`1.99.1`) for
+reproducibility; developers may use newer stable.
+
+Local Phase 0 toolchain lives entirely on D: because C: is the small OS volume:
+
+```text
+CARGO_HOME=D:\cargo
+RUSTUP_HOME=D:\rustup
+CARGO_TARGET_DIR=D:\cargo-target\stark
+MinGW=D:\toolchains\winlibs\mingw64\bin
+```
+
+The Rust source is identical under either toolchain; only the linker/ABI
+environment differs.
 
 ---
 
@@ -253,12 +265,16 @@ manual_let_else = "deny"
 
 ## 6. Windows specifics
 
-- **MSVC required.** Install Visual Studio Build Tools with the
-  "Desktop development with C++" workload; `rustup default stable-msvc`.
+- **Toolchain:** CI uses MSVC (`1.99.1` on `windows-latest`). Local Phase 0 on
+  this machine uses GNU (`x86_64-pc-windows-gnu` + WinLibs) on D: because C: is
+  the small OS volume. If a dependency requires MSVC, install Build Tools with
+  the "Desktop development with C++" workload and `rustup default stable-msvc`.
 - **Long paths:** `git config --system core.longpaths true`; keep the repo path
   short (`D:\MyProject\LangChain` is fine).
 - **Target dir:** Rust builds are large. Set
-  `CARGO_TARGET_DIR=D:\cargo-target` if C: is tight.
+  `CARGO_TARGET_DIR=D:\cargo-target\stark`. Also set
+  `CARGO_HOME=D:\cargo` and `RUSTUP_HOME=D:\rustup` so the registry and
+  toolchains stay off C:.
 - **Defender:** exclude `backend-rs\target` and `D:\cargo-target` for build
   speed.
 - **Process groups:** use `CREATE_NEW_PROCESS_GROUP` for background commands;
@@ -277,12 +293,11 @@ manual_let_else = "deny"
 ## 7. CI
 
 ```yaml
-# .github/workflows/rust.yml (proposed)
-- cargo fmt --all -- --check
+# .github/workflows/rust-validate.yml (Phase 0)
+- cargo fmt --all --check
 - cargo clippy --workspace --all-targets -- -D warnings
 - cargo test --workspace
-- cargo build --release
-- python scripts/export_tool_specs.py --check   # schema/description parity
+- python -B scripts/export_tool_specs.py --check   # schema/description parity
 ```
 
 Optional:

@@ -35,6 +35,9 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return ToolOutcome::err("Error: run_command requires command");
     };
+    if let stark_policy::CommandDecision::Deny(reason) = stark_policy::classify_command(command) {
+        return ToolOutcome::err(format!("[BLOCKED] Command denied by policy: {reason}"));
+    }
     let workdir = match args.get("workdir").and_then(Value::as_str) {
         Some(raw) if !raw.trim().is_empty() => match resolve_workspace_path(&ctx.workspace, raw) {
             Ok(path) => path,

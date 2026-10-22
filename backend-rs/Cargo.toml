@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/stark-contract",
+    "crates/stark-policy",
     "crates/stark-providers",
     "crates/stark-tools",
     "crates/stark-store",

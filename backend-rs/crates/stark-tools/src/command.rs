@@ -1,15 +1,15 @@
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::Value;
-use tokio::process::Command;
 
 use crate::paths::resolve_workspace_path;
+use crate::processes::ProcessStatus;
 use crate::{ToolContext, ToolOutcome};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+const DEFAULT_YIELD_MS: u64 = 10_000;
+const MAX_YIELD_MS: u64 = 30_000;
 const MAX_OUTPUT_CHARS: usize = 100_000;
 
 pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
@@ -52,26 +52,24 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         },
         _ => ctx.workspace.clone(),
     };
-
-    let mut timeout_ms = args
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT_MS);
-    if timeout_ms < 1000 {
-        timeout_ms *= 1000;
-    }
-    timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
+    let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
 
     if args
         .get("background")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        let (name, pid) = match ctx.processes.spawn(command, &workdir, &ctx.chat_id) {
+        let spawned = match ctx
+            .processes
+            .spawn_background(command, &workdir, &ctx.chat_id, tty)
+        {
             Ok(value) => value,
             Err(error) => return ToolOutcome::err(format!("Error: {error}")),
         };
-        let mut note = format!("[OK] Started background process '{name}' (PID {pid}).");
+        let mut note = format!(
+            "[OK] Started background process '{}' (session #{}, PID {}).",
+            spawned.name, spawned.id, spawned.pid
+        );
         if let Some(expect) = args
             .get("expect")
             .and_then(Value::as_str)
@@ -81,7 +79,11 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
                 .get("ready_timeout")
                 .and_then(Value::as_u64)
                 .unwrap_or(15_000);
-            match ctx.processes.wait_ready(&name, expect, ready_timeout).await {
+            match ctx
+                .processes
+                .wait_ready(&spawned.id.to_string(), expect, ready_timeout)
+                .await
+            {
                 Ok(ready) => note.push_str(&format!("\n{ready}")),
                 Err(error) => note.push_str(&format!("\n[READY_TIMEOUT] {error}")),
             }
@@ -89,33 +91,47 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         return ToolOutcome::ok(note);
     }
 
-    let bash = find_bash();
+    let mut timeout_ms = args
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout_ms < 1000 {
+        timeout_ms *= 1000;
+    }
+    timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
+    let explicit_yield = args.get("yield_time_ms").and_then(Value::as_u64);
+    let yield_ms = explicit_yield
+        .map(|value| value.clamp(250, MAX_YIELD_MS))
+        .unwrap_or(DEFAULT_YIELD_MS);
     let started = Instant::now();
-    let mut process = Command::new(&bash);
-    process
-        .arg("-lc")
-        .arg(command)
-        .current_dir(&workdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
 
-    let child = match process.spawn() {
-        Ok(child) => child,
-        Err(error) => return ToolOutcome::err(format!("Error: failed to start shell: {error}")),
+    let spawned = match ctx
+        .processes
+        .spawn_session(command, &workdir, &ctx.chat_id, tty)
+    {
+        Ok(value) => value,
+        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
-
-    let result =
-        tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await;
+    let session = spawned.id.to_string();
+    let wait_ms = if explicit_yield.is_some() {
+        yield_ms
+    } else {
+        timeout_ms
+    };
+    let (status, output) = match ctx.processes.wait_status(&session, wait_ms).await {
+        Ok(value) => value,
+        Err(error) => {
+            ctx.processes.remove(&session);
+            return ToolOutcome::err(format!("Error: {error}"));
+        }
+    };
     let elapsed = started.elapsed().as_millis() as u64;
 
-    match result {
-        Ok(Ok(output)) => {
-            let code = output.status.code().unwrap_or(-1);
-            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            let text = truncate(text);
+    match status {
+        ProcessStatus::Exited(code) => {
+            ctx.processes.remove(&session);
+            let text = truncate(output);
+            let code = code.unwrap_or(-1);
             if code == 0 {
                 ToolOutcome::with_code(format!("[OK] Exit 0 ({elapsed}ms)\n{text}"), false, Some(0))
             } else {
@@ -126,10 +142,25 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
                 )
             }
         }
-        Ok(Err(error)) => ToolOutcome::err(format!("Error: shell failed: {error}")),
-        Err(_) => ToolOutcome::err(format!(
-            "[TIMEOUT] Command exceeded {timeout_ms}ms\n{command}"
-        )),
+        ProcessStatus::Killed => {
+            ctx.processes.remove(&session);
+            ToolOutcome::err(format!("[KILLED] Process {session}\n{}", truncate(output)))
+        }
+        ProcessStatus::Running => {
+            if explicit_yield.is_some() {
+                ToolOutcome::ok(format!(
+                    "[RUNNING] session #{session} still running after {elapsed}ms\n{}",
+                    truncate(output)
+                ))
+            } else {
+                let _ = ctx.processes.kill(&session);
+                ctx.processes.remove(&session);
+                ToolOutcome::err(format!(
+                    "[TIMEOUT] Command exceeded {timeout_ms}ms\n{command}\n{}",
+                    truncate(output)
+                ))
+            }
+        }
     }
 }
 
@@ -168,9 +199,9 @@ async fn handle_process_action(
         "kill_all" => {
             let count = ctx.processes.kill_all();
             ToolOutcome::ok(if count == 0 {
-                "No background processes to kill.".to_string()
+                "No running processes to kill.".to_string()
             } else {
-                format!("[OK] Killed {count} background process(es).")
+                format!("[OK] Killed {count} process(es).")
             })
         }
         "logs" => {
@@ -237,14 +268,39 @@ async fn handle_process_action(
                 return ToolOutcome::err("Error: process_action='send' requires command");
             }
             let input = args.get("input").and_then(Value::as_str).unwrap_or("");
-            match ctx.processes.send(command, input).await {
-                Ok(()) => ToolOutcome::ok(format!("[OK] Sent input to {command}")),
+            let default_yield = if input.is_empty() { 5_000 } else { 250 };
+            let yield_ms = args
+                .get("yield_time_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(default_yield)
+                .clamp(250, MAX_YIELD_MS);
+            match ctx.processes.send(command, input, yield_ms).await {
+                Ok((status, output)) => {
+                    let mut text = format!("[OK] Session {command} — {}", status_label(&status));
+                    if !output.trim().is_empty() {
+                        text.push('\n');
+                        text.push_str(&truncate(output));
+                    }
+                    if matches!(status, ProcessStatus::Exited(_)) {
+                        ctx.processes.remove(command);
+                    }
+                    ToolOutcome::ok(text)
+                }
                 Err(error) => ToolOutcome::err(format!("Error: {error}")),
             }
         }
         other => ToolOutcome::err(format!(
             "Error: unknown process_action '{other}' (list|logs|kill|wait|ready|send|kill_all)"
         )),
+    }
+}
+
+fn status_label(status: &ProcessStatus) -> String {
+    match status {
+        ProcessStatus::Running => "running".to_string(),
+        ProcessStatus::Exited(Some(code)) => format!("exited({code})"),
+        ProcessStatus::Exited(None) => "exited(unknown)".to_string(),
+        ProcessStatus::Killed => "killed".to_string(),
     }
 }
 
@@ -255,22 +311,4 @@ fn truncate(text: String) -> String {
     let mut out: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
     out.push_str("\n[output truncated at 100000 chars]");
     out
-}
-
-fn find_bash() -> PathBuf {
-    if let Ok(path) = std::env::var("STARK_BASH")
-        && Path::new(&path).is_file()
-    {
-        return PathBuf::from(path);
-    }
-    for path in [
-        r"C:\Program Files\Git\bin\bash.exe",
-        r"C:\Program Files\Git\usr\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ] {
-        if Path::new(path).is_file() {
-            return PathBuf::from(path);
-        }
-    }
-    PathBuf::from("bash")
 }

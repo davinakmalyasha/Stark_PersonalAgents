@@ -1,6 +1,7 @@
 mod ask;
 mod command;
 mod edit;
+mod head_tail;
 mod patch;
 mod paths;
 mod processes;
@@ -192,6 +193,56 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("[OK] Exit 0"));
         assert!(result.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn run_command_supports_pty_and_resumable_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+
+        let pty = dispatch(
+            "run_command",
+            &json!({"command": "printf 'pty-hello\\n'", "tty": true, "timeout": 3000}),
+            &ctx,
+        )
+        .await;
+        assert!(!pty.is_error, "{}", pty.content);
+        assert!(pty.content.contains("pty-hello"), "{}", pty.content);
+
+        let started = dispatch(
+            "run_command",
+            &json!({
+                "command": "sleep 0.8; printf 'session-done\\n'",
+                "yield_time_ms": 100
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!started.is_error, "{}", started.content);
+        assert!(started.content.contains("[RUNNING]"), "{}", started.content);
+        let id = started
+            .content
+            .split("session #")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("session id")
+            .to_string();
+        let polled = dispatch(
+            "run_command",
+            &json!({
+                "command": id,
+                "process_action": "send",
+                "yield_time_ms": 5000
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!polled.is_error, "{}", polled.content);
+        assert!(
+            polled.content.contains("session-done"),
+            "{}",
+            polled.content
+        );
     }
 
     #[tokio::test]

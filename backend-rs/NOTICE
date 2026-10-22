@@ -1,6 +1,13 @@
 Stark Rust backend
 
-Behavioral compatibility and test fixtures for `apply_patch` and the
-`execpolicy` prefix-rule/decision engine are derived from OpenAI Codex
-(https://github.com/openai/codex), licensed under Apache-2.0.
+Behavioral compatibility and test fixtures for `apply_patch`, the `execpolicy`
+prefix-rule/decision engine, and unified-exec head/tail output buffering are
+derived from OpenAI Codex (https://github.com/openai/codex), licensed under
+Apache-2.0.
 See docs/rust-rewrite/01-codex-reference.md for the reference mapping.
+
+`backend-rs/vendor/portable-pty` is portable-pty 0.9.0
+(https://github.com/wez/wezterm/tree/main/pty), Copyright (c) 2018 Wez Furlong,
+licensed under MIT. It is vendored with two local fixes: ConPTY is created with
+the resize-quirk flag only (avoiding cursor/inherit-input hangs), and
+TerminateProcess result handling is corrected.

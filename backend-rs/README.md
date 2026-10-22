@@ -82,10 +82,15 @@ Implemented routes: `POST /api/run`, `GET /api/stream/{chat_id}`,
 `GET /api/models`, `GET /api/provider`.
 
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
-passes Codex's 25 scenario fixtures. `run_command` supports background
-processes (`list`, `logs`, `kill`, `wait`, `ready`, `send`, `kill_all`), and
-`stark-policy` now uses a Codex-compatible Starlark `prefix_rule` engine with
-`allow` / `prompt` / `forbidden` decisions and `host_executable` paths.
-`prompt` decisions use the `ask_user` question broker for approval. The process
-manager is still not Codex `unified_exec`/PTY parity. Tool calls are recorded as
+passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible
+Starlark `prefix_rule` engine with `allow` / `prompt` / `forbidden` decisions
+and `host_executable` paths; `prompt` decisions use the `ask_user` broker.
+
+`run_command` now has a unified-exec lifecycle: numeric session IDs, optional
+`tty` via a patched ConPTY backend, optional `yield_time_ms` (returns a session
+ID for still-running commands), resumable `process_action=send` polling, a
+64-process cap, and a 1 MiB head/tail output buffer. `process_action=list`,
+`logs`, `kill`, `wait`, `ready`, and `kill_all` accept either a session ID or
+the background process name. `tty` and `yield_time_ms` are Rust extensions not
+yet exposed in the frozen tool schema. Tool calls are recorded as
 `tool_started` / `tool_finished` deltas; chat history survives restart.

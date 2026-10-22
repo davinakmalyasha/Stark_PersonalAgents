@@ -1833,6 +1833,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "stark-policy"
+version = "0.1.0"
+
+[[package]]
 name = "stark-providers"
 version = "0.1.0"
 dependencies = [
@@ -1899,6 +1903,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stark-contract",
+ "stark-policy",
  "tempfile",
  "thiserror",
  "tokio",

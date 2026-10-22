@@ -190,6 +190,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_blocks_destructive_policy_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let result = dispatch("run_command", &json!({"command": "rm -rf /"}), &ctx).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("[BLOCKED]"));
+    }
+
+    #[tokio::test]
     async fn ask_user_resolves_through_broker() {
         let dir = tempfile::tempdir().unwrap();
         let broker = Arc::new(QuestionBroker::new());

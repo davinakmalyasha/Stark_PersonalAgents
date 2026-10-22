@@ -313,7 +313,7 @@ implementation notes only.
 |---|---|---|---|
 | `read_file` | `stark-tools::fs::read_file` | `MainTool/readFile.py` | Batch `file_paths`; paging; cached-stub for unchanged full re-reads; `[FILE]` sections; image/PDF handling where applicable |
 | `edit_file` | `stark-tools::patch` | `MainTool/editFile.py` | Mode A exact replace; Mode B whole file; Mode C patch headers + `@@` hunks; transactional apply; `verify=py_compile|tsc|shell`; snapshot before write |
-| `run_command` | `stark-tools::proc` | `MainTool/runCommand.py` | Git Bash; timeout/idle timeout; auto-background server-like commands; process actions list/logs/kill/wait/ready/send/kill_all; `expect` regex; owner cleanup |
+| `run_command` | `stark-tools::proc` | `MainTool/runCommand.py` | Git Bash; numeric unified-exec sessions; optional `tty` (ConPTY) and `yield_time_ms`; process actions list/logs/kill/wait/ready/send/kill_all by ID or name; 64-process cap; 1 MiB head/tail output; `expect` regex; owner cleanup |
 | `search_code` | `stark-tools::search` | `MainTool/searchCode.py` | `ignore` + `globset` + `regex`; lines/files/count; symbol annotation via tree-sitter; multi-pattern ranking; function snippets; `/scratch` overflow |
 | `ast_search` | `stark-tools::ast` | `MainTool/astSearch.py` | Python-only structural rules; use `tree-sitter-python` or `rustpython-parser`; keep exact result format; port last |
 

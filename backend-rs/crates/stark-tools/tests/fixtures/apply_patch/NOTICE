@@ -1,0 +1,4 @@
+These apply_patch scenario fixtures are from OpenAI Codex
+(https://github.com/openai/codex), licensed under Apache-2.0.
+They are used to verify behavioral compatibility of Stark's Rust apply_patch
+implementation.

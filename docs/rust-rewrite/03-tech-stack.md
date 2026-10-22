@@ -127,6 +127,13 @@ require `DATABASE_URL`/offline metadata; add them after the schema stabilizes.
 | `notify` | `8.2` | File watcher |
 | `bm25` | `2.3.2` | Search ranking (optional) |
 
+### Policy
+| Crate | Version | Why |
+|---|---|---|
+| `starlark` | `0.14.2` | Codex-compatible `prefix_rule`/`host_executable` policy files |
+| `multimap` | `0.10` | Rule index by program |
+| `shlex` | `1.3` | Command tokenization and rule examples |
+
 ### Process / OS / security
 | Crate | Version | Why |
 |---|---|---|

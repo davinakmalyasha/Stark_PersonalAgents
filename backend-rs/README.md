@@ -84,8 +84,8 @@ Implemented routes: `POST /api/run`, `GET /api/stream/{chat_id}`,
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `run_command` supports background
 processes (`list`, `logs`, `kill`, `wait`, `ready`, `send`, `kill_all`), and
-`stark-policy` guards destructive shell commands. The guard is still a
-deny-list, not Codex `execpolicy` with prompt/forbidden approvals; that is the
-next fidelity step. `ask_user` uses the question broker/UI polling, and tool
-calls are recorded as `tool_started` / `tool_finished` deltas. Chat history
-survives restart.
+`stark-policy` now uses a Codex-compatible Starlark `prefix_rule` engine with
+`allow` / `prompt` / `forbidden` decisions and `host_executable` paths.
+`prompt` decisions use the `ask_user` question broker for approval. The process
+manager is still not Codex `unified_exec`/PTY parity. Tool calls are recorded as
+`tool_started` / `tool_finished` deltas; chat history survives restart.

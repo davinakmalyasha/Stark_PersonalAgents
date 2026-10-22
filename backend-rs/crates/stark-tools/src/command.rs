@@ -27,8 +27,23 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if command.trim().is_empty() {
         return ToolOutcome::err("Error: run_command requires command");
     }
-    if let stark_policy::CommandDecision::Deny(reason) = stark_policy::classify_command(command) {
-        return ToolOutcome::err(format!("[BLOCKED] Command denied by policy: {reason}"));
+    let policy = stark_policy::evaluate_command(command);
+    match policy.decision {
+        stark_policy::Decision::Forbidden => {
+            return ToolOutcome::err(format!(
+                "[BLOCKED] Command denied by policy: {}",
+                policy.reason.unwrap_or_else(|| "forbidden".to_string())
+            ));
+        }
+        stark_policy::Decision::Prompt => {
+            if !request_command_approval(ctx, command, policy.reason.as_deref()).await {
+                return ToolOutcome::err(format!(
+                    "[BLOCKED] Command requires approval: {}",
+                    policy.reason.unwrap_or_else(|| "prompt".to_string())
+                ));
+            }
+        }
+        stark_policy::Decision::Allow => {}
     }
     let workdir = match args.get("workdir").and_then(Value::as_str) {
         Some(raw) if !raw.trim().is_empty() => match resolve_workspace_path(&ctx.workspace, raw) {
@@ -115,6 +130,30 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Err(_) => ToolOutcome::err(format!(
             "[TIMEOUT] Command exceeded {timeout_ms}ms\n{command}"
         )),
+    }
+}
+
+async fn request_command_approval(ctx: &ToolContext, command: &str, reason: Option<&str>) -> bool {
+    let question = serde_json::json!({
+        "id": "command-approval",
+        "question": format!("Allow this command?\n\n{command}"),
+        "header": "Approval",
+        "detail": reason.unwrap_or("This command requires explicit approval."),
+        "options": ["Approve", "Deny"],
+        "intent": {"kind": "plan-review", "approve": "Approve"}
+    });
+    match ctx.questions.ask(vec![question], 300).await {
+        Ok(answers) => answers.iter().any(|answer| {
+            answer
+                .get("selected")
+                .and_then(Value::as_array)
+                .is_some_and(|selected| {
+                    selected
+                        .iter()
+                        .any(|value| value.as_str() == Some("Approve"))
+                })
+        }),
+        Err(_) => false,
     }
 }
 

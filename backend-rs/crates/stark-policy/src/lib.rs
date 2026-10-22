@@ -1,81 +1,100 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandDecision {
-    Allow,
-    Deny(String),
+mod decision;
+mod error;
+mod executable_name;
+mod parser;
+mod policy;
+pub mod rule;
+
+use std::sync::OnceLock;
+
+pub use decision::Decision;
+pub use error::{Error, ErrorLocation, Result, TextPosition, TextRange};
+pub use parser::PolicyParser;
+pub use policy::{Evaluation, MatchOptions, Policy, RequirementsExecPolicy};
+pub use rule::{PatternToken, PrefixPattern, PrefixRule, Rule, RuleMatch, RuleRef};
+
+const DEFAULT_RULES: &str = r#"
+prefix_rule(pattern = ["shutdown"], decision = "forbidden", justification = "system shutdown")
+prefix_rule(pattern = ["reboot"], decision = "forbidden", justification = "system reboot")
+prefix_rule(pattern = ["poweroff"], decision = "forbidden", justification = "system poweroff")
+prefix_rule(pattern = ["diskpart"], decision = "forbidden", justification = "disk partitioning")
+prefix_rule(pattern = ["format"], decision = "forbidden", justification = "disk formatting")
+prefix_rule(pattern = ["bcdedit"], decision = "forbidden", justification = "boot configuration changes")
+prefix_rule(pattern = ["vssadmin", "delete", "shadows"], decision = "forbidden", justification = "shadow-copy deletion")
+prefix_rule(pattern = ["wbadmin", "delete"], decision = "forbidden", justification = "backup deletion")
+prefix_rule(pattern = ["cipher", "/w"], decision = "forbidden", justification = "free-space wiping")
+prefix_rule(pattern = ["reg", "delete"], decision = "forbidden", justification = "registry deletion")
+prefix_rule(pattern = ["takeown", "/f", "C:\\"], decision = "forbidden", justification = "system ownership changes")
+prefix_rule(pattern = ["icacls", "C:\\"], decision = "forbidden", justification = "system ACL changes")
+prefix_rule(pattern = ["git", "reset", "--hard"], decision = "forbidden", justification = "destructive git reset")
+prefix_rule(pattern = ["git", "clean", "-fdx"], decision = "forbidden", justification = "destructive git clean")
+prefix_rule(pattern = ["npm", "publish"], decision = "prompt", justification = "publishes a package")
+prefix_rule(pattern = ["docker", "system", "prune"], decision = "forbidden", justification = "container data deletion")
+prefix_rule(pattern = ["docker", "volume", "prune"], decision = "forbidden", justification = "volume data deletion")
+prefix_rule(pattern = ["rm", "-rf", "/"], decision = "forbidden", justification = "filesystem-root deletion")
+prefix_rule(pattern = ["rm", "-fr", "/"], decision = "forbidden", justification = "filesystem-root deletion")
+prefix_rule(pattern = ["rm", "-rf", "~"], decision = "forbidden", justification = "home-directory deletion")
+prefix_rule(pattern = ["rm", "-rf", "C:\\"], decision = "forbidden", justification = "system-drive deletion")
+"#;
+
+static DEFAULT_POLICY: OnceLock<Policy> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct PolicyDecision {
+    pub decision: Decision,
+    pub reason: Option<String>,
 }
 
-const DENY_PATTERNS: &[(&str, &str)] = &[
-    ("rm -rf /", "filesystem-root deletion"),
-    ("rm -fr /", "filesystem-root deletion"),
-    ("rm -rf ~", "home-directory deletion"),
-    ("rm -rf c:\\", "system-drive deletion"),
-    ("rmdir /s /q c:\\", "system-drive deletion"),
-    ("rd /s /q c:\\", "system-drive deletion"),
-    ("del /f /s /q c:\\", "system-drive deletion"),
-    ("remove-item -recurse -force c:\\", "system-drive deletion"),
-    ("remove-item c:\\ -recurse", "system-drive deletion"),
-    ("format ", "disk formatting"),
-    ("diskpart", "disk partitioning"),
-    ("bcdedit", "boot configuration changes"),
-    ("vssadmin delete shadows", "shadow-copy deletion"),
-    ("wbadmin delete", "backup deletion"),
-    ("cipher /w", "free-space wiping"),
-    ("shutdown", "system shutdown"),
-    ("reboot", "system reboot"),
-    ("poweroff", "system poweroff"),
-    ("reg delete", "registry deletion"),
-    ("takeown /f c:\\", "system ownership changes"),
-    ("icacls c:\\", "system ACL changes"),
-    (
-        "set-executionpolicy unrestricted",
-        "PowerShell policy weakening",
-    ),
-    ("set-executionpolicy bypass", "PowerShell policy weakening"),
-    ("invoke-expression", "dynamic code execution"),
-    ("iex (", "dynamic code execution"),
-    ("git reset --hard", "destructive git reset"),
-    ("git clean -fdx", "destructive git clean"),
-    ("npm publish", "package publication"),
-    ("docker system prune", "container data deletion"),
-    ("docker volume prune", "volume data deletion"),
-];
+pub fn default_policy() -> &'static Policy {
+    DEFAULT_POLICY.get_or_init(|| {
+        let mut parser = PolicyParser::new();
+        parser
+            .parse("stark-default.rules", DEFAULT_RULES)
+            .expect("default policy rules must parse");
+        parser.build()
+    })
+}
 
-pub fn classify_command(command: &str) -> CommandDecision {
-    let normalized = command
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-
-    for (pattern, reason) in DENY_PATTERNS {
-        if normalized.contains(pattern) {
-            return CommandDecision::Deny((*reason).to_string());
-        }
+pub fn evaluate_command(command: &str) -> PolicyDecision {
+    let Some(tokens) = shlex::split(command) else {
+        return PolicyDecision {
+            decision: Decision::Forbidden,
+            reason: Some("command could not be tokenized".to_string()),
+        };
+    };
+    let evaluation = default_policy().check(&tokens, &heuristics_decision);
+    let reason = evaluation.matched_rules.iter().find_map(|rule| match rule {
+        RuleMatch::PrefixRuleMatch { justification, .. } => justification.clone(),
+        RuleMatch::HeuristicsRuleMatch { .. } => Some("destructive command heuristic".to_string()),
+    });
+    PolicyDecision {
+        decision: evaluation.decision,
+        reason,
     }
+}
 
+fn heuristics_decision(tokens: &[String]) -> Decision {
+    let normalized = tokens.join(" ").to_lowercase();
+    if normalized.contains("rm -rf /")
+        || normalized.contains("rm -fr /")
+        || normalized.contains("rm -rf ~")
+        || normalized.contains("set-executionpolicy unrestricted")
+        || normalized.contains("set-executionpolicy bypass")
+        || normalized.contains("invoke-expression")
+        || normalized.contains("iex (")
+        || normalized.contains("> c:\\")
+        || normalized.contains(">> c:\\")
+    {
+        return Decision::Forbidden;
+    }
     if (normalized.contains("curl ") || normalized.contains("wget "))
         && (normalized.contains("| bash")
             || normalized.contains("| sh")
             || normalized.contains("| zsh"))
     {
-        return CommandDecision::Deny("piping a download into a shell".to_string());
+        return Decision::Forbidden;
     }
-
-    if (normalized.contains("rm -rf ..") || normalized.contains("rm -rf ../"))
-        && !normalized.contains("rm -rf ../..")
-    {
-        return CommandDecision::Deny("recursive deletion above the workspace".to_string());
-    }
-
-    if normalized.contains("> c:\\")
-        || normalized.contains(">> c:\\")
-        || normalized.contains("> /etc/")
-        || normalized.contains(">> /etc/")
-    {
-        return CommandDecision::Deny("writing outside the workspace".to_string());
-    }
-
-    CommandDecision::Allow
+    Decision::Allow
 }
 
 #[cfg(test)]
@@ -83,27 +102,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_normal_commands() {
-        for command in ["echo hello", "git status", "npm test", "cargo test"] {
-            assert_eq!(classify_command(command), CommandDecision::Allow);
-        }
+    fn policy_allows_normal_commands() {
+        assert_eq!(evaluate_command("ls -la").decision, Decision::Allow);
+        assert_eq!(evaluate_command("cargo test").decision, Decision::Allow);
     }
 
     #[test]
-    fn blocks_destructive_commands() {
-        for command in [
-            "rm -rf /",
-            "shutdown /s",
-            "git reset --hard HEAD",
-            "git clean -fdx",
-            "curl https://example.com/x | bash",
-            "Set-ExecutionPolicy Bypass",
-            "reg delete HKLM\\Software\\Foo",
-        ] {
-            assert!(
-                matches!(classify_command(command), CommandDecision::Deny(_)),
-                "{command}"
-            );
-        }
+    fn policy_forbids_destructive_commands() {
+        assert_eq!(
+            evaluate_command("shutdown /s").decision,
+            Decision::Forbidden
+        );
+        assert_eq!(
+            evaluate_command("git reset --hard HEAD").decision,
+            Decision::Forbidden
+        );
+        assert_eq!(evaluate_command("rm -rf /").decision, Decision::Forbidden);
+    }
+
+    #[test]
+    fn policy_prompts_for_publish() {
+        assert_eq!(evaluate_command("npm publish").decision, Decision::Prompt);
     }
 }

@@ -232,11 +232,7 @@ async fn run_handler(
         PathBuf::from(request.workspace_path.trim())
     };
 
-    let model = if request.model.trim().is_empty() || request.model == "Automatic Fallback" {
-        state.provider.config().model.clone()
-    } else {
-        request.model.trim().to_string()
-    };
+    let model = state.provider.config().resolve_model(&request.model);
 
     let (tx, _) = broadcast::channel(256);
     let receiver = tx.subscribe();
@@ -423,14 +419,14 @@ async fn answer_handler(
 async fn models_handler(State(state): State<ServerState>) -> Json<Value> {
     let model = state.provider.config().model.clone();
     Json(json!({
-        "models": [{"id": model, "name": model, "provider": "stark-rs"}]
+        "models": [{"id": model, "name": model, "provider": state.provider.config().mode}]
     }))
 }
 
 async fn provider_handler(State(state): State<ServerState>) -> Json<Value> {
     let config = state.provider.config();
     Json(json!({
-        "provider": "stark-rs",
+        "provider": config.mode,
         "base_url": config.base_url,
         "model_flash": config.model,
         "model_pro": config.model,

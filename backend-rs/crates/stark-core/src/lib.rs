@@ -422,6 +422,7 @@ mod tests {
             .unwrap();
         let store = ChatStore::open(dir.path()).await.unwrap();
         let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
             base_url: format!("http://{address}"),
             api_key: "test".to_string(),
             model: "mock".to_string(),

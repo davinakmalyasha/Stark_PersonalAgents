@@ -54,6 +54,17 @@ export STARK_PORT=8124
 cargo run -p stark-server
 ```
 
+Command provider mode reads the existing `.env` keys directly:
+
+```bash
+export STARK_PROVIDER=command   # uses COMMAND_CODE_BASE_URL / API_KEY / MODEL_*
+export STARK_HARNESS_ROOT="D:/MyProject/LangChain"
+export STARK_PORT=8124
+```
+
+The Command mode maps canonical `deepseek-v4.1-flash` to the gateway slug
+`deepseek/deepseek-v4.1-flash`.
+
 The Rust server defaults to `127.0.0.1:8124`; Python remains on `:8123`.
 Point the Vite dev UI at it with:
 
@@ -70,9 +81,11 @@ Implemented routes: `POST /api/run`, `GET /api/stream/{chat_id}`,
 `GET /api/runs/active`, `GET /api/ask/pending`, `POST /api/ask/answer`,
 `GET /api/models`, `GET /api/provider`.
 
-Phase 2 progress: `edit_file` now supports Mode C patch sets, `run_command`
-supports background processes (`list`, `logs`, `kill`, `wait`, `ready`, `send`,
-`kill_all`), and `stark-policy` guards destructive shell commands. The guard is
-a conservative deny-list, not a sandbox; approvals are next. `ask_user` uses the
-question broker/UI polling, and tool calls are recorded as `tool_started` /
-`tool_finished` deltas. Chat history survives restart.
+Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
+passes Codex's 25 scenario fixtures. `run_command` supports background
+processes (`list`, `logs`, `kill`, `wait`, `ready`, `send`, `kill_all`), and
+`stark-policy` guards destructive shell commands. The guard is still a
+deny-list, not Codex `execpolicy` with prompt/forbidden approvals; that is the
+next fidelity step. `ask_user` uses the question broker/UI polling, and tool
+calls are recorded as `tool_started` / `tool_finished` deltas. Chat history
+survives restart.

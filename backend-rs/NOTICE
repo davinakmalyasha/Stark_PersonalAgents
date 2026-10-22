@@ -1,0 +1,5 @@
+Stark Rust backend
+
+Behavioral compatibility and test fixtures for `apply_patch` are derived from
+OpenAI Codex (https://github.com/openai/codex), licensed under Apache-2.0.
+See docs/rust-rewrite/01-codex-reference.md for the reference mapping.

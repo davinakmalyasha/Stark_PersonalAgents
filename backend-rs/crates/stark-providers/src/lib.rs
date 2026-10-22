@@ -8,6 +8,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
+    pub mode: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -15,21 +16,76 @@ pub struct ProviderConfig {
 
 impl ProviderConfig {
     pub fn from_env() -> Self {
-        let base_url = first_env(&[
-            "STARK_PROVIDER_BASE",
-            "OPENAI_BASE_URL",
-            "DEEPSEEK_BASE_URL",
-        ])
-        .unwrap_or_else(|| "https://api.deepseek.com".to_string());
-        let api_key =
-            first_env(&["STARK_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"]).unwrap_or_default();
-        let model = first_env(&["STARK_MODEL", "OPENAI_MODEL", "DEEPSEEK_MODEL"])
-            .unwrap_or_else(|| "deepseek-chat".to_string());
-        Self {
-            base_url,
-            api_key,
-            model,
+        let requested_mode = std::env::var("STARK_PROVIDER")
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        let explicit_base = first_env(&["STARK_PROVIDER_BASE", "OPENAI_BASE_URL"]);
+        let explicit_key = first_env(&["STARK_API_KEY", "OPENAI_API_KEY"]);
+        let explicit_model = first_env(&["STARK_MODEL", "OPENAI_MODEL"]);
+
+        if requested_mode == "command" || requested_mode == "commandcode" {
+            return Self {
+                mode: "command".to_string(),
+                base_url: explicit_base
+                    .or_else(|| first_env(&["COMMAND_CODE_BASE_URL"]))
+                    .unwrap_or_else(|| "https://api.commandcode.ai/provider/v1".to_string()),
+                api_key: explicit_key
+                    .or_else(|| first_env(&["COMMAND_CODE_API_KEY"]))
+                    .unwrap_or_default(),
+                model: explicit_model
+                    .or_else(|| first_env(&["COMMAND_CODE_MODEL_FLASH", "COMMAND_CODE_MODEL_ORCH"]))
+                    .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash".to_string()),
+            };
         }
+
+        if requested_mode == "opencode" {
+            return Self {
+                mode: "opencode".to_string(),
+                base_url: explicit_base
+                    .or_else(|| first_env(&["DEEPSEEK_BASE_URL"]))
+                    .unwrap_or_else(|| "https://opencode.ai/zen/go/v1".to_string()),
+                api_key: explicit_key
+                    .or_else(|| first_env(&["OPENCODE_API_KEY", "DEEPSEEK_API_KEY"]))
+                    .unwrap_or_default(),
+                model: explicit_model
+                    .or_else(|| first_env(&["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL"]))
+                    .unwrap_or_else(|| "deepseek-v4.1-flash".to_string()),
+            };
+        }
+
+        Self {
+            mode: if requested_mode.is_empty() {
+                "deepseek".to_string()
+            } else {
+                requested_mode
+            },
+            base_url: explicit_base
+                .or_else(|| first_env(&["DEEPSEEK_BASE_URL"]))
+                .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
+            api_key: explicit_key
+                .or_else(|| first_env(&["DEEPSEEK_API_KEY", "OPENCODE_API_KEY"]))
+                .unwrap_or_default(),
+            model: explicit_model
+                .or_else(|| first_env(&["DEEPSEEK_MODEL", "DEEPSEEK_MODEL_FLASH"]))
+                .unwrap_or_else(|| "deepseek-chat".to_string()),
+        }
+    }
+
+    pub fn resolve_model(&self, requested: &str) -> String {
+        let requested = requested.trim();
+        if requested.is_empty() || requested.eq_ignore_ascii_case("Automatic Fallback") {
+            return self.model.clone();
+        }
+        if self.mode == "command"
+            && matches!(
+                requested,
+                "deepseek-v4.1-flash" | "deepseek-flash" | "deepseek:v4.1-flash"
+            )
+        {
+            return self.model.clone();
+        }
+        requested.to_string()
     }
 
     pub fn endpoint(&self) -> String {
@@ -394,5 +450,23 @@ mod tests {
                 finish_reason: None
             }
         ));
+    }
+
+    #[test]
+    fn command_mode_maps_canonical_model_to_gateway_slug() {
+        let config = ProviderConfig {
+            mode: "command".to_string(),
+            base_url: "https://api.commandcode.ai/provider/v1".to_string(),
+            api_key: "test".to_string(),
+            model: "deepseek/deepseek-v4.1-flash".to_string(),
+        };
+        assert_eq!(
+            config.resolve_model("deepseek-v4.1-flash"),
+            "deepseek/deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            config.resolve_model("poolside/laguna-s-2.1-free"),
+            "poolside/laguna-s-2.1-free"
+        );
     }
 }

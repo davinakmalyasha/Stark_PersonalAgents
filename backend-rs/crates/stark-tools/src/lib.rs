@@ -1,6 +1,7 @@
 mod ask;
 mod command;
 mod edit;
+mod patch;
 mod paths;
 mod processes;
 mod questions;

@@ -13,28 +13,20 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_CHARS: usize = 100_000;
 
 pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    if args
-        .get("background")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return ToolOutcome::err(
-            "Error: background commands are not implemented in the Rust Phase 1 backend",
-        );
-    }
-    if args
+    let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+    let process_action = args
         .get("process_action")
         .and_then(Value::as_str)
-        .is_some_and(|action| !action.trim().is_empty())
-    {
-        return ToolOutcome::err(
-            "Error: process_action is not implemented in the Rust Phase 1 backend",
-        );
+        .unwrap_or("")
+        .trim();
+
+    if !process_action.is_empty() {
+        return handle_process_action(ctx, process_action, command, args).await;
     }
 
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
+    if command.trim().is_empty() {
         return ToolOutcome::err("Error: run_command requires command");
-    };
+    }
     if let stark_policy::CommandDecision::Deny(reason) = stark_policy::classify_command(command) {
         return ToolOutcome::err(format!("[BLOCKED] Command denied by policy: {reason}"));
     }
@@ -54,6 +46,33 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         timeout_ms *= 1000;
     }
     timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
+
+    if args
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let (name, pid) = match ctx.processes.spawn(command, &workdir, &ctx.chat_id) {
+            Ok(value) => value,
+            Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+        };
+        let mut note = format!("[OK] Started background process '{name}' (PID {pid}).");
+        if let Some(expect) = args
+            .get("expect")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let ready_timeout = args
+                .get("ready_timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(15_000);
+            match ctx.processes.wait_ready(&name, expect, ready_timeout).await {
+                Ok(ready) => note.push_str(&format!("\n{ready}")),
+                Err(error) => note.push_str(&format!("\n[READY_TIMEOUT] {error}")),
+            }
+        }
+        return ToolOutcome::ok(note);
+    }
 
     let bash = find_bash();
     let started = Instant::now();
@@ -95,6 +114,97 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Ok(Err(error)) => ToolOutcome::err(format!("Error: shell failed: {error}")),
         Err(_) => ToolOutcome::err(format!(
             "[TIMEOUT] Command exceeded {timeout_ms}ms\n{command}"
+        )),
+    }
+}
+
+async fn handle_process_action(
+    ctx: &ToolContext,
+    action: &str,
+    command: &str,
+    args: &Value,
+) -> ToolOutcome {
+    match action {
+        "list" => ToolOutcome::ok(ctx.processes.list()),
+        "kill_all" => {
+            let count = ctx.processes.kill_all();
+            ToolOutcome::ok(if count == 0 {
+                "No background processes to kill.".to_string()
+            } else {
+                format!("[OK] Killed {count} background process(es).")
+            })
+        }
+        "logs" => {
+            if command.trim().is_empty() {
+                return ToolOutcome::err("Error: process_action='logs' requires command");
+            }
+            let tail = args
+                .get("tail_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(200) as usize;
+            match ctx.processes.logs(command, tail) {
+                Ok(logs) => ToolOutcome::ok(logs),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+        "kill" => {
+            if command.trim().is_empty() {
+                return ToolOutcome::err("Error: process_action='kill' requires command");
+            }
+            match ctx.processes.kill(command) {
+                Ok(()) => ToolOutcome::ok(format!("[OK] Killed {command}")),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+        "wait" => {
+            if command.trim().is_empty() {
+                return ToolOutcome::err("Error: process_action='wait' requires command");
+            }
+            let timeout = args
+                .get("timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_TIMEOUT_MS);
+            match ctx.processes.wait(command, timeout).await {
+                Ok(message) => ToolOutcome::ok(format!("[OK] {message}")),
+                Err(error) => ToolOutcome::err(format!("[TIMEOUT] {error}")),
+            }
+        }
+        "ready" => {
+            if command.trim().is_empty() {
+                return ToolOutcome::err("Error: process_action='ready' requires command");
+            }
+            let Some(expect) = args
+                .get("expect")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return ToolOutcome::err("Error: process_action='ready' requires expect (regex)");
+            };
+            let ready_timeout = args
+                .get("ready_timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(15_000);
+            match ctx
+                .processes
+                .wait_ready(command, expect, ready_timeout)
+                .await
+            {
+                Ok(message) => ToolOutcome::ok(message),
+                Err(error) => ToolOutcome::err(format!("[NOT READY] {error}")),
+            }
+        }
+        "send" => {
+            if command.trim().is_empty() {
+                return ToolOutcome::err("Error: process_action='send' requires command");
+            }
+            let input = args.get("input").and_then(Value::as_str).unwrap_or("");
+            match ctx.processes.send(command, input).await {
+                Ok(()) => ToolOutcome::ok(format!("[OK] Sent input to {command}")),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+        other => ToolOutcome::err(format!(
+            "Error: unknown process_action '{other}' (list|logs|kill|wait|ready|send|kill_all)"
         )),
     }
 }

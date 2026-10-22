@@ -1,0 +1,50 @@
+name: rust-validate
+
+on:
+  push:
+    paths:
+      - "backend-rs/**"
+      - "scripts/export_tool_specs.py"
+      - "tools/_schemas.py"
+      - "agents/workspace_registry.py"
+      - "agents/specialists/**"
+      - "llm/deps.py"
+      - ".github/workflows/rust-validate.yml"
+  pull_request:
+    paths:
+      - "backend-rs/**"
+      - "scripts/export_tool_specs.py"
+      - "tools/_schemas.py"
+      - "agents/workspace_registry.py"
+      - "agents/specialists/**"
+      - "llm/deps.py"
+      - ".github/workflows/rust-validate.yml"
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: backend-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend-rs -> target
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  specs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r requirements-test.txt
+      - run: python -B scripts/export_tool_specs.py --check

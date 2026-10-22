@@ -99,3 +99,12 @@ scratch/gen10_crashed_smoke/
 # absolute local path. main.cjs:21 already has a default fallback.
 frontend/electron/stark-root.txt
 
+# Rust build output
+backend-rs/target/
+target/
+**/*.rs.bk
+
+# The global specs/ ignore above must not hide the frozen tool contract
+!backend-rs/specs/
+!backend-rs/specs/**
+

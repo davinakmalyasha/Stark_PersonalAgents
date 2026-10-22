@@ -1,10 +1,14 @@
 # 04 — Tool System
 
 The tool layer is the largest compatibility surface in Stark: **42 definitions
-in `TOOL_DEFINITIONS`** (plus `propose_plan`, which is exposed by plan mode
-but is not in that list), each with a name, description, JSON Schema, scope,
+in `TOOL_DEFINITIONS`**, each with a name, description, JSON Schema, scope,
 caps, and a text result contract. The model sees these strings; changing them
 changes behavior.
+
+`propose_plan` exists in `tools/MainTool/proposePlan.py` and is allowed by the
+plan-mode guard, but it is **not registered** in `TOOL_DEFINITIONS` or the
+runtime `_SCOPE_MAP`; the native schema never exposes it. Phase 0 freezes the 42
+registered tools and records this gap rather than changing Python behavior.
 
 This document defines the Rust implementation and the exact port order.
 
@@ -327,7 +331,7 @@ implementation notes only.
 |---|---|---|---|
 | `ask_user` | `stark-tools::ask` | `MainTool/planTools.py` | Question batch schema; 2–4 options; `multiSelect`; plan-review intent; timeout |
 | `update_plan` | `stark-tools::plan` | `MainTool/planTools.py` | Full replacement; ≤1 `in_progress`; persist per scope |
-| `propose_plan` | `stark-tools::plan` | `MainTool/proposePlan.py` | Plan-review gate; **not in `TOOL_DEFINITIONS`** — verify plan-mode exposure and add it to the exporter deliberately |
+| `propose_plan` | `stark-tools::plan` | `MainTool/proposePlan.py` | Plan-review gate; **not in `TOOL_DEFINITIONS` or `_SCOPE_MAP`** — unregistered in Python; not part of the 42-tool Phase 0 contract |
 | `files_changed` | `stark-tools::watch` | `tools/watcher.py` | Recent external edits; advisory |
 
 ### 10.4 Browser / screen

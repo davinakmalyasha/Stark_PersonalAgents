@@ -9,7 +9,7 @@ criterion and a rollback point.
 
 - **Port the contract, not the code.**
 - Rust runs on `:8124` while Python stays on `:8123`.
-- The frontend selects the backend with `VITE_API_BASE`.
+- The Vite dev proxy selects the backend with `STARK_PORT`.
 - Every phase adds tests; no phase removes the Python fallback.
 - Cutover is a config flip after parity, not a big-bang rewrite.
 
@@ -187,7 +187,7 @@ Acceptance:
 
 Tasks:
 - Shadow-run both backends on the same fixtures.
-- Flip `VITE_API_BASE`/Electron to Rust.
+- Flip the Vite proxy/Electron startup to Rust.
 - Keep Python voice/Telegram sidecars.
 - Monitor errors/latency.
 - Remove Python backend startup; archive the tree.

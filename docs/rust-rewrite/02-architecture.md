@@ -258,7 +258,8 @@ CI gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warn
 **Strangler, side-by-side, contract-first.**
 
 1. Rust runs on `:8124`; Python stays on `:8123`.
-2. Frontend uses `VITE_API_BASE` (already reads `API_BASE`) to choose.
+2. Frontend Vite proxy reads `STARK_PORT` (default `8123`) to choose. Electron
+   still launches the Python server, so Phase 1 browser/Vite uses `STARK_PORT=8124`.
 3. Every ported endpoint gets a contract test against the Python response.
 4. A run fixture is replayed through both and normalized-diffed.
 5. Cutover is a config flip, not a big-bang rewrite.

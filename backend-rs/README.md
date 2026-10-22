@@ -55,11 +55,15 @@ cargo run -p stark-server
 ```
 
 The Rust server defaults to `127.0.0.1:8124`; Python remains on `:8123`.
-Point the UI at it with:
+Point the Vite dev UI at it with:
 
 ```bash
-VITE_API_BASE=http://127.0.0.1:8124 npm run dev
+cd ../frontend
+STARK_PORT=8124 npm run dev
 ```
+
+The Vite proxy reads `STARK_PORT`; Electron still starts the Python server
+itself, so browser/Vite is the Phase 1 UI path.
 
 Implemented routes: `POST /api/run`, `GET /api/stream/{chat_id}`,
 `POST /api/abort`, `GET /api/health`, `GET /api/state`, `GET /api/history`,

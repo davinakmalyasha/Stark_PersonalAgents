@@ -287,7 +287,7 @@ cargo run -p stark-server -- --port 8124
 | Variable | Purpose |
 |---|---|
 | `STARK_PORT` | Server port (default 8123; Rust dev 8124) |
-| `VITE_API_BASE` | Frontend → backend base URL |
+| `STARK_PORT` | Vite proxy target; set `8124` for the Rust server |
 | `RUST_LOG` | `tracing` filter (e.g. `stark=debug`) |
 | `HARNESS_ROOT` | Harness root for `.deep_agents` |
 | `DEEPSEEK_API_KEY` / provider keys | Provider auth |

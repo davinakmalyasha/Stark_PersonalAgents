@@ -70,9 +70,9 @@ Implemented routes: `POST /api/run`, `GET /api/stream/{chat_id}`,
 `GET /api/runs/active`, `GET /api/ask/pending`, `POST /api/ask/answer`,
 `GET /api/models`, `GET /api/provider`.
 
-Phase 2 progress: `edit_file` now supports Mode C patch sets, and
-`run_command` is guarded by `stark-policy` against destructive shell commands.
-The guard is a conservative deny-list, not a sandbox; approvals are next.
-`run_command` remains foreground-only, `ask_user` uses the question broker/UI
-polling, and tool calls are recorded as `tool_started` / `tool_finished`
-deltas. Chat history survives restart.
+Phase 2 progress: `edit_file` now supports Mode C patch sets, `run_command`
+supports background processes (`list`, `logs`, `kill`, `wait`, `ready`, `send`,
+`kill_all`), and `stark-policy` guards destructive shell commands. The guard is
+a conservative deny-list, not a sandbox; approvals are next. `ask_user` uses the
+question broker/UI polling, and tool calls are recorded as `tool_started` /
+`tool_finished` deltas. Chat history survives restart.

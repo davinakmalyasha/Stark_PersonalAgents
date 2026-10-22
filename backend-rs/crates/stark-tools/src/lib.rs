@@ -2,6 +2,7 @@ mod ask;
 mod command;
 mod edit;
 mod paths;
+mod processes;
 mod questions;
 mod read;
 mod search;
@@ -12,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{Value, json};
 use stark_contract::ToolSpecFile;
 
+pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
 
 const IMPLEMENTED: &[&str] = &[
@@ -29,6 +31,7 @@ pub struct ToolContext {
     pub workspace: PathBuf,
     pub chat_id: String,
     pub questions: Arc<QuestionBroker>,
+    pub processes: Arc<ProcessManager>,
 }
 
 impl ToolContext {
@@ -41,6 +44,7 @@ impl ToolContext {
             workspace: workspace.into(),
             chat_id: chat_id.into(),
             questions,
+            processes: Arc::new(ProcessManager::new()),
         }
     }
 }
@@ -187,6 +191,42 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("[OK] Exit 0"));
         assert!(result.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn background_process_ready_logs_and_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let command = "printf 'bg-ready\\n'; sleep 2";
+        let started = dispatch(
+            "run_command",
+            &json!({
+                "command": command,
+                "background": true,
+                "expect": "bg-ready",
+                "ready_timeout": 5000
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!started.is_error, "{}", started.content);
+        assert!(started.content.contains("[READY]"));
+
+        let logs = dispatch(
+            "run_command",
+            &json!({"command": command, "process_action": "logs"}),
+            &ctx,
+        )
+        .await;
+        assert!(logs.content.contains("bg-ready"));
+
+        let killed = dispatch(
+            "run_command",
+            &json!({"command": command, "process_action": "kill"}),
+            &ctx,
+        )
+        .await;
+        assert!(!killed.is_error, "{}", killed.content);
     }
 
     #[tokio::test]

@@ -505,6 +505,51 @@ impl ChatStore {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn chat_workspace_path(&self, chat_id: &str) -> Result<Option<String>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let row = sqlx::query("SELECT workspace_path FROM chats WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|row| {
+            row.try_get::<Option<String>, _>("workspace_path")
+                .ok()
+                .flatten()
+        }))
+    }
+
+    pub async fn messages_from(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<Vec<Value>>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let rows = sqlx::query(
+            "SELECT id, role, content FROM messages WHERE chat_id = ? ORDER BY timestamp ASC, rowid ASC",
+        )
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(index) = rows
+            .iter()
+            .position(|row| row.get::<String, _>("id") == message_id)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            rows[index..]
+                .iter()
+                .map(|row| {
+                    json!({
+                        "id": row.get::<String, _>("id"),
+                        "role": display_role(&row.get::<String, _>("role")),
+                        "content": row.get::<String, _>("content"),
+                    })
+                })
+                .collect(),
+        ))
+    }
+
     pub async fn truncate_from_message(
         &self,
         chat_id: &str,

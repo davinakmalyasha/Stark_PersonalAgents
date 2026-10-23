@@ -9,6 +9,9 @@ pub async fn edit_file(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .and_then(Value::as_str)
         .filter(|diff| !diff.trim().is_empty())
     {
+        if let Some(checkpoint) = &ctx.checkpoint {
+            checkpoint.snapshot_patch(diff);
+        }
         return crate::patch::apply_patch(ctx, diff).await;
     }
 
@@ -19,6 +22,10 @@ pub async fn edit_file(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
+
+    if let Some(checkpoint) = &ctx.checkpoint {
+        checkpoint.snapshot_file(&path);
+    }
 
     let old_string = args.get("old_string").and_then(Value::as_str);
     let Some(new_string) = args.get("new_string").and_then(Value::as_str) else {
@@ -82,6 +89,30 @@ mod tests {
 
     fn context(workspace: &std::path::Path) -> ToolContext {
         ToolContext::new(workspace, "test", Arc::new(QuestionBroker::new()))
+    }
+
+    #[tokio::test]
+    async fn edit_records_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        tokio::fs::write(&file, "before").await.unwrap();
+        let checkpoint = crate::Checkpoint::begin("chat", dir.path());
+        checkpoint.set_user_message("u1");
+        let ctx = context(dir.path()).with_checkpoint(checkpoint.clone());
+        let result = edit_file(
+            &ctx,
+            &serde_json::json!({"file_path": "a.txt", "new_string": "after"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        checkpoint.finalize();
+
+        let groups = crate::Checkpoint::list(dir.path(), "chat", 10);
+        assert_eq!(groups.len(), 1);
+        let report =
+            crate::Checkpoint::restore_for_messages(dir.path(), "chat", &["u1".to_string()], false);
+        assert!(report.ok(), "{:?}", report);
+        assert_eq!(tokio::fs::read_to_string(&file).await.unwrap(), "before");
     }
 
     #[tokio::test]

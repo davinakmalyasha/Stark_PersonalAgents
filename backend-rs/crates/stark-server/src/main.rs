@@ -286,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/chats/{chat_id}/runs/{run_id}/restore",
             post(restore_run_handler),
         )
+        .route("/api/runs/{run_id}/undo", post(undo_run_handler))
         .route("/api/groups", get(groups_handler))
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route("/api/notes/chat/{chat_id}", get(notes_handler))
@@ -835,6 +836,30 @@ async fn save_ui_state_handler(
         .await
         .map_err(|error| bad_request(error.to_string()))?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn undo_run_handler(
+    State(state): State<ServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut roots = vec![state.harness_root.clone()];
+    roots.extend(
+        state
+            .registry
+            .list()
+            .into_iter()
+            .map(|workspace| std::path::PathBuf::from(workspace.path)),
+    );
+    for root in roots {
+        if let Some((ok, messages)) = Checkpoint::restore_run_any(&root, &run_id) {
+            return Ok(Json(json!({
+                "status": "undone",
+                "ok": ok,
+                "results": messages,
+            })));
+        }
+    }
+    Err(not_found("This run is no longer available for undo."))
 }
 
 async fn session_reset_handler() -> Json<Value> {

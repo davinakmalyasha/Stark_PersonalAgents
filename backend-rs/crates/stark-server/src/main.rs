@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -207,7 +207,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/workspaces/{workspace_id}",
-            delete(remove_workspace_handler),
+            get(workspace_handler).delete(remove_workspace_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/files",
+            get(workspace_files_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/file",
+            get(workspace_file_handler),
         )
         .route(
             "/api/workspaces/{workspace_id}/chats",
@@ -774,4 +782,271 @@ async fn canvas_status_handler() -> Json<Value> {
 
 async fn notes_handler() -> Json<Value> {
     Json(json!({"notes": []}))
+}
+
+async fn workspace_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some((name, path, kind)) = virtual_workspace(&workspace_id) {
+        let (chat_count, updated_at) = state.store.chat_stats(&workspace_id).await;
+        return Ok(Json(json!({
+            "id": workspace_id,
+            "name": name,
+            "path": path,
+            "exists": true,
+            "chatCount": chat_count,
+            "addedAt": "",
+            "updatedAt": updated_at,
+            "isGeneral": kind == "general",
+            "isHouse": kind == "house",
+            "isPersonal": kind == "personal",
+            "isDfd": kind == "dfd",
+            "workspaceKind": kind,
+        })));
+    }
+    let Some(record) = state.registry.get(&workspace_id) else {
+        return Err(not_found("workspace not found"));
+    };
+    let (chat_count, updated_at) = state.store.chat_stats(&workspace_id).await;
+    Ok(Json(json!({
+        "id": record.id,
+        "name": record.name,
+        "path": record.path,
+        "exists": std::path::Path::new(&record.path).is_dir(),
+        "chatCount": chat_count,
+        "addedAt": record.added_at,
+        "updatedAt": if updated_at.is_empty() { record.added_at } else { updated_at },
+        "isGeneral": false,
+        "workspaceKind": "project",
+    })))
+}
+
+const FILE_SKIP_DIRS: [&str; 15] = [
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "venv",
+    "venv312",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".agent-memory",
+    ".deep_agents",
+    "dist",
+    "build",
+    ".next",
+];
+
+const FILE_MAX_SIZE: u64 = 5 * 1024 * 1024;
+const FILE_PREVIEW_MAX: u64 = 200 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct FilesQuery {
+    max_depth: Option<usize>,
+}
+
+async fn workspace_files_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Query(query): Query<FilesQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(path) = workspace_path(&state, &workspace_id) else {
+        return Err(not_found("workspace not found"));
+    };
+    if path.is_empty() || !std::path::Path::new(&path).is_dir() {
+        return Err(not_found("workspace folder not found"));
+    }
+    let max_depth = query.max_depth.unwrap_or(8).min(32);
+    let files = tokio::task::spawn_blocking(move || list_files(&path, max_depth))
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(json!({"files": files})))
+}
+
+async fn workspace_file_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(root) = workspace_path(&state, &workspace_id) else {
+        return Err(not_found("workspace not found"));
+    };
+    if root.is_empty() {
+        return Err(not_found("workspace folder not found"));
+    }
+    let file_path = query.path.unwrap_or_default();
+    match tokio::task::spawn_blocking(move || read_file(&root, &file_path)).await {
+        Ok(Ok(content)) => Ok(Json(content)),
+        Ok(Err((status, message))) => Err((status, Json(json!({"error": message})))),
+        Err(error) => Err(bad_request(error.to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: Option<String>,
+}
+
+fn list_files(root: &str, max_depth: usize) -> Vec<Value> {
+    let root = std::path::Path::new(root);
+    let mut files = Vec::new();
+    walk_files(root, 0, max_depth, "", &mut files);
+
+    let project_memory = root.join(".agent-memory").join("project.md");
+    if project_memory.is_file()
+        && let Ok(metadata) = project_memory.metadata()
+    {
+        files.push(json!({
+            "name": "project.md",
+            "path": ".agent-memory/project.md",
+            "type": "file",
+            "size": metadata.len(),
+        }));
+    }
+
+    files.sort_by(|left, right| {
+        let left_dir = left["type"] == "dir";
+        let right_dir = right["type"] == "dir";
+        right_dir.cmp(&left_dir).then_with(|| {
+            left["path"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .cmp(&right["path"].as_str().unwrap_or("").to_lowercase())
+        })
+    });
+    files
+}
+
+fn walk_files(
+    dir: &std::path::Path,
+    depth: usize,
+    max_depth: usize,
+    prefix: &str,
+    out: &mut Vec<Value>,
+) {
+    if depth > max_depth {
+        return;
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if FILE_SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let full = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            out.push(json!({"name": name, "path": rel, "type": "dir"}));
+            walk_files(&full, depth + 1, max_depth, &rel, out);
+        } else if metadata.is_file() {
+            if metadata.len() > FILE_MAX_SIZE {
+                continue;
+            }
+            out.push(json!({
+                "name": name,
+                "path": rel,
+                "type": "file",
+                "size": metadata.len(),
+            }));
+        }
+    }
+}
+
+fn read_file(root: &str, requested: &str) -> Result<Value, (StatusCode, String)> {
+    let root = std::fs::canonicalize(root).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            "Workspace folder not found".to_string(),
+        )
+    })?;
+    let candidate = std::fs::canonicalize(root.join(requested))
+        .map_err(|_| (StatusCode::NOT_FOUND, "File not found".to_string()))?;
+    if !candidate.starts_with(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Path outside workspace".to_string(),
+        ));
+    }
+    if !candidate.is_file() {
+        return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
+    }
+    let metadata = std::fs::metadata(&candidate)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if metadata.len() > FILE_PREVIEW_MAX {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "File too large to preview".to_string(),
+        ));
+    }
+    let bytes = std::fs::read(&candidate)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(json!({
+        "path": requested,
+        "content": String::from_utf8_lossy(&bytes),
+        "truncated": false,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_files_skips_metadata_and_keeps_dirs_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("README.md"), "hello").unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules").join("x.js"), "skip").unwrap();
+        std::fs::create_dir(root.join(".agent-memory")).unwrap();
+        std::fs::write(root.join(".agent-memory").join("project.md"), "memory").unwrap();
+
+        let files = list_files(root.to_string_lossy().as_ref(), 8);
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths[0], "src");
+        assert!(paths.contains(&"src/main.rs"));
+        assert!(paths.contains(&"README.md"));
+        assert!(paths.contains(&".agent-memory/project.md"));
+        assert!(!paths.contains(&"node_modules"));
+    }
+
+    #[test]
+    fn reads_files_and_blocks_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "nope").unwrap();
+
+        let content = read_file(root.to_string_lossy().as_ref(), "a.txt").unwrap();
+        assert_eq!(content["content"], "alpha");
+
+        let error = read_file(root.to_string_lossy().as_ref(), "../outside.txt").unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let missing = read_file(root.to_string_lossy().as_ref(), "missing.txt").unwrap_err();
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
 }

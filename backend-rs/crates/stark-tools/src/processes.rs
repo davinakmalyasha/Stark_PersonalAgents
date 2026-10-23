@@ -522,7 +522,16 @@ impl ProcessManager {
         }
 
         if yield_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(yield_ms)).await;
+            let started = Instant::now();
+            loop {
+                process.refresh_status();
+                if !matches!(*process.status.lock().unwrap(), ProcessStatus::Running)
+                    || started.elapsed() >= Duration::from_millis(yield_ms)
+                {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
         }
         process.refresh_status();
         let status = process.status.lock().unwrap().clone();

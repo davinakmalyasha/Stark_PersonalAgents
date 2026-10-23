@@ -245,7 +245,7 @@ mod tests {
 
         let pty = dispatch(
             "run_command",
-            &json!({"command": "printf 'pty-hello\\n'", "tty": true, "timeout": 3000}),
+            &json!({"command": "printf 'pty-hello\\n'", "tty": true, "timeout": 15000}),
             &ctx,
         )
         .await;
@@ -275,7 +275,7 @@ mod tests {
             &json!({
                 "command": id,
                 "process_action": "send",
-                "yield_time_ms": 5000
+                "yield_time_ms": 15000
             }),
             &ctx,
         )

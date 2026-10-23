@@ -34,6 +34,7 @@ struct RunHandle {
     cancel: CancellationToken,
     tx: broadcast::Sender<ServerEvent>,
     steering: Arc<Mutex<VecDeque<String>>>,
+    follow_up: Arc<Mutex<VecDeque<String>>>,
     started_at: String,
     workspace_path: String,
 }
@@ -51,6 +52,7 @@ impl RunManager {
         cancel: CancellationToken,
         tx: broadcast::Sender<ServerEvent>,
         steering: Arc<Mutex<VecDeque<String>>>,
+        follow_up: Arc<Mutex<VecDeque<String>>>,
         workspace_path: &str,
     ) -> bool {
         match self.runs.entry(chat_id.to_string()) {
@@ -60,6 +62,7 @@ impl RunManager {
                     cancel,
                     tx,
                     steering,
+                    follow_up,
                     started_at: Utc::now().to_rfc3339(),
                     workspace_path: workspace_path.to_string(),
                 });
@@ -91,6 +94,28 @@ impl RunManager {
             .unwrap()
             .push_back(message.to_string());
         true
+    }
+
+    fn follow_up(&self, chat_id: &str, message: &str) -> bool {
+        let Some(handle) = self.runs.get(chat_id) else {
+            return false;
+        };
+        handle
+            .follow_up
+            .lock()
+            .unwrap()
+            .push_back(message.to_string());
+        true
+    }
+
+    fn inbox_counts(&self, chat_id: &str) -> Value {
+        let Some(handle) = self.runs.get(chat_id) else {
+            return json!({"steering": 0, "follow_up": 0});
+        };
+        json!({
+            "steering": handle.steering.lock().unwrap().len(),
+            "follow_up": handle.follow_up.lock().unwrap().len(),
+        })
     }
 
     fn cancel(&self, chat_id: &str) -> bool {
@@ -277,6 +302,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chat/{chat_id}/mode", post(chat_mode_handler))
         .route("/api/chat/{chat_id}/state", get(chat_state_handler))
         .route("/api/steer", post(steer_handler))
+        .route("/api/followup", post(follow_up_handler))
+        .route("/api/inbox", get(inbox_handler))
         .route("/api/chats/{chat_id}/snapshots", get(snapshots_handler))
         .route(
             "/api/chats/{chat_id}/snapshots/{snap_id}/restore",
@@ -359,12 +386,14 @@ Attached files:
     let receiver = tx.subscribe();
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
+    let follow_up = Arc::new(Mutex::new(VecDeque::new()));
     let checkpoint = Checkpoint::begin(&chat_id, &workspace);
     if !state.runs.claim(
         &chat_id,
         cancel.clone(),
         tx.clone(),
         steering.clone(),
+        follow_up.clone(),
         workspace.to_string_lossy().as_ref(),
     ) {
         return Err((
@@ -386,6 +415,7 @@ Attached files:
         tx: tx.clone(),
         latest: latest.clone(),
         steering,
+        follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel,
     };
@@ -1417,6 +1447,30 @@ async fn steer_handler(
     let ok = !request.message.trim().is_empty()
         && state.runs.steer(&request.chat_id, request.message.trim());
     Json(json!({"ok": ok}))
+}
+
+async fn follow_up_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<SteerRequest>,
+) -> Json<Value> {
+    let ok = !request.message.trim().is_empty()
+        && state
+            .runs
+            .follow_up(&request.chat_id, request.message.trim());
+    Json(json!({"ok": ok}))
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxQuery {
+    #[serde(default)]
+    chat_id: String,
+}
+
+async fn inbox_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<InboxQuery>,
+) -> Json<Value> {
+    Json(state.runs.inbox_counts(&query.chat_id))
 }
 
 #[derive(Debug, Deserialize)]

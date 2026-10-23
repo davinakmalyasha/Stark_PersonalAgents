@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
@@ -238,6 +238,18 @@ async fn main() -> anyhow::Result<()> {
             get(ui_state_handler).put(save_ui_state_handler),
         )
         .route("/api/session/reset", post(session_reset_handler))
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/subagents",
+            get(subagents_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/subagents/{child_id}",
+            get(subagent_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/attachments",
+            post(upload_attachments_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/api/groups", get(groups_handler))
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route("/api/notes/chat/{chat_id}", get(notes_handler))
@@ -258,8 +270,23 @@ async fn run_handler(
     State(state): State<ServerState>,
     Json(request): Json<RunRequest>,
 ) -> Result<Sse<SseStream>, (StatusCode, Json<Value>)> {
-    let prompt = request.prompt.trim().to_string();
-    let _ = (&request.attachments, &request.workspace_kind);
+    let mut prompt = request.prompt.trim().to_string();
+    let _ = &request.workspace_kind;
+    if !request.attachments.is_empty() {
+        let note = attachment_note(&state.harness_root, &request.attachments);
+        if prompt.is_empty() {
+            prompt = "Review the attached files.".to_string();
+        }
+        if !note.is_empty() {
+            prompt.push_str(
+                "
+
+Attached files:
+",
+            );
+            prompt.push_str(&note);
+        }
+    }
     if prompt.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1002,6 +1029,177 @@ fn read_file(root: &str, requested: &str) -> Result<Value, (StatusCode, String)>
         "content": String::from_utf8_lossy(&bytes),
         "truncated": false,
     }))
+}
+
+fn attachment_note(harness_root: &std::path::Path, attachments: &[Value]) -> String {
+    let Ok(upload_root) = std::fs::canonicalize(harness_root.join(".deep_agents").join("uploads"))
+    else {
+        return String::new();
+    };
+    attachments
+        .iter()
+        .filter_map(|attachment| {
+            let name = attachment.get("name").and_then(Value::as_str)?;
+            let mime = attachment
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let size = attachment.get("size").and_then(Value::as_u64).unwrap_or(0);
+            let path = attachment
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .filter(|path| path.starts_with(&upload_root))?;
+            Some(format!(
+                "- {name} ({mime}, {size} bytes): {}",
+                path.display()
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+async fn subagents_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, _chat_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if workspace_path(&state, &workspace_id).is_none() {
+        return Err(not_found("workspace not found"));
+    }
+    Ok(Json(json!({"subagents": []})))
+}
+
+async fn subagent_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, _child_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if workspace_path(&state, &workspace_id).is_none() {
+        return Err(not_found("workspace not found"));
+    }
+    Err(not_found("subagent session not found"))
+}
+
+const MAX_ATTACHMENTS: usize = 8;
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+async fn upload_attachments_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, chat_id)): Path<(String, String)>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if workspace_path(&state, &workspace_id).is_none() {
+        return Err(not_found("workspace not found"));
+    }
+    if state
+        .store
+        .get_chat(&chat_id)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Err(not_found("chat not found"));
+    }
+    let Some(workspace_component) = safe_component(&workspace_id) else {
+        return Err(bad_request("invalid workspace id"));
+    };
+    let Some(chat_component) = safe_component(&chat_id) else {
+        return Err(bad_request("invalid chat id"));
+    };
+
+    let upload_dir = state
+        .harness_root
+        .join(".deep_agents")
+        .join("uploads")
+        .join(workspace_component)
+        .join(chat_component);
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+
+    let mut attachments = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| bad_request(format!("invalid multipart upload: {error}")))?
+    {
+        if attachments.len() >= MAX_ATTACHMENTS {
+            return Err(bad_request("A maximum of 8 files can be uploaded"));
+        }
+        let Some(raw_name) = field.file_name().map(str::to_string) else {
+            continue;
+        };
+        let name = safe_filename(&raw_name);
+        let mime = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|error| bad_request(format!("failed to read upload: {error}")))?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(bad_request(format!("{name} is larger than 20 MB")));
+        }
+
+        let stored_name = format!("{}-{}", &Uuid::new_v4().simple().to_string()[..8], name);
+        let target = upload_dir.join(&stored_name);
+        tokio::fs::write(&target, &bytes)
+            .await
+            .map_err(|error| bad_request(error.to_string()))?;
+        attachments.push(json!({
+            "id": stored_name,
+            "name": name,
+            "type": mime,
+            "size": bytes.len(),
+            "path": target,
+            "isImage": mime.starts_with("image/"),
+        }));
+    }
+
+    if attachments.is_empty() {
+        return Err(bad_request("no files uploaded"));
+    }
+    Ok(Json(json!({"attachments": attachments})))
+}
+
+fn safe_component(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn safe_filename(value: &str) -> String {
+    let base = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("attachment")
+        .trim();
+    let cleaned: String = base
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "attachment".to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[cfg(test)]

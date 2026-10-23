@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -32,6 +33,7 @@ type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 struct RunHandle {
     cancel: CancellationToken,
     tx: broadcast::Sender<ServerEvent>,
+    steering: Arc<Mutex<VecDeque<String>>>,
     started_at: String,
     workspace_path: String,
 }
@@ -48,6 +50,7 @@ impl RunManager {
         chat_id: &str,
         cancel: CancellationToken,
         tx: broadcast::Sender<ServerEvent>,
+        steering: Arc<Mutex<VecDeque<String>>>,
         workspace_path: &str,
     ) -> bool {
         match self.runs.entry(chat_id.to_string()) {
@@ -56,6 +59,7 @@ impl RunManager {
                 entry.insert(RunHandle {
                     cancel,
                     tx,
+                    steering,
                     started_at: Utc::now().to_rfc3339(),
                     workspace_path: workspace_path.to_string(),
                 });
@@ -75,6 +79,18 @@ impl RunManager {
 
     fn is_running(&self, chat_id: &str) -> bool {
         self.runs.contains_key(chat_id)
+    }
+
+    fn steer(&self, chat_id: &str, message: &str) -> bool {
+        let Some(handle) = self.runs.get(chat_id) else {
+            return false;
+        };
+        handle
+            .steering
+            .lock()
+            .unwrap()
+            .push_back(message.to_string());
+        true
     }
 
     fn cancel(&self, chat_id: &str) -> bool {
@@ -333,10 +349,12 @@ Attached files:
     let (tx, _) = broadcast::channel(256);
     let receiver = tx.subscribe();
     let cancel = CancellationToken::new();
+    let steering = Arc::new(Mutex::new(VecDeque::new()));
     if !state.runs.claim(
         &chat_id,
         cancel.clone(),
         tx.clone(),
+        steering.clone(),
         workspace.to_string_lossy().as_ref(),
     ) {
         return Err((
@@ -357,6 +375,7 @@ Attached files:
         questions: state.questions.clone(),
         tx: tx.clone(),
         latest: latest.clone(),
+        steering,
         cancel,
     };
 
@@ -1312,8 +1331,21 @@ async fn chat_state_handler(
     }
 }
 
-async fn steer_handler() -> Json<Value> {
-    Json(json!({"ok": false}))
+#[derive(Debug, Deserialize)]
+struct SteerRequest {
+    #[serde(default)]
+    chat_id: String,
+    #[serde(default)]
+    message: String,
+}
+
+async fn steer_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<SteerRequest>,
+) -> Json<Value> {
+    let ok = !request.message.trim().is_empty()
+        && state.runs.steer(&request.chat_id, request.message.trim());
+    Json(json!({"ok": ok}))
 }
 
 async fn snapshots_handler() -> Json<Value> {

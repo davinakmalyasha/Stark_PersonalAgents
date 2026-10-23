@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -37,6 +37,7 @@ pub struct RunContext {
     pub questions: Arc<QuestionBroker>,
     pub tx: broadcast::Sender<ServerEvent>,
     pub latest: Arc<Mutex<Option<AppState>>>,
+    pub steering: Arc<Mutex<VecDeque<String>>>,
     pub cancel: CancellationToken,
 }
 
@@ -127,6 +128,10 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
         if ctx.cancel.is_cancelled() {
             finish_aborted(&ctx, &mut state).await;
             return Ok(());
+        }
+
+        if let Some(message) = ctx.steering.lock().unwrap().pop_front() {
+            messages.push(ChatMessage::user(&message));
         }
 
         let mut stream = match ctx
@@ -446,6 +451,7 @@ mod tests {
             questions: Arc::new(QuestionBroker::new()),
             tx,
             latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
             cancel: CancellationToken::new(),
         };
 

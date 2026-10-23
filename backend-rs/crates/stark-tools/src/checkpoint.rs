@@ -7,7 +7,22 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_BASELINE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_BASELINE_FILES: usize = 20_000;
 const MAX_LIST: usize = 100;
+const SKIP_DIRS: [&str; 11] = [
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "venv",
+    "venv312",
+    ".venv",
+    "__pycache__",
+    ".deep_agents",
+    "target",
+    "dist",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FileEntry {
@@ -185,6 +200,30 @@ impl Checkpoint {
         self.save();
     }
 
+    pub fn snapshot_all(&self) {
+        let Ok(root) = std::path::absolute(&self.workspace) else {
+            return;
+        };
+        let mut files = Vec::new();
+        collect_files(&root, &root, 0, &mut files);
+        let mut count = 0usize;
+        let mut total = 0u64;
+        for (_, path) in files {
+            if count >= MAX_BASELINE_FILES || total >= MAX_BASELINE_BYTES {
+                break;
+            }
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if metadata.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            total = total.saturating_add(metadata.len());
+            count += 1;
+            self.snapshot_file(&path);
+        }
+    }
+
     pub fn snapshot_patch(&self, patch: &str) {
         for line in patch.lines() {
             let path = line
@@ -206,6 +245,7 @@ impl Checkpoint {
         let Ok(mut manifest) = self.manifest.lock() else {
             return;
         };
+        let mut unchanged = Vec::new();
         for (relative, entry) in &mut manifest.files {
             let target = self.workspace.join(relative);
             entry.after_sha = if target.is_file() {
@@ -213,6 +253,27 @@ impl Checkpoint {
             } else {
                 None
             };
+            if entry.created {
+                continue;
+            }
+            if let Some(after) = entry.after_sha.as_deref()
+                && let Some(snapshot_id) = entry.snapshot_id.as_deref()
+            {
+                let safe_name = relative.replace('/', "__").replace(':', "_");
+                let snapshot = self.dir.join(format!("{safe_name}.snap"));
+                if std::fs::read(&snapshot)
+                    .ok()
+                    .map(|bytes| sha(&bytes))
+                    .as_deref()
+                    == Some(after)
+                {
+                    unchanged.push((relative.clone(), safe_name, snapshot_id.to_string()));
+                }
+            }
+        }
+        for (relative, safe_name, _) in unchanged {
+            manifest.files.remove(&relative);
+            let _ = std::fs::remove_file(self.dir.join(format!("{safe_name}.snap")));
         }
         drop(manifest);
         self.save();
@@ -442,6 +503,32 @@ impl Checkpoint {
     }
 }
 
+fn collect_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+    if depth > 64 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_files(root, &path, depth + 1, out);
+        } else if metadata.is_file()
+            && let Ok(relative) = path.strip_prefix(root)
+        {
+            out.push((relative.to_string_lossy().replace('\\', "/"), path));
+        }
+    }
+}
+
 fn sha(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -478,6 +565,41 @@ mod tests {
         let (ok, _) = Checkpoint::restore_snapshot(dir.path(), "chat", &snapshot_id);
         assert!(ok);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+    }
+
+    #[test]
+    fn snapshot_all_captures_shell_changes_and_prunes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let changed = dir.path().join("src").join("changed.txt");
+        let deleted = dir.path().join("deleted.txt");
+        std::fs::write(&changed, "before").unwrap();
+        std::fs::write(&deleted, "gone soon").unwrap();
+        std::fs::write(dir.path().join("same.txt"), "same").unwrap();
+
+        let checkpoint = Checkpoint::begin("chat", dir.path());
+        checkpoint.set_user_message("u4");
+        checkpoint.snapshot_all();
+        std::fs::write(&changed, "after").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        checkpoint.finalize();
+
+        let groups = Checkpoint::list(dir.path(), "chat", 10);
+        assert_eq!(groups.len(), 1);
+        let paths: Vec<&str> = groups[0]
+            .files
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"src/changed.txt"));
+        assert!(paths.contains(&"deleted.txt"));
+        assert!(!paths.contains(&"same.txt"));
+
+        let report =
+            Checkpoint::restore_for_messages(dir.path(), "chat", &["u4".to_string()], false);
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(std::fs::read_to_string(&changed).unwrap(), "before");
+        assert_eq!(std::fs::read_to_string(&deleted).unwrap(), "gone soon");
     }
 
     #[test]

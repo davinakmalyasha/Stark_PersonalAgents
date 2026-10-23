@@ -81,6 +81,13 @@ Implemented routes: `POST /api/run`, `GET /api/stream/{chat_id}`,
 `GET /api/runs/active`, `GET /api/ask/pending`, `POST /api/ask/answer`,
 `GET /api/models`, `GET /api/provider`.
 
+Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
+`chats.db`: `GET/POST /api/workspaces`, `DELETE /api/workspaces/{id}`,
+`GET/POST /api/workspaces/{id}/chats`, `GET/DELETE .../chats/{chat_id}`,
+`PUT .../title`, `POST .../messages`, `GET/PUT /api/ui/state`,
+`POST /api/session/reset`. Empty stubs exist for `/api/groups`, canvas status,
+and chat notes so the existing UI can boot cleanly.
+
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible
 Starlark `prefix_rule` engine with `allow` / `prompt` / `forbidden` decisions
@@ -91,6 +98,6 @@ and `host_executable` paths; `prompt` decisions use the `ask_user` broker.
 ID for still-running commands), resumable `process_action=send` polling, a
 64-process cap, and a 1 MiB head/tail output buffer. `process_action=list`,
 `logs`, `kill`, `wait`, `ready`, and `kill_all` accept either a session ID or
-the background process name. `tty` and `yield_time_ms` are Rust extensions not
-yet exposed in the frozen tool schema. Tool calls are recorded as
+the background process name. `tty` and `yield_time_ms` are exposed to the Rust
+agent at runtime; the frozen Python-derived contract is unchanged. Tool calls are recorded as
 `tool_started` / `tool_finished` deltas; chat history survives restart.

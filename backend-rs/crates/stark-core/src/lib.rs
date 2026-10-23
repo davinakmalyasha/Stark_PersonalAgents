@@ -28,6 +28,7 @@ pub enum RunError {
 
 pub struct RunContext {
     pub chat_id: String,
+    pub workspace_id: String,
     pub workspace: PathBuf,
     pub model: String,
     pub temperature: f64,
@@ -67,6 +68,7 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
     ctx.store
         .ensure_chat(
             &ctx.chat_id,
+            &ctx.workspace_id,
             ctx.workspace.to_string_lossy().as_ref(),
             &ctx.model,
             &prompt,
@@ -168,12 +170,14 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
                     state.token_usage.total_input_tokens += usage.input_tokens;
                     state.token_usage.total_output_tokens += usage.output_tokens;
                     state.token_usage.calls.push(json!({
+                        "agent": "Supervisor",
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
                         "total_tokens": usage.total_tokens,
                     }));
                     ctx.emit_delta(Delta::usage(
                         json!({
+                            "agent": "Supervisor",
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
                             "total_tokens": usage.total_tokens,
@@ -433,6 +437,7 @@ mod tests {
         let latest = Arc::new(Mutex::new(None));
         let ctx = RunContext {
             chat_id: "chat".to_string(),
+            workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
             model: "mock".to_string(),
             temperature: 0.0,

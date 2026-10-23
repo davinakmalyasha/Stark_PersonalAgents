@@ -402,6 +402,11 @@ Attached files:
         ));
     }
 
+    if workspace != state.harness_root {
+        let checkpoint = checkpoint.clone();
+        let _ = tokio::task::spawn_blocking(move || checkpoint.snapshot_all()).await;
+    }
+
     let latest = Arc::new(Mutex::new(None));
     let ctx = RunContext {
         chat_id: chat_id.clone(),

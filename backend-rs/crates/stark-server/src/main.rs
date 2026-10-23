@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, run_agent};
 use stark_providers::{Provider, ProviderConfig};
-use stark_store::ChatStore;
+use stark_store::{ChatStore, WorkspaceRegistry};
 use stark_tools::QuestionBroker;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -129,6 +129,8 @@ struct ServerState {
     provider: Provider,
     questions: Arc<QuestionBroker>,
     runs: Arc<RunManager>,
+    registry: WorkspaceRegistry,
+    ui_state_path: PathBuf,
     harness_root: PathBuf,
 }
 
@@ -142,6 +144,8 @@ struct RunRequest {
     temperature: f64,
     #[serde(default)]
     workspace_path: String,
+    #[serde(default)]
+    workspace_id: String,
     #[serde(default)]
     chat_id: String,
     #[serde(default)]
@@ -180,6 +184,8 @@ async fn main() -> anyhow::Result<()> {
         provider,
         questions: Arc::new(QuestionBroker::new()),
         runs: Arc::new(RunManager::default()),
+        registry: WorkspaceRegistry::new(&harness_root),
+        ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
     };
 
@@ -195,6 +201,38 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/ask/answer", post(answer_handler))
         .route("/api/models", get(models_handler))
         .route("/api/provider", get(provider_handler))
+        .route(
+            "/api/workspaces",
+            get(workspaces_handler).post(add_workspace_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}",
+            delete(remove_workspace_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats",
+            get(chats_handler).post(create_chat_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}",
+            get(chat_handler).delete(delete_chat_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/title",
+            put(rename_chat_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
+            post(add_message_handler),
+        )
+        .route(
+            "/api/ui/state",
+            get(ui_state_handler).put(save_ui_state_handler),
+        )
+        .route("/api/session/reset", post(session_reset_handler))
+        .route("/api/groups", get(groups_handler))
+        .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
+        .route("/api/notes/chat/{chat_id}", get(notes_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -233,6 +271,17 @@ async fn run_handler(
     };
 
     let model = state.provider.config().resolve_model(&request.model);
+    let workspace_id = if !request.workspace_id.trim().is_empty() {
+        request.workspace_id.trim().to_string()
+    } else if let Ok(Some(existing)) = state.store.chat_workspace_id(&chat_id).await {
+        existing
+    } else if request.workspace_path.trim().is_empty() {
+        "_general".to_string()
+    } else {
+        state
+            .store
+            .workspace_id_for_path(workspace.to_string_lossy().as_ref())
+    };
 
     let (tx, _) = broadcast::channel(256);
     let receiver = tx.subscribe();
@@ -252,6 +301,7 @@ async fn run_handler(
     let latest = Arc::new(Mutex::new(None));
     let ctx = RunContext {
         chat_id: chat_id.clone(),
+        workspace_id,
         workspace,
         model,
         temperature: request.temperature,
@@ -432,4 +482,296 @@ async fn provider_handler(State(state): State<ServerState>) -> Json<Value> {
         "model_pro": config.model,
         "has_key": config.has_key(),
     }))
+}
+
+const VIRTUAL_WORKSPACES: [(&str, &str, &str, &str); 4] = [
+    ("_general", "General", "", "general"),
+    ("_house", "House", "_house", "house"),
+    ("_personal", "Personal", "_personal", "personal"),
+    ("_dfd", "DFD", "_dfd", "dfd"),
+];
+
+fn virtual_workspace(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    VIRTUAL_WORKSPACES
+        .iter()
+        .find(|(candidate, _, _, _)| *candidate == id)
+        .map(|(_, name, path, kind)| (*name, *path, *kind))
+}
+
+fn workspace_path(state: &ServerState, id: &str) -> Option<String> {
+    if let Some((_, path, _)) = virtual_workspace(id) {
+        return Some(path.to_string());
+    }
+    state.registry.get(id).map(|workspace| workspace.path)
+}
+
+fn bad_request(message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": message.into()})),
+    )
+}
+
+fn not_found(message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": message.into()})),
+    )
+}
+
+async fn workspaces_handler(State(state): State<ServerState>) -> Json<Value> {
+    let mut workspaces = Vec::new();
+    for (id, name, path, kind) in VIRTUAL_WORKSPACES {
+        let (chat_count, updated_at) = state.store.chat_stats(id).await;
+        workspaces.push(json!({
+            "id": id,
+            "name": name,
+            "path": path,
+            "exists": true,
+            "chatCount": chat_count,
+            "addedAt": "",
+            "updatedAt": updated_at,
+            "isGeneral": kind == "general",
+            "isHouse": kind == "house",
+            "isPersonal": kind == "personal",
+            "isDfd": kind == "dfd",
+            "workspaceKind": kind,
+        }));
+    }
+
+    let mut projects = Vec::new();
+    for record in state.registry.list() {
+        let (chat_count, updated_at) = state.store.chat_stats(&record.id).await;
+        let exists = std::path::Path::new(&record.path).is_dir();
+        let updated_at = if updated_at.is_empty() {
+            record.added_at.clone()
+        } else {
+            updated_at
+        };
+        projects.push(json!({
+            "id": record.id,
+            "name": record.name,
+            "path": record.path,
+            "exists": exists,
+            "chatCount": chat_count,
+            "addedAt": record.added_at,
+            "updatedAt": updated_at,
+            "isGeneral": false,
+            "workspaceKind": "project",
+        }));
+    }
+    projects.sort_by(|left, right| {
+        right["updatedAt"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(left["updatedAt"].as_str().unwrap_or(""))
+    });
+    workspaces.extend(projects);
+    Json(json!({"workspaces": workspaces}))
+}
+
+#[derive(Debug, Deserialize)]
+struct AddWorkspaceRequest {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    name: String,
+}
+
+async fn add_workspace_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<AddWorkspaceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let record = state
+        .registry
+        .add(&request.path, &request.name)
+        .map_err(bad_request)?;
+    Ok(Json(json!({
+        "id": record.id,
+        "name": record.name,
+        "path": record.path,
+        "exists": true,
+        "chatCount": 0,
+        "addedAt": record.added_at,
+        "updatedAt": record.added_at,
+        "isGeneral": false,
+        "workspaceKind": "project",
+    })))
+}
+
+async fn remove_workspace_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Json<Value> {
+    let status = if state.registry.remove(&workspace_id) {
+        "ok"
+    } else {
+        "not found"
+    };
+    Json(json!({"status": status}))
+}
+
+async fn chats_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if workspace_path(&state, &workspace_id).is_none() {
+        return Err(not_found("workspace not found"));
+    }
+    let chats = state.store.list_chats(&workspace_id).await;
+    Ok(Json(json!({"chats": chats})))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChatRequest {
+    #[serde(default)]
+    title: String,
+    #[serde(default = "default_model")]
+    model: String,
+}
+
+fn default_model() -> String {
+    "Automatic Fallback".to_string()
+}
+
+async fn create_chat_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<CreateChatRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(path) = workspace_path(&state, &workspace_id) else {
+        return Err(not_found("workspace not found"));
+    };
+    let chat = state
+        .store
+        .create_chat(&workspace_id, &path, &request.title, &request.model)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(chat))
+}
+
+async fn chat_handler(
+    State(state): State<ServerState>,
+    Path((_workspace_id, chat_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match state.store.get_chat(&chat_id).await {
+        Ok(Some(chat)) => Ok(Json(chat)),
+        Ok(None) => Err(not_found("chat not found")),
+        Err(error) => Err(bad_request(error.to_string())),
+    }
+}
+
+async fn delete_chat_handler(
+    State(state): State<ServerState>,
+    Path((_workspace_id, chat_id)): Path<(String, String)>,
+) -> Json<Value> {
+    let ok = state.store.delete_chat(&chat_id).await.unwrap_or(false);
+    Json(json!({"status": if ok { "ok" } else { "not found" }}))
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameChatRequest {
+    #[serde(default)]
+    title: String,
+}
+
+async fn rename_chat_handler(
+    State(state): State<ServerState>,
+    Path((_workspace_id, chat_id)): Path<(String, String)>,
+    Json(request): Json<RenameChatRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ok = state
+        .store
+        .update_chat_title(&chat_id, &request.title)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    if ok {
+        Ok(Json(json!({"status": "ok"})))
+    } else {
+        Err(not_found("chat not found"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AddMessageRequest {
+    #[serde(default = "default_role")]
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+fn default_role() -> String {
+    "user".to_string()
+}
+
+async fn add_message_handler(
+    State(state): State<ServerState>,
+    Path((_workspace_id, chat_id)): Path<(String, String)>,
+    Json(request): Json<AddMessageRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if state
+        .store
+        .get_chat(&chat_id)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Err(not_found("chat not found"));
+    }
+    let message = state
+        .store
+        .add_message(
+            &chat_id,
+            &request.role,
+            &request.content,
+            request.metadata.as_ref(),
+        )
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(message))
+}
+
+async fn ui_state_handler(State(state): State<ServerState>) -> Json<Value> {
+    let value = tokio::fs::read_to_string(&state.ui_state_path)
+        .await
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({}));
+    Json(value)
+}
+
+async fn save_ui_state_handler(
+    State(state): State<ServerState>,
+    Json(value): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(parent) = state.ui_state_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| bad_request(error.to_string()))?;
+    }
+    let text =
+        serde_json::to_string_pretty(&value).map_err(|error| bad_request(error.to_string()))?;
+    tokio::fs::write(&state.ui_state_path, text)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn session_reset_handler() -> Json<Value> {
+    Json(json!({"ok": true}))
+}
+
+async fn groups_handler() -> Json<Value> {
+    Json(json!({"projects": [], "scoped": false}))
+}
+
+async fn canvas_status_handler() -> Json<Value> {
+    Json(json!({"active": false, "watch": null}))
+}
+
+async fn notes_handler() -> Json<Value> {
+    Json(json!({"notes": []}))
 }

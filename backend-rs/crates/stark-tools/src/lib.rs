@@ -97,14 +97,43 @@ pub fn tool_specs() -> Vec<Value> {
         .iter()
         .filter(|tool| tool.exposed && IMPLEMENTED.contains(&tool.name.as_str()))
         .map(|tool| {
-            json!({
+            let mut spec = json!({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
                 }
-            })
+            });
+            if tool.name == "run_command"
+                && let Some(properties) = spec
+                    .pointer_mut("/function/parameters/properties")
+                    .and_then(Value::as_object_mut)
+            {
+                properties.insert(
+                    "tty".to_string(),
+                    json!({
+                        "type": "boolean",
+                        "description": "Allocate a ConPTY for interactive commands (Windows)."
+                    }),
+                );
+                properties.insert(
+                    "yield_time_ms".to_string(),
+                    json!({
+                        "type": "integer",
+                        "description": "Return a session ID if the command is still running after this many ms (250-30000). Omit to block up to timeout."
+                    }),
+                );
+                properties.insert(
+                    "process_action".to_string(),
+                    json!({
+                        "type": "string",
+                        "enum": ["list", "logs", "kill", "wait", "ready", "send", "kill_all"],
+                        "description": "'list' | 'logs' | 'kill' | 'wait' | 'ready' | 'send' | 'kill_all' (command carries a session ID or background process name)."
+                    }),
+                );
+            }
+            spec
         })
         .collect()
 }
@@ -128,6 +157,20 @@ mod tests {
 
     fn context(workspace: &std::path::Path) -> ToolContext {
         ToolContext::new(workspace, "test-chat", Arc::new(QuestionBroker::new()))
+    }
+
+    #[test]
+    fn tool_specs_exposes_unified_exec_fields() {
+        let specs = tool_specs();
+        let run = specs
+            .iter()
+            .find(|spec| spec["function"]["name"] == "run_command")
+            .expect("run_command spec");
+        let properties = run
+            .pointer("/function/parameters/properties")
+            .expect("run_command properties");
+        assert!(properties.get("tty").is_some());
+        assert!(properties.get("yield_time_ms").is_some());
     }
 
     #[tokio::test]

@@ -8,6 +8,9 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod workspaces;
+pub use workspaces::{WorkspaceRecord, WorkspaceRegistry};
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
@@ -77,6 +80,13 @@ impl ChatStore {
         )
         .execute(&self.pool)
         .await?;
+        for statement in [
+            "ALTER TABLE chats ADD COLUMN parent_chat_id TEXT",
+            "ALTER TABLE chats ADD COLUMN parent_workspace_id TEXT",
+            "ALTER TABLE chats ADD COLUMN token_usage_json TEXT",
+        ] {
+            let _ = sqlx::query(statement).execute(&self.pool).await;
+        }
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS messages (
@@ -101,9 +111,37 @@ impl ChatStore {
         Ok(())
     }
 
+    pub fn workspace_id_for_path(&self, workspace_path: &str) -> String {
+        let path = workspace_path.trim();
+        if path.is_empty() || path == "_general" {
+            return "_general".to_string();
+        }
+        if matches!(path, "_house" | "_personal" | "_dfd") {
+            return path.to_string();
+        }
+        WorkspaceRegistry::new(&self.harness_root)
+            .find_by_path(path)
+            .map(|workspace| workspace.id)
+            .unwrap_or_else(|| path.to_string())
+    }
+
+    pub async fn chat_workspace_id(&self, chat_id: &str) -> Result<Option<String>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let row = sqlx::query("SELECT workspace_id FROM chats WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|row| {
+            row.try_get::<Option<String>, _>("workspace_id")
+                .ok()
+                .flatten()
+        }))
+    }
+
     pub async fn ensure_chat(
         &self,
         chat_id: &str,
+        workspace_id: &str,
         workspace_path: &str,
         model: &str,
         prompt: &str,
@@ -123,7 +161,7 @@ impl ChatStore {
             "#,
         )
         .bind(chat_id)
-        .bind(workspace_path)
+        .bind(workspace_id)
         .bind(workspace_path)
         .bind(title)
         .bind(model)
@@ -214,6 +252,256 @@ impl ChatStore {
         Ok(prompts)
     }
 
+    pub async fn chat_stats(&self, workspace_id: &str) -> (i64, String) {
+        let row = sqlx::query(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM chats WHERE workspace_id = ?",
+        )
+        .bind(workspace_id)
+        .fetch_one(&self.pool)
+        .await;
+        match row {
+            Ok(row) => (row.get::<i64, _>(0), row.get::<String, _>(1)),
+            Err(_) => (0, String::new()),
+        }
+    }
+
+    pub async fn list_chats(&self, workspace_id: &str) -> Vec<Value> {
+        let rows = sqlx::query(
+            r#"
+            SELECT c.id, c.title, c.model, c.created_at, c.updated_at, c.message_count,
+                   c.parent_chat_id, c.parent_workspace_id,
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role
+            FROM chats c
+            WHERE c.workspace_id = ?
+            ORDER BY c.updated_at DESC
+            "#,
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|row| {
+                let mut item = json!({
+                    "id": row.get::<String, _>("id"),
+                    "title": row.get::<String, _>("title"),
+                    "messageCount": row.get::<i64, _>("message_count"),
+                    "model": row.get::<String, _>("model"),
+                    "createdAt": row.get::<String, _>("created_at"),
+                    "updatedAt": row.get::<String, _>("updated_at"),
+                });
+                if let Some(parent) = row
+                    .try_get::<Option<String>, _>("parent_chat_id")
+                    .ok()
+                    .flatten()
+                {
+                    item["parentChatId"] = Value::String(parent);
+                }
+                if let Some(parent) = row
+                    .try_get::<Option<String>, _>("parent_workspace_id")
+                    .ok()
+                    .flatten()
+                {
+                    item["parentWorkspaceId"] = Value::String(parent);
+                }
+                if let Some(last) = row
+                    .try_get::<Option<String>, _>("last_message")
+                    .ok()
+                    .flatten()
+                {
+                    let snippet: String = last.split_whitespace().collect::<Vec<_>>().join(" ");
+                    item["lastMessage"] = Value::String(snippet.chars().take(180).collect());
+                }
+                if let Some(role) = row.try_get::<Option<String>, _>("last_role").ok().flatten() {
+                    item["lastRole"] = Value::String(display_role(&role));
+                }
+                item
+            })
+            .collect()
+    }
+
+    pub async fn create_chat(
+        &self,
+        workspace_id: &str,
+        workspace_path: &str,
+        title: &str,
+        model: &str,
+    ) -> Result<Value, StoreError> {
+        let id = format!("chat-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        validate_chat_id(&id)?;
+        let title = if title.trim().is_empty() {
+            "New Chat".to_string()
+        } else {
+            title.trim().to_string()
+        };
+        let now = now_iso();
+        sqlx::query(
+            r#"
+            INSERT INTO chats
+                (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'build')
+            "#,
+        )
+        .bind(&id)
+        .bind(workspace_id)
+        .bind(workspace_path)
+        .bind(&title)
+        .bind(model)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(json!({
+            "id": id,
+            "title": title,
+            "model": model,
+            "createdAt": now,
+            "updatedAt": now,
+            "messages": [],
+        }))
+    }
+
+    pub async fn get_chat(&self, chat_id: &str) -> Result<Option<Value>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let row = sqlx::query(
+            "SELECT id, workspace_id, workspace_path, title, model, created_at, updated_at, pinned, token_usage_json, parent_chat_id, parent_workspace_id FROM chats WHERE id = ?",
+        )
+        .bind(chat_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let messages = sqlx::query(
+            "SELECT id, role, content, timestamp, is_trace, metadata_json FROM messages WHERE chat_id = ? ORDER BY timestamp ASC, rowid ASC",
+        )
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let messages: Vec<Value> = messages
+            .into_iter()
+            .map(|message| {
+                let is_trace = message.get::<i64, _>("is_trace") != 0;
+                let metadata: Option<String> = message.get("metadata_json");
+                let mut value = json!({
+                    "id": message.get::<String, _>("id"),
+                    "role": display_role(&message.get::<String, _>("role")),
+                    "content": message.get::<String, _>("content"),
+                    "timestamp": message.get::<String, _>("timestamp"),
+                });
+                if let Some(raw) = metadata {
+                    if let Ok(mut metadata) = serde_json::from_str::<Value>(&raw) {
+                        if is_trace {
+                            metadata["isTrace"] = Value::Bool(true);
+                        }
+                        value["metadata"] = metadata;
+                    }
+                } else if is_trace {
+                    value["metadata"] = json!({"isTrace": true});
+                }
+                value
+            })
+            .collect();
+
+        let mut deduped: Vec<Value> = Vec::with_capacity(messages.len());
+        for message in messages {
+            let duplicate = deduped.last().is_some_and(|previous| {
+                previous["role"] == "agent"
+                    && message["role"] == "agent"
+                    && previous["content"] == message["content"]
+            });
+            if duplicate {
+                deduped.pop();
+            }
+            deduped.push(message);
+        }
+        let messages = deduped;
+
+        let mut chat = json!({
+            "id": row.get::<String, _>("id"),
+            "title": row.get::<String, _>("title"),
+            "model": row.get::<String, _>("model"),
+            "createdAt": row.get::<String, _>("created_at"),
+            "updatedAt": row.get::<String, _>("updated_at"),
+            "messages": messages,
+            "isPinned": row.get::<i64, _>("pinned") != 0,
+        });
+        if let Some(parent) = row
+            .try_get::<Option<String>, _>("parent_chat_id")
+            .ok()
+            .flatten()
+        {
+            chat["parentChatId"] = Value::String(parent);
+        }
+        if let Some(parent) = row
+            .try_get::<Option<String>, _>("parent_workspace_id")
+            .ok()
+            .flatten()
+        {
+            chat["parentWorkspaceId"] = Value::String(parent);
+        }
+        if let Some(raw) = row
+            .try_get::<Option<String>, _>("token_usage_json")
+            .ok()
+            .flatten()
+            && let Ok(usage) = serde_json::from_str::<Value>(&raw)
+        {
+            chat["token_usage"] = usage;
+        }
+        Ok(Some(chat))
+    }
+
+    pub async fn delete_chat(&self, chat_id: &str) -> Result<bool, StoreError> {
+        validate_chat_id(chat_id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM messages WHERE chat_id = ?")
+            .bind(chat_id)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("DELETE FROM chats WHERE id = ?")
+            .bind(chat_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_chat_title(&self, chat_id: &str, title: &str) -> Result<bool, StoreError> {
+        validate_chat_id(chat_id)?;
+        let result = sqlx::query("UPDATE chats SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(title)
+            .bind(now_iso())
+            .bind(chat_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn add_message(
+        &self,
+        chat_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Value, StoreError> {
+        let id = self.append_message(chat_id, role, content, false).await?;
+        let mut message = json!({
+            "id": id,
+            "role": role,
+            "content": content,
+            "timestamp": now_iso(),
+        });
+        if let Some(metadata) = metadata {
+            message["metadata"] = metadata.clone();
+        }
+        Ok(message)
+    }
+
     pub async fn append_session_entry(
         &self,
         workspace: &Path,
@@ -263,6 +551,14 @@ impl ChatStore {
     }
 }
 
+fn display_role(role: &str) -> String {
+    if role == "assistant" {
+        "agent".to_string()
+    } else {
+        role.to_string()
+    }
+}
+
 fn validate_chat_id(chat_id: &str) -> Result<(), StoreError> {
     if chat_id.is_empty()
         || !chat_id.chars().all(|character| {
@@ -305,12 +601,52 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn chat_crud_uses_workspace_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let registry = WorkspaceRegistry::new(dir.path());
+        let record = registry
+            .add(project.to_string_lossy().as_ref(), "Project")
+            .unwrap();
+
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let chat = store
+            .create_chat(&record.id, &record.path, "New Chat", "mock")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap();
+
+        store
+            .add_message(chat_id, "user", "hello", None)
+            .await
+            .unwrap();
+        store.update_chat_title(chat_id, "Renamed").await.unwrap();
+
+        let chats = store.list_chats(&record.id).await;
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0]["title"], "Renamed");
+        assert_eq!(chats[0]["messageCount"], 1);
+        assert_eq!(chats[0]["lastMessage"], "hello");
+        assert_eq!(
+            store.chat_workspace_id(chat_id).await.unwrap().as_deref(),
+            Some(record.id.as_str())
+        );
+
+        let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
+        assert_eq!(loaded["messages"][0]["content"], "hello");
+        assert!(store.delete_chat(chat_id).await.unwrap());
+        assert!(store.list_chats(&record.id).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn chat_round_trip_and_session_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = ChatStore::open(dir.path()).await.unwrap();
         store
             .ensure_chat(
                 "chat-1",
+                "_general",
                 dir.path().to_string_lossy().as_ref(),
                 "mock",
                 "Hello",

@@ -308,6 +308,28 @@ impl Checkpoint {
         (false, format!("snapshot {snapshot_id} not found"))
     }
 
+    pub fn restore_run_any(workspace: &Path, run_id: &str) -> Option<(bool, Vec<String>)> {
+        if run_id.is_empty()
+            || run_id.chars().any(|character| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+            })
+        {
+            return None;
+        }
+        let dir = workspace.join(".deep_agents").join("snapshots");
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let chat_id = entry.file_name().to_string_lossy().to_string();
+            if entry.path().join(run_id).join("manifest.json").is_file() {
+                return Some(Self::restore_run(workspace, &chat_id, run_id));
+            }
+        }
+        None
+    }
+
     pub fn restore_run(workspace: &Path, chat_id: &str, run_id: &str) -> (bool, Vec<String>) {
         let Some(manifest) = Self::load(workspace, chat_id, run_id) else {
             return (false, vec!["run not found".to_string()]);
@@ -455,6 +477,22 @@ mod tests {
         };
         let (ok, _) = Checkpoint::restore_snapshot(dir.path(), "chat", &snapshot_id);
         assert!(ok);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+    }
+
+    #[test]
+    fn restores_a_run_without_chat_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "before").unwrap();
+        let checkpoint = Checkpoint::begin("chat", dir.path());
+        checkpoint.set_user_message("u3");
+        checkpoint.snapshot_file(&file);
+        std::fs::write(&file, "after").unwrap();
+        checkpoint.finalize();
+
+        let (ok, messages) = Checkpoint::restore_run_any(dir.path(), checkpoint.run_id()).unwrap();
+        assert!(ok, "{messages:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
     }
 

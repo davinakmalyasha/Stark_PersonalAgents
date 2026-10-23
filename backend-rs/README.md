@@ -92,7 +92,8 @@ Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
 `POST /api/chat/{chat_id}/mode`, `GET /api/chat/{chat_id}/state`,
 `POST /api/steer`, `GET /api/chats/{chat_id}/snapshots`,
 `POST /api/chats/{chat_id}/snapshots/{snap_id}/restore`,
-`POST /api/chats/{chat_id}/runs/{run_id}/restore`. Uploads are capped at
+`POST /api/chats/{chat_id}/runs/{run_id}/restore`,
+`POST /api/runs/{run_id}/undo`. Uploads are capped at
 8 files / 20 MB each and stored under `.deep_agents/uploads/`; run prompts
 include their safe paths. `edit_file` snapshots the pre-write bytes into
 `.deep_agents/snapshots/{chat}/{run}`; rewind restores those files and truncates

@@ -1,4 +1,5 @@
 mod ask;
+mod checkpoint;
 mod command;
 mod edit;
 mod head_tail;
@@ -15,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{Value, json};
 use stark_contract::ToolSpecFile;
 
+pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
 
@@ -34,6 +36,7 @@ pub struct ToolContext {
     pub chat_id: String,
     pub questions: Arc<QuestionBroker>,
     pub processes: Arc<ProcessManager>,
+    pub checkpoint: Option<Arc<Checkpoint>>,
 }
 
 impl ToolContext {
@@ -47,7 +50,13 @@ impl ToolContext {
             chat_id: chat_id.into(),
             questions,
             processes: Arc::new(ProcessManager::new()),
+            checkpoint: None,
         }
+    }
+
+    pub fn with_checkpoint(mut self, checkpoint: Arc<Checkpoint>) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
     }
 }
 

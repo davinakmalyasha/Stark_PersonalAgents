@@ -20,7 +20,7 @@ use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, run_agent};
 use stark_providers::{Provider, ProviderConfig};
 use stark_store::{ChatStore, WorkspaceRegistry};
-use stark_tools::QuestionBroker;
+use stark_tools::{Checkpoint, QuestionBroker};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -278,6 +278,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chat/{chat_id}/state", get(chat_state_handler))
         .route("/api/steer", post(steer_handler))
         .route("/api/chats/{chat_id}/snapshots", get(snapshots_handler))
+        .route(
+            "/api/chats/{chat_id}/snapshots/{snap_id}/restore",
+            post(restore_snapshot_handler),
+        )
+        .route(
+            "/api/chats/{chat_id}/runs/{run_id}/restore",
+            post(restore_run_handler),
+        )
         .route("/api/groups", get(groups_handler))
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route("/api/notes/chat/{chat_id}", get(notes_handler))
@@ -350,6 +358,7 @@ Attached files:
     let receiver = tx.subscribe();
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
+    let checkpoint = Checkpoint::begin(&chat_id, &workspace);
     if !state.runs.claim(
         &chat_id,
         cancel.clone(),
@@ -376,6 +385,7 @@ Attached files:
         tx: tx.clone(),
         latest: latest.clone(),
         steering,
+        checkpoint: Some(checkpoint.clone()),
         cancel,
     };
 
@@ -384,6 +394,7 @@ Attached files:
     let prompt_for_run = prompt;
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt_for_run).await;
+        checkpoint.finalize();
         let error = result.as_ref().err().map(ToString::to_string);
         let final_state = latest.lock().ok().and_then(|guard| guard.clone());
         let status = if error.is_some() {
@@ -1248,10 +1259,9 @@ async fn rewind_chat_handler(
     Path((workspace_id, chat_id)): Path<(String, String)>,
     Json(request): Json<RewindRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let _ = (request.restore_files, request.force);
-    if workspace_path(&state, &workspace_id).is_none() {
+    let Some(workspace) = workspace_path(&state, &workspace_id) else {
         return Err(not_found("workspace not found"));
-    }
+    };
     if request.message_id.is_empty() {
         return Err(bad_request("message_id is required"));
     }
@@ -1261,6 +1271,47 @@ async fn rewind_chat_handler(
             Json(json!({"error": "This chat is still running. Stop it before rewinding."})),
         ));
     }
+    let Some(removed_messages) = state
+        .store
+        .messages_from(&chat_id, &request.message_id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?
+    else {
+        return Err(not_found("Message not found"));
+    };
+    let user_message_ids: Vec<String> = removed_messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["id"].as_str().map(str::to_string))
+        .collect();
+
+    let mut report = stark_tools::RestoreReport::default();
+    if request.restore_files != Some(false) && !user_message_ids.is_empty() {
+        let root = state
+            .store
+            .chat_workspace_path(&chat_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|path| !path.is_empty())
+            .unwrap_or(workspace);
+        report = Checkpoint::restore_for_messages(
+            std::path::Path::new(&root),
+            &chat_id,
+            &user_message_ids,
+            request.force,
+        );
+        if !report.ok() && !request.force {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "Some files changed after this checkpoint. Retry with force=true to overwrite them.",
+                    "restore": report.to_json(),
+                })),
+            ));
+        }
+    }
+
     let Some((prompt, removed)) = state
         .store
         .truncate_from_message(&chat_id, &request.message_id)
@@ -1273,12 +1324,7 @@ async fn rewind_chat_handler(
         "ok": true,
         "prompt": prompt,
         "removed": removed,
-        "restore": {
-            "ok": true,
-            "restored": [],
-            "removed": [],
-            "conflicts": [],
-        },
+        "restore": report.to_json(),
     })))
 }
 
@@ -1348,8 +1394,71 @@ async fn steer_handler(
     Json(json!({"ok": ok}))
 }
 
-async fn snapshots_handler() -> Json<Value> {
-    Json(json!({"groups": []}))
+#[derive(Debug, Deserialize)]
+struct SnapshotQuery {
+    #[serde(default)]
+    workspace_path: String,
+    limit: Option<usize>,
+}
+
+async fn snapshot_workspace(state: &ServerState, chat_id: &str, requested: &str) -> Option<String> {
+    if !requested.trim().is_empty() {
+        return Some(requested.trim().to_string());
+    }
+    state
+        .store
+        .chat_workspace_path(chat_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|path| !path.is_empty())
+}
+
+async fn snapshots_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let workspace = snapshot_workspace(&state, &chat_id, &query.workspace_path).await;
+    let Some(workspace) = workspace else {
+        return Ok(Json(json!({"groups": [], "workspace_path": ""})));
+    };
+    let limit = query.limit.unwrap_or(100);
+    let groups = Checkpoint::list(std::path::Path::new(&workspace), &chat_id, limit);
+    Ok(Json(json!({
+        "groups": groups,
+        "workspace_path": workspace,
+        "chat_id": chat_id,
+    })))
+}
+
+async fn restore_snapshot_handler(
+    State(state): State<ServerState>,
+    Path((chat_id, snap_id)): Path<(String, String)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(workspace) = snapshot_workspace(&state, &chat_id, &query.workspace_path).await else {
+        return Err(bad_request("no workspace_path"));
+    };
+    let (ok, message) =
+        Checkpoint::restore_snapshot(std::path::Path::new(&workspace), &chat_id, &snap_id);
+    if !ok {
+        return Err(not_found(message));
+    }
+    Ok(Json(json!({"ok": true, "message": message})))
+}
+
+async fn restore_run_handler(
+    State(state): State<ServerState>,
+    Path((chat_id, run_id)): Path<(String, String)>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(workspace) = snapshot_workspace(&state, &chat_id, &query.workspace_path).await else {
+        return Err(bad_request("no workspace_path"));
+    };
+    let (ok, messages) =
+        Checkpoint::restore_run(std::path::Path::new(&workspace), &chat_id, &run_id);
+    Ok(Json(json!({"ok": ok, "messages": messages})))
 }
 
 #[cfg(test)]

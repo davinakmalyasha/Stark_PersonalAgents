@@ -90,12 +90,16 @@ Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
 `GET .../chats/{chat_id}/subagents`, `GET .../subagents/{child_id}`,
 `POST .../chats/{chat_id}/attachments`, `POST .../chats/{chat_id}/rewind`,
 `POST /api/chat/{chat_id}/mode`, `GET /api/chat/{chat_id}/state`,
-`POST /api/steer`, `GET /api/chats/{chat_id}/snapshots`. Uploads are capped at
+`POST /api/steer`, `GET /api/chats/{chat_id}/snapshots`,
+`POST /api/chats/{chat_id}/snapshots/{snap_id}/restore`,
+`POST /api/chats/{chat_id}/runs/{run_id}/restore`. Uploads are capped at
 8 files / 20 MB each and stored under `.deep_agents/uploads/`; run prompts
-include their safe paths. Rewind truncates the transcript; file checkpoint
-restore is still pending. Steering messages are delivered at the next agent
-step boundary. Empty stubs exist for `/api/groups`, canvas status, and chat notes so
-the existing UI can boot cleanly.
+include their safe paths. `edit_file` snapshots the pre-write bytes into
+`.deep_agents/snapshots/{chat}/{run}`; rewind restores those files and truncates
+the transcript. Shell-created changes are not checkpointed yet. Steering
+messages are delivered at the next agent step boundary. Empty stubs exist for
+`/api/groups`, canvas status, and chat notes so the existing UI can boot
+cleanly.
 
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible

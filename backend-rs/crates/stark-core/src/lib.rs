@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
 use stark_providers::{ChatMessage, Provider, ProviderEvent, ToolCall};
 use stark_store::{ChatStore, StoreError};
-use stark_tools::{QuestionBroker, ToolContext};
+use stark_tools::{Checkpoint, QuestionBroker, ToolContext};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,7 @@ pub struct RunContext {
     pub tx: broadcast::Sender<ServerEvent>,
     pub latest: Arc<Mutex<Option<AppState>>>,
     pub steering: Arc<Mutex<VecDeque<String>>>,
+    pub checkpoint: Option<Arc<Checkpoint>>,
     pub cancel: CancellationToken,
 }
 
@@ -75,9 +76,13 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
             &prompt,
         )
         .await?;
-    ctx.store
+    let user_message_id = ctx
+        .store
         .append_message(&ctx.chat_id, "user", &prompt, false)
         .await?;
+    if let Some(checkpoint) = &ctx.checkpoint {
+        checkpoint.set_user_message(&user_message_id);
+    }
     ctx.store
         .append_session_entry(
             &ctx.workspace,
@@ -118,11 +123,14 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
     ctx.emit_state(&mut state);
 
     let tool_specs = stark_tools::tool_specs();
-    let tools = ToolContext::new(
+    let mut tools = ToolContext::new(
         ctx.workspace.clone(),
         ctx.chat_id.clone(),
         ctx.questions.clone(),
     );
+    if let Some(checkpoint) = &ctx.checkpoint {
+        tools = tools.with_checkpoint(checkpoint.clone());
+    }
 
     for _step in 0..MAX_STEPS {
         if ctx.cancel.is_cancelled() {
@@ -452,6 +460,7 @@ mod tests {
             tx,
             latest: latest.clone(),
             steering: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
             cancel: CancellationToken::new(),
         };
 

@@ -90,7 +90,8 @@ Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
 `GET .../chats/{chat_id}/subagents`, `GET .../subagents/{child_id}`,
 `POST .../chats/{chat_id}/attachments`, `POST .../chats/{chat_id}/rewind`,
 `POST /api/chat/{chat_id}/mode`, `GET /api/chat/{chat_id}/state`,
-`POST /api/steer`, `GET /api/chats/{chat_id}/snapshots`,
+`POST /api/steer`, `POST /api/followup`, `GET /api/inbox`,
+`GET /api/chats/{chat_id}/snapshots`,
 `POST /api/chats/{chat_id}/snapshots/{snap_id}/restore`,
 `POST /api/chats/{chat_id}/runs/{run_id}/restore`,
 `POST /api/runs/{run_id}/undo`. Uploads are capped at

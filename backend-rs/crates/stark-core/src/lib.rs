@@ -38,6 +38,7 @@ pub struct RunContext {
     pub tx: broadcast::Sender<ServerEvent>,
     pub latest: Arc<Mutex<Option<AppState>>>,
     pub steering: Arc<Mutex<VecDeque<String>>>,
+    pub follow_up: Arc<Mutex<VecDeque<String>>>,
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub cancel: CancellationToken,
 }
@@ -253,6 +254,30 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
                     )
                     .await?;
             }
+            let next_follow_up = ctx.follow_up.lock().unwrap().pop_front();
+            if let Some(follow_up) = next_follow_up {
+                if !text.is_empty() {
+                    messages.push(ChatMessage::assistant(&text));
+                }
+                let user_id = ctx
+                    .store
+                    .append_message(&ctx.chat_id, "user", &follow_up, false)
+                    .await?;
+                ctx.store
+                    .append_session_entry(
+                        &ctx.workspace,
+                        &ctx.chat_id,
+                        json!({"type": "message", "role": "user", "content": follow_up}),
+                    )
+                    .await?;
+                let _ = user_id;
+                messages.push(ChatMessage::user(&follow_up));
+                state.active_node = "agent".to_string();
+                state.outputs = json!({});
+                state.state_version += 1;
+                ctx.emit_state(&mut state);
+                continue;
+            }
             state.active_node = "done".to_string();
             state.outputs = json!({"agent_report": text});
             ctx.emit_state(&mut state);
@@ -460,6 +485,7 @@ mod tests {
             tx,
             latest: latest.clone(),
             steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
         };

@@ -73,6 +73,10 @@ impl RunManager {
         }
     }
 
+    fn is_running(&self, chat_id: &str) -> bool {
+        self.runs.contains_key(chat_id)
+    }
+
     fn cancel(&self, chat_id: &str) -> bool {
         let Some(handle) = self.runs.get(chat_id) else {
             return false;
@@ -250,6 +254,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/workspaces/{workspace_id}/chats/{chat_id}/attachments",
             post(upload_attachments_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/rewind",
+            post(rewind_chat_handler),
+        )
+        .route("/api/chat/{chat_id}/mode", post(chat_mode_handler))
+        .route("/api/chat/{chat_id}/state", get(chat_state_handler))
+        .route("/api/steer", post(steer_handler))
+        .route("/api/chats/{chat_id}/snapshots", get(snapshots_handler))
         .route("/api/groups", get(groups_handler))
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route("/api/notes/chat/{chat_id}", get(notes_handler))
@@ -1200,6 +1212,112 @@ fn safe_filename(value: &str) -> String {
     } else {
         cleaned
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RewindRequest {
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    restore_files: Option<bool>,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn rewind_chat_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, chat_id)): Path<(String, String)>,
+    Json(request): Json<RewindRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _ = (request.restore_files, request.force);
+    if workspace_path(&state, &workspace_id).is_none() {
+        return Err(not_found("workspace not found"));
+    }
+    if request.message_id.is_empty() {
+        return Err(bad_request("message_id is required"));
+    }
+    if state.runs.is_running(&chat_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "This chat is still running. Stop it before rewinding."})),
+        ));
+    }
+    let Some((prompt, removed)) = state
+        .store
+        .truncate_from_message(&chat_id, &request.message_id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?
+    else {
+        return Err(not_found("Message not found"));
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "prompt": prompt,
+        "removed": removed,
+        "restore": {
+            "ok": true,
+            "restored": [],
+            "removed": [],
+            "conflicts": [],
+        },
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatModeRequest {
+    #[serde(default)]
+    mode: String,
+}
+
+async fn chat_mode_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+    Json(request): Json<ChatModeRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mode = request.mode.trim();
+    if !matches!(mode, "plan" | "build") {
+        return Err(bad_request("mode must be 'plan' or 'build'"));
+    }
+    let current = state
+        .store
+        .chat_mode(&chat_id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    if current.is_none() {
+        return Err(not_found("chat not found"));
+    }
+    if !state
+        .store
+        .set_chat_mode(&chat_id, mode)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?
+    {
+        return Err(not_found("chat not found"));
+    }
+    Ok(Json(json!({"ok": true, "mode": mode})))
+}
+
+async fn chat_state_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mode = state
+        .store
+        .chat_mode(&chat_id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    match mode {
+        Some(mode) => Ok(Json(json!({"chat_id": chat_id, "mode": mode}))),
+        None => Err(not_found("chat not found")),
+    }
+}
+
+async fn steer_handler() -> Json<Value> {
+    Json(json!({"ok": false}))
+}
+
+async fn snapshots_handler() -> Json<Value> {
+    Json(json!({"groups": []}))
 }
 
 #[cfg(test)]

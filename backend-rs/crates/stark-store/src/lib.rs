@@ -482,6 +482,80 @@ impl ChatStore {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn chat_mode(&self, chat_id: &str) -> Result<Option<String>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let row = sqlx::query("SELECT mode FROM chats WHERE id = ?")
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get::<String, _>("mode")))
+    }
+
+    pub async fn set_chat_mode(&self, chat_id: &str, mode: &str) -> Result<bool, StoreError> {
+        validate_chat_id(chat_id)?;
+        if !matches!(mode, "plan" | "build") {
+            return Ok(false);
+        }
+        let result = sqlx::query("UPDATE chats SET mode = ?, updated_at = ? WHERE id = ?")
+            .bind(mode)
+            .bind(now_iso())
+            .bind(chat_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn truncate_from_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<(String, Vec<Value>)>, StoreError> {
+        validate_chat_id(chat_id)?;
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let rows = sqlx::query(
+            "SELECT id, role, content FROM messages WHERE chat_id = ? ORDER BY timestamp ASC, rowid ASC",
+        )
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(index) = rows
+            .iter()
+            .position(|row| row.get::<String, _>("id") == message_id)
+        else {
+            return Ok(None);
+        };
+        let prompt = rows[index].get::<String, _>("content");
+        let removed: Vec<Value> = rows[index..]
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<String, _>("id"),
+                    "role": display_role(&row.get::<String, _>("role")),
+                })
+            })
+            .collect();
+        let keep = &rows[..index];
+
+        let mut tx = self.pool.begin().await?;
+        for row in &rows[index..] {
+            sqlx::query("DELETE FROM messages WHERE id = ? AND chat_id = ?")
+                .bind(row.get::<String, _>("id"))
+                .bind(chat_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE chats SET updated_at = ?, message_count = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(keep.len() as i64)
+            .bind(chat_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some((prompt, removed)))
+    }
+
     pub async fn add_message(
         &self,
         chat_id: &str,
@@ -599,6 +673,68 @@ fn session_path(workspace: &Path, chat_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn truncate_and_mode_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let chat = store
+            .create_chat("_general", "", "Mode", "mock")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap();
+        let first = store
+            .add_message(chat_id, "user", "one", None)
+            .await
+            .unwrap();
+        store
+            .add_message(chat_id, "assistant", "two", None)
+            .await
+            .unwrap();
+        let last = store
+            .add_message(chat_id, "user", "three", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.chat_mode(chat_id).await.unwrap().as_deref(),
+            Some("build")
+        );
+        assert!(store.set_chat_mode(chat_id, "plan").await.unwrap());
+        assert_eq!(
+            store.chat_mode(chat_id).await.unwrap().as_deref(),
+            Some("plan")
+        );
+
+        let (prompt, removed) = store
+            .truncate_from_message(chat_id, last["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt, "three");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            store.get_chat(chat_id).await.unwrap().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let (prompt, removed) = store
+            .truncate_from_message(chat_id, first["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt, "one");
+        assert_eq!(removed.len(), 2);
+        assert!(
+            store.get_chat(chat_id).await.unwrap().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn chat_crud_uses_workspace_bucket() {

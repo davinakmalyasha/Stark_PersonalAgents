@@ -86,9 +86,12 @@ Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
 `GET/POST /api/workspaces/{id}/chats`, `GET/DELETE .../chats/{chat_id}`,
 `PUT .../title`, `POST .../messages`, `GET/PUT /api/ui/state`,
 `POST /api/session/reset`, `GET /api/workspaces/{id}`,
-`GET /api/workspaces/{id}/files`, `GET /api/workspaces/{id}/file?path=...`.
-Empty stubs exist for `/api/groups`, canvas status, and chat notes so the
-existing UI can boot cleanly.
+`GET /api/workspaces/{id}/files`, `GET /api/workspaces/{id}/file?path=...`,
+`GET .../chats/{chat_id}/subagents`, `GET .../subagents/{child_id}`,
+`POST .../chats/{chat_id}/attachments`. Uploads are capped at 8 files / 20 MB
+each and stored under `.deep_agents/uploads/`; run prompts include their safe
+paths. Empty stubs exist for `/api/groups`, canvas status, and chat notes so
+the existing UI can boot cleanly.
 
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible

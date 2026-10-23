@@ -1483,6 +1483,8 @@ struct SnapshotQuery {
     #[serde(default)]
     workspace_path: String,
     limit: Option<usize>,
+    #[serde(default)]
+    force: bool,
 }
 
 async fn snapshot_workspace(state: &ServerState, chat_id: &str, requested: &str) -> Option<String> {
@@ -1524,6 +1526,18 @@ async fn restore_snapshot_handler(
     let Some(workspace) = snapshot_workspace(&state, &chat_id, &query.workspace_path).await else {
         return Err(bad_request("no workspace_path"));
     };
+    if !query.force
+        && let Some((path, true)) =
+            Checkpoint::inspect_snapshot(std::path::Path::new(&workspace), &chat_id, &snap_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "message": format!("{path} has changed since this snapshot; retry with force=true"),
+            })),
+        ));
+    }
     let (ok, message) =
         Checkpoint::restore_snapshot(std::path::Path::new(&workspace), &chat_id, &snap_id);
     if !ok {

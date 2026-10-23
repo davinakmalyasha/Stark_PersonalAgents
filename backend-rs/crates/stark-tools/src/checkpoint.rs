@@ -29,6 +29,8 @@ struct FileEntry {
     #[serde(default)]
     snapshot_id: Option<String>,
     #[serde(default)]
+    before_sha: Option<String>,
+    #[serde(default)]
     existed: bool,
     #[serde(default)]
     created: bool,
@@ -190,6 +192,7 @@ impl Checkpoint {
             relative,
             FileEntry {
                 snapshot_id: Some(snapshot_id),
+                before_sha: Some(sha(&bytes)),
                 existed: true,
                 created: false,
                 size: bytes.len() as u64,
@@ -349,6 +352,31 @@ impl Checkpoint {
             }
         }
         groups
+    }
+
+    pub fn inspect_snapshot(
+        workspace: &Path,
+        chat_id: &str,
+        snapshot_id: &str,
+    ) -> Option<(String, bool)> {
+        for manifest in Self::load_all(workspace, chat_id) {
+            for (relative, entry) in manifest.files {
+                if entry.snapshot_id.as_deref() != Some(snapshot_id) {
+                    continue;
+                }
+                let target = safe_target(workspace, &relative);
+                let current_sha = target.as_ref().and_then(|target| {
+                    target
+                        .is_file()
+                        .then(|| std::fs::read(target).ok().map(|bytes| sha(&bytes)))
+                        .flatten()
+                });
+                let conflicts = target.as_ref().is_some_and(|target| target.is_file())
+                    && entry.before_sha.as_deref() != current_sha.as_deref();
+                return Some((relative, conflicts));
+            }
+        }
+        None
     }
 
     pub fn restore_snapshot(workspace: &Path, chat_id: &str, snapshot_id: &str) -> (bool, String) {
@@ -565,6 +593,32 @@ mod tests {
         let (ok, _) = Checkpoint::restore_snapshot(dir.path(), "chat", &snapshot_id);
         assert!(ok);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+    }
+
+    #[test]
+    fn reports_snapshot_conflicts_and_force_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "before").unwrap();
+        let checkpoint = Checkpoint::begin("chat", dir.path());
+        checkpoint.set_user_message("u5");
+        checkpoint.snapshot_file(&file);
+        std::fs::write(&file, "after").unwrap();
+        checkpoint.finalize();
+
+        let snapshot_id = {
+            let manifest = Checkpoint::load(dir.path(), "chat", checkpoint.run_id()).unwrap();
+            manifest.files["a.txt"].snapshot_id.clone().unwrap()
+        };
+        let (path, conflicts) =
+            Checkpoint::inspect_snapshot(dir.path(), "chat", &snapshot_id).unwrap();
+        assert_eq!(path, "a.txt");
+        assert!(conflicts);
+        let (ok, _) = Checkpoint::restore_snapshot(dir.path(), "chat", &snapshot_id);
+        assert!(ok);
+        let (_, conflicts) =
+            Checkpoint::inspect_snapshot(dir.path(), "chat", &snapshot_id).unwrap();
+        assert!(!conflicts);
     }
 
     #[test]

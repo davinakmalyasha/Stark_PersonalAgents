@@ -142,10 +142,88 @@ impl RunContext {
     }
 }
 
+fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
+    let start = entries.len().saturating_sub(80);
+    let mut messages = Vec::new();
+    for entry in &entries[start..] {
+        let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "toolResult" {
+            let call_id = entry
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let content = entry.get("content").map(content_text).unwrap_or_default();
+            messages.push(ChatMessage::tool(call_id, content));
+            continue;
+        }
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let content = entry.get("content").cloned().unwrap_or(Value::Null);
+        if role == "user" {
+            messages.push(ChatMessage::user(content_text(&content)));
+            continue;
+        }
+        if let Some(blocks) = content.as_array() {
+            let mut text = String::new();
+            let mut calls = Vec::new();
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        text.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""))
+                    }
+                    Some("toolCall") => {
+                        let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                        let arguments =
+                            block.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                        calls.push(ToolCall::function(
+                            id,
+                            name,
+                            serde_json::to_string(&arguments).unwrap_or_default(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if calls.is_empty() {
+                if !text.is_empty() {
+                    messages.push(ChatMessage::assistant(text));
+                }
+            } else {
+                messages.push(ChatMessage::assistant_tool_calls(
+                    (!text.is_empty()).then_some(text),
+                    calls,
+                ));
+            }
+        } else {
+            messages.push(ChatMessage::assistant(content_text(&content)));
+        }
+    }
+    messages
+}
+
+fn content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
 async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError> {
     let history = ctx
         .store
         .history(&ctx.chat_id, HISTORY_LIMIT)
+        .await
+        .unwrap_or_default();
+    let session_entries = ctx
+        .store
+        .read_session_entries(&ctx.workspace_id, &ctx.workspace, &ctx.chat_id)
         .await
         .unwrap_or_default();
 
@@ -181,16 +259,20 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
          Use the provided tools to inspect and change files. Read before editing. \
          Never invent tool results. Keep the final answer concise."
     ))];
-    for message in history {
-        if message.role == "user" || message.role == "assistant" {
-            messages.push(ChatMessage {
-                role: message.role,
-                content: Some(message.content),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            });
+    if session_entries.is_empty() {
+        for message in history {
+            if message.role == "user" || message.role == "assistant" {
+                messages.push(ChatMessage {
+                    role: message.role,
+                    content: Some(message.content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
         }
+    } else {
+        messages.extend(session_messages(&session_entries));
     }
     messages.push(ChatMessage::user(&prompt));
 
@@ -892,6 +974,27 @@ mod tests {
             .collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["title"], "reply DONE");
+    }
+
+    #[test]
+    fn session_messages_preserve_tool_pairs() {
+        let entries = vec![
+            json!({"type": "message", "role": "user", "content": "read it"}),
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "text", "text": "reading"},
+                {"type": "toolCall", "id": "c1", "name": "read_file", "arguments": {"file_path": "a.txt"}}
+            ]}),
+            json!({"type": "message", "role": "toolResult", "tool_call_id": "c1", "tool_name": "read_file", "content": "hello"}),
+            json!({"type": "message", "role": "assistant", "content": "done"}),
+        ];
+        let messages = session_messages(&entries);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[3].content.as_deref(), Some("done"));
     }
 
     #[tokio::test]

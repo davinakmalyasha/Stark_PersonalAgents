@@ -1,7 +1,9 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -15,6 +17,47 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_STEPS: usize = 12;
 const HISTORY_LIMIT: usize = 40;
+
+#[derive(Debug, Clone)]
+enum ChildStatus {
+    Running,
+    Done(String),
+    Failed(String),
+    Stopped,
+}
+
+impl ChildStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Running => "running".to_string(),
+            Self::Done(_) => "done".to_string(),
+            Self::Failed(_) => "failed".to_string(),
+            Self::Stopped => "stopped".to_string(),
+        }
+    }
+
+    fn report(&self) -> Option<&str> {
+        match self {
+            Self::Done(report) => Some(report),
+            Self::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+struct ChildHandle {
+    parent_chat_id: String,
+    name: String,
+    status: Arc<Mutex<ChildStatus>>,
+    steering: Arc<Mutex<VecDeque<String>>>,
+    cancel: CancellationToken,
+}
+
+static CHILDREN: OnceLock<Mutex<HashMap<String, Arc<ChildHandle>>>> = OnceLock::new();
+
+fn children() -> &'static Mutex<HashMap<String, Arc<ChildHandle>>> {
+    CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -63,7 +106,7 @@ impl RunContext {
     }
 }
 
-pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> {
+async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError> {
     let history = ctx
         .store
         .history(&ctx.chat_id, HISTORY_LIMIT)
@@ -368,6 +411,13 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
     Err(RunError::Message(message))
 }
 
+pub fn run_agent(
+    ctx: RunContext,
+    prompt: String,
+) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
+    Box::pin(run_agent_inner(ctx, prompt))
+}
+
 #[derive(Default)]
 struct PartialCall {
     id: Option<String>,
@@ -419,51 +469,62 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
         .trim();
     match action {
         "list" => {
-            let chats = ctx.store.list_chats(&ctx.workspace_id).await;
-            let rows: Vec<String> = chats
-                .into_iter()
-                .filter(|chat| {
-                    let prefix = format!("cont-{}-", ctx.chat_id);
-                    chat["id"]
-                        .as_str()
-                        .is_some_and(|id| id.starts_with(&prefix))
+            let prefix = format!("cont-{}-", ctx.chat_id);
+            let children = children().lock().unwrap();
+            let rows: Vec<String> = children
+                .iter()
+                .filter(|(id, child)| {
+                    id.starts_with(&prefix) && child.parent_chat_id == ctx.chat_id
                 })
-                .map(|chat| {
-                    format!(
-                        "- {} - {}",
-                        chat["id"].as_str().unwrap_or(""),
-                        chat["title"].as_str().unwrap_or("Subagent")
-                    )
+                .map(|(id, child)| {
+                    let status = child.status.lock().unwrap();
+                    format!("- {id} - {} - {}", child.name, status.label())
                 })
                 .collect();
             ToolOutcome::ok(if rows.is_empty() {
                 "No subagent sessions.".to_string()
             } else {
-                rows.join(
-                    "
-",
-                )
+                rows.join("\n")
             })
         }
         "status" => {
             let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {
                 return ToolOutcome::err("Error: action='status' requires child_id");
             };
-            match ctx.store.get_chat(child_id).await {
-                Ok(Some(chat)) => ToolOutcome::ok(
-                    serde_json::to_string_pretty(&json!({
-                        "child_id": child_id,
-                        "title": chat["title"],
-                        "status": "idle",
-                        "messages": chat["messages"],
-                    }))
-                    .unwrap_or_default(),
-                ),
-                Ok(None) => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
-                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            let wait_seconds = args
+                .get("wait_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(300);
+            let deadline = Instant::now() + Duration::from_secs(wait_seconds);
+            loop {
+                let handle = children().lock().unwrap().get(child_id).cloned();
+                let Some(handle) = handle else {
+                    return match ctx.store.get_chat(child_id).await {
+                        Ok(Some(chat)) => ToolOutcome::ok(format!(
+                            "child={child_id}\nstatus=idle\ntitle={}",
+                            chat["title"].as_str().unwrap_or("")
+                        )),
+                        _ => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
+                    };
+                };
+                let status = handle.status.lock().unwrap().clone();
+                if !matches!(status, ChildStatus::Running) || Instant::now() >= deadline {
+                    let mut text = format!(
+                        "child={child_id}\nname={}\nstatus={}",
+                        handle.name,
+                        status.label()
+                    );
+                    if let Some(report) = status.report() {
+                        text.push('\n');
+                        text.push_str(report);
+                    }
+                    return ToolOutcome::ok(text);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        "run" | "" => {
+        "run" | "spawn" => {
             if ctx.depth >= 2 {
                 return ToolOutcome::err("Error: subagent nesting limit reached");
             }
@@ -478,7 +539,7 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 .unwrap_or("")
                 .trim();
             if task.is_empty() {
-                return ToolOutcome::err("Error: action='run' requires task");
+                return ToolOutcome::err(format!("Error: action='{action}' requires task"));
             }
             let safe_name: String = name
                 .chars()
@@ -497,49 +558,136 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 },
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             );
-            let (tx, _) = broadcast::channel(64);
-            let latest = Arc::new(Mutex::new(None));
-            let child = RunContext {
-                chat_id: child_id.clone(),
-                workspace_id: ctx.workspace_id.clone(),
-                workspace: ctx.workspace.clone(),
-                role: Some(format!("the {name} specialist subagent")),
-                depth: ctx.depth + 1,
-                model: ctx.model.clone(),
-                temperature: ctx.temperature,
-                provider: ctx.provider.clone(),
-                store: ctx.store.clone(),
-                questions: ctx.questions.clone(),
-                tx,
-                latest: latest.clone(),
-                steering: Arc::new(Mutex::new(VecDeque::new())),
-                follow_up: Arc::new(Mutex::new(VecDeque::new())),
-                checkpoint: None,
-                cancel: ctx.cancel.child_token(),
+            let steering = Arc::new(Mutex::new(VecDeque::new()));
+            let cancel = ctx.cancel.child_token();
+            let status = Arc::new(Mutex::new(ChildStatus::Running));
+            let handle = Arc::new(ChildHandle {
+                parent_chat_id: ctx.chat_id.clone(),
+                name: name.to_string(),
+                status: status.clone(),
+                steering: steering.clone(),
+                cancel: cancel.clone(),
+            });
+            children()
+                .lock()
+                .unwrap()
+                .insert(child_id.clone(), handle.clone());
+            let (child, latest) = child_context(ctx, &child_id, name, steering, cancel.clone());
+
+            if action == "spawn" {
+                let handle = handle.clone();
+                let task = task.to_string();
+                tokio::spawn(async move {
+                    let result = Box::pin(run_agent(child, task)).await;
+                    let next = if handle.cancel.is_cancelled() {
+                        ChildStatus::Stopped
+                    } else {
+                        match result {
+                            Ok(()) => ChildStatus::Done(read_report(&latest)),
+                            Err(error) => ChildStatus::Failed(error.to_string()),
+                        }
+                    };
+                    *handle.status.lock().unwrap() = next;
+                });
+                return ToolOutcome::ok(format!(
+                    "[SPAWNED] child={child_id} name={name}; use action=status/child_id"
+                ));
+            }
+
+            let result = Box::pin(run_agent(child, task.to_string())).await;
+            let next = if cancel.is_cancelled() {
+                ChildStatus::Stopped
+            } else {
+                match result {
+                    Ok(()) => ChildStatus::Done(read_report(&latest)),
+                    Err(error) => ChildStatus::Failed(error.to_string()),
+                }
             };
-            if let Err(error) = Box::pin(run_agent(child, task.to_string())).await {
+            *status.lock().unwrap() = next.clone();
+            if let ChildStatus::Failed(error) = next {
                 return ToolOutcome::err(format!("[ERR] Subagent {name}: {error}"));
             }
-            let report = latest
-                .lock()
-                .ok()
-                .and_then(|latest| latest.clone())
-                .and_then(|state| state.outputs.get("agent_report").cloned())
-                .and_then(|report| report.as_str().map(str::to_string))
-                .unwrap_or_else(|| "(no report)".to_string());
             ToolOutcome::ok(format!(
-                "[SUBAGENT {name}] child={child_id}
-{report}"
+                "[SUBAGENT {name}] child={child_id}\n{}",
+                read_report(&latest)
             ))
         }
-        "spawn" => ToolOutcome::err(
-            "Error: spawn is not available in the Rust runtime yet; use action='run'",
-        ),
-        "message" | "stop" => ToolOutcome::err(format!(
-            "Error: action='{action}' is not available in the Rust runtime yet"
-        )),
+        "message" => {
+            let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {
+                return ToolOutcome::err("Error: action='message' requires child_id");
+            };
+            let Some(message) = args.get("message").and_then(Value::as_str) else {
+                return ToolOutcome::err("Error: action='message' requires message");
+            };
+            let handle = children().lock().unwrap().get(child_id).cloned();
+            match handle {
+                Some(handle) => {
+                    handle
+                        .steering
+                        .lock()
+                        .unwrap()
+                        .push_back(message.to_string());
+                    ToolOutcome::ok(format!("[OK] queued steering for {child_id}"))
+                }
+                None => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
+            }
+        }
+        "stop" => {
+            let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {
+                return ToolOutcome::err("Error: action='stop' requires child_id");
+            };
+            let handle = children().lock().unwrap().get(child_id).cloned();
+            match handle {
+                Some(handle) => {
+                    handle.cancel.cancel();
+                    *handle.status.lock().unwrap() = ChildStatus::Stopped;
+                    ToolOutcome::ok(format!("[OK] stopped {child_id}"))
+                }
+                None => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
+            }
+        }
         other => ToolOutcome::err(format!("Error: unknown subagent action '{other}'")),
     }
+}
+
+fn read_report(latest: &Arc<Mutex<Option<AppState>>>) -> String {
+    latest
+        .lock()
+        .ok()
+        .and_then(|latest| latest.clone())
+        .and_then(|state| state.outputs.get("agent_report").cloned())
+        .and_then(|report| report.as_str().map(str::to_string))
+        .unwrap_or_else(|| "(no report)".to_string())
+}
+
+fn child_context(
+    ctx: &RunContext,
+    child_id: &str,
+    name: &str,
+    steering: Arc<Mutex<VecDeque<String>>>,
+    cancel: CancellationToken,
+) -> (RunContext, Arc<Mutex<Option<AppState>>>) {
+    let (tx, _) = broadcast::channel(64);
+    let latest = Arc::new(Mutex::new(None));
+    let child = RunContext {
+        chat_id: child_id.to_string(),
+        workspace_id: ctx.workspace_id.clone(),
+        workspace: ctx.workspace.clone(),
+        role: Some(format!("the {name} specialist subagent")),
+        depth: ctx.depth + 1,
+        model: ctx.model.clone(),
+        temperature: ctx.temperature,
+        provider: ctx.provider.clone(),
+        store: ctx.store.clone(),
+        questions: ctx.questions.clone(),
+        tx,
+        latest: latest.clone(),
+        steering,
+        follow_up: Arc::new(Mutex::new(VecDeque::new())),
+        checkpoint: None,
+        cancel,
+    };
+    (child, latest)
 }
 
 #[cfg(test)]

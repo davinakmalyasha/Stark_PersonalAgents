@@ -17,7 +17,7 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use stark_contract::{AppState, ServerEvent};
-use stark_core::{RunContext, run_agent};
+use stark_core::{RunContext, run_agent, subagent_status, subagent_status_for};
 use stark_providers::{Provider, ProviderConfig};
 use stark_store::{ChatStore, WorkspaceRegistry};
 use stark_tools::{Checkpoint, QuestionBroker};
@@ -1174,6 +1174,7 @@ async fn subagents_handler(
         return Err(not_found("workspace not found"));
     }
     let prefix = format!("cont-{chat_id}-");
+    let live = subagent_status(&chat_id);
     let subagents: Vec<Value> = state
         .store
         .list_chats(&workspace_id)
@@ -1186,6 +1187,12 @@ async fn subagents_handler(
         })
         .map(|chat| {
             let id = chat["id"].as_str().unwrap_or("");
+            if let Some(info) = live
+                .iter()
+                .find(|info| info["child_id"].as_str() == Some(id))
+            {
+                return info.clone();
+            }
             let title = chat["title"].as_str().unwrap_or("Subagent");
             json!({
                 "child_id": id,
@@ -1193,7 +1200,7 @@ async fn subagents_handler(
                 "label": title,
                 "status": "idle",
                 "created": 0,
-                "parent_session": null,
+                "parent_session": chat_id,
             })
         })
         .collect();
@@ -1219,6 +1226,16 @@ async fn subagent_handler(
         return Err(not_found("subagent session not found"));
     };
     let title = chat["title"].as_str().unwrap_or("Subagent").to_string();
+    let live = subagent_status_for(&child_id).unwrap_or_else(|| {
+        json!({
+            "child_id": child_id,
+            "name": title,
+            "label": title,
+            "status": "idle",
+            "created": 0,
+            "parent_session": null,
+        })
+    });
     let entries: Vec<Value> = chat["messages"]
         .as_array()
         .cloned()
@@ -1237,14 +1254,7 @@ async fn subagent_handler(
         })
         .collect();
     Ok(Json(json!({
-        "info": {
-            "child_id": child_id,
-            "name": title,
-            "label": title,
-            "status": "idle",
-            "created": 0,
-            "parent_session": null,
-        },
+        "info": live,
         "entries": entries,
     })))
 }

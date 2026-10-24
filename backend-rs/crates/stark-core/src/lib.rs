@@ -59,6 +59,42 @@ fn children() -> &'static Mutex<HashMap<String, Arc<ChildHandle>>> {
     CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub fn subagent_status(parent_chat_id: &str) -> Vec<Value> {
+    let children = children().lock().unwrap();
+    children
+        .iter()
+        .filter(|(_, child)| child.parent_chat_id == parent_chat_id)
+        .map(|(id, child)| {
+            let status = child.status.lock().unwrap();
+            json!({
+                "child_id": id,
+                "name": child.name,
+                "label": child.name,
+                "status": status.label(),
+                "report": status.report(),
+                "created": 0,
+                "parent_session": parent_chat_id,
+            })
+        })
+        .collect()
+}
+
+pub fn subagent_status_for(child_id: &str) -> Option<Value> {
+    let children = children().lock().unwrap();
+    children.get(child_id).map(|child| {
+        let status = child.status.lock().unwrap();
+        json!({
+            "child_id": child_id,
+            "name": child.name,
+            "label": child.name,
+            "status": status.label(),
+            "report": status.report(),
+            "created": 0,
+            "parent_session": child.parent_chat_id,
+        })
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum RunError {
     #[error(transparent)]

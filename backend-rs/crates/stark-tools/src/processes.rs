@@ -66,6 +66,7 @@ struct ManagedProcess {
     pid: u32,
     io: Box<ProcessIo>,
     output: Arc<Mutex<HeadTailBuffer>>,
+    read_pos: Arc<Mutex<usize>>,
     status: Arc<Mutex<ProcessStatus>>,
     started: Instant,
 }
@@ -108,6 +109,20 @@ impl ManagedProcess {
     fn output_text(&self) -> String {
         let output = self.output.lock().unwrap();
         String::from_utf8_lossy(&output.to_bytes_with_omission_marker()).into_owned()
+    }
+
+    fn pending_text(&self) -> String {
+        let full = self.output_text();
+        let mut position = self.read_pos.lock().unwrap();
+        let start = (*position).min(full.len());
+        let pending = full[start..].to_string();
+        *position = full.len();
+        pending
+    }
+
+    pub fn mark_read(&self) {
+        let full = self.output_text();
+        *self.read_pos.lock().unwrap() = full.len();
     }
 
     fn write_pty(&self, input: &str) -> Result<(), String> {
@@ -237,6 +252,7 @@ impl ProcessManager {
             pid,
             io,
             output,
+            read_pos: Arc::new(Mutex::new(0)),
             status: Arc::new(Mutex::new(ProcessStatus::Running)),
             started: Instant::now(),
         });
@@ -488,6 +504,12 @@ impl ProcessManager {
         }
     }
 
+    pub fn mark_read(&self, target: &str) {
+        if let Ok(process) = self.get(target) {
+            process.mark_read();
+        }
+    }
+
     pub async fn send(
         &self,
         target: &str,
@@ -535,7 +557,7 @@ impl ProcessManager {
         }
         process.refresh_status();
         let status = process.status.lock().unwrap().clone();
-        Ok((status, process.output_text()))
+        Ok((status, process.pending_text()))
     }
 }
 

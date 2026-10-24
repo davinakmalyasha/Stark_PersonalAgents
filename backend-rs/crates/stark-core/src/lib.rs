@@ -389,6 +389,37 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             tool_calls.clone(),
         ));
 
+        let mut assistant_blocks = Vec::new();
+        if !text.is_empty() {
+            assistant_blocks.push(json!({"type": "text", "text": text}));
+        }
+        for call in &tool_calls {
+            let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+                .unwrap_or_else(|_| json!({}));
+            assistant_blocks.push(json!({
+                "type": "toolCall",
+                "id": call.id,
+                "name": call.function.name,
+                "arguments": arguments,
+            }));
+        }
+        let _ = ctx
+            .store
+            .append_session_entry_for(
+                &ctx.workspace_id,
+                &ctx.workspace,
+                &ctx.chat_id,
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": assistant_blocks,
+                    "provider": "stark-rs",
+                    "model": ctx.model.clone(),
+                    "stop_reason": "toolUse",
+                }),
+            )
+            .await;
+
         for call in tool_calls {
             if ctx.cancel.is_cancelled() {
                 finish_aborted(&ctx, &mut state).await;

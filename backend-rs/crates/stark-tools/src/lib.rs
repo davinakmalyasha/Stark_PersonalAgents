@@ -1,3 +1,4 @@
+mod approvals;
 mod ask;
 mod checkpoint;
 mod command;
@@ -16,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{Value, json};
 use stark_contract::ToolSpecFile;
 
+pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
@@ -38,6 +40,7 @@ pub struct ToolContext {
     pub questions: Arc<QuestionBroker>,
     pub processes: Arc<ProcessManager>,
     pub checkpoint: Option<Arc<Checkpoint>>,
+    pub approvals: Arc<ApprovalCache>,
 }
 
 impl ToolContext {
@@ -52,6 +55,7 @@ impl ToolContext {
             questions,
             processes: Arc::new(ProcessManager::new()),
             checkpoint: None,
+            approvals: Arc::new(ApprovalCache::new()),
         }
     }
 
@@ -132,6 +136,29 @@ pub fn tool_specs() -> Vec<Value> {
                     json!({
                         "type": "integer",
                         "description": "Return a session ID if the command is still running after this many ms (250-30000). Omit to block up to timeout."
+                    }),
+                );
+                properties.insert(
+                    "sandbox_permissions".to_string(),
+                    json!({
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"],
+                        "description": "Request user approval before running this command."
+                    }),
+                );
+                properties.insert(
+                    "justification".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "User-facing reason for requiring approval."
+                    }),
+                );
+                properties.insert(
+                    "prefix_rule".to_string(),
+                    json!({
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Command prefix to approve for the rest of this run, for example git pull."
                     }),
                 );
                 properties.insert(

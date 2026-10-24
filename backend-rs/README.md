@@ -111,7 +111,10 @@ token.
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible
 Starlark `prefix_rule` engine with `allow` / `prompt` / `forbidden` decisions
-and `host_executable` paths; `prompt` decisions use the `ask_user` broker.
+and `host_executable` paths; `prompt` decisions use the `ask_user` broker. `run_command` also accepts
+`prefix_rule` and `sandbox_permissions=require_escalated`; approved prefixes
+are cached for the rest of the run. OS-level sandbox enforcement is not
+implemented yet.
 
 `run_command` now has a unified-exec lifecycle: numeric session IDs, optional
 `tty` via a patched ConPTY backend, optional `yield_time_ms` (returns a session

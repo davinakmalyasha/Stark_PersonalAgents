@@ -28,22 +28,43 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         return ToolOutcome::err("Error: run_command requires command");
     }
     let policy = stark_policy::evaluate_command(command);
-    match policy.decision {
-        stark_policy::Decision::Forbidden => {
+    if matches!(policy.decision, stark_policy::Decision::Forbidden) {
+        return ToolOutcome::err(format!(
+            "[BLOCKED] Command denied by policy: {}",
+            policy.reason.unwrap_or_else(|| "forbidden".to_string())
+        ));
+    }
+    let prefix_rule: Vec<String> = args
+        .get("prefix_rule")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let escalated = args
+        .get("sandbox_permissions")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "require_escalated");
+    let needs_approval = (matches!(policy.decision, stark_policy::Decision::Prompt) || escalated)
+        && !ctx.approvals.is_approved(command);
+    if needs_approval {
+        let justification = args
+            .get("justification")
+            .and_then(Value::as_str)
+            .or(policy.reason.as_deref());
+        if !request_command_approval(ctx, command, justification).await {
             return ToolOutcome::err(format!(
-                "[BLOCKED] Command denied by policy: {}",
-                policy.reason.unwrap_or_else(|| "forbidden".to_string())
+                "[BLOCKED] Command requires approval: {}",
+                policy.reason.unwrap_or_else(|| "prompt".to_string())
             ));
         }
-        stark_policy::Decision::Prompt => {
-            if !request_command_approval(ctx, command, policy.reason.as_deref()).await {
-                return ToolOutcome::err(format!(
-                    "[BLOCKED] Command requires approval: {}",
-                    policy.reason.unwrap_or_else(|| "prompt".to_string())
-                ));
-            }
+        if !prefix_rule.is_empty() {
+            ctx.approvals.approve(&prefix_rule);
         }
-        stark_policy::Decision::Allow => {}
     }
     let workdir = match args.get("workdir").and_then(Value::as_str) {
         Some(raw) if !raw.trim().is_empty() => match resolve_workspace_path(&ctx.workspace, raw) {

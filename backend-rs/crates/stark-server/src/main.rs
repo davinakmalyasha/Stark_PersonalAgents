@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, patch, post, put};
@@ -27,6 +29,9 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+
+mod pairing;
+use pairing::PairingStore;
 
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
@@ -175,6 +180,7 @@ struct ServerState {
     questions: Arc<QuestionBroker>,
     runs: Arc<RunManager>,
     registry: WorkspaceRegistry,
+    pairing: Arc<PairingStore>,
     ui_state_path: PathBuf,
     harness_root: PathBuf,
 }
@@ -230,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
         questions: Arc::new(QuestionBroker::new()),
         runs: Arc::new(RunManager::default()),
         registry: WorkspaceRegistry::new(&harness_root),
+        pairing: Arc::new(PairingStore::new(&harness_root)),
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
     };
@@ -314,6 +321,8 @@ async fn main() -> anyhow::Result<()> {
             post(restore_run_handler),
         )
         .route("/api/runs/{run_id}/undo", post(undo_run_handler))
+        .route("/api/pairing", get(pairing_handler))
+        .route("/api/pairing/rotate", post(pairing_rotate_handler))
         .route("/api/groups", get(groups_handler))
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route(
@@ -327,6 +336,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
     let host = std::env::var("STARK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -334,7 +347,11 @@ async fn main() -> anyhow::Result<()> {
     let address = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!("stark-server listening on http://{address}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1741,6 +1758,51 @@ async fn restore_run_handler(
     let (ok, messages) =
         Checkpoint::restore_run(std::path::Path::new(&workspace), &chat_id, &run_id);
     Ok(Json(json!({"ok": ok, "messages": messages})))
+}
+
+async fn auth_middleware(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let local = address.ip().is_loopback();
+    if local || request.method() == axum::http::Method::OPTIONS {
+        return next.run(request).await;
+    }
+    let token = request
+        .headers()
+        .get("x-api-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if token == state.pairing.token() {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "Pairing required"})),
+    )
+        .into_response()
+}
+
+async fn pairing_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !address.ip().is_loopback() {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
+    }
+    Ok(Json(json!({"token": state.pairing.token()})))
+}
+
+async fn pairing_rotate_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !address.ip().is_loopback() {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
+    }
+    Ok(Json(json!({"token": state.pairing.rotate()})))
 }
 
 #[cfg(test)]

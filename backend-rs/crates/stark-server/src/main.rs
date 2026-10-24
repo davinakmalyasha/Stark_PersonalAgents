@@ -1050,7 +1050,7 @@ async fn groups_handler(
 }
 
 async fn group_handler(
-    State(state): State<ServerState>,
+    State(_state): State<ServerState>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !safe_project_id(&project_id) {

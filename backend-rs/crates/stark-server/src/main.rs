@@ -324,6 +324,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/pairing", get(pairing_handler))
         .route("/api/pairing/rotate", post(pairing_rotate_handler))
         .route("/api/groups", get(groups_handler))
+        .route("/api/groups/{project_id}", get(group_handler))
+        .route(
+            "/api/groups/{project_id}/update",
+            post(group_update_handler),
+        )
+        .route(
+            "/api/groups/{project_id}/items/{item_id}/approval",
+            post(group_approval_handler),
+        )
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route(
             "/api/notes/{scope_type}/{scope_id}",
@@ -928,8 +937,168 @@ async fn session_reset_handler() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-async fn groups_handler() -> Json<Value> {
-    Json(json!({"projects": [], "scoped": false}))
+#[derive(Debug, Deserialize)]
+struct GroupQuery {
+    #[serde(default)]
+    workspace_id: String,
+}
+
+fn groups_root() -> std::path::PathBuf {
+    std::env::var("STARK_PROJECTS_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(r"D:\StarkProjects"))
+}
+
+fn safe_project_id(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn group_title_and_id(path: &std::path::Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path.join("PROJECT.md")).ok()?;
+    let title = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .unwrap_or("")
+        .to_string();
+    let id = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("id:").map(str::trim))
+        .map(|value| value.trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    Some((title, id))
+}
+
+fn group_origins(state: &ServerState) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(
+        state
+            .harness_root
+            .join(".deep_agents")
+            .join("group_origins.json"),
+    )
+    .ok()
+    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    .and_then(|value| value.as_object().cloned())
+    .map(|object| {
+        object
+            .into_iter()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn group_rows(state: &ServerState, workspace_id: &str) -> (Vec<Value>, bool) {
+    let scoped = !workspace_id.is_empty() && state.registry.get(workspace_id).is_some();
+    let origins = group_origins(state);
+    let root = groups_root();
+    let mut rows = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return (rows, scoped);
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some((title, id)) = group_title_and_id(&entry.path()) else {
+            continue;
+        };
+        let origin = origins.get(&id).cloned();
+        if scoped && origin.as_deref() != Some(workspace_id) {
+            continue;
+        }
+        rows.push(json!({
+            "id": id,
+            "path": entry.path(),
+            "title": title,
+            "status": "unknown",
+            "origin_workspace_id": origin,
+            "shell_enabled": false,
+            "spent_usd": null,
+            "milestones_done": 0,
+            "milestones_total": 0,
+            "items_done": 0,
+            "items_total": 0,
+            "awaiting_approval": 0,
+        }));
+    }
+    rows.sort_by(|left, right| {
+        left["title"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&right["title"].as_str().unwrap_or("").to_lowercase())
+    });
+    (rows, scoped)
+}
+
+async fn groups_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<GroupQuery>,
+) -> Json<Value> {
+    let (projects, scoped) = group_rows(&state, &query.workspace_id);
+    Json(json!({"projects": projects, "scoped": scoped}))
+}
+
+async fn group_handler(
+    State(_state): State<ServerState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !safe_project_id(&project_id) {
+        return Err(bad_request("invalid project id"));
+    }
+    let path = groups_root().join(&project_id);
+    if !path.join("PROJECT.md").is_file() {
+        return Err(not_found("unknown project"));
+    }
+    let (title, id) =
+        group_title_and_id(&path).unwrap_or_else(|| (String::new(), project_id.clone()));
+    Ok(Json(json!({
+        "id": id,
+        "path": path,
+        "shell_enabled": false,
+        "project": {"status": "unknown", "goal": title},
+        "milestones": [],
+        "items": [],
+        "events": [],
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupUpdateRequest {
+    #[serde(default)]
+    op: String,
+}
+
+async fn group_update_handler(
+    Path(_project_id): Path<String>,
+    Json(request): Json<GroupUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !matches!(request.op.as_str(), "pause" | "resume" | "close") {
+        return Err(bad_request("op must be pause, resume, or close"));
+    }
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "group lifecycle is not implemented in the Rust runtime yet"})),
+    ))
+}
+
+async fn group_approval_handler(
+    Path((_project_id, _item_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "group approvals are not implemented in the Rust runtime yet"})),
+    ))
 }
 
 async fn canvas_status_handler() -> Json<Value> {

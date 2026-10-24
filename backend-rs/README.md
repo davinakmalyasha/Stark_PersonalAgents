@@ -105,8 +105,10 @@ messages are delivered at the next agent step boundary. Session JSONL now follow
 Notes are stored in `chats.db`. Pairing uses `.deep_agents/pairing.json`:
 loopback clients bypass auth, remote clients must send `X-API-Token`, and
 `GET /api/pairing` / `POST /api/pairing/rotate` are loopback-only. Bind
-`STARK_HOST=0.0.0.0` to expose the server to a phone. Empty stubs remain for
-`/api/groups` and canvas status.
+`STARK_HOST=0.0.0.0` to expose the server to a phone. `/api/groups` scans
+`STARK_PROJECTS_ROOT` for `PROJECT.md` folders and returns read-only project
+rows/details; lifecycle and approvals still return 501. Canvas status remains
+an inactive stub.
 
 `call_subagent` supports `run`, `spawn`, `status`, `message`, `stop`, and
 `list`; child sessions are persisted as `cont-*` chats and exposed through the

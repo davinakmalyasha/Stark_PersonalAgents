@@ -760,10 +760,22 @@ impl ChatStore {
         &self,
         workspace: &Path,
         chat_id: &str,
+        entry: Value,
+    ) -> Result<(), StoreError> {
+        let workspace_id = self.workspace_id_for_path(workspace.to_string_lossy().as_ref());
+        self.append_session_entry_for(&workspace_id, workspace, chat_id, entry)
+            .await
+    }
+
+    pub async fn append_session_entry_for(
+        &self,
+        workspace_id: &str,
+        workspace: &Path,
+        chat_id: &str,
         mut entry: Value,
     ) -> Result<(), StoreError> {
         validate_chat_id(chat_id)?;
-        let path = session_path(workspace, chat_id);
+        let path = session_path_for(workspace, workspace_id, chat_id);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -890,10 +902,20 @@ fn title_from(prompt: &str) -> String {
     }
 }
 
-fn session_path(workspace: &Path, chat_id: &str) -> PathBuf {
+fn session_path_for(workspace: &Path, workspace_id: &str, chat_id: &str) -> PathBuf {
+    let (kind, id) = match workspace_id {
+        "_general" | "" => ("general", "_general"),
+        "_house" => ("house", "_house"),
+        "_personal" => ("personal", "_personal"),
+        "_dfd" => ("dfd", "_dfd"),
+        id if id.starts_with("ws-") => ("project", id),
+        _ => ("project", "_unregistered"),
+    };
     workspace
         .join(".deep_agents")
         .join("sessions")
+        .join(kind)
+        .join(id)
         .join(format!("{chat_id}.jsonl"))
 }
 
@@ -1067,14 +1089,15 @@ mod tests {
         assert_eq!(prompts, vec!["Hello"]);
 
         store
-            .append_session_entry(
+            .append_session_entry_for(
+                "_general",
                 dir.path(),
                 "chat-1",
                 json!({"type": "message", "role": "user", "content": "Hello"}),
             )
             .await
             .unwrap();
-        let path = session_path(dir.path(), "chat-1");
+        let path = session_path_for(dir.path(), "_general", "chat-1");
         let raw = tokio::fs::read_to_string(path).await.unwrap();
         assert!(raw.contains("\"type\":\"session\""));
         assert!(raw.contains("\"role\":\"user\""));

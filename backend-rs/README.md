@@ -100,7 +100,9 @@ Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
 include their safe paths. `edit_file` snapshots the pre-write bytes into
 `.deep_agents/snapshots/{chat}/{run}`; rewind restores those files and truncates
 the transcript. Shell-created changes are not checkpointed yet. Steering
-messages are delivered at the next agent step boundary. Notes are stored in `chats.db`. Pairing uses `.deep_agents/pairing.json`:
+messages are delivered at the next agent step boundary. Session JSONL now follows the Python layout:
+`.deep_agents/sessions/{general|house|personal|dfd|project}/{workspace_id}/{chat_id}.jsonl`.
+Notes are stored in `chats.db`. Pairing uses `.deep_agents/pairing.json`:
 loopback clients bypass auth, remote clients must send `X-API-Token`, and
 `GET /api/pairing` / `POST /api/pairing/rotate` are loopback-only. Bind
 `STARK_HOST=0.0.0.0` to expose the server to a phone. Empty stubs remain for

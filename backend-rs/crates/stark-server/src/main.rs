@@ -8,7 +8,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -316,7 +316,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/runs/{run_id}/undo", post(undo_run_handler))
         .route("/api/groups", get(groups_handler))
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
-        .route("/api/notes/chat/{chat_id}", get(notes_handler))
+        .route(
+            "/api/notes/{scope_type}/{scope_id}",
+            get(list_notes_handler),
+        )
+        .route("/api/notes", post(create_note_handler))
+        .route(
+            "/api/notes/{note_id}",
+            patch(update_note_handler).delete(delete_note_handler),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -911,8 +919,109 @@ async fn canvas_status_handler() -> Json<Value> {
     Json(json!({"active": false, "watch": null}))
 }
 
-async fn notes_handler() -> Json<Value> {
-    Json(json!({"notes": []}))
+fn valid_note_scope(scope_type: &str, scope_id: &str) -> bool {
+    matches!(scope_type, "chat" | "group") && !scope_id.trim().is_empty()
+}
+
+async fn list_notes_handler(
+    State(state): State<ServerState>,
+    Path((scope_type, scope_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !valid_note_scope(&scope_type, &scope_id) {
+        return Err(bad_request("invalid scope"));
+    }
+    let notes = state.store.list_notes(&scope_type, &scope_id).await;
+    Ok(Json(json!({"notes": notes})))
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteCreateRequest {
+    #[serde(default = "default_note_scope")]
+    scope_type: String,
+    #[serde(default)]
+    scope_id: String,
+    #[serde(default = "default_note_title")]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    todos: Value,
+}
+
+fn default_note_scope() -> String {
+    "chat".to_string()
+}
+
+fn default_note_title() -> String {
+    "Note".to_string()
+}
+
+async fn create_note_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<NoteCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !valid_note_scope(&request.scope_type, &request.scope_id) {
+        return Err(bad_request("invalid scope"));
+    }
+    let note = state
+        .store
+        .create_note(
+            &request.scope_type,
+            &request.scope_id,
+            &request.title,
+            &request.body,
+            &request.todos,
+        )
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(note))
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteUpdateRequest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    todos: Option<Value>,
+}
+
+async fn update_note_handler(
+    State(state): State<ServerState>,
+    Path(note_id): Path<String>,
+    Json(request): Json<NoteUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let note = state
+        .store
+        .update_note(
+            &note_id,
+            request.title.as_deref(),
+            request.body.as_deref(),
+            request.todos.as_ref(),
+        )
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    match note {
+        Some(note) => Ok(Json(note)),
+        None => Err(not_found("note not found")),
+    }
+}
+
+async fn delete_note_handler(
+    State(state): State<ServerState>,
+    Path(note_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let deleted = state
+        .store
+        .delete_note(&note_id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    if deleted {
+        Ok(Json(json!({"ok": true})))
+    } else {
+        Err(not_found("note not found"))
+    }
 }
 
 async fn workspace_handler(

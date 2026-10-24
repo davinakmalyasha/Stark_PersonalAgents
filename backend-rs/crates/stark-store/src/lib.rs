@@ -108,6 +108,29 @@ impl ChatStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_notes (
+                id TEXT PRIMARY KEY,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                workspace_path TEXT DEFAULT '',
+                title TEXT DEFAULT '',
+                body TEXT DEFAULT '',
+                todos_json TEXT DEFAULT '[]',
+                created_by TEXT DEFAULT 'orchestrator',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_notes_scope ON agent_notes(scope_type, scope_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -250,6 +273,118 @@ impl ChatStore {
             .collect();
         prompts.reverse();
         Ok(prompts)
+    }
+
+    pub async fn list_notes(&self, scope_type: &str, scope_id: &str) -> Vec<Value> {
+        let rows = sqlx::query(
+            "SELECT id, scope_type, scope_id, workspace_path, title, body, todos_json, created_by, created_at, updated_at FROM agent_notes WHERE scope_type = ? AND scope_id = ? ORDER BY updated_at DESC",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter().map(note_row).collect()
+    }
+
+    pub async fn create_note(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        title: &str,
+        body: &str,
+        todos: &Value,
+    ) -> Result<Value, StoreError> {
+        let id = format!("note-{}", &Uuid::new_v4().simple().to_string()[..10]);
+        let now = now_iso();
+        let title = if title.trim().is_empty() {
+            "Note".to_string()
+        } else {
+            title.trim().to_string()
+        };
+        let todos = normalize_todos(todos);
+        sqlx::query(
+            "INSERT INTO agent_notes (id, scope_type, scope_id, workspace_path, title, body, todos_json, created_by, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, 'user', ?, ?)",
+        )
+        .bind(&id)
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(&title)
+        .bind(body)
+        .bind(todos.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(json!({
+            "id": id,
+            "scopeType": scope_type,
+            "scopeId": scope_id,
+            "workspacePath": "",
+            "title": title,
+            "body": body,
+            "todos": todos,
+            "createdBy": "user",
+            "createdAt": now,
+            "updatedAt": now,
+        }))
+    }
+
+    pub async fn update_note(
+        &self,
+        note_id: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+        todos: Option<&Value>,
+    ) -> Result<Option<Value>, StoreError> {
+        let existing = sqlx::query(
+            "SELECT id, scope_type, scope_id, workspace_path, title, body, todos_json, created_by, created_at, updated_at FROM agent_notes WHERE id = ?",
+        )
+        .bind(note_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = existing else {
+            return Ok(None);
+        };
+        let title = title
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| row.get::<String, _>("title"));
+        let body = body
+            .map(str::to_string)
+            .unwrap_or_else(|| row.get::<String, _>("body"));
+        let todos = todos.map(normalize_todos).unwrap_or_else(|| {
+            serde_json::from_str(&row.get::<String, _>("todos_json")).unwrap_or_else(|_| json!([]))
+        });
+        let now = now_iso();
+        sqlx::query("UPDATE agent_notes SET title = ?, body = ?, todos_json = ?, updated_at = ? WHERE id = ?")
+            .bind(&title)
+            .bind(&body)
+            .bind(todos.to_string())
+            .bind(&now)
+            .bind(note_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(json!({
+            "id": note_id,
+            "scopeType": row.get::<String, _>("scope_type"),
+            "scopeId": row.get::<String, _>("scope_id"),
+            "workspacePath": row.get::<String, _>("workspace_path"),
+            "title": title,
+            "body": body,
+            "todos": todos,
+            "createdBy": row.get::<String, _>("created_by"),
+            "createdAt": row.get::<String, _>("created_at"),
+            "updatedAt": now,
+        })))
+    }
+
+    pub async fn delete_note(&self, note_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM agent_notes WHERE id = ?")
+            .bind(note_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn chat_stats(&self, workspace_id: &str) -> (i64, String) {
@@ -670,6 +805,53 @@ impl ChatStore {
     }
 }
 
+fn note_row(row: sqlx::sqlite::SqliteRow) -> Value {
+    let todos = serde_json::from_str::<Value>(&row.get::<String, _>("todos_json"))
+        .unwrap_or_else(|_| json!([]));
+    json!({
+        "id": row.get::<String, _>("id"),
+        "scopeType": row.get::<String, _>("scope_type"),
+        "scopeId": row.get::<String, _>("scope_id"),
+        "workspacePath": row.get::<String, _>("workspace_path"),
+        "title": row.get::<String, _>("title"),
+        "body": row.get::<String, _>("body"),
+        "todos": todos,
+        "createdBy": row.get::<String, _>("created_by"),
+        "createdAt": row.get::<String, _>("created_at"),
+        "updatedAt": row.get::<String, _>("updated_at"),
+    })
+}
+
+fn normalize_todos(value: &Value) -> Value {
+    let items = value.as_array().cloned().unwrap_or_default();
+    let normalized: Vec<Value> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            Value::String(text) => {
+                let text = text.trim().to_string();
+                (!text.is_empty()).then(|| json!({"text": text, "done": false}))
+            }
+            Value::Object(object) => {
+                let text = object
+                    .get("text")
+                    .or_else(|| object.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                (!text.is_empty()).then(|| {
+                    json!({
+                        "text": text,
+                        "done": object.get("done").and_then(Value::as_bool).unwrap_or(false)
+                    })
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    Value::Array(normalized)
+}
+
 fn display_role(role: &str) -> String {
     if role == "assistant" {
         "agent".to_string()
@@ -718,6 +900,39 @@ fn session_path(workspace: &Path, chat_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn notes_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let note = store
+            .create_note(
+                "chat",
+                "chat-1",
+                "Title",
+                "Body",
+                &json!(["one", {"text": "two", "done": true}]),
+            )
+            .await
+            .unwrap();
+        let id = note["id"].as_str().unwrap();
+        assert_eq!(note["todos"][0]["text"], "one");
+        assert_eq!(note["todos"][1]["done"], true);
+
+        let notes = store.list_notes("chat", "chat-1").await;
+        assert_eq!(notes.len(), 1);
+
+        let updated = store
+            .update_note(id, Some("Renamed"), None, Some(&json!(["done"])))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["title"], "Renamed");
+        assert_eq!(updated["todos"][0]["text"], "done");
+
+        assert!(store.delete_note(id).await.unwrap());
+        assert!(store.list_notes("chat", "chat-1").await.is_empty());
+    }
 
     #[tokio::test]
     async fn truncate_and_mode_round_trip() {

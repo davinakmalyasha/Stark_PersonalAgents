@@ -105,8 +105,8 @@ cleanly.
 
 `call_subagent` supports `run`, `spawn`, `status`, `message`, `stop`, and
 `list`; child sessions are persisted as `cont-*` chats and exposed through the
-subagent routes. `message` queues steering and `stop` cancels the child's
-token.
+subagent routes. `message` queues steering, `stop` cancels the child's token,
+and the subagent routes report live child status.
 
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible

@@ -166,7 +166,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         checkpoint.set_user_message(&user_message_id);
     }
     ctx.store
-        .append_session_entry(
+        .append_session_entry_for(
+            &ctx.workspace_id,
             &ctx.workspace,
             &ctx.chat_id,
             json!({"type": "message", "role": "user", "content": prompt.clone()}),
@@ -322,7 +323,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     .append_message(&ctx.chat_id, "assistant", &text, false)
                     .await?;
                 ctx.store
-                    .append_session_entry(
+                    .append_session_entry_for(
+                        &ctx.workspace_id,
                         &ctx.workspace,
                         &ctx.chat_id,
                         json!({
@@ -346,7 +348,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     .append_message(&ctx.chat_id, "user", &follow_up, false)
                     .await?;
                 ctx.store
-                    .append_session_entry(
+                    .append_session_entry_for(
+                        &ctx.workspace_id,
                         &ctx.workspace,
                         &ctx.chat_id,
                         json!({"type": "message", "role": "user", "content": follow_up}),
@@ -416,7 +419,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             messages.push(ChatMessage::tool(&call.id, &outcome.content));
             let _ = ctx
                 .store
-                .append_session_entry(
+                .append_session_entry_for(
+                    &ctx.workspace_id,
                     &ctx.workspace,
                     &ctx.chat_id,
                     json!({
@@ -469,7 +473,8 @@ async fn finish_aborted(ctx: &RunContext, state: &mut AppState) {
         .await;
     let _ = ctx
         .store
-        .append_session_entry(
+        .append_session_entry_for(
+            &ctx.workspace_id,
             &ctx.workspace,
             &ctx.chat_id,
             json!({"type": "message", "role": "assistant", "content": message, "stop_reason": "aborted"}),
@@ -936,6 +941,8 @@ mod tests {
             dir.path()
                 .join(".deep_agents")
                 .join("sessions")
+                .join("general")
+                .join("_general")
                 .join("chat.jsonl")
                 .exists()
         );

@@ -94,14 +94,14 @@ Session/UI routes share the Python `.deep_agents/workspaces.json` registry and
 `GET /api/chats/{chat_id}/snapshots`,
 `POST /api/chats/{chat_id}/snapshots/{snap_id}/restore`,
 `POST /api/chats/{chat_id}/runs/{run_id}/restore`,
-`POST /api/runs/{run_id}/undo`. Uploads are capped at
+`POST /api/runs/{run_id}/undo`, `GET/POST /api/notes`,
+`GET /api/notes/{scope_type}/{scope_id}`, `PATCH/DELETE /api/notes/{note_id}`. Uploads are capped at
 8 files / 20 MB each and stored under `.deep_agents/uploads/`; run prompts
 include their safe paths. `edit_file` snapshots the pre-write bytes into
 `.deep_agents/snapshots/{chat}/{run}`; rewind restores those files and truncates
 the transcript. Shell-created changes are not checkpointed yet. Steering
-messages are delivered at the next agent step boundary. Empty stubs exist for
-`/api/groups`, canvas status, and chat notes so the existing UI can boot
-cleanly.
+messages are delivered at the next agent step boundary. Notes are stored in `chats.db`. Empty stubs remain for `/api/groups` and
+canvas status.
 
 `call_subagent` supports `run`, `spawn`, `status`, `message`, `stop`, and
 `list`; child sessions are persisted as `cont-*` chats and exposed through the

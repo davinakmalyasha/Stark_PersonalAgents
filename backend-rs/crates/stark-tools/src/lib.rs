@@ -26,6 +26,7 @@ const IMPLEMENTED: &[&str] = &[
     "run_command",
     "search_code",
     "ask_user",
+    "call_subagent",
 ];
 
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();

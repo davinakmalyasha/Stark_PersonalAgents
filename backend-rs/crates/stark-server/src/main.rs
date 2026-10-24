@@ -412,6 +412,8 @@ Attached files:
         chat_id: chat_id.clone(),
         workspace_id,
         workspace,
+        role: None,
+        depth: 0,
         model,
         temperature: request.temperature,
         provider: state.provider.clone(),
@@ -1166,22 +1168,85 @@ fn attachment_note(harness_root: &std::path::Path, attachments: &[Value]) -> Str
 
 async fn subagents_handler(
     State(state): State<ServerState>,
-    Path((workspace_id, _chat_id)): Path<(String, String)>,
+    Path((workspace_id, chat_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if workspace_path(&state, &workspace_id).is_none() {
         return Err(not_found("workspace not found"));
     }
-    Ok(Json(json!({"subagents": []})))
+    let prefix = format!("cont-{chat_id}-");
+    let subagents: Vec<Value> = state
+        .store
+        .list_chats(&workspace_id)
+        .await
+        .into_iter()
+        .filter(|chat| {
+            chat["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(&prefix))
+        })
+        .map(|chat| {
+            let id = chat["id"].as_str().unwrap_or("");
+            let title = chat["title"].as_str().unwrap_or("Subagent");
+            json!({
+                "child_id": id,
+                "name": title,
+                "label": title,
+                "status": "idle",
+                "created": 0,
+                "parent_session": null,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"subagents": subagents})))
 }
 
 async fn subagent_handler(
     State(state): State<ServerState>,
-    Path((workspace_id, _child_id)): Path<(String, String)>,
+    Path((workspace_id, child_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if workspace_path(&state, &workspace_id).is_none() {
         return Err(not_found("workspace not found"));
     }
-    Err(not_found("subagent session not found"))
+    if !child_id.starts_with("cont-") {
+        return Err(not_found("subagent session not found"));
+    }
+    let Some(chat) = state
+        .store
+        .get_chat(&child_id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?
+    else {
+        return Err(not_found("subagent session not found"));
+    };
+    let title = chat["title"].as_str().unwrap_or("Subagent").to_string();
+    let entries: Vec<Value> = chat["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|message| message["metadata"]["isTrace"] != true)
+        .map(|message| {
+            let role = message["role"].as_str().unwrap_or("assistant");
+            json!({
+                "kind": if role == "user" { "user" } else if role == "tool" { "tool" } else { "assistant" },
+                "content": message["content"],
+                "toolName": message["metadata"]["toolName"],
+                "isError": role == "error",
+                "ts": 0,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "info": {
+            "child_id": child_id,
+            "name": title,
+            "label": title,
+            "status": "idle",
+            "created": 0,
+            "parent_session": null,
+        },
+        "entries": entries,
+    })))
 }
 
 const MAX_ATTACHMENTS: usize = 8;

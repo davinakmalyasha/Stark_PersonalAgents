@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
 use stark_providers::{ChatMessage, Provider, ProviderEvent, ToolCall};
 use stark_store::{ChatStore, StoreError};
-use stark_tools::{Checkpoint, QuestionBroker, ToolContext};
+use stark_tools::{Checkpoint, QuestionBroker, ToolContext, ToolOutcome};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +30,8 @@ pub struct RunContext {
     pub chat_id: String,
     pub workspace_id: String,
     pub workspace: PathBuf,
+    pub role: Option<String>,
+    pub depth: u32,
     pub model: String,
     pub temperature: f64,
     pub provider: Provider,
@@ -93,8 +95,9 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
         .await?;
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
+    let role = ctx.role.as_deref().unwrap_or("a coding agent");
     let mut messages = vec![ChatMessage::system(format!(
-        "You are Stark, a coding agent working in {workspace_label}. \
+        "You are Stark, {role} working in {workspace_label}. \
          Use the provided tools to inspect and change files. Read before editing. \
          Never invent tool results. Keep the final answer concise."
     ))];
@@ -316,7 +319,11 @@ pub async fn run_agent(ctx: RunContext, prompt: String) -> Result<(), RunError> 
             ctx.emit_delta(Delta::tool_started(&call.function.name, &args_text));
 
             let started = Instant::now();
-            let outcome = stark_tools::dispatch(&call.function.name, &args, &tools).await;
+            let outcome = if call.function.name == "call_subagent" {
+                run_subagent_tool(&ctx, &args).await
+            } else {
+                stark_tools::dispatch(&call.function.name, &args, &tools).await
+            };
             let elapsed = started.elapsed().as_millis() as u64;
             let preview: String = outcome.content.chars().take(300).collect();
             ctx.emit_delta(Delta::tool_finished(
@@ -404,6 +411,137 @@ async fn fail(ctx: &RunContext, state: &mut AppState, message: String) {
     ctx.emit_delta(Delta::end(""));
 }
 
+async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("run")
+        .trim();
+    match action {
+        "list" => {
+            let chats = ctx.store.list_chats(&ctx.workspace_id).await;
+            let rows: Vec<String> = chats
+                .into_iter()
+                .filter(|chat| {
+                    let prefix = format!("cont-{}-", ctx.chat_id);
+                    chat["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(&prefix))
+                })
+                .map(|chat| {
+                    format!(
+                        "- {} - {}",
+                        chat["id"].as_str().unwrap_or(""),
+                        chat["title"].as_str().unwrap_or("Subagent")
+                    )
+                })
+                .collect();
+            ToolOutcome::ok(if rows.is_empty() {
+                "No subagent sessions.".to_string()
+            } else {
+                rows.join(
+                    "
+",
+                )
+            })
+        }
+        "status" => {
+            let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {
+                return ToolOutcome::err("Error: action='status' requires child_id");
+            };
+            match ctx.store.get_chat(child_id).await {
+                Ok(Some(chat)) => ToolOutcome::ok(
+                    serde_json::to_string_pretty(&json!({
+                        "child_id": child_id,
+                        "title": chat["title"],
+                        "status": "idle",
+                        "messages": chat["messages"],
+                    }))
+                    .unwrap_or_default(),
+                ),
+                Ok(None) => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+        "run" | "" => {
+            if ctx.depth >= 2 {
+                return ToolOutcome::err("Error: subagent nesting limit reached");
+            }
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Specialist")
+                .trim();
+            let task = args
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if task.is_empty() {
+                return ToolOutcome::err("Error: action='run' requires task");
+            }
+            let safe_name: String = name
+                .chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .take(24)
+                .collect();
+            let child_id = format!(
+                "cont-{}-{}-{}",
+                ctx.chat_id,
+                if safe_name.is_empty() {
+                    "subagent"
+                } else {
+                    safe_name.as_str()
+                },
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            );
+            let (tx, _) = broadcast::channel(64);
+            let latest = Arc::new(Mutex::new(None));
+            let child = RunContext {
+                chat_id: child_id.clone(),
+                workspace_id: ctx.workspace_id.clone(),
+                workspace: ctx.workspace.clone(),
+                role: Some(format!("the {name} specialist subagent")),
+                depth: ctx.depth + 1,
+                model: ctx.model.clone(),
+                temperature: ctx.temperature,
+                provider: ctx.provider.clone(),
+                store: ctx.store.clone(),
+                questions: ctx.questions.clone(),
+                tx,
+                latest: latest.clone(),
+                steering: Arc::new(Mutex::new(VecDeque::new())),
+                follow_up: Arc::new(Mutex::new(VecDeque::new())),
+                checkpoint: None,
+                cancel: ctx.cancel.child_token(),
+            };
+            if let Err(error) = Box::pin(run_agent(child, task.to_string())).await {
+                return ToolOutcome::err(format!("[ERR] Subagent {name}: {error}"));
+            }
+            let report = latest
+                .lock()
+                .ok()
+                .and_then(|latest| latest.clone())
+                .and_then(|state| state.outputs.get("agent_report").cloned())
+                .and_then(|report| report.as_str().map(str::to_string))
+                .unwrap_or_else(|| "(no report)".to_string());
+            ToolOutcome::ok(format!(
+                "[SUBAGENT {name}] child={child_id}
+{report}"
+            ))
+        }
+        "spawn" => ToolOutcome::err(
+            "Error: spawn is not available in the Rust runtime yet; use action='run'",
+        ),
+        "message" | "stop" => ToolOutcome::err(format!(
+            "Error: action='{action}' is not available in the Rust runtime yet"
+        )),
+        other => ToolOutcome::err(format!("Error: unknown subagent action '{other}'")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -446,6 +584,96 @@ mod tests {
             .unwrap()
     }
 
+    async fn mock_subagent_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"call_subagent","arguments":"{\"name\":\"Developer\",\"task\":\"reply DONE\"}"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!(
+                "data: {item}
+
+"
+            ));
+        }
+        body.push_str(
+            "data: [DONE]
+
+",
+        );
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn subagent_run_persists_a_child_chat() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_subagent_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "parent".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            depth: 0,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+        };
+        run_agent(ctx, "delegate".to_string()).await.unwrap();
+        let chats = store.list_chats("_general").await;
+        let children: Vec<&Value> = chats
+            .iter()
+            .filter(|chat| {
+                chat["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("cont-parent-"))
+            })
+            .collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["title"], "reply DONE");
+    }
+
     #[tokio::test]
     async fn loop_executes_a_tool_and_finishes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -477,6 +705,8 @@ mod tests {
             chat_id: "chat".to_string(),
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
+            role: None,
+            depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,
             provider,

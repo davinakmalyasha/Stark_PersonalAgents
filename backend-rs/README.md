@@ -103,6 +103,10 @@ messages are delivered at the next agent step boundary. Empty stubs exist for
 `/api/groups`, canvas status, and chat notes so the existing UI can boot
 cleanly.
 
+`call_subagent` is implemented for synchronous `action=run`, plus `list` and
+`status`; child chats are persisted as `cont-*` records and exposed through the
+subagent routes. `spawn`, `message`, and `stop` are not implemented yet.
+
 Phase 2 progress: `edit_file` Mode C follows Codex `apply_patch` behavior and
 passes Codex's 25 scenario fixtures. `stark-policy` uses a Codex-compatible
 Starlark `prefix_rule` engine with `allow` / `prompt` / `forbidden` decisions

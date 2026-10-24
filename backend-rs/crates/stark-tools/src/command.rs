@@ -148,6 +148,7 @@ pub async fn run_command(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         }
         ProcessStatus::Running => {
             if explicit_yield.is_some() {
+                ctx.processes.mark_read(&session);
                 ToolOutcome::ok(format!(
                     "[RUNNING] session #{session} still running after {elapsed}ms\n{}",
                     truncate(output)

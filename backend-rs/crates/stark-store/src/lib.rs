@@ -756,6 +756,24 @@ impl ChatStore {
         Ok(message)
     }
 
+    pub async fn read_session_entries(
+        &self,
+        workspace_id: &str,
+        workspace: &Path,
+        chat_id: &str,
+    ) -> Result<Vec<Value>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let path = session_path_for(workspace, workspace_id, chat_id);
+        let Ok(text) = tokio::fs::read_to_string(path).await else {
+            return Ok(Vec::new());
+        };
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
+            .collect())
+    }
+
     pub async fn append_session_entry(
         &self,
         workspace: &Path,

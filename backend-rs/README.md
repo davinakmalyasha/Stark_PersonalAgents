@@ -102,6 +102,8 @@ include their safe paths. `edit_file` snapshots the pre-write bytes into
 the transcript. Shell-created changes are not checkpointed yet. Steering
 messages are delivered at the next agent step boundary. Session JSONL now follows the Python layout:
 `.deep_agents/sessions/{general|house|personal|dfd|project}/{workspace_id}/{chat_id}.jsonl`.
+Runs rebuild prior tool-call/tool-result pairs from that log before falling back
+to the SQLite message history.
 Notes are stored in `chats.db`. Pairing uses `.deep_agents/pairing.json`:
 loopback clients bypass auth, remote clients must send `X-API-Token`, and
 `GET /api/pairing` / `POST /api/pairing/rotate` are loopback-only. Bind

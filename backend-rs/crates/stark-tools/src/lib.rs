@@ -3,6 +3,7 @@ mod ask;
 mod browser;
 mod checkpoint;
 mod command;
+mod dfd;
 mod edit;
 mod head_tail;
 mod house;
@@ -47,11 +48,14 @@ const IMPLEMENTED: &[&str] = &[
     "house_set_device",
     "house_run_scene",
     "house_get_history",
+    "dfd_bridge",
+    "create_client",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "edit_file",
     "create_project",
+    "create_client",
     "github_apply_gate",
     "house_set_device",
     "house_run_scene",
@@ -310,6 +314,8 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "house_set_device" => house::house_set_device(ctx, args).await,
         "house_run_scene" => house::house_run_scene(ctx, args).await,
         "house_get_history" => house::house_get_history(ctx, args).await,
+        "dfd_bridge" => dfd::dfd_bridge(ctx, args).await,
+        "create_client" => dfd::create_client(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -393,6 +399,12 @@ mod tests {
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
 
+        let dfd = tool_specs_for_scope("build", "dfd");
+        let names = tool_names(&dfd);
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"dfd_bridge"));
+        assert!(names.contains(&"create_client"));
+
         let house = tool_specs_for_scope("build", "house");
         let names = tool_names(&house);
         assert_eq!(names.len(), 9);
@@ -413,7 +425,7 @@ mod tests {
         );
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            18
+            20
         );
     }
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Smartphone, X } from 'lucide-react';
 import PairingModal from './PairingModal';
+import WindowControls from './WindowControls';
 
 type AppRegionStyle = React.CSSProperties & { WebkitAppRegion?: 'drag' | 'no-drag' };
 
@@ -36,13 +37,16 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
       if (document.hidden) return;
       try {
         const res = await fetch('/api/runs/active');
-        const data = await res.json();
+        const data = (await res.json()) as { runs?: Array<{ chat_id?: string }>; running?: boolean } & { chat_id?: string };
         const ids = new Set<string>();
-        for (const r of (Array.isArray((data as any)?.runs) ? (data as any).runs : data?.running ? [data] : [])) {
+        const runs = Array.isArray(data?.runs) ? data.runs : data?.running ? [data] : [];
+        for (const r of runs) {
           if (r.chat_id) ids.add(String(r.chat_id));
         }
         if (!cancelled) setLiveChatIds(ids);
-      } catch {}
+      } catch {
+        /* backend briefly unavailable */
+      }
     };
     poll();
     const id = window.setInterval(poll, 2500);
@@ -55,6 +59,7 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
     <header
       className={`relative flex items-center select-none flex-shrink-0 h-[38px] bg-[#0c0c0e] border-b border-zinc-800/60 px-2 z-50 gap-2 ${dragOver ? 'bg-white/[0.04]' : ''}`}
       style={{ WebkitAppRegion: 'drag' } as AppRegionStyle}
+      data-tauri-drag-region="deep"
       onDragOver={(e) => {
         if (!onDropTab) return;
         e.preventDefault();
@@ -125,6 +130,7 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
         <Smartphone size={13} />
         Phone
       </button>
+      <WindowControls />
       <PairingModal open={pairingOpen} onClose={() => setPairingOpen(false)} />
     </header>
   );

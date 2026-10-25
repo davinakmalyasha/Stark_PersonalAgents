@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import WindowControls from '../components/Layout/WindowControls';
 import {
   ArrowLeft, House, Menu, RotateCcw, Thermometer, Zap, Shield, Lightbulb, LoaderCircle,
   ChevronDown, ChevronUp, Sparkles,
@@ -231,6 +232,7 @@ export default function HouseWorkspace() {
           >
             <RotateCcw size={13} />
           </button>
+          <WindowControls />
         </div>
       </header>
 

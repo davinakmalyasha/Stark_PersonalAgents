@@ -12,7 +12,10 @@
     "preview": "vite preview",
     "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:9000 && electron .\"",
     "electron:build": "npm run build && electron-builder",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "build": {
     "appId": "com.stark.workspace",
@@ -40,6 +43,7 @@
     }
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
     "@types/react-syntax-highlighter": "^15.5.13",
     "lucide-react": "^1.17.0",
     "qrcode.react": "^4.2.0",
@@ -50,6 +54,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2.12.4",
     "@types/node": "^24.12.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

@@ -1,0 +1,36 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "voice",
+  "description": "Voice overlay permissions",
+  "windows": [
+    "voice"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:8123",
+      "http://localhost:9000",
+      "http://127.0.0.1:8124"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "allow-ping",
+    "allow-runtime-info",
+    "allow-select-folder",
+    "allow-reveal-path",
+    "allow-voice-toggle",
+    "allow-voice-set-chat",
+    "allow-voice-close",
+    "allow-voice-emit-event",
+    "allow-voice-resize",
+    "allow-voice-screen-sources",
+    "allow-voice-screen-select",
+    "allow-voice-screen-protect"
+  ]
+}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import WindowControls from '../components/Layout/WindowControls';
 import { Activity, ArrowLeft, RefreshCw, Server, ShieldCheck, Terminal, Trash2 } from 'lucide-react';
 import { fetchAdminHealth, fetchBots, fetchClients, fetchUsage, disableBot } from './agentsAdminApi';
 
@@ -77,15 +78,18 @@ export default function AgentsAdminWorkspace() {
             super-operator
           </span>
         </div>
-        <button
-          type="button"
-          onClick={refreshAll}
-          disabled={!!busy}
-          title="Refresh"
-          className="grid place-items-center w-8 h-8 rounded-lg text-zinc-400 hover:text-white hover:bg-white/[0.07] transition-colors cursor-pointer disabled:opacity-40"
-        >
-          <RefreshCw size={15} className={busy ? 'animate-spin' : ''} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={refreshAll}
+            disabled={!!busy}
+            title="Refresh"
+            className="grid place-items-center w-8 h-8 rounded-lg text-zinc-400 hover:text-white hover:bg-white/[0.07] transition-colors cursor-pointer disabled:opacity-40"
+          >
+            <RefreshCw size={15} className={busy ? 'animate-spin' : ''} />
+          </button>
+          <WindowControls />
+        </div>
       </header>
 
       <main className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-5 space-y-4">

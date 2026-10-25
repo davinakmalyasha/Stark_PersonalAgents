@@ -23,6 +23,7 @@ use stark_contract::{PlanItem, ToolSpecFile};
 
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
+pub use house::{HouseStore, public_device, public_state};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;

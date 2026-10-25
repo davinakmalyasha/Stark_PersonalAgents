@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,7 +20,7 @@ fn lock() -> &'static Mutex<()> {
 
 pub async fn house_get_state(ctx: &ToolContext, _args: &Value) -> ToolOutcome {
     let _guard = lock().lock().await;
-    match load_state(ctx).await {
+    match load_state(&ctx.harness_root).await {
         Ok(state) => ToolOutcome::ok(format_state(&state)),
         Err(error) => ToolOutcome::err(error),
     }
@@ -35,7 +36,7 @@ pub async fn house_get_device(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         return ToolOutcome::err("Error: device_id is required");
     }
     let _guard = lock().lock().await;
-    let state = match load_state(ctx).await {
+    let state = match load_state(&ctx.harness_root).await {
         Ok(state) => state,
         Err(error) => return ToolOutcome::err(error),
     };
@@ -78,7 +79,7 @@ pub async fn house_set_device(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         );
     }
     let _guard = lock().lock().await;
-    let mut state = match load_state(ctx).await {
+    let mut state = match load_state(&ctx.harness_root).await {
         Ok(state) => state,
         Err(error) => return ToolOutcome::err(error),
     };
@@ -99,7 +100,7 @@ pub async fn house_set_device(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         }
     }
     state["updatedAt"] = json!(Utc::now().to_rfc3339());
-    if let Err(error) = save_state(ctx, &state).await {
+    if let Err(error) = save_state(&ctx.harness_root, &state).await {
         return ToolOutcome::err(error);
     }
     let device = &state["devices"][device_id];
@@ -116,7 +117,7 @@ pub async fn house_run_scene(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         return ToolOutcome::err("Error: scene_id is required");
     }
     let _guard = lock().lock().await;
-    let mut state = match load_state(ctx).await {
+    let mut state = match load_state(&ctx.harness_root).await {
         Ok(state) => state,
         Err(error) => return ToolOutcome::err(error),
     };
@@ -146,7 +147,7 @@ pub async fn house_run_scene(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         applied.push(device_id);
     }
     state["updatedAt"] = json!(Utc::now().to_rfc3339());
-    if let Err(error) = save_state(ctx, &state).await {
+    if let Err(error) = save_state(&ctx.harness_root, &state).await {
         return ToolOutcome::err(error);
     }
     let name = scene["name"].as_str().unwrap_or(scene_id);
@@ -175,7 +176,7 @@ pub async fn house_get_history(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or(DEFAULT_HOURS)
         .clamp(1, MAX_HOURS);
     let _guard = lock().lock().await;
-    let state = match load_state(ctx).await {
+    let state = match load_state(&ctx.harness_root).await {
         Ok(state) => state,
         Err(error) => return ToolOutcome::err(error),
     };
@@ -203,16 +204,288 @@ pub async fn house_get_history(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     ))
 }
 
-async fn load_state(ctx: &ToolContext) -> Result<Value, String> {
-    let path = ctx
-        .harness_root
-        .join(".deep_agents")
-        .join("house_state.json");
+#[derive(Clone, Debug)]
+pub struct HouseStore {
+    root: PathBuf,
+}
+
+impl HouseStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub async fn state(&self) -> Result<Value, String> {
+        let _guard = lock().lock().await;
+        load_state(&self.root).await
+    }
+
+    pub async fn device(&self, device_id: &str) -> Result<Option<Value>, String> {
+        let _guard = lock().lock().await;
+        let state = load_state(&self.root).await?;
+        let Some(device) = state["devices"].get(device_id) else {
+            return Ok(None);
+        };
+        Ok(Some(with_id(device_id, device)))
+    }
+
+    pub async fn set_device(
+        &self,
+        device_id: &str,
+        patch: &Map<String, Value>,
+    ) -> Result<Value, String> {
+        let _guard = lock().lock().await;
+        let mut state = load_state(&self.root).await?;
+        {
+            let Some(device) = state["devices"].get_mut(device_id) else {
+                return Err(format!("Unknown device {device_id}"));
+            };
+            let (valid, error) = validate_patch(device["type"].as_str().unwrap_or(""), patch);
+            if valid.is_empty() {
+                return Err(error);
+            }
+            let state_object = device
+                .get_mut("state")
+                .and_then(Value::as_object_mut)
+                .expect("device state is an object");
+            for (key, value) in valid {
+                state_object.insert(key, value);
+            }
+        }
+        state["updatedAt"] = json!(Utc::now().to_rfc3339());
+        save_state(&self.root, &state).await?;
+        Ok(with_id(device_id, &state["devices"][device_id]))
+    }
+
+    pub async fn set_room(
+        &self,
+        room_id: &str,
+        patch: &Map<String, Value>,
+    ) -> Result<Value, String> {
+        let _guard = lock().lock().await;
+        let mut state = load_state(&self.root).await?;
+        let mut applied = Vec::new();
+        let mut skipped = Vec::new();
+        let ids: Vec<String> = state["devices"]
+            .as_object()
+            .map(|devices| devices.keys().cloned().collect())
+            .unwrap_or_default();
+        for device_id in ids {
+            let Some(device) = state["devices"].get_mut(&device_id) else {
+                continue;
+            };
+            if device_room(device) != room_id {
+                continue;
+            }
+            let (valid, error) = validate_patch(device["type"].as_str().unwrap_or(""), patch);
+            if valid.is_empty() {
+                skipped.push(json!([device_id, error]));
+                continue;
+            }
+            let state_object = device
+                .get_mut("state")
+                .and_then(Value::as_object_mut)
+                .expect("device state is an object");
+            for (key, value) in valid {
+                state_object.insert(key, value);
+            }
+            applied.push(device_id);
+        }
+        if applied.is_empty() && skipped.is_empty() {
+            return Err(format!("Room {room_id} not found"));
+        }
+        state["updatedAt"] = json!(Utc::now().to_rfc3339());
+        save_state(&self.root, &state).await?;
+        Ok(json!({"applied": applied, "skipped": skipped}))
+    }
+
+    pub async fn run_scene(&self, scene_id: &str) -> Result<Value, String> {
+        let _guard = lock().lock().await;
+        let mut state = load_state(&self.root).await?;
+        let Some(scene) = state["scenes"].get(scene_id).cloned() else {
+            return Err(format!("Scene {scene_id} not found"));
+        };
+        let mut applied = Vec::new();
+        let mut skipped = Vec::new();
+        for (device_id, patch) in scene_actions(&scene) {
+            let Some(device) = state["devices"].get_mut(&device_id) else {
+                skipped.push(json!([device_id, "unknown device"]));
+                continue;
+            };
+            let (valid, error) = validate_patch(device["type"].as_str().unwrap_or(""), &patch);
+            if valid.is_empty() {
+                skipped.push(json!([device_id, error]));
+                continue;
+            }
+            let state_object = device
+                .get_mut("state")
+                .and_then(Value::as_object_mut)
+                .expect("device state is an object");
+            for (key, value) in valid {
+                state_object.insert(key, value);
+            }
+            applied.push(device_id);
+        }
+        state["updatedAt"] = json!(Utc::now().to_rfc3339());
+        save_state(&self.root, &state).await?;
+        Ok(json!({
+            "ok": true,
+            "scene": with_id(scene_id, &scene),
+            "applied": applied,
+            "skipped": skipped,
+        }))
+    }
+
+    pub async fn history(&self, device_id: &str, hours: i64) -> Result<Value, String> {
+        let _guard = lock().lock().await;
+        let state = load_state(&self.root).await?;
+        if state["devices"].get(device_id).is_none() {
+            return Err(format!("Unknown device {device_id}"));
+        }
+        let hours = hours.clamp(1, MAX_HOURS);
+        let cutoff = unix_now() - hours * 3_600;
+        let mut points = Vec::new();
+        if let Some(items) = state["history"].get(device_id).and_then(Value::as_array) {
+            for point in items {
+                if point.get("ts").and_then(Value::as_i64).unwrap_or(0) >= cutoff {
+                    points.push(point.clone());
+                }
+            }
+        }
+        if points.is_empty() {
+            for index in 0..hours {
+                points.push(json!({
+                    "ts": unix_now() - index * 3_600,
+                    "kwh": 0.12 * ((index % 7) as f64),
+                }));
+            }
+        }
+        let series: Vec<f64> = points
+            .iter()
+            .map(|point| point.get("kwh").and_then(Value::as_f64).unwrap_or(0.0))
+            .collect();
+        Ok(json!({
+            "device_id": device_id,
+            "hours": hours,
+            "points": points,
+            "series": series,
+        }))
+    }
+
+    pub async fn reset(&self) -> Result<Value, String> {
+        let _guard = lock().lock().await;
+        let state = normalize_state(default_state());
+        save_state(&self.root, &state).await?;
+        Ok(json!({"ok": true, "state": state}))
+    }
+}
+
+pub fn public_state(state: &Value) -> Value {
+    let rooms: Vec<Value> = state["rooms"]
+        .as_array()
+        .map(|rooms| rooms.iter().map(public_room).collect())
+        .unwrap_or_default();
+    let devices: Vec<Value> = state["devices"]
+        .as_object()
+        .map(|devices| {
+            devices
+                .iter()
+                .map(|(id, device)| public_device(id, device))
+                .collect()
+        })
+        .unwrap_or_default();
+    let scenes: Vec<Value> = state["scenes"]
+        .as_object()
+        .map(|scenes| {
+            scenes
+                .iter()
+                .map(|(id, scene)| public_scene(id, scene))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "version": 1,
+        "updatedAt": state["updatedAt"].as_str().unwrap_or(""),
+        "rooms": rooms,
+        "devices": devices,
+        "scenes": scenes,
+        "energy": {
+            "todayKwh": state["energy"]["today_kwh"].as_f64().unwrap_or(0.0),
+            "cost": state["energy"]["cost_today"].as_f64().unwrap_or(0.0),
+            "series": [],
+        },
+        "security": {
+            "armed": state["security"]["armed"].as_bool().unwrap_or(false),
+            "mode": if state["security"]["armed"].as_bool().unwrap_or(false) { "armed" } else { "disarmed" },
+            "lastEvent": "",
+        },
+    })
+}
+
+pub fn public_device(id: &str, device: &Value) -> Value {
+    let mut result = device.clone();
+    result["id"] = json!(id);
+    result["roomId"] = json!(device_room(device));
+    result["capabilities"] = json!(capabilities(device["type"].as_str().unwrap_or("")));
+    result["isOnline"] = json!(
+        device
+            .get("isOnline")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    );
+    if !result["state"].is_object() {
+        result["state"] = json!({});
+    }
+    result
+}
+
+fn with_id(id: &str, device: &Value) -> Value {
+    let mut result = device.clone();
+    result["id"] = json!(id);
+    result
+}
+
+fn public_room(room: &Value) -> Value {
+    if let Some(id) = room.as_str() {
+        let mut chars = id.chars();
+        let name = chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default();
+        return json!({"id": id, "name": name, "icon": "home"});
+    }
+    let mut room = room.clone();
+    room["icon"] = room.get("icon").cloned().unwrap_or_else(|| json!("home"));
+    room
+}
+
+fn public_scene(id: &str, scene: &Value) -> Value {
+    let actions: Vec<Value> = scene_actions(scene)
+        .into_iter()
+        .map(|(device_id, state)| json!({"deviceId": device_id, "state": state}))
+        .collect();
+    json!({
+        "id": id,
+        "name": scene["name"].as_str().unwrap_or(""),
+        "icon": scene.get("icon").cloned().unwrap_or_else(|| json!("sparkles")),
+        "actions": actions,
+    })
+}
+
+fn device_room(device: &Value) -> String {
+    device["roomId"]
+        .as_str()
+        .or_else(|| device["room"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn load_state(root: &Path) -> Result<Value, String> {
+    let path = root.join(".deep_agents").join("house_state.json");
     let raw = match tokio::fs::read_to_string(&path).await {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let state = normalize_state(default_state());
-            save_state(ctx, &state).await?;
+            save_state(root, &state).await?;
             return Ok(state);
         }
         Err(error) => return Err(format!("Error: {error}")),
@@ -221,11 +494,8 @@ async fn load_state(ctx: &ToolContext) -> Result<Value, String> {
     Ok(normalize_state(state))
 }
 
-async fn save_state(ctx: &ToolContext, state: &Value) -> Result<(), String> {
-    let path = ctx
-        .harness_root
-        .join(".deep_agents")
-        .join("house_state.json");
+async fn save_state(root: &Path, state: &Value) -> Result<(), String> {
+    let path = root.join(".deep_agents").join("house_state.json");
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -585,5 +855,32 @@ mod tests {
             house_get_history(&ctx, &json!({"device_id": "living_light_1", "hours": 3})).await;
         assert!(!history.is_error);
         assert!(history.content.contains("last 3h"));
+
+        let store = HouseStore::new(dir.path());
+        let room = store
+            .set_room("kitchen", json!({"power": true}).as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            room["applied"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "kitchen_light_1")
+        );
+        let public = public_state(&store.state().await.unwrap());
+        assert!(public["rooms"].as_array().unwrap()[0].get("id").is_some());
+        assert!(
+            public["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|device| device["id"] == "kitchen_light_1")
+        );
+        assert!(
+            public["scenes"].as_array().unwrap()[0]
+                .get("actions")
+                .is_some()
+        );
     }
 }

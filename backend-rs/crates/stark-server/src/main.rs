@@ -22,7 +22,7 @@ use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, resolve_agent, run_agent, subagent_status, subagent_status_for};
 use stark_providers::{Provider, ProviderConfig};
 use stark_store::{ChatStore, WorkspaceRegistry};
-use stark_tools::{Checkpoint, PlanStore, QuestionBroker};
+use stark_tools::{Checkpoint, HouseStore, PlanStore, QuestionBroker, public_device, public_state};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -345,6 +345,18 @@ async fn main() -> anyhow::Result<()> {
             post(group_approval_handler),
         )
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
+        .route("/api/house/state", get(house_state_handler))
+        .route(
+            "/api/house/devices/{device_id}",
+            get(house_device_handler).patch(house_set_device_handler),
+        )
+        .route("/api/house/rooms/{room_id}", post(house_set_room_handler))
+        .route(
+            "/api/house/scenes/{scene_id}/run",
+            post(house_run_scene_handler),
+        )
+        .route("/api/house/history", get(house_history_handler))
+        .route("/api/house/reset", post(house_reset_handler))
         .route(
             "/api/notes/{scope_type}/{scope_id}",
             get(list_notes_handler),
@@ -1215,6 +1227,126 @@ async fn canvas_status_handler() -> Json<Value> {
 
 fn valid_note_scope(scope_type: &str, scope_id: &str) -> bool {
     matches!(scope_type, "chat" | "group") && !scope_id.trim().is_empty()
+}
+
+#[derive(Debug, Deserialize)]
+struct HousePatch {
+    #[serde(default)]
+    state: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HouseHistoryQuery {
+    #[serde(default)]
+    device_id: String,
+    hours: Option<i64>,
+}
+
+fn house_error(error: String) -> (StatusCode, Json<Value>) {
+    let status =
+        if error.to_lowercase().contains("unknown") || error.to_lowercase().contains("not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+    (status, Json(json!({"error": error})))
+}
+
+async fn house_state_handler(
+    State(state): State<ServerState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    HouseStore::new(&state.harness_root)
+        .state()
+        .await
+        .map(|state| Json(public_state(&state)))
+        .map_err(house_error)
+}
+
+async fn house_device_handler(
+    State(state): State<ServerState>,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match HouseStore::new(&state.harness_root)
+        .device(&device_id)
+        .await
+    {
+        Ok(Some(device)) => Ok(Json(public_device(&device_id, &device))),
+        Ok(None) => Err(not_found("Device not found")),
+        Err(error) => Err(house_error(error)),
+    }
+}
+
+async fn house_set_device_handler(
+    State(state): State<ServerState>,
+    Path(device_id): Path<String>,
+    Json(request): Json<HousePatch>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(patch) = request.state.as_object() else {
+        return Err(bad_request("state must be an object"));
+    };
+    HouseStore::new(&state.harness_root)
+        .set_device(&device_id, patch)
+        .await
+        .map(|device| Json(public_device(&device_id, &device)))
+        .map_err(house_error)
+}
+
+async fn house_set_room_handler(
+    State(state): State<ServerState>,
+    Path(room_id): Path<String>,
+    Json(request): Json<HousePatch>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(patch) = request.state.as_object() else {
+        return Err(bad_request("state must be an object"));
+    };
+    HouseStore::new(&state.harness_root)
+        .set_room(&room_id, patch)
+        .await
+        .map(Json)
+        .map_err(house_error)
+}
+
+async fn house_run_scene_handler(
+    State(state): State<ServerState>,
+    Path(scene_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = HouseStore::new(&state.harness_root)
+        .run_scene(&scene_id)
+        .await
+        .map_err(house_error)?;
+    Ok(Json(json!({
+        "sceneId": scene_id,
+        "name": result["scene"]["name"].as_str().unwrap_or(""),
+        "applied": result["applied"],
+        "skipped": result["skipped"],
+    })))
+}
+
+async fn house_history_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<HouseHistoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if query.device_id.trim().is_empty() {
+        return Err(bad_request("device_id is required"));
+    }
+    HouseStore::new(&state.harness_root)
+        .history(query.device_id.trim(), query.hours.unwrap_or(24))
+        .await
+        .map(Json)
+        .map_err(house_error)
+}
+
+async fn house_reset_handler(
+    State(state): State<ServerState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = HouseStore::new(&state.harness_root)
+        .reset()
+        .await
+        .map_err(house_error)?;
+    Ok(Json(json!({
+        "ok": true,
+        "state": public_state(&result["state"]),
+    })))
 }
 
 async fn list_notes_handler(

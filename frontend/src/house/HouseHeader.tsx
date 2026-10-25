@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Menu, FolderKanban, CircleAlert, Terminal } from 'lucide-react';
 import type { SessionTab, GroupProjectRow } from '../types';
 import SessionTabs from './SessionTabs';
+import WindowControls from '../components/Layout/WindowControls';
 
 interface HouseHeaderProps {
   tabs: SessionTab[];
@@ -62,6 +63,7 @@ export default function HouseHeader({
   onOpenSidebar, projects, projectsScoped, onOpenProject,
 }: HouseHeaderProps) {
   const isElectron = typeof window !== 'undefined' && !!window.antigravity;
+  const isDesktopShell = isElectron || Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
   const [projectsOpen, setProjectsOpen] = useState(false);
   const projectsRef = useRef<HTMLDivElement | null>(null);
 
@@ -71,7 +73,7 @@ export default function HouseHeader({
 
   return (
     <header
-      className={`relative z-20 flex items-center gap-2 px-3 sm:px-4 ${isElectron ? 'pr-36' : ''} h-[52px] border-b house-hairline shrink-0`}
+      className={`relative z-20 flex items-center gap-2 px-3 sm:px-4 ${isDesktopShell ? 'pr-36' : ''} h-[52px] border-b house-hairline shrink-0`}
       style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
     >
       <button
@@ -197,6 +199,7 @@ export default function HouseHeader({
           onNewSession={onNewSession}
         />
       </div>
+      <WindowControls className="absolute right-2 top-1/2 -translate-y-1/2 z-30" />
     </header>
   );
 }

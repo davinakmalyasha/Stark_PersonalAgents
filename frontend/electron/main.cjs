@@ -4,7 +4,9 @@ const fs = require('fs');
 const http = require('http');
 const { exec } = require('child_process');
 const { spawn, spawnSync } = require('child_process');
-const VOICE_HTML = path.join(__dirname, 'voice.html');
+const VOICE_HTML = (process.env.ELECTRON_PROD === '1' || app.isPackaged)
+  ? path.join(__dirname, '..', 'dist', 'voice.html')
+  : path.join(__dirname, '..', 'public', 'voice.html');
 
 // Stark is a thin shell: the UI build (frontend/dist) and the Python backend
 // live in the project tree, not inside the installer. Unpackaged, that tree

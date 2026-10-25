@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import WindowControls from '../components/Layout/WindowControls';
 import { ArrowLeft, Menu, User } from 'lucide-react';
 import HouseSidebar from '../house/HouseSidebar';
 import { useSessions, tabId } from '../house/useSessions';
@@ -88,6 +89,7 @@ export default function PersonalWorkspace() {
             </span>
           </div>
         </div>
+        <WindowControls />
       </header>
 
       {/* ── Body: reserved ── */}

@@ -56,11 +56,13 @@ const IMPLEMENTED: &[&str] = &[
     "read_pdf",
     "create_docx",
     "create_xlsx",
+    "create_coding_project",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "edit_file",
     "create_project",
+    "create_coding_project",
     "create_client",
     "github_apply_gate",
     "house_set_device",
@@ -414,7 +416,8 @@ mod tests {
 
         let dfd = tool_specs_for_scope("build", "dfd");
         let names = tool_names(&dfd);
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"create_coding_project"));
         assert!(names.contains(&"dfd_bridge"));
         assert!(names.contains(&"create_client"));
         assert!(names.contains(&"files_changed"));
@@ -426,20 +429,18 @@ mod tests {
         assert!(names.contains(&"house_run_scene"));
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
-        assert_eq!(
-            tool_names(&orchestrator),
-            vec![
-                "ask_user",
-                "delegate",
-                "delegation_status",
-                "job_message",
-                "job_cancel",
-                "give_note"
-            ]
-        );
+        let names = tool_names(&orchestrator);
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"create_coding_project"));
+        assert!(names.contains(&"ask_user"));
+        assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"delegation_status"));
+        assert!(names.contains(&"job_message"));
+        assert!(names.contains(&"job_cancel"));
+        assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            24
+            25
         );
     }
 

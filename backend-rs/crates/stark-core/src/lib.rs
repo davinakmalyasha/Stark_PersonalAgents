@@ -19,6 +19,7 @@ mod agents;
 mod compaction;
 mod delegation;
 mod notes;
+mod projects;
 pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
@@ -598,6 +599,14 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     ToolOutcome::err(reason)
                 } else {
                     run_subagent_tool(&ctx, &args).await
+                }
+            } else if call.function.name == "create_coding_project" {
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    projects::create_coding_project(&ctx, &args).await
                 }
             } else if call.function.name == "delegate" {
                 if let Some(reason) =

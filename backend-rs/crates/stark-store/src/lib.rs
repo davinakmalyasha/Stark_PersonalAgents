@@ -521,10 +521,30 @@ impl ChatStore {
         model: &str,
         parent_chat_id: &str,
     ) -> Result<Value, StoreError> {
+        self.create_linked_chat(
+            workspace_id,
+            workspace_path,
+            title,
+            model,
+            parent_chat_id,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn create_linked_chat(
+        &self,
+        workspace_id: &str,
+        workspace_path: &str,
+        title: &str,
+        model: &str,
+        parent_chat_id: &str,
+        parent_workspace_id: &str,
+    ) -> Result<Value, StoreError> {
         let id = format!("del-{}", &Uuid::new_v4().simple().to_string()[..10]);
         validate_chat_id(&id)?;
         let title = if title.trim().is_empty() {
-            "Delegated job".to_string()
+            "New Chat".to_string()
         } else {
             title.trim().chars().take(80).collect()
         };
@@ -544,7 +564,7 @@ impl ChatStore {
         .bind(&now)
         .bind(&now)
         .bind(parent_chat_id)
-        .bind(workspace_id)
+        .bind(parent_workspace_id)
         .execute(&self.pool)
         .await?;
         Ok(json!({

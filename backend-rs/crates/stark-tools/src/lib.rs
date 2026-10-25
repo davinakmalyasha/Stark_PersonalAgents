@@ -62,6 +62,7 @@ const IMPLEMENTED: &[&str] = &[
     "group_item_detail",
     "group_events",
     "group_update",
+    "schedule",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -437,7 +438,8 @@ mod tests {
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         let names = tool_names(&orchestrator);
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
+        assert!(names.contains(&"schedule"));
         assert!(names.contains(&"create_group"));
         assert!(names.contains(&"group_board"));
         assert!(names.contains(&"group_item_detail"));
@@ -452,7 +454,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            30
+            31
         );
     }
 

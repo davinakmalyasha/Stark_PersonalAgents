@@ -21,6 +21,7 @@ mod delegation;
 mod groups;
 mod notes;
 mod projects;
+mod schedules;
 pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
@@ -639,6 +640,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 groups::group_events(&ctx, &args).await
             } else if call.function.name == "group_update" {
                 groups::group_update(&ctx, &args).await
+            } else if call.function.name == "schedule" {
+                schedules::schedule(&ctx, &args).await
             } else if call.function.name == "give_note" {
                 notes::give_note(&ctx, &args).await
             } else {

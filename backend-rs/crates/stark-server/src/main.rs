@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, resolve_agent, run_agent, subagent_status, subagent_status_for};
 use stark_providers::{Provider, ProviderConfig};
-use stark_store::{ChatStore, GroupStore, WorkspaceRegistry};
+use stark_store::{ChatStore, GroupStore, ScheduleStore, WorkspaceRegistry};
 use stark_tools::{Checkpoint, HouseStore, PlanStore, QuestionBroker, public_device, public_state};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -251,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
     };
+    let scheduler_state = state.clone();
 
     let app = Router::new()
         .route("/api/run", post(run_handler))
@@ -378,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("STARK_PORT").unwrap_or_else(|_| "8124".to_string());
     let address = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await?;
+    tokio::spawn(schedule_loop(scheduler_state));
     tracing::info!("stark-server listening on http://{address}");
     axum::serve(
         listener,
@@ -385,6 +387,53 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+async fn schedule_loop(state: ServerState) {
+    let store = match ScheduleStore::open(&state.harness_root).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!("scheduler disabled: {error}");
+            return;
+        }
+    };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let due = match store.due(20).await {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!("scheduler due query failed: {error}");
+                continue;
+            }
+        };
+        for record in due {
+            if let Err(error) = store.mark_queued(&record.id).await {
+                tracing::warn!("scheduler mark queued failed: {error}");
+                continue;
+            }
+            let workspace = if record.workspace_path.trim().is_empty() {
+                state.harness_root.clone()
+            } else {
+                PathBuf::from(&record.workspace_path)
+            };
+            spawn_follow_up_run(
+                state.clone(),
+                RunTarget {
+                    chat_id: record.chat_id.clone(),
+                    workspace_id: record.workspace_id.clone(),
+                    workspace,
+                    scope: record.scope.clone(),
+                    role: record.role.clone(),
+                    model: record.model.clone(),
+                    temperature: record.temperature,
+                },
+                record.prompt.clone(),
+            );
+            if let Err(error) = store.mark_after_run(&record).await {
+                tracing::warn!("scheduler mark after run failed: {error}");
+            }
+        }
+    }
 }
 
 async fn run_handler(

@@ -10,9 +10,13 @@ use uuid::Uuid;
 
 mod groups;
 mod jobs;
+mod schedules;
 mod workspaces;
 pub use groups::GroupStore;
 pub use jobs::{JobRecord, JobStore};
+pub use schedules::{
+    ScheduleRecord, ScheduleStore, parse_time as parse_schedule_time, record_json as schedule_json,
+};
 pub use workspaces::{WorkspaceRecord, WorkspaceRegistry};
 
 #[derive(Debug, Error)]

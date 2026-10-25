@@ -5,6 +5,7 @@ mod checkpoint;
 mod command;
 mod edit;
 mod head_tail;
+mod house;
 mod patch;
 mod paths;
 mod plan;
@@ -40,6 +41,11 @@ const IMPLEMENTED: &[&str] = &[
     "job_message",
     "job_cancel",
     "give_note",
+    "house_get_state",
+    "house_get_device",
+    "house_set_device",
+    "house_run_scene",
+    "house_get_history",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -65,6 +71,7 @@ pub struct ToolContext {
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub approvals: Arc<ApprovalCache>,
     pub plan_store: Arc<PlanStore>,
+    pub harness_root: PathBuf,
     pub scope: String,
     pub mode: String,
 }
@@ -78,6 +85,7 @@ impl ToolContext {
         let workspace = workspace.into();
         Self {
             plan_store: Arc::new(PlanStore::new(&workspace)),
+            harness_root: workspace.clone(),
             workspace,
             chat_id: chat_id.into(),
             questions,
@@ -96,6 +104,11 @@ impl ToolContext {
 
     pub fn with_plan_store(mut self, plan_store: Arc<PlanStore>) -> Self {
         self.plan_store = plan_store;
+        self
+    }
+
+    pub fn with_harness_root(mut self, harness_root: impl Into<PathBuf>) -> Self {
+        self.harness_root = harness_root.into();
         self
     }
 
@@ -291,6 +304,11 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "ask_user" => ask::ask_user(ctx, args).await,
         "update_plan" => update_plan(ctx, args).await,
         "browser_act" => browser::browser_act(ctx, args).await,
+        "house_get_state" => house::house_get_state(ctx, args).await,
+        "house_get_device" => house::house_get_device(ctx, args).await,
+        "house_set_device" => house::house_set_device(ctx, args).await,
+        "house_run_scene" => house::house_run_scene(ctx, args).await,
+        "house_get_history" => house::house_get_history(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -374,6 +392,12 @@ mod tests {
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
 
+        let house = tool_specs_for_scope("build", "house");
+        let names = tool_names(&house);
+        assert_eq!(names.len(), 9);
+        assert!(names.contains(&"house_set_device"));
+        assert!(names.contains(&"house_run_scene"));
+
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         assert_eq!(
             tool_names(&orchestrator),
@@ -388,7 +412,7 @@ mod tests {
         );
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            13
+            18
         );
     }
 

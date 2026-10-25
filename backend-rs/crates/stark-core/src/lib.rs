@@ -361,6 +361,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         ctx.questions.clone(),
     )
     .with_plan_store(Arc::new(plan_store))
+    .with_harness_root(ctx.store.harness_root().to_path_buf())
     .with_scope(ctx.scope.clone())
     .with_mode(mode.clone());
     if let Some(checkpoint) = &ctx.checkpoint {

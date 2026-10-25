@@ -1,6 +1,7 @@
 mod approvals;
 mod ask;
 mod browser;
+mod changes;
 mod checkpoint;
 mod command;
 mod dfd;
@@ -50,6 +51,7 @@ const IMPLEMENTED: &[&str] = &[
     "house_get_history",
     "dfd_bridge",
     "create_client",
+    "files_changed",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -316,6 +318,7 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "house_get_history" => house::house_get_history(ctx, args).await,
         "dfd_bridge" => dfd::dfd_bridge(ctx, args).await,
         "create_client" => dfd::create_client(ctx, args).await,
+        "files_changed" => changes::files_changed(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -401,9 +404,10 @@ mod tests {
 
         let dfd = tool_specs_for_scope("build", "dfd");
         let names = tool_names(&dfd);
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
         assert!(names.contains(&"dfd_bridge"));
         assert!(names.contains(&"create_client"));
+        assert!(names.contains(&"files_changed"));
 
         let house = tool_specs_for_scope("build", "house");
         let names = tool_names(&house);
@@ -425,7 +429,7 @@ mod tests {
         );
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            20
+            21
         );
     }
 

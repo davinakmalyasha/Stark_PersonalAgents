@@ -16,7 +16,15 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 mod agents;
+mod compaction;
+mod delegation;
+mod groups;
+mod notes;
+mod projects;
+mod schedules;
 pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
+
+pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
 
 const MAX_STEPS: usize = 12;
 const HISTORY_LIMIT: usize = 40;
@@ -126,6 +134,7 @@ pub struct RunContext {
     pub follow_up: Arc<Mutex<VecDeque<String>>>,
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub cancel: CancellationToken,
+    pub on_job_done: Option<JobDoneHook>,
 }
 
 impl RunContext {
@@ -156,8 +165,26 @@ impl RunContext {
 fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
     let start = entries.len().saturating_sub(80);
     let mut messages = Vec::new();
+    if start > 0
+        && entries
+            .first()
+            .is_some_and(|entry| entry.get("role").and_then(Value::as_str) == Some("system"))
+        && let Some(summary) = entries.first().and_then(|entry| entry.get("content"))
+    {
+        let summary = content_text(summary);
+        if !summary.is_empty() {
+            messages.push(ChatMessage::system(summary));
+        }
+    }
     for entry in &entries[start..] {
         let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "system" {
+            let content = entry.get("content").map(content_text).unwrap_or_default();
+            if !content.is_empty() {
+                messages.push(ChatMessage::system(content));
+            }
+            continue;
+        }
         if role == "toolResult" {
             let call_id = entry
                 .get("tool_call_id")
@@ -314,6 +341,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         messages.push(ChatMessage::user(block));
     }
     messages.push(ChatMessage::user(&prompt));
+    let mut compactions = 0;
+    maybe_compact(&ctx, &mut messages, &mut compactions).await;
 
     let mut state = AppState {
         active_node: "agent".to_string(),
@@ -335,6 +364,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         ctx.questions.clone(),
     )
     .with_plan_store(Arc::new(plan_store))
+    .with_harness_root(ctx.store.harness_root().to_path_buf())
     .with_scope(ctx.scope.clone())
     .with_mode(mode.clone());
     if let Some(checkpoint) = &ctx.checkpoint {
@@ -572,6 +602,48 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 } else {
                     run_subagent_tool(&ctx, &args).await
                 }
+            } else if call.function.name == "create_coding_project" {
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    projects::create_coding_project(&ctx, &args).await
+                }
+            } else if call.function.name == "delegate" {
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    delegation::delegate(&ctx, &args).await
+                }
+            } else if call.function.name == "delegation_status" {
+                delegation::delegation_status(&ctx, &args).await
+            } else if call.function.name == "job_message" {
+                delegation::job_message(&ctx, &args).await
+            } else if call.function.name == "job_cancel" {
+                delegation::job_cancel(&ctx, &args).await
+            } else if call.function.name == "create_group" {
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    groups::create_group(&ctx, &args).await
+                }
+            } else if call.function.name == "group_board" {
+                groups::group_board(&ctx, &args).await
+            } else if call.function.name == "group_item_detail" {
+                groups::group_item_detail(&ctx, &args).await
+            } else if call.function.name == "group_events" {
+                groups::group_events(&ctx, &args).await
+            } else if call.function.name == "group_update" {
+                groups::group_update(&ctx, &args).await
+            } else if call.function.name == "schedule" {
+                schedules::schedule(&ctx, &args).await
+            } else if call.function.name == "give_note" {
+                notes::give_note(&ctx, &args).await
             } else {
                 stark_tools::dispatch(&call.function.name, &args, &tools).await
             };
@@ -616,6 +688,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 .thoughts
                 .insert(format!("step-{}", state.state_version), reasoning);
         }
+        maybe_compact(&ctx, &mut messages, &mut compactions).await;
     }
 
     let message = format!("Stopped after {MAX_STEPS} steps without a final answer.");
@@ -632,6 +705,48 @@ pub fn run_agent(
     prompt: String,
 ) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
     Box::pin(run_agent_inner(ctx, prompt))
+}
+async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, compactions: &mut usize) {
+    if *compactions >= 2 {
+        return;
+    }
+    let policy = compaction::CompactionPolicy::from_env(&ctx.scope);
+    let tokens = compaction::estimate_tokens(messages);
+    if tokens >= policy.hard_limit_tokens {
+        tracing::warn!(
+            "chat {} is above the compaction hard limit ({} tokens)",
+            ctx.chat_id,
+            tokens
+        );
+    }
+    if !compaction::should_compact(messages, &policy) {
+        return;
+    }
+    let Some(outcome) =
+        compaction::compact_history(&ctx.provider, &ctx.cancel, messages, &policy).await
+    else {
+        return;
+    };
+    *messages = outcome.messages;
+    *compactions += 1;
+    if let Err(error) = ctx
+        .store
+        .append_session_entry_for(
+            &ctx.workspace_id,
+            &ctx.workspace,
+            &ctx.chat_id,
+            json!({
+                "type": "compaction",
+                "summary": outcome.summary,
+                "retained_tail": outcome.retained_tail,
+                "tokens_before": outcome.tokens_before,
+                "first_kept_entry_id": null,
+            }),
+        )
+        .await
+    {
+        tracing::warn!("failed to persist compaction for {}: {error}", ctx.chat_id);
+    }
 }
 
 #[derive(Default)]
@@ -867,7 +982,7 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
     }
 }
 
-fn read_report(latest: &Arc<Mutex<Option<AppState>>>) -> String {
+pub(crate) fn read_report(latest: &Arc<Mutex<Option<AppState>>>) -> String {
     latest
         .lock()
         .ok()
@@ -877,7 +992,7 @@ fn read_report(latest: &Arc<Mutex<Option<AppState>>>) -> String {
         .unwrap_or_else(|| "(no report)".to_string())
 }
 
-fn child_context(
+pub(crate) fn child_context(
     ctx: &RunContext,
     child_id: &str,
     name: &str,
@@ -904,6 +1019,7 @@ fn child_context(
         follow_up: Arc::new(Mutex::new(VecDeque::new())),
         checkpoint: None,
         cancel,
+        on_job_done: None,
     };
     (child, latest)
 }
@@ -1053,6 +1169,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            on_job_done: None,
         };
 
         run_agent(ctx, "make a plan".to_string()).await.unwrap();
@@ -1111,6 +1228,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            on_job_done: None,
         };
         run_agent(ctx, "delegate".to_string()).await.unwrap();
         let chats = store.list_chats("_general").await;
@@ -1192,6 +1310,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            on_job_done: None,
         };
 
         run_agent(ctx, "read a.txt".to_string()).await.unwrap();

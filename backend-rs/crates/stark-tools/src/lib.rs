@@ -1,10 +1,14 @@
 mod approvals;
 mod ask;
 mod browser;
+mod changes;
 mod checkpoint;
 mod command;
+mod dfd;
+mod docs;
 mod edit;
 mod head_tail;
+mod house;
 mod patch;
 mod paths;
 mod plan;
@@ -22,6 +26,7 @@ use stark_contract::{PlanItem, ToolSpecFile};
 
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
+pub use house::{HouseStore, public_device, public_state};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
@@ -35,14 +40,41 @@ const IMPLEMENTED: &[&str] = &[
     "call_subagent",
     "update_plan",
     "browser_act",
+    "delegate",
+    "delegation_status",
+    "job_message",
+    "job_cancel",
+    "give_note",
+    "house_get_state",
+    "house_get_device",
+    "house_set_device",
+    "house_run_scene",
+    "house_get_history",
+    "dfd_bridge",
+    "create_client",
+    "files_changed",
+    "read_pdf",
+    "create_docx",
+    "create_xlsx",
+    "create_coding_project",
+    "create_group",
+    "group_board",
+    "group_item_detail",
+    "group_events",
+    "group_update",
+    "schedule",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "edit_file",
     "create_project",
+    "create_coding_project",
+    "create_group",
+    "create_client",
     "github_apply_gate",
     "house_set_device",
     "house_run_scene",
+    "group_update",
     "create_docx",
     "create_xlsx",
     "delegate",
@@ -60,6 +92,7 @@ pub struct ToolContext {
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub approvals: Arc<ApprovalCache>,
     pub plan_store: Arc<PlanStore>,
+    pub harness_root: PathBuf,
     pub scope: String,
     pub mode: String,
 }
@@ -73,6 +106,7 @@ impl ToolContext {
         let workspace = workspace.into();
         Self {
             plan_store: Arc::new(PlanStore::new(&workspace)),
+            harness_root: workspace.clone(),
             workspace,
             chat_id: chat_id.into(),
             questions,
@@ -91,6 +125,11 @@ impl ToolContext {
 
     pub fn with_plan_store(mut self, plan_store: Arc<PlanStore>) -> Self {
         self.plan_store = plan_store;
+        self
+    }
+
+    pub fn with_harness_root(mut self, harness_root: impl Into<PathBuf>) -> Self {
+        self.harness_root = harness_root.into();
         self
     }
 
@@ -286,6 +325,17 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "ask_user" => ask::ask_user(ctx, args).await,
         "update_plan" => update_plan(ctx, args).await,
         "browser_act" => browser::browser_act(ctx, args).await,
+        "house_get_state" => house::house_get_state(ctx, args).await,
+        "house_get_device" => house::house_get_device(ctx, args).await,
+        "house_set_device" => house::house_set_device(ctx, args).await,
+        "house_run_scene" => house::house_run_scene(ctx, args).await,
+        "house_get_history" => house::house_get_history(ctx, args).await,
+        "dfd_bridge" => dfd::dfd_bridge(ctx, args).await,
+        "create_client" => dfd::create_client(ctx, args).await,
+        "files_changed" => changes::files_changed(ctx, args).await,
+        "read_pdf" => docs::read_pdf(ctx, args).await,
+        "create_docx" => docs::create_docx(ctx, args).await,
+        "create_xlsx" => docs::create_xlsx(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -364,14 +414,48 @@ mod tests {
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"update_plan"));
+        assert!(names.contains(&"read_pdf"));
+        assert!(names.contains(&"create_docx"));
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
 
+        let dfd = tool_specs_for_scope("build", "dfd");
+        let names = tool_names(&dfd);
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"create_coding_project"));
+        assert!(names.contains(&"dfd_bridge"));
+        assert!(names.contains(&"create_client"));
+        assert!(names.contains(&"files_changed"));
+
+        let house = tool_specs_for_scope("build", "house");
+        let names = tool_names(&house);
+        assert_eq!(names.len(), 9);
+        assert!(names.contains(&"house_set_device"));
+        assert!(names.contains(&"house_run_scene"));
+
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
-        assert_eq!(tool_names(&orchestrator), vec!["ask_user"]);
-        assert_eq!(tool_names(&tool_specs_for_scope("build", "agent")).len(), 8);
+        let names = tool_names(&orchestrator);
+        assert_eq!(names.len(), 13);
+        assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"create_group"));
+        assert!(names.contains(&"group_board"));
+        assert!(names.contains(&"group_item_detail"));
+        assert!(names.contains(&"group_events"));
+        assert!(names.contains(&"group_update"));
+        assert!(names.contains(&"create_coding_project"));
+        assert!(names.contains(&"ask_user"));
+        assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"delegation_status"));
+        assert!(names.contains(&"job_message"));
+        assert!(names.contains(&"job_cancel"));
+        assert!(names.contains(&"give_note"));
+        assert_eq!(
+            tool_names(&tool_specs_for_scope("build", "agent")).len(),
+            31
+        );
     }
 
     #[tokio::test]

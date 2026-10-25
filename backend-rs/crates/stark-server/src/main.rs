@@ -21,8 +21,8 @@ use serde_json::{Value, json};
 use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, resolve_agent, run_agent, subagent_status, subagent_status_for};
 use stark_providers::{Provider, ProviderConfig};
-use stark_store::{ChatStore, WorkspaceRegistry};
-use stark_tools::{Checkpoint, PlanStore, QuestionBroker};
+use stark_store::{ChatStore, GroupStore, ScheduleStore, WorkspaceRegistry};
+use stark_tools::{Checkpoint, HouseStore, PlanStore, QuestionBroker, public_device, public_state};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -185,6 +185,17 @@ struct ServerState {
     harness_root: PathBuf,
 }
 
+#[derive(Clone)]
+struct RunTarget {
+    chat_id: String,
+    workspace_id: String,
+    workspace: PathBuf,
+    scope: String,
+    role: Option<String>,
+    model: String,
+    temperature: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct RunRequest {
     #[serde(default)]
@@ -240,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
     };
+    let scheduler_state = state.clone();
 
     let app = Router::new()
         .route("/api/run", post(run_handler))
@@ -334,6 +346,18 @@ async fn main() -> anyhow::Result<()> {
             post(group_approval_handler),
         )
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
+        .route("/api/house/state", get(house_state_handler))
+        .route(
+            "/api/house/devices/{device_id}",
+            get(house_device_handler).patch(house_set_device_handler),
+        )
+        .route("/api/house/rooms/{room_id}", post(house_set_room_handler))
+        .route(
+            "/api/house/scenes/{scene_id}/run",
+            post(house_run_scene_handler),
+        )
+        .route("/api/house/history", get(house_history_handler))
+        .route("/api/house/reset", post(house_reset_handler))
         .route(
             "/api/notes/{scope_type}/{scope_id}",
             get(list_notes_handler),
@@ -355,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("STARK_PORT").unwrap_or_else(|_| "8124".to_string());
     let address = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await?;
+    tokio::spawn(schedule_loop(scheduler_state));
     tracing::info!("stark-server listening on http://{address}");
     axum::serve(
         listener,
@@ -362,6 +387,53 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+async fn schedule_loop(state: ServerState) {
+    let store = match ScheduleStore::open(&state.harness_root).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!("scheduler disabled: {error}");
+            return;
+        }
+    };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let due = match store.due(20).await {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!("scheduler due query failed: {error}");
+                continue;
+            }
+        };
+        for record in due {
+            if let Err(error) = store.mark_queued(&record.id).await {
+                tracing::warn!("scheduler mark queued failed: {error}");
+                continue;
+            }
+            let workspace = if record.workspace_path.trim().is_empty() {
+                state.harness_root.clone()
+            } else {
+                PathBuf::from(&record.workspace_path)
+            };
+            spawn_follow_up_run(
+                state.clone(),
+                RunTarget {
+                    chat_id: record.chat_id.clone(),
+                    workspace_id: record.workspace_id.clone(),
+                    workspace,
+                    scope: record.scope.clone(),
+                    role: record.role.clone(),
+                    model: record.model.clone(),
+                    temperature: record.temperature,
+                },
+                record.prompt.clone(),
+            );
+            if let Err(error) = store.mark_after_run(&record).await {
+                tracing::warn!("scheduler mark after run failed: {error}");
+            }
+        }
+    }
 }
 
 async fn run_handler(
@@ -441,16 +513,25 @@ Attached files:
         let _ = tokio::task::spawn_blocking(move || checkpoint.snapshot_all()).await;
     }
 
-    let latest = Arc::new(Mutex::new(None));
-    let ctx = RunContext {
+    let target = RunTarget {
         chat_id: chat_id.clone(),
         workspace_id,
         workspace,
-        role: Some(agent.display.to_string()),
         scope: agent.key.to_string(),
-        depth: 0,
+        role: Some(agent.display.to_string()),
         model,
         temperature: request.temperature,
+    };
+    let latest = Arc::new(Mutex::new(None));
+    let ctx = RunContext {
+        chat_id: target.chat_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        workspace: target.workspace.clone(),
+        role: target.role.clone(),
+        scope: target.scope.clone(),
+        depth: 0,
+        model: target.model.clone(),
+        temperature: target.temperature,
         provider: state.provider.clone(),
         store: state.store.clone(),
         questions: state.questions.clone(),
@@ -460,6 +541,7 @@ Attached files:
         follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel,
+        on_job_done: Some(job_hook(state.clone(), target)),
     };
 
     let manager = state.runs.clone();
@@ -489,6 +571,80 @@ Attached files:
 
     let stream: SseStream = Box::pin(sse_stream(receiver));
     Ok(Sse::new(stream))
+}
+
+fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
+    Arc::new(move |message| {
+        if state.runs.follow_up(&target.chat_id, &message) {
+            return;
+        }
+        spawn_follow_up_run(state.clone(), target.clone(), message);
+    })
+}
+
+fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
+    let (tx, _) = broadcast::channel(256);
+    let cancel = CancellationToken::new();
+    let steering = Arc::new(Mutex::new(VecDeque::new()));
+    let follow_up = Arc::new(Mutex::new(VecDeque::new()));
+    if !state.runs.claim(
+        &target.chat_id,
+        cancel.clone(),
+        tx.clone(),
+        steering.clone(),
+        follow_up.clone(),
+        target.workspace.to_string_lossy().as_ref(),
+    ) {
+        let _ = state.runs.follow_up(&target.chat_id, &message);
+        return;
+    }
+
+    let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
+    let latest = Arc::new(Mutex::new(None));
+    let ctx = RunContext {
+        chat_id: target.chat_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        workspace: target.workspace.clone(),
+        role: target.role.clone(),
+        scope: target.scope.clone(),
+        depth: 0,
+        model: target.model.clone(),
+        temperature: target.temperature,
+        provider: state.provider.clone(),
+        store: state.store.clone(),
+        questions: state.questions.clone(),
+        tx: tx.clone(),
+        latest: latest.clone(),
+        steering,
+        follow_up,
+        checkpoint: Some(checkpoint.clone()),
+        cancel,
+        on_job_done: Some(job_hook(state.clone(), target.clone())),
+    };
+    let manager = state.runs.clone();
+    let done_tx = tx.clone();
+    let chat_id = target.chat_id.clone();
+    tokio::spawn(async move {
+        let result = run_agent(ctx, message).await;
+        checkpoint.finalize();
+        let error = result.as_ref().err().map(ToString::to_string);
+        let final_state = latest.lock().ok().and_then(|guard| guard.clone());
+        let status = if error.is_some() {
+            "error"
+        } else if final_state
+            .as_ref()
+            .is_some_and(|state| state.active_node == "aborted")
+        {
+            "aborted"
+        } else {
+            "complete"
+        };
+        manager.finish(&chat_id, final_state);
+        let _ = done_tx.send(ServerEvent::new(
+            "done",
+            json!({"status": status, "error": error}),
+        ));
+    });
 }
 
 async fn stream_handler(
@@ -956,109 +1112,23 @@ struct GroupQuery {
     workspace_id: String,
 }
 
-fn groups_root() -> std::path::PathBuf {
-    std::env::var("STARK_PROJECTS_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(r"D:\StarkProjects"))
-}
-
-fn safe_project_id(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-        })
-}
-
-fn group_title_and_id(path: &std::path::Path) -> Option<(String, String)> {
-    let text = std::fs::read_to_string(path.join("PROJECT.md")).ok()?;
-    let title = text
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
-        .unwrap_or("")
-        .to_string();
-    let id = text
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("id:").map(str::trim))
-        .map(|value| value.trim_matches(['"', '\'']).to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
-        .unwrap_or_default();
-    Some((title, id))
-}
-
-fn group_origins(state: &ServerState) -> std::collections::HashMap<String, String> {
-    std::fs::read_to_string(
-        state
-            .harness_root
-            .join(".deep_agents")
-            .join("group_origins.json"),
-    )
-    .ok()
-    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    .and_then(|value| value.as_object().cloned())
-    .map(|object| {
-        object
-            .into_iter()
-            .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_string())))
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-fn group_rows(state: &ServerState, workspace_id: &str) -> (Vec<Value>, bool) {
-    let scoped = !workspace_id.is_empty() && state.registry.get(workspace_id).is_some();
-    let origins = group_origins(state);
-    let root = groups_root();
-    let mut rows = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return (rows, scoped);
-    };
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let Some((title, id)) = group_title_and_id(&entry.path()) else {
-            continue;
-        };
-        let origin = origins.get(&id).cloned();
-        if scoped && origin.as_deref() != Some(workspace_id) {
-            continue;
-        }
-        rows.push(json!({
-            "id": id,
-            "path": entry.path(),
-            "title": title,
-            "status": "unknown",
-            "origin_workspace_id": origin,
-            "shell_enabled": false,
-            "spent_usd": null,
-            "milestones_done": 0,
-            "milestones_total": 0,
-            "items_done": 0,
-            "items_total": 0,
-            "awaiting_approval": 0,
-        }));
-    }
-    rows.sort_by(|left, right| {
-        left["title"]
-            .as_str()
-            .unwrap_or("")
-            .to_lowercase()
-            .cmp(&right["title"].as_str().unwrap_or("").to_lowercase())
-    });
-    (rows, scoped)
-}
-
 async fn groups_handler(
     State(state): State<ServerState>,
     Query(query): Query<GroupQuery>,
 ) -> Json<Value> {
-    let (projects, scoped) = group_rows(&state, &query.workspace_id);
+    let scoped =
+        !query.workspace_id.is_empty() && state.registry.get(&query.workspace_id).is_some();
+    let projects = GroupStore::default_root().list().await;
+    let projects = if scoped {
+        projects
+            .into_iter()
+            .filter(|project| {
+                project["origin_workspace_id"].as_str() == Some(query.workspace_id.as_str())
+            })
+            .collect()
+    } else {
+        projects
+    };
     Json(json!({"projects": projects, "scoped": scoped}))
 }
 
@@ -1066,52 +1136,59 @@ async fn group_handler(
     State(_state): State<ServerState>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !safe_project_id(&project_id) {
-        return Err(bad_request("invalid project id"));
-    }
-    let path = groups_root().join(&project_id);
-    if !path.join("PROJECT.md").is_file() {
-        return Err(not_found("unknown project"));
-    }
-    let (title, id) =
-        group_title_and_id(&path).unwrap_or_else(|| (String::new(), project_id.clone()));
-    Ok(Json(json!({
-        "id": id,
-        "path": path,
-        "shell_enabled": false,
-        "project": {"status": "unknown", "goal": title},
-        "milestones": [],
-        "items": [],
-        "events": [],
-    })))
+    GroupStore::default_root()
+        .detail(&project_id, 60)
+        .await
+        .map(Json)
+        .map_err(group_error)
 }
 
 #[derive(Debug, Deserialize)]
 struct GroupUpdateRequest {
     #[serde(default)]
     op: String,
+    #[serde(default)]
+    params: Value,
 }
 
 async fn group_update_handler(
-    Path(_project_id): Path<String>,
+    Path(project_id): Path<String>,
     Json(request): Json<GroupUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !matches!(request.op.as_str(), "pause" | "resume" | "close") {
-        return Err(bad_request("op must be pause, resume, or close"));
-    }
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "group lifecycle is not implemented in the Rust runtime yet"})),
-    ))
+    GroupStore::default_root()
+        .update(&project_id, &request.op, &request.params)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupApprovalRequest {
+    #[serde(default)]
+    grant: bool,
+    #[serde(default)]
+    note: String,
 }
 
 async fn group_approval_handler(
-    Path((_project_id, _item_id)): Path<(String, String)>,
+    Path((project_id, item_id)): Path<(String, String)>,
+    Json(request): Json<GroupApprovalRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "group approvals are not implemented in the Rust runtime yet"})),
-    ))
+    GroupStore::default_root()
+        .approval(&project_id, &item_id, request.grant, &request.note)
+        .await
+        .map(Json)
+        .map_err(group_error)
+}
+
+fn group_error(error: String) -> (StatusCode, Json<Value>) {
+    let status =
+        if error.to_lowercase().contains("unknown") || error.to_lowercase().contains("not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+    (status, Json(json!({"error": error})))
 }
 
 async fn canvas_status_handler() -> Json<Value> {
@@ -1120,6 +1197,126 @@ async fn canvas_status_handler() -> Json<Value> {
 
 fn valid_note_scope(scope_type: &str, scope_id: &str) -> bool {
     matches!(scope_type, "chat" | "group") && !scope_id.trim().is_empty()
+}
+
+#[derive(Debug, Deserialize)]
+struct HousePatch {
+    #[serde(default)]
+    state: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HouseHistoryQuery {
+    #[serde(default)]
+    device_id: String,
+    hours: Option<i64>,
+}
+
+fn house_error(error: String) -> (StatusCode, Json<Value>) {
+    let status =
+        if error.to_lowercase().contains("unknown") || error.to_lowercase().contains("not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+    (status, Json(json!({"error": error})))
+}
+
+async fn house_state_handler(
+    State(state): State<ServerState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    HouseStore::new(&state.harness_root)
+        .state()
+        .await
+        .map(|state| Json(public_state(&state)))
+        .map_err(house_error)
+}
+
+async fn house_device_handler(
+    State(state): State<ServerState>,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match HouseStore::new(&state.harness_root)
+        .device(&device_id)
+        .await
+    {
+        Ok(Some(device)) => Ok(Json(public_device(&device_id, &device))),
+        Ok(None) => Err(not_found("Device not found")),
+        Err(error) => Err(house_error(error)),
+    }
+}
+
+async fn house_set_device_handler(
+    State(state): State<ServerState>,
+    Path(device_id): Path<String>,
+    Json(request): Json<HousePatch>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(patch) = request.state.as_object() else {
+        return Err(bad_request("state must be an object"));
+    };
+    HouseStore::new(&state.harness_root)
+        .set_device(&device_id, patch)
+        .await
+        .map(|device| Json(public_device(&device_id, &device)))
+        .map_err(house_error)
+}
+
+async fn house_set_room_handler(
+    State(state): State<ServerState>,
+    Path(room_id): Path<String>,
+    Json(request): Json<HousePatch>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(patch) = request.state.as_object() else {
+        return Err(bad_request("state must be an object"));
+    };
+    HouseStore::new(&state.harness_root)
+        .set_room(&room_id, patch)
+        .await
+        .map(Json)
+        .map_err(house_error)
+}
+
+async fn house_run_scene_handler(
+    State(state): State<ServerState>,
+    Path(scene_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = HouseStore::new(&state.harness_root)
+        .run_scene(&scene_id)
+        .await
+        .map_err(house_error)?;
+    Ok(Json(json!({
+        "sceneId": scene_id,
+        "name": result["scene"]["name"].as_str().unwrap_or(""),
+        "applied": result["applied"],
+        "skipped": result["skipped"],
+    })))
+}
+
+async fn house_history_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<HouseHistoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if query.device_id.trim().is_empty() {
+        return Err(bad_request("device_id is required"));
+    }
+    HouseStore::new(&state.harness_root)
+        .history(query.device_id.trim(), query.hours.unwrap_or(24))
+        .await
+        .map(Json)
+        .map_err(house_error)
+}
+
+async fn house_reset_handler(
+    State(state): State<ServerState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = HouseStore::new(&state.harness_root)
+        .reset()
+        .await
+        .map_err(house_error)?;
+    Ok(Json(json!({
+        "ok": true,
+        "state": public_state(&result["state"]),
+    })))
 }
 
 async fn list_notes_handler(
@@ -2013,6 +2210,88 @@ mod tests {
         assert!(paths.contains(&"README.md"));
         assert!(paths.contains(&".agent-memory/project.md"));
         assert!(!paths.contains(&"node_modules"));
+    }
+
+    #[tokio::test]
+    async fn follow_up_run_persists_a_woken_reply() {
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::response::Response;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn mock_provider(Json(_body): Json<Value>) -> Response {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Woke\"}}]}
+
+",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+",
+                "data: [DONE]
+
+"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/chat/completions", post(mock_provider));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let state = ServerState {
+            store: store.clone(),
+            provider,
+            questions: Arc::new(QuestionBroker::new()),
+            runs: Arc::new(RunManager::default()),
+            registry: WorkspaceRegistry::new(dir.path()),
+            pairing: Arc::new(PairingStore::new(dir.path())),
+            ui_state_path: dir.path().join("ui_state.json"),
+            harness_root: dir.path().to_path_buf(),
+        };
+        spawn_follow_up_run(
+            state.clone(),
+            RunTarget {
+                chat_id: "wake-chat".to_string(),
+                workspace_id: "_general".to_string(),
+                workspace: dir.path().to_path_buf(),
+                scope: "orchestrator".to_string(),
+                role: Some("Orchestrator".to_string()),
+                model: "mock".to_string(),
+                temperature: 0.0,
+            },
+            "[DELEGATION RESULT] job done".to_string(),
+        );
+
+        for _ in 0..100 {
+            let history = store.history("wake-chat", 10).await.unwrap_or_default();
+            if history.iter().any(|message| message.content == "Woke") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let history = store.history("wake-chat", 10).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "[DELEGATION RESULT] job done")
+        );
+        assert!(history.iter().any(|message| message.content == "Woke"));
     }
 
     #[tokio::test]

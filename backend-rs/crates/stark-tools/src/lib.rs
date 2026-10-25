@@ -57,16 +57,23 @@ const IMPLEMENTED: &[&str] = &[
     "create_docx",
     "create_xlsx",
     "create_coding_project",
+    "create_group",
+    "group_board",
+    "group_item_detail",
+    "group_events",
+    "group_update",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "edit_file",
     "create_project",
     "create_coding_project",
+    "create_group",
     "create_client",
     "github_apply_gate",
     "house_set_device",
     "house_run_scene",
+    "group_update",
     "create_docx",
     "create_xlsx",
     "delegate",
@@ -430,7 +437,12 @@ mod tests {
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         let names = tool_names(&orchestrator);
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 12);
+        assert!(names.contains(&"create_group"));
+        assert!(names.contains(&"group_board"));
+        assert!(names.contains(&"group_item_detail"));
+        assert!(names.contains(&"group_events"));
+        assert!(names.contains(&"group_update"));
         assert!(names.contains(&"create_coding_project"));
         assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"delegate"));
@@ -440,7 +452,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            25
+            30
         );
     }
 

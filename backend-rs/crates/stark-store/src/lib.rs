@@ -8,8 +8,10 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod groups;
 mod jobs;
 mod workspaces;
+pub use groups::GroupStore;
 pub use jobs::{JobRecord, JobStore};
 pub use workspaces::{WorkspaceRecord, WorkspaceRegistry};
 

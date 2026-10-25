@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 mod agents;
 mod compaction;
 mod delegation;
+mod groups;
 mod notes;
 mod projects;
 pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
@@ -622,6 +623,22 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 delegation::job_message(&ctx, &args).await
             } else if call.function.name == "job_cancel" {
                 delegation::job_cancel(&ctx, &args).await
+            } else if call.function.name == "create_group" {
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    groups::create_group(&ctx, &args).await
+                }
+            } else if call.function.name == "group_board" {
+                groups::group_board(&ctx, &args).await
+            } else if call.function.name == "group_item_detail" {
+                groups::group_item_detail(&ctx, &args).await
+            } else if call.function.name == "group_events" {
+                groups::group_events(&ctx, &args).await
+            } else if call.function.name == "group_update" {
+                groups::group_update(&ctx, &args).await
             } else if call.function.name == "give_note" {
                 notes::give_note(&ctx, &args).await
             } else {

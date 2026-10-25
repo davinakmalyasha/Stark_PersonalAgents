@@ -3,15 +3,16 @@
 // future real smart-home backend only changes this file.
 
 import type { HouseState, HouseDevice } from './house.types';
+import { apiUrl } from '../services/api/base';
 
 export async function fetchHouseState(): Promise<HouseState> {
-  const res = await fetch('/api/house/state');
+  const res = await fetch(apiUrl('/api/house/state'));
   if (!res.ok) throw new Error(`House state failed: HTTP ${res.status}`);
   return res.json();
 }
 
 export async function setDeviceState(deviceId: string, state: Record<string, unknown>): Promise<HouseDevice> {
-  const res = await fetch(`/api/house/devices/${encodeURIComponent(deviceId)}`, {
+  const res = await fetch(apiUrl(`/api/house/devices/${encodeURIComponent(deviceId)}`), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state }),
@@ -22,7 +23,7 @@ export async function setDeviceState(deviceId: string, state: Record<string, unk
 }
 
 export async function setRoomState(roomId: string, state: Record<string, unknown>): Promise<{ applied: string[]; skipped: [string, string][] }> {
-  const res = await fetch(`/api/house/rooms/${encodeURIComponent(roomId)}`, {
+  const res = await fetch(apiUrl(`/api/house/rooms/${encodeURIComponent(roomId)}`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state }),
@@ -40,13 +41,13 @@ export interface SceneRunResult {
 }
 
 export async function runScene(sceneId: string): Promise<SceneRunResult> {
-  const res = await fetch(`/api/house/scenes/${encodeURIComponent(sceneId)}/run`, { method: 'POST' });
+  const res = await fetch(apiUrl(`/api/house/scenes/${encodeURIComponent(sceneId)}/run`), { method: 'POST' });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `Scene failed: HTTP ${res.status}`);
   return data as SceneRunResult;
 }
 
 export async function resetHouse(): Promise<void> {
-  const res = await fetch('/api/house/reset', { method: 'POST' });
+  const res = await fetch(apiUrl('/api/house/reset'), { method: 'POST' });
   if (!res.ok) throw new Error('House reset failed');
 }

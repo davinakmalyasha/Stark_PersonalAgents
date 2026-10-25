@@ -21,6 +21,9 @@ tauri-build = { version = "=2.7.4", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+xcap = { version = "0.9.8", features = ["wgc"] }
 tauri = { version = "=2.12.5", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-single-instance = "2"

@@ -8,8 +8,7 @@ import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 const DesignWorkspace = lazy(() => import('./modules/design-workspace/DesignWorkspace'));
 import { usePipeline } from './hooks/usePipeline';
-import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun, abortRun, rewindChat } from './services/api';
-const API_BASE = '/api';
+import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun, abortRun, rewindChat, API_BASE, apiUrl } from './services/api';
 import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment } from './types';
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
 
@@ -678,7 +677,7 @@ export default function App() {
     }
 
     // Sync project_path to the workspace folder
-    fetch('/api/session/reset', { method: 'POST' }).catch(() => {});
+    fetch(apiUrl('/api/session/reset'), { method: 'POST' }).catch(() => {});
   }, [upsertCwTab]);
 
   const handleChatTitleUpdated = useCallback((chatId: string, newTitle: string) => {
@@ -747,7 +746,7 @@ export default function App() {
         content: `Chat ready in ${ws.name}.`,
         timestamp: new Date().toISOString(),
       }]);
-      fetch('/api/session/reset', { method: 'POST' }).catch(() => {});
+      fetch(apiUrl('/api/session/reset'), { method: 'POST' }).catch(() => {});
     }).catch(() => {});
   }, []);
 

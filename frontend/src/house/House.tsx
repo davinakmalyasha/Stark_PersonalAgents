@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2 } from 'lucide-react';
-import iconUrl from '../../electron/icon.png';
+import iconUrl from '../assets/stark-icon.png';
 import HouseHeader from './HouseHeader';
 import HouseChat from './HouseChat';
 import HouseSidebar from './HouseSidebar';
@@ -330,9 +330,29 @@ export default function House() {
     </div>
   );
 
-  // Initial blank (Electron shows #0c0c0e) — reuse the single desktop icon
-  // (frontend/electron/icon.png) so changing it updates both places.
+  // Initial blank (#0c0c0e) while the session layer boots.
   if (!sessions.booted) {
+    if (sessions.bootError) {
+      return (
+        <div className="fixed inset-0 grid place-items-center bg-[#0c0c0e] px-6 select-none">
+          <div className="flex max-w-sm flex-col items-center gap-4 text-center">
+            <img src={iconUrl} alt="Stark" width={72} height={72} style={{ borderRadius: 18 }} />
+            <div className="space-y-1.5">
+              <div className="text-sm font-medium text-zinc-200">Stark backend is not ready</div>
+              <div className="text-xs leading-relaxed text-zinc-500">
+                Start the backend or retry once it has finished loading.
+              </div>
+            </div>
+            <button
+              onClick={() => void sessions.retryBoot()}
+              className="rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-700"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="fixed inset-0 grid place-items-center bg-[#0c0c0e] select-none">
         <div className="flex flex-col items-center gap-4 animate-[splashIn_.35s_ease]">

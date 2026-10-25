@@ -6,10 +6,12 @@ use tauri::{AppHandle, Manager};
 use crate::ShellState;
 
 fn root_dir() -> PathBuf {
-    if let Ok(root) = std::env::var("STARK_ROOT") {
-        let path = PathBuf::from(root);
-        if path.join("server").join("api_server.py").exists() {
-            return path;
+    for key in ["STARK_HARNESS_ROOT", "STARK_ROOT"] {
+        if let Ok(root) = std::env::var(key) {
+            let path = PathBuf::from(root);
+            if path.exists() {
+                return path;
+            }
         }
     }
 
@@ -21,6 +23,21 @@ fn root_dir() -> PathBuf {
     }
 
     PathBuf::from(r"D:\MyProject\LangChain")
+}
+
+fn packaged_backend(app: &AppHandle) -> Option<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    for relative in [
+        "binaries/stark-server.exe",
+        "stark-server.exe",
+        "binaries/stark-server-x86_64-pc-windows-gnu.exe",
+    ] {
+        let path = resource_dir.join(relative);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn python_command(root: &Path) -> Option<(PathBuf, Vec<String>)> {
@@ -75,11 +92,23 @@ pub fn ensure_running(app: &AppHandle) {
         .ok()
         .map(PathBuf::from)
         .filter(|path| path.exists());
+    let prefer_rust = std::env::var("STARK_BACKEND").ok().as_deref() == Some("rust");
+    let python = python_command(&root);
+    let python_ready = root.join("server").join("api_server.py").exists();
 
     let (program, args, cwd) = if let Some(binary) = configured {
-        (binary, Vec::new(), root)
-    } else if let Some((python, args)) = python_command(&root) {
-        (python, args, root)
+        (binary, Vec::new(), root.clone())
+    } else if !prefer_rust && python_ready {
+        if let Some((python, args)) = python {
+            (python, args, root.clone())
+        } else {
+            log::error!("Python backend is present but no interpreter was found");
+            return;
+        }
+    } else if let Some(binary) = packaged_backend(app) {
+        (binary, Vec::new(), root.clone())
+    } else if let Some((python, args)) = python {
+        (python, args, root.clone())
     } else {
         log::error!("no Stark backend binary or Python venv found");
         return;
@@ -89,6 +118,8 @@ pub fn ensure_running(app: &AppHandle) {
         .args(args)
         .current_dir(cwd)
         .env("STARK_PORT", crate::api_port().to_string())
+        .env("STARK_HARNESS_ROOT", &root)
+        .env("HARNESS_ROOT", &root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

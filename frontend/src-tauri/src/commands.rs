@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::screen::{self, ScreenState};
 use crate::voice;
 
 #[tauri::command]
@@ -19,6 +20,19 @@ pub fn runtime_info() -> Value {
         "desktop": "tauri",
         "dev": tauri::is_dev()
     })
+}
+
+#[tauri::command]
+pub fn pairing_base() -> String {
+    let ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|socket| {
+            socket.connect("8.8.8.8:80").ok()?;
+            socket.local_addr().ok()
+        })
+        .map(|address| address.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("http://{ip}:{}", crate::api_port())
 }
 
 #[tauri::command]
@@ -90,13 +104,18 @@ pub fn voice_resize(app: AppHandle, width: f64, height: f64, animate: bool) -> R
 }
 
 #[tauri::command]
-pub fn voice_screen_sources() -> Vec<Value> {
-    voice::screen_sources()
+pub fn voice_screen_sources(state: State<'_, ScreenState>) -> Vec<Value> {
+    screen::sources(&state)
 }
 
 #[tauri::command]
-pub fn voice_screen_select(id: String) -> Value {
-    voice::screen_select(&id)
+pub fn voice_screen_select(state: State<'_, ScreenState>, id: String) -> Value {
+    screen::select(&state, &id)
+}
+
+#[tauri::command]
+pub fn voice_screen_frame(state: State<'_, ScreenState>) -> Result<Value, String> {
+    screen::frame(&state)
 }
 
 #[tauri::command]

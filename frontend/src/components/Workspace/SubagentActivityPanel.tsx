@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, ChevronDown, ChevronUp, CircleDot, Loader2, X } from 'lucide-react';
 import type { ChatMessage } from '../../types';
+import { apiUrl } from '../../services/api';
 import type { TraceStep } from '../../utils/logParser';
 
 interface Props {
@@ -30,7 +31,7 @@ export default function SubagentActivityPanel({ name, taskDesc, steps, isActive,
   useEffect(() => {
     if (!workspaceId || !chatId || !name) return;
     setHistoryLoading(true);
-    fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/subagents/${encodeURIComponent(name)}`)
+    fetch(apiUrl(`/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/subagents/${encodeURIComponent(name)}`))
       .then((res) => (res.ok ? res.json() : []))
       .then((data) => setHistory(Array.isArray(data) ? data : []))
       .catch(() => setHistory([]))

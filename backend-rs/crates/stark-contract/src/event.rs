@@ -72,6 +72,11 @@ impl Delta {
         }
     }
 
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
+        self
+    }
+
     fn new(kind: &str, text: impl Into<String>) -> Self {
         Self {
             kind: kind.to_string(),

@@ -28,6 +28,7 @@ from tools import (
 from llm.deps import WorkspaceDeps
 from llm.model_history import build_initial_history, estimate_history_tokens
 from llm.native_tools import run_native_agent
+from memory.context_compaction import get_compaction_policy
 from inbox import drain_follow_up, consume_abort
 from pydantic_graph import GraphTaskRequest
 from pydantic_ai.messages import (

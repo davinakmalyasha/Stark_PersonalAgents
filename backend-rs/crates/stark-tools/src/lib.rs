@@ -1,24 +1,28 @@
 mod approvals;
 mod ask;
+mod browser;
 mod checkpoint;
 mod command;
 mod edit;
 mod head_tail;
 mod patch;
 mod paths;
+mod plan;
 mod processes;
 mod questions;
 mod read;
 mod search;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
-use stark_contract::ToolSpecFile;
+use stark_contract::{PlanItem, ToolSpecFile};
 
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
+pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
 
@@ -28,6 +32,20 @@ const IMPLEMENTED: &[&str] = &[
     "run_command",
     "search_code",
     "ask_user",
+    "call_subagent",
+    "update_plan",
+    "browser_act",
+];
+
+pub const PLAN_WRITE_TOOLS: &[&str] = &[
+    "edit_file",
+    "create_project",
+    "github_apply_gate",
+    "house_set_device",
+    "house_run_scene",
+    "create_docx",
+    "create_xlsx",
+    "delegate",
     "call_subagent",
 ];
 
@@ -41,6 +59,9 @@ pub struct ToolContext {
     pub processes: Arc<ProcessManager>,
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub approvals: Arc<ApprovalCache>,
+    pub plan_store: Arc<PlanStore>,
+    pub scope: String,
+    pub mode: String,
 }
 
 impl ToolContext {
@@ -49,18 +70,37 @@ impl ToolContext {
         chat_id: impl Into<String>,
         questions: Arc<QuestionBroker>,
     ) -> Self {
+        let workspace = workspace.into();
         Self {
-            workspace: workspace.into(),
+            plan_store: Arc::new(PlanStore::new(&workspace)),
+            workspace,
             chat_id: chat_id.into(),
             questions,
             processes: Arc::new(ProcessManager::new()),
             checkpoint: None,
             approvals: Arc::new(ApprovalCache::new()),
+            scope: "agent".to_string(),
+            mode: "build".to_string(),
         }
     }
 
     pub fn with_checkpoint(mut self, checkpoint: Arc<Checkpoint>) -> Self {
         self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    pub fn with_plan_store(mut self, plan_store: Arc<PlanStore>) -> Self {
+        self.plan_store = plan_store;
+        self
+    }
+
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = scope.into();
+        self
+    }
+
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = mode.into();
         self
     }
 }
@@ -70,6 +110,7 @@ pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
     pub exit_code: Option<i32>,
+    pub plan: Option<BTreeMap<String, Vec<PlanItem>>>,
 }
 
 impl ToolOutcome {
@@ -78,6 +119,7 @@ impl ToolOutcome {
             content: content.into(),
             is_error: false,
             exit_code: None,
+            plan: None,
         }
     }
 
@@ -86,6 +128,7 @@ impl ToolOutcome {
             content: content.into(),
             is_error: true,
             exit_code: None,
+            plan: None,
         }
     }
 
@@ -94,7 +137,13 @@ impl ToolOutcome {
             content: content.into(),
             is_error,
             exit_code,
+            plan: None,
         }
+    }
+
+    pub fn with_plan(mut self, plan: BTreeMap<String, Vec<PlanItem>>) -> Self {
+        self.plan = Some(plan);
+        self
     }
 }
 
@@ -106,10 +155,25 @@ pub fn contract() -> &'static ToolSpecFile {
 }
 
 pub fn tool_specs() -> Vec<Value> {
+    tool_specs_for("build")
+}
+
+pub fn tool_specs_for(mode: &str) -> Vec<Value> {
+    tool_specs_for_scope(mode, "agent")
+}
+
+pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
+    let scope = scope.trim().to_lowercase();
+    let allowed = contract().scope_map.get(&scope);
     contract()
         .tools
         .iter()
-        .filter(|tool| tool.exposed && IMPLEMENTED.contains(&tool.name.as_str()))
+        .filter(|tool| {
+            tool.exposed
+                && IMPLEMENTED.contains(&tool.name.as_str())
+                && allowed.is_none_or(|names| names.contains(&tool.name))
+                && !(mode == "plan" && PLAN_WRITE_TOOLS.contains(&tool.name.as_str()))
+        })
         .map(|tool| {
             let mut spec = json!({
                 "type": "function",
@@ -175,13 +239,53 @@ pub fn tool_specs() -> Vec<Value> {
         .collect()
 }
 
+pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> {
+    if mode != "plan" {
+        return None;
+    }
+    if PLAN_WRITE_TOOLS.contains(&name) {
+        return Some(format!(
+            "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. ({name} is a write-class tool.)"
+        ));
+    }
+    if name == "run_command" {
+        let process_action = args
+            .get("process_action")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let background = args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !process_action.is_empty() || background {
+            return Some(
+                "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. (background processes and process actions are blocked.)"
+                    .to_string(),
+            );
+        }
+        let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+        if let Err(reason) = stark_policy::check_read_only(command) {
+            return Some(format!(
+                "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. (run_command with write/side-effect verbs is blocked: {reason})"
+            ));
+        }
+    }
+    None
+}
+
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
+    if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
+        return ToolOutcome::err(reason);
+    }
     match name {
         "read_file" => read::read_file(ctx, args).await,
         "edit_file" => edit::edit_file(ctx, args).await,
         "search_code" => search::search_code(ctx, args).await,
         "run_command" => command::run_command(ctx, args).await,
         "ask_user" => ask::ask_user(ctx, args).await,
+        "update_plan" => update_plan(ctx, args).await,
+        "browser_act" => browser::browser_act(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -196,6 +300,13 @@ mod tests {
         ToolContext::new(workspace, "test-chat", Arc::new(QuestionBroker::new()))
     }
 
+    fn tool_names(specs: &[Value]) -> Vec<&str> {
+        specs
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str())
+            .collect()
+    }
+
     #[test]
     fn tool_specs_exposes_unified_exec_fields() {
         let specs = tool_specs();
@@ -208,6 +319,78 @@ mod tests {
             .expect("run_command properties");
         assert!(properties.get("tty").is_some());
         assert!(properties.get("yield_time_ms").is_some());
+        assert!(tool_names(&specs).contains(&"update_plan"));
+    }
+
+    #[test]
+    fn plan_mode_hides_write_tools_and_guards_shell() {
+        let build = tool_specs_for("build");
+        let plan = tool_specs_for("plan");
+        assert!(tool_names(&build).contains(&"edit_file"));
+        assert!(tool_names(&build).contains(&"call_subagent"));
+        assert!(!tool_names(&plan).contains(&"edit_file"));
+        assert!(!tool_names(&plan).contains(&"call_subagent"));
+        assert!(tool_names(&plan).contains(&"update_plan"));
+        assert!(tool_names(&plan).contains(&"run_command"));
+
+        assert!(
+            plan_mode_denial(
+                "plan",
+                "edit_file",
+                &json!({"file_path": "a.txt", "new_string": "x"})
+            )
+            .is_some()
+        );
+        assert!(plan_mode_denial("plan", "run_command", &json!({"command": "ls"})).is_none());
+        assert!(
+            plan_mode_denial(
+                "plan",
+                "run_command",
+                &json!({"command": "echo x > out.txt"})
+            )
+            .is_some()
+        );
+        assert!(plan_mode_denial("build", "edit_file", &json!({})).is_none());
+    }
+
+    #[test]
+    fn scope_limits_tools_to_agent_acl() {
+        let developer = tool_specs_for_scope("build", "developer");
+        let names = tool_names(&developer);
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"call_subagent"));
+        assert!(names.contains(&"update_plan"));
+        assert!(!names.contains(&"read_pdf"));
+
+        let general = tool_specs_for_scope("build", "general");
+        let names = tool_names(&general);
+        assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"update_plan"));
+        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"read_file"));
+
+        let orchestrator = tool_specs_for_scope("build", "orchestrator");
+        assert_eq!(tool_names(&orchestrator), vec!["ask_user"]);
+        assert_eq!(tool_names(&tool_specs_for_scope("build", "agent")).len(), 8);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_dispatch_blocks_edits_but_allows_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let ctx = context(dir.path()).with_mode("plan");
+
+        let edit = dispatch(
+            "edit_file",
+            &json!({"file_path": "a.txt", "old_string": "hello", "new_string": "bye"}),
+            &ctx,
+        )
+        .await;
+        assert!(edit.is_error);
+        assert!(edit.content.contains("[BLOCKED]"));
+
+        let read = dispatch("read_file", &json!({"file_path": "a.txt"}), &ctx).await;
+        assert!(!read.is_error, "{}", read.content);
     }
 
     #[tokio::test]

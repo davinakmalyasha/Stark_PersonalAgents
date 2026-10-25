@@ -8,7 +8,9 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod jobs;
 mod workspaces;
+pub use jobs::{JobRecord, JobStore};
 pub use workspaces::{WorkspaceRecord, WorkspaceRegistry};
 
 #[derive(Debug, Error)]
@@ -31,6 +33,7 @@ pub struct StoredMessage {
 pub struct ChatStore {
     pool: SqlitePool,
     harness_root: PathBuf,
+    jobs: JobStore,
 }
 
 impl ChatStore {
@@ -51,13 +54,23 @@ impl ChatStore {
             .connect_with(options)
             .await?;
 
-        let store = Self { pool, harness_root };
+        let jobs = JobStore::open(&harness_root).await?;
+        jobs.fail_stale().await?;
+        let store = Self {
+            pool,
+            harness_root,
+            jobs,
+        };
         store.init().await?;
         Ok(store)
     }
 
     pub fn harness_root(&self) -> &Path {
         &self.harness_root
+    }
+
+    pub fn jobs(&self) -> &JobStore {
+        &self.jobs
     }
 
     async fn init(&self) -> Result<(), StoreError> {
@@ -500,6 +513,51 @@ impl ChatStore {
         }))
     }
 
+    pub async fn create_child_chat(
+        &self,
+        workspace_id: &str,
+        workspace_path: &str,
+        title: &str,
+        model: &str,
+        parent_chat_id: &str,
+    ) -> Result<Value, StoreError> {
+        let id = format!("del-{}", &Uuid::new_v4().simple().to_string()[..10]);
+        validate_chat_id(&id)?;
+        let title = if title.trim().is_empty() {
+            "Delegated job".to_string()
+        } else {
+            title.trim().chars().take(80).collect()
+        };
+        let now = now_iso();
+        sqlx::query(
+            r#"
+            INSERT INTO chats
+                (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, mode, parent_chat_id, parent_workspace_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'build', ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(workspace_id)
+        .bind(workspace_path)
+        .bind(&title)
+        .bind(model)
+        .bind(&now)
+        .bind(&now)
+        .bind(parent_chat_id)
+        .bind(workspace_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(json!({
+            "id": id,
+            "title": title,
+            "model": model,
+            "createdAt": now,
+            "updatedAt": now,
+            "messages": [],
+            "parentChatId": parent_chat_id,
+        }))
+    }
+
     pub async fn get_chat(&self, chat_id: &str) -> Result<Option<Value>, StoreError> {
         validate_chat_id(chat_id)?;
         let row = sqlx::query(
@@ -767,11 +825,39 @@ impl ChatStore {
         let Ok(text) = tokio::fs::read_to_string(path).await else {
             return Ok(Vec::new());
         };
-        Ok(text
+        let entries: Vec<Value> = text
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
-            .collect())
+            .collect();
+        let Some(last_compaction) = entries
+            .iter()
+            .rposition(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction"))
+        else {
+            return Ok(entries
+                .into_iter()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
+                .collect());
+        };
+        let compaction = &entries[last_compaction];
+        let mut result = Vec::new();
+        if let Some(summary) = compaction.get("summary").and_then(Value::as_str) {
+            result.push(json!({
+                "type": "message",
+                "role": "system",
+                "content": format!("[CONTEXT SUMMARY]
+            {summary}"),
+            }));
+        }
+        if let Some(tail) = compaction.get("retained_tail").and_then(Value::as_array) {
+            result.extend(tail.iter().cloned());
+        }
+        result.extend(
+            entries[last_compaction + 1..]
+                .iter()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
+                .cloned(),
+        );
+        Ok(result)
     }
 
     pub async fn append_session_entry(
@@ -1073,6 +1159,60 @@ mod tests {
         assert_eq!(loaded["messages"][0]["content"], "hello");
         assert!(store.delete_chat(chat_id).await.unwrap());
         assert!(store.list_chats(&record.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_chat_keeps_parent_link_and_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let chat = store
+            .create_child_chat("_general", "", "Delegated task", "mock", "parent-chat")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap();
+        assert!(chat_id.starts_with("del-"));
+        assert_eq!(chat["title"], "Delegated task");
+        let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
+        assert_eq!(loaded["parentChatId"], "parent-chat");
+        assert_eq!(loaded["title"], "Delegated task");
+    }
+
+    #[tokio::test]
+    async fn compaction_entry_restores_summary_tail_and_later_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        for entry in [
+            json!({"type": "message", "role": "user", "content": "old"}),
+            json!({
+                "type": "compaction",
+                "summary": "old work summarized",
+                "retained_tail": [
+                    {"type": "message", "role": "user", "content": "recent"},
+                    {"type": "message", "role": "assistant", "content": "answer"}
+                ]
+            }),
+            json!({"type": "message", "role": "user", "content": "after"}),
+        ] {
+            store
+                .append_session_entry_for("_general", dir.path(), "chat-compact", entry)
+                .await
+                .unwrap();
+        }
+        let entries = store
+            .read_session_entries("_general", dir.path(), "chat-compact")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0]["role"], "system");
+        assert!(
+            entries[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("old work summarized")
+        );
+        assert_eq!(entries[1]["content"], "recent");
+        assert_eq!(entries[3]["content"], "after");
+        assert!(!entries.iter().any(|entry| entry["content"] == "old"));
     }
 
     #[tokio::test]

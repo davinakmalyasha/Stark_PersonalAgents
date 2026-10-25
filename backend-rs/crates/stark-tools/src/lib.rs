@@ -35,6 +35,11 @@ const IMPLEMENTED: &[&str] = &[
     "call_subagent",
     "update_plan",
     "browser_act",
+    "delegate",
+    "delegation_status",
+    "job_message",
+    "job_cancel",
+    "give_note",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -370,8 +375,21 @@ mod tests {
         assert!(!names.contains(&"read_file"));
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
-        assert_eq!(tool_names(&orchestrator), vec!["ask_user"]);
-        assert_eq!(tool_names(&tool_specs_for_scope("build", "agent")).len(), 8);
+        assert_eq!(
+            tool_names(&orchestrator),
+            vec![
+                "ask_user",
+                "delegate",
+                "delegation_status",
+                "job_message",
+                "job_cancel",
+                "give_note"
+            ]
+        );
+        assert_eq!(
+            tool_names(&tool_specs_for_scope("build", "agent")).len(),
+            13
+        );
     }
 
     #[tokio::test]

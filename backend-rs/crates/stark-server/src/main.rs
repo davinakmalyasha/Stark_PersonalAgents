@@ -185,6 +185,17 @@ struct ServerState {
     harness_root: PathBuf,
 }
 
+#[derive(Clone)]
+struct RunTarget {
+    chat_id: String,
+    workspace_id: String,
+    workspace: PathBuf,
+    scope: String,
+    role: Option<String>,
+    model: String,
+    temperature: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct RunRequest {
     #[serde(default)]
@@ -441,16 +452,25 @@ Attached files:
         let _ = tokio::task::spawn_blocking(move || checkpoint.snapshot_all()).await;
     }
 
-    let latest = Arc::new(Mutex::new(None));
-    let ctx = RunContext {
+    let target = RunTarget {
         chat_id: chat_id.clone(),
         workspace_id,
         workspace,
-        role: Some(agent.display.to_string()),
         scope: agent.key.to_string(),
-        depth: 0,
+        role: Some(agent.display.to_string()),
         model,
         temperature: request.temperature,
+    };
+    let latest = Arc::new(Mutex::new(None));
+    let ctx = RunContext {
+        chat_id: target.chat_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        workspace: target.workspace.clone(),
+        role: target.role.clone(),
+        scope: target.scope.clone(),
+        depth: 0,
+        model: target.model.clone(),
+        temperature: target.temperature,
         provider: state.provider.clone(),
         store: state.store.clone(),
         questions: state.questions.clone(),
@@ -460,6 +480,7 @@ Attached files:
         follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel,
+        on_job_done: Some(job_hook(state.clone(), target)),
     };
 
     let manager = state.runs.clone();
@@ -489,6 +510,80 @@ Attached files:
 
     let stream: SseStream = Box::pin(sse_stream(receiver));
     Ok(Sse::new(stream))
+}
+
+fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
+    Arc::new(move |message| {
+        if state.runs.follow_up(&target.chat_id, &message) {
+            return;
+        }
+        spawn_follow_up_run(state.clone(), target.clone(), message);
+    })
+}
+
+fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
+    let (tx, _) = broadcast::channel(256);
+    let cancel = CancellationToken::new();
+    let steering = Arc::new(Mutex::new(VecDeque::new()));
+    let follow_up = Arc::new(Mutex::new(VecDeque::new()));
+    if !state.runs.claim(
+        &target.chat_id,
+        cancel.clone(),
+        tx.clone(),
+        steering.clone(),
+        follow_up.clone(),
+        target.workspace.to_string_lossy().as_ref(),
+    ) {
+        let _ = state.runs.follow_up(&target.chat_id, &message);
+        return;
+    }
+
+    let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
+    let latest = Arc::new(Mutex::new(None));
+    let ctx = RunContext {
+        chat_id: target.chat_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        workspace: target.workspace.clone(),
+        role: target.role.clone(),
+        scope: target.scope.clone(),
+        depth: 0,
+        model: target.model.clone(),
+        temperature: target.temperature,
+        provider: state.provider.clone(),
+        store: state.store.clone(),
+        questions: state.questions.clone(),
+        tx: tx.clone(),
+        latest: latest.clone(),
+        steering,
+        follow_up,
+        checkpoint: Some(checkpoint.clone()),
+        cancel,
+        on_job_done: Some(job_hook(state.clone(), target.clone())),
+    };
+    let manager = state.runs.clone();
+    let done_tx = tx.clone();
+    let chat_id = target.chat_id.clone();
+    tokio::spawn(async move {
+        let result = run_agent(ctx, message).await;
+        checkpoint.finalize();
+        let error = result.as_ref().err().map(ToString::to_string);
+        let final_state = latest.lock().ok().and_then(|guard| guard.clone());
+        let status = if error.is_some() {
+            "error"
+        } else if final_state
+            .as_ref()
+            .is_some_and(|state| state.active_node == "aborted")
+        {
+            "aborted"
+        } else {
+            "complete"
+        };
+        manager.finish(&chat_id, final_state);
+        let _ = done_tx.send(ServerEvent::new(
+            "done",
+            json!({"status": status, "error": error}),
+        ));
+    });
 }
 
 async fn stream_handler(
@@ -2013,6 +2108,88 @@ mod tests {
         assert!(paths.contains(&"README.md"));
         assert!(paths.contains(&".agent-memory/project.md"));
         assert!(!paths.contains(&"node_modules"));
+    }
+
+    #[tokio::test]
+    async fn follow_up_run_persists_a_woken_reply() {
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::response::Response;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn mock_provider(Json(_body): Json<Value>) -> Response {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Woke\"}}]}
+
+",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+",
+                "data: [DONE]
+
+"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/chat/completions", post(mock_provider));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let state = ServerState {
+            store: store.clone(),
+            provider,
+            questions: Arc::new(QuestionBroker::new()),
+            runs: Arc::new(RunManager::default()),
+            registry: WorkspaceRegistry::new(dir.path()),
+            pairing: Arc::new(PairingStore::new(dir.path())),
+            ui_state_path: dir.path().join("ui_state.json"),
+            harness_root: dir.path().to_path_buf(),
+        };
+        spawn_follow_up_run(
+            state.clone(),
+            RunTarget {
+                chat_id: "wake-chat".to_string(),
+                workspace_id: "_general".to_string(),
+                workspace: dir.path().to_path_buf(),
+                scope: "orchestrator".to_string(),
+                role: Some("Orchestrator".to_string()),
+                model: "mock".to_string(),
+                temperature: 0.0,
+            },
+            "[DELEGATION RESULT] job done".to_string(),
+        );
+
+        for _ in 0..100 {
+            let history = store.history("wake-chat", 10).await.unwrap_or_default();
+            if history.iter().any(|message| message.content == "Woke") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let history = store.history("wake-chat", 10).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "[DELEGATION RESULT] job done")
+        );
+        assert!(history.iter().any(|message| message.content == "Woke"));
     }
 
     #[tokio::test]

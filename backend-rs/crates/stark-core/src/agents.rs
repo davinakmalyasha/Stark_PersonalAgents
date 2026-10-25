@@ -9,14 +9,6 @@ pub struct AgentSpec {
     pub instructions: &'static str,
 }
 
-pub const GENERIC: AgentSpec = AgentSpec {
-    key: "agent",
-    display: "Agent",
-    plan_scope: "agent",
-    tier: "workspace",
-    instructions: "You are Stark, a coding agent.",
-};
-
 pub const DEVELOPER: AgentSpec = AgentSpec {
     key: "developer",
     display: "Developer",
@@ -87,7 +79,7 @@ pub fn resolve_agent(
         "dfd" | "dfd_workspace" => DFD,
         "design" | "design_workspace" => UI,
         _ if workspace_path != harness_root => DEVELOPER,
-        _ => GENERIC,
+        _ => ORCHESTRATOR,
     }
 }
 
@@ -113,10 +105,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_workspace_uses_generic() {
+    fn empty_workspace_uses_orchestrator() {
         let root = Path::new("root");
-        assert_eq!(resolve_agent("", root, root), GENERIC);
-        assert_eq!(resolve_agent("unknown", root, root), GENERIC);
+        assert_eq!(resolve_agent("", root, root), ORCHESTRATOR);
+        assert_eq!(resolve_agent("unknown", root, root), ORCHESTRATOR);
     }
 
     #[test]

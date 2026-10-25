@@ -19,10 +19,10 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use stark_contract::{AppState, ServerEvent};
-use stark_core::{RunContext, run_agent, subagent_status, subagent_status_for};
+use stark_core::{RunContext, resolve_agent, run_agent, subagent_status, subagent_status_for};
 use stark_providers::{Provider, ProviderConfig};
 use stark_store::{ChatStore, WorkspaceRegistry};
-use stark_tools::{Checkpoint, QuestionBroker};
+use stark_tools::{Checkpoint, PlanStore, QuestionBroker};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -369,7 +369,6 @@ async fn run_handler(
     Json(request): Json<RunRequest>,
 ) -> Result<Sse<SseStream>, (StatusCode, Json<Value>)> {
     let mut prompt = request.prompt.trim().to_string();
-    let _ = &request.workspace_kind;
     if !request.attachments.is_empty() {
         let note = attachment_note(&state.harness_root, &request.attachments);
         if prompt.is_empty() {
@@ -402,6 +401,7 @@ Attached files:
     } else {
         PathBuf::from(request.workspace_path.trim())
     };
+    let agent = resolve_agent(&request.workspace_kind, &workspace, &state.harness_root);
 
     let model = state.provider.config().resolve_model(&request.model);
     let workspace_id = if !request.workspace_id.trim().is_empty() {
@@ -446,7 +446,8 @@ Attached files:
         chat_id: chat_id.clone(),
         workspace_id,
         workspace,
-        role: None,
+        role: Some(agent.display.to_string()),
+        scope: agent.key.to_string(),
         depth: 0,
         model,
         temperature: request.temperature,
@@ -551,11 +552,23 @@ async fn state_handler(
     State(state): State<ServerState>,
     Query(query): Query<StateQuery>,
 ) -> Json<Value> {
-    let value = state
+    let mut value = state
         .runs
         .state(query.chat_id.as_deref())
         .unwrap_or_else(|| serde_json::to_value(AppState::default()).unwrap_or(Value::Null));
+    hydrate_plan(&state.harness_root, &mut value, query.chat_id.as_deref()).await;
     Json(value)
+}
+
+async fn hydrate_plan(harness_root: &std::path::Path, value: &mut Value, chat_id: Option<&str>) {
+    if let Some(chat_id) = chat_id.filter(|chat_id| !chat_id.is_empty())
+        && let Ok(plan) = PlanStore::new(harness_root.to_path_buf())
+            .plan_state(chat_id)
+            .await
+        && !plan.is_empty()
+    {
+        value["plan"] = serde_json::to_value(plan).unwrap_or(Value::Null);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2000,6 +2013,25 @@ mod tests {
         assert!(paths.contains(&"README.md"));
         assert!(paths.contains(&".agent-memory/project.md"));
         assert!(!paths.contains(&"node_modules"));
+    }
+
+    #[tokio::test]
+    async fn state_hydration_includes_a_persisted_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = dir.path().join(".deep_agents").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("task_chat-1.json"),
+            serde_json::to_string(&json!({
+                "plan": {"agent": [{"step": "inspect", "status": "in_progress"}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut value = json!({});
+        hydrate_plan(dir.path(), &mut value, Some("chat-1")).await;
+        assert_eq!(value["plan"]["agent"][0]["step"], "inspect");
     }
 
     #[test]

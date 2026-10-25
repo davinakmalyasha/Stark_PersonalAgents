@@ -10,10 +10,13 @@ use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
 use stark_providers::{ChatMessage, Provider, ProviderEvent, ToolCall};
 use stark_store::{ChatStore, StoreError};
-use stark_tools::{Checkpoint, QuestionBroker, ToolContext, ToolOutcome};
+use stark_tools::{Checkpoint, PlanStore, QuestionBroker, ToolContext, ToolOutcome};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+
+mod agents;
+pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
 
 const MAX_STEPS: usize = 12;
 const HISTORY_LIMIT: usize = 40;
@@ -110,6 +113,7 @@ pub struct RunContext {
     pub workspace_id: String,
     pub workspace: PathBuf,
     pub role: Option<String>,
+    pub scope: String,
     pub depth: u32,
     pub model: String,
     pub temperature: f64,
@@ -139,6 +143,13 @@ impl RunContext {
             *latest = Some(state.clone());
         }
         self.emit("state", state.clone());
+    }
+
+    fn agent_label(&self) -> String {
+        agent_for_scope(&self.scope)
+            .map(|agent| agent.display.to_string())
+            .or_else(|| self.role.clone())
+            .unwrap_or_else(|| "Stark".to_string())
     }
 }
 
@@ -236,6 +247,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             &prompt,
         )
         .await?;
+    let plan_store = PlanStore::new(ctx.store.harness_root().to_path_buf());
+    let mode = ctx
+        .store
+        .chat_mode(&ctx.chat_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "build".to_string());
+    let initial_plan = plan_store
+        .plan_state(&ctx.chat_id)
+        .await
+        .unwrap_or_default();
     let user_message_id = ctx
         .store
         .append_message(&ctx.chat_id, "user", &prompt, false)
@@ -254,11 +277,22 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
     let role = ctx.role.as_deref().unwrap_or("a coding agent");
-    let mut messages = vec![ChatMessage::system(format!(
-        "You are Stark, {role} working in {workspace_label}. \
+    let preamble = match agent_for_scope(&ctx.scope) {
+        Some(agent) => agent.instructions.to_string(),
+        None => format!("You are Stark, {role}."),
+    };
+    let mut system_prompt = format!(
+        "{preamble} Working in {workspace_label}. \
          Use the provided tools to inspect and change files. Read before editing. \
          Never invent tool results. Keep the final answer concise."
-    ))];
+    );
+    if mode == "plan" {
+        system_prompt.push_str(
+            " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
+             Do not edit files, spawn subagents, or run commands with side effects.",
+        );
+    }
+    let mut messages = vec![ChatMessage::system(system_prompt)];
     if session_entries.is_empty() {
         for message in history {
             if message.role == "user" || message.role == "assistant" {
@@ -274,6 +308,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     } else {
         messages.extend(session_messages(&session_entries));
     }
+    if let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
+        && !block.is_empty()
+    {
+        messages.push(ChatMessage::user(block));
+    }
     messages.push(ChatMessage::user(&prompt));
 
     let mut state = AppState {
@@ -284,19 +323,24 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         selected_model: ctx.model.clone(),
         selected_temp: ctx.temperature,
         outputs: json!({}),
+        plan: (!initial_plan.is_empty()).then_some(initial_plan),
         ..AppState::default()
     };
     ctx.emit_state(&mut state);
 
-    let tool_specs = stark_tools::tool_specs();
+    let tool_specs = stark_tools::tool_specs_for_scope(&mode, &ctx.scope);
     let mut tools = ToolContext::new(
         ctx.workspace.clone(),
         ctx.chat_id.clone(),
         ctx.questions.clone(),
-    );
+    )
+    .with_plan_store(Arc::new(plan_store))
+    .with_scope(ctx.scope.clone())
+    .with_mode(mode.clone());
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());
     }
+    let agent_label = ctx.agent_label();
 
     for _step in 0..MAX_STEPS {
         if ctx.cancel.is_cancelled() {
@@ -339,11 +383,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             match event {
                 Ok(ProviderEvent::Text(chunk)) => {
                     text.push_str(&chunk);
-                    ctx.emit_delta(Delta::text(chunk));
+                    ctx.emit_delta(Delta::text(chunk).with_agent(agent_label.clone()));
                 }
                 Ok(ProviderEvent::Reasoning(chunk)) => {
                     reasoning.push_str(&chunk);
-                    ctx.emit_delta(Delta::reasoning(chunk));
+                    ctx.emit_delta(Delta::reasoning(chunk).with_agent(agent_label.clone()));
                 }
                 Ok(ProviderEvent::Usage(usage)) => {
                     state.token_usage.total_input_tokens += usage.input_tokens;
@@ -354,15 +398,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         "output_tokens": usage.output_tokens,
                         "total_tokens": usage.total_tokens,
                     }));
-                    ctx.emit_delta(Delta::usage(
-                        json!({
-                            "agent": "Supervisor",
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "total_tokens": usage.total_tokens,
-                        })
-                        .to_string(),
-                    ));
+                    ctx.emit_delta(
+                        Delta::usage(
+                            json!({
+                                "agent": "Supervisor",
+                                "input_tokens": usage.input_tokens,
+                                "output_tokens": usage.output_tokens,
+                                "total_tokens": usage.total_tokens,
+                            })
+                            .to_string(),
+                        )
+                        .with_agent(agent_label.clone()),
+                    );
                 }
                 Ok(ProviderEvent::ToolCall {
                     index,
@@ -511,23 +558,39 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             let args: Value =
                 serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
             let args_text = serde_json::to_string(&args).unwrap_or_default();
-            ctx.emit_delta(Delta::tool_started(&call.function.name, &args_text));
+            ctx.emit_delta(
+                Delta::tool_started(&call.function.name, &args_text)
+                    .with_agent(agent_label.clone()),
+            );
 
             let started = Instant::now();
             let outcome = if call.function.name == "call_subagent" {
-                run_subagent_tool(&ctx, &args).await
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    run_subagent_tool(&ctx, &args).await
+                }
             } else {
                 stark_tools::dispatch(&call.function.name, &args, &tools).await
             };
             let elapsed = started.elapsed().as_millis() as u64;
             let preview: String = outcome.content.chars().take(300).collect();
-            ctx.emit_delta(Delta::tool_finished(
-                &call.function.name,
-                &args_text,
-                !outcome.is_error,
-                elapsed,
-                preview,
-            ));
+            ctx.emit_delta(
+                Delta::tool_finished(
+                    &call.function.name,
+                    &args_text,
+                    !outcome.is_error,
+                    elapsed,
+                    preview,
+                )
+                .with_agent(agent_label.clone()),
+            );
+            if let Some(plan) = &outcome.plan {
+                state.plan = Some(plan.clone());
+                ctx.emit_state(&mut state);
+            }
 
             messages.push(ChatMessage::tool(&call.id, &outcome.content));
             let _ = ctx
@@ -596,7 +659,7 @@ async fn finish_aborted(ctx: &RunContext, state: &mut AppState) {
     state.active_node = "aborted".to_string();
     state.error = Some(message.to_string());
     ctx.emit_state(state);
-    ctx.emit_delta(Delta::end(""));
+    ctx.emit_delta(Delta::end("").with_agent(ctx.agent_label()));
 }
 
 async fn fail(ctx: &RunContext, state: &mut AppState, message: String) {
@@ -612,7 +675,7 @@ async fn fail(ctx: &RunContext, state: &mut AppState, message: String) {
             false,
         )
         .await;
-    ctx.emit_delta(Delta::end(""));
+    ctx.emit_delta(Delta::end("").with_agent(ctx.agent_label()));
 }
 
 async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
@@ -828,6 +891,7 @@ fn child_context(
         workspace_id: ctx.workspace_id.clone(),
         workspace: ctx.workspace.clone(),
         role: Some(format!("the {name} specialist subagent")),
+        scope: name.to_lowercase(),
         depth: ctx.depth + 1,
         model: ctx.model.clone(),
         temperature: ctx.temperature,
@@ -921,6 +985,91 @@ mod tests {
             .unwrap()
     }
 
+    async fn mock_plan_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"update_plan","arguments":"{\"plan\":[{\"step\":\"inspect\",\"status\":\"in_progress\"}]}"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Planned"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_plan_populates_run_state_and_task_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_plan_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "plan-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: None,
+            scope: "agent".to_string(),
+            depth: 0,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+        };
+
+        run_agent(ctx, "make a plan".to_string()).await.unwrap();
+
+        let state = latest.lock().unwrap().clone().unwrap();
+        let plan = state.plan.expect("plan in state");
+        assert_eq!(plan["agent"][0].step, "inspect");
+        let task = std::fs::read_to_string(
+            dir.path()
+                .join(".deep_agents")
+                .join("tasks")
+                .join("task_plan-chat.json"),
+        )
+        .unwrap();
+        assert!(task.contains("\"inspect\""));
+    }
+
     #[tokio::test]
     async fn subagent_run_persists_a_child_chat() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -949,6 +1098,7 @@ mod tests {
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
             role: None,
+            scope: "agent".to_string(),
             depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,
@@ -1029,6 +1179,7 @@ mod tests {
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
             role: None,
+            scope: "agent".to_string(),
             depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,

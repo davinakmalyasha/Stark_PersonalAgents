@@ -3,6 +3,7 @@ mod error;
 mod executable_name;
 mod parser;
 mod policy;
+mod read_only;
 pub mod rule;
 
 use std::sync::OnceLock;
@@ -11,6 +12,7 @@ pub use decision::Decision;
 pub use error::{Error, ErrorLocation, Result, TextPosition, TextRange};
 pub use parser::PolicyParser;
 pub use policy::{Evaluation, MatchOptions, Policy, RequirementsExecPolicy};
+pub use read_only::{check_read_only, is_read_only_command};
 pub use rule::{PatternToken, PrefixPattern, PrefixRule, Rule, RuleMatch, RuleRef};
 
 const DEFAULT_RULES: &str = r#"

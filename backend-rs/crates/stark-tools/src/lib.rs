@@ -5,6 +5,7 @@ mod changes;
 mod checkpoint;
 mod command;
 mod dfd;
+mod docs;
 mod edit;
 mod head_tail;
 mod house;
@@ -52,6 +53,9 @@ const IMPLEMENTED: &[&str] = &[
     "dfd_bridge",
     "create_client",
     "files_changed",
+    "read_pdf",
+    "create_docx",
+    "create_xlsx",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -319,6 +323,9 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "dfd_bridge" => dfd::dfd_bridge(ctx, args).await,
         "create_client" => dfd::create_client(ctx, args).await,
         "files_changed" => changes::files_changed(ctx, args).await,
+        "read_pdf" => docs::read_pdf(ctx, args).await,
+        "create_docx" => docs::create_docx(ctx, args).await,
+        "create_xlsx" => docs::create_xlsx(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -397,8 +404,11 @@ mod tests {
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"update_plan"));
+        assert!(names.contains(&"read_pdf"));
+        assert!(names.contains(&"create_docx"));
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
 
@@ -429,7 +439,7 @@ mod tests {
         );
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            21
+            24
         );
     }
 

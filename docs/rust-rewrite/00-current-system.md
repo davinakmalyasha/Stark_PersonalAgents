@@ -9,21 +9,22 @@ not a design. The authoritative sources are the code paths named here.
 
 **Stark** is a local-first, Windows desktop multi-agent workspace.
 
-- Frontend: React 19 + Vite 8 + Electron 44 (`frontend/`)
-- Backend: Python 3.13 + FastAPI + uvicorn on port **8123** (`server/`)
+- Frontend: React 19 + Vite 8 + Tauri 2 (`frontend/`)
+- Backend: Python 3.13 + FastAPI + uvicorn on port **8123** (`server/`), with
+  the Rust server on the same contract (`backend-rs/`)
 - Transport: HTTP + SSE for runs; WebSocket for live voice
 - Persistence: SQLite + append-only JSONL + per-project event stores
-- Front doors: web/Electron UI, Telegram bot, on-device voice (Moonshine STT +
-  Pocket TTS), smart-home panel, DFD agency panel
-- Packaging: Electron is a thin shell; it builds the frontend and spawns the
-  Python backend (`frontend/electron/main.cjs`)
+- Front doors: Tauri desktop UI, browser/PWA, Telegram bot, on-device voice
+  (Moonshine STT + Pocket TTS), smart-home panel, DFD agency panel
+- Packaging: Tauri bundles the frontend, starts the Rust sidecar when packaged,
+  and keeps the Python server as the development/fallback backend
 
 ---
 
 ## 2. Runtime topology
 
 ```
-Electron / browser
+Tauri / browser / PWA
    │  fetch + SSE        │ WebSocket (voice)
    ▼                     ▼
 FastAPI :8123  ──────────────────────────────┐
@@ -405,7 +406,7 @@ event: done    data: {"status": "complete"|"error"}
 | `Voice/*` | STT/TTS engine |
 | `Telegram/*` | Telegram bot |
 | `Desktop/*` | Workspace manager / desktop bridge |
-| `frontend/*` | React UI + Electron shell |
+| `frontend/*` | React UI + Tauri shell |
 | `tests/*` | pytest suite (24 files, ~7.5k LOC) |
 | `docs/tools/*` | Per-tool docs (the tool contract) |
 | `docs/group-projects/*` | Group-project design of record |

@@ -1,6 +1,5 @@
 import type { AgentNote } from '../../types';
-
-const API_BASE = '/api';
+import { API_BASE } from './base';
 
 async function readError(res: Response): Promise<string> {
   try {

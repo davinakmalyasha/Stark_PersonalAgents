@@ -7,9 +7,7 @@
   ],
   "remote": {
     "urls": [
-      "http://127.0.0.1:8123",
-      "http://localhost:9000",
-      "http://127.0.0.1:8124"
+      "http://localhost:9000"
     ]
   },
   "permissions": [
@@ -22,6 +20,7 @@
     "core:window:allow-show",
     "allow-ping",
     "allow-runtime-info",
+    "allow-pairing-base",
     "allow-select-folder",
     "allow-reveal-path",
     "allow-voice-toggle",
@@ -31,6 +30,7 @@
     "allow-voice-resize",
     "allow-voice-screen-sources",
     "allow-voice-screen-select",
+    "allow-voice-screen-frame",
     "allow-voice-screen-protect"
   ]
 }

@@ -1,5 +1,7 @@
 mod backend;
 mod commands;
+mod screen;
+mod storage;
 mod voice;
 
 use serde_json::json;
@@ -8,7 +10,7 @@ use std::net::TcpStream;
 use std::process::Child;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tauri::{
     AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
     menu::{Menu, MenuItem},
@@ -38,11 +40,7 @@ pub(crate) fn api_origin() -> String {
 }
 
 pub(crate) fn ui_url() -> String {
-    if tauri::is_dev() {
-        "http://localhost:9000".to_string()
-    } else {
-        api_origin()
-    }
+    "http://localhost:9000".to_string()
 }
 
 pub(crate) fn is_allowed_url(url: &tauri::Url) -> bool {
@@ -86,20 +84,8 @@ fn api_healthy() -> bool {
     String::from_utf8_lossy(&buffer[..read]).contains(" 200 ")
 }
 
-fn wait_for_api() {
-    for _ in 0..90 {
-        if api_healthy() {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn spawn_main_when_ready(app: AppHandle) {
+fn spawn_main(app: AppHandle) {
     std::thread::spawn(move || {
-        if !api_healthy() {
-            wait_for_api();
-        }
         if let Err(error) = create_main_window(&app) {
             log::error!("failed to create main window: {error}");
         }
@@ -124,53 +110,49 @@ fn create_main_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     }
 
     let url = if tauri::is_dev() {
-        ui_url()
+        WebviewUrl::External(ui_url().parse().expect("valid Stark development UI URL"))
     } else {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or(0);
-        format!("{}?stark_build={stamp}", ui_url())
+        WebviewUrl::App("index.html".into())
     };
     let navigation_app = app.clone();
     let new_window_app = app.clone();
 
-    let window = WebviewWindowBuilder::new(
-        app,
-        "main",
-        WebviewUrl::External(url.parse().expect("valid Stark UI URL")),
-    )
-    .title("Stark — Agent Workspace")
-    .inner_size(1440.0, 900.0)
-    .min_inner_size(1100.0, 700.0)
-    .background_color(tauri::webview::Color(12, 12, 14, 255))
-    .additional_browser_args("--autoplay-policy=no-user-gesture-required")
-    .decorations(false)
-    .maximized(true)
-    .visible(false)
-    .initialization_script(main_bridge_script())
-    .on_navigation(move |url| {
-        if is_allowed_url(&url) {
-            true
-        } else {
-            let _ = navigation_app.opener().open_url(url.as_str(), None::<&str>);
-            false
-        }
-    })
-    .on_new_window(move |url, _features| {
-        let _ = new_window_app.opener().open_url(url.as_str(), None::<&str>);
-        NewWindowResponse::Deny
-    })
-    .on_document_title_changed(|window, title| {
-        let _ = window.set_title(&title);
-    })
-    .on_page_load(|window, payload| {
-        if payload.event() == PageLoadEvent::Finished {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-    })
-    .build()?;
+    let window = WebviewWindowBuilder::new(app, "main", url)
+        .title("Stark — Agent Workspace")
+        .inner_size(1440.0, 900.0)
+        .min_inner_size(1100.0, 700.0)
+        .background_color(tauri::webview::Color(12, 12, 14, 255))
+        .additional_browser_args("--autoplay-policy=no-user-gesture-required")
+        .decorations(false)
+        .maximized(true)
+        .visible(false)
+        .initialization_script(format!(
+            "{}\n{}",
+            storage::seed_script(app),
+            main_bridge_script()
+        ))
+        .on_navigation(move |url| {
+            if is_allowed_url(&url) {
+                true
+            } else {
+                let _ = navigation_app.opener().open_url(url.as_str(), None::<&str>);
+                false
+            }
+        })
+        .on_new_window(move |url, _features| {
+            let _ = new_window_app.opener().open_url(url.as_str(), None::<&str>);
+            NewWindowResponse::Deny
+        })
+        .on_document_title_changed(|window, title| {
+            let _ = window.set_title(&title);
+        })
+        .on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })
+        .build()?;
 
     window.show()?;
     Ok(window)
@@ -227,9 +209,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(ShellState::default())
+        .manage(screen::ScreenState::default())
         .invoke_handler(tauri::generate_handler![
             commands::ping,
             commands::runtime_info,
+            commands::pairing_base,
             commands::select_folder,
             commands::reveal_path,
             commands::voice_toggle,
@@ -239,6 +223,7 @@ pub fn run() {
             commands::voice_resize,
             commands::voice_screen_sources,
             commands::voice_screen_select,
+            commands::voice_screen_frame,
             commands::voice_screen_protect,
         ])
         .setup(|app| {
@@ -263,7 +248,7 @@ pub fn run() {
             if tauri::is_dev() {
                 let _ = create_main_window(app.handle());
             } else {
-                spawn_main_when_ready(app.handle().clone());
+                spawn_main(app.handle().clone());
             }
             Ok(())
         })
@@ -315,8 +300,10 @@ fn main_bridge_script() -> String {
   };
   window.__STARK_DESKTOP__ = "tauri";
   window.__STARK_PORT__ = __PORT__;
+  window.__STARK_API_ORIGIN__ = "__API_ORIGIN__";
   window.antigravity = {
     selectFolder: () => invoke("select_folder"),
+    getPairingBase: () => invoke("pairing_base"),
     revealPath: (target) => invoke("reveal_path", { target }),
     voiceToggle: () => invoke("voice_toggle"),
     voiceText: () => {},
@@ -331,7 +318,9 @@ fn main_bridge_script() -> String {
   };
 })();
 "#;
-    SCRIPT.replace("__PORT__", &api_port().to_string())
+    SCRIPT
+        .replace("__PORT__", &api_port().to_string())
+        .replace("__API_ORIGIN__", &api_origin())
 }
 
 pub(crate) fn voice_bridge_script() -> String {
@@ -345,6 +334,7 @@ pub(crate) fn voice_bridge_script() -> String {
   const invoke = tauri.core.invoke;
   const listen = tauri.event.listen;
   window.__STARK_PORT__ = __PORT__;
+  window.__STARK_API_ORIGIN__ = "__API_ORIGIN__";
   window.voiceBridge = {
     sendEvent: (payload) => invoke("voice_emit_event", { payload }),
     close: () => invoke("voice_close"),
@@ -354,9 +344,12 @@ pub(crate) fn voice_bridge_script() -> String {
     getStarkPort: () => String(window.__STARK_PORT__),
     listScreenSources: () => invoke("voice_screen_sources"),
     selectScreenSource: (id) => invoke("voice_screen_select", { id }),
+    captureScreenFrame: () => invoke("voice_screen_frame"),
     setScreenProtection: (on) => invoke("voice_screen_protect", { on: !!on }),
   };
 })();
 "#;
-    SCRIPT.replace("__PORT__", &api_port().to_string())
+    SCRIPT
+        .replace("__PORT__", &api_port().to_string())
+        .replace("__API_ORIGIN__", &api_origin())
 }

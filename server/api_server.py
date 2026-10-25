@@ -212,6 +212,12 @@ async def _lifespan(app):
 # Reassign app with lifespan (FastAPI accepts lifespan=; must be set before
 # routers are included — this runs _shutdown_voice on uvicorn shutdown too).
 app = FastAPI(title="Deep Agents API", version="2.0", lifespan=_lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Phase 7: domain routers ──
 from server.house.router import router as house_router

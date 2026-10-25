@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { MessageSquare, Plus, Trash2, Pencil, MoreHorizontal, ChevronDown, Bot, CornerDownRight } from 'lucide-react';
 import { PanelLeftClose, FolderPlus } from 'lucide-react';
 import { isSpawnedChat } from '../../utils/chatHierarchy';
-import { fetchWorkspaces, addWorkspace, removeWorkspace, fetchChats, createChat, deleteChat, fetchChat, updateChatTitle } from '../../services/api';
+import { apiUrl, fetchWorkspaces, addWorkspace, removeWorkspace, fetchChats, createChat, deleteChat, fetchChat, updateChatTitle } from '../../services/api';
 import type { WorkspaceInfo, ChatSummary, ChatData } from '../../types';
 import SidebarProjectList from './SidebarProjectList';
 import SidebarAddFolderModal from './SidebarAddFolderModal';
@@ -215,7 +215,7 @@ export default function Sidebar({
     const poll = async () => {
       if (document.hidden) return;
       try {
-        const res = await fetch('/api/runs/active');
+        const res = await fetch(apiUrl('/api/runs/active'));
         const data = await res.json();
         const ids = new Set<string>();
         for (const r of (Array.isArray((data as any)?.runs) ? (data as any).runs : data?.running ? [data] : [])) {

@@ -3,6 +3,8 @@
 // (it lives in the LangChain server process and is forwarded to the
 // proxy's MCP endpoint server-side).
 
+import { apiUrl } from '../services/api/base';
+
 export interface AdminResult {
   ok: boolean;
   text?: string;
@@ -10,7 +12,7 @@ export interface AdminResult {
 }
 
 async function get<T = AdminResult>(path: string): Promise<T> {
-  const res = await fetch(path);
+  const res = await fetch(apiUrl(path));
   const data = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: (data?.error) || `HTTP ${res.status}` } as T;
   return data as T;
@@ -23,7 +25,7 @@ export const fetchUsage = (tenantId: string) => get(`/api/agentsadmin/usage?tena
 export const fetchDeadReminders = (tenantId = '') => get(`/api/agentsadmin/dead-reminders${tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : ''}`);
 
 export async function disableBot(botId: string): Promise<AdminResult> {
-  const res = await fetch(`/api/agentsadmin/bots/${encodeURIComponent(botId)}/disable`, { method: 'POST' });
+  const res = await fetch(apiUrl(`/api/agentsadmin/bots/${encodeURIComponent(botId)}/disable`), { method: 'POST' });
   const data = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: data?.error || `HTTP ${res.status}` };
   return data as AdminResult;

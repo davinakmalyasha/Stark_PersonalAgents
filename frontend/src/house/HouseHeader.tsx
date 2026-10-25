@@ -62,8 +62,8 @@ export default function HouseHeader({
   onActivateTab, onCloseTab, onNewSession,
   onOpenSidebar, projects, projectsScoped, onOpenProject,
 }: HouseHeaderProps) {
-  const isElectron = typeof window !== 'undefined' && !!window.antigravity;
-  const isDesktopShell = isElectron || Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
+  const hasDesktopBridge = typeof window !== 'undefined' && !!window.antigravity;
+  const isDesktopShell = hasDesktopBridge || Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
   const [projectsOpen, setProjectsOpen] = useState(false);
   const projectsRef = useRef<HTMLDivElement | null>(null);
 

@@ -12,7 +12,7 @@ dist
 dist-ssr
 *.local
 
-# electron-builder output
+# legacy desktop build output
 release
 release2
 

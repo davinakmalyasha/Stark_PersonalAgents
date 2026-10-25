@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Copy, Check, RefreshCw, Smartphone, X } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
+import { API_ORIGIN, apiUrl } from '../../services/api';
 
 interface Props {
   open: boolean;
@@ -16,13 +17,23 @@ export default function PairingModal({ open, onClose }: Props) {
   const [token, setToken] = useState('');
   const [error, setError] = useState('');
   const [copied, setCopied] = useState<'link' | 'token' | null>(null);
+  const [pairOrigin, setPairOrigin] = useState(API_ORIGIN || window.location.origin);
+
+  useEffect(() => {
+    if (!open || !window.antigravity?.getPairingBase) return;
+    let cancelled = false;
+    window.antigravity.getPairingBase()
+      .then((origin) => { if (!cancelled && origin) setPairOrigin(origin); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
     void (async () => {
       try {
-        const res = await fetch('/api/pairing');
+        const res = await fetch(apiUrl('/api/pairing'));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (!cancelled) setToken(data.token ?? '');
@@ -33,7 +44,7 @@ export default function PairingModal({ open, onClose }: Props) {
     return () => { cancelled = true; };
   }, [open]);
 
-  const pairUrl = token ? `${window.location.origin}/?token=${token}` : '';
+  const pairUrl = token ? `${pairOrigin.replace(/\/+$/, '')}/?token=${token}` : '';
 
   const copy = async (text: string, kind: 'link' | 'token') => {
     try {
@@ -45,7 +56,7 @@ export default function PairingModal({ open, onClose }: Props) {
 
   const rotate = async () => {
     try {
-      const res = await fetch('/api/pairing/rotate', { method: 'POST' });
+      const res = await fetch(apiUrl('/api/pairing/rotate'), { method: 'POST' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setToken(data.token ?? '');

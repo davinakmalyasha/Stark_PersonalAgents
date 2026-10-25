@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Smartphone, X } from 'lucide-react';
 import PairingModal from './PairingModal';
 import WindowControls from './WindowControls';
+import { apiUrl } from '../../services/api';
 
 type AppRegionStyle = React.CSSProperties & { WebkitAppRegion?: 'drag' | 'no-drag' };
 
@@ -36,7 +37,7 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
     const poll = async () => {
       if (document.hidden) return;
       try {
-        const res = await fetch('/api/runs/active');
+        const res = await fetch(apiUrl('/api/runs/active'));
         const data = (await res.json()) as { runs?: Array<{ chat_id?: string }>; running?: boolean } & { chat_id?: string };
         const ids = new Set<string>();
         const runs = Array.isArray(data?.runs) ? data.runs : data?.running ? [data] : [];

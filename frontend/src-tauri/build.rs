@@ -3,6 +3,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "ping",
             "runtime_info",
+            "pairing_base",
             "select_folder",
             "reveal_path",
             "voice_toggle",
@@ -12,6 +13,7 @@ fn main() {
             "voice_resize",
             "voice_screen_sources",
             "voice_screen_select",
+            "voice_screen_frame",
             "voice_screen_protect",
         ]),
     ))

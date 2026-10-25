@@ -11,7 +11,7 @@ export default defineConfig({
     // Chrome turns this into a real WebAPK on "Add to Home screen".
     VitePWA({
       registerType: 'autoUpdate',
-      injectRegister: 'auto',
+      injectRegister: false,
       includeAssets: ['icons/pwa-192.png', 'icons/pwa-512.png'],
       manifest: {
         name: 'Stark — AI Workspace',

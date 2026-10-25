@@ -2,13 +2,21 @@ export {};
 
 declare global {
   interface Window {
+    /** Absolute API origin injected by the Tauri shell; empty in web/PWA. */
+    __STARK_API_ORIGIN__?: string;
+    /** Voice overlay bridge port. */
+    __STARK_PORT__?: number | string;
+    /** Desktop shell marker (`tauri`). */
+    __STARK_DESKTOP__?: string;
     antigravity?: {
-      /** Open a native folder picker dialog (Electron). Returns path or null. */
+      /** Open a native folder picker dialog (desktop shell). Returns path or null. */
       selectFolder: () => Promise<string | null>;
+      /** LAN base URL the phone can use to reach this desktop. */
+      getPairingBase?: () => Promise<string>;
       /** Reveal a project folder in the OS file manager. The main process
        *  rejects any path outside the projects root. */
       revealPath?: (target: string) => Promise<{ ok: boolean; error?: string }>;
-      /** Toggle the floating voice overlay window (Electron). */
+      /** Toggle the floating voice overlay window (desktop shell). */
       voiceToggle?: () => Promise<boolean>;
       /** Subscribe to voice session events from the overlay.
        *  Returns an unsubscribe function (and off*() clears all). */

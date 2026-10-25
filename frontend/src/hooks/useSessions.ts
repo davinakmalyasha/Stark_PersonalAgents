@@ -65,6 +65,7 @@ export function useSessions() {
   const [pinnedChats, setPinnedChats] = useState<string[]>([]);
   const [chatsFilter, setChatsFilterState] = useState<ChatsFilter>('general');
   const [booted, setBooted] = useState(false);
+  const [bootError, setBootError] = useState(false);
   const bootedRef = useRef(false);
   const knownChatIdsRef = useRef<Set<string>>(new Set());
   const lastRunJsonRef = useRef('');
@@ -115,11 +116,14 @@ export function useSessions() {
   }, []);
 
   // ── Boot: load sessions + restore persisted layout ──
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
+  const boot = useCallback(async () => {
+    setBootError(false);
+    try {
       const [{ wsList, byWs }, ui] = await Promise.all([refreshSessions(), fetchUiState()]);
-      if (cancelled) return;
+      if (wsList.length === 0) {
+        setBootError(true);
+        return;
+      }
       setWorkspaces(wsList);
       setChatsByWs(byWs);
 
@@ -144,9 +148,15 @@ export function useSessions() {
       if (ui.chats_filter) setChatsFilterState(ui.chats_filter);
       bootedRef.current = true;
       setBooted(true);
-    })();
-    return () => { cancelled = true; };
+    } catch {
+      setBootError(true);
+    }
   }, [refreshSessions]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void boot(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [boot]);
 
   // ── Persist layout (debounced) ──
   useEffect(() => {
@@ -343,6 +353,6 @@ export function useSessions() {
     runningTabId, isGlobalRunning, activeRun,
     pinnedChats, togglePin, chatsFilter, setChatsFilter,
     openTab, closeTab, activateTab, openChat,
-    newSession, newChatIn, refreshSessions, forceRefresh, removeChatLocal, renameChatLocal, booted,
+    newSession, newChatIn, refreshSessions, forceRefresh, removeChatLocal, renameChatLocal, booted, bootError, retryBoot: boot,
   };
 }

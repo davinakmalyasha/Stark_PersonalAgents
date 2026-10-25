@@ -703,6 +703,9 @@ body.state-error .screen-status { color: #f2a0a0; }
   -webkit-app-region: no-drag;
 }
 .screen-preview video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.screen-preview img { width: 100%; height: 100%; object-fit: contain; display: none; }
+.screen-preview img.native { display: block; }
+.screen-preview.native video { display: none; }
 .screen-preview::after {
   content: '';
   position: absolute;
@@ -1146,6 +1149,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       </div>
       <div class="screen-preview" id="screen-preview">
         <video id="screen-video" autoplay muted playsinline></video>
+        <img id="screen-native" alt="" />
         <div id="screen-preview-state" class="screen-preview-state">
           <div id="screen-spinner" class="screen-spinner" style="display:none"></div>
           <div id="screen-preview-empty" class="screen-preview-empty">No screen shared</div>
@@ -1197,6 +1201,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   const menuContinuous = $('menu-continuous');
   const screenPanel = $('screen-panel');
   const screenVideo = $('screen-video');
+  const screenNative = $('screen-native');
   const screenPreview = $('screen-preview');
   const screenPreviewEmpty = $('screen-preview-empty');
   const screenSourceBtn = $('screen-source-btn');
@@ -2151,6 +2156,10 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   let voiceMode = 'voice';          // 'voice' | 'screen'
   let screenSharing = 'off';        // 'off' | 'on' | 'continuous'
   let screenStream = null;
+  let nativeCapturing = false;
+  let nativePreviewTimer = null;
+  function nativeCaptureAvailable() { return !!(bridge && bridge.captureScreenFrame); }
+  function hasScreenSource() { return !!screenStream || nativeCapturing; }
   let screenSourceId = localStorage.getItem(SCREEN_SOURCE_KEY) || '';
   let screenSourceLabel = '';
   let screenTimer = null;
@@ -2309,25 +2318,54 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       updateMenuMode();
       return true;
     }
-    if (!screenStream) {
+    if (!hasScreenSource()) {
       const ok = await startScreenShare();
       if (!ok) return false;
     }
     screenSharing = mode;
     setScreenTimer();
     // Refresh badge/chip (e.g. LIVE -> CONT) without touching the preview.
-    if (screenStream) setPreviewState('live');
+    if (hasScreenSource()) setPreviewState('live');
     updateMenuMode();
     broadcastScreenState();
     return true;
   }
 
-  async function startScreenShare(sourceId) {
-    if (screenStream) return true;
-    if (!bridge || !bridge.selectScreenSource || !navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-      setPreviewState('error', 'Screen sharing needs the desktop app');
-      return false;
+  async function refreshNativePreview() {
+    if (!nativeCapturing || screenSharing === 'off') return null;
+    const frame = await bridge.captureScreenFrame();
+    if (!frame || !frame.ok || !frame.image_b64) return null;
+    if (screenNative) {
+      screenPreview.classList.add('native');
+      screenNative.src = 'data:image/jpeg;base64,' + frame.image_b64;
+      screenNative.classList.add('native');
     }
+    if (frame.source) screenSourceLabel = frame.source;
+    if (frame.id && frame.id !== screenSourceId) screenSourceId = frame.id;
+    return frame;
+  }
+
+  function startNativePreview() {
+    if (nativePreviewTimer) return;
+    nativePreviewTimer = setInterval(() => {
+      refreshNativePreview().catch(() => {});
+    }, 1000);
+  }
+
+  function stopNativePreview() {
+    if (nativePreviewTimer) {
+      clearInterval(nativePreviewTimer);
+      nativePreviewTimer = null;
+    }
+    try { if (screenNative) screenNative.src = ''; } catch (_e) {}
+    try {
+      screenNative.classList.remove('native');
+      screenPreview.classList.remove('native');
+    } catch (_e) {}
+  }
+
+  async function startScreenShare(sourceId) {
+    if (hasScreenSource()) return true;
     if (sourceId !== undefined && sourceId !== null) {
       screenSourceId = sourceId || '';
       try {
@@ -2337,6 +2375,41 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     }
     screenBusy = true;
     setPreviewState('starting', 'Starting screen capture…');
+    if (nativeCaptureAvailable()) {
+      try {
+        const sel = await bridge.selectScreenSource(screenSourceId);
+        if (!sel || !sel.ok) throw new Error((sel && sel.error) || 'No screen selected');
+        screenSourceId = sel.id;
+        screenSourceLabel = sel.name || 'Screen';
+        nativeCapturing = true;
+        screenSharing = 'on';
+        const first = await refreshNativePreview();
+        if (!first) throw new Error('The first frame could not be captured');
+        setPreviewState('live');
+        if (bridge.setScreenProtection) bridge.setScreenProtection(true);
+        startNativePreview();
+        updateScreenChip();
+        setScreenTimer();
+        broadcastScreenState();
+        return true;
+      } catch (e) {
+        console.error('[Voice] native screen capture failed', e);
+        nativeCapturing = false;
+        screenSharing = 'off';
+        stopNativePreview();
+        setPreviewState('error', 'Screen sharing was not started');
+        screenCaptionText.textContent = 'Could not start screen sharing.';
+        broadcastScreenState();
+        return false;
+      } finally {
+        screenBusy = false;
+      }
+    }
+    if (!bridge || !bridge.selectScreenSource || !navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      screenBusy = false;
+      setPreviewState('error', 'Screen sharing needs the desktop app');
+      return false;
+    }
     try {
       let selName = '';
       try {
@@ -2387,6 +2460,8 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       try { screenStream.getTracks().forEach((t) => t.stop()); } catch (_e) {}
       screenStream = null;
     }
+    nativeCapturing = false;
+    stopNativePreview();
     try { screenVideo.srcObject = null; } catch (_e) {}
     // State first: setPreviewState/updateScreenChip read screenSharing.
     screenSharing = 'off';
@@ -2402,7 +2477,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
 
   function setScreenTimer() {
     clearScreenTimer();
-    if (screenSharing === 'continuous' && screenStream) {
+    if (screenSharing === 'continuous' && hasScreenSource()) {
       screenTimer = setInterval(() => { uploadScreenFrame('continuous'); }, 5000);
     }
   }
@@ -2436,6 +2511,10 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   }
 
   async function screenCaptureJpeg() {
+    if (nativeCaptureAvailable()) {
+      const frame = await refreshNativePreview();
+      return frame && frame.image_b64 ? frame.image_b64 : null;
+    }
     if (!screenStream) return null;
     if (!(await ensureVideoReady(2000))) return null;
     const vw = screenVideo.videoWidth;
@@ -2541,7 +2620,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   // and shows the panel so the user sees what is being shared).
   async function onScreenCaptureRequest(reqId) {
     if (!screenActive()) showScreenLayout();
-    if (!screenStream || screenSharing === 'off') {
+    if (!hasScreenSource() || screenSharing === 'off') {
       const ok = await setSharingMode('on');
       if (!ok) { sendScreenAck(reqId, false, 'Screen sharing is not available'); return; }
     }
@@ -2597,7 +2676,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       btn.appendChild(cap);
       btn.addEventListener('click', async () => {
         screenPicker.classList.remove('open');
-        if (screenStream) stopScreenShare();
+        if (hasScreenSource()) stopScreenShare();
         await startScreenShare(source.id);
       });
       screenPickerGrid.appendChild(btn);
@@ -2611,7 +2690,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     screenPicker.classList.remove('open');
     // Entering screen mode implies sharing: closing the first-time picker
     // falls back to the primary screen instead of leaving a dead panel.
-    if (firstTime && screenActive() && !screenStream) setSharingMode('on');
+    if (firstTime && screenActive() && !hasScreenSource()) setSharingMode('on');
   }
 
   // Design-QA only (?demo=screen): paint a mock document into the preview so

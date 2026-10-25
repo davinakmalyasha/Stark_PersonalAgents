@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Smartphone, KeyRound, ArrowRight } from 'lucide-react';
 import { getPairingToken, setPairingToken } from '../../services/remoteAuth';
+import { apiUrl } from '../../services/api';
 
 /**
  * Phone-side pairing gate (mobile/remote feature).
@@ -22,7 +23,7 @@ export default function PairingGate() {
     setBusy(true);
     setPairingToken(value);
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch(apiUrl('/api/health'));
       if (res.ok) {
         window.location.reload();
         return;

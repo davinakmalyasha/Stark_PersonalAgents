@@ -7,13 +7,13 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:9000",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build && node scripts/prepare-sidecar.mjs"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' tauri: asset: http://tauri.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:8123 ws://127.0.0.1:8123 http://localhost:9000 ws://localhost:9000; img-src 'self' asset: http://asset.localhost http://127.0.0.1:8123 data: blob:; media-src 'self' blob: http://127.0.0.1:8123; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; frame-src 'self' data: blob:; worker-src 'self' blob:; base-uri 'self'",
       "capabilities": [
         "main",
         "voice"
@@ -24,6 +24,9 @@
     "active": true,
     "targets": [
       "nsis"
+    ],
+    "externalBin": [
+      "binaries/stark-server"
     ],
     "icon": [
       "icons/32x32.png",

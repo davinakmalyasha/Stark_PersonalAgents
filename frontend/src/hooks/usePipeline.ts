@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import type { AppState, ChatAttachment, StreamDelta } from '../types';
-import { streamPipeline } from '../services/api';
+import { apiUrl, streamPipeline } from '../services/api';
 import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
 
 export interface LiveStream {
@@ -131,7 +131,7 @@ export function usePipeline(): UsePipelineReturn {
 
     (async () => {
       try {
-        const res = await fetch(`/api/stream/${encodeURIComponent(chatId)}`, { signal: controller.signal });
+        const res = await fetch(apiUrl(`/api/stream/${encodeURIComponent(chatId)}`), { signal: controller.signal });
         if (!res.ok || !res.body) {
           setRunMode(null);
           setIsRunning(false);

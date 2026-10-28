@@ -8,6 +8,7 @@ members = [
     "crates/stark-store",
     "crates/stark-core",
     "crates/stark-server",
+    "crates/stark-voice",
 ]
 
 [workspace.package]
@@ -19,7 +20,7 @@ rust-version = "1.99"
 [workspace.dependencies]
 anyhow = "1"
 async-stream = "0.3"
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 dotenvy = "0.15"

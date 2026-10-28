@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::ShellState;
 
-fn root_dir() -> PathBuf {
+fn root_dir(app: &AppHandle) -> PathBuf {
     for key in ["STARK_HARNESS_ROOT", "STARK_ROOT"] {
         if let Ok(root) = std::env::var(key) {
             let path = PathBuf::from(root);
@@ -22,19 +22,28 @@ fn root_dir() -> PathBuf {
         }
     }
 
-    PathBuf::from(r"D:\MyProject\LangChain")
+    let fallback = app.path().app_data_dir().unwrap_or_else(|_| cwd.clone());
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
 }
 
 fn packaged_backend(app: &AppHandle) -> Option<PathBuf> {
     let resource_dir = app.path().resource_dir().ok()?;
-    for relative in [
-        "binaries/stark-server.exe",
-        "stark-server.exe",
-        "binaries/stark-server-x86_64-pc-windows-gnu.exe",
-    ] {
-        let path = resource_dir.join(relative);
-        if path.exists() {
-            return Some(path);
+    let mut bases = vec![resource_dir.clone()];
+    if let Some(parent) = resource_dir.parent() {
+        bases.push(parent.to_path_buf());
+    }
+    for base in bases {
+        for relative in [
+            "binaries/stark-server.exe",
+            "stark-server.exe",
+            "binaries/stark-server-x86_64-pc-windows-gnu.exe",
+            "binaries/stark-server-x86_64-pc-windows-msvc.exe",
+        ] {
+            let path = base.join(relative);
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
     None
@@ -87,7 +96,7 @@ pub fn ensure_running(app: &AppHandle) {
         return;
     }
 
-    let root = root_dir();
+    let root = root_dir(app);
     let configured = std::env::var("STARK_BACKEND_BIN")
         .ok()
         .map(PathBuf::from)

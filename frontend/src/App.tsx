@@ -556,9 +556,11 @@ export default function App() {
         lastVoiceEventAt.current = Date.now();
         const seq = typeof (ev as any)?.runSeq === 'number' ? (ev as any).runSeq : undefined;
         if (seq === undefined || seq === voiceRunSeqRef.current) {
+          const incoming = (ev.state || null) as AppState | null;
+          const terminal = incoming?.active_node === 'done' || incoming?.active_node === 'error';
           setVoiceLiveRun((current) => ({
-            state: ev.state as AppState,
-            active: true,
+            state: incoming,
+            active: terminal ? false : true,
             workspaceId: ev.workspaceId || current?.workspaceId || '',
             chatId: ev.chatId || current?.chatId || '',
             startedAt: current?.startedAt || Date.now(),
@@ -574,6 +576,19 @@ export default function App() {
         const fresh = seq === undefined || seq === voiceRunSeqRef.current;
         const completed = (ev as any)?.status !== 'aborted';
         if (fresh && completed) {
+          const error = String((ev as any)?.error || '').trim();
+          if (error) {
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (last && last.role === 'agent' && last.content === `Error: ${error}`) return prev;
+              return [...prev, {
+                id: `voice-error-${Date.now()}`,
+                role: 'agent',
+                content: `Error: ${error}`,
+                timestamp: new Date().toISOString(),
+              }];
+            });
+          }
           setVoiceLiveRun((current) => current ? {
             ...current,
             state: (ev.state as AppState | null) || current.state,

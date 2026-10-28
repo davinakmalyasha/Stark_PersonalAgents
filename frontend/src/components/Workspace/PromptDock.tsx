@@ -9,6 +9,7 @@ const PROVIDER_LABELS: Record<ProviderMode, string> = {
   deepseek: 'DeepSeek API',
   opencode: 'OpenCode Go',
   command: 'Command Code',
+  openrouter: 'OpenRouter',
 };
 
 interface Props {

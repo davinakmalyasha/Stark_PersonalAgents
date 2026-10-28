@@ -108,3 +108,7 @@ target/
 !backend-rs/specs/
 !backend-rs/specs/**
 
+
+# Voice model assets (large, generated locally)
+backend-rs/models/
+backend-rs/onnxruntime.dll

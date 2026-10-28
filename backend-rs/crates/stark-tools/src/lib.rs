@@ -15,6 +15,7 @@ mod plan;
 mod processes;
 mod questions;
 mod read;
+mod screen;
 mod search;
 
 use std::collections::BTreeMap;
@@ -30,6 +31,9 @@ pub use house::{HouseStore, public_device, public_state};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
+pub use screen::{
+    PendingImage, ScreenBridge, drain_images, latest_continuous_image, screen_bridge,
+};
 
 const IMPLEMENTED: &[&str] = &[
     "read_file",
@@ -63,6 +67,8 @@ const IMPLEMENTED: &[&str] = &[
     "group_events",
     "group_update",
     "schedule",
+    "look_at_screen",
+    "set_screen_share",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -79,6 +85,8 @@ pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "create_xlsx",
     "delegate",
     "call_subagent",
+    "look_at_screen",
+    "set_screen_share",
 ];
 
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
@@ -342,6 +350,8 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "dfd_bridge" => dfd::dfd_bridge(ctx, args).await,
         "create_client" => dfd::create_client(ctx, args).await,
         "files_changed" => changes::files_changed(ctx, args).await,
+        "look_at_screen" => screen::look_at_screen(ctx, args).await,
+        "set_screen_share" => screen::set_screen_share(ctx, args).await,
         "read_pdf" => docs::read_pdf(ctx, args).await,
         "create_docx" => docs::create_docx(ctx, args).await,
         "create_xlsx" => docs::create_xlsx(ctx, args).await,
@@ -423,11 +433,13 @@ mod tests {
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 10);
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"update_plan"));
         assert!(names.contains(&"read_pdf"));
         assert!(names.contains(&"create_docx"));
+        assert!(names.contains(&"look_at_screen"));
+        assert!(names.contains(&"set_screen_share"));
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
 
@@ -463,7 +475,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            31
+            33
         );
     }
 

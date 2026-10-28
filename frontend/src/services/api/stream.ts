@@ -112,7 +112,7 @@ export async function fetchHistory(): Promise<string[]> {
 }
 
 import type { ModelOption } from '../../types';
-export type ProviderMode = 'free' | 'deepseek' | 'opencode' | 'command';
+export type ProviderMode = 'free' | 'deepseek' | 'opencode' | 'command' | 'openrouter';
 export interface ProviderInfo {
   provider: ProviderMode;
   modes?: ProviderMode[];

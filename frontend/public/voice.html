@@ -1262,6 +1262,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   function voiceForLanguage(lang) { return lang === 'id' ? voiceId : voice; }
 
   let micOn = false;
+  let startInFlight = false;
   let speaking = false;
   let incrementalTtsBuffer = '';  // settled sentences awaiting speak-out
   let ttsHeldUntil = 0;         // Phase 8-V1: sentence-settle debounce timestamp
@@ -1269,8 +1270,14 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   let accumulated = '';
   let lastReply = '';
   let stream = null;
-  let micNodes = null;      // {src} on the shared auCtx while the mic is on
+  let micNodes = null;      // {src, node} on the shared auCtx while the mic is on
   let analyser = null;
+  let micWorkletNode = null;
+  let liveSessionReady = false;
+  let liveSessionWaiters = [];
+  let lastFinalTurnId = '';
+  let bargeTurnId = '';
+  let bargeAt = 0;
   let freqBuf = null;
   let levelBuf = null;
   // TTS output meter (visual-only tap — never in the audio path). Each
@@ -1578,6 +1585,25 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     startWave(s === 'muted' || s === 'idle' ? 'idle' : s);
     if (extraText !== undefined) requestAnimationFrame(refreshMarquee);
     send('status', { status: s, text: textEl.textContent });
+    // The server-side cpal capture does not share the browser's AEC. Mute its
+    // Moonshine feed while TTS is speaking so the assistant cannot transcribe
+    // its own voice; unmute as soon as the turn returns to listening.
+    if (s === 'speaking') {
+      setServerCaptureMuted(true);
+    } else if (s === 'listening' || s === 'muted' || s === 'idle' || s === 'error') {
+      setServerCaptureMuted(false);
+    }
+  }
+
+  let serverCaptureMuted = false;
+  function setServerCaptureMuted(muted) {
+    if (serverCaptureMuted === muted) return;
+    serverCaptureMuted = muted;
+    fetch(API + '/api/voice/mute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ muted }),
+    }).catch(() => {});
   }
 
   function updateMicBtn() {
@@ -1706,10 +1732,141 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     }
   }
 
-  // ── Capture: server-side streaming STT (no MediaRecorder, no webm, no ffmpeg)
-  // The browser keeps the mic ONLY for VAD/barge-in (analyser); actual audio
-  // goes through /api/voice/start → Moonshine streaming → /api/voice/peek
-  // (live transcript while talking) → /api/voice/send (final + wav for MiMo).
+  // ── Live session: browser PCM → Rust VAD/STT ─────────────────────────
+  // The browser now owns the only microphone. A worklet downsamples to 16 kHz
+  // mono PCM and sends binary frames over the voice WebSocket; the backend
+  // emits partials and exactly one turn_final per utterance.
+  function ensureVoiceWsOpen(timeout = 4000) {
+    return new Promise((resolve, reject) => {
+      if (_voiceWs && _voiceWs.readyState === 1) { resolve(); return; }
+      if (!_voiceWs || _voiceWs.readyState === 3) {
+        try { openVoiceWs(); } catch (e) { reject(e); return; }
+      }
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (_voiceWs && _voiceWs.readyState === 1) {
+          clearInterval(timer);
+          resolve();
+        } else if (Date.now() - started > timeout) {
+          clearInterval(timer);
+          reject(new Error('Voice WebSocket did not open'));
+        }
+      }, 80);
+    });
+  }
+
+  function resolveLiveSession(error) {
+    const waiters = liveSessionWaiters.splice(0);
+    waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer);
+      if (error) waiter.reject(new Error(error));
+      else waiter.resolve();
+    });
+  }
+
+  function startLiveSession(timeout = 6000) {
+    return new Promise((resolve, reject) => {
+      if (!_voiceWs || _voiceWs.readyState !== 1) {
+        reject(new Error('Voice WebSocket is not connected'));
+        return;
+      }
+      const waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const index = liveSessionWaiters.indexOf(waiter);
+          if (index >= 0) liveSessionWaiters.splice(index, 1);
+          reject(new Error('Moonshine session did not start'));
+        }, timeout),
+      };
+      liveSessionWaiters.push(waiter);
+      _voiceWs.send(JSON.stringify({ type: 'session.start' }));
+    });
+  }
+
+  function stopLiveSession() {
+    liveSessionReady = false;
+    resolveLiveSession('voice session stopped');
+    try {
+      if (_voiceWs && _voiceWs.readyState === 1) {
+        _voiceWs.send(JSON.stringify({ type: 'session.stop' }));
+      }
+    } catch (_e) {}
+  }
+
+  function handleLiveSpeechStarted(msg) {
+    roundHasSpeech = true;
+    lastSpeechAt = Date.now();
+    // Do not kill TTS on the first energy frame: speaker echo can leak into
+    // the mic for a frame or two. Wait for a real partial transcript, or an
+    // explicit stop word, before treating this as barge-in.
+    if (speaking) {
+      bargeTurnId = String((msg && msg.turn_id) || '');
+      bargeAt = Date.now();
+    }
+    if (msg && msg.turn_id) send('speech_started', { turnId: msg.turn_id });
+  }
+
+  function maybeBargeIn(text, turnId) {
+    if (!speaking || !bargeTurnId || (turnId && turnId !== bargeTurnId)) return;
+    const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+    const explicit = /\b(stop|cancel|wait|no|hold on|shut up)\b/i.test(text || '');
+    if (words.length < 2 && !explicit) return;
+    if (Date.now() - bargeAt < 120 && !explicit) return;
+    stopSpeaking();
+    if (micOn) setStatus('listening', text || 'Listening');
+  }
+
+  function abortVoiceRun() {
+    runSeq++;
+    thinking = false;
+    try {
+      if (chatId) {
+        fetch(API + '/api/abort', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId }),
+        }).catch(() => {});
+      }
+    } catch (_e) {}
+    try {
+      if (abortRef) abortRef.abort();
+    } catch (_e) {}
+    abortRef = null;
+  }
+
+  function handleLiveTurnFinal(msg) {
+    const turnId = String((msg && msg.turn_id) || '');
+    if (turnId && turnId === lastFinalTurnId) return;
+    if (turnId) lastFinalTurnId = turnId;
+    bargeTurnId = '';
+    const text = cleanTranscript(String((msg && msg.text) || ''));
+    if (!text || isGarbage(text)) {
+      if (accumulated && isGarbage(accumulated)) accumulated = '';
+      return;
+    }
+    accumulated = text;
+    lastLang = detectLanguage(text);
+    setStatus('listening', text);
+    showHint();
+    send('transcript', { text, final: true, turnId });
+    const generation = captureGen;
+    const dispatch = () => {
+      if (!micOn || generation !== captureGen) return;
+      if (sending) { setTimeout(dispatch, 120); return; }
+      sendText(text);
+    };
+    if (thinking || speaking) {
+      if (speaking) stopSpeaking();
+      if (thinking) abortVoiceRun();
+      // Let the cancelled stream settle before starting the replacement turn.
+      setTimeout(dispatch, 250);
+    } else {
+      dispatch();
+    }
+  }
+
+  // ── Capture: legacy cpal path retained for explicit fallback/tests ────
   let recTimer = null;
 
   function startRound() {
@@ -2781,6 +2938,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     const ttsFlights = [];
     let ttsSentences = 0;
     function queueSentenceTts(clean) {
+      if (isStale()) return;
       const useVoice = voiceForLanguage(detectLanguage(clean));
       ttsSentences++;
       if (!incrementalMuted) {
@@ -2824,12 +2982,14 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     }
     try {
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      if (isStale()) return false;
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
       let pendingEvent = '';
       let evDone = false;
       while (true) {
+        if (isStale()) return false;
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -2896,6 +3056,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
           runSeq: seq,
         });
       }
+      if (isStale()) return false;
       const reply = ((lastState && lastState.outputs && lastState.outputs.agent_report) || '').trim();
       if (reply) {
         if (!T_DEBUG && feedStatus) feedStatus.textContent = 'answering';
@@ -3013,6 +3174,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
           model: voiceModel,
           temperature: voiceTemp,
           workspace_path: (voiceWsPath !== null && voiceWsPath !== undefined) ? voiceWsPath : '',
+          workspace_id: voiceWsId || '',
           chat_id: chat,
           attachments: _attachments,
           workspace_kind: voiceWsId === '_house' ? 'house' : (voiceWsId === '_personal' ? 'personal' : 'general'),
@@ -3380,84 +3542,109 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   }
 
   // ── Mic on/off ──
-  function startListening() {
-    if (micOn) return;
-    // Start server-side streaming capture FIRST (Moonshine hears us live).
-    fetch(API + '/api/voice/start', { method: 'POST' })
-      .then((r) => r.json().catch(() => ({})))
-      .then((d) => {
-        if (d && d.active === false) {
-          console.error('[Voice] server capture failed to start:', d.error || 'unknown');
-          setStatus('error', 'Capture failed — check API logs');
-        }
-      })
-      .catch(() => {});
-    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
-      .then((s) => {
-        stream = s;
-        // Shared auCtx (24kHz): mic is resampled down automatically — fine
-        // for a level meter. Never closed here; nodes disconnect on mic-off.
-        const actx = ensureAuCtx();
-        const src = actx.createMediaStreamSource(stream);
-        analyser = actx.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.75;
-        freqBuf = new Uint8Array(analyser.frequencyBinCount);
-        levelBuf = new Uint8Array(analyser.fftSize);
-        src.connect(analyser);
-        micNodes = { src };
-        micOn = true;
-        captureGen++; // fresh generation — stale pre-toggle rounds can't send
-        localStorage.setItem('voice.micOn', '1');
-        accumulated = '';
-        clearVoicePeek();
-        if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
-        lastSpeechAt = 0;
-        lastLang = '';
-        sending = false;
-        mutePendingSend = false;
-        hideHint();
-        updateMicBtn();
-        // Mic is live — boot pulse no longer needed (spinner stays until
-        // TTS warm via the existing loading logic). Visual-only.
-        try { setBootLoading(false); } catch (_e) {}
-        setStatus('listening', 'Listening');
-        send('mic', { mic: true });
-        // Laptop hardware mute button → instant send trigger
-        stream.getAudioTracks().forEach((track) => {
-          track.addEventListener('muted', onTrackMuted);
-        });
-        startRound();
-      })
-      .catch((e) => {
-        console.error('[Voice] mic denied', e);
-        micOn = false;
-        localStorage.setItem('voice.micOn', '0');
-        // stop server capture since we won't listen
-        fetch(API + '/api/voice/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ discard: true }) }).catch(() => {});
-        updateMicBtn();
-        setStatus('error', 'Mic denied');
-        send('mic', { mic: false });
+  async function startListening() {
+    if (micOn || startInFlight) return;
+    startInFlight = true;
+    let s = null;
+    try {
+      // The Rust session must be ready before we send any PCM. It owns VAD,
+      // endpointing and Moonshine so the browser cannot cut sentences apart.
+      await ensureVoiceWsOpen(4000);
+      await startLiveSession(6000);
+
+      s = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      stream = s;
+      const actx = ensureAuCtx();
+      if (!actx.audioWorklet) throw new Error('AudioWorklet is not available');
+      const src = actx.createMediaStreamSource(stream);
+      analyser = actx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.75;
+      freqBuf = new Uint8Array(analyser.frequencyBinCount);
+      levelBuf = new Uint8Array(analyser.fftSize);
+      src.connect(analyser);
+
+      const workletUrl = new URL('pcm-worklet.js', location.href).href;
+      await actx.audioWorklet.addModule(workletUrl);
+      const node = new AudioWorkletNode(actx, 'stark-pcm', {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: 'explicit',
+      });
+      node.port.onmessage = (event) => {
+        if (!micOn || !liveSessionReady) return;
+        try {
+          if (_voiceWs && _voiceWs.readyState === 1) _voiceWs.send(event.data);
+        } catch (_e) {}
+      };
+      src.connect(node);
+      micWorkletNode = node;
+      micNodes = { src, node };
+      micOn = true;
+      captureGen++;
+      localStorage.setItem('voice.micOn', '1');
+      accumulated = '';
+      lastFinalTurnId = '';
+      bargeTurnId = '';
+      clearVoicePeek();
+      if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
+      lastSpeechAt = 0;
+      lastLang = '';
+      sending = false;
+      mutePendingSend = false;
+      hideHint();
+      updateMicBtn();
+      try { setBootLoading(false); } catch (_e) {}
+      setStatus('listening', 'Listening');
+      send('mic', { mic: true });
+      stream.getAudioTracks().forEach((track) => {
+        track.addEventListener('muted', onTrackMuted);
+      });
+    } catch (e) {
+      console.error('[Voice] capture start failed', e);
+      micOn = false;
+      liveSessionReady = false;
+      stopLiveSession();
+      if (s) { s.getTracks().forEach((track) => track.stop()); stream = null; }
+      if (micNodes) { try { micNodes.src.disconnect(); } catch(_e){} micNodes = null; }
+      if (micWorkletNode) { try { micWorkletNode.disconnect(); } catch(_e){} micWorkletNode = null; }
+      analyser = null; freqBuf = null; levelBuf = null;
+      localStorage.setItem('voice.micOn', '0');
+      updateMicBtn();
+      setStatus('error', 'Capture failed — ' + String(e.message || e));
+      send('mic', { mic: false });
+    } finally {
+      startInFlight = false;
+    }
   }
 
   function stopListening() {
     // Mic toggle = capture control ONLY. It must never abort the in-flight
     // LLM run: turning the mic off while the agent answers keeps the chat
-    // trace alive (previously abortRef.abort() here wiped voiceLiveRun back
-    // to Thinking while TTS kept playing). Explicit Stop uses sendNow/abort.
+    // trace alive.
     captureGen++;
     micOn = false;
+    liveSessionReady = false;
     localStorage.setItem('voice.micOn', '0');
     clearTimeout(roundTimer);
     if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
     clearVoicePeek();
-    // Stop server-side capture (discard — mic off, no transcribe).
-    fetch(API + '/api/voice/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ discard: true }) }).catch(() => {});
+    stopLiveSession();
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
     // Disconnect mic nodes but keep the shared auCtx alive — TTS playback
     // uses the same context and must survive mic-off.
-    if (micNodes) { try { micNodes.src.disconnect(); } catch(_e){} micNodes = null; }
+    if (micNodes) {
+      try { micNodes.src.disconnect(); } catch(_e){}
+      try { micNodes.node.disconnect(); } catch(_e){}
+      micNodes = null;
+    }
+    if (micWorkletNode) {
+      try { micWorkletNode.port.onmessage = null; micWorkletNode.disconnect(); } catch(_e){}
+      micWorkletNode = null;
+    }
     analyser = null; freqBuf = null; levelBuf = null;
     stopSpeaking();
     mutePendingSend = false;
@@ -3556,19 +3743,44 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       _voiceWs = ws;
       ws.onopen = () => {
         try { ws.send(JSON.stringify({ type: 'ping' })); } catch(_e) {}
+        // If the socket reconnects while the mic is already on, restart the
+        // Rust STT session automatically; the worklet keeps producing PCM.
+        if (micOn) {
+          startLiveSession(6000).then(() => {
+            if (micOn) setStatus('listening', accumulated || 'Listening');
+          }).catch((e) => {
+            if (micOn) setStatus('error', 'STT reconnect failed');
+            console.error('[Voice] STT reconnect failed', e);
+          });
+        }
       };
       ws.onmessage = (ev) => {
         try {
           if (typeof ev.data !== 'string') return;
           const msg = JSON.parse(ev.data);
           if (!msg || !msg.type) return;
-          if (msg.type === 'transcript') {
+          if (msg.type === 'session.ready') {
+            liveSessionReady = true;
+            resolveLiveSession();
+          } else if (msg.type === 'session.error') {
+            liveSessionReady = false;
+            resolveLiveSession(msg.error || 'Voice session failed');
+            if (micOn) setStatus('error', 'STT unavailable');
+          } else if (msg.type === 'session.stopped') {
+            liveSessionReady = false;
+          } else if (msg.type === 'speech_started') {
+            handleLiveSpeechStarted(msg);
+          } else if (msg.type === 'turn_final') {
+            liveSessionReady = true;
+            handleLiveTurnFinal(msg);
+          } else if (msg.type === 'transcript') {
             const t = (msg.text || '').trim();
+            if (t) maybeBargeIn(t, msg.turn_id || '');
             if (t && t !== lastPeekTextRef()) {
               setLastPeekText(t);
               accumulated = t;
               setStatus('listening', t);
-              send('transcript', { text: t });
+              send('transcript', { text: t, final: false, turnId: msg.turn_id || '' });
               showHint();
             }
           } else if (msg.type === 'final') {
@@ -3586,10 +3798,13 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       };
       ws.onclose = () => {
         if (_voiceWs === ws) _voiceWs = null;
+        liveSessionReady = false;
+        resolveLiveSession('voice connection closed');
         // Fail open: HTTP fallback covers the gap; the overlay heartbeat
         // below reconnects (no backoff chain — one timer owns supervision).
         const waiters = _wsFlushWaiters.splice(0);
         waiters.forEach((w) => { try { w(null); } catch(_e){} });
+        if (micOn) setStatus('error', 'Voice connection lost');
         try { if (!hbTimer) hbTimer = setInterval(overlayHeartbeat, 500); } catch(_e){}
       };
       ws.onerror = () => { try { ws.close(); } catch(_e){} };

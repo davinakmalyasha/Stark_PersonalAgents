@@ -2,6 +2,7 @@ use std::pin::Pin;
 
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -23,6 +24,22 @@ impl ProviderConfig {
         let explicit_base = first_env(&["STARK_PROVIDER_BASE", "OPENAI_BASE_URL"]);
         let explicit_key = first_env(&["STARK_API_KEY", "OPENAI_API_KEY"]);
         let explicit_model = first_env(&["STARK_MODEL", "OPENAI_MODEL"]);
+
+        if requested_mode == "openrouter" {
+            return Self {
+                mode: "openrouter".to_string(),
+                base_url: explicit_base
+                    .or_else(|| first_env(&["OPENROUTER_BASE_URL"]))
+                    .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+                api_key: explicit_key
+                    .or_else(|| first_env(&["OPENROUTER_API_KEY"]))
+                    .or_else(|| first_key(&["OPENROUTER_API_KEYS"]))
+                    .unwrap_or_default(),
+                model: explicit_model
+                    .or_else(|| first_env(&["OPENROUTER_MODEL", "STARK_MODEL"]))
+                    .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".to_string()),
+            };
+        }
 
         if requested_mode == "command" || requested_mode == "commandcode" {
             return Self {
@@ -77,7 +94,7 @@ impl ProviderConfig {
         if requested.is_empty() || requested.eq_ignore_ascii_case("Automatic Fallback") {
             return self.model.clone();
         }
-        if self.mode == "command"
+        if matches!(self.mode.as_str(), "command" | "openrouter")
             && matches!(
                 requested,
                 "deepseek-v4.1-flash" | "deepseek-flash" | "deepseek:v4.1-flash"
@@ -107,6 +124,17 @@ fn first_env(names: &[&str]) -> Option<String> {
         std::env::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn first_key(names: &[&str]) -> Option<String> {
+    first_env(names).map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .find(|part| !part.is_empty())
+            .unwrap_or("")
+            .to_string()
     })
 }
 
@@ -142,16 +170,68 @@ impl ToolCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagePart {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
+}
+
+impl Serialize for ChatMessage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("ChatMessage", 5)?;
+        state.serialize_field("role", &self.role)?;
+        if self.images.is_empty() {
+            if let Some(content) = &self.content {
+                state.serialize_field("content", content)?;
+            }
+        } else {
+            let mut parts = Vec::new();
+            let mut text = self.content.clone().unwrap_or_default();
+            for image in &self.images {
+                if !image.note.is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str("- ");
+                    text.push_str(&image.note);
+                }
+            }
+            if !text.is_empty() {
+                parts.push(json!({"type": "text", "text": text}));
+            }
+            for image in &self.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": image.url},
+                }));
+            }
+            state.serialize_field("content", &parts)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            state.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(name) = &self.name {
+            state.serialize_field("name", name)?;
+        }
+        state.end()
+    }
 }
 
 impl ChatMessage {
@@ -174,6 +254,7 @@ impl ChatMessage {
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -184,6 +265,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -194,6 +276,18 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImagePart>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            images,
         }
     }
 }
@@ -280,19 +374,27 @@ impl Provider {
             body["tool_choice"] = Value::String("auto".to_string());
         }
 
-        let response = self
-            .client
-            .post(self.config.endpoint())
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
+        let mut attempt = 0usize;
+        let response = loop {
+            let response = self
+                .client
+                .post(self.config.endpoint())
+                .bearer_auth(&self.config.api_key)
+                .json(&body)
+                .send()
+                .await?;
+            if response.status().is_success() {
+                break response;
+            }
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
+            if matches!(status, 429 | 500 | 502 | 503 | 504) && attempt < 2 {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(700 * attempt as u64)).await;
+                continue;
+            }
             return Err(ProviderError::HttpStatus { status, body });
-        }
+        };
 
         let events = response.bytes_stream().eventsource();
         let stream = async_stream::try_stream! {
@@ -450,6 +552,24 @@ mod tests {
                 finish_reason: None
             }
         ));
+    }
+
+    #[test]
+    fn image_messages_use_openai_content_parts() {
+        let message = ChatMessage::user_with_images(
+            "look here",
+            vec![ImagePart {
+                url: "data:image/png;base64,AAAA".to_string(),
+                note: "screen".to_string(),
+            }],
+        );
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["role"], "user");
+        let parts = value["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"].as_str().unwrap().contains("screen"));
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]

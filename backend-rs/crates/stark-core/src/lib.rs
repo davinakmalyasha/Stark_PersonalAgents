@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
-use stark_providers::{ChatMessage, Provider, ProviderEvent, ToolCall};
+use stark_providers::{ChatMessage, ImagePart, Provider, ProviderEvent, ToolCall};
 use stark_store::{ChatStore, StoreError};
 use stark_tools::{Checkpoint, PlanStore, QuestionBroker, ToolContext, ToolOutcome};
 use thiserror::Error;
@@ -335,6 +335,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    images: Vec::new(),
                 });
             }
         }
@@ -377,6 +378,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         tools = tools.with_checkpoint(checkpoint.clone());
     }
     let agent_label = ctx.agent_label();
+    let mut last_continuous_screen: Option<Instant> = None;
 
     for _step in 0..MAX_STEPS {
         if ctx.cancel.is_cancelled() {
@@ -386,6 +388,19 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
         if let Some(message) = ctx.steering.lock().unwrap().pop_front() {
             messages.push(ChatMessage::user(&message));
+        }
+
+        if last_continuous_screen.is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
+            && let Some(image) = stark_tools::latest_continuous_image()
+        {
+            messages.push(ChatMessage::user_with_images(
+                "[Live screen (continuous share)]",
+                vec![ImagePart {
+                    url: image.url,
+                    note: image.note,
+                }],
+            ));
+            last_continuous_screen = Some(Instant::now());
         }
 
         let mut stream = match ctx
@@ -690,6 +705,21 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     }),
                 )
                 .await;
+        }
+
+        let images = stark_tools::drain_images(&ctx.chat_id);
+        if !images.is_empty() {
+            let images = images
+                .into_iter()
+                .map(|image| ImagePart {
+                    url: image.url,
+                    note: image.note,
+                })
+                .collect();
+            messages.push(ChatMessage::user_with_images(
+                "[Inline image(s) from tool result]",
+                images,
+            ));
         }
 
         if !reasoning.is_empty() {

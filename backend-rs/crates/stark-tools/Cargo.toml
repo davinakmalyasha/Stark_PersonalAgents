@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
 chrono.workspace = true
 dashmap.workspace = true
 globset.workspace = true

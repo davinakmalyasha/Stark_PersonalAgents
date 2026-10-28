@@ -36,6 +36,8 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 mod pairing;
+mod screen_routes;
+mod voice;
 use pairing::PairingStore;
 
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
@@ -188,6 +190,7 @@ struct ServerState {
     pairing: Arc<PairingStore>,
     ui_state_path: PathBuf,
     harness_root: PathBuf,
+    voice: Option<Arc<voice::VoiceRuntime>>,
 }
 
 #[derive(Clone)]
@@ -228,16 +231,22 @@ fn default_temperature() -> f64 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
+    let _ = tracing_log::LogTracer::init();
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "stark_server=info,tower_http=info".into()),
         )
-        .init();
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
     let harness_root = std::env::var("STARK_HARNESS_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let app_env = harness_root.join(".env");
+    if app_env.is_file() {
+        let _ = dotenvy::from_path(&app_env);
+    }
     let provider_config = ProviderConfig::from_env();
     if !provider_config.has_key() {
         tracing::warn!(
@@ -246,6 +255,13 @@ async fn main() -> anyhow::Result<()> {
     }
     let provider = Provider::new(provider_config)?;
     let store = ChatStore::open(&harness_root).await?;
+    let voice = stark_voice::resolve_models_dir(&harness_root).map(|dir| {
+        tracing::info!("voice models: {}", dir.display());
+        Arc::new(voice::VoiceRuntime::new(dir))
+    });
+    if voice.is_none() {
+        tracing::warn!("no voice models directory found; voice/TTS endpoints will return 503");
+    }
     let state = ServerState {
         store,
         provider,
@@ -255,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         pairing: Arc::new(PairingStore::new(&harness_root)),
         ui_state_path: harness_root.join(".deep_agents").join("ui_state.json"),
         harness_root,
+        voice,
     };
     let scheduler_state = state.clone();
     let group_runner_state = state.clone();
@@ -361,6 +378,31 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/schedules/{schedule_id}",
             delete(delete_schedule_handler),
+        )
+        .route("/api/turn_detection", get(voice::turn_detection_handler))
+        .route(
+            "/api/vision/frame",
+            post(screen_routes::vision_frame_handler)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/voice/ws", get(screen_routes::voice_ws_handler))
+        .route("/api/tts", post(voice::tts_handler))
+        .route("/api/tts/stream", post(voice::tts_stream_handler))
+        .route("/api/tts/cancel", post(voice::tts_cancel_handler))
+        .route("/api/voice/start", post(voice::voice_start_handler))
+        .route("/api/voice/status", get(voice::voice_status_handler))
+        .route("/api/voice/stop", post(voice::voice_stop_handler))
+        .route("/api/voice/mute", post(voice::voice_mute_handler))
+        .route("/api/voice/interrupt", post(voice::voice_interrupt_handler))
+        .route("/api/voice/peek", get(voice::voice_peek_handler))
+        .route("/api/voice/send", post(voice::voice_send_handler))
+        .route("/api/voice/warm_tts", post(voice::tts_warm_handler))
+        .route("/api/voice/release_tts", post(voice::tts_release_handler))
+        .route("/api/voice/release_asr", post(voice::release_asr_handler))
+        .route("/api/voice/tts_status", get(voice::tts_status_handler))
+        .route(
+            "/api/transcribe",
+            post(voice::transcribe_handler).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/api/canvas/{chat_id}/status", get(canvas_status_handler))
         .route("/api/house/state", get(house_state_handler))
@@ -2922,6 +2964,7 @@ mod tests {
             pairing: Arc::new(PairingStore::new(dir.path())),
             ui_state_path: dir.path().join("ui_state.json"),
             harness_root: dir.path().to_path_buf(),
+            voice: None,
         };
         spawn_follow_up_run(
             state.clone(),

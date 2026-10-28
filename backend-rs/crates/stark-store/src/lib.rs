@@ -920,16 +920,45 @@ impl ChatStore {
         };
         let compaction = &entries[last_compaction];
         let mut result = Vec::new();
-        if let Some(summary) = compaction.get("summary").and_then(Value::as_str) {
+        let checkpoint_format = compaction
+            .get("checkpoint_format")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let summary = compaction
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tail = compaction
+            .get("retained_tail")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if checkpoint_format == "opencode-v1" {
+            let recent = recent_text(&tail);
             result.push(json!({
                 "type": "message",
-                "role": "system",
-                "content": format!("[CONTEXT SUMMARY]
-            {summary}"),
+                "role": "user",
+                "content": format!(
+                    "<conversation-checkpoint>
+<summary>
+{summary}
+</summary>
+<recent-context>
+{recent}
+</recent-context>
+</conversation-checkpoint>"
+                ),
             }));
-        }
-        if let Some(tail) = compaction.get("retained_tail").and_then(Value::as_array) {
-            result.extend(tail.iter().cloned());
+        } else {
+            if !summary.is_empty() {
+                result.push(json!({
+                    "type": "message",
+                    "role": "system",
+                    "content": format!("[CONTEXT SUMMARY]
+                {summary}"),
+                }));
+            }
+            result.extend(tail);
         }
         result.extend(
             entries[last_compaction + 1..]
@@ -1101,6 +1130,47 @@ fn session_path_for(workspace: &Path, workspace_id: &str, chat_id: &str) -> Path
         .join(kind)
         .join(id)
         .join(format!("{chat_id}.jsonl"))
+}
+
+fn recent_text(entries: &[Value]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+        let content = &entry["content"];
+        let mut rendered = String::new();
+        if let Some(text) = content.as_str() {
+            rendered.push_str(text);
+        } else if let Some(blocks) = content.as_array() {
+            for block in blocks {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    rendered.push_str(text);
+                } else if block.get("type").and_then(Value::as_str) == Some("toolCall") {
+                    if !rendered.is_empty() {
+                        rendered.push('\n');
+                    }
+                    rendered.push_str(&format!(
+                        "[Assistant tool call]: {}({})",
+                        block.get("name").and_then(Value::as_str).unwrap_or(""),
+                        block.get("arguments").cloned().unwrap_or_else(|| json!({}))
+                    ));
+                }
+            }
+        }
+        if rendered.trim().is_empty() {
+            continue;
+        }
+        let label = match role {
+            "user" => "User",
+            "assistant" => "Assistant",
+            "toolResult" => "Tool result",
+            other => other,
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[{label}]: {rendered}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1292,6 +1362,42 @@ mod tests {
         );
         assert_eq!(entries[1]["content"], "recent");
         assert_eq!(entries[3]["content"], "after");
+        assert!(!entries.iter().any(|entry| entry["content"] == "old"));
+    }
+
+    #[tokio::test]
+    async fn opencode_checkpoint_restores_one_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        for entry in [
+            json!({"type": "message", "role": "user", "content": "old"}),
+            json!({
+                "type": "compaction",
+                "checkpoint_format": "opencode-v1",
+                "summary": "checkpoint summary",
+                "retained_tail": [
+                    {"type": "message", "role": "user", "content": "recent"},
+                    {"type": "message", "role": "assistant", "content": "answer"}
+                ]
+            }),
+            json!({"type": "message", "role": "user", "content": "after"}),
+        ] {
+            store
+                .append_session_entry_for("_general", dir.path(), "chat-checkpoint", entry)
+                .await
+                .unwrap();
+        }
+        let entries = store
+            .read_session_entries("_general", dir.path(), "chat-checkpoint")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["role"], "user");
+        let content = entries[0]["content"].as_str().unwrap();
+        assert!(content.starts_with("<conversation-checkpoint>"));
+        assert!(content.contains("checkpoint summary"));
+        assert!(content.contains("[User]: recent"));
+        assert_eq!(entries[1]["content"], "after");
         assert!(!entries.iter().any(|entry| entry["content"] == "old"));
     }
 

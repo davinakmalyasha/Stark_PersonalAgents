@@ -38,20 +38,36 @@ export function usePipeline(): UsePipelineReturn {
   // tok/s estimation: chars since last delta / seconds since last delta, smoothed
   const rateRef = useRef(emptyRateAccum());
   const streamRef = useRef(emptyStreamAccum());
+  const frameRef = useRef<number | null>(null);
+  const rateValueRef = useRef(0);
 
   const applyDelta = useCallback((delta: StreamDelta) => {
-    const rate = applyDeltaToAccum(streamRef.current, rateRef.current, delta, performance.now());
-    setStreaming({
-      text: streamRef.current.text,
-      reasoning: streamRef.current.reasoning,
-      agent: streamRef.current.agent,
-      segments: [...streamRef.current.segments],
-      active: true,
-      rate,
+    rateValueRef.current = applyDeltaToAccum(
+      streamRef.current,
+      rateRef.current,
+      delta,
+      performance.now(),
+    );
+    // Coalesce provider chunks into one React update per animation frame.
+    if (frameRef.current !== null) return;
+    frameRef.current = requestAnimationFrame(() => {
+      frameRef.current = null;
+      setStreaming({
+        text: streamRef.current.text,
+        reasoning: streamRef.current.reasoning,
+        agent: streamRef.current.agent,
+        segments: [...streamRef.current.segments],
+        active: true,
+        rate: rateValueRef.current,
+      });
     });
   }, []);
 
   const resetStream = useCallback(() => {
+    if (frameRef.current !== null) {
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
     streamRef.current = emptyStreamAccum();
     rateRef.current = emptyRateAccum();
     setStreaming(EMPTY_STREAM);

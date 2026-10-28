@@ -1,7 +1,7 @@
 {
   "contract_version": 1,
   "source": "tools/_schemas.py",
-  "tool_count": 42,
+  "tool_count": 43,
   "tools": [
     {
       "name": "read_file",
@@ -1660,6 +1660,35 @@
       "exposed": true,
       "required": [],
       "doc": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) — Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching."
+    },
+    {
+      "name": "run_code",
+      "description": "Run a short JavaScript program that calls Stark tools directly. Use this for multi-step coding work: read or search several files, compute over the results, edit files, run commands, and return one compact result. Tool calls are synchronous: const text = tools.read_file({file_path: 'src/lib.rs'}); use JSON.parse(text) for structured output. Use search('query') to discover available tools. Programs have no filesystem, network, process, or import access except through tools. Not available in plan mode. Default limits: 30s, 50 tool calls, 32KB result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "JavaScript function body. Use return to send a JSON-serializable result."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Execution timeout in milliseconds (default 30000, max 120000)."
+          },
+          "max_tool_calls": {
+            "type": "integer",
+            "description": "Maximum inner tool calls (default 50, max 100)."
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "exposed": true,
+      "required": [
+        "code"
+      ],
+      "doc": "run_code(code, timeout_ms?, max_tool_calls?) — Run a restricted JavaScript program that calls Stark tools. Use tools.<name>({...}) synchronously and return one compact value."
     }
   ],
   "scope_map": {
@@ -1670,7 +1699,8 @@
       "search_code",
       "ask_user",
       "update_plan",
-      "call_subagent"
+      "call_subagent",
+      "run_code"
     ],
     "general": [
       "run_command",

@@ -27,8 +27,13 @@ pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
 
-const MAX_STEPS: usize = 12;
 const HISTORY_LIMIT: usize = 40;
+const DEFAULT_RUN_SECONDS: u64 = 3_600;
+const DEFAULT_RUN_TOKENS: u64 = 4_000_000;
+const DEFAULT_RUN_TOOL_CALLS: usize = 500;
+const REPEAT_READ_LIMIT: usize = 4;
+const REPEAT_WRITE_LIMIT: usize = 5;
+const MAX_CONSECUTIVE_ERRORS: usize = 5;
 
 #[derive(Debug, Clone)]
 enum ChildStatus {
@@ -170,14 +175,22 @@ fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
     let start = entries.len().saturating_sub(80);
     let mut messages = Vec::new();
     if start > 0
-        && entries
-            .first()
-            .is_some_and(|entry| entry.get("role").and_then(Value::as_str) == Some("system"))
-        && let Some(summary) = entries.first().and_then(|entry| entry.get("content"))
+        && let Some(first) = entries.first()
     {
-        let summary = content_text(summary);
-        if !summary.is_empty() {
-            messages.push(ChatMessage::system(summary));
+        let role = first.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "system" {
+            let summary = first.get("content").map(content_text).unwrap_or_default();
+            if !summary.is_empty() {
+                messages.push(ChatMessage::system(summary));
+            }
+        } else if role == "user" {
+            let checkpoint = first.get("content").map(content_text).unwrap_or_default();
+            if checkpoint
+                .trim_start()
+                .starts_with("<conversation-checkpoint>")
+            {
+                messages.push(ChatMessage::user(checkpoint));
+            }
         }
     }
     for entry in &entries[start..] {
@@ -329,6 +342,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
              Do not edit files, spawn subagents, or run commands with side effects.",
         );
     }
+    if mode != "plan" && ctx.scope == "developer" {
+        system_prompt.push_str(
+            " For multi-step coding work, prefer run_code: one short JavaScript program can call              tools.read_file/search_code/edit_file/run_command synchronously, loop over results,              and return one compact value without putting every intermediate result in context.",
+        );
+    }
     let mut messages = vec![ChatMessage::system(system_prompt)];
     if session_entries.is_empty() {
         for message in history {
@@ -356,8 +374,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     } else {
         messages.push(ChatMessage::user_with_images(&prompt, ctx.images.clone()));
     }
-    let mut compactions = 0;
-    maybe_compact(&ctx, &mut messages, &mut compactions).await;
+    maybe_compact(&ctx, &mut messages).await;
 
     let mut state = AppState {
         active_node: "agent".to_string(),
@@ -373,6 +390,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     ctx.emit_state(&mut state);
 
     let tool_specs = stark_tools::tool_specs_for_scope(&mode, &ctx.scope);
+    let agent_label = ctx.agent_label();
     let mut tools = ToolContext::new(
         ctx.workspace.clone(),
         ctx.chat_id.clone(),
@@ -385,13 +403,46 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());
     }
-    let agent_label = ctx.agent_label();
+    {
+        let tx = ctx.tx.clone();
+        let agent = agent_label.clone();
+        tools = tools.with_code_delta(Arc::new(move |delta| {
+            let _ = tx.send(ServerEvent::new("delta", delta.with_agent(agent.clone())));
+        }));
+    }
     let mut last_continuous_screen: Option<Instant> = None;
+    let (max_wall, max_tokens, max_tool_calls) = run_limits();
+    let run_started = Instant::now();
+    let mut tool_calls_used = 0usize;
+    let mut repeat_counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut consecutive_errors = 0usize;
 
-    for _step in 0..MAX_STEPS {
+    loop {
         if ctx.cancel.is_cancelled() {
             finish_aborted(&ctx, &mut state).await;
             return Ok(());
+        }
+        if run_started.elapsed() >= max_wall {
+            let message = format!(
+                "Run stopped: wall-clock budget of {} seconds exhausted.",
+                max_wall.as_secs()
+            );
+            fail(&ctx, &mut state, message.clone()).await;
+            return Err(RunError::Message(message));
+        }
+        let used_tokens = state
+            .token_usage
+            .total_input_tokens
+            .saturating_add(state.token_usage.total_output_tokens);
+        if used_tokens >= max_tokens {
+            let message = format!("Run stopped: token budget of {max_tokens} exhausted.");
+            fail(&ctx, &mut state, message.clone()).await;
+            return Err(RunError::Message(message));
+        }
+        if tool_calls_used >= max_tool_calls {
+            let message = format!("Run stopped: tool-call budget of {max_tool_calls} exhausted.");
+            fail(&ctx, &mut state, message.clone()).await;
+            return Err(RunError::Message(message));
         }
 
         if let Some(message) = ctx.steering.lock().unwrap().pop_front() {
@@ -715,6 +766,35 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     }),
                 )
                 .await;
+
+            tool_calls_used += 1;
+            if outcome.is_error {
+                consecutive_errors += 1;
+            } else {
+                consecutive_errors = 0;
+            }
+            let repeat_key = (call.function.name.clone(), args_text.clone());
+            let repeat_count = repeat_counts.entry(repeat_key).or_insert(0);
+            *repeat_count += 1;
+            let repeat_limit = if is_read_only_tool(&call.function.name) {
+                REPEAT_READ_LIMIT
+            } else {
+                REPEAT_WRITE_LIMIT
+            };
+            if *repeat_count >= repeat_limit {
+                let message = format!(
+                    "Run stopped: {} was called {} times with identical arguments. Use the previous result or change the approach.",
+                    call.function.name, repeat_count
+                );
+                fail(&ctx, &mut state, message.clone()).await;
+                return Err(RunError::Message(message));
+            }
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                let message =
+                    format!("Run stopped: {MAX_CONSECUTIVE_ERRORS} consecutive tool errors.");
+                fail(&ctx, &mut state, message.clone()).await;
+                return Err(RunError::Message(message));
+            }
         }
 
         let images = stark_tools::drain_images(&ctx.chat_id);
@@ -737,16 +817,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 .thoughts
                 .insert(format!("step-{}", state.state_version), reasoning);
         }
-        maybe_compact(&ctx, &mut messages, &mut compactions).await;
+        maybe_compact(&ctx, &mut messages).await;
     }
-
-    let message = format!("Stopped after {MAX_STEPS} steps without a final answer.");
-    state.error = Some(message.clone());
-    ctx.store
-        .append_message(&ctx.chat_id, "assistant", &message, false)
-        .await?;
-    ctx.emit_state(&mut state);
-    Err(RunError::Message(message))
 }
 
 pub fn run_agent(
@@ -755,11 +827,43 @@ pub fn run_agent(
 ) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
     Box::pin(run_agent_inner(ctx, prompt))
 }
-async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, compactions: &mut usize) {
-    if *compactions >= 2 {
-        return;
-    }
-    let policy = compaction::CompactionPolicy::from_env(&ctx.scope);
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn run_limits() -> (Duration, u64, usize) {
+    (
+        Duration::from_secs(env_u64("STARK_RUN_MAX_SECONDS", DEFAULT_RUN_SECONDS)),
+        env_u64("STARK_RUN_MAX_TOKENS", DEFAULT_RUN_TOKENS),
+        env_u64("STARK_RUN_MAX_TOOL_CALLS", DEFAULT_RUN_TOOL_CALLS as u64) as usize,
+    )
+}
+
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "search_code"
+            | "read_pdf"
+            | "look_at_screen"
+            | "house_get_state"
+            | "house_get_device"
+            | "house_get_history"
+            | "delegation_status"
+            | "group_board"
+            | "group_item_detail"
+            | "group_events"
+            | "canvas_mode"
+            | "files_changed"
+    )
+}
+
+async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>) {
+    let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
     let tokens = compaction::estimate_tokens(messages);
     if tokens >= policy.hard_limit_tokens {
         tracing::warn!(
@@ -776,8 +880,14 @@ async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, compac
     else {
         return;
     };
+    if compaction::estimate_tokens(&outcome.messages) >= policy.trigger_tokens {
+        tracing::warn!(
+            "chat {} compaction did not reduce the context below the trigger; keeping the previous history",
+            ctx.chat_id
+        );
+        return;
+    }
     *messages = outcome.messages;
-    *compactions += 1;
     if let Err(error) = ctx
         .store
         .append_session_entry_for(
@@ -786,6 +896,7 @@ async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, compac
             &ctx.chat_id,
             json!({
                 "type": "compaction",
+                "checkpoint_format": "opencode-v1",
                 "summary": outcome.summary,
                 "retained_tail": outcome.retained_tail,
                 "tokens_before": outcome.tokens_before,
@@ -1314,6 +1425,30 @@ mod tests {
             .collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["title"], "reply DONE");
+    }
+
+    #[test]
+    fn session_messages_keep_checkpoint_when_truncating() {
+        let mut entries = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": "<conversation-checkpoint>
+<summary>s</summary>
+</conversation-checkpoint>"
+        })];
+        for index in 0..100 {
+            entries
+                .push(json!({"type": "message", "role": "user", "content": format!("m{index}")}));
+        }
+        let messages = session_messages(&entries);
+        assert_eq!(messages[0].role, "user");
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("<conversation-checkpoint>")
+        );
     }
 
     #[test]

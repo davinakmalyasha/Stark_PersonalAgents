@@ -1,6 +1,6 @@
 # Stark Rust Rewrite — Design Docs
 
-Status: **design set, implementation not started**
+Status: **core implemented in `backend-rs`; parity work continues**
 Scope: replace the Python backend with a Rust backend that preserves the
 existing product contract — features, tool descriptions/schemas, HTTP/SSE API,
 persistence, and the multi-agent concept — while following the architecture
@@ -46,6 +46,8 @@ conflicts with these docs, update the doc first, then the code.
 | 10 | [Parity Testing](./10-parity-testing.md) | Golden fixtures, Python-vs-Rust harness, CI gates |
 | 11 | [Migration Plan](./11-migration-plan.md) | Phases, acceptance criteria, estimates, risks, cutover |
 | 12 | [Setup & Branching](./12-setup-and-branching.md) | Rust install, repo snapshot, branch, Codex clone, bootstrap |
+| 13 | [Canvas & MCP](./13-canvas-mcp.md) | Canvas watches, wake loop, MCP stdio/HTTP, approvals |
+| 14 | [Code Mode & Compaction](./14-code-mode-compaction.md) | QuickJS tool programs, checkpoint compaction, run budgets |
 
 ---
 

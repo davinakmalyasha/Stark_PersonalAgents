@@ -1,3 +1,18 @@
+//! Conversation compaction.
+//!
+//! The shape follows opencode's checkpoint model:
+//!
+//! 1. When the request approaches the model window, summarize the older
+//!    history into a structured Markdown checkpoint.
+//! 2. Keep the newest `keep` tokens as a textual `<recent-context>` beside
+//!    the summary, so the next request starts with one synthetic user
+//!    message instead of a second system prompt.
+//! 3. On a later compaction, update the existing checkpoint in place rather
+//!    than summarizing a summary.
+//!
+//! Token counts are estimates: provider usage is not available inside the
+//! compaction step, so characters/4 plus a small per-message overhead is used.
+
 use std::env;
 
 use futures_util::StreamExt;
@@ -5,14 +20,61 @@ use serde_json::{Value, json};
 use stark_providers::{ChatMessage, Provider, ProviderEvent};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_TRIGGER_TOKENS: usize = 500_000;
-const DEFAULT_HARD_LIMIT_TOKENS: usize = 550_000;
-const DEFAULT_SUMMARY_TOKENS: usize = 4_096;
-const MAX_SUMMARY_INPUT_CHARS: usize = 120_000;
-const MAX_SUMMARY_OUTPUT_CHARS: usize = 16_000;
-const MIN_TAIL_TOKENS: usize = 8_000;
-const MAX_TAIL_TOKENS: usize = 60_000;
+const DEFAULT_CONTEXT_WINDOW: usize = 500_000;
+const DEFAULT_OUTPUT_TOKENS: usize = 32_000;
+const DEFAULT_SUMMARY_TOKENS: usize = 8_000;
+const DEFAULT_KEEP_TOKENS: usize = 15_000;
+const RESERVE_SHARE: f64 = 0.15;
+const RESERVE_MIN: usize = 16_000;
+const MAX_SUMMARY_INPUT_CHARS: usize = 1_500_000;
+const MAX_SUMMARY_OUTPUT_CHARS: usize = 32_000;
+const MAX_TAIL_MESSAGE_CHARS: usize = 12_000;
+const TRANSCRIPT_CLIP: usize = 2_000;
 
+const SUMMARY_TEMPLATE: &str = r#"You MUST use this format for your response (you may omit sections that aren't applicable). Do not include the <template> tags in your response.
+<template>
+## Objective
+- [one or two brief sentences describing what the user is trying to accomplish]
+
+## Requirements
+- [constraints, preferences, requirements, and scope boundaries stated by the user, or "(none)"]
+
+## Decisions
+- [decisions already made and why, or "(none)"]
+
+## Work State
+Break the objective into smaller goals and report which are completed, which are being worked on, and which are blocked.
+### Completed
+- [goals that have been completed; otherwise "(none)"]
+
+### Active
+- [goals currently being worked on; otherwise "(none)"]
+
+### Blocked
+- [anything blocking progress, and why; otherwise "(none)"]
+
+## Next Move
+1. [ordered list of next actions, or "(none)"]
+
+## Relevant Files
+List the files and directories, other than the current working directory, that another agent would need to open to continue this work. Include at most 15, most important first. Do not list every file that was read or changed. Include paths outside the current working directory when relevant. If none, write "(none)".
+- `[file or directory path]`: [brief reason it matters]
+
+## Important Context
+- [facts the next agent cannot continue without and cannot easily find on its own; or "(none)"]
+</template>"#;
+
+const NUDGE: &str = "The previous response did not fill in the required summary template. Do not call tools.      Return the summary as text using the exact section headings from the template.";
+
+const SUMMARY_RULES: &str = r#"Rules:
+- Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.
+- Prefer short references over detailed restatement. It is fine to leave out information the next agent can recover from the code or the files listed above.
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
+- Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.
+- Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.
+- Do not mention the summary process or that context was compacted."#;
+
+#[derive(Clone, Debug)]
 pub struct CompactionPolicy {
     pub trigger_tokens: usize,
     pub hard_limit_tokens: usize,
@@ -21,27 +83,32 @@ pub struct CompactionPolicy {
 }
 
 impl CompactionPolicy {
-    pub fn from_env(role: &str) -> Self {
-        let role_key: String = role
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character.to_ascii_uppercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let trigger_tokens = setting(&role_key, "CHECKPOINT_TOKENS", DEFAULT_TRIGGER_TOKENS);
+    pub fn from_env(role: &str, model: &str) -> Self {
+        let role_key = env_key(role);
+        let model_key = env_key(model);
+        let context_window = positive_env(&format!("STARK_MODEL_CONTEXT_{model_key}"))
+            .or_else(|| positive_env("STARK_MODEL_CONTEXT"))
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let output_tokens = positive_env(&format!("STARK_MODEL_OUTPUT_{model_key}"))
+            .or_else(|| positive_env("STARK_MODEL_OUTPUT"))
+            .unwrap_or(DEFAULT_OUTPUT_TOKENS);
+        let ceiling = ceiling_for(context_window);
+        let trigger_tokens = setting(&role_key, "CHECKPOINT_TOKENS", ceiling);
         let hard_limit_tokens =
-            setting(&role_key, "HARD_LIMIT", DEFAULT_HARD_LIMIT_TOKENS).max(trigger_tokens);
-        let summary_output_tokens =
-            setting(&role_key, "SUMMARY_OUTPUT_TOKENS", DEFAULT_SUMMARY_TOKENS);
-        let tail_tokens = setting(
+            setting(&role_key, "HARD_LIMIT", context_window.max(trigger_tokens));
+        let summary_output_tokens = setting(
             &role_key,
-            "TAIL_TOKENS",
-            (trigger_tokens / 4).clamp(MIN_TAIL_TOKENS, MAX_TAIL_TOKENS),
+            "SUMMARY_OUTPUT_TOKENS",
+            output_tokens.clamp(1_024, DEFAULT_SUMMARY_TOKENS),
         );
+        // A large window can afford more recent verbatim context; 15k is
+        // opencode's default, 30k keeps working state for 500k-class models.
+        let default_keep = if context_window >= 400_000 {
+            30_000
+        } else {
+            DEFAULT_KEEP_TOKENS
+        };
+        let tail_tokens = setting(&role_key, "KEEP_TOKENS", default_keep);
         Self {
             trigger_tokens,
             hard_limit_tokens,
@@ -51,10 +118,24 @@ impl CompactionPolicy {
     }
 }
 
+fn env_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn setting(role_key: &str, suffix: &str, default: usize) -> usize {
     let role_name = format!("{role_key}_COMPACTION_{suffix}");
     positive_env(&role_name)
-        .unwrap_or_else(|| positive_env(&format!("COMPACTION_{suffix}")).unwrap_or(default))
+        .or_else(|| positive_env(&format!("COMPACTION_{suffix}")))
+        .unwrap_or(default)
 }
 
 fn positive_env(name: &str) -> Option<usize> {
@@ -64,6 +145,22 @@ fn positive_env(name: &str) -> Option<usize> {
         .parse::<usize>()
         .ok()
         .filter(|value| *value > 0)
+}
+
+/// The largest prompt the model should receive while leaving room for the
+/// reply: 15% of the window, or 16k, whichever is larger. Mirrors opencode's
+/// `calculateCeiling`.
+pub fn ceiling_for(window: usize) -> usize {
+    if window == 0 {
+        return 0;
+    }
+    let reserve =
+        ((window as f64 * RESERVE_SHARE).floor() as usize).max(if window >= RESERVE_MIN * 2 {
+            RESERVE_MIN
+        } else {
+            0
+        });
+    window.saturating_sub(reserve)
 }
 
 pub struct CompactionOutcome {
@@ -129,20 +226,32 @@ pub async fn compact_history(
     let cut = split_index(messages, policy.tail_tokens)?;
     let tokens_before = estimate_tokens(messages);
     let summary = summarize(provider, cancel, &messages[1..cut], policy).await?;
-    let mut compacted = Vec::with_capacity(messages.len() - cut + 2);
-    compacted.push(messages[0].clone());
-    compacted.push(ChatMessage::system(format!("[CONTEXT SUMMARY]\n{summary}")));
-    compacted.extend(messages[cut..].iter().cloned());
-    let retained_tail = messages[cut..]
-        .iter()
-        .map(message_to_entry)
-        .collect::<Vec<_>>();
+    let tail = &messages[cut..];
+    let tail_text = tail_transcript(tail);
+    let checkpoint = format_checkpoint(&summary, &tail_text);
+    let compacted = vec![messages[0].clone(), ChatMessage::user(checkpoint)];
+    let retained_tail = tail.iter().map(message_to_entry).collect::<Vec<_>>();
     Some(CompactionOutcome {
         messages: compacted,
         summary,
         retained_tail,
         tokens_before,
     })
+}
+
+pub fn format_checkpoint(summary: &str, recent: &str) -> String {
+    format!(
+        "<conversation-checkpoint>\n<summary>\n{summary}\n</summary>\n<recent-context>\n{recent}\n</recent-context>\n</conversation-checkpoint>"
+    )
+}
+
+pub fn is_checkpoint(message: &ChatMessage) -> bool {
+    message.role == "user"
+        && message.content.as_deref().is_some_and(|content| {
+            content
+                .trim_start()
+                .starts_with("<conversation-checkpoint>")
+        })
 }
 
 fn split_index(messages: &[ChatMessage], tail_tokens: usize) -> Option<usize> {
@@ -159,7 +268,15 @@ fn split_index(messages: &[ChatMessage], tail_tokens: usize) -> Option<usize> {
         }
     }
     if cut >= messages.len() {
-        return None;
+        // Everything fits in the tail. Keep only the latest exchange rather
+        // than duplicating the whole conversation beside the summary.
+        let latest_user = messages
+            .iter()
+            .rposition(|message| message.role == "user")?;
+        if latest_user <= 1 {
+            return None;
+        }
+        cut = latest_user;
     }
     cut = cut.max(1);
     while cut > 1 && messages[cut].role != "user" {
@@ -178,7 +295,7 @@ fn message_tokens(message: &ChatMessage) -> usize {
             chars += call.function.name.len() + call.function.arguments.len();
         }
     }
-    chars.div_ceil(3) + 12
+    chars.div_ceil(4) + 12
 }
 
 async fn summarize(
@@ -187,18 +304,50 @@ async fn summarize(
     messages: &[ChatMessage],
     policy: &CompactionPolicy,
 ) -> Option<String> {
-    let transcript = transcript(messages);
+    let update = messages.first().is_some_and(is_checkpoint);
+    let budget = policy
+        .trigger_tokens
+        .saturating_mul(3)
+        .clamp(64_000, MAX_SUMMARY_INPUT_CHARS);
+    let input = transcript(messages, budget);
+    if input.trim().is_empty() {
+        return None;
+    }
+    let prompt = build_prompt(update);
     let request = vec![
         ChatMessage::system(
             "You compress conversation history for an autonomous coding agent. \
              Preserve user goals, decisions, file paths, commands, errors, test results, \
              tool outcomes, and unfinished work. Be factual and compact. Do not call tools.",
         ),
-        ChatMessage::user(format!(
-            "Summarize the conversation segment below. Return only the summary.\n\n{transcript}"
-        )),
+        ChatMessage::user(input),
+        ChatMessage::user(prompt),
     ];
-    let mut stream = provider.stream_chat(&request, &[], 0.0).await.ok()?;
+    let mut text = stream_summary(provider, cancel, &request).await?;
+    if !has_summary_heading(&text) {
+        let mut retry = request;
+        retry.push(ChatMessage::user(NUDGE));
+        text = stream_summary(provider, cancel, &retry).await?;
+    }
+    if !has_summary_heading(&text) {
+        return None;
+    }
+    let limit = (policy.summary_output_tokens * 4).min(MAX_SUMMARY_OUTPUT_CHARS);
+    Some(text.chars().take(limit).collect())
+}
+
+fn has_summary_heading(text: &str) -> bool {
+    ["## Objective", "## Requirements", "## Work State"]
+        .iter()
+        .any(|heading| text.contains(heading))
+}
+
+async fn stream_summary(
+    provider: &Provider,
+    cancel: &CancellationToken,
+    request: &[ChatMessage],
+) -> Option<String> {
+    let mut stream = provider.stream_chat(request, &[], 0.0).await.ok()?;
     let mut text = String::new();
     loop {
         let event = tokio::select! {
@@ -217,36 +366,153 @@ async fn summarize(
             Some(Err(_)) => return None,
         }
     }
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let limit = (policy.summary_output_tokens * 4).min(MAX_SUMMARY_OUTPUT_CHARS);
-    Some(text.chars().take(limit).collect())
+    let text = text.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
-fn transcript(messages: &[ChatMessage]) -> String {
-    let mut text = String::new();
+fn build_prompt(update: bool) -> String {
+    let mut parts = Vec::new();
+    if update {
+        parts.push(
+            "Update the existing checkpoint in the conversation above into one consolidated summary."
+                .to_string(),
+        );
+        parts.push(
+            "Newer history always takes precedence over the existing checkpoint. Preserve previous \
+             information unless newer history clearly contradicts, supersedes, resolves, or makes it \
+             stale. Reconcile Work State and Next Move: move completed work out of Active, remove \
+             resolved blockers and answered questions, and preserve unresolved or pending work."
+                .to_string(),
+        );
+    } else {
+        parts.push(
+            "Summarize the conversation above into a structured summary that will be given to another \
+             agent to resume the work."
+                .to_string(),
+        );
+    }
+    parts.push(SUMMARY_TEMPLATE.to_string());
+    parts.push(SUMMARY_RULES.to_string());
+    parts.push("Do not continue the task or call tools.".to_string());
+    parts.push(
+        "Return only the structured summary in the requested format. Do not include a preamble, \
+         explanation, or other commentary."
+            .to_string(),
+    );
+    parts.join("\n\n")
+}
+
+fn tail_transcript(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
     for message in messages {
-        let content = message.content.as_deref().unwrap_or("");
-        text.push_str(&format!("[{}] {content}", message.role));
-        if let Some(calls) = &message.tool_calls {
-            for call in calls {
-                text.push_str(&format!(
-                    "\n  tool_call {} {}",
-                    call.function.name, call.function.arguments
-                ));
-            }
+        let rendered = render_message(message, 0, MAX_TAIL_MESSAGE_CHARS);
+        if rendered.is_empty() {
+            continue;
         }
-        if let Some(id) = &message.tool_call_id {
-            text.push_str(&format!("\n  tool_call_id {id}"));
+        if !out.is_empty() {
+            out.push('\n');
         }
-        text.push('\n');
-        if text.len() >= MAX_SUMMARY_INPUT_CHARS {
+        out.push_str(&rendered);
+        if out.len() >= MAX_TAIL_MESSAGE_CHARS {
             break;
         }
     }
-    text.chars().take(MAX_SUMMARY_INPUT_CHARS).collect()
+    out.chars().take(MAX_TAIL_MESSAGE_CHARS).collect()
+}
+
+fn transcript(messages: &[ChatMessage], max_chars: usize) -> String {
+    for level in 0..=3 {
+        let text = messages
+            .iter()
+            .map(|message| render_message(message, level, TRANSCRIPT_CLIP))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.len() <= max_chars {
+            return text;
+        }
+    }
+    // Last resort: keep the newest messages that fit, with a marker.
+    let mut start = 0;
+    while start < messages.len() {
+        let text = messages[start..]
+            .iter()
+            .map(|message| render_message(message, 2, 600))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.len() <= max_chars || start + 1 >= messages.len() {
+            return format!("[… older history omitted …]\n{text}");
+        }
+        start += 1;
+    }
+    String::new()
+}
+
+fn render_message(message: &ChatMessage, level: usize, clip: usize) -> String {
+    if message.role == "system" {
+        return String::new();
+    }
+    if level >= 3 && message.role != "user" {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if let Some(content) = message
+        .content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        let label = match message.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            "tool" => "Tool result",
+            other => other,
+        };
+        let text = if level >= 3 {
+            clip_text(content, clip)
+        } else {
+            content.to_string()
+        };
+        parts.push(format!("[{label}]: {text}"));
+    }
+    if let Some(calls) = &message.tool_calls {
+        for call in calls {
+            if level >= 2 {
+                parts.push(format!("[Assistant tool call]: {}", call.function.name));
+            } else {
+                let input = if level >= 1 {
+                    clip_text(&call.function.arguments, clip)
+                } else {
+                    call.function.arguments.clone()
+                };
+                parts.push(format!(
+                    "[Assistant tool call]: {}({input})",
+                    call.function.name
+                ));
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn clip_text(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let half = limit / 2;
+    let start: String = value.chars().take(half).collect();
+    let end: String = value
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!(
+        "{start}\n[… {} characters omitted …]\n{end}",
+        value.len() - limit
+    )
 }
 
 #[cfg(test)]
@@ -271,6 +537,13 @@ mod tests {
             messages.push(ChatMessage::assistant("done"));
         }
         messages
+    }
+
+    #[test]
+    fn ceiling_keeps_fifteen_percent_or_sixteen_k() {
+        assert_eq!(ceiling_for(500_000), 425_000);
+        assert_eq!(ceiling_for(100_000), 84_000);
+        assert_eq!(ceiling_for(20_000), 17_000);
     }
 
     #[test]
@@ -299,6 +572,14 @@ mod tests {
         assert_eq!(tool["tool_call_id"], "call-0");
     }
 
+    #[test]
+    fn checkpoint_is_one_user_message() {
+        let checkpoint = format_checkpoint("summary", "recent");
+        assert!(checkpoint.starts_with("<conversation-checkpoint>"));
+        assert!(checkpoint.contains("<summary>\nsummary\n</summary>"));
+        assert!(checkpoint.contains("<recent-context>\nrecent\n</recent-context>"));
+    }
+
     #[tokio::test]
     async fn compact_history_summarizes_old_turns_and_keeps_tail() {
         use axum::body::Body;
@@ -309,15 +590,9 @@ mod tests {
 
         async fn mock_provider(Json(_body): Json<Value>) -> Response {
             let body = concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"SUMMARY\"}}]}
-
-",
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
-
-",
-                "data: [DONE]
-
-"
+                "data: {\"choices\":[{\"delta\":{\"content\":\"## Objective\\n- ship it\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
             );
             Response::builder()
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -352,16 +627,16 @@ mod tests {
         let outcome = compact_history(&provider, &CancellationToken::new(), &messages, &policy)
             .await
             .expect("compacted");
-        assert_eq!(outcome.summary, "SUMMARY");
-        assert_eq!(outcome.messages[1].role, "system");
+        assert!(outcome.summary.contains("ship it"));
+        assert_eq!(outcome.messages.len(), 2);
+        assert_eq!(outcome.messages[1].role, "user");
         assert!(
             outcome.messages[1]
                 .content
                 .as_deref()
                 .unwrap()
-                .contains("SUMMARY")
+                .contains("<conversation-checkpoint>")
         );
         assert!(outcome.retained_tail.len() < messages.len());
-        assert_eq!(outcome.retained_tail.first().unwrap()["role"], "user");
     }
 }

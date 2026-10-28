@@ -3,6 +3,7 @@ mod ask;
 mod browser;
 mod changes;
 mod checkpoint;
+mod codemode;
 mod command;
 mod dfd;
 mod docs;
@@ -76,6 +77,7 @@ const IMPLEMENTED: &[&str] = &[
     "look_at_screen",
     "set_screen_share",
     "canvas_mode",
+    "run_code",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -94,6 +96,7 @@ pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "call_subagent",
     "look_at_screen",
     "set_screen_share",
+    "run_code",
 ];
 
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
@@ -110,6 +113,7 @@ pub struct ToolContext {
     pub harness_root: PathBuf,
     pub scope: String,
     pub mode: String,
+    pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
 }
 
 impl ToolContext {
@@ -130,6 +134,7 @@ impl ToolContext {
             approvals: Arc::new(ApprovalCache::new()),
             scope: "agent".to_string(),
             mode: "build".to_string(),
+            code_delta: None,
         }
     }
 
@@ -155,6 +160,14 @@ impl ToolContext {
 
     pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
         self.mode = mode.into();
+        self
+    }
+
+    pub fn with_code_delta(
+        mut self,
+        delta: Arc<dyn Fn(stark_contract::Delta) + Send + Sync>,
+    ) -> Self {
+        self.code_delta = Some(delta);
         self
     }
 }
@@ -346,6 +359,9 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
     if name.starts_with("mcp__") {
         return mcp::call(name, args, ctx).await;
     }
+    if name == "run_code" {
+        return codemode::handle(ctx, args).await;
+    }
     match name {
         "read_file" => read::read_file(ctx, args).await,
         "edit_file" => edit::edit_file(ctx, args).await,
@@ -411,6 +427,7 @@ mod tests {
         assert!(tool_names(&build).contains(&"call_subagent"));
         assert!(!tool_names(&plan).contains(&"edit_file"));
         assert!(!tool_names(&plan).contains(&"call_subagent"));
+        assert!(!tool_names(&plan).contains(&"run_code"));
         assert!(tool_names(&plan).contains(&"update_plan"));
         assert!(tool_names(&plan).contains(&"run_command"));
 
@@ -432,6 +449,7 @@ mod tests {
             .is_some()
         );
         assert!(plan_mode_denial("build", "edit_file", &json!({})).is_none());
+        assert!(plan_mode_denial("plan", "run_code", &json!({"code": "return 1"})).is_some());
     }
 
     #[test]
@@ -441,6 +459,7 @@ mod tests {
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"call_subagent"));
         assert!(names.contains(&"update_plan"));
+        assert!(names.contains(&"run_code"));
         assert!(!names.contains(&"read_pdf"));
 
         let general = tool_specs_for_scope("build", "general");
@@ -488,7 +507,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            34
+            35
         );
     }
 

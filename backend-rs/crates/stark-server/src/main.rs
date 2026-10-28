@@ -2798,6 +2798,7 @@ mod tests {
             pairing: Arc::new(PairingStore::new(root)),
             ui_state_path: root.join(".deep_agents").join("ui_state.json"),
             harness_root: root.to_path_buf(),
+            voice: None,
         }
     }
 

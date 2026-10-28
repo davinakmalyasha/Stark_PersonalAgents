@@ -17,6 +17,7 @@ mod questions;
 mod read;
 mod screen;
 mod search;
+mod verify;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ pub use questions::QuestionBroker;
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, screen_bridge,
 };
+pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
 const IMPLEMENTED: &[&str] = &[
     "read_file",

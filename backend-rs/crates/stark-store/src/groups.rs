@@ -289,7 +289,7 @@ impl GroupStore {
         }
 
         let candidates = sqlx::query(
-            "SELECT i.id, i.milestone_id, i.title, i.detail, i.acceptance_json, i.owner_member, m.title AS milestone_title, m.depends_on_json, p.goal FROM items i JOIN milestones m ON m.project_id = i.project_id AND m.id = i.milestone_id JOIN projects p ON p.id = i.project_id WHERE i.project_id = ? AND i.status IN ('todo', 'ready') ORDER BY m.seq_no ASC, i.id ASC",
+            "SELECT i.id, i.milestone_id, i.title, i.detail, i.acceptance_json, i.tags_json, i.owner_member, m.title AS milestone_title, m.depends_on_json, p.goal FROM items i JOIN milestones m ON m.project_id = i.project_id AND m.id = i.milestone_id JOIN projects p ON p.id = i.project_id WHERE i.project_id = ? AND i.status IN ('todo', 'ready') ORDER BY m.seq_no ASC, i.id ASC",
         )
         .bind(project_id)
         .fetch_all(&mut *tx)
@@ -386,6 +386,7 @@ impl GroupStore {
                 "title": row.get::<String, _>("title"),
                 "detail": row.try_get::<Option<String>, _>("detail").ok().flatten().unwrap_or_default(),
                 "acceptance": parse_json(row.get("acceptance_json")),
+                "tags": parse_json(row.get("tags_json")),
                 "milestone_title": row.get::<String, _>("milestone_title"),
                 "goal": row.get::<String, _>("goal"),
             });
@@ -846,6 +847,51 @@ impl GroupStore {
             other => return Err(format!("unsupported op '{other}'")),
         };
         Ok(json!({"ok": true, "queued": false, "message": message}))
+    }
+
+    /// Park a claimed (`doing`) item for owner approval instead of running or
+    /// finishing it. The existing approval route returns the item to `todo`
+    /// on grant (so the runner picks it up again) or `failed` on reject.
+    /// Idempotent: an already-parked item is left alone.
+    pub async fn park_for_approval(
+        &self,
+        project_id: &str,
+        item_id: &str,
+        reason: &str,
+    ) -> Result<bool, String> {
+        let pool = open_pool(&self.root.join(project_id), false).await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT blocked_reason FROM items WHERE project_id = ? AND id = ?")
+                .bind(project_id)
+                .bind(item_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| error.to_string())?
+                .flatten();
+        if current.as_deref() == Some("awaiting_approval") {
+            return Ok(false);
+        }
+        let updated = sqlx::query("UPDATE items SET status = 'awaiting_approval', blocked_reason = 'awaiting_approval', lease_owner = NULL, lease_expires = NULL, updated_at = ? WHERE project_id = ? AND id = ? AND status IN ('todo', 'ready', 'doing')")
+            .bind(now())
+            .bind(project_id)
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        if updated.rows_affected() == 0 {
+            return Ok(false);
+        }
+        append_event(
+            &pool,
+            project_id,
+            "approval.requested",
+            "group-runner",
+            None,
+            Some(item_id.to_string()),
+            json!({"reason": reason}),
+        )
+        .await?;
+        Ok(true)
     }
 
     pub async fn approval(

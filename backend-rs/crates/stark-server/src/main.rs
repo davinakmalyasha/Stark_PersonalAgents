@@ -27,7 +27,10 @@ use stark_store::{
     ChatStore, GroupStore, ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time,
     schedule_json,
 };
-use stark_tools::{Checkpoint, HouseStore, PlanStore, QuestionBroker, public_device, public_state};
+use stark_tools::{
+    Checkpoint, HouseStore, PlanStore, QuestionBroker, evaluate_acceptance, public_device,
+    public_state,
+};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -531,6 +534,38 @@ async fn group_loop(state: ServerState) {
 }
 
 async fn run_group_item(state: ServerState, groups: GroupStore, project_id: String, item: Value) {
+    let item_id = item["id"].as_str().unwrap_or("").to_string();
+    // Pre-run approval gate: a tagged (or flagged) item parks for the owner
+    // instead of executing. The existing approval route returns it to `todo`
+    // on grant, so the claim loop picks it up again — nothing is lost.
+    let wants_approval = item
+        .get("requires_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || item
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter().any(|tag| {
+                    tag.as_str().is_some_and(|tag| {
+                        tag.eq_ignore_ascii_case("needs-approval")
+                            || tag.eq_ignore_ascii_case("needs_approval")
+                    })
+                })
+            });
+    if wants_approval {
+        if let Err(error) = groups
+            .park_for_approval(
+                &project_id,
+                &item_id,
+                "owner approval required before work starts",
+            )
+            .await
+        {
+            tracing::warn!("group {project_id} item {item_id} park failed: {error}");
+        }
+        return;
+    }
     let detail = match groups.detail(&project_id, 0).await {
         Ok(detail) => detail,
         Err(error) => {
@@ -685,6 +720,39 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         Ok(()) if success => format!("Worker chat: {chat_id}\n\n{report}"),
         Ok(()) => "Agent run was aborted.".to_string(),
         Err(error) => error.to_string(),
+    };
+    // Post-run acceptance verification: machine-checkable criteria must hold
+    // before the item counts as done; `manual` criteria park the item for the
+    // owner instead of failing it. Unsupported/free-form criteria are noted
+    // in the report, never invented as failures.
+    let (success, output) = if success {
+        let verdict = evaluate_acceptance(&workspace, &item["acceptance"]);
+        if !verdict.failed.is_empty() {
+            (
+                false,
+                format!(
+                    "Acceptance verification failed: {}\n\nAgent report:\n{output}",
+                    verdict.summary()
+                ),
+            )
+        } else if !verdict.needs_human.is_empty() {
+            let reason = format!("manual acceptance check needed: {}", verdict.summary());
+            state.runs.finish(&chat_id, state_snapshot);
+            if let Err(error) = groups
+                .park_for_approval(&project_id, &item_id, &reason)
+                .await
+            {
+                tracing::warn!("group {project_id} item {item_id} park failed: {error}");
+            }
+            return;
+        } else {
+            (
+                true,
+                format!("{output}\n\nVerification: {}", verdict.summary()),
+            )
+        }
+    } else {
+        (success, output)
     };
     state.runs.finish(&chat_id, state_snapshot);
     if let Err(error) = groups
@@ -2804,6 +2872,26 @@ mod tests {
         }
     }
 
+    async fn group_with_items(dir: &std::path::Path, items: Value) -> GroupStore {
+        let groups = GroupStore::new(dir.join("projects"));
+        groups
+            .create(
+                &json!({
+                    "id": "mock-run",
+                    "goal": "Do things",
+                    "milestones": [{
+                        "id": "m1",
+                        "title": "Build",
+                        "items": items,
+                    }]
+                }),
+                "_general",
+            )
+            .await
+            .unwrap();
+        groups
+    }
+
     async fn group_with_one_ready_item(root: &std::path::Path) -> GroupStore {
         let groups = GroupStore::new(root.join("projects"));
         groups.create(&json!({
@@ -2844,6 +2932,87 @@ mod tests {
         ));
         let answers = ask.await.unwrap().expect("ask resolves");
         assert_eq!(answers[0]["custom"], serde_json::json!("yes"));
+    }
+
+    #[tokio::test]
+    async fn group_item_with_needs_approval_tag_parks_without_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = group_with_items(
+            dir.path(),
+            json!([{"id": "i1", "title": "Risky", "detail": "Do it", "acceptance": [], "tags": ["needs-approval"]}]),
+        )
+        .await;
+        let item = groups.claim_next_ready("mock-run").await.unwrap().unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        run_group_item(state, groups.clone(), "mock-run".to_string(), item).await;
+        let fetched = groups.item("mock-run", "i1").await.unwrap();
+        assert_eq!(fetched["status"], json!("awaiting_approval"));
+    }
+
+    #[tokio::test]
+    async fn group_item_with_failing_criterion_finishes_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = group_with_items(
+            dir.path(),
+            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
+        )
+        .await;
+        let item = groups.claim_next_ready("mock-run").await.unwrap().unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        run_group_item(state, groups.clone(), "mock-run".to_string(), item).await;
+        let detail = groups.detail("mock-run", 0).await.unwrap();
+        assert_eq!(detail["items"][0]["status"], "failed");
+        assert!(
+            detail["items"][0]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Acceptance verification failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn group_item_with_passing_criterion_finishes_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = group_with_items(
+            dir.path(),
+            json!([{"id": "i1", "title": "Write it", "detail": "Create the deliverable", "acceptance": [{"kind": "file_exists", "path": "proof.txt"}]}]),
+        )
+        .await;
+        // The runner evaluates acceptance against the project folder.
+        std::fs::write(
+            dir.path()
+                .join("projects")
+                .join("mock-run")
+                .join("proof.txt"),
+            "deliverable",
+        )
+        .unwrap();
+        let item = groups.claim_next_ready("mock-run").await.unwrap().unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        run_group_item(state, groups.clone(), "mock-run".to_string(), item).await;
+        let detail = groups.detail("mock-run", 0).await.unwrap();
+        assert_eq!(detail["items"][0]["status"], "done");
+        assert!(
+            detail["items"][0]["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Verification:")
+        );
+    }
+
+    #[tokio::test]
+    async fn group_item_with_manual_criterion_parks_for_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = group_with_items(
+            dir.path(),
+            json!([{"id": "i1", "title": "Polish", "detail": "Make it pretty", "acceptance": [{"kind": "manual", "question": "Does it look right?"}]}]),
+        )
+        .await;
+        let item = groups.claim_next_ready("mock-run").await.unwrap().unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        run_group_item(state, groups.clone(), "mock-run".to_string(), item).await;
+        let fetched = groups.item("mock-run", "i1").await.unwrap();
+        assert_eq!(fetched["status"], json!("awaiting_approval"));
     }
 
     #[tokio::test]

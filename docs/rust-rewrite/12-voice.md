@@ -87,6 +87,16 @@ npm run tauri build
 executable or under the harness root. If no models are found, the server still starts and voice
 routes return `503` instead of crashing.
 
+## Voice answers to ask_user
+
+`QuestionBroker` pending batches carry the originating `chat_id`
+(`GET /api/ask/pending` exposes it). While the mic is on, the voice overlay
+polls for batches belonging to its own chat, speaks each question with TTS,
+and routes the next committed turns to `POST /api/ask/answer` instead of
+starting new agent runs. The main-window question modal stays as a fallback
+and is also shown during active voice runs. Verified end to end: a blocked
+`ask_user` run resumed after a spoken answer and completed.
+
 ## Known limits
 
 - `/api/transcribe` accepts WAV/MP3/AAC/FLAC/OGG/M4A through `symphonia`. Browser

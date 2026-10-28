@@ -25,8 +25,8 @@ use stark_core::{
 };
 use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
 use stark_store::{
-    AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, ScheduleRecord, ScheduleStore,
-    WorkspaceRegistry, parse_schedule_time, schedule_json,
+    AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, ScheduleRecord,
+    ScheduleStore, WorkspaceRegistry, parse_schedule_time, schedule_json,
 };
 use stark_tools::{
     Checkpoint, HouseStore, PlanStore, QuestionBroker, evaluate_acceptance, public_device,
@@ -373,6 +373,8 @@ async fn main() -> anyhow::Result<()> {
             get(groups_handler).post(create_group_handler),
         )
         .route("/api/groups/{project_id}", get(group_handler))
+        .route("/api/agents", get(agents_handler))
+        .route("/api/agents/{agent_id}", get(agent_handler))
         .route("/api/mcp/servers", get(mcp_servers_handler))
         .route(
             "/api/mcp/servers/{server_name}",
@@ -444,6 +446,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/notes/{note_id}",
             patch(update_note_handler).delete(delete_note_handler),
+        )
+        .route(
+            "/api/memory/{workspace_id}",
+            get(memory_status_handler).delete(memory_clear_handler),
+        )
+        .route(
+            "/api/memory/{workspace_id}/consolidate",
+            post(memory_consolidate_handler),
         )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -1476,6 +1486,80 @@ async fn active_handler(
 ) -> Json<Value> {
     let _ = query.workspace_path;
     Json(state.runs.active(query.chat_id.as_deref()))
+}
+
+async fn agents_handler(State(state): State<ServerState>) -> Json<Value> {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"agents": []}));
+    };
+    let agents = store
+        .list(None)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(AgentRecord::to_json)
+        .collect::<Vec<_>>();
+    Json(json!({"agents": agents}))
+}
+
+async fn agent_handler(
+    State(state): State<ServerState>,
+    Path(agent_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "agent store unavailable"}));
+    };
+    match store.get(&agent_id).await {
+        Ok(Some(agent)) => {
+            let messages = store.messages(&agent_id).await.unwrap_or_default();
+            Json(json!({"agent": agent.to_json(), "messages": messages}))
+        }
+        Ok(None) => Json(json!({"error": "agent not found"})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
+}
+
+async fn memory_status_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    let status = store
+        .status(&workspace_id)
+        .await
+        .unwrap_or_else(|error| json!({"error": error.to_string()}));
+    let summary = store
+        .summary(&workspace_id, stark_store::memory_max_chars())
+        .await;
+    Json(json!({"status": status, "summary": summary}))
+}
+
+async fn memory_consolidate_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    match store.consolidate(&workspace_id, 30).await {
+        Ok(summary) => Json(json!({"ok": true, "summary": summary})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
+}
+
+async fn memory_clear_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    match store.clear(&workspace_id).await {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
 }
 
 async fn pending_handler(State(state): State<ServerState>) -> Json<Value> {

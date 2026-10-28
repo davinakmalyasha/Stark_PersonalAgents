@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
-use stark_providers::{ChatMessage, ImagePart, Provider, ProviderEvent, ProviderSession, ToolCall};
+use stark_providers::{
+    ChatMessage, ImagePart, Provider, ProviderEvent, ProviderSession, ToolCall, pricing_for,
+};
 use stark_store::{ChatStore, StoreError};
 use stark_tools::{Checkpoint, PlanStore, QuestionBroker, ToolContext, ToolOutcome};
 use thiserror::Error;
@@ -21,6 +23,7 @@ pub mod canvas;
 mod compaction;
 mod delegation;
 mod groups;
+mod instructions;
 mod notes;
 mod projects;
 mod schedules;
@@ -346,6 +349,20 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
          Use the provided tools to inspect and change files. Read before editing. \
          Never invent tool results. Keep the final answer concise."
     );
+    if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&instructions);
+    }
+    if ctx.depth <= 1
+        && stark_store::memory_enabled()
+        && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
+        && let Some(summary) = memory
+            .summary(&ctx.workspace_id, stark_store::memory_max_chars())
+            .await
+    {
+        system_prompt.push_str("\n\n[WORKSPACE MEMORY]\n");
+        system_prompt.push_str(&summary);
+    }
     if mode == "plan" {
         system_prompt.push_str(
             " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
@@ -519,26 +536,38 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     ctx.emit_delta(Delta::reasoning(chunk).with_agent(agent_label.clone()));
                 }
                 Ok(ProviderEvent::Usage(usage)) => {
+                    let cached = usage.cached_tokens.min(usage.input_tokens);
+                    let miss = usage.input_tokens.saturating_sub(cached);
+                    let pricing = pricing_for(&ctx.model);
+                    let cost = if usage.cost > 0.0 {
+                        usage.cost
+                    } else {
+                        pricing.cost(&usage)
+                    };
                     state.token_usage.total_input_tokens += usage.input_tokens;
                     state.token_usage.total_output_tokens += usage.output_tokens;
-                    state.token_usage.calls.push(json!({
+                    state.token_usage.total_cache_hit_tokens += cached;
+                    state.token_usage.total_cache_miss_tokens += miss;
+                    state.token_usage.total_cost += cost;
+                    let call = json!({
                         "agent": "Supervisor",
+                        "model": ctx.model,
+                        "input": usage.input_tokens,
+                        "output": usage.output_tokens,
+                        "cache_hits": cached,
+                        "cache_misses": miss,
                         "input_tokens": usage.input_tokens,
+                        "cached_tokens": cached,
+                        "cache_miss_tokens": miss,
                         "output_tokens": usage.output_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
                         "total_tokens": usage.total_tokens,
-                    }));
-                    ctx.emit_delta(
-                        Delta::usage(
-                            json!({
-                                "agent": "Supervisor",
-                                "input_tokens": usage.input_tokens,
-                                "output_tokens": usage.output_tokens,
-                                "total_tokens": usage.total_tokens,
-                            })
-                            .to_string(),
-                        )
-                        .with_agent(agent_label.clone()),
-                    );
+                        "cost": cost,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "where": agent_label,
+                    });
+                    state.token_usage.calls.push(call.clone());
+                    ctx.emit_delta(Delta::usage(call.to_string()).with_agent(agent_label.clone()));
                 }
                 Ok(ProviderEvent::ToolCall {
                     index,
@@ -626,6 +655,15 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             state.active_node = "done".to_string();
             state.outputs = json!({"agent_report": text});
             ctx.emit_state(&mut state);
+            if ctx.depth <= 1
+                && stark_store::memory_enabled()
+                && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
+            {
+                let _ = memory
+                    .record(&ctx.workspace_id, &ctx.chat_id, None, &prompt, &text)
+                    .await;
+                let _ = memory.consolidate(&ctx.workspace_id, 30).await;
+            }
             return Ok(());
         }
 

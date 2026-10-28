@@ -89,6 +89,30 @@ pub struct AgentStore {
     root: PathBuf,
 }
 
+impl AgentRecord {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "kind": self.kind,
+            "path": self.path,
+            "parentId": self.parent_id,
+            "chatId": self.chat_id,
+            "workspaceId": self.workspace_id,
+            "scope": self.scope,
+            "role": self.role,
+            "nickname": self.nickname,
+            "status": self.status,
+            "model": self.model,
+            "depth": self.depth,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+            "lastActive": self.last_active,
+            "result": self.result,
+            "usage": self.usage,
+        })
+    }
+}
+
 impl AgentStore {
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();

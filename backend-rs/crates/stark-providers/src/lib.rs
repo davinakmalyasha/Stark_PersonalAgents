@@ -338,9 +338,64 @@ pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cost: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModelPricing {
+    /// USD per million input tokens.
+    pub input: f64,
+    /// USD per million cached input tokens.
+    pub cached_input: f64,
+    /// USD per million output tokens.
+    pub output: f64,
+}
+
+impl ModelPricing {
+    pub fn cost(&self, usage: &Usage) -> f64 {
+        let cached = usage.cached_tokens.min(usage.input_tokens);
+        let miss = usage.input_tokens.saturating_sub(cached);
+        (miss as f64 * self.input
+            + cached as f64 * self.cached_input
+            + usage.output_tokens as f64 * self.output)
+            / 1_000_000.0
+    }
+}
+
+/// Pricing is provider-reported when available. When it is not, this reads
+/// optional per-model or global USD-per-million overrides.
+pub fn pricing_for(model: &str) -> ModelPricing {
+    let key: String = model
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let price = |suffix: &str| {
+        std::env::var(format!("STARK_PRICING_{key}_{suffix}"))
+            .ok()
+            .or_else(|| std::env::var(format!("STARK_PRICING_{suffix}")).ok())
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| *value >= 0.0)
+            .unwrap_or(0.0)
+    };
+    ModelPricing {
+        input: price("INPUT"),
+        cached_input: price("CACHED_INPUT"),
+        output: price("OUTPUT"),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -590,21 +645,41 @@ pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
 }
 
 fn parse_usage(value: &Value) -> Usage {
+    let input_tokens = value
+        .get("prompt_tokens")
+        .or_else(|| value.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = value
+        .get("completion_tokens")
+        .or_else(|| value.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_tokens = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| value.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = value
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .or_else(|| value.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cost = value
+        .get("cost")
+        .or_else(|| value.get("total_cost"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     Usage {
-        input_tokens: value
-            .get("prompt_tokens")
-            .or_else(|| value.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .get("completion_tokens")
-            .or_else(|| value.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        reasoning_tokens,
         total_tokens: value
             .get("total_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or(input_tokens + output_tokens),
+        cost,
     }
 }
 
@@ -633,6 +708,30 @@ mod tests {
             ProviderEvent::ToolCall { index: 0, id: Some(id), name: Some(name), .. }
             if id == "c1" && name == "read_file"
         ));
+    }
+
+    #[test]
+    fn parses_cached_reasoning_and_cost() {
+        let usage = parse_usage(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "completion_tokens_details": {"reasoning_tokens": 5},
+            "cost": 0.0123
+        }));
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_tokens, 5);
+        assert!((usage.cost - 0.0123).abs() < f64::EPSILON);
+        let pricing = ModelPricing {
+            input: 1.0,
+            cached_input: 0.1,
+            output: 2.0,
+        };
+        let cost = pricing.cost(&usage);
+        assert!((cost - 0.000068).abs() < 1e-9, "{cost}");
     }
 
     #[test]

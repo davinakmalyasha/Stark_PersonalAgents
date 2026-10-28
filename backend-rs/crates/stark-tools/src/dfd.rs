@@ -165,7 +165,46 @@ pub async fn dfd_bridge(_ctx: &ToolContext, args: &Value) -> ToolOutcome {
 }
 
 pub async fn create_client(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    create_client_in(ctx, args, None).await
+    let mut args = args.clone();
+    let approved = args
+        .get("approved_by")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if approved.is_empty() {
+        let name = args
+            .get("business_name")
+            .and_then(Value::as_str)
+            .unwrap_or("the client");
+        let question = json!({
+            "id": "client-approval",
+            "question": format!("Approve creating DFD client '{name}' and its workspace?"),
+            "options": ["Approve", "Deny"]
+        });
+        let answers = match ctx.questions.ask(&ctx.chat_id, vec![question], 300).await {
+            Ok(answers) => answers,
+            Err(error) => {
+                return ToolOutcome::err(format!("Error: client approval unavailable: {error}"));
+            }
+        };
+        let accepted = answers.iter().any(|answer| {
+            answer
+                .get("selected")
+                .and_then(Value::as_array)
+                .is_some_and(|selected| {
+                    selected.iter().any(|item| {
+                        item.as_str()
+                            .is_some_and(|value| value.eq_ignore_ascii_case("approve"))
+                    })
+                })
+        });
+        if !accepted {
+            return ToolOutcome::err("Error: client creation was not approved.");
+        }
+        args["approved_by"] = json!(format!("user:{}", ctx.chat_id));
+    }
+    create_client_in(ctx, &args, None).await
 }
 
 async fn create_client_in(
@@ -185,7 +224,16 @@ async fn create_client_in(
         )
     {
         return ToolOutcome::err(
-            "Error: create_client requires explicit owner approval (approved_by must be a real approval marker, e.g. 'telegram:<request_id>'). The DFD agent must obtain approval via the approval channel first.",
+            "Error: create_client requires explicit owner approval (approved_by must be a real marker, e.g. 'user:<request_id>').",
+        );
+    }
+    let marker = approved_by.to_ascii_lowercase();
+    if !(marker.starts_with("user:")
+        || marker.starts_with("approval:")
+        || marker.starts_with("telegram:"))
+    {
+        return ToolOutcome::err(
+            "Error: approved_by must be 'user:<id>', 'approval:<id>', or 'telegram:<id>'.",
         );
     }
     let name = args

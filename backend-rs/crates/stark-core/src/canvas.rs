@@ -558,3 +558,137 @@ mod tests {
         assert!(result.content.contains("[CANVAS TARGETS]"));
     }
 }
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+    use crate::RunContext;
+    use stark_providers::{Provider, ProviderConfig};
+    use stark_store::{CanvasStore, ChatStore};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
+
+    async fn ctx_for(root: &std::path::Path) -> RunContext {
+        let store = ChatStore::open(root).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(8);
+        RunContext {
+            chat_id: "orch".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: root.to_path_buf(),
+            role: None,
+            scope: "orchestrator".to_string(),
+            depth: 0,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store,
+            questions: Arc::new(stark_tools::QuestionBroker::new()),
+            tx,
+            latest: Arc::new(Mutex::new(None)),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            on_job_done: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_enqueues_wake_for_matching_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(dir.path()).await;
+        ctx.store
+            .create_chat("_general", "", "Orchestrator", "mock")
+            .await
+            .unwrap();
+        ctx.store
+            .create_child_chat("_general", "", "Worker", "mock", "orch")
+            .await
+            .unwrap();
+        let store = CanvasStore::open(dir.path()).await.unwrap();
+        store
+            .enter_watch(
+                "orch",
+                "",
+                "single",
+                &["chat-worker".to_string()],
+                &["completed".to_string()],
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        // The generated child id is chat-<uuid>; look it up from the store.
+        let chats = ctx.store.all_chats().await;
+        let source = chats
+            .iter()
+            .find(|chat| chat["title"] == "Worker")
+            .and_then(|chat| chat["id"].as_str())
+            .unwrap()
+            .to_string();
+        store.close_watch_for_chat("orch").await.unwrap();
+        store
+            .enter_watch(
+                "orch",
+                "",
+                "single",
+                std::slice::from_ref(&source),
+                &["completed".to_string()],
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        let queued = notify_run_finished(&ctx.store, &source, "finished", "complete").await;
+        assert_eq!(queued, 1);
+        let dues = store.due_wakes(10).await.unwrap();
+        assert_eq!(dues.len(), 1);
+        assert_eq!(dues[0]["chatId"], "orch");
+        assert!(dues[0]["text"].as_str().unwrap().contains("[CANVAS EVENT]"));
+    }
+
+    #[tokio::test]
+    async fn non_matching_status_does_not_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(dir.path()).await;
+        ctx.store
+            .create_child_chat("_general", "", "Worker", "mock", "orch")
+            .await
+            .unwrap();
+        let store = CanvasStore::open(dir.path()).await.unwrap();
+        store
+            .enter_watch(
+                "orch",
+                "",
+                "single",
+                &["chat-never".to_string()],
+                &["failed".to_string()],
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        let source = ctx
+            .store
+            .all_chats()
+            .await
+            .iter()
+            .find(|chat| chat["title"] == "Worker")
+            .and_then(|chat| chat["id"].as_str())
+            .unwrap()
+            .to_string();
+        let queued = notify_run_finished(&ctx.store, &source, "finished", "complete").await;
+        assert_eq!(queued, 0);
+        assert!(store.due_wakes(10).await.unwrap().is_empty());
+    }
+}

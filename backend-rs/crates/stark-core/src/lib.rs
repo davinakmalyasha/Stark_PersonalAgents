@@ -125,6 +125,9 @@ pub struct RunContext {
     pub depth: u32,
     pub model: String,
     pub temperature: f64,
+    /// Images attached to this run (uploads, screen frames). Sent once with
+    /// the opening user message; never persisted into chat history.
+    pub images: Vec<ImagePart>,
     pub provider: Provider,
     pub store: ChatStore,
     pub questions: Arc<QuestionBroker>,
@@ -347,7 +350,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     {
         messages.push(ChatMessage::user(block));
     }
-    messages.push(ChatMessage::user(&prompt));
+    if ctx.images.is_empty() {
+        messages.push(ChatMessage::user(&prompt));
+    } else {
+        messages.push(ChatMessage::user_with_images(&prompt, ctx.images.clone()));
+    }
     let mut compactions = 0;
     maybe_compact(&ctx, &mut messages, &mut compactions).await;
 
@@ -1069,6 +1076,7 @@ pub(crate) fn child_context(
         depth: ctx.depth + 1,
         model: ctx.model.clone(),
         temperature: ctx.temperature,
+        images: Vec::new(),
         provider: ctx.provider.clone(),
         store: ctx.store.clone(),
         questions: ctx.questions.clone(),
@@ -1219,6 +1227,7 @@ mod tests {
             depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,
+            images: Vec::new(),
             provider,
             store: store.clone(),
             questions: Arc::new(QuestionBroker::new()),
@@ -1278,6 +1287,7 @@ mod tests {
             depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,
+            images: Vec::new(),
             provider,
             store: store.clone(),
             questions: Arc::new(QuestionBroker::new()),
@@ -1360,6 +1370,7 @@ mod tests {
             depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,
+            images: Vec::new(),
             provider,
             store: store.clone(),
             questions: Arc::new(QuestionBroker::new()),

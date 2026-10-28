@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde_json::Value;
 
 use crate::paths::resolve_workspace_path;
@@ -41,14 +42,9 @@ async fn read_one(ctx: &ToolContext, raw_path: &str, args: &Value) -> ToolOutcom
     };
 
     if let Some(ext) = path.extension().and_then(|ext| ext.to_str())
-        && matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp"
-        )
+        && let Some(mime) = crate::images::mime_for_ext(ext)
     {
-        return ToolOutcome::err(format!(
-            "Error: image reads are not implemented in the Rust Phase 1 backend: {raw_path}"
-        ));
+        return read_image(ctx, &path, raw_path, mime).await;
     }
 
     let content = match tokio::fs::read_to_string(&path).await {
@@ -98,4 +94,47 @@ fn trim_line(line: &str) -> String {
     let mut out: String = line.chars().take(MAX_LINE_CHARS).collect();
     out.push_str("... (line truncated to 2000 chars)");
     out
+}
+
+/// Image reads queue the file for the model's next step (tool results are
+/// text-only) and return a short note. The agent loop drains the queue into
+/// a real `image_url` part, so no pixels travel through chat text.
+async fn read_image(
+    ctx: &ToolContext,
+    path: &std::path::Path,
+    raw_path: &str,
+    mime: &str,
+) -> ToolOutcome {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) => return ToolOutcome::err(format!("Error: {raw_path}: {error}")),
+    };
+    if bytes.is_empty() {
+        return ToolOutcome::err(format!("Error: {raw_path} is empty"));
+    }
+    if bytes.len() > crate::images::MAX_INLINE_IMAGE_BYTES {
+        return ToolOutcome::err(format!(
+            "Error: {raw_path} is too large for inline vision ({} bytes, max {}); downscale it first",
+            bytes.len(),
+            crate::images::MAX_INLINE_IMAGE_BYTES
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(raw_path)
+        .to_string();
+    crate::screen::queue_image(
+        &ctx.chat_id,
+        format!(
+            "data:{};base64,{}",
+            mime,
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        ),
+        name.clone(),
+    );
+    ToolOutcome::ok(format!(
+        "[IMAGE] {raw_path} ({mime}, {} bytes) queued for the model's next step",
+        bytes.len()
+    ))
 }

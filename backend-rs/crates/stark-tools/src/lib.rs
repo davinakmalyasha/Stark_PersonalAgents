@@ -9,6 +9,7 @@ mod docs;
 mod edit;
 mod head_tail;
 mod house;
+mod images;
 mod patch;
 mod paths;
 mod plan;
@@ -29,11 +30,12 @@ use stark_contract::{PlanItem, ToolSpecFile};
 pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
+pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
 pub use screen::{
-    PendingImage, ScreenBridge, drain_images, latest_continuous_image, screen_bridge,
+    PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
@@ -498,6 +500,19 @@ mod tests {
 
         let read = dispatch("read_file", &json!({"file_path": "a.txt"}), &ctx).await;
         assert!(!read.is_error, "{}", read.content);
+    }
+
+    #[tokio::test]
+    async fn read_image_queues_inline_vision() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        std::fs::write(dir.path().join("shot.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let read = dispatch("read_file", &json!({"file_path": "shot.png"}), &ctx).await;
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("[IMAGE]"));
+        let queued = crate::screen::drain_images("test-chat");
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].url.starts_with("data:image/png;base64,"));
     }
 
     #[tokio::test]

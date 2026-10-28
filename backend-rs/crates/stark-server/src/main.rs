@@ -22,7 +22,7 @@ use stark_contract::{AppState, ServerEvent};
 use stark_core::{
     RunContext, agent_for_scope, resolve_agent, run_agent, subagent_status, subagent_status_for,
 };
-use stark_providers::{CURATED_MODELS, Provider, ProviderConfig};
+use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
 use stark_store::{
     ChatStore, GroupStore, ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time,
     schedule_json,
@@ -655,6 +655,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         depth: 0,
         model,
         temperature: 0.2,
+        images: Vec::new(),
         provider: state.provider.clone(),
         store: state.store.clone(),
         questions: state.questions.clone(),
@@ -854,6 +855,19 @@ Attached files:
         model,
         temperature: request.temperature,
     };
+    // Image attachments (uploads, voice screen frames) ride the opening user
+    // message as real vision parts; the text note in the prompt stays for
+    // context. Images are one-shot: never persisted into chat history.
+    let upload_root = state.harness_root.join(".deep_agents").join("uploads");
+    let screen_root = state.harness_root.join(".deep_agents").join("live_screen");
+    let run_images: Vec<ImagePart> =
+        stark_tools::collect_inline_images(&[upload_root, screen_root], &request.attachments)
+            .into_iter()
+            .map(|image| ImagePart {
+                url: image.data_url(),
+                note: image.name,
+            })
+            .collect();
     let latest = Arc::new(Mutex::new(None));
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
@@ -864,6 +878,7 @@ Attached files:
         depth: 0,
         model: target.model.clone(),
         temperature: target.temperature,
+        images: run_images,
         provider: state.provider.clone(),
         store: state.store.clone(),
         questions: state.questions.clone(),
@@ -942,6 +957,7 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
         depth: 0,
         model: target.model.clone(),
         temperature: target.temperature,
+        images: Vec::new(),
         provider: state.provider.clone(),
         store: state.store.clone(),
         questions: state.questions.clone(),
@@ -2263,10 +2279,16 @@ fn read_file(root: &str, requested: &str) -> Result<Value, (StatusCode, String)>
 }
 
 fn attachment_note(harness_root: &std::path::Path, attachments: &[Value]) -> String {
-    let Ok(upload_root) = std::fs::canonicalize(harness_root.join(".deep_agents").join("uploads"))
-    else {
+    let roots: Vec<std::path::PathBuf> = [
+        harness_root.join(".deep_agents").join("uploads"),
+        harness_root.join(".deep_agents").join("live_screen"),
+    ]
+    .into_iter()
+    .filter_map(|root| std::fs::canonicalize(root).ok())
+    .collect();
+    if roots.is_empty() {
         return String::new();
-    };
+    }
     attachments
         .iter()
         .filter_map(|attachment| {
@@ -2280,7 +2302,7 @@ fn attachment_note(harness_root: &std::path::Path, attachments: &[Value]) -> Str
                 .get("path")
                 .and_then(Value::as_str)
                 .and_then(|path| std::fs::canonicalize(path).ok())
-                .filter(|path| path.starts_with(&upload_root))?;
+                .filter(|path| roots.iter().any(|root| path.starts_with(root)))?;
             Some(format!(
                 "- {name} ({mime}, {size} bytes): {}",
                 path.display()

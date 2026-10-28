@@ -707,6 +707,7 @@ mod tests {
             depth: 0,
             model: "mock".to_string(),
             temperature: 0.0,
+            images: Vec::new(),
             provider,
             store: store.clone(),
             questions: Arc::new(stark_tools::QuestionBroker::new()),

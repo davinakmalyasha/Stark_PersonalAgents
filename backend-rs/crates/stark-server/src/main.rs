@@ -375,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/groups/{project_id}", get(group_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}", get(agent_handler))
+        .route("/api/agents/{agent_id}/cancel", post(agent_cancel_handler))
         .route("/api/mcp/servers", get(mcp_servers_handler))
         .route(
             "/api/mcp/servers/{server_name}",
@@ -1287,12 +1288,14 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         cancel: cancel.clone(),
         on_job_done: Some(job_hook(state.clone(), target.clone())),
     };
+    stark_core::register_agent_cancel(&agent.id, cancel.clone());
     let manager = state.runs.clone();
     let done_tx = tx.clone();
     let canvas_state = state.clone();
     let canvas_chat = target.chat_id.clone();
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt).await;
+        stark_core::unregister_agent_cancel(&agent.id);
         checkpoint.finalize();
         let error = result.as_ref().err().map(ToString::to_string);
         let final_state = latest.lock().ok().and_then(|guard| guard.clone());
@@ -1517,6 +1520,29 @@ async fn agent_handler(
         Ok(None) => Json(json!({"error": "agent not found"})),
         Err(error) => Json(json!({"error": error.to_string()})),
     }
+}
+
+async fn agent_cancel_handler(
+    State(state): State<ServerState>,
+    Path(agent_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "agent store unavailable"}));
+    };
+    let Ok(Some(agent)) = store.get(&agent_id).await else {
+        return Json(json!({"error": "agent not found"}));
+    };
+    let mut cancelled = 0usize;
+    let mut stack = vec![agent];
+    while let Some(item) = stack.pop() {
+        stark_core::cancel_agent_run(&item.id);
+        let _ = store.set_status(&item.id, "cancelled", false).await;
+        cancelled += 1;
+        if let Ok(children) = store.list(Some(&item.id)).await {
+            stack.extend(children);
+        }
+    }
+    Json(json!({"ok": true, "cancelled": cancelled}))
 }
 
 async fn memory_status_handler(
@@ -3761,12 +3787,19 @@ mod tests {
         let finished = agents.get(&child.id).await.unwrap().unwrap();
         assert_eq!(finished.status, "completed", "{:?}", finished.result);
         assert!(finished.result.contains("Child done"));
-        let parent_messages = agents.messages_all(&parent.id).await.unwrap();
-        assert!(
-            parent_messages
+        let mut parent_result = false;
+        for _ in 0..100 {
+            let parent_messages = agents.messages_all(&parent.id).await.unwrap();
+            if parent_messages
                 .iter()
                 .any(|message| message["kind"] == "result")
-        );
+            {
+                parent_result = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(parent_result);
     }
 
     #[tokio::test]

@@ -1703,7 +1703,8 @@
               "list",
               "status",
               "send",
-              "report"
+              "report",
+              "cancel"
             ]
           },
           "kind": {

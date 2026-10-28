@@ -75,6 +75,35 @@ struct ChildHandle {
 }
 
 static CHILDREN: OnceLock<Mutex<HashMap<String, Arc<ChildHandle>>>> = OnceLock::new();
+static AGENT_CANCELS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+
+fn agent_cancels() -> &'static Mutex<HashMap<String, CancellationToken>> {
+    AGENT_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_agent_cancel(agent_id: &str, token: CancellationToken) {
+    if let Ok(mut cancels) = agent_cancels().lock() {
+        cancels.insert(agent_id.to_string(), token);
+    }
+}
+
+pub fn unregister_agent_cancel(agent_id: &str) {
+    if let Ok(mut cancels) = agent_cancels().lock() {
+        cancels.remove(agent_id);
+    }
+}
+
+pub fn cancel_agent_run(agent_id: &str) -> bool {
+    agent_cancels()
+        .lock()
+        .ok()
+        .and_then(|cancels| cancels.get(agent_id).cloned())
+        .map(|token| {
+            token.cancel();
+            true
+        })
+        .unwrap_or(false)
+}
 
 fn children() -> &'static Mutex<HashMap<String, Arc<ChildHandle>>> {
     CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))

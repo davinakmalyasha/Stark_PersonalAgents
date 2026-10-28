@@ -326,6 +326,37 @@ async fn send(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Stri
     ))
 }
 
+async fn cancel(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<String, String> {
+    let current = current_agent(ctx, store).await?;
+    let id = args
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "cancel requires agent_id".to_string())?;
+    let target = store
+        .get(id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("unknown agent {id}"))?;
+    if target.parent_id.as_deref() != Some(current.id.as_str()) && target.id != current.id {
+        return Err("agent is not a child of this agent".to_string());
+    }
+    let mut stack = vec![target.clone()];
+    let mut cancelled = 0usize;
+    while let Some(agent) = stack.pop() {
+        crate::cancel_agent_run(&agent.id);
+        let _ = store.set_status(&agent.id, "cancelled", false).await;
+        cancelled += 1;
+        if let Ok(children) = store.list(Some(&agent.id)).await {
+            stack.extend(children);
+        }
+    }
+    Ok(format!(
+        "[OK] cancellation requested for {cancelled} agent(s)"
+    ))
+}
+
 async fn report(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<String, String> {
     let current = current_agent(ctx, store).await?;
     let Some(parent_id) = current.parent_id.as_deref() else {
@@ -399,8 +430,9 @@ pub async fn handle(ctx: &RunContext, args: &Value) -> ToolOutcome {
         }
         "send" => send(ctx, &store, args).await,
         "report" => report(ctx, &store, args).await,
+        "cancel" => cancel(ctx, &store, args).await,
         other => Err(format!(
-            "unknown action '{other}' (spawn|list|status|send|report)"
+            "unknown action '{other}' (spawn|list|status|send|report|cancel)"
         )),
     };
     match result {
@@ -482,6 +514,16 @@ mod tests {
         let children = store.list(Some(&workspace[0].id)).await.unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].kind, "subagent");
+
+        let token = CancellationToken::new();
+        crate::register_agent_cancel(&children[0].id, token.clone());
+        let cancelled = handle(&dev, &json!({"action":"cancel","agent_id":children[0].id})).await;
+        assert!(!cancelled.is_error, "{}", cancelled.content);
+        assert!(token.is_cancelled());
+        assert_eq!(
+            store.get(&children[0].id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
 
         let sub_chat = children[0].chat_id.clone();
         let sub = context(dir.path(), &sub_chat, 2, "explore").await;

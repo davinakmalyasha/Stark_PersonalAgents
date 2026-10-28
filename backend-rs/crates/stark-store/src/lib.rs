@@ -8,10 +8,12 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod canvas;
 mod groups;
 mod jobs;
 mod schedules;
 mod workspaces;
+pub use canvas::CanvasStore;
 pub use groups::GroupStore;
 pub use jobs::{JobRecord, JobStore};
 pub use schedules::{
@@ -27,6 +29,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("invalid chat id: {0}")]
     InvalidChatId(String),
+    #[error("invalid state: {0}")]
+    Invalid(String),
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +482,54 @@ impl ChatStore {
             .collect()
     }
 
+    /// Every chat across workspaces with its workspace/parent metadata.
+    /// Canvas mode needs the global view; `list_chats` stays workspace-scoped.
+    pub async fn all_chats(&self) -> Vec<Value> {
+        let rows = sqlx::query(
+            r#"
+            SELECT c.id, c.workspace_id, c.workspace_path, c.title, c.model,
+                   c.created_at, c.updated_at, c.message_count, c.parent_chat_id,
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role
+            FROM chats c
+            ORDER BY c.updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|row| {
+                let last = row
+                    .try_get::<Option<String>, _>("last_message")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let snippet: String = last.split_whitespace().collect::<Vec<_>>().join(" ");
+                json!({
+                    "id": row.get::<String, _>("id"),
+                    "workspaceId": row.get::<String, _>("workspace_id"),
+                    "workspacePath": row.get::<String, _>("workspace_path"),
+                    "title": row.get::<String, _>("title"),
+                    "model": row.get::<String, _>("model"),
+                    "createdAt": row.get::<String, _>("created_at"),
+                    "updatedAt": row.get::<String, _>("updated_at"),
+                    "messageCount": row.get::<i64, _>("message_count"),
+                    "parentChatId": row.try_get::<Option<String>, _>("parent_chat_id").ok().flatten(),
+                    "lastRole": row
+                        .try_get::<Option<String>, _>("last_role")
+                        .ok()
+                        .flatten()
+                        .map(|role| display_role(&role))
+                        .unwrap_or_default(),
+                    "lastMessage": snippet.chars().take(1200).collect::<String>(),
+                })
+            })
+            .collect()
+    }
+
     pub async fn create_chat(
         &self,
         workspace_id: &str,
@@ -649,6 +701,8 @@ impl ChatStore {
             "updatedAt": row.get::<String, _>("updated_at"),
             "messages": messages,
             "isPinned": row.get::<i64, _>("pinned") != 0,
+            "workspaceId": row.get::<String, _>("workspace_id"),
+            "workspacePath": row.get::<String, _>("workspace_path"),
         });
         if let Some(parent) = row
             .try_get::<Option<String>, _>("parent_chat_id")

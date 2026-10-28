@@ -24,8 +24,8 @@ use stark_core::{
 };
 use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
 use stark_store::{
-    ChatStore, GroupStore, ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time,
-    schedule_json,
+    CanvasStore, ChatStore, GroupStore, ScheduleRecord, ScheduleStore, WorkspaceRegistry,
+    parse_schedule_time, schedule_json,
 };
 use stark_tools::{
     Checkpoint, HouseStore, PlanStore, QuestionBroker, evaluate_acceptance, public_device,
@@ -278,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let scheduler_state = state.clone();
     let group_runner_state = state.clone();
+    let canvas_state = state.clone();
 
     let app = Router::new()
         .route("/api/run", post(run_handler))
@@ -443,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tokio::spawn(schedule_loop(scheduler_state));
     tokio::spawn(group_loop(group_runner_state));
+    tokio::spawn(canvas_loop(canvas_state));
     tracing::info!("stark-server listening on http://{address}");
     axum::serve(
         listener,
@@ -450,6 +452,107 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+async fn canvas_loop(state: ServerState) {
+    let store = match CanvasStore::open(&state.harness_root).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!("canvas mode disabled: {error}");
+            return;
+        }
+    };
+    if let Ok(count) = store.recover_dispatching().await
+        && count > 0
+    {
+        tracing::info!("recovered {count} interrupted canvas wake(s)");
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let due = match store.due_wakes(20).await {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!("canvas wake query failed: {error}");
+                continue;
+            }
+        };
+        for wake in due {
+            let Some(id) = wake["id"].as_str() else {
+                continue;
+            };
+            let Some(chat_id) = wake["chatId"].as_str() else {
+                continue;
+            };
+            let text = wake["text"].as_str().unwrap_or("").to_string();
+            if let Err(error) = store.mark_wake(id, "dispatching").await {
+                tracing::warn!("canvas wake {id} mark failed: {error}");
+                continue;
+            }
+            let chat = match state.store.get_chat(chat_id).await {
+                Ok(Some(chat)) => chat,
+                _ => {
+                    let _ = store.mark_wake(id, "failed").await;
+                    continue;
+                }
+            };
+            if state.runs.is_running(chat_id) {
+                // A wake for a busy chat becomes the next turn, not a second
+                // concurrent run.
+                let queued = state.runs.follow_up(chat_id, &text);
+                let _ = store
+                    .mark_wake(id, if queued { "done" } else { "failed" })
+                    .await;
+                continue;
+            }
+            let target = canvas_target(&state, &chat);
+            spawn_follow_up_run(state.clone(), target, text);
+            let _ = store.mark_wake(id, "done").await;
+        }
+    }
+}
+
+fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
+    let workspace_path = chat["workspacePath"].as_str().unwrap_or("");
+    let workspace = if workspace_path.trim().is_empty() {
+        state.harness_root.clone()
+    } else {
+        PathBuf::from(workspace_path)
+    };
+    let workspace_id = chat["workspaceId"].as_str().unwrap_or("_general");
+    let parent = chat["parentChatId"].as_str().unwrap_or("");
+    let scope = if workspace_id == "_house" {
+        "house"
+    } else if workspace_id == "_dfd" {
+        "dfd"
+    } else if workspace_id == "_personal" {
+        "general"
+    } else if !parent.trim().is_empty() {
+        if workspace != state.harness_root {
+            "developer"
+        } else {
+            "general"
+        }
+    } else if workspace != state.harness_root {
+        "developer"
+    } else {
+        "orchestrator"
+    };
+    let agent = stark_core::agent_for_scope(scope)
+        .unwrap_or_else(|| stark_core::agent_for_scope("general").expect("general agent"));
+    let model = chat["model"]
+        .as_str()
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| state.provider.config().resolve_model(""));
+    RunTarget {
+        chat_id: chat["id"].as_str().unwrap_or("").to_string(),
+        workspace_id: workspace_id.to_string(),
+        workspace,
+        scope: agent.key.to_string(),
+        role: Some(agent.display.to_string()),
+        model,
+        temperature: 0.2,
+    }
 }
 
 async fn schedule_loop(state: ServerState) {
@@ -756,6 +859,14 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         (success, output)
     };
     state.runs.finish(&chat_id, state_snapshot);
+    let canvas_report = output.clone();
+    let canvas_status = if success { "complete" } else { "failed" };
+    spawn_canvas_notification(
+        state.clone(),
+        format!("group:{project_id}"),
+        canvas_report,
+        canvas_status,
+    );
     if let Err(error) = groups
         .finish_item(
             &project_id,
@@ -893,6 +1004,8 @@ Attached files:
 
     let manager = state.runs.clone();
     let done_tx = tx.clone();
+    let canvas_state = state.clone();
+    let canvas_chat = chat_id.clone();
     let prompt_for_run = prompt;
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt_for_run).await;
@@ -909,11 +1022,18 @@ Attached files:
         } else {
             "complete"
         };
+        let report = final_state
+            .as_ref()
+            .and_then(|state| state.outputs.get("agent_report"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         manager.finish(&chat_id, final_state);
         let _ = done_tx.send(ServerEvent::new(
             "done",
             json!({"status": status, "error": error}),
         ));
+        spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
 
     let stream: SseStream = Box::pin(sse_stream(receiver));
@@ -972,6 +1092,8 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
     let manager = state.runs.clone();
     let done_tx = tx.clone();
     let chat_id = target.chat_id.clone();
+    let canvas_state = state.clone();
+    let canvas_chat = target.chat_id.clone();
     tokio::spawn(async move {
         let result = run_agent(ctx, message).await;
         checkpoint.finalize();
@@ -987,11 +1109,26 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
         } else {
             "complete"
         };
+        let report = final_state
+            .as_ref()
+            .and_then(|state| state.outputs.get("agent_report"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         manager.finish(&chat_id, final_state);
         let _ = done_tx.send(ServerEvent::new(
             "done",
             json!({"status": status, "error": error}),
         ));
+        spawn_canvas_notification(canvas_state, canvas_chat, report, status);
+    });
+}
+
+fn spawn_canvas_notification(state: ServerState, chat_id: String, report: String, status: &str) {
+    let status = status.to_string();
+    tokio::spawn(async move {
+        let _ =
+            stark_core::canvas::notify_run_finished(&state.store, &chat_id, &report, &status).await;
     });
 }
 
@@ -1829,8 +1966,17 @@ fn group_error(error: String) -> (StatusCode, Json<Value>) {
     (status, Json(json!({"error": error})))
 }
 
-async fn canvas_status_handler() -> Json<Value> {
-    Json(json!({"active": false, "watch": null}))
+async fn canvas_status_handler(
+    State(state): State<ServerState>,
+    Path(chat_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = CanvasStore::open(&state.harness_root).await else {
+        return Json(json!({"active": false, "watch": null}));
+    };
+    match store.active_watch(&chat_id).await {
+        Ok(Some(watch)) => Json(json!({"active": true, "watch": watch})),
+        _ => Json(json!({"active": false, "watch": null})),
+    }
 }
 
 fn valid_note_scope(scope_type: &str, scope_id: &str) -> bool {

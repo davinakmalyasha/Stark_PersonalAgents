@@ -15,7 +15,8 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-mod agents;
+pub mod agents;
+pub mod canvas;
 mod compaction;
 mod delegation;
 mod groups;
@@ -674,6 +675,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 schedules::schedule(&ctx, &args).await
             } else if call.function.name == "give_note" {
                 notes::give_note(&ctx, &args).await
+            } else if call.function.name == "canvas_mode" {
+                canvas::handle(&ctx, &args).await
             } else {
                 stark_tools::dispatch(&call.function.name, &args, &tools).await
             };

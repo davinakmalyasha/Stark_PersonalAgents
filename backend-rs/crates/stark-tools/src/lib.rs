@@ -73,6 +73,7 @@ const IMPLEMENTED: &[&str] = &[
     "schedule",
     "look_at_screen",
     "set_screen_share",
+    "canvas_mode",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -463,7 +464,8 @@ mod tests {
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         let names = tool_names(&orchestrator);
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 14);
+        assert!(names.contains(&"canvas_mode"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"create_group"));
         assert!(names.contains(&"group_board"));
@@ -479,7 +481,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            33
+            34
         );
     }
 

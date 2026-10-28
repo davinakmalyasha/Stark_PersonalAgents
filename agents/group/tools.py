@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import events as ev
+from . import messages as group_messages
 from . import planner as planner_mod
 
 #: Injected so this module never imports a store implementation.
@@ -354,6 +355,18 @@ class GroupToolkit:
             if write_key:
                 payload["write_key"] = write_key
         store.append(project_id, kind, "human", item_id=item_id, data=payload)
+        try:
+            item = store.item(item_id) or {}
+            group_messages.send(
+                store, project_id,
+                sender="owner",
+                recipient=str(item.get("lease_owner") or item.get("owner_member") or "member"),
+                body=(f"Approved {item_id}." if grant else f"Rejected {item_id}.")
+                     + (f" Note: {note}" if note else ""),
+                kind="owner", item_id=item_id,
+            )
+        except Exception:  # noqa: BLE001 - approval already applied
+            pass
         if grant:
             return ToolResult(True, f"{item_id} approved")
         return ToolResult(True, f"{item_id} rejected — blocked awaiting a re-plan")

@@ -735,6 +735,24 @@ TOOL_DEFINITIONS = [
         }
     },
     {
+        "name": "group_message",
+        "description": (
+            "Send a persisted message to a teammate or the supervisor. Only "
+            "available inside a group project member run. Delivery is "
+            "asynchronous: the recipient reads it when its next work item "
+            "starts. Use for coordination, not for asking a human — use "
+            "request_approval for that."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Teammate name or 'supervisor'."},
+                "message": {"type": "string", "description": "Short coordination message."}
+            },
+            "required": ["to", "message"]
+        }
+    },
+    {
         "name": "schedule",
         "description": (
             "Create a time-triggered wake for THIS orchestrator chat. When due, it appends "
@@ -824,6 +842,7 @@ _TOOL_DOCS = {
     "delegation_status": "delegation_status(id?, wait_seconds?, status?) — Board of this session's delegations (queued/running/done/failed/cancelled) with chats and elapsed time; id=<del-id> drills into one job's full evidence (task, outcome, acceptance, full artifact report, recent chat, file digest).",
     "job_message": "job_message(job_id, message) — Steer a RUNNING delegation mid-flight (fresh: steering channel; resume: durable Dev FIFO). Running jobs only; never blocks.",
     "job_cancel": "job_cancel(job_id, reason?) — Cancel ONE running delegation (fresh: abort; resume: interrupt). Reports back as [DELEGATION RESULT] CANCELLED.",
+    "group_message": "group_message(to, message) — Send a persisted message to a teammate or the supervisor. Only inside a group project member run; delivered when the recipient starts its next work item.",
     "schedule": "schedule(action?, name?, at?, prompt?, recurrence?, schedule_id?) — Create/list/cancel a time-triggered wake for this orchestrator chat. When due it appends a scheduled message and wakes the orchestrator. recurrence: none|daily|weekly|monthly|interval-<minutes>. No manual task UI.",
     "give_note": "give_note(action?, target?, title?, body?, todos?, note_id?) — Orchestrator-owned sticky note/checklist for chat:<id> or group:<id>. Actions create/update/remove/list. Notes are memory, not work items.",
     "canvas_mode": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) — Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching.",
@@ -865,6 +884,15 @@ def _member_allowed() -> set[str] | None:
         return None
     narrowed = active_allowed_tools.get()
     return None if narrowed is None else set(narrowed)
+
+
+def _group_messaging_active() -> bool:
+    """True only for a member run inside a group project."""
+    try:
+        from tools._runtime import active_group_messenger
+        return active_group_messenger.get() is not None
+    except Exception:  # noqa: BLE001 - no state module means no group context
+        return False
 
 
 def _scope_allowed(scope: Optional[str]) -> set[str] | None:
@@ -921,13 +949,17 @@ def get_native_tools(scope: Optional[str] = None) -> list[dict]:
     optionally filtered by scope."""
     tools = []
     allowed = _scope_allowed(scope)
+    group_enabled = _group_messaging_active()
     for d in TOOL_DEFINITIONS:
         if d.get("exposed") is False:
+            continue
+        if d["name"] == "group_message" and not group_enabled:
             continue
         if _eval_blocked(d["name"]):
             continue
         if allowed is not None and d["name"] not in allowed:
-            continue
+            if not (group_enabled and d["name"] == "group_message"):
+                continue
         tools.append({
             "type": "function",
             "function": {
@@ -963,6 +995,8 @@ def get_native_tool_names(scope: Optional[str] = None) -> list[str]:
     else:
         names = [d["name"] for d in TOOL_DEFINITIONS if d.get("exposed") is not False]
     names = [n for n in names if not _eval_blocked(n)]
+    if _group_messaging_active() and "group_message" not in names:
+        names.append("group_message")
     try:
         from tools.mcp.mcp_bridge import mcp_tool_names_for_scope
         names.extend(mcp_tool_names_for_scope(scope or ""))

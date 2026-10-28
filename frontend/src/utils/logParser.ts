@@ -230,6 +230,58 @@ export function parseLogToSteps(log: string): { steps: TraceStep[]; assistantRes
         };
         steps.push(currentStep);
       }
+    } else if (trimmed.startsWith('[DELEGATION STARTED]')) {
+      // Legacy parallel delegate output is followed by rows containing the
+      // durable child chat id. The row parser below attaches those inline.
+    } else if (/^\s*-\s*del-[\w-]+\s*[·|]/.test(trimmed)) {
+      const row = trimmed.match(/^\s*-\s*(del-[\w-]+)\s*[·|]\s*([^·|]+?)\s*[·|]\s*(.+?)\s*[—-].*?\(chat:\s*([^)]+)\)/i);
+      if (row) {
+        const childId = row[4].trim();
+        const spawnName = normalizeAgentName(row[2].trim());
+        const label = row[3].trim();
+        if (currentStep && isDelegationToolName(currentStep.toolName) && !currentStep.childId) {
+          currentStep.childId = childId;
+          currentStep.label = label;
+          currentStep.childName = spawnName;
+        } else {
+          currentStep = {
+            id: `step-${stepCounter++}`,
+            type: 'system',
+            agent: spawnName,
+            title: label || spawnName,
+            content: '',
+            childId,
+            label,
+            childName: spawnName,
+          };
+          steps.push(currentStep);
+        }
+      }
+    } else if (trimmed.startsWith('[SPAWNED]')) {
+      const spawned = trimmed.match(/^\[SPAWNED\]\s+child=([^\s;]+)(?:\s+name=([^;]+))?/i);
+      if (spawned) {
+        const childId = spawned[1].trim();
+        const spawnName = normalizeAgentName((spawned[2] || 'Subagent').trim());
+        const argsTask: string = currentStep?.args ? delegationTarget(currentStep.args).task : '';
+        const label: string = argsTask || spawnName;
+        if (currentStep && isDelegationToolName(currentStep.toolName) && !currentStep.childId) {
+          currentStep.childId = childId;
+          currentStep.label = label;
+          currentStep.childName = spawnName;
+        } else {
+          currentStep = {
+            id: `step-${stepCounter++}`,
+            type: 'system',
+            agent: spawnName,
+            title: label,
+            content: '',
+            childId,
+            label,
+            childName: spawnName,
+          };
+          steps.push(currentStep);
+        }
+      }
     } else if (trimmed.startsWith('[SUBAGENT]')) {
       // [SUBAGENT] child=<id> name=<Agent> [ws=<workspace>] [chat=<chat_id>] label=<short task label>
       // New delegations include ws/chat (which chat Stark is talking in / checking);

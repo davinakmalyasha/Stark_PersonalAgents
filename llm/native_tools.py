@@ -26,7 +26,7 @@ from decimal import Decimal
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities.hooks import Hooks
-from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.tools import Tool
 from pydantic_ai.toolsets import FilteredToolset, FunctionToolset
 from pydantic_ai.usage import UsageLimits
@@ -51,6 +51,53 @@ except Exception:
 #: Group 1 is the status tag — exit codes alone are ambiguous because
 #: grep/find/diff exit 1 is a normal negative answer.
 _EXIT_RE = re.compile(r"\[(OK|ERR)\]\s+Exit\s+(-?\d+)", re.IGNORECASE)
+
+
+def _new_messages_since(all_messages: list, history: list) -> list:
+    """The messages this turn appended, excluding the caller's message_history."""
+    prior_ids = {id(message) for message in history}
+    appended = [message for message in all_messages if id(message) not in prior_ids]
+    if not appended and len(all_messages) > len(history):
+        # Providers occasionally rebuild history objects; preserve the slice.
+        appended = list(all_messages[len(history):])
+    return appended
+
+
+def _text_from_message_slice(
+    messages: list,
+    events_log: list[dict],
+    result_output: Any,
+) -> str:
+    """Final reply text from only the NEW messages added by this turn.
+
+    ``AgentRunResult.all_messages()`` includes ``message_history``. Reading text
+    from that whole list makes every reply repeat the entire prior assistant
+    transcript. The caller must pass the appended slice, never all messages.
+    """
+    parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            continue
+        for part in getattr(message, "parts", []) or []:
+            if getattr(part, "part_kind", "") != "text":
+                continue
+            content = getattr(part, "content", "")
+            if isinstance(content, str) and content:
+                parts.append(content)
+    text = "".join(parts).strip()
+    if not text:
+        text = "".join(
+            str(event.get("text") or "")
+            for event in events_log
+            if event.get("kind") == "text"
+        ).strip()
+    if not text:
+        text = (
+            result_output
+            if isinstance(result_output, str)
+            else ("" if result_output is None else str(result_output))
+        )
+    return text.strip()
 
 
 def _tool_map() -> dict[str, Any]:
@@ -1226,25 +1273,24 @@ async def arun_native_agent(
     _text_start_seen_nt.clear()
     # Drop any leftover text_start entries that were not flushed
     events_log[:] = [e for e in events_log if e.get("kind") != "text_start"]
-    text = "".join(
-        p.content
-        for m in all_msgs
-        if isinstance(m, ModelResponse)
-        for p in m.parts
-        if getattr(p, "part_kind", "") == "text"
-    ).strip()
-    if not text:
-        _fallback = "".join(e["text"] for e in events_log if e["kind"] == "text").strip()
-        text = _fallback or str(result_output if isinstance(result_output, str) else (result_output or ""))
+
+    # A6b: always return the native ModelMessage slice (P0-LLM — the LC
+    # reverse-convert path _pai_to_lc is deleted). Compute this BEFORE reading
+    # text/reasoning/usage: all_messages() includes message_history, so reading
+    # the whole list repeats every prior assistant reply in the new one and
+    # double-counts prior usage.
+    new_msgs = _new_messages_since(all_msgs, history)
+
+    text = _text_from_message_slice(new_msgs, events_log, result_output)
     reasoning = "".join(
         e["text"] for e in events_log if e["kind"] == "reasoning"
     ).strip() or None
-    # Fallback: if event log empty but response has thinking parts, use those.
+    # Fallback: if event log empty but the new response has thinking parts, use those.
     if not reasoning:
         try:
             _thinking = "".join(
                 p.content
-                for m in all_msgs
+                for m in new_msgs
                 if isinstance(m, ModelResponse)
                 for p in m.parts
                 if getattr(p, "part_kind", "") == "thinking"
@@ -1254,20 +1300,16 @@ async def arun_native_agent(
         except Exception:
             pass
 
-    # A6b: always return the native ModelMessage slice (P0-LLM — the LC
-    # reverse-convert path _pai_to_lc is deleted).
-    prior_ids = {id(m) for m in history}
-    new_msgs = [m for m in all_msgs if id(m) not in prior_ids]
     # ── Usage aggregation (telemetry honesty) ──────────────────────────────
     # run_stream's facade can report only the LAST request (observed: requests=1
     # and tool_calls_total=0 for a 53-tool run). The complete aggregate is
-    # derivable from each ModelResponse's RequestUsage in the message slice, so
-    # build it here and prefer it unless the facade has more requests.
+    # derivable from each ModelResponse's RequestUsage in the NEW message slice,
+    # so build it here and prefer it unless the facade has more requests.
     _agg_tool_calls = 0
     try:
         from pydantic_ai.usage import RunUsage as _RunUsage
         _agg = None
-        for _m in all_msgs:
+        for _m in new_msgs:
             if isinstance(_m, ModelResponse):
                 _u = getattr(_m, "usage", None)
                 if _u is not None:

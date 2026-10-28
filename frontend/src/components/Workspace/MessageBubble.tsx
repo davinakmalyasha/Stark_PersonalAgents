@@ -123,7 +123,7 @@ function ArtifactSummary({ artifacts }: { artifacts: RunArtifacts }) {
           <span><b className="artifact-total-add">+{additions}</b> <b className="artifact-total-delete">-{deletions}</b>{artifacts.tests_passing && <em><CheckCircle2 size={11} /> Tests passed</em>}</span>
         </div>
         <div className="artifact-summary-actions">
-          <button type="button" onClick={handleUndo} disabled={!artifacts.run_id || undoState === 'working' || undoState === 'undone'} title={!artifacts.run_id ? 'Undo is only available for recent runs' : 'Undo this run'}>{undoState === 'working' ? 'Undoing…' : undoState === 'undone' ? 'Undone' : undoState === 'conflict' ? 'Conflict' : 'Undo'} <RotateCcw size={15} /></button>
+          <button type="button" className="artifact-action-pill" onClick={handleUndo} disabled={!artifacts.run_id || undoState === 'working' || undoState === 'undone'} title={!artifacts.run_id ? 'Undo is only available for recent runs' : 'Undo this run'}>{undoState === 'working' ? 'Undoing…' : undoState === 'undone' ? 'Undone' : undoState === 'conflict' ? 'Conflict' : 'Undo'} <RotateCcw size={15} /></button>
           <button type="button" onClick={() => setReviewOpen(true)}>Review</button>
         </div>
       </div>
@@ -211,6 +211,7 @@ function ThinkingPlaceholder() {
 }
 
 export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
+  const [rewindConfirmOpen, setRewindConfirmOpen] = useState(false);
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -269,16 +270,23 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
         </div>
       )}
       {isUser && onRewind && (
-        <div className="flex justify-end -mt-2 mb-1">
-          <button
-            type="button"
-            onClick={() => onRewind(message)}
-            title="Rewind to before this message — restores files and puts the text back in the prompt"
-            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-zinc-600 opacity-0 transition-opacity hover:text-zinc-300 hover:bg-white/[0.06] group-hover:opacity-100 cursor-pointer"
-          >
-            <RotateCcw size={10} />
-            Rewind here
-          </button>
+        <div className="message-revert-row">
+          {!rewindConfirmOpen ? (
+            <button
+              type="button"
+              onClick={() => setRewindConfirmOpen(true)}
+              title="Revert to before this message"
+              className="message-revert-pill"
+            >
+              <RotateCcw size={11} /> Revert message
+            </button>
+          ) : (
+            <div className="message-revert-confirm" role="group" aria-label="Confirm message revert">
+              <span>Files changed after this message will be restored and the prompt will return to the composer.</span>
+              <button type="button" onClick={() => setRewindConfirmOpen(false)}>Cancel</button>
+              <button type="button" className="is-primary" onClick={() => { setRewindConfirmOpen(false); onRewind(message); }}>Revert</button>
+            </div>
+          )}
         </div>
       )}
 

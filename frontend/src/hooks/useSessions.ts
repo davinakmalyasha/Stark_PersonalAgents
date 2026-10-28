@@ -315,11 +315,11 @@ export function useSessions() {
   }, []);
 
   /** "+ New session" — a fresh General chat, opened + activated immediately. */
-  const newSession = useCallback(async (): Promise<SessionTab | null> => {
+  const newSession = useCallback(async (title = 'New Conversation'): Promise<SessionTab | null> => {
     const general = workspaces.find((w) => w.isGeneral);
     if (!general) return null;
     try {
-      const chat = await createChat(general.id, 'New Conversation');
+      const chat = await createChat(general.id, title.trim() || 'New Conversation');
       return registerNewChat(general, chat);
     } catch {
       return null;

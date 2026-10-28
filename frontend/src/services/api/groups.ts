@@ -2,8 +2,70 @@ import type {
   GroupOp,
   GroupProjectDetail,
   GroupProjectList,
+  ScheduledTask,
 } from '../../types';
 import { API_BASE } from './base';
+
+export interface CreateGroupRequest {
+  goal: string;
+  workspaceId: string;
+}
+
+export async function createGroupProject(input: CreateGroupRequest): Promise<{ id: string; path: string; title: string }> {
+  const res = await fetch(`${API_BASE}/groups`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ goal: input.goal, workspace_id: input.workspaceId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Could not create group project.');
+  return {
+    id: data.id || data.project?.id,
+    path: data.path || data.project?.path || '',
+    title: data.title || data.project?.goal || input.goal,
+  };
+}
+
+export interface CreateScheduleInput {
+  workspaceId: string;
+  chatId: string;
+  name: string;
+  prompt: string;
+  at: string;
+  recurrence: 'none' | 'daily' | 'weekly' | 'monthly';
+}
+
+export async function fetchScheduledTasks(workspaceId = ''): Promise<ScheduledTask[]> {
+  const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : '';
+  const res = await fetch(`${API_BASE}/schedules${query}`);
+  if (!res.ok) throw new Error('Could not load scheduled tasks.');
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data.schedules) ? data.schedules : [];
+}
+
+export async function createSchedule(input: CreateScheduleInput): Promise<ScheduledTask> {
+  const res = await fetch(`${API_BASE}/schedules`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      workspace_id: input.workspaceId,
+      chat_id: input.chatId,
+      name: input.name,
+      prompt: input.prompt,
+      at: input.at,
+      recurrence: input.recurrence,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Could not schedule task.');
+  return data as ScheduledTask;
+}
+
+export async function cancelSchedule(scheduleId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/schedules/${encodeURIComponent(scheduleId)}`, { method: 'DELETE' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Could not cancel scheduled task.');
+}
 
 /** Projects visible from one workspace.
  *
@@ -23,7 +85,7 @@ export async function fetchGroupProjects(workspaceId: string): Promise<GroupProj
   }
 }
 
-export async function fetchGroupProject(projectId: string, events = 60): Promise<GroupProjectDetail | null> {
+export async function fetchGroupProject(projectId: string, events = 200): Promise<GroupProjectDetail | null> {
   try {
     const res = await fetch(
       `${API_BASE}/groups/${encodeURIComponent(projectId)}?events=${events}`,

@@ -150,6 +150,7 @@ pub struct ToolOutcome {
     pub is_error: bool,
     pub exit_code: Option<i32>,
     pub plan: Option<BTreeMap<String, Vec<PlanItem>>>,
+    pub children: Vec<Value>,
 }
 
 impl ToolOutcome {
@@ -159,6 +160,7 @@ impl ToolOutcome {
             is_error: false,
             exit_code: None,
             plan: None,
+            children: Vec::new(),
         }
     }
 
@@ -168,6 +170,7 @@ impl ToolOutcome {
             is_error: true,
             exit_code: None,
             plan: None,
+            children: Vec::new(),
         }
     }
 
@@ -177,11 +180,17 @@ impl ToolOutcome {
             is_error,
             exit_code,
             plan: None,
+            children: Vec::new(),
         }
     }
 
     pub fn with_plan(mut self, plan: BTreeMap<String, Vec<PlanItem>>) -> Self {
         self.plan = Some(plan);
+        self
+    }
+
+    pub fn with_children(mut self, children: Vec<Value>) -> Self {
+        self.children = children;
         self
     }
 }

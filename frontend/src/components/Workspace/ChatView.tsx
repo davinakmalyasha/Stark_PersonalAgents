@@ -225,6 +225,8 @@ function RewindPopover({ chatId, workspaceId, onClose }: { chatId: string; works
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -243,14 +245,20 @@ function RewindPopover({ chatId, workspaceId, onClose }: { chatId: string; works
 
   const handleRestore = async (runId: string) => {
     if (restoring) return;
-    if (!confirm('Restore every file touched by this run? This will overwrite the current state of those files.')) return;
+    if (confirming !== runId) {
+      setConfirming(runId);
+      setNotice(null);
+      return;
+    }
+    setConfirming(null);
     setRestoring(runId);
     try {
       const result = await restoreRun(chatId, runId, workspaceId);
-      alert(result.ok ? 'Restored.' : `Some files were skipped:\n${result.messages.join('\n')}`);
-      onClose();
+      setNotice(result.ok
+        ? 'Files restored.'
+        : `Some files were skipped: ${result.messages.join('; ') || 'see console'}`);
     } catch (e) {
-      alert(`Restore failed: ${e}`);
+      setNotice(`Restore failed: ${e}`);
     } finally {
       setRestoring(null);
     }
@@ -262,6 +270,7 @@ function RewindPopover({ chatId, workspaceId, onClose }: { chatId: string; works
         <strong className="text-zinc-100 text-sm">Rewind chat</strong>
         <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200 text-xs">Close</button>
       </div>
+      {notice && <div role="status" className="mb-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-2 text-[11px] text-zinc-300">{notice}</div>}
       {loading && <div className="text-zinc-500 text-xs py-4 text-center">Loading snapshots…</div>}
       {error && <div className="text-rose-400 text-xs py-4">{error}</div>}
       {!loading && !error && groups.length === 0 && (
@@ -275,13 +284,34 @@ function RewindPopover({ chatId, workspaceId, onClose }: { chatId: string; works
                 <div className="text-zinc-200 truncate">{new Date(g.created_at * 1000).toLocaleString()}</div>
                 <div className="text-zinc-500 truncate">{g.files.length} file{g.files.length === 1 ? '' : 's'} · {(g.total_size / 1024).toFixed(1)} KB</div>
               </div>
-              <button
-                onClick={() => handleRestore(g.run_id)}
-                disabled={restoring === g.run_id}
-                className="pressable px-2 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-700 text-white rounded-md text-[11px] font-medium transition-colors"
-              >
-                {restoring === g.run_id ? 'Restoring…' : 'Restore'}
-              </button>
+              {confirming === g.run_id ? (
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setConfirming(null)}
+                    className="pressable rounded-md px-2 py-1 text-[10px] text-zinc-400 hover:bg-white/[0.06] hover:text-zinc-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRestore(g.run_id)}
+                    disabled={restoring === g.run_id}
+                    className="pressable rounded-md bg-zinc-100 px-2 py-1 text-[10px] font-semibold text-zinc-900 hover:bg-white disabled:bg-zinc-700 disabled:text-zinc-400"
+                  >
+                    {restoring === g.run_id ? 'Restoring…' : 'Confirm'}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleRestore(g.run_id)}
+                  disabled={restoring === g.run_id}
+                  className="pressable rounded-md border border-white/10 bg-white/[0.035] px-2 py-1 text-[10px] font-semibold text-zinc-300 hover:bg-white/[0.09] hover:text-white disabled:bg-zinc-700 disabled:text-zinc-400"
+                >
+                  {restoring === g.run_id ? 'Restoring…' : 'Restore'}
+                </button>
+              )}
             </div>
             <ul className="mt-1.5 space-y-0.5 text-[10px] text-zinc-500">
               {g.files.slice(0, 4).map((f) => (

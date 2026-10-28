@@ -81,6 +81,20 @@ function ToolIcon({ name }: { name: string }) {
   return <Wrench size={13} />;
 }
 
+function structuredDelegationSteps(event: LiveToolEvent): TraceStep[] {
+  return (event.children || []).filter((child) => !!child.chatId).map((child, index) => ({
+    id: child.jobId || `${event.id}-child-${index}`,
+    type: 'system',
+    agent: event.agent || '',
+    title: child.label || 'Delegated task',
+    content: '',
+    childId: child.chatId,
+    label: child.label,
+    childName: child.agentName,
+    childWorkspace: child.workspaceId,
+  }));
+}
+
 /**
  * Child steps for one delegation tool event, in call order. The first child
  * attaches to the delegation tool step itself; extra children from a parallel
@@ -185,10 +199,12 @@ function ToolEventDetail({ event, delegations, isActive, onOpenSubagentSession }
 }) {
   if (isDelegationToolName(event.name)) {
     // One card per spawned child, inline at the delegation call.
-    if (delegations?.length) {
+    const children = structuredDelegationSteps(event);
+    const childSteps = children.length ? children : delegations;
+    if (childSteps?.length) {
       return (
         <>
-          {delegations.map((step) => (
+          {childSteps.map((step) => (
             <DelegationCard key={step.id} event={event} step={step} isActive={isActive} onOpenSubagentSession={onOpenSubagentSession} />
           ))}
         </>

@@ -107,6 +107,7 @@ from .AddOnTool import (
     subagent_catalog,
     ask_user,
     send_message,
+    group_message,
     list_agents,
     interrupt_agent,
     report,

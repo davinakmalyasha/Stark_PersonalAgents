@@ -246,6 +246,8 @@ from server.routers.canvas import router as canvas_router
 app.include_router(canvas_router)
 from server.routers.groups import router as groups_router
 app.include_router(groups_router)
+from server.routers.schedules import router as schedules_router
+app.include_router(schedules_router)
 from server.routers.runs import router as runs_router
 app.include_router(runs_router)
 from server.routers.voice import router as voice_router

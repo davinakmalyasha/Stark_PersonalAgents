@@ -18,6 +18,8 @@ import PromptDock from '../components/Workspace/PromptDock';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import { updateChatTitle, deleteChat } from '../services/api';
 import { getAssistantName } from '../house/assistant';
+import SubagentTabsPane from '../house/SubagentTabsPane';
+import { useSubagentTabs } from '../house/useSubagentTabs';
 import './houseControl.css';
 import '../house/house.css';
 
@@ -40,6 +42,7 @@ export default function HouseWorkspace() {
   // Chat index for the hamburger sidebar (same session layer as the main
   // workspace — routes are exclusive, so only one instance polls at a time).
   const sessions = useSessions();
+  const subagents = useSubagentTabs();
 
   // Escape closes the sidebar
   useEffect(() => {
@@ -237,7 +240,8 @@ export default function HouseWorkspace() {
       </header>
 
       {/* ── Body: page scrolls on mobile; independent columns on lg, chat dock pinned bottom-right ── */}
-      <main className="flex-1 min-h-0 overflow-y-auto hw-scroll lg:overflow-hidden">
+      <main className="relative z-10 flex flex-1 min-w-0 min-h-0 overflow-hidden">
+        <div className="flex-1 min-w-0 min-h-0 overflow-y-auto hw-scroll lg:overflow-hidden">
         <div className="max-w-[1400px] mx-auto px-4 sm:px-8 lg:px-12 py-5 lg:h-full flex flex-col min-h-0 gap-4">
           {/* Stat strip */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 hw-rise-1 shrink-0">
@@ -373,7 +377,7 @@ export default function HouseWorkspace() {
                           messages={chat.displayMessages}
                           hasActiveChat={chat.displayMessages.length > 0}
                           onOpenSubagent={() => {}}
-                          onOpenSubagentSession={undefined}
+                          onOpenSubagentSession={subagents.open}
                           workspaceId={chat.workspaceId}
                           chatId={chat.activeChatId}
                         />
@@ -408,6 +412,18 @@ export default function HouseWorkspace() {
             </div>
           </div>
         </div>
+        </div>
+        {subagents.tabs.length > 0 && (
+          <SubagentTabsPane
+            tabs={subagents.tabs}
+            activeChildId={subagents.activeChildId}
+            parentTitle={HOUSE_CHAT_TITLE}
+            fallbackWorkspaceId={chat.workspaceId || '_house'}
+            onActivate={subagents.activate}
+            onClose={subagents.close}
+            onOpenSubagent={subagents.open}
+          />
+        )}
       </main>
 
       {/* Hamburger sidebar (room variant: search + all chats + workspaces) */}

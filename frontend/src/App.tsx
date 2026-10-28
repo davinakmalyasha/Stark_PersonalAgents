@@ -752,7 +752,6 @@ export default function App() {
 
   const handleRewind = useCallback(async (message: ChatMessage) => {
     if (!activeWorkspace || !activeChat || isRunning) return;
-    if (!window.confirm('Rewind to before this message? Files changed by it and every later message will be restored, and the text goes back to the prompt.')) return;
     try {
       const result = await rewindChat(activeWorkspace.id, activeChat.id, message.id);
       const chat = await fetchChat(activeWorkspace.id, activeChat.id);

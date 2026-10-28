@@ -21,8 +21,11 @@ from __future__ import annotations
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import re
+import uuid
 
 from agents.group import events as ev
+from agents.group import messages as group_messages
 
 router = APIRouter(tags=["groups"])
 
@@ -33,7 +36,7 @@ router = APIRouter(tags=["groups"])
 UI_OPS = ("pause", "resume", "close")
 
 #: How many events the detail view returns by default.
-EVENT_TAIL = 60
+EVENT_TAIL = 200
 
 
 def _registry():
@@ -62,28 +65,178 @@ class GroupOpRequest(BaseModel):
     params: dict = {}
 
 
+class CreateGroupRequest(BaseModel):
+    goal: str
+    workspace_id: str = ""
+
+
 def _progress(project_id: str) -> dict:
-    """Cheap counts for one panel row. Never raises — a broken project still
-    has to be *listed*, because a project that vanishes from the board is
-    worse than one shown as broken."""
+    """Counts plus a small live preview for one panel row.
+
+    Never raises — a broken project still has to be *listed*, because a project
+    that vanishes from the board is worse than one shown as broken.
+    """
     out = {"milestones_done": 0, "milestones_total": 0,
-           "items_done": 0, "items_total": 0, "awaiting_approval": 0}
+           "items_done": 0, "items_total": 0, "awaiting_approval": 0,
+           "goal": "", "active_item": None, "active_member": None,
+           "participants": [], "last_message": None, "last_activity_ts": 0}
     try:
         store = _registry().open_store(project_id)
+        project = store.project(project_id) or {}
         milestones = store.milestones(project_id)
         items = store.items(project_id)
+        events = store.events_tail(project_id, 80)
     except Exception:  # noqa: BLE001 - an unreadable store is data, not a crash
         return out
+    out["goal"] = str(project.get("goal") or "")
     out["milestones_total"] = len(milestones)
     out["milestones_done"] = sum(1 for m in milestones if m.get("status") == "done")
     out["items_total"] = len(items)
     out["items_done"] = sum(1 for i in items if i.get("status") == "done")
     out["awaiting_approval"] = sum(
         1 for i in items if i.get("blocked_reason") == ev.AWAITING_APPROVAL)
+    active = next(
+        (i for i in items if i.get("status") == "doing"),
+        next((i for i in items if i.get("status") == "ready"), None),
+    )
+    if active:
+        out["active_item"] = {
+            "id": active.get("id"), "title": active.get("title"),
+            "status": active.get("status"),
+        }
+        out["active_member"] = active.get("lease_owner") or active.get("owner_member")
+    participants = set()
+    for item in items:
+        for key in ("owner_member", "lease_owner"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                participants.add(value)
+    for event in events[-80:]:
+        actor = str(event.get("actor") or "").strip()
+        if actor and not actor.startswith("member:"):
+            participants.add(actor)
+        elif actor.startswith("member:"):
+            participants.add(actor.split(":", 1)[1])
+    out["participants"] = sorted(participants)
+    try:
+        recent_messages = group_messages.from_events(events)
+        out["last_message"] = group_messages.preview(
+            recent_messages[-1] if recent_messages else None
+        )
+    except Exception:  # noqa: BLE001 - preview is optional
+        pass
+    if events:
+        last = events[-1]
+        try:
+            out["last_activity_ts"] = float(last.get("ts") or 0)
+        except (TypeError, ValueError):
+            out["last_activity_ts"] = 0
     return out
 
 
 # ── reads ───────────────────────────────────────────────────────────────────
+
+
+def _starter_manifest(goal: str):
+    """Use the deterministic planner floor to create a runnable starter board."""
+    from agents.group import manifest as manifest_mod
+    from agents.group import planner
+    from agents.workspace_registry import WORKSPACE_REGISTRY
+
+    clean_goal = str(goal or "").strip()
+    if not clean_goal:
+        raise ValueError("goal is required")
+    catalog = [
+        {
+            "name": spec.key,
+            "key": spec.key,
+            "display": spec.display,
+            "description": spec.description,
+            "when_to_use": spec.orchestrator_blurb,
+            "tools": list(spec.tools),
+            "model": spec.model,
+            "thinking": spec.thinking,
+        }
+        for spec in WORKSPACE_REGISTRY.values()
+    ]
+    environment = planner.propose_environment(clean_goal, agents=catalog)
+    if not environment.get("members"):
+        spec = WORKSPACE_REGISTRY["developer"]
+        environment["members"] = [{
+            "name": spec.key,
+            "derived_from": spec.key,
+            "model": spec.model,
+            "thinking": spec.thinking,
+            "tools": list(spec.tools),
+            "skills": [],
+            "mcp": [],
+            "why": "default implementer for a new project",
+        }]
+    # `ask_user` is structurally forbidden in a group project: nobody can
+    # answer it while the member is unattended. `run_command` is allowed in
+    # the manifest but defaults to the `blocked` tier below, so the runtime
+    # can ask for approval without the member silently losing the tool.
+    for member in environment["members"]:
+        member.pop("why", None)
+        tools = list(member.get("tools") or [])
+        member["tools"] = [tool for tool in tools if tool != "ask_user"]
+    milestones = planner.propose_plan(clean_goal, environment)
+    base = re.sub(r"[^a-z0-9]+", "-", clean_goal.lower()).strip("-")[:42].strip("-") or "group-project"
+    manifest_id = f"{base}-{uuid.uuid4().hex[:6]}"
+    data = {
+        "schema": 1,
+        "id": manifest_id,
+        "goal": clean_goal,
+        "owner": "localhost",
+        "members": environment["members"],
+        "milestones": milestones,
+        "environment": {"skills": [], "mcp": [], "deps": {}},
+        "autonomy": {
+            "project_folder": "autonomous",
+            "external_read": "autonomous",
+            "external_write": "needs_approval",
+            "destructive": "blocked",
+            "run_command": "blocked",
+        },
+        "completion": {"kind": "all_milestones_done"},
+    }
+    authored_title = clean_goal.splitlines()[0][:96]
+    authored = manifest_mod.Manifest(
+        title=authored_title,
+        prose=f"# {authored_title}\n\n## Why\n{clean_goal}",
+        data=data,
+    )
+    authored.validate()
+    return authored
+
+
+@router.post("/api/groups")
+async def create_group(req: CreateGroupRequest):
+    goal = (req.goal or "").strip()
+    if not goal:
+        return JSONResponse(status_code=400, content={"error": "goal is required"})
+    try:
+        registry = _registry()
+        manifest = _starter_manifest(goal)
+        result = registry.toolkit().create_group_project(
+            registry.root(), manifest_mod_render(manifest),
+        )
+        if not getattr(result, "ok", False):
+            return JSONResponse(status_code=400, content={"error": str(result.message)})
+        project_id = str((result.data or {}).get("project_id") or manifest.id)
+        registry.set_origin_workspace(project_id, req.workspace_id.strip() or None)
+        return JSONResponse(status_code=201, content={
+            "id": project_id,
+            "path": str((result.data or {}).get("path") or ""),
+            "title": manifest.title or goal,
+        })
+    except Exception as exc:  # noqa: BLE001 - creation errors are API errors
+        return JSONResponse(status_code=400, content={"error": f"{type(exc).__name__}: {exc}"})
+
+
+def manifest_mod_render(manifest) -> str:
+    from agents.group.manifest import render
+    return render(manifest)
 
 
 @router.get("/api/groups")
@@ -140,14 +293,35 @@ async def get_group(project_id: str, events: int = EVENT_TAIL):
     except Exception:  # noqa: BLE001, S110 - a broken manifest is data, not a crash
         pass
 
+    events_tail = store.events_tail(project_id, limit)
+    try:
+        members = []
+        for spec in getattr(_context, "manifest_members", []) or []:
+            name = str(spec.get("name") or "").strip()
+            if not name:
+                continue
+            agent = (_context.members or {}).get(name) or {}
+            members.append({
+                "name": name,
+                "display": str(agent.get("display") or spec.get("display") or name),
+                "kind": str(agent.get("kind") or spec.get("kind") or "member"),
+                "derived_from": str(agent.get("derived_from") or spec.get("derived_from") or ""),
+                "model": str(agent.get("model") or spec.get("model") or ""),
+            })
+        if not members:
+            members = [{"name": "orchestrator", "display": "Orchestrator", "kind": "supervisor"}]
+    except Exception:  # noqa: BLE001 - team display is optional
+        members = []
     return JSONResponse(content={
         "id": project_id,
         "path": paths.project_dir,
         "shell_enabled": shell_enabled,
         "project": store.project(project_id) or {},
+        "members": members,
+        "messages": group_messages.from_events(events_tail),
         "milestones": store.milestones(project_id),
         "items": store.items(project_id),
-        "events": store.events(project_id, limit=limit),
+        "events": events_tail,
     })
 
 

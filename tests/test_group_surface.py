@@ -511,7 +511,7 @@ def test_a_member_cannot_finish_the_work_it_asked_permission_for():
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def test_router_exposes_the_four_routes():
+def test_router_exposes_the_group_routes_and_creation_method():
     from server.routers import groups
     paths = {r.path for r in groups.router.routes}
     assert paths == {
@@ -520,6 +520,13 @@ def test_router_exposes_the_four_routes():
         "/api/groups/{project_id}/items/{item_id}/approval",
         "/api/groups/{project_id}/update",
     }
+    methods = {
+        method
+        for route in groups.router.routes
+        if route.path == "/api/groups"
+        for method in (route.methods or ())
+    }
+    assert {"GET", "POST"} <= methods
 
 
 def test_the_board_cannot_edit_the_plan():
@@ -567,6 +574,24 @@ def test_the_board_answers_over_http():
         assert len(detail["milestones"]) == 1
         assert len(detail["items"]) == 1
         assert detail["project"]["status"] == "running"
+
+
+def test_group_creation_uses_a_starter_manifest_and_records_origin():
+    with Rig(runner=FakeRunner()) as rig:
+        res = _client().post("/api/groups", json={
+            "goal": "Prepare a concise launch checklist",
+            "workspace_id": WS_CODING,
+        })
+        assert res.status_code == 201, res.text
+        body = res.json()
+        assert body["id"]
+        assert body["title"] == "Prepare a concise launch checklist"
+        found = rig.registry.resolve(body["id"])
+        assert found is not None
+        assert rig.registry.origin_workspace(body["id"]) == WS_CODING
+        _paths, store, _context = found
+        assert store.milestones(body["id"])
+        assert store.items(body["id"])
 
 
 def test_an_unknown_project_is_a_404_not_a_400():

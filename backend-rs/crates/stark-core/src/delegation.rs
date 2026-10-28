@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{Value, json};
 use stark_store::{ChatStore, JobRecord};
 use stark_tools::ToolOutcome;
 use tokio_util::sync::CancellationToken;
@@ -235,6 +235,18 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
             )
         })
         .collect();
+    let child_refs = job_refs
+        .iter()
+        .map(|job| {
+            json!({
+                "chatId": job.chat_id,
+                "jobId": job.id,
+                "agentName": job.agent,
+                "label": job.title,
+                "workspaceId": ctx.workspace_id,
+            })
+        })
+        .collect();
     ToolOutcome::ok(format!(
         "[DELEGATION STARTED]
 {}
@@ -242,6 +254,7 @@ Use delegation_status with wait_seconds to collect results; job_message/job_canc
         lines.join("
 ")
     ))
+    .with_children(child_refs)
 }
 
 pub(crate) async fn job_message(ctx: &RunContext, args: &Value) -> ToolOutcome {

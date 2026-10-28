@@ -253,6 +253,10 @@ fn content_text(value: &Value) -> String {
     }
 }
 
+fn is_internal_delegation_result(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("[DELEGATION RESULT]")
+}
+
 async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError> {
     let history = ctx
         .store
@@ -286,21 +290,23 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         .plan_state(&ctx.chat_id)
         .await
         .unwrap_or_default();
-    let user_message_id = ctx
-        .store
-        .append_message(&ctx.chat_id, "user", &prompt, false)
-        .await?;
-    if let Some(checkpoint) = &ctx.checkpoint {
-        checkpoint.set_user_message(&user_message_id);
+    if !is_internal_delegation_result(&prompt) {
+        let user_message_id = ctx
+            .store
+            .append_message(&ctx.chat_id, "user", &prompt, false)
+            .await?;
+        if let Some(checkpoint) = &ctx.checkpoint {
+            checkpoint.set_user_message(&user_message_id);
+        }
+        ctx.store
+            .append_session_entry_for(
+                &ctx.workspace_id,
+                &ctx.workspace,
+                &ctx.chat_id,
+                json!({"type": "message", "role": "user", "content": prompt.clone()}),
+            )
+            .await?;
     }
-    ctx.store
-        .append_session_entry_for(
-            &ctx.workspace_id,
-            &ctx.workspace,
-            &ctx.chat_id,
-            json!({"type": "message", "role": "user", "content": prompt.clone()}),
-        )
-        .await?;
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
     let role = ctx.role.as_deref().unwrap_or("a coding agent");
@@ -502,19 +508,21 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 if !text.is_empty() {
                     messages.push(ChatMessage::assistant(&text));
                 }
-                let user_id = ctx
-                    .store
-                    .append_message(&ctx.chat_id, "user", &follow_up, false)
-                    .await?;
-                ctx.store
-                    .append_session_entry_for(
-                        &ctx.workspace_id,
-                        &ctx.workspace,
-                        &ctx.chat_id,
-                        json!({"type": "message", "role": "user", "content": follow_up}),
-                    )
-                    .await?;
-                let _ = user_id;
+                if !is_internal_delegation_result(&follow_up) {
+                    let user_id = ctx
+                        .store
+                        .append_message(&ctx.chat_id, "user", &follow_up, false)
+                        .await?;
+                    ctx.store
+                        .append_session_entry_for(
+                            &ctx.workspace_id,
+                            &ctx.workspace,
+                            &ctx.chat_id,
+                            json!({"type": "message", "role": "user", "content": follow_up}),
+                        )
+                        .await?;
+                    let _ = user_id;
+                }
                 messages.push(ChatMessage::user(&follow_up));
                 state.active_node = "agent".to_string();
                 state.outputs = json!({});
@@ -657,7 +665,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     elapsed,
                     preview,
                 )
-                .with_agent(agent_label.clone()),
+                .with_agent(agent_label.clone())
+                .with_children(outcome.children.clone()),
             );
             if let Some(plan) = &outcome.plan {
                 state.plan = Some(plan.clone());
@@ -908,9 +917,10 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
 
             if action == "spawn" {
                 let handle = handle.clone();
-                let task = task.to_string();
+                let task_for_run = task.to_string();
+                let task_for_label = task.to_string();
                 tokio::spawn(async move {
-                    let result = Box::pin(run_agent(child, task)).await;
+                    let result = Box::pin(run_agent(child, task_for_run)).await;
                     let next = if handle.cancel.is_cancelled() {
                         ChildStatus::Stopped
                     } else {
@@ -923,7 +933,13 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 });
                 return ToolOutcome::ok(format!(
                     "[SPAWNED] child={child_id} name={name}; use action=status/child_id"
-                ));
+                ))
+                .with_children(vec![json!({
+                    "chatId": child_id,
+                    "agentName": name,
+                    "label": task_for_label,
+                    "workspaceId": ctx.workspace_id,
+                })]);
             }
 
             let result = Box::pin(run_agent(child, task.to_string())).await;
@@ -937,12 +953,25 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
             };
             *status.lock().unwrap() = next.clone();
             if let ChildStatus::Failed(error) = next {
-                return ToolOutcome::err(format!("[ERR] Subagent {name}: {error}"));
+                return ToolOutcome::err(format!("[ERR] Subagent {name}: {error}")).with_children(
+                    vec![json!({
+                        "chatId": child_id,
+                        "agentName": name,
+                        "label": task,
+                        "workspaceId": ctx.workspace_id,
+                    })],
+                );
             }
             ToolOutcome::ok(format!(
                 "[SUBAGENT {name}] child={child_id}\n{}",
                 read_report(&latest)
             ))
+            .with_children(vec![json!({
+                "chatId": child_id,
+                "agentName": name,
+                "label": task,
+                "workspaceId": ctx.workspace_id,
+            })])
         }
         "message" => {
             let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {

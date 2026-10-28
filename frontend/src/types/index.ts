@@ -74,6 +74,16 @@ export interface StreamDelta {
   /** tool_finished only. */
   ok?: boolean;
   ms?: number;
+  /** Structured child session reference for live delegation cards. */
+  children?: ChildReference[];
+}
+
+export interface ChildReference {
+    chatId: string;
+    jobId?: string;
+    agentName?: string;
+    label?: string;
+    workspaceId?: string;
 }
 
 export interface PlanItem {
@@ -316,12 +326,55 @@ export interface GroupProjectRow {
   items_done: number;
   items_total: number;
   awaiting_approval: number;
+  goal?: string;
+  active_item?: { id: string; title: string; status: string } | null;
+  active_member?: string | null;
+  participants?: string[];
+  last_message?: GroupMessagePreview | null;
+  last_activity_ts?: number;
+}
+
+/** Small, list-safe chat preview. */
+export interface GroupMessagePreview {
+  seq: number;
+  ts: number;
+  from: string;
+  to: string;
+  body: string;
+  kind: string;
+  item_id?: string | null;
+}
+
+/** One persisted agent/supervisor message in a group project. */
+export interface GroupMessage extends GroupMessagePreview {
+  reply_to?: number | null;
+  deliver?: boolean;
+}
+
+export interface GroupMember {
+  name: string;
+  display: string;
+  kind?: string;
+  derived_from?: string;
+  model?: string;
 }
 
 export interface GroupProjectList {
   projects: GroupProjectRow[];
   /** True when the board is filtered to one coding workspace. */
   scoped: boolean;
+}
+
+/** A scheduled prompt attached to a regular chat. */
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  workspaceId: string;
+  chatId: string;
+  nextRunAt: string;
+  recurrence: 'none' | 'daily' | 'weekly' | 'monthly' | string;
+  status: string;
 }
 
 export interface GroupEvent {
@@ -376,9 +429,12 @@ export interface GroupProject {
 export interface GroupProjectDetail {
   id: string;
   path: string;
+  runtime_notice?: string;
   /** Members hold a shell, so the rest of the envelope is advisory. */
   shell_enabled?: boolean;
   project: GroupProject;
+  members?: GroupMember[];
+  messages?: GroupMessage[];
   milestones: GroupMilestone[];
   items: GroupItem[];
   events: GroupEvent[];

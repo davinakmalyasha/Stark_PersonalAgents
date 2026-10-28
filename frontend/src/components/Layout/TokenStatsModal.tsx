@@ -16,7 +16,7 @@ export default function TokenStatsModal({ isOpen, onClose, tokenUsage, lastModel
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 animate-fade-in">
       {/* Modal Card */}
       <div 
-        className="modal-panel-enter w-[calc(100vw-220px)] max-w-[1280px] border bg-zinc-950 flex flex-col overflow-hidden"
+        className="modal-panel-enter w-[calc(100vw-220px)] max-w-[1280px] h-[min(620px,calc(100vh-48px))] border bg-zinc-950 flex flex-col overflow-hidden"
         style={{ 
           borderColor: 'var(--border-color)',
           borderRadius: '16px',
@@ -60,7 +60,7 @@ export default function TokenStatsModal({ isOpen, onClose, tokenUsage, lastModel
 
         {/* Content Area with explicit padding */}
         <div 
-          className="flex-1 overflow-y-auto pr-1.5 min-h-0"
+          className="flex flex-1 flex-col overflow-y-auto pr-1.5 min-h-0"
           style={{ 
             paddingLeft: '24px',
             paddingRight: '24px',

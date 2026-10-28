@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Menu, FolderKanban, CircleAlert, Terminal } from 'lucide-react';
-import type { SessionTab, GroupProjectRow } from '../types';
+import { Menu, FolderKanban, CircleAlert, Terminal, Plus, CalendarClock, X } from 'lucide-react';
+import type { SessionTab, GroupProjectRow, ScheduledTask } from '../types';
 import SessionTabs from './SessionTabs';
 import WindowControls from '../components/Layout/WindowControls';
+import { displayActor, timeAgo } from './group/groupProjectUi';
 
 interface HouseHeaderProps {
   tabs: SessionTab[];
@@ -18,6 +19,10 @@ interface HouseHeaderProps {
    *  the panel, so a short list never looks like a bug. */
   projectsScoped: boolean;
   onOpenProject: (projectId: string) => void;
+  schedules: ScheduledTask[];
+  onNewTask: () => void;
+  onCancelSchedule: (scheduleId: string) => void;
+  onOpenScheduledChat: (workspaceId: string, chatId: string) => void;
 }
 
 /** Close a dropdown on outside-click or Escape. */
@@ -60,12 +65,18 @@ function projectDotClass(status: string, awaiting: number): string {
 export default function HouseHeader({
   tabs, activeTabId, runningTabId,
   onActivateTab, onCloseTab, onNewSession,
-  onOpenSidebar, projects, projectsScoped, onOpenProject,
+  onOpenSidebar, projects, projectsScoped, onOpenProject, schedules,
+  onNewTask, onCancelSchedule, onOpenScheduledChat,
 }: HouseHeaderProps) {
   const hasDesktopBridge = typeof window !== 'undefined' && !!window.antigravity;
   const isDesktopShell = hasDesktopBridge || Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
   const [projectsOpen, setProjectsOpen] = useState(false);
+  const [taskTab, setTaskTab] = useState<'projects' | 'scheduled'>('projects');
   const projectsRef = useRef<HTMLDivElement | null>(null);
+  const handleNewTask = useCallback(() => {
+    setProjectsOpen(false);
+    onNewTask();
+  }, [onNewTask]);
 
   useDismiss(projectsOpen, useCallback(() => setProjectsOpen(false), []), projectsRef);
 
@@ -86,27 +97,32 @@ export default function HouseHeader({
         <Menu size={16} />
       </button>
 
-      {/* ── Group projects — durable work that outlives this chat ── */}
+      {/* ── Durable and scheduled tasks ── */}
       <div ref={projectsRef} className="relative shrink-0" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-        <button
-          onClick={() => setProjectsOpen((v) => !v)}
-          title="Projects"
-          aria-label="Durable projects"
-          aria-expanded={projectsOpen}
-          aria-haspopup="true"
-          className={`relative grid place-items-center w-8 h-8 rounded-lg transition-colors cursor-pointer ${
-            projectsOpen ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
-          }`}
-        >
-          <FolderKanban size={15} />
-          {projects.length > 0 && (
-            <span className={`absolute -top-0.5 -right-0.5 grid place-items-center min-w-[14px] h-[14px] px-0.5 rounded-full text-[9px] font-bold tabular-nums ${
-              waiting > 0 ? 'bg-amber-400 text-[#0a0a0d]' : 'bg-white text-[#0a0a0d]'
-            }`}>
-              {projects.length}
-            </span>
-          )}
-        </button>
+        <div className="flex items-center gap-0.5">
+          <button
+            onClick={() => setProjectsOpen((v) => !v)}
+            title="Tasks"
+            aria-label="Tasks"
+            aria-expanded={projectsOpen}
+            aria-haspopup="true"
+            className={`relative grid place-items-center w-8 h-8 rounded-lg transition-colors cursor-pointer ${
+              projectsOpen ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
+            }`}
+          >
+            <FolderKanban size={15} />
+            {(projects.length + schedules.length) > 0 && (
+              <span className={`absolute -top-0.5 -right-0.5 grid place-items-center min-w-[14px] h-[14px] px-0.5 rounded-full text-[9px] font-bold tabular-nums ${
+                waiting > 0 ? 'bg-amber-400 text-[#0a0a0d]' : 'bg-white text-[#0a0a0d]'
+              }`}>
+                {projects.length + schedules.length}
+              </span>
+            )}
+          </button>
+          <button type="button" onClick={handleNewTask} title="New task" aria-label="Create a task" className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70">
+            <Plus size={14} />
+          </button>
+        </div>
 
         {/* One atomic announcement rather than a live region per row: a bare
             number is meaningless read aloud, and competing regions are worse. */}
@@ -123,14 +139,21 @@ export default function HouseHeader({
           }`}
         >
           <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 border-b house-hairline sticky top-0 bg-[#141419]/95 backdrop-blur-xl">
-            <span className="text-[10px] uppercase tracking-widest font-semibold text-zinc-500">Projects</span>
-            {projectsScoped && (
-              <span className="text-[10px] text-zinc-600 truncate" title="Projects started from this workspace">
-                this workspace
-              </span>
-            )}
+            <span className="text-[10px] uppercase tracking-widest font-semibold text-zinc-500">Tasks</span>
+            <button type="button" onClick={handleNewTask} className="flex h-7 items-center gap-1 rounded-md bg-white px-2 text-[10px] font-semibold text-[#0a0a0d] hover:bg-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70">
+              <Plus size={12} /> New task
+            </button>
           </div>
 
+          <div role="tablist" aria-label="Task categories" className="flex gap-1 border-b border-white/[0.06] px-2 py-1.5">
+            <button type="button" role="tab" aria-selected={taskTab === 'projects'} onClick={() => setTaskTab('projects')} className={`rounded-md px-2.5 py-1 text-[10px] font-medium ${taskTab === 'projects' ? 'bg-white/[0.08] text-zinc-200' : 'text-zinc-500 hover:text-zinc-300'}`}>Projects <span className="ml-1 text-zinc-600">{projects.length}</span></button>
+            <button type="button" role="tab" aria-selected={taskTab === 'scheduled'} onClick={() => setTaskTab('scheduled')} className={`rounded-md px-2.5 py-1 text-[10px] font-medium ${taskTab === 'scheduled' ? 'bg-white/[0.08] text-zinc-200' : 'text-zinc-500 hover:text-zinc-300'}`}>Scheduled <span className="ml-1 text-zinc-600">{schedules.length}</span></button>
+          </div>
+
+          {taskTab === 'projects' ? <>
+          {projectsScoped && (
+            <div className="px-3.5 pt-2 text-[10px] text-zinc-600" title="Projects started from this workspace">Projects from this workspace</div>
+          )}
           {projects.length === 0 ? (
             <div className="px-4 py-6 text-center">
               <p className="text-[12px] text-zinc-500">
@@ -139,8 +162,9 @@ export default function HouseHeader({
               <p className="text-[11px] text-zinc-600 mt-1">
                 {projectsScoped
                   ? 'Projects started here will appear here.'
-                  : 'Ask Stark to run something long-running.'}
+                  : 'Create a project to coordinate longer work.'}
               </p>
+              <button type="button" onClick={handleNewTask} className="mx-auto mt-3 flex h-8 items-center gap-1 rounded-lg bg-white px-3 text-[10px] font-semibold text-[#0a0a0d] hover:bg-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70"><Plus size={12} /> New task</button>
             </div>
           ) : (
             <div className="flex flex-col gap-2 p-2.5">
@@ -156,15 +180,35 @@ export default function HouseHeader({
                     className={`canvas-task-dot ${projectDotClass(p.status, p.awaiting_approval)}`}
                     aria-hidden="true"
                   />
-                  <span className="canvas-task-chip-copy">
-                    <b>{p.title || p.id}</b>
-                    <small>
-                      milestones {p.milestones_done}/{p.milestones_total}
-                      {' · '}items {p.items_done}/{p.items_total}
-                      {typeof p.spent_usd === 'number' && p.spent_usd > 0
-                        ? ` · $${p.spent_usd.toFixed(2)}`
-                        : ''}
-                    </small>
+                  <span className="flex min-w-0 flex-1 flex-col gap-1">
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <b className="min-w-0 flex-1 truncate text-[11px] font-semibold text-zinc-200">
+                        {p.title || p.id}
+                      </b>
+                      {p.last_activity_ts ? (
+                        <span className="shrink-0 text-[8.5px] text-zinc-600">
+                          {timeAgo(p.last_activity_ts)}
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="truncate text-[9.5px] leading-4 text-zinc-500">
+                      {p.active_item
+                        ? `${displayActor(p.active_member || '')} · ${p.active_item.title}`
+                        : p.last_message?.body || (p.goal && p.goal !== p.title ? p.goal : 'No messages yet.')}
+                    </span>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-white/[0.06]">
+                        <span
+                          className="block h-full rounded-full bg-zinc-400"
+                          style={{
+                            width: `${p.items_total ? Math.round((p.items_done / p.items_total) * 100) : 0}%`,
+                          }}
+                        />
+                      </span>
+                      <span className="shrink-0 text-[8.5px] tabular-nums text-zinc-600">
+                        {p.milestones_done}/{p.milestones_total} · {p.items_done}/{p.items_total}
+                      </span>
+                    </span>
                   </span>
                   {p.shell_enabled && (
                     <span
@@ -182,6 +226,26 @@ export default function HouseHeader({
                     </span>
                   )}
                 </button>
+              ))}
+            </div>
+          )}
+          </> : schedules.length === 0 ? (
+            <div className="px-4 py-6 text-center">
+              <CalendarClock size={18} className="mx-auto mb-2 text-zinc-600" />
+              <p className="text-[12px] text-zinc-500">No scheduled tasks.</p>
+              <p className="mt-1 text-[11px] text-zinc-600">Choose when a prompt should run.</p>
+              <button type="button" onClick={handleNewTask} className="mx-auto mt-3 flex h-8 items-center gap-1 rounded-lg bg-white px-3 text-[10px] font-semibold text-[#0a0a0d] hover:bg-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70"><Plus size={12} /> New task</button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5 p-2">
+              {schedules.map((schedule) => (
+                <div key={schedule.id} className="group flex items-center gap-2 rounded-lg border border-white/[0.05] bg-white/[0.02] p-2 hover:bg-white/[0.045]">
+                  <button type="button" onClick={() => { setProjectsOpen(false); onOpenScheduledChat(schedule.workspaceId, schedule.chatId); }} className="min-w-0 flex-1 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70">
+                    <span className="block truncate text-[11px] font-medium text-zinc-200">{schedule.name}</span>
+                    <span className="mt-1 block text-[9.5px] text-zinc-500">{new Date(schedule.nextRunAt).toLocaleString()} · {schedule.recurrence === 'none' ? 'once' : schedule.recurrence}</span>
+                  </button>
+                  <button type="button" onClick={() => onCancelSchedule(schedule.id)} title="Cancel scheduled task" aria-label={`Cancel ${schedule.name}`} className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-zinc-600 hover:bg-white/[0.08] hover:text-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70"><X size={13} /></button>
+                </div>
               ))}
             </div>
           )}

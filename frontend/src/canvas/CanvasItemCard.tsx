@@ -5,6 +5,7 @@ import type { ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import { cleanChatTitle } from '../utils/chatTitle';
 import type { CanvasItem } from './canvasTypes';
+import { displayActor } from '../house/group/groupProjectUi';
 
 interface Props {
   item: CanvasItem;
@@ -232,10 +233,15 @@ export default function CanvasItemCard({
           onClick={(e) => { e.stopPropagation(); onOpen(); }}
           className="w-full px-2.5 py-2 text-left hover:bg-white/[0.02]"
         >
-          <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+          <div className="truncate text-[10px] leading-4 text-zinc-500">
+            {project.active_item
+              ? `${displayActor(project.active_member || '')} · ${project.active_item.title}`
+              : project.last_message?.body || project.goal || 'No activity yet.'}
+          </div>
+          <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-white/[0.06]">
             <div className="h-full rounded-full bg-zinc-400" style={{ width: `${pct}%` }} />
           </div>
-          <div className="mt-1.5 flex items-center justify-between text-[9.5px] text-zinc-600 tabular-nums">
+          <div className="mt-1.5 flex items-center justify-between gap-2 text-[9.5px] text-zinc-600 tabular-nums">
             <span>{project.items_done}/{project.items_total} items</span>
             <span>{project.status}</span>
           </div>

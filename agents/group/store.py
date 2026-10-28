@@ -306,6 +306,12 @@ def _reduce(state: State, event: dict) -> set[tuple[str, str]]:
         # not change shape.
         return touched
 
+    if kind in (ev.MESSAGE_SENT, ev.MESSAGE_READ):
+        # The chat transcript is read directly from the event log. There is no
+        # projection to update, but replay must not raise: a project's history
+        # includes every message it ever exchanged.
+        return touched
+
     if kind == ev.CAPABILITY_CHANGED:
         # The capability files (agents/, skills/, tools/, mcp/) are the
         # folder's own truth, not projections of this log — so there is
@@ -673,6 +679,22 @@ class ProjectStore:
             rows = self._db.execute(sql, params).fetchall()
         out = []
         for row in rows:
+            record = dict(row)
+            try:
+                record["data"] = json.loads(record["data"] or "{}")
+            except (TypeError, ValueError):
+                record["data"] = {}
+            out.append(record)
+        return out
+
+    def events_tail(self, project_id: str, limit: int = 200) -> list[dict]:
+        """The newest events, oldest-first, without loading the whole log."""
+        sql = ("SELECT seq, ts, kind, actor, milestone_id, item_id, data"
+               " FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT ?")
+        with self._lock:
+            rows = self._db.execute(sql, (project_id, int(limit))).fetchall()
+        out = []
+        for row in reversed(rows):
             record = dict(row)
             try:
                 record["data"] = json.loads(record["data"] or "{}")

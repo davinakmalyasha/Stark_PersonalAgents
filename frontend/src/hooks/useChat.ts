@@ -265,7 +265,6 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
 
   const handleRewind = useCallback(async (message: ChatMessage) => {
     if (!generalWs || !activeChatId || isRunning) return;
-    if (!window.confirm('Rewind to before this message? Files changed by it and every later message will be restored, and the text goes back to the prompt.')) return;
     try {
       const result = await rewindChat(generalWs.id, activeChatId, message.id);
       const chat = await fetchChat(generalWs.id, activeChatId);
@@ -444,6 +443,8 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const lastModelName = lastCall?.model || 'Automatic Fallback';
   const activeContextTokens = lastCall?.input || 0;
 
+  const seedDraft = useCallback((prompt: string) => setDraft(prompt), []);
+
   return {
     workspaceId: generalWs?.id ?? null,
     chats, activeChatId, displayMessages, liveState, isRunning, isLoading, notification, threadRef,
@@ -456,7 +457,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     combinedTokenUsage, lastModelName,
     handleNewChat, handleSelectChat, handleRenameChat, handleDeleteChat,
     handleSend, handleCancel, handleRewind,
-    draft, clearDraft: () => setDraft(''),
+    draft, seedDraft, clearDraft: () => setDraft(''),
   };
 }
 

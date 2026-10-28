@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import events as ev
+from . import messages as group_messages
 
 #: Default parallel members. Deliberately small: every one is an LLM loop.
 MAX_WORKERS = 4
@@ -67,6 +68,9 @@ class RunContext:
     #: The project's store. Needed by the approval gate, which parks the item
     #: and reads back the shapes a human has already approved.
     store: Any = None
+    #: Unread chat messages included in this run's prompt. Marked read after
+    #: the member run settles, so a crash does not silently consume them.
+    delivered_messages: list[dict] = field(default_factory=list)
 
 
 # ── the approval gate (Phase 5) ─────────────────────────────────────────────
@@ -259,6 +263,15 @@ def _park(store: Any, project_id: str, item_id: str, shape: str, detail: str,
         data = {"detail": detail, "shape": shape}
         if write_key:
             data["write_key"] = write_key
+        try:
+            sender = str(item.get("lease_owner") or item.get("owner_member") or "member")
+            group_messages.send(
+                store, project_id,
+                sender=sender, recipient="owner",
+                body=detail, kind="approval", item_id=item_id,
+            )
+        except Exception:  # noqa: BLE001 - the approval itself must still park
+            pass
         store.append(
             project_id, ev.APPROVAL_REQUESTED, "member", item_id=item_id,
             data=data,
@@ -480,6 +493,13 @@ def build_prompt(ctx: RunContext) -> str:
         "- If the plan itself turns out to be wrong, say so and stop — do not",
         "  force the item through. It will be invalidated and re-planned.",
     ]
+    try:
+        unread = group_messages.unread_for(ctx.store, ctx.project_id, ctx.member_name)
+        if unread:
+            ctx.delivered_messages = list(unread)
+            lines += ["", group_messages.render_prompt(unread)]
+    except Exception:  # noqa: BLE001 - chat delivery must never block work
+        pass
     return "\n".join(lines)
 
 
@@ -540,6 +560,15 @@ class LocalRunner(ItemRunner):
             )
             self._threads[item_id] = thread
             self._running[item_id] = ctx.project_id
+            try:
+                group_messages.send(
+                    ctx.store, ctx.project_id,
+                    sender="supervisor", recipient=ctx.member_name,
+                    body=f"Assigned {ctx.item['id']}: {ctx.item.get('title') or 'work item'}",
+                    kind="assignment", item_id=str(ctx.item.get("id") or ""),
+                )
+            except Exception:  # noqa: BLE001 - assignment still dispatches
+                pass
             thread.start()
 
     def collect(self, project_id: str) -> list[RunResult]:
@@ -571,6 +600,16 @@ class LocalRunner(ItemRunner):
         except Exception as exc:  # noqa: BLE001 - a failed run is a result
             result = RunResult(item_id=ctx.item["id"], ok=False,
                                error=f"{type(exc).__name__}: {exc}")
+        try:
+            body = result.report if result.ok else result.error
+            group_messages.send(
+                ctx.store, ctx.project_id,
+                sender=ctx.member_name, recipient="supervisor",
+                body=body or ("Work item completed." if result.ok else "Work item failed."),
+                kind="report", item_id=str(ctx.item.get("id") or ""),
+            )
+        except Exception:  # noqa: BLE001 - reporting must not lose the result
+            pass
         try:
             from server.services.canvas_watch import notify_run_finished
             notify_run_finished(
@@ -620,13 +659,29 @@ class LocalRunner(ItemRunner):
         allow_token = None
         gate_token = None
         ledger_token = None
+        messenger_token = None
         try:
             from sync.state_sync import active_state, new_scoped_state, safe_get_state
             from tools._runtime import (
                 active_allowed_tools,
                 active_approval_gate,
+                active_group_messenger,
                 active_write_ledger,
             )
+
+            def _send_group_message(to: str, body: str) -> str:
+                target = str(to or "").strip()
+                if not target:
+                    return "Error: group_message needs a recipient."
+                group_messages.send(
+                    ctx.store, ctx.project_id,
+                    sender=ctx.member_name, recipient=target,
+                    body=body, kind="note",
+                    item_id=str(ctx.item.get("id") or ""),
+                )
+                return f"[OK] Message queued for {target}."
+
+            messenger_token = active_group_messenger.set(_send_group_message)
 
             # The member's materialised allowlist is the real ceiling on its
             # tools (``04`` §5). Until this ran, ``tools/bindings.json`` was
@@ -665,6 +720,18 @@ class LocalRunner(ItemRunner):
         except Exception as exc:  # noqa: BLE001 - a failed run is a result
             output = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
+            try:
+                for delivered in getattr(ctx, "delivered_messages", []) or []:
+                    group_messages.mark_read(ctx.store, ctx.project_id, delivered, ctx.member_name)
+                ctx.delivered_messages = []
+            except Exception:  # noqa: BLE001 - acknowledgement is best-effort
+                pass
+            if messenger_token is not None:
+                try:
+                    from tools._runtime import active_group_messenger as _messenger
+                    _messenger.reset(messenger_token)
+                except Exception:  # noqa: BLE001, S110 - scope cleanup only
+                    pass
             if ledger_token is not None:
                 try:
                     from tools._runtime import active_write_ledger as _ledger

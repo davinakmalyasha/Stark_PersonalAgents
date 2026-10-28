@@ -60,6 +60,13 @@ active_approval_gate: ContextVar[Optional[Callable[[str, str], Optional[str]]]] 
 #: directly and behaviour is exactly as it was before AU-05.
 active_write_ledger: ContextVar[Optional[Any]] = ContextVar("active_write_ledger", default=None)
 
+#: A group member's message sender, set by the group runner for one run.
+#: ``send(to, body) -> str``. None means this is not a group member run, so the
+#: ``group_message`` tool is neither offered nor executable.
+active_group_messenger: ContextVar[Optional[Callable[[str, str], str]]] = ContextVar(
+    "active_group_messenger", default=None
+)
+
 #: Tier names, spelled out rather than imported. ``tools/`` must not depend on
 #: the group package, not even for a constant (``04`` §5, bullet 4).
 TIER_AUTONOMOUS = "autonomous"

@@ -1,13 +1,13 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { LayoutGrid, Maximize2, Plus, RotateCcw } from 'lucide-react';
+import { LayoutGrid, Plus } from 'lucide-react';
 import type { ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import CanvasAddMenu from './CanvasAddMenu';
 import type { AddAddonEntry, AddChatEntry, AddProjectEntry } from './CanvasAddMenu';
 import CanvasItemCard from './CanvasItemCard';
 import type { CanvasAddonId, CanvasDraft, CanvasItem, CanvasScope, CanvasView } from './canvasTypes';
-import { DEFAULT_VIEW, draftId, makeItem } from './canvasTypes';
+import { draftId, makeItem } from './canvasTypes';
 import { loadItems, loadView, saveItems, saveView } from './canvasStorage';
 
 interface Props {
@@ -29,9 +29,6 @@ interface Props {
 type Interaction =
   | { type: 'pan'; sx: number; sy: number; vx: number; vy: number }
   | { type: 'item'; id: string; sx: number; sy: number; ix: number; iy: number; moved: boolean; item: CanvasItem };
-
-const CARD_W = 320;
-const CARD_H = 230;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -164,30 +161,6 @@ export default function CanvasStage({
       onOpenAddon?.(item.workspaceId, item.addonId, item.chatId);
     }
   }, [onOpenChat, onOpenGroup, onOpenAddon]);
-
-  const fitView = useCallback(() => {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    if (itemsRef.current.length === 0) {
-      commitView({ ...DEFAULT_VIEW });
-      return;
-    }
-    const minX = Math.min(...itemsRef.current.map((item) => item.x));
-    const minY = Math.min(...itemsRef.current.map((item) => item.y));
-    const maxX = Math.max(...itemsRef.current.map((item) => item.x + CARD_W));
-    const maxY = Math.max(...itemsRef.current.map((item) => item.y + CARD_H));
-    const pad = 48;
-    const scale = clamp(
-      Math.min((rect.width - pad * 2) / (maxX - minX), (rect.height - pad * 2) / (maxY - minY)),
-      0.45,
-      1.1,
-    );
-    commitView({
-      scale,
-      x: (rect.width - (maxX - minX) * scale) / 2 - minX * scale,
-      y: (rect.height - (maxY - minY) * scale) / 2 - minY * scale,
-    });
-  }, [commitView]);
 
   const onWheel = (e: ReactWheelEvent) => {
     if ((e.target as HTMLElement).closest('[data-canvas-ui]')) return;
@@ -354,23 +327,6 @@ export default function CanvasStage({
             </div>
           );
         })}
-      </div>
-
-      <div data-canvas-ui className="absolute left-3 top-3 z-20 flex items-center gap-1.5">
-        <button
-          type="button"
-          onClick={() => setAddOpen((open) => !open)}
-          className="flex h-8 items-center gap-1.5 rounded-lg border border-white/[0.09] bg-[#141419]/95 px-2.5 text-[10.5px] font-medium text-zinc-300 hover:bg-white/[0.06] hover:text-white"
-        >
-          <Plus size={12} /> Add
-        </button>
-        <button type="button" onClick={fitView} className="grid h-8 w-8 place-items-center rounded-lg border border-white/[0.09] bg-[#141419]/95 text-zinc-500 hover:text-white hover:bg-white/[0.06]" title="Fit to contents" aria-label="Fit to contents">
-          <Maximize2 size={12} />
-        </button>
-        <button type="button" onClick={() => commitView({ ...DEFAULT_VIEW })} className="grid h-8 w-8 place-items-center rounded-lg border border-white/[0.09] bg-[#141419]/95 text-zinc-500 hover:text-white hover:bg-white/[0.06]" title="Reset view" aria-label="Reset view">
-          <RotateCcw size={12} />
-        </button>
-        <span className="ml-1 text-[9.5px] text-zinc-600">{items.length} on canvas</span>
       </div>
 
       {addOpen && (

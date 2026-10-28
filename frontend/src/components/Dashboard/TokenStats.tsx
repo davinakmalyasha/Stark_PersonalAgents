@@ -1,3 +1,4 @@
+import { Activity } from 'lucide-react';
 import type { TokenUsage } from '../../types';
 import { TokenSummary } from './TokenSummary';
 import { CallList } from './CallList';
@@ -10,8 +11,16 @@ interface TokenStatsProps {
 export function TokenStats({ tokenUsage, lastModelName }: TokenStatsProps) {
   if (!tokenUsage || !tokenUsage.calls || tokenUsage.calls.length === 0) {
     return (
-      <div className="p-4 rounded-lg text-xs italic bg-zinc-900/40 border border-zinc-800 text-zinc-400">
-        No token usage recorded for this session yet. Start the agentic pipeline to analyze cost.
+      <div className="flex min-h-[420px] flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+        <div className="grid h-12 w-12 place-items-center rounded-2xl border border-zinc-800 bg-white/[0.035] text-zinc-400">
+          <Activity size={22} />
+        </div>
+        <div>
+          <div className="text-sm font-semibold text-zinc-200">No usage yet</div>
+          <p className="mt-1 max-w-sm text-[12px] leading-5 text-zinc-500">
+            Run a message to see cost, token usage, cache activity, and context here.
+          </p>
+        </div>
       </div>
     );
   }

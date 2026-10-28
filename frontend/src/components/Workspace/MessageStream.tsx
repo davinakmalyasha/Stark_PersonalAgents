@@ -93,12 +93,15 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
     isAtBottomRef.current = true;
   };
 
-  const isEmpty = !hasActiveChat && messages.length <= 1;
+  const visibleMessages = messages.filter((message) => !(
+    message.role === 'user' && message.content.trimStart().startsWith('[DELEGATION RESULT]')
+  ));
+  const isEmpty = !hasActiveChat && visibleMessages.length <= 1;
 
   // General mode persists the assistant response first and the trace record
   // after the run completes. Keep an empty trace attached before that response
   // so the duration/activity summary reads like the project chat flow.
-  const orderedMessages = messages.reduce<ChatMessage[]>((ordered, message) => {
+  const orderedMessages = visibleMessages.reduce<ChatMessage[]>((ordered, message) => {
     const isEmptyTrace = message.role === 'agent'
       && !!message.metadata?.isTrace
       && !message.content.trim();

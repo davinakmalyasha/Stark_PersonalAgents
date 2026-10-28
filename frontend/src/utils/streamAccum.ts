@@ -1,4 +1,4 @@
-import type { StreamDelta } from '../types';
+import type { ChildReference, StreamDelta } from '../types';
 
 /**
  * Shared stream accumulator — single implementation of the SSE delta fold
@@ -19,6 +19,7 @@ export interface LiveToolEvent {
   ms?: number;
   preview?: string;
   agent?: string;
+  children?: ChildReference[];
 }
 
 /**
@@ -52,6 +53,20 @@ export function emptyStreamAccum(): StreamAccum {
 
 export function emptyRateAccum(): RateAccum {
   return { lastTs: 0, lastChars: 0, ema: 0 };
+}
+
+function legacyChildRefs(text: string): ChildReference[] {
+  const refs: ChildReference[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const delegated = line.match(/^\s*-\s*(del-[\w-]+)\s*[·|]\s*([^·|]+?)\s*[·|]\s*(.+?)\s*[—-].*?\(chat:\s*([^)]+)\)/i);
+    if (delegated) {
+      refs.push({ chatId: delegated[4].trim(), jobId: delegated[1], agentName: delegated[2].trim(), label: delegated[3].trim() });
+      continue;
+    }
+    const spawned = line.match(/\[SPAWNED\]\s+child=([^\s;]+)(?:\s+name=([^;]+))?/i);
+    if (spawned) refs.push({ chatId: spawned[1], agentName: spawned[2]?.trim(), label: spawned[2]?.trim() });
+  }
+  return refs;
 }
 
 let toolSeq = 0;
@@ -119,6 +134,7 @@ export function applyDeltaToAccum(
       ev.ok = delta.ok;
       ev.ms = delta.ms;
       ev.preview = delta.text || undefined;
+      ev.children = delta.children?.length ? delta.children : legacyChildRefs(delta.text || '');
     } else {
       // Finish without a recorded start (mirror attach, reconnect): keep it.
       toolSeq += 1;
@@ -131,6 +147,7 @@ export function applyDeltaToAccum(
         ms: delta.ms,
         preview: delta.text || undefined,
         agent: delta.agent,
+        children: delta.children?.length ? delta.children : legacyChildRefs(delta.text || ''),
       };
       acc.toolEvents.push(ev);
       acc.segments.push({ type: 'tool', ev });

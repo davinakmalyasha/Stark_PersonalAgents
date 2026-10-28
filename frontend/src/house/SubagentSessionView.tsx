@@ -19,6 +19,7 @@ interface SubagentSessionViewProps {
   parentTitle: string;
   onBack: () => void;
   onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
+  hideHeader?: boolean;
 }
 
 function ToolRow({ entry }: { entry: SubagentSessionEntry }) {
@@ -93,6 +94,7 @@ export default function SubagentSessionView({
   parentTitle,
   onBack,
   onOpenSubagentSession,
+  hideHeader = false,
 }: SubagentSessionViewProps) {
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [childChat, setChildChat] = useState<ChatData | null>(null);
@@ -206,7 +208,7 @@ export default function SubagentSessionView({
 
   return (
     <div className="subagent-session-view">
-      <header className="subagent-session-view-header">
+      {!hideHeader && <header className="subagent-session-view-header">
         <button
           type="button"
           onClick={onBack}
@@ -228,7 +230,7 @@ export default function SubagentSessionView({
             <span className="session-run-dot" /> running
           </span>
         )}
-      </header>
+      </header>}
 
       <div className="subagent-session-view-body">
         {isLoading && !activeChildChat && !activeLegacySession ? (

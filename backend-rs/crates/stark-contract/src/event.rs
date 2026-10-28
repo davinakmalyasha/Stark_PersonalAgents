@@ -19,6 +19,8 @@ pub struct Delta {
     pub ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ms: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub children: Vec<Value>,
 }
 
 impl Delta {
@@ -49,6 +51,7 @@ impl Delta {
             args: Some(args.into()),
             ok: None,
             ms: None,
+            children: Vec::new(),
         }
     }
 
@@ -69,11 +72,17 @@ impl Delta {
             args: Some(args.into()),
             ok: Some(ok),
             ms: Some(ms),
+            children: Vec::new(),
         }
     }
 
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = Some(agent.into());
+        self
+    }
+
+    pub fn with_children(mut self, children: Vec<Value>) -> Self {
+        self.children = children;
         self
     }
 
@@ -88,6 +97,7 @@ impl Delta {
             args: None,
             ok: None,
             ms: None,
+            children: Vec::new(),
         }
     }
 }

@@ -7,9 +7,12 @@ import HouseSidebar from './HouseSidebar';
 import HousePortal from './HousePortal';
 import CodingIDE from './CodingIDE';
 import NewProjectDialog from './NewProjectDialog';
-import SubagentSessionView from './SubagentSessionView';
+import NewTaskDialog, { type NewTaskRequest } from './NewTaskDialog';
+import SubagentTabsPane from './SubagentTabsPane';
+import { useSubagentTabs } from './useSubagentTabs';
 import GroupProjectModal from './GroupProjectModal';
 import { useGroupProjects } from './useGroupProjects';
+import { useScheduledTasks } from './useScheduledTasks';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import { useHouseChat } from './useHouseChat';
 import { useSessions, tabId } from './useSessions';
@@ -17,7 +20,7 @@ import { useSessionRunner } from './useSessionRunner';
 import { useCanvasAgentState } from '../hooks/useCanvasAgentState';
 import type { TraceStep } from '../utils/logParser';
 import { kindForWorkspace, sendCanvasChat } from '../canvas/canvasSend';
-import { addWorkspace, createChat, updateChatTitle, deleteChat } from '../services/api';
+import { addWorkspace, createChat, updateChatTitle, deleteChat, addChatMessage, createGroupProject, createSchedule, cancelSchedule } from '../services/api';
 import '../house/house.css';
 
 const CanvasStage = lazy(() => import('../canvas/CanvasStage'));
@@ -28,7 +31,8 @@ export default function House() {
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
-  const [subagentView, setSubagentView] = useState<{ childId: string; label: string; workspaceId?: string } | null>(null);
+  const [taskDialogOpen, setTaskDialogOpen] = useState(false);
+  const subagents = useSubagentTabs();
   const [exitingIdeTab, setExitingIdeTab] = useState<import('../types').SessionTab | null>(null);
 
   const sessions = useSessions();
@@ -53,6 +57,7 @@ export default function House() {
   const [openProjectId, setOpenProjectId] = useState<string | null>(null);
   const groupScopeId = activeTab?.workspaceId || chat.workspaceId || '';
   const { projects, scoped: projectsScoped, refresh: refreshProjects } = useGroupProjects(groupScopeId);
+  const { schedules, refresh: refreshSchedules } = useScheduledTasks('');
 
   // IDE open/close transition: keep the exiting IDE mounted for the exit
   // animation so it feels like staying on the same page (only the IDE shows/
@@ -136,12 +141,13 @@ export default function House() {
   const activeTabType = activeTab?.type ?? null;
   const activeTabChatId = activeTab?.chatId ?? null;
 
-  // Switching sessions closes any open subagent drill-in (render-time reset)
+  // A child pane belongs to its parent session; clear it when switching chats.
   const prevTabRef = useRef<string | null>(activeTabId);
-  if (prevTabRef.current !== activeTabId) {
+  const clearSubagents = subagents.clear;
+  useEffect(() => {
+    if (prevTabRef.current !== activeTabId) clearSubagents();
     prevTabRef.current = activeTabId;
-    if (subagentView) setSubagentView(null);
-  }
+  }, [activeTabId, clearSubagents]);
 
   useEffect(() => {
     if (activeTabType !== 'chat' || !activeTabChatId) return;
@@ -155,6 +161,56 @@ export default function House() {
   const handleNewSession = useCallback(() => {
     newSession();
   }, [newSession]);
+
+  const handleCreateTask = useCallback(async (request: NewTaskRequest) => {
+    const titleSource = request.instructions.split(/[\n.!?]/, 1)[0].trim();
+    const title = (titleSource.slice(0, 48) || 'New Conversation') + (titleSource.length > 48 ? '…' : '');
+    if (request.kind === 'single') {
+      const tab = await newSession(title);
+      if (!tab) throw new Error('Could not create a General chat.');
+      chat.seedDraft(request.instructions);
+      setTaskDialogOpen(false);
+      return;
+    }
+
+    if (request.kind === 'group') {
+      const project = await createGroupProject({ goal: request.instructions, workspaceId: groupScopeId });
+      if (!project.id) throw new Error('The backend did not return a project id.');
+      await refreshProjects();
+      setOpenProjectId(project.id);
+      setTaskDialogOpen(false);
+      return;
+    }
+
+    const tab = await newSession(title);
+    if (!tab) throw new Error('Could not create a General chat.');
+    const localDate = request.runAt ? new Date(request.runAt) : null;
+    if (!localDate || Number.isNaN(localDate.getTime())) throw new Error('Choose a valid local date and time.');
+    const schedule = await createSchedule({
+      workspaceId: tab.workspaceId,
+      chatId: tab.chatId,
+      name: title,
+      prompt: request.instructions,
+      at: localDate.toISOString(),
+      recurrence: request.repeat === 'once' ? 'none' : (request.repeat || 'none'),
+    });
+    const repeatLabel = request.repeat === 'once' ? 'once' : request.repeat;
+    await addChatMessage(tab.workspaceId, tab.chatId, 'system', `Scheduled task: ${title}. Next run: ${new Date(schedule.nextRunAt).toLocaleString()}. Repeat: ${repeatLabel}.`);
+    await Promise.all([sessions.forceRefresh(), refreshSchedules()]);
+    sessions.activateTab(tab.id);
+    await chat.handleSelectChat(tab.chatId, { silent: true });
+    setTaskDialogOpen(false);
+  }, [newSession, chat, groupScopeId, refreshProjects, sessions, refreshSchedules]);
+
+  const handleCancelSchedule = useCallback(async (scheduleId: string) => {
+    try {
+      await cancelSchedule(scheduleId);
+      await refreshSchedules();
+    } catch (error) {
+      setBlockedNote(error instanceof Error ? error.message : 'Could not cancel scheduled task.');
+      window.setTimeout(() => setBlockedNote(null), 3500);
+    }
+  }, [refreshSchedules]);
   const handleNewChatIn = useCallback((workspaceId: string) => {
     newChatIn(workspaceId);
   }, [newChatIn]);
@@ -319,7 +375,7 @@ export default function House() {
         onCancel={chat.handleCancel}
         onToggleVoice={chat.toggleVoice}
         onOpenStats={() => setIsStatsOpen(true)}
-        onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
+        onOpenSubagent={subagents.open}
         workspaceId={chat.workspaceId}
         chatId={activeTabChatId}
         onRewind={chat.handleRewind}
@@ -380,14 +436,19 @@ export default function House() {
         projects={projects}
         projectsScoped={projectsScoped}
         onOpenProject={setOpenProjectId}
+        schedules={schedules}
+        onNewTask={() => setTaskDialogOpen(true)}
+        onCancelSchedule={handleCancelSchedule}
+        onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
       />
 
-      <main className="relative z-10 flex-1 min-h-0 flex flex-col overflow-hidden">
+      <main className="relative z-10 flex-1 min-h-0 flex overflow-hidden">
+        <div className="relative flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
         {exitingIdeTab ? (
           <>
             {/* Chat is visible immediately under the exiting IDE — feels like the IDE slides away */}
             {generalChatView}
-            <div className="absolute inset-0 z-10 ide-exit bg-[#0a0a0d]">
+            <div className="absolute inset-0 z-10 flex ide-exit bg-[#0a0a0d]">
               <CodingIDE
                 key={exitingIdeTab.id}
                 session={exitingIdeTab}
@@ -398,7 +459,7 @@ export default function House() {
             </div>
           </>
         ) : isCodingTab && activeTab ? (
-          <div key={activeTab.id} className="flex-1 min-h-0 flex flex-col ide-enter">
+          <div key={activeTab.id} className="relative flex-1 min-w-0 min-h-0 flex ide-enter">
             <CodingIDE
               key={activeTab.id}
               session={activeTab}
@@ -410,20 +471,17 @@ export default function House() {
         ) : (
           generalChatView
         )}
-
-        {/* Child sessions open as a right-side drill-in drawer. The parent
-            conversation remains visible and never receives child transcript. */}
-        {subagentView && !isCodingTab && (
-          <aside className="subagent-session-drawer" aria-label="Subagent session">
-            <SubagentSessionView
-              workspaceId={subagentView.workspaceId || chat.workspaceId || sessions.workspaces.find((w) => w.isGeneral)?.id || ''}
-              childId={subagentView.childId}
-              label={subagentView.label}
-              parentTitle={activeGeneralTitle}
-              onBack={() => setSubagentView(null)}
-              onOpenSubagentSession={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
-            />
-          </aside>
+        </div>
+        {!isCodingTab && !exitingIdeTab && subagents.tabs.length > 0 && (
+          <SubagentTabsPane
+            tabs={subagents.tabs}
+            activeChildId={subagents.activeChildId}
+            parentTitle={activeGeneralTitle}
+            fallbackWorkspaceId={chat.workspaceId || sessions.workspaces.find((w) => w.isGeneral)?.id || ''}
+            onActivate={subagents.activate}
+            onClose={subagents.close}
+            onOpenSubagent={subagents.open}
+          />
         )}
       </main>
 
@@ -454,6 +512,13 @@ export default function House() {
         <NewProjectDialog
           onClose={() => setProjectDialogOpen(false)}
           onCreateProject={handleCreateProject}
+        />
+      )}
+
+      {taskDialogOpen && (
+        <NewTaskDialog
+          onClose={() => setTaskDialogOpen(false)}
+          onCreate={handleCreateTask}
         />
       )}
 

@@ -50,6 +50,7 @@ from .githubTools import (
     github_apply_observability,
 )
 
+from .groupChat import group_message
 from .orchestrationTools import (
     send_message,
     list_agents,
@@ -143,6 +144,7 @@ __all__ = [
     'github_init_project',
     'github_apply_observability',
     'send_message',
+    'group_message',
     'list_agents',
     'interrupt_agent',
     'report',

@@ -41,6 +41,7 @@ from typing import Any
 
 from . import criteria as criteria_mod
 from . import events as ev
+from . import messages as group_messages
 from .runner import ItemRunner, RunContext
 from .store import ProjectStore, evaluate_completion
 
@@ -731,6 +732,18 @@ class Supervisor:
 
     # ── phase 7: verify against the acceptance criteria ─────────────────
 
+    def _say(self, project_id: str, item: dict, body: str, *, kind: str = "verdict") -> None:
+        """Record a supervisor-to-member chat message (best-effort)."""
+        try:
+            group_messages.send(
+                self.store, project_id,
+                sender="supervisor",
+                recipient=str(item.get("lease_owner") or item.get("owner_member") or "member"),
+                body=body, kind=kind, item_id=str(item.get("id") or ""),
+            )
+        except Exception:  # noqa: BLE001 - chat must not block the board
+            pass
+
     def _verify(self, project_id: str) -> int:
         """Judge harvested items against their own acceptance criteria.
 
@@ -768,15 +781,22 @@ class Supervisor:
             if evaluation.passed:
                 self.store.append(project_id, ev.ITEM_DONE, "supervisor",
                                   item_id=item["id"])
+                self._say(project_id, item, f"{item['id']} passed acceptance.", kind="verdict")
                 changed += 1
             elif evaluation.pending:
                 # Park it — but only announce it once, or the inbox fills with
                 # the same question every 15 seconds.
                 if item.get("blocked_reason") != ev.AWAITING_APPROVAL:
+                    pending_text = "\n".join(str(r.detail) for r in evaluation.pending)
                     self.store.append(
                         project_id, ev.APPROVAL_REQUESTED, "supervisor",
                         item_id=item["id"],
                         data={"pending": [r.detail for r in evaluation.pending]},
+                    )
+                    self._say(
+                        project_id, item,
+                        pending_text or f"{item['id']} is waiting for owner approval.",
+                        kind="approval",
                     )
                     changed += 1
             elif evaluation.failed:
@@ -795,9 +815,19 @@ class Supervisor:
             self.store.append(project_id, ev.ITEM_READY, "supervisor",
                               item_id=item["id"],
                               data={"retry": attempts, "reason": reason[:400]})
+            self._say(
+                project_id, item,
+                f"{item['id']} failed attempt {attempts}/{max_attempts}: {reason[:400]}. Retrying.",
+                kind="verdict",
+            )
         else:
             self.store.append(project_id, ev.ITEM_FAILED, "supervisor",
                               item_id=item["id"], data={"reason": reason[:400]})
+            self._say(
+                project_id, item,
+                f"{item['id']} failed after {attempts} attempts: {reason[:400]}",
+                kind="verdict",
+            )
         return 1
 
     # ── phase 8: invalidation bursts ────────────────────────────────────

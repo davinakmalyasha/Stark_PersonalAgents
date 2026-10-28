@@ -120,6 +120,9 @@ REDUCED_KINDS = frozenset({
     OP_SUBMITTED, OP_APPLIED, OP_REJECTED,
     LEASE_EXPIRED, BUDGET_WARN, BUDGET_STOP, DEADLINE_REACHED,
     APPROVAL_REQUESTED, APPROVAL_GRANTED, APPROVAL_REJECTED,
+    # Chat is an append-only audit stream, not a projection. The reducer is a
+    # no-op; ``agents.group.messages`` reads these events back as the transcript.
+    MESSAGE_SENT, MESSAGE_READ,
     # A capability change edits the FOLDER (agents/, skills/, tools/, mcp/),
     # which is the folder's own truth and not a projection of the log. It is
     # reduced as a no-op so replay never raises, while remaining a first-class

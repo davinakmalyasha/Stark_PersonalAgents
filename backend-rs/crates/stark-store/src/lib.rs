@@ -8,11 +8,13 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod agents;
 mod canvas;
 mod groups;
 mod jobs;
 mod schedules;
 mod workspaces;
+pub use agents::{AgentRecord, AgentStore};
 pub use canvas::CanvasStore;
 pub use groups::GroupStore;
 pub use jobs::{JobRecord, JobStore};

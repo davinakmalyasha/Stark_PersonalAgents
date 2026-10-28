@@ -160,10 +160,10 @@ mod tests {
         let file = ToolSpecFile::load(fixture()).expect("tool contract");
 
         assert_eq!(file.contract_version, 1);
-        assert_eq!(file.tool_count, 43);
-        assert_eq!(file.tools.len(), 43);
+        assert_eq!(file.tool_count, 44);
+        assert_eq!(file.tools.len(), 44);
         assert_eq!(file.scope_map.len(), 8);
-        assert_eq!(file.exposed_tools().count(), 37);
+        assert_eq!(file.exposed_tools().count(), 38);
 
         let hidden: BTreeSet<&str> = file
             .tools
@@ -190,14 +190,14 @@ mod tests {
         assert_eq!(file.orphan_docs, vec!["browser_click", "browser_fill"]);
         assert!(file.tool("propose_plan").is_none());
 
-        assert_eq!(file.scope_map["developer"].len(), 8);
-        assert_eq!(file.scope_map["general"].len(), 10);
-        assert_eq!(file.scope_map["house"].len(), 9);
-        assert_eq!(file.scope_map["dfd"].len(), 7);
-        assert_eq!(file.scope_map["orchestrator"].len(), 14);
+        assert_eq!(file.scope_map["developer"].len(), 9);
+        assert_eq!(file.scope_map["general"].len(), 11);
+        assert_eq!(file.scope_map["house"].len(), 10);
+        assert_eq!(file.scope_map["dfd"].len(), 8);
+        assert_eq!(file.scope_map["orchestrator"].len(), 15);
         assert_eq!(file.scope_map["devops"].len(), 6);
         assert_eq!(file.scope_map["explore"].len(), 3);
-        assert_eq!(file.scope_map["ui"].len(), 7);
+        assert_eq!(file.scope_map["ui"].len(), 8);
 
         assert_eq!(
             file.tool("read_file").unwrap().required,

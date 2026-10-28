@@ -49,6 +49,7 @@ conflicts with these docs, update the doc first, then the code.
 | 13 | [Canvas & MCP](./13-canvas-mcp.md) | Canvas watches, wake loop, MCP stdio/HTTP, approvals |
 | 14 | [Code Mode & Compaction](./14-code-mode-compaction.md) | QuickJS tool programs, checkpoint compaction, run budgets |
 | 15 | [Provider Affinity](./15-provider-affinity.md) | opencode-go session/affinity headers and cache routing |
+| 16 | [Durable Agents](./16-durable-agents.md) | Orchestrator → workspace → subagent tree, mailboxes, supervisor |
 
 ---
 

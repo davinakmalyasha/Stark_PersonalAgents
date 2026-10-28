@@ -25,8 +25,8 @@ use stark_core::{
 };
 use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
 use stark_store::{
-    CanvasStore, ChatStore, GroupStore, ScheduleRecord, ScheduleStore, WorkspaceRegistry,
-    parse_schedule_time, schedule_json,
+    AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, ScheduleRecord, ScheduleStore,
+    WorkspaceRegistry, parse_schedule_time, schedule_json,
 };
 use stark_tools::{
     Checkpoint, HouseStore, PlanStore, QuestionBroker, evaluate_acceptance, public_device,
@@ -281,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_state = state.clone();
     let group_runner_state = state.clone();
     let canvas_state = state.clone();
+    let agent_state = state.clone();
     tokio::spawn(async move {
         mcp_manager.start_all().await;
     });
@@ -459,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(schedule_loop(scheduler_state));
     tokio::spawn(group_loop(group_runner_state));
     tokio::spawn(canvas_loop(canvas_state));
+    tokio::spawn(agent_loop(agent_state));
     tracing::info!("stark-server listening on http://{address}");
     axum::serve(
         listener,
@@ -1136,6 +1138,225 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
         ));
         spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
+}
+
+async fn agent_loop(state: ServerState) {
+    let store = match AgentStore::open(&state.harness_root).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!("durable agents disabled: {error}");
+            return;
+        }
+    };
+    if let Ok(count) = store.recover_running().await
+        && count > 0
+    {
+        tracing::info!("recovered {count} interrupted agent(s)");
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let due = match store.pending_trigger(8).await {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!("agent mailbox query failed: {error}");
+                continue;
+            }
+        };
+        for agent in due {
+            if !store.claim(&agent.id).await.unwrap_or(false) {
+                continue;
+            }
+            if !spawn_agent_run(state.clone(), store.clone(), agent.clone()).await {
+                let _ = store.requeue(&agent.id).await;
+            }
+        }
+    }
+}
+
+async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
+    let workspace_path = state
+        .store
+        .chat_workspace_path(&agent.chat_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let workspace = if workspace_path.trim().is_empty() {
+        state.harness_root.clone()
+    } else {
+        PathBuf::from(workspace_path)
+    };
+    let model = if agent.model.trim().is_empty() {
+        state.provider.config().resolve_model("")
+    } else {
+        agent.model.clone()
+    };
+    RunTarget {
+        chat_id: agent.chat_id.clone(),
+        workspace_id: agent.workspace_id.clone(),
+        workspace,
+        scope: agent.scope.clone(),
+        role: (!agent.role.is_empty()).then(|| agent.role.clone()),
+        model,
+        temperature: 0.2,
+    }
+}
+
+async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentRecord) -> bool {
+    let target = agent_target(&state, &agent).await;
+    let pending = match store.messages(&agent.id).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!("agent {} mailbox failed: {error}", agent.id);
+            return false;
+        }
+    };
+    if pending.is_empty() {
+        let _ = store.set_status(&agent.id, "idle", false).await;
+        return false;
+    }
+    let (tx, _) = broadcast::channel(256);
+    let cancel = CancellationToken::new();
+    let steering = Arc::new(Mutex::new(VecDeque::new()));
+    let follow_up = Arc::new(Mutex::new(VecDeque::new()));
+    if !state.runs.claim(
+        &target.chat_id,
+        cancel.clone(),
+        tx.clone(),
+        steering.clone(),
+        follow_up.clone(),
+        target.workspace.to_string_lossy().as_ref(),
+    ) {
+        return false;
+    }
+    let messages = match store.take_messages(&agent.id, 20).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!("agent {} mailbox take failed: {error}", agent.id);
+            state.runs.finish(&target.chat_id, None);
+            return false;
+        }
+    };
+    if messages.is_empty() {
+        state.runs.finish(&target.chat_id, None);
+        let _ = store.set_status(&agent.id, "idle", false).await;
+        return false;
+    }
+    let prompt = messages
+        .iter()
+        .map(|message| {
+            format!(
+                "[{} from {}]\n{}",
+                message["kind"].as_str().unwrap_or("message"),
+                message["senderId"].as_str().unwrap_or("user"),
+                message["body"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
+    let latest = Arc::new(Mutex::new(None));
+    let ctx = RunContext {
+        chat_id: target.chat_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        workspace: target.workspace.clone(),
+        role: target.role.clone(),
+        scope: target.scope.clone(),
+        depth: agent.depth.max(0) as u32,
+        model: target.model.clone(),
+        temperature: target.temperature,
+        images: Vec::new(),
+        provider: state.provider.clone(),
+        store: state.store.clone(),
+        questions: state.questions.clone(),
+        tx: tx.clone(),
+        latest: latest.clone(),
+        steering,
+        follow_up,
+        checkpoint: Some(checkpoint.clone()),
+        cancel: cancel.clone(),
+        on_job_done: Some(job_hook(state.clone(), target.clone())),
+    };
+    let manager = state.runs.clone();
+    let done_tx = tx.clone();
+    let canvas_state = state.clone();
+    let canvas_chat = target.chat_id.clone();
+    tokio::spawn(async move {
+        let result = run_agent(ctx, prompt).await;
+        checkpoint.finalize();
+        let error = result.as_ref().err().map(ToString::to_string);
+        let final_state = latest.lock().ok().and_then(|guard| guard.clone());
+        let status = if error.is_some() {
+            "failed"
+        } else if final_state
+            .as_ref()
+            .is_some_and(|state| state.active_node == "aborted")
+        {
+            "cancelled"
+        } else {
+            "completed"
+        };
+        let report = final_state
+            .as_ref()
+            .and_then(|state| state.outputs.get("agent_report"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let usage = final_state
+            .as_ref()
+            .and_then(|state| serde_json::to_value(&state.token_usage).ok())
+            .unwrap_or_else(|| json!({}));
+        manager.finish(&canvas_chat, final_state);
+        let _ = done_tx.send(ServerEvent::new(
+            "done",
+            json!({"status": status, "error": error}),
+        ));
+        let _ = store.finish(&agent.id, status, &report, usage).await;
+        if let Ok(Some(message_id)) = store.notify_parent(&agent, &report, status).await {
+            wake_parent_agent(&store, &canvas_state, &agent, &report, message_id).await;
+        }
+        if store
+            .messages(&agent.id)
+            .await
+            .map(|messages| !messages.is_empty())
+            .unwrap_or(false)
+        {
+            let _ = store.set_status(&agent.id, "queued", false).await;
+        }
+        spawn_canvas_notification(canvas_state, canvas_chat, report, status);
+    });
+    true
+}
+
+async fn wake_parent_agent(
+    store: &AgentStore,
+    state: &ServerState,
+    child: &AgentRecord,
+    report: &str,
+    message_id: String,
+) {
+    let Some(parent_id) = child.parent_id.as_deref() else {
+        return;
+    };
+    let Ok(Some(parent)) = store.get(parent_id).await else {
+        return;
+    };
+    let target = agent_target(state, &parent).await;
+    let text = format!(
+        "[AGENT RESULT] {} · {} · {}\nchat: {}\n{}\nReview the child result and continue.",
+        child.path,
+        child.role,
+        child.status,
+        child.chat_id,
+        report.chars().take(12_000).collect::<String>()
+    );
+    // The mailbox row is the durable copy. The immediate wake is best-effort;
+    // the parent's next turn also sees the unconsumed message if delivery
+    // has not happened yet.
+    if !state.runs.follow_up(&parent.chat_id, &text) {
+        spawn_follow_up_run(state.clone(), target, text);
+    }
+    let _ = store.consume_message(&message_id).await;
 }
 
 fn spawn_canvas_notification(state: ServerState, chat_id: String, report: String, status: &str) {
@@ -3340,6 +3561,128 @@ mod tests {
         assert!(paths.contains(&"README.md"));
         assert!(paths.contains(&".agent-memory/project.md"));
         assert!(!paths.contains(&"node_modules"));
+    }
+
+    #[tokio::test]
+    async fn durable_agent_run_completes_and_notifies_parent() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::routing::post;
+
+        async fn mock_provider(Json(_body): Json<Value>) -> Response {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Child done\"}}]}
+
+",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+",
+                "data: [DONE]
+
+"
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(mock_provider)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), format!("http://{address}")).await;
+        let agents = AgentStore::open(dir.path()).await.unwrap();
+        let parent_chat = state
+            .store
+            .create_chat(
+                "_general",
+                dir.path().to_string_lossy().as_ref(),
+                "Parent",
+                "mock",
+            )
+            .await
+            .unwrap();
+        let child_chat = state
+            .store
+            .create_child_chat(
+                "_general",
+                dir.path().to_string_lossy().as_ref(),
+                "Child",
+                "mock",
+                parent_chat["id"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        let parent = agents
+            .create_agent(
+                "orchestrator",
+                "orchestrator:test",
+                None,
+                parent_chat["id"].as_str().unwrap(),
+                "_general",
+                "orchestrator",
+                "Orchestrator",
+                "Orch",
+                "mock",
+                0,
+            )
+            .await
+            .unwrap();
+        let child = agents
+            .create_agent(
+                "workspace",
+                "workspace:_general:developer",
+                Some(&parent.id),
+                child_chat["id"].as_str().unwrap(),
+                "_general",
+                "developer",
+                "Developer",
+                "Dev",
+                "mock",
+                1,
+            )
+            .await
+            .unwrap();
+        agents
+            .enqueue(
+                Some(&parent.id),
+                &child.id,
+                "spawn",
+                "do the work",
+                "trigger",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(agents.claim(&child.id).await.unwrap());
+        assert!(spawn_agent_run(state.clone(), agents.clone(), child.clone()).await);
+
+        for _ in 0..100 {
+            let status = agents.get(&child.id).await.unwrap().unwrap().status;
+            if status == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let finished = agents.get(&child.id).await.unwrap().unwrap();
+        assert_eq!(finished.status, "completed", "{:?}", finished.result);
+        assert!(finished.result.contains("Child done"));
+        let parent_messages = agents.messages_all(&parent.id).await.unwrap();
+        assert!(
+            parent_messages
+                .iter()
+                .any(|message| message["kind"] == "result")
+        );
     }
 
     #[tokio::test]

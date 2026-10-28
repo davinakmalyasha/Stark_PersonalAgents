@@ -1,7 +1,7 @@
 {
   "contract_version": 1,
   "source": "tools/_schemas.py",
-  "tool_count": 43,
+  "tool_count": 44,
   "tools": [
     {
       "name": "read_file",
@@ -1689,6 +1689,70 @@
         "code"
       ],
       "doc": "run_code(code, timeout_ms?, max_tool_calls?) — Run a restricted JavaScript program that calls Stark tools. Use tools.<name>({...}) synchronously and return one compact value."
+    },
+    {
+      "name": "agent",
+      "description": "Durable three-level agent control. spawn creates or reuses a workspace agent (or a subagent from a workspace agent) with a persisted mailbox task; list/status/send/report manage the tree. The server supervisor leases and runs agents, so work survives restarts and parent chats wake on results.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "spawn",
+              "list",
+              "status",
+              "send",
+              "report"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "workspace",
+              "subagent"
+            ]
+          },
+          "agent": {
+            "type": "string",
+            "description": "Agent role, e.g. Developer, General, House, DFD, UI."
+          },
+          "task": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string",
+            "description": "Target workspace id when the orchestrator spawns a workspace agent."
+          },
+          "workspace_path": {
+            "type": "string",
+            "description": "Target workspace path when the orchestrator spawns a workspace agent."
+          },
+          "agent_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "quiet": {
+            "type": "boolean"
+          },
+          "wait_seconds": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "exposed": true,
+      "required": [
+        "action"
+      ],
+      "doc": "agent(action, kind?, agent?, task?, title?, workspace_id?, workspace_path?, agent_id?, message?, quiet?, wait_seconds?) — Durable spawn/list/status/send/report for orchestrator → workspace → subagent."
     }
   ],
   "scope_map": {
@@ -1700,7 +1764,8 @@
       "ask_user",
       "update_plan",
       "call_subagent",
-      "run_code"
+      "run_code",
+      "agent"
     ],
     "general": [
       "run_command",
@@ -1712,7 +1777,8 @@
       "browser_act",
       "files_changed",
       "look_at_screen",
-      "set_screen_share"
+      "set_screen_share",
+      "agent"
     ],
     "house": [
       "house_get_state",
@@ -1723,7 +1789,8 @@
       "run_command",
       "browser_act",
       "ask_user",
-      "update_plan"
+      "update_plan",
+      "agent"
     ],
     "dfd": [
       "dfd_bridge",
@@ -1732,7 +1799,8 @@
       "run_command",
       "ask_user",
       "update_plan",
-      "files_changed"
+      "files_changed",
+      "agent"
     ],
     "orchestrator": [
       "create_coding_project",
@@ -1748,7 +1816,8 @@
       "group_update",
       "schedule",
       "give_note",
-      "canvas_mode"
+      "canvas_mode",
+      "agent"
     ],
     "devops": [
       "github_apply_gate",
@@ -1770,7 +1839,8 @@
       "run_command",
       "edit_file",
       "ask_user",
-      "update_plan"
+      "update_plan",
+      "agent"
     ]
   },
   "missing_docs": [

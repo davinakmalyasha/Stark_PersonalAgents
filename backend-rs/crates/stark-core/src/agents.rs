@@ -49,6 +49,22 @@ pub const UI: AgentSpec = AgentSpec {
     instructions: "You are the UI agent. Design and verify frontends with the browser and editing tools.",
 };
 
+pub const DEVOPS: AgentSpec = AgentSpec {
+    key: "devops",
+    display: "DevOps",
+    plan_scope: "devops",
+    tier: "specialist",
+    instructions: "You are the DevOps agent. Handle deployment, CI, infrastructure, and operational verification. Prefer reproducible commands and explicit rollback paths.",
+};
+
+pub const EXPLORE: AgentSpec = AgentSpec {
+    key: "explore",
+    display: "Explore",
+    plan_scope: "explore",
+    tier: "specialist",
+    instructions: "You are the Explore agent. Read broadly, map unfamiliar code, and report concise findings with exact paths. Do not edit files unless explicitly asked.",
+};
+
 pub const ORCHESTRATOR: AgentSpec = AgentSpec {
     key: "orchestrator",
     display: "Orchestrator",
@@ -57,7 +73,16 @@ pub const ORCHESTRATOR: AgentSpec = AgentSpec {
     instructions: "You are the Orchestrator. Route work to the right agent and coordinate jobs.",
 };
 
-const WORKSPACE_AGENTS: &[AgentSpec] = &[DEVELOPER, GENERAL, HOUSE, DFD, UI, ORCHESTRATOR];
+const WORKSPACE_AGENTS: &[AgentSpec] = &[
+    DEVELOPER,
+    GENERAL,
+    HOUSE,
+    DFD,
+    UI,
+    DEVOPS,
+    EXPLORE,
+    ORCHESTRATOR,
+];
 
 pub fn for_scope(scope: &str) -> Option<AgentSpec> {
     let scope = scope.trim().to_lowercase();

@@ -78,6 +78,7 @@ const IMPLEMENTED: &[&str] = &[
     "set_screen_share",
     "canvas_mode",
     "run_code",
+    "agent",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -97,6 +98,7 @@ pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "look_at_screen",
     "set_screen_share",
     "run_code",
+    "agent",
 ];
 
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
@@ -428,6 +430,7 @@ mod tests {
         assert!(!tool_names(&plan).contains(&"edit_file"));
         assert!(!tool_names(&plan).contains(&"call_subagent"));
         assert!(!tool_names(&plan).contains(&"run_code"));
+        assert!(!tool_names(&plan).contains(&"agent"));
         assert!(tool_names(&plan).contains(&"update_plan"));
         assert!(tool_names(&plan).contains(&"run_command"));
 
@@ -450,6 +453,7 @@ mod tests {
         );
         assert!(plan_mode_denial("build", "edit_file", &json!({})).is_none());
         assert!(plan_mode_denial("plan", "run_code", &json!({"code": "return 1"})).is_some());
+        assert!(plan_mode_denial("plan", "agent", &json!({"action": "spawn"})).is_some());
     }
 
     #[test]
@@ -464,7 +468,7 @@ mod tests {
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"update_plan"));
         assert!(names.contains(&"read_pdf"));
@@ -476,7 +480,7 @@ mod tests {
 
         let dfd = tool_specs_for_scope("build", "dfd");
         let names = tool_names(&dfd);
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"create_coding_project"));
         assert!(names.contains(&"dfd_bridge"));
         assert!(names.contains(&"create_client"));
@@ -484,13 +488,13 @@ mod tests {
 
         let house = tool_specs_for_scope("build", "house");
         let names = tool_names(&house);
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
         assert!(names.contains(&"house_set_device"));
         assert!(names.contains(&"house_run_scene"));
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         let names = tool_names(&orchestrator);
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         assert!(names.contains(&"canvas_mode"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"create_group"));
@@ -507,7 +511,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            35
+            36
         );
     }
 

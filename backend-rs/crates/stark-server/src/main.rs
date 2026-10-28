@@ -22,7 +22,7 @@ use stark_contract::{AppState, ServerEvent};
 use stark_core::{
     RunContext, agent_for_scope, resolve_agent, run_agent, subagent_status, subagent_status_for,
 };
-use stark_providers::{Provider, ProviderConfig};
+use stark_providers::{CURATED_MODELS, Provider, ProviderConfig};
 use stark_store::{
     ChatStore, GroupStore, ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time,
     schedule_json,
@@ -1049,10 +1049,12 @@ async fn answer_handler(
 }
 
 async fn models_handler(State(state): State<ServerState>) -> Json<Value> {
-    let model = state.provider.config().model.clone();
-    Json(json!({
-        "models": [{"id": model, "name": model, "provider": state.provider.config().mode}]
-    }))
+    let mode = state.provider.config().mode.clone();
+    let models: Vec<Value> = CURATED_MODELS
+        .iter()
+        .map(|(id, name)| json!({"id": id, "name": name, "provider": mode}))
+        .collect();
+    Json(json!({ "models": models }))
 }
 
 async fn provider_handler(State(state): State<ServerState>) -> Json<Value> {

@@ -1,16 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
-import { fetchProvider, setProvider } from '../../services/api';
-import type { ProviderMode } from '../../services/api';
 import type { ModelOption } from '../../types';
-
-const PROVIDER_LABELS: Record<ProviderMode, string> = {
-  free: 'Free Providers',
-  deepseek: 'DeepSeek API',
-  opencode: 'OpenCode Go',
-  command: 'Command Code',
-  openrouter: 'OpenRouter',
-};
 
 interface Props {
   onSend: (message: string, files: File[]) => void;
@@ -43,21 +33,18 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   const [files, setFiles] = useState<File[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [provider, setProviderState] = useState<ProviderMode>('deepseek');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
 
-  const [availableProviders, setAvailableProviders] = useState<ProviderMode[] | null>(null);
-  const [openMenu, setOpenMenu] = useState<'provider' | 'model' | null>(null);
-  const providerMenuRef = useRef<HTMLDivElement>(null);
+  const [openMenu, setOpenMenu] = useState<'model' | null>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
   // Close dropup on outside click / Escape
   useEffect(() => {
     if (!openMenu) return;
     const onPointerDown = (e: PointerEvent) => {
-      const el = openMenu === 'provider' ? providerMenuRef.current : modelMenuRef.current;
+      const el = modelMenuRef.current;
       if (el && !el.contains(e.target as Node)) setOpenMenu(null);
     };
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpenMenu(null); };
@@ -68,25 +55,6 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
       document.removeEventListener('keydown', onKey);
     };
   }, [openMenu]);
-  // Load the active LLM provider once on mount — derive options from server matrix, not hardcoded
-  useEffect(() => {
-    let mounted = true;
-    fetchProvider().then((info) => {
-      if (!mounted) return;
-      setProviderState(info.provider);
-      const modes = (info as any).modes as ProviderMode[] | undefined;
-      const matrix = (info as any).matrix as Record<string, unknown> | undefined;
-      const derived = modes && modes.length ? modes : matrix ? (Object.keys(matrix) as ProviderMode[]) : null;
-      if (derived && derived.length) setAvailableProviders(derived);
-    }).catch(() => {});
-    return () => { mounted = false; };
-  }, []);
-
-  const changeProvider = async (value: ProviderMode) => {
-    setProviderState(value);
-    try { await setProvider(value); } catch (e) { console.error('Failed to set LLM provider', e); }
-  };
-
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -183,39 +151,9 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
           <div className="flex items-center gap-2">
             <span className="hidden sm:block text-[10px] text-zinc-600">{files.length ? `${files.length} attachment${files.length > 1 ? 's' : ''}` : ''}</span>
             <div className="usage-control"><button type="button" className="usage-orb" title="Usage" aria-label="Usage"><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100` }}/></svg><span>{Math.round(cacheRate)}</span></button><div className="usage-popover"><div className="usage-popover-title">Usage</div><div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div><div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div><div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div><div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div><button type="button" onClick={onOpenStats} className="usage-details">View details</button></div></div>
-            <div className="provider-dropup" ref={providerMenuRef}>
-              <button
-                type="button"
-                onClick={() => setOpenMenu((m) => (m === 'provider' ? null : 'provider'))}
-                className="provider-trigger"
-                title={`LLM provider: ${PROVIDER_LABELS[provider] ?? provider}`}
-                aria-label="LLM provider"
-                aria-expanded={openMenu === 'provider'}
-              >
-                <span className="truncate">{PROVIDER_LABELS[provider] ?? provider}</span>
-                <ChevronDown size={13} className={`provider-chevron ${openMenu === 'provider' ? 'is-open' : ''}`} />
-              </button>
-              {openMenu === 'provider' && (
-                <div className="provider-menu" role="menu" aria-label="LLM provider">
-                  {(availableProviders || (['free','deepseek','opencode','command'] as ProviderMode[])).map((p) => {
-                    const selected = p === provider;
-                    return (
-                      <button
-                        key={p}
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={selected}
-                        className={`provider-item ${selected ? 'selected' : ''}`}
-                        onClick={() => { changeProvider(p); setOpenMenu(null); }}
-                      >
-                        <span className="truncate">{PROVIDER_LABELS[p] ?? p}</span>
-                        {selected && <Check size={13} className="shrink-0" />}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+            <span className="provider-trigger" title="LLM provider: OpenCode Go" aria-label="LLM provider">
+              <span className="truncate">OpenCode Go</span>
+            </span>
             {models.length > 0 && onModelChange && (
               <div className="provider-dropup" ref={modelMenuRef}>
                 <button

@@ -15,6 +15,35 @@ pub struct ProviderConfig {
     pub model: String,
 }
 
+/// The only models the Stark UI offers. Single-provider setup: everything
+/// runs through opencode go; the dropdown is a curated shortlist, not a
+/// provider matrix.
+pub const CURATED_MODELS: &[(&str, &str)] = &[
+    ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+    ("mimo-v2.6-flash", "MiMo V2.6 Flash"),
+    ("mimo-v2.6-pro", "MiMo V2.6 Pro"),
+    ("muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor"),
+];
+
+/// Canonical opencode go model id for a requested id or alias. Unknown ids
+/// pass through untouched so custom models keep working.
+pub fn canonical_opencode_model(requested: &str) -> String {
+    match requested {
+        "deepseek/deepseek-v4.1-flash-1017"
+        | "deepseek/deepseek-v4.1-flash"
+        | "deepseek-v4.1-flash"
+        | "deepseek-flash"
+        | "deepseek:v4.1-flash" => "deepseek-v4.1-flash",
+        "xiaomi/mimo-v2.6-flash" | "mimo-v2.6-flash" | "mimo-flash" => "mimo-v2.6-flash",
+        "xiaomi/mimo-v2.6-pro" | "mimo-v2.6-pro" | "mimo-pro" => "mimo-v2.6-pro",
+        "meta/muse-spark-1.3-contributor" | "muse-spark-1.3-contributor" => {
+            "muse-spark-1.3-contributor"
+        }
+        _ => requested,
+    }
+    .to_string()
+}
+
 impl ProviderConfig {
     pub fn from_env() -> Self {
         let requested_mode = std::env::var("STARK_PROVIDER")
@@ -56,7 +85,9 @@ impl ProviderConfig {
             };
         }
 
-        if requested_mode == "opencode" {
+        // No explicit provider: opencode go is the default. Explicit
+        // STARK_PROVIDER values (including "deepseek") still work as before.
+        if requested_mode.is_empty() || requested_mode == "opencode" {
             return Self {
                 mode: "opencode".to_string(),
                 base_url: explicit_base
@@ -72,11 +103,7 @@ impl ProviderConfig {
         }
 
         Self {
-            mode: if requested_mode.is_empty() {
-                "deepseek".to_string()
-            } else {
-                requested_mode
-            },
+            mode: requested_mode,
             base_url: explicit_base
                 .or_else(|| first_env(&["DEEPSEEK_BASE_URL"]))
                 .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
@@ -94,13 +121,27 @@ impl ProviderConfig {
         if requested.is_empty() || requested.eq_ignore_ascii_case("Automatic Fallback") {
             return self.model.clone();
         }
-        if matches!(self.mode.as_str(), "command" | "openrouter")
-            && matches!(
-                requested,
-                "deepseek-v4.1-flash" | "deepseek-flash" | "deepseek:v4.1-flash"
-            )
-        {
-            return self.model.clone();
+        if self.mode.as_str() == "opencode" {
+            return canonical_opencode_model(requested);
+        }
+        if matches!(self.mode.as_str(), "command" | "openrouter") {
+            // Curated bare ids map to gateway slugs; unknown ids pass through.
+            match requested {
+                "deepseek-v4.1-flash" | "deepseek-flash" | "deepseek:v4.1-flash" => {
+                    return self.model.clone();
+                }
+                "mimo-v2.6-flash" | "mimo-flash" => {
+                    return "xiaomi/mimo-v2.6-flash".to_string();
+                }
+                "mimo-v2.6-pro" | "mimo-pro" => {
+                    return "xiaomi/mimo-v2.6-pro".to_string();
+                }
+                "muse-spark-1.3-contributor" => {
+                    return "meta/muse-spark-1.3-contributor".to_string();
+                }
+                _ => {}
+            }
+            return requested.to_string();
         }
         requested.to_string()
     }
@@ -587,6 +628,82 @@ mod tests {
         assert_eq!(
             config.resolve_model("poolside/laguna-s-2.1-free"),
             "poolside/laguna-s-2.1-free"
+        );
+    }
+
+    #[test]
+    fn gateway_modes_map_curated_ids_to_vendor_slugs() {
+        for mode in ["command", "openrouter"] {
+            let config = ProviderConfig {
+                mode: mode.to_string(),
+                base_url: "https://example.invalid".to_string(),
+                api_key: "test".to_string(),
+                model: "deepseek/deepseek-v4.1-flash-1017".to_string(),
+            };
+            assert_eq!(
+                config.resolve_model("deepseek-v4.1-flash"),
+                "deepseek/deepseek-v4.1-flash-1017"
+            );
+            assert_eq!(
+                config.resolve_model("mimo-v2.6-flash"),
+                "xiaomi/mimo-v2.6-flash"
+            );
+            assert_eq!(
+                config.resolve_model("mimo-v2.6-pro"),
+                "xiaomi/mimo-v2.6-pro"
+            );
+            assert_eq!(
+                config.resolve_model("muse-spark-1.3-contributor"),
+                "meta/muse-spark-1.3-contributor"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_aliases_canonicalize_to_curated_ids() {
+        let config = ProviderConfig {
+            mode: "opencode".to_string(),
+            base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            api_key: "test".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+        };
+        assert_eq!(
+            config.resolve_model("Automatic Fallback"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            config.resolve_model("deepseek/deepseek-v4.1-flash-1017"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            config.resolve_model("xiaomi/mimo-v2.6-flash"),
+            "mimo-v2.6-flash"
+        );
+        assert_eq!(
+            config.resolve_model("xiaomi/mimo-v2.6-pro"),
+            "mimo-v2.6-pro"
+        );
+        assert_eq!(
+            config.resolve_model("meta/muse-spark-1.3-contributor"),
+            "muse-spark-1.3-contributor"
+        );
+        assert_eq!(
+            config.resolve_model("some-custom-model"),
+            "some-custom-model"
+        );
+    }
+
+    #[test]
+    fn curated_models_cover_the_four_supported_ids() {
+        let ids: Vec<&str> = CURATED_MODELS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-v4.1-flash",
+                "mimo-v2.6-flash",
+                "mimo-v2.6-pro",
+                "muse-spark-1.3-contributor",
+            ]
         );
     }
 }

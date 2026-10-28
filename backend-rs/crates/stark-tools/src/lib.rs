@@ -10,6 +10,7 @@ mod edit;
 mod head_tail;
 mod house;
 mod images;
+mod mcp;
 mod patch;
 mod paths;
 mod plan;
@@ -31,6 +32,7 @@ pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
+pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
@@ -226,7 +228,7 @@ pub fn tool_specs_for(mode: &str) -> Vec<Value> {
 pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
     let scope = scope.trim().to_lowercase();
     let allowed = contract().scope_map.get(&scope);
-    contract()
+    let mut specs: Vec<Value> = contract()
         .tools
         .iter()
         .filter(|tool| {
@@ -297,7 +299,9 @@ pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
             }
             spec
         })
-        .collect()
+        .collect();
+    specs.extend(mcp::tool_specs_for_scope(&scope));
+    specs
 }
 
 pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> {
@@ -338,6 +342,9 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
         return ToolOutcome::err(reason);
+    }
+    if name.starts_with("mcp__") {
+        return mcp::call(name, args, ctx).await;
     }
     match name {
         "read_file" => read::read_file(ctx, args).await,

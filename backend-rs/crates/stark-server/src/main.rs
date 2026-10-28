@@ -9,6 +9,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
@@ -265,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
     if voice.is_none() {
         tracing::warn!("no voice models directory found; voice/TTS endpoints will return 503");
     }
+    let mcp_manager = stark_tools::init_mcp(&harness_root);
     let state = ServerState {
         store,
         provider,
@@ -279,6 +281,9 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_state = state.clone();
     let group_runner_state = state.clone();
     let canvas_state = state.clone();
+    tokio::spawn(async move {
+        mcp_manager.start_all().await;
+    });
 
     let app = Router::new()
         .route("/api/run", post(run_handler))
@@ -367,6 +372,15 @@ async fn main() -> anyhow::Result<()> {
             get(groups_handler).post(create_group_handler),
         )
         .route("/api/groups/{project_id}", get(group_handler))
+        .route("/api/mcp/servers", get(mcp_servers_handler))
+        .route(
+            "/api/mcp/servers/{server_name}",
+            post(mcp_upsert_handler).delete(mcp_delete_handler),
+        )
+        .route(
+            "/api/mcp/servers/{server_name}/restart",
+            post(mcp_restart_handler),
+        )
         .route(
             "/api/groups/{project_id}/update",
             post(group_update_handler),
@@ -1245,6 +1259,60 @@ async fn active_handler(
 
 async fn pending_handler(State(state): State<ServerState>) -> Json<Value> {
     Json(json!({"batches": state.questions.pending_batches()}))
+}
+
+async fn mcp_servers_handler() -> Json<Value> {
+    let servers = stark_tools::McpManager::global()
+        .map(|manager| manager.status_snapshot())
+        .unwrap_or_default();
+    Json(json!({"servers": servers}))
+}
+
+async fn mcp_upsert_handler(Path(server_name): Path<String>, Json(body): Json<Value>) -> Response {
+    let config = match serde_json::from_value::<stark_tools::McpServerConfig>(body) {
+        Ok(config) => config,
+        Err(error) => return mcp_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let Some(manager) = stark_tools::McpManager::global() else {
+        return mcp_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MCP manager is not initialized",
+        );
+    };
+    match manager.upsert_server(&server_name, config).await {
+        Ok(servers) => Json(json!({"servers": servers})).into_response(),
+        Err(error) => mcp_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn mcp_delete_handler(Path(server_name): Path<String>) -> Response {
+    let Some(manager) = stark_tools::McpManager::global() else {
+        return mcp_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MCP manager is not initialized",
+        );
+    };
+    match manager.remove_server(&server_name).await {
+        Ok(servers) => Json(json!({"servers": servers})).into_response(),
+        Err(error) => mcp_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn mcp_restart_handler(Path(server_name): Path<String>) -> Response {
+    let Some(manager) = stark_tools::McpManager::global() else {
+        return mcp_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MCP manager is not initialized",
+        );
+    };
+    match manager.restart_server(&server_name).await {
+        Ok(servers) => Json(json!({"servers": servers})).into_response(),
+        Err(error) => mcp_error(StatusCode::NOT_FOUND, &error),
+    }
+}
+
+fn mcp_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({"error": message}))).into_response()
 }
 
 #[derive(Debug, Deserialize)]

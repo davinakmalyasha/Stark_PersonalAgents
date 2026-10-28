@@ -86,6 +86,19 @@ again queues a new task instead of creating a duplicate workspace agent.
 - Workspace agents are the only writers; subagents should default to read-only
   unless isolated in a worktree.
 
+## Agent tree UI
+
+The sidebar renders `/api/agents` as a collapsible tree:
+
+- status dot per agent;
+- role/kind/path;
+- click opens the agent's chat;
+- cancel button for queued/running agents;
+- 5-second refresh.
+
+The tree is read-only apart from cancellation. Full mailbox/send controls remain
+a later UI pass.
+
 ## Not implemented yet
 
 - Active-run cancellation propagation (status is durable; the live token is not).

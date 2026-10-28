@@ -4,9 +4,10 @@ import { MessageSquare, Plus, Trash2, Pencil, MoreHorizontal, ChevronDown, Bot, 
 import { PanelLeftClose, FolderPlus } from 'lucide-react';
 import { isSpawnedChat } from '../../utils/chatHierarchy';
 import { apiUrl, fetchWorkspaces, addWorkspace, removeWorkspace, fetchChats, createChat, deleteChat, fetchChat, updateChatTitle } from '../../services/api';
-import type { WorkspaceInfo, ChatSummary, ChatData } from '../../types';
+import type { WorkspaceInfo, ChatSummary, ChatData, AgentNode } from '../../types';
 import SidebarProjectList from './SidebarProjectList';
 import SidebarAddFolderModal from './SidebarAddFolderModal';
+import AgentTreePanel from './AgentTreePanel';
 
 interface Props {
   activeWorkspaceId: string | null;
@@ -68,6 +69,21 @@ export default function Sidebar({
       });
     }
   }, [activeChatId, activeWorkspaceId, activeChatTitle]);
+
+  const openAgent = useCallback(async (agent: AgentNode) => {
+    let workspace = workspaces.find((item) => item.id === agent.workspaceId);
+    if (!workspace) {
+      const all = await fetchWorkspaces().catch(() => []);
+      workspace = all.find((item) => item.id === agent.workspaceId);
+    }
+    if (!workspace) return;
+    try {
+      const chat = await fetchChat(workspace.id, agent.chatId);
+      onSelectChat(workspace, chat);
+    } catch {
+      // The transcript may have been removed; leave the current chat alone.
+    }
+  }, [workspaces, onSelectChat]);
 
   const handleLocalChatTitleUpdated = useCallback((workspaceId: string, chatId: string, newTitle: string) => {
     setChatMap((prev) => {
@@ -437,6 +453,12 @@ export default function Sidebar({
               liveChatIds={liveChatIds}
               deletingChatId={deletingChatId}
             /></div>
+
+          <AgentTreePanel
+            collapsed={collapsed}
+            onOpen={openAgent}
+            refreshSignal={refreshSignal}
+          />
 
         </div>
       )}

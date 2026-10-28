@@ -149,6 +149,22 @@ export interface AppState {
   traceback?: string;
 }
 
+export interface AgentNode {
+  id: string;
+  kind: 'orchestrator' | 'workspace' | 'subagent';
+  path: string;
+  parentId: string | null;
+  chatId: string;
+  workspaceId: string;
+  scope: string;
+  role: string;
+  nickname: string;
+  status: 'idle' | 'queued' | 'running' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
+  model: string;
+  depth: number;
+  result?: string;
+}
+
 export interface ModelOption {
   id: string;
   name: string;

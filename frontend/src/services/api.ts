@@ -7,4 +7,5 @@ export * from './api/groups';
 export * from './api/notes';
 export * from './api/maintenance';
 export * from './api/canvas';
+export * from './api/agents';
 export * from './api/stream';

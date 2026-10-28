@@ -11,7 +11,7 @@ use stark_contract::{AppState, Delta, ServerEvent};
 use stark_providers::{
     ChatMessage, ImagePart, Provider, ProviderEvent, ProviderSession, ToolCall, pricing_for,
 };
-use stark_store::{ChatStore, StoreError};
+use stark_store::{AgentStore, ChatStore, StoreError};
 use stark_tools::{Checkpoint, PlanStore, QuestionBroker, ToolContext, ToolOutcome};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -39,42 +39,6 @@ const REPEAT_READ_LIMIT: usize = 4;
 const REPEAT_WRITE_LIMIT: usize = 5;
 const MAX_CONSECUTIVE_ERRORS: usize = 5;
 
-#[derive(Debug, Clone)]
-enum ChildStatus {
-    Running,
-    Done(String),
-    Failed(String),
-    Stopped,
-}
-
-impl ChildStatus {
-    fn label(&self) -> String {
-        match self {
-            Self::Running => "running".to_string(),
-            Self::Done(_) => "done".to_string(),
-            Self::Failed(_) => "failed".to_string(),
-            Self::Stopped => "stopped".to_string(),
-        }
-    }
-
-    fn report(&self) -> Option<&str> {
-        match self {
-            Self::Done(report) => Some(report),
-            Self::Failed(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-struct ChildHandle {
-    parent_chat_id: String,
-    name: String,
-    status: Arc<Mutex<ChildStatus>>,
-    steering: Arc<Mutex<VecDeque<String>>>,
-    cancel: CancellationToken,
-}
-
-static CHILDREN: OnceLock<Mutex<HashMap<String, Arc<ChildHandle>>>> = OnceLock::new();
 static AGENT_CANCELS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
 
 fn agent_cancels() -> &'static Mutex<HashMap<String, CancellationToken>> {
@@ -103,46 +67,6 @@ pub fn cancel_agent_run(agent_id: &str) -> bool {
             true
         })
         .unwrap_or(false)
-}
-
-fn children() -> &'static Mutex<HashMap<String, Arc<ChildHandle>>> {
-    CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn subagent_status(parent_chat_id: &str) -> Vec<Value> {
-    let children = children().lock().unwrap();
-    children
-        .iter()
-        .filter(|(_, child)| child.parent_chat_id == parent_chat_id)
-        .map(|(id, child)| {
-            let status = child.status.lock().unwrap();
-            json!({
-                "child_id": id,
-                "name": child.name,
-                "label": child.name,
-                "status": status.label(),
-                "report": status.report(),
-                "created": 0,
-                "parent_session": parent_chat_id,
-            })
-        })
-        .collect()
-}
-
-pub fn subagent_status_for(child_id: &str) -> Option<Value> {
-    let children = children().lock().unwrap();
-    children.get(child_id).map(|child| {
-        let status = child.status.lock().unwrap();
-        json!({
-            "child_id": child_id,
-            "name": child.name,
-            "label": child.name,
-            "status": status.label(),
-            "report": status.report(),
-            "created": 0,
-            "parent_session": child.parent_chat_id,
-        })
-    })
 }
 
 #[derive(Debug, Error)]
@@ -1049,70 +973,64 @@ async fn fail(ctx: &RunContext, state: &mut AppState, message: String) {
 }
 
 async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
+    let store = match AgentStore::open(ctx.store.harness_root()).await {
+        Ok(store) => store,
+        Err(error) => return ToolOutcome::err(format!("Error: agent store unavailable: {error}")),
+    };
     let action = args
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("run")
         .trim();
+    let current = match agents_tools::current_agent(ctx, &store).await {
+        Ok(agent) => agent,
+        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+    };
     match action {
         "list" => {
-            let prefix = format!("cont-{}-", ctx.chat_id);
-            let children = children().lock().unwrap();
-            let rows: Vec<String> = children
+            let agents = store.list(Some(&current.id)).await.unwrap_or_default();
+            if agents.is_empty() {
+                return ToolOutcome::ok("No subagent sessions.".to_string());
+            }
+            let rows = agents
                 .iter()
-                .filter(|(id, child)| {
-                    id.starts_with(&prefix) && child.parent_chat_id == ctx.chat_id
+                .map(|agent| {
+                    format!(
+                        "- {} - {} - {} (chat: {})",
+                        agent.id, agent.role, agent.status, agent.chat_id
+                    )
                 })
-                .map(|(id, child)| {
-                    let status = child.status.lock().unwrap();
-                    format!("- {id} - {} - {}", child.name, status.label())
-                })
-                .collect();
-            ToolOutcome::ok(if rows.is_empty() {
-                "No subagent sessions.".to_string()
-            } else {
-                rows.join("\n")
-            })
+                .collect::<Vec<_>>();
+            ToolOutcome::ok(format!("[SUBAGENTS]\n{}", rows.join("\n")))
         }
         "status" => {
             let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {
                 return ToolOutcome::err("Error: action='status' requires child_id");
             };
-            let wait_seconds = args
+            let wait = args
                 .get("wait_seconds")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .min(300);
-            let deadline = Instant::now() + Duration::from_secs(wait_seconds);
-            loop {
-                let handle = children().lock().unwrap().get(child_id).cloned();
-                let Some(handle) = handle else {
-                    return match ctx.store.get_chat(child_id).await {
-                        Ok(Some(chat)) => ToolOutcome::ok(format!(
-                            "child={child_id}\nstatus=idle\ntitle={}",
-                            chat["title"].as_str().unwrap_or("")
-                        )),
-                        _ => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
-                    };
-                };
-                let status = handle.status.lock().unwrap().clone();
-                if !matches!(status, ChildStatus::Running) || Instant::now() >= deadline {
-                    let mut text = format!(
-                        "child={child_id}\nname={}\nstatus={}",
-                        handle.name,
-                        status.label()
-                    );
-                    if let Some(report) = status.report() {
-                        text.push('\n');
-                        text.push_str(report);
-                    }
-                    return ToolOutcome::ok(text);
+            let result = if wait == 0 {
+                match store.get(child_id).await {
+                    Ok(Some(agent)) => Ok(format_subagent(&agent)),
+                    Ok(None) => Err(format!("Error: unknown subagent {child_id}")),
+                    Err(error) => Err(error.to_string()),
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else {
+                agents_tools::wait_for(&store, child_id, wait).await
+            };
+            match result {
+                Ok(text) => ToolOutcome::ok(text),
+                Err(error) => ToolOutcome::err(error),
             }
         }
         "run" | "spawn" => {
-            if ctx.depth >= 2 {
+            if current.kind != "workspace" {
+                return ToolOutcome::err("Error: only a workspace agent can spawn subagents");
+            }
+            if current.depth >= 2 {
                 return ToolOutcome::err("Error: subagent nesting limit reached");
             }
             let name = args
@@ -1128,94 +1046,118 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
             if task.is_empty() {
                 return ToolOutcome::err(format!("Error: action='{action}' requires task"));
             }
-            let safe_name: String = name
-                .chars()
-                .filter(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                })
-                .take(24)
-                .collect();
-            let child_id = format!(
-                "cont-{}-{}-{}",
-                ctx.chat_id,
-                if safe_name.is_empty() {
-                    "subagent"
-                } else {
-                    safe_name.as_str()
-                },
-                &uuid::Uuid::new_v4().simple().to_string()[..8]
-            );
-            let steering = Arc::new(Mutex::new(VecDeque::new()));
-            let cancel = ctx.cancel.child_token();
-            let status = Arc::new(Mutex::new(ChildStatus::Running));
-            let handle = Arc::new(ChildHandle {
-                parent_chat_id: ctx.chat_id.clone(),
-                name: name.to_string(),
-                status: status.clone(),
-                steering: steering.clone(),
-                cancel: cancel.clone(),
-            });
-            children()
-                .lock()
-                .unwrap()
-                .insert(child_id.clone(), handle.clone());
-            let (child, latest) = child_context(ctx, &child_id, name, steering, cancel.clone());
-
+            let spec = agent_for_scope(name)
+                .or_else(|| agent_for_scope("general"))
+                .unwrap_or(crate::agents::GENERAL);
+            let title: String = args
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| task.chars().take(60).collect());
+            let chat = match ctx
+                .store
+                .create_child_chat(
+                    &ctx.workspace_id,
+                    ctx.workspace.to_string_lossy().as_ref(),
+                    &title,
+                    &ctx.model,
+                    &current.chat_id,
+                )
+                .await
+            {
+                Ok(chat) => chat,
+                Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+            };
+            let chat_id = chat["id"].as_str().unwrap_or("").to_string();
+            let short = &uuid::Uuid::new_v4().simple().to_string()[..8];
+            let path = format!("{}/sub:{}-{}", current.path, safe_agent_name(name), short);
+            let agent = match store
+                .create_agent(
+                    "subagent",
+                    &path,
+                    Some(&current.id),
+                    &chat_id,
+                    &ctx.workspace_id,
+                    spec.key,
+                    spec.display,
+                    &title,
+                    &ctx.model,
+                    current.depth + 1,
+                )
+                .await
+            {
+                Ok(agent) => agent,
+                Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+            };
             if action == "spawn" {
-                let handle = handle.clone();
-                let task_for_run = task.to_string();
-                let task_for_label = task.to_string();
-                tokio::spawn(async move {
-                    let result = Box::pin(run_agent(child, task_for_run)).await;
-                    let next = if handle.cancel.is_cancelled() {
-                        ChildStatus::Stopped
-                    } else {
-                        match result {
-                            Ok(()) => ChildStatus::Done(read_report(&latest)),
-                            Err(error) => ChildStatus::Failed(error.to_string()),
-                        }
-                    };
-                    *handle.status.lock().unwrap() = next;
-                });
+                let _ = store
+                    .enqueue(
+                        Some(&current.id),
+                        &agent.id,
+                        "spawn",
+                        task,
+                        "trigger",
+                        json!({"title": title}),
+                    )
+                    .await;
+                let _ = store.wake(&agent.id).await;
                 return ToolOutcome::ok(format!(
-                    "[SPAWNED] child={child_id} name={name}; use action=status/child_id"
+                    "[SPAWNED] child={} name={}; use action=status/child_id",
+                    agent.id, agent.role
                 ))
                 .with_children(vec![json!({
-                    "chatId": child_id,
-                    "agentName": name,
-                    "label": task_for_label,
+                    "agentId": agent.id,
+                    "chatId": agent.chat_id,
+                    "agentName": agent.role,
+                    "label": title,
                     "workspaceId": ctx.workspace_id,
                 })]);
             }
-
+            if let Err(error) = store.set_status(&agent.id, "running", true).await {
+                return ToolOutcome::err(format!("Error: {error}"));
+            }
+            let cancel = ctx.cancel.child_token();
+            let steering = Arc::new(Mutex::new(VecDeque::new()));
+            let (child, latest) =
+                child_context(ctx, &agent.chat_id, spec.display, steering, cancel.clone());
             let result = Box::pin(run_agent(child, task.to_string())).await;
-            let next = if cancel.is_cancelled() {
-                ChildStatus::Stopped
+            let status = if cancel.is_cancelled() {
+                "cancelled"
+            } else if result.is_ok() {
+                "completed"
             } else {
-                match result {
-                    Ok(()) => ChildStatus::Done(read_report(&latest)),
-                    Err(error) => ChildStatus::Failed(error.to_string()),
-                }
+                "failed"
             };
-            *status.lock().unwrap() = next.clone();
-            if let ChildStatus::Failed(error) = next {
-                return ToolOutcome::err(format!("[ERR] Subagent {name}: {error}")).with_children(
-                    vec![json!({
-                        "chatId": child_id,
-                        "agentName": name,
-                        "label": task,
+            let report = if result.is_ok() {
+                read_report(&latest)
+            } else {
+                result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default()
+            };
+            let _ = store.finish(&agent.id, status, &report, json!({})).await;
+            if status == "failed" {
+                return ToolOutcome::err(format!("[ERR] Subagent {}: {report}", agent.role))
+                    .with_children(vec![json!({
+                        "agentId": agent.id,
+                        "chatId": agent.chat_id,
+                        "agentName": agent.role,
+                        "label": title,
                         "workspaceId": ctx.workspace_id,
-                    })],
-                );
+                    })]);
             }
             ToolOutcome::ok(format!(
-                "[SUBAGENT {name}] child={child_id}\n{}",
-                read_report(&latest)
+                "[SUBAGENT {}] child={}\n{}",
+                agent.role, agent.id, report
             ))
             .with_children(vec![json!({
-                "chatId": child_id,
-                "agentName": name,
-                "label": task,
+                "agentId": agent.id,
+                "chatId": agent.chat_id,
+                "agentName": agent.role,
+                "label": title,
                 "workspaceId": ctx.workspace_id,
             })])
         }
@@ -1226,34 +1168,65 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
             let Some(message) = args.get("message").and_then(Value::as_str) else {
                 return ToolOutcome::err("Error: action='message' requires message");
             };
-            let handle = children().lock().unwrap().get(child_id).cloned();
-            match handle {
-                Some(handle) => {
-                    handle
-                        .steering
-                        .lock()
-                        .unwrap()
-                        .push_back(message.to_string());
-                    ToolOutcome::ok(format!("[OK] queued steering for {child_id}"))
+            match store.get(child_id).await {
+                Ok(Some(target)) if target.parent_id.as_deref() == Some(current.id.as_str()) => {
+                    let _ = store
+                        .enqueue(
+                            Some(&current.id),
+                            &target.id,
+                            "message",
+                            message,
+                            "trigger",
+                            json!({}),
+                        )
+                        .await;
+                    if target.status != "running" {
+                        let _ = store.wake(&target.id).await;
+                    }
+                    ToolOutcome::ok(format!("[OK] queued message for {child_id}"))
                 }
-                None => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
+                _ => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
             }
         }
         "stop" => {
             let Some(child_id) = args.get("child_id").and_then(Value::as_str) else {
                 return ToolOutcome::err("Error: action='stop' requires child_id");
             };
-            let handle = children().lock().unwrap().get(child_id).cloned();
-            match handle {
-                Some(handle) => {
-                    handle.cancel.cancel();
-                    *handle.status.lock().unwrap() = ChildStatus::Stopped;
+            match store.get(child_id).await {
+                Ok(Some(target)) if target.parent_id.as_deref() == Some(current.id.as_str()) => {
+                    crate::cancel_agent_run(&target.id);
+                    let _ = store.set_status(&target.id, "cancelled", false).await;
                     ToolOutcome::ok(format!("[OK] stopped {child_id}"))
                 }
-                None => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
+                _ => ToolOutcome::err(format!("Error: unknown subagent {child_id}")),
             }
         }
         other => ToolOutcome::err(format!("Error: unknown subagent action '{other}'")),
+    }
+}
+
+fn format_subagent(agent: &stark_store::AgentRecord) -> String {
+    let mut text = format!(
+        "child={}\nname={}\nstatus={}",
+        agent.id, agent.role, agent.status
+    );
+    if !agent.result.is_empty() {
+        text.push('\n');
+        text.push_str(&agent.result.chars().take(12_000).collect::<String>());
+    }
+    text
+}
+
+fn safe_agent_name(value: &str) -> String {
+    let name: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(24)
+        .collect();
+    if name.is_empty() {
+        "agent".to_string()
+    } else {
+        name
     }
 }
 
@@ -1491,9 +1464,9 @@ mod tests {
             chat_id: "parent".to_string(),
             workspace_id: "_general".to_string(),
             workspace: dir.path().to_path_buf(),
-            role: None,
-            scope: "agent".to_string(),
-            depth: 0,
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
+            depth: 1,
             model: "mock".to_string(),
             temperature: 0.0,
             images: Vec::new(),
@@ -1512,11 +1485,7 @@ mod tests {
         let chats = store.list_chats("_general").await;
         let children: Vec<&Value> = chats
             .iter()
-            .filter(|chat| {
-                chat["id"]
-                    .as_str()
-                    .is_some_and(|id| id.starts_with("cont-parent-"))
-            })
+            .filter(|chat| chat["id"].as_str().is_some_and(|id| id.starts_with("del-")))
             .collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["title"], "reply DONE");

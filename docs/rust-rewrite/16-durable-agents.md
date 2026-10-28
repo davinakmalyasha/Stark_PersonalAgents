@@ -99,11 +99,17 @@ The sidebar renders `/api/agents` as a collapsible tree:
 The tree is read-only apart from cancellation. Full mailbox/send controls remain
 a later UI pass.
 
+## Legacy tools migrated
+
+`delegate` now creates/reuses durable workspace agents, and `call_subagent`
+uses the durable subagent store for list/status/message/stop. The old
+`JOBS`/`CHILDREN` in-memory registries are gone. `call_subagent` with
+`action=run` still executes synchronously, but persists the agent record and
+result.
+
 ## Not implemented yet
 
-- Active-run cancellation propagation (status is durable; the live token is not).
-- Agent-tree UI beyond the existing chat/child links.
-- Per-agent pricing rollups (usage is stored, pricing comes with the model
-  catalog work).
 - Worktree isolation for write-capable subagents.
-- Telegram approval channel and Codex-style memory/AGENTS.md loading.
+- Full mailbox/send UI controls in the agent tree.
+- Model-assisted long-term memory consolidation (stage-1/summary store exists).
+- Telegram bot (DFD approval is in-app now).

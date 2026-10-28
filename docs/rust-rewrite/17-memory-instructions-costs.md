@@ -107,4 +107,3 @@ The durable agent scheduler and mailbox are documented in
 - Agent-tree UI
 - Active cancellation propagation
 - Worktree isolation for write subagents
-- Legacy delegate/call_subagent migration to the durable store

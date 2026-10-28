@@ -30,7 +30,10 @@ fn sanitize(value: &str) -> String {
     }
 }
 
-async fn current_agent(ctx: &RunContext, store: &AgentStore) -> Result<AgentRecord, String> {
+pub(crate) async fn current_agent(
+    ctx: &RunContext,
+    store: &AgentStore,
+) -> Result<AgentRecord, String> {
     if let Some(agent) = store
         .by_chat(&ctx.chat_id)
         .await
@@ -229,7 +232,7 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
     Ok(text)
 }
 
-async fn wait_for(store: &AgentStore, id: &str, seconds: u64) -> Result<String, String> {
+pub(crate) async fn wait_for(store: &AgentStore, id: &str, seconds: u64) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let Some(agent) = store.get(id).await.map_err(|error| error.to_string())? else {

@@ -20,9 +20,7 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use stark_contract::{AppState, ServerEvent};
-use stark_core::{
-    RunContext, agent_for_scope, resolve_agent, run_agent, subagent_status, subagent_status_for,
-};
+use stark_core::{RunContext, agent_for_scope, resolve_agent, run_agent};
 use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
 use stark_store::{
     AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, ScheduleRecord,
@@ -1033,6 +1031,9 @@ Attached files:
     let done_tx = tx.clone();
     let canvas_state = state.clone();
     let canvas_chat = chat_id.clone();
+    let status_state = state.clone();
+    let status_chat = chat_id.clone();
+    mark_agent_status(&state, &chat_id, "running").await;
     let prompt_for_run = prompt;
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt_for_run).await;
@@ -1060,6 +1061,7 @@ Attached files:
             "done",
             json!({"status": status, "error": error}),
         ));
+        mark_agent_status(&status_state, &status_chat, "idle").await;
         spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
 
@@ -1121,6 +1123,15 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
     let chat_id = target.chat_id.clone();
     let canvas_state = state.clone();
     let canvas_chat = target.chat_id.clone();
+    let status_state = state.clone();
+    let status_chat = target.chat_id.clone();
+    {
+        let state = state.clone();
+        let chat_id = target.chat_id.clone();
+        tokio::spawn(async move {
+            mark_agent_status(&state, &chat_id, "running").await;
+        });
+    }
     tokio::spawn(async move {
         let result = run_agent(ctx, message).await;
         checkpoint.finalize();
@@ -1147,8 +1158,20 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
             "done",
             json!({"status": status, "error": error}),
         ));
+        mark_agent_status(&status_state, &status_chat, "idle").await;
         spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
+}
+
+async fn mark_agent_status(state: &ServerState, chat_id: &str, status: &str) {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return;
+    };
+    if let Ok(Some(agent)) = store.by_chat(chat_id).await {
+        let _ = store
+            .set_status(&agent.id, status, status == "running")
+            .await;
+    }
 }
 
 async fn agent_loop(state: ServerState) {
@@ -2867,37 +2890,39 @@ async fn subagents_handler(
     if workspace_path(&state, &workspace_id).is_none() {
         return Err(not_found("workspace not found"));
     }
-    let prefix = format!("cont-{chat_id}-");
-    let live = subagent_status(&chat_id);
-    let subagents: Vec<Value> = state
-        .store
-        .list_chats(&workspace_id)
-        .await
-        .into_iter()
-        .filter(|chat| {
-            chat["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with(&prefix))
-        })
-        .map(|chat| {
-            let id = chat["id"].as_str().unwrap_or("");
-            if let Some(info) = live
-                .iter()
-                .find(|info| info["child_id"].as_str() == Some(id))
-            {
-                return info.clone();
-            }
-            let title = chat["title"].as_str().unwrap_or("Subagent");
-            json!({
-                "child_id": id,
-                "name": title,
-                "label": title,
-                "status": "idle",
-                "created": 0,
-                "parent_session": chat_id,
-            })
-        })
-        .collect();
+    let parent_id = match AgentStore::open(&state.harness_root).await {
+        Ok(store) => store
+            .by_chat(&chat_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|agent| agent.id),
+        Err(_) => None,
+    };
+    let subagents = if let Some(parent_id) = parent_id {
+        match AgentStore::open(&state.harness_root).await {
+            Ok(store) => store
+                .list(Some(&parent_id))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|agent| {
+                    json!({
+                        "child_id": agent.chat_id,
+                        "agent_id": agent.id,
+                        "name": agent.role,
+                        "label": agent.nickname,
+                        "status": agent.status,
+                        "created": 0,
+                        "parent_session": chat_id,
+                    })
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     Ok(Json(json!({"subagents": subagents})))
 }
 
@@ -2920,7 +2945,22 @@ async fn subagent_handler(
         return Err(not_found("subagent session not found"));
     };
     let title = chat["title"].as_str().unwrap_or("Subagent").to_string();
-    let live = subagent_status_for(&child_id).unwrap_or_else(|| {
+    let live = match AgentStore::open(&state.harness_root).await {
+        Ok(store) => store.by_chat(&child_id).await.ok().flatten().map(|agent| {
+            json!({
+                "child_id": child_id,
+                "agent_id": agent.id,
+                "name": agent.role,
+                "label": agent.nickname,
+                "status": agent.status,
+                "report": agent.result,
+                "created": 0,
+                "parent_session": agent.parent_id,
+            })
+        }),
+        Err(_) => None,
+    }
+    .unwrap_or_else(|| {
         json!({
             "child_id": child_id,
             "name": title,

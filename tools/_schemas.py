@@ -353,23 +353,6 @@ TOOL_DEFINITIONS = [
     },
     # -- GitHub tools (gh CLI bridge) --
     {
-        "name": "github_apply_gate",
-        "description": "Create a repo and/or install the tiered CI/security gate: T1 fast-checks / T2 staging / T3 release workflows + .harness-ci.json, dev/staging/prod branch ladder, waits for first run, enforces prod branch protection. Non-destructive otherwise; stack auto-detected. Confirms first (gate=ask).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "repo": {"type": "string", "description": "'owner/name' (plain name when create=true)."},
-                "stack": {"type": "string", "description": "'auto'(default) | python | node | go | php | generic."},
-                "create": {"type": "boolean"},
-                "private": {"type": "boolean"},
-                "description": {"type": "string"},
-                "gate": {"type": "string", "description": "'ask'(default) | 'yes' | 'no'."},
-                "update_levels": {"type": "boolean", "description": "Re-render level-owned files after a branch rename."}
-            },
-            "required": ["repo"]
-        }
-    },
-    {
         "name": "create_coding_project",
         "description": "Create a NEW project: creates the folder (under D:\\MyProject, or under parent_root if given), registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background. The DFD agent MUST pass parent_root (the client folder under D:\\MyProject\\DFDClientProjects) so client projects always live inside the client root.",
         "parameters": {
@@ -848,7 +831,6 @@ _TOOL_DOCS = {
     "canvas_mode": "canvas_mode(action?, mode?, targets?, wake_on?, max_actions?, until?, target?, message?) — Watch agent chats (single/multiple/all) and wake the orchestrator on completion/failure. available lists selectable chats/groups; read returns the work snapshot; message sends follow-up to a watched chat; exit stops watching.",
     "call_subagent": "call_subagent(name, task, action?, child_id?, message?, wait_seconds?) — Specialist subagent lifecycle: run (block) / spawn (background) / status / message / stop / list (e.g. UI for browser verification).",
     "ask_user": "ask_user(questions, timeout?) — Ask the human a structured question and wait for the answer (use when the request is ambiguous, a decision is needed, or a plan needs approval via plan-review intent).",
-    "github_apply_gate": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no).",
     "create_coding_project": "create_coding_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects.",
     "update_plan": "update_plan(explanation?, plan?, ops?) — Maintain the task plan. FULL replacement: always send every step (at most one in_progress), or patch small tweaks via ops=[{op: add|set_status|rename|remove, match?, step?, status?}] (mutually exclusive with plan).",
     "house_get_state": "house_get_state() — Read the full house state: rooms, devices, scenes, energy, security. Call first for any house question.",

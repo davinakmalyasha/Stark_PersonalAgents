@@ -40,14 +40,13 @@ PARALLEL_SAFE = frozenset({
     "github_view_issue",
     "github_view_pull_request",
     "github_view_workflow_run",
-    "web_search",
     "update_plan",
     "delegation_status",
     "files_changed",
 })
 
 #: Same names, explicit "always sequential" grouping for the definition flag.
-PARALLEL_SAFE_ALIASES = {"exec_command", "github_apply_gate", "github_init_project"}
+PARALLEL_SAFE_ALIASES = {"exec_command"}
 
 def _parallel_max_workers() -> int:
     """Single source for tool-pool size — mirrors PAI_MAX_CONCURRENCY.

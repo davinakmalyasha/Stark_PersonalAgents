@@ -6,16 +6,15 @@ dock (POST /api/chat/{id}/mode). The agent can never change the mode in
 either direction — no tool exposes a mode switch to the LLM.
 
 When a chat is in `plan` mode, write-class tools are vetoed. The agent
-can call `propose_plan` to present the plan for the user-initiated review,
-but cannot transition out of plan mode — only the user (prompt dock or
+cannot transition out of plan mode — only the user (prompt dock or
 `/build` slash alias) flips the mode back to `build`.
 
 Read-class tools remain available: read_file, search_code, browser_*,
-read_pdf, ask_user, update_plan, propose_plan, plus all the existing
+read_pdf, ask_user, update_plan, plus all the existing
 read-only registry calls.
 
 Write-class tool blocklist (deliberately narrow): edit_file, create_project,
-github_apply_gate, house_set_device, house_run_scene,
+house_set_device, house_run_scene,
 create_docx, create_xlsx, delegate, call_subagent.
 
 run_command is not blanket-blocked in plan mode: each call is checked by
@@ -28,7 +27,7 @@ from __future__ import annotations
 # Tools blocked in plan mode.
 WRITE_CLASS_TOOLS: frozenset[str] = frozenset({
     "edit_file", "create_project",
-    "github_apply_gate", "house_set_device", "house_run_scene",
+    "house_set_device", "house_run_scene",
     "create_docx", "create_xlsx",
     "delegate", "call_subagent",
 })
@@ -93,5 +92,5 @@ def plan_mode_guard(ctx: dict) -> str | None:
         return f"Plan mode is read-only. Type /build to leave plan mode. ({name} is a write-class tool.)"
 
     # Allow everything else (read_file, search_code, browser_*, ask_user,
-    # update_plan, propose_plan, read_pdf, etc.).
+    # update_plan, read_pdf, etc.).
     return None

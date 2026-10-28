@@ -132,7 +132,7 @@ def _specialist_entries() -> list[dict]:
         if os.environ.get("DEEP_AGENTS_EVAL_RUN") == "1":
             # Headless eval: no human to answer ask_user (it would block to its
             # timeout), so drop the interactive tools from every specialist spec.
-            tools = [t for t in tools if t not in ("ask_user", "propose_plan")]
+            tools = [t for t in tools if t not in ("ask_user",)]
         entry = {
             "name": spec.display,
             "kind": spec.kind or "subagent",

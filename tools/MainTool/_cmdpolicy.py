@@ -311,7 +311,7 @@ def _git_subcommand(args: list) -> str:
 def _git_danger(args: list):
     sub = _git_subcommand(args)
     if sub == "push":
-        return "git push is blocked in run_command — use the deploy gate (github_apply_gate)"
+        return "git push is blocked in run_command — use a deploy workflow outside run_command"
     if sub == "reset" and "--hard" in args:
         return "git reset --hard discards uncommitted work"
     if sub == "clean" and any(re.match(r"^-[a-z]*f", a) for a in args):

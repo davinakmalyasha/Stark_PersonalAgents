@@ -37,17 +37,6 @@ from .githubTools import (
     github_list_workflow_runs,
     github_view_workflow_run,
     github_dispatch_workflow,
-    _GATE_CHECKS,
-    _GATE_PROFILE_TEMPLATES,
-    _repo_default_branch,
-    _detect_stack,
-    _ask_gate_choice,
-    _seed_gate,
-    _wait_for_first_run,
-    _protect_default_branch,
-    github_apply_gate,
-    github_init_project,
-    github_apply_observability,
 )
 
 from .groupChat import group_message
@@ -58,11 +47,6 @@ from .orchestrationTools import (
     report,
     ask_user,
     create_project,
-)
-
-from .webTools import (
-    web_fetch,
-    web_search,
 )
 
 from .workspaceTools import (
@@ -131,18 +115,6 @@ __all__ = [
     'github_list_workflow_runs',
     'github_view_workflow_run',
     'github_dispatch_workflow',
-    '_GATE_CHECKS',
-    '_GATE_PROFILE_TEMPLATES',
-    '_repo_default_branch',
-    '_detect_stack',
-    '_ask_gate_choice',
-    '_seed_gate',
-    '_wait_for_first_run',
-    '_protect_default_branch',
-    'github_apply_gate',
-    'github_apply_gate',
-    'github_init_project',
-    'github_apply_observability',
     'send_message',
     'group_message',
     'list_agents',
@@ -150,8 +122,6 @@ __all__ = [
     'report',
     'ask_user',
     'create_project',
-    'web_fetch',
-    'web_search',
     'capture_workspace_delta',
     '_REDACT_PATTERNS',
     '_GENERIC_SECRET_PAT',

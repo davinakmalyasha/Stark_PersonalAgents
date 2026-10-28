@@ -55,11 +55,6 @@ from .MainTool import (
     LocalShellBackend,
     update_plan, get_plan_for_context,
 )
-# Stage 4: propose_plan is the agent-callable plan proposal tool.
-try:
-    from .MainTool.proposePlan import propose_plan
-except Exception:
-    propose_plan = None
 # Stage 5: files_changed is the advisory file-watcher tool.
 try:
     from .watcher import files_changed
@@ -96,12 +91,6 @@ from .AddOnTool import (
     github_list_workflow_runs,
     github_view_workflow_run,
     github_dispatch_workflow,
-    _GATE_CHECKS,
-    _GATE_PROFILE_TEMPLATES,
-    _repo_default_branch,
-    _detect_stack,
-    github_apply_gate,
-    github_apply_observability,
     task,
     call_subagent,
     subagent_catalog,

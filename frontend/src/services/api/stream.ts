@@ -11,7 +11,7 @@ export interface AskQuestion {
   options?: (string | AskOption)[];
   intent?: { kind: string; approve?: string };
 }
-export interface AskBatch { batch_id: string; questions: AskQuestion[]; created: number }
+export interface AskBatch { batch_id: string; chat_id?: string; questions: AskQuestion[]; created: number }
 export interface AskAnswer { id: string; selected: string[]; custom: string }
 
 export async function fetchPendingQuestions(): Promise<AskBatch[]> {

@@ -2817,6 +2817,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_pending_route_exposes_chat_id_for_voice_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = group_test_state(dir.path(), group_provider(false).await).await;
+        let broker = state.questions.clone();
+        let ask = tokio::spawn(async move {
+            broker
+                .ask(
+                    "voice-chat-1",
+                    vec![serde_json::json!({"id": "q1", "question": "Go?"})],
+                    30,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let Json(body) = pending_handler(State(state.clone())).await;
+        let batches = body["batches"].as_array().cloned().unwrap_or_default();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0]["chat_id"], serde_json::json!("voice-chat-1"));
+        let batch_id = batches[0]["batch_id"].as_str().unwrap().to_string();
+        assert!(state.questions.answer(
+            &batch_id,
+            vec![serde_json::json!({"id": "q1", "custom": "yes"})]
+        ));
+        let answers = ask.await.unwrap().expect("ask resolves");
+        assert_eq!(answers[0]["custom"], serde_json::json!("yes"));
+    }
+
+    #[tokio::test]
     async fn group_runner_executes_a_ready_item_in_a_child_chat_with_mock_provider() {
         let dir = tempfile::tempdir().unwrap();
         let groups = group_with_one_ready_item(dir.path()).await;

@@ -195,7 +195,7 @@ async fn request_command_approval(ctx: &ToolContext, command: &str, reason: Opti
         "options": ["Approve", "Deny"],
         "intent": {"kind": "plan-review", "approve": "Approve"}
     });
-    match ctx.questions.ask(vec![question], 300).await {
+    match ctx.questions.ask(&ctx.chat_id, vec![question], 300).await {
         Ok(answers) => answers.iter().any(|answer| {
             answer
                 .get("selected")

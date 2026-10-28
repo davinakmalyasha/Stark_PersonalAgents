@@ -16,7 +16,11 @@ pub async fn ask_user(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or(600)
         .max(1);
 
-    let answers = match ctx.questions.ask(questions.clone(), timeout).await {
+    let answers = match ctx
+        .questions
+        .ask(&ctx.chat_id, questions.clone(), timeout)
+        .await
+    {
         Ok(answers) => answers,
         Err(error) => return ToolOutcome::err(format!("Error: ask_user {error}")),
     };

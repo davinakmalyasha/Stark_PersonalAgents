@@ -955,7 +955,7 @@ export default function App() {
           </div>
         </div>
       )}
-      <QuestionModal visible={isRunning || isPersisting} />
+      <QuestionModal visible={isRunning || isPersisting || !!voiceLiveRun?.active} />
 
       {/* OpenDesign module launcher — opens the design room bound to this workspace/chat */}
       <button

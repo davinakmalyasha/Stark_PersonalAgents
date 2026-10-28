@@ -1278,6 +1278,8 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   let lastFinalTurnId = '';
   let bargeTurnId = '';
   let bargeAt = 0;
+  let answeringBatch = null; // ask_user batch currently answered by voice
+  let questionTimer = null;   // /api/ask/pending poller while the mic is on
   let freqBuf = null;
   let levelBuf = null;
   // TTS output meter (visual-only tap — never in the audio path). Each
@@ -1845,6 +1847,9 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       if (accumulated && isGarbage(accumulated)) accumulated = '';
       return;
     }
+    // A voice-answered question batch owns the next committed turns.
+    // Route them to the broker instead of starting a new agent run.
+    if (answeringBatch) { collectVoiceAnswer(text); return; }
     accumulated = text;
     lastLang = detectLanguage(text);
     setStatus('listening', text);
@@ -1864,6 +1869,94 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     } else {
       dispatch();
     }
+  }
+
+  // -- Voice answers to ask_user --
+  // The Rust QuestionBroker exposes /api/ask/pending with a chat_id per
+  // batch. While the mic is on, the overlay claims batches for its own chat,
+  // speaks each question, and routes the next committed turns to /api/ask/answer
+  // instead of starting new agent runs. The main-window modal stays as fallback.
+  async function pollVoiceQuestions() {
+    if (!micOn || answeringBatch || !chatId) return;
+    try {
+      const r = await fetch(API + '/api/ask/pending');
+      const d = await r.json().catch(() => ({}));
+      const batches = Array.isArray(d && d.batches) ? d.batches : [];
+      const mine = batches.find((b) => b && b.chat_id === chatId);
+      if (mine && Array.isArray(mine.questions) && mine.questions.length) {
+        beginAnswering(mine);
+      }
+    } catch (_e) { /* retry on next tick */ }
+  }
+
+  function formatQuestionForSpeech(q) {
+    const parts = [];
+    if (q && q.header) parts.push(String(q.header));
+    if (q && q.question) parts.push(String(q.question));
+    if (q && Array.isArray(q.options) && q.options.length) {
+      const labels = q.options
+        .map((o) => (typeof o === 'string' ? o : (o && (o.label || o.value)) || ''))
+        .filter(Boolean);
+      if (labels.length) parts.push('Options: ' + labels.join(', '));
+    }
+    return parts.join('. ');
+  }
+
+  function beginAnswering(batch) {
+    answeringBatch = {
+      batch_id: batch.batch_id,
+      questions: batch.questions.slice(),
+      answers: [],
+      index: 0,
+    };
+    if (speaking) stopSpeaking();
+    send('question', { batchId: batch.batch_id, count: batch.questions.length });
+    speakCurrentQuestion();
+  }
+
+  async function speakCurrentQuestion() {
+    const batch = answeringBatch;
+    if (!batch || !micOn) return;
+    const q = batch.questions[batch.index] || {};
+    const text = formatQuestionForSpeech(q) || 'The agent has a question for you.';
+    setStatus('listening', 'Question: ' + text.slice(0, 120));
+    try {
+      await speak(text);
+    } catch (e) {
+      console.error('[Voice] question TTS failed', e);
+    }
+    // The user's next committed turn is collected as the answer.
+    if (answeringBatch === batch && micOn) {
+      setStatus('listening', 'Answer: ' + (q.question || 'please answer'));
+    }
+  }
+
+  function collectVoiceAnswer(text) {
+    const batch = answeringBatch;
+    if (!batch) return;
+    const q = batch.questions[batch.index] || {};
+    batch.answers.push({ id: q.id || ('q' + batch.index), selected: [], custom: text });
+    batch.index++;
+    send('transcript', { text, final: true, answer: true });
+    if (batch.index < batch.questions.length) {
+      speakCurrentQuestion();
+    } else {
+      submitVoiceAnswers();
+    }
+  }
+
+  async function submitVoiceAnswers() {
+    const batch = answeringBatch;
+    answeringBatch = null;
+    if (!batch) return;
+    try {
+      await fetch(API + '/api/ask/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_id: batch.batch_id, answers: batch.answers }),
+      });
+    } catch (_e) { /* the broker timeout/modal covers failures */ }
+    if (micOn) setStatus('listening', accumulated || 'Listening');
   }
 
   // ── Capture: legacy cpal path retained for explicit fallback/tests ────
@@ -3600,6 +3693,9 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       try { setBootLoading(false); } catch (_e) {}
       setStatus('listening', 'Listening');
       send('mic', { mic: true });
+      if (questionTimer) { clearInterval(questionTimer); questionTimer = null; }
+      questionTimer = setInterval(pollVoiceQuestions, 2000);
+      pollVoiceQuestions();
       stream.getAudioTracks().forEach((track) => {
         track.addEventListener('muted', onTrackMuted);
       });
@@ -3632,6 +3728,8 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
     clearTimeout(roundTimer);
     if (autoSendTimer) { clearTimeout(autoSendTimer); autoSendTimer = null; }
     clearVoicePeek();
+    if (questionTimer) { clearInterval(questionTimer); questionTimer = null; }
+    answeringBatch = null;
     stopLiveSession();
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
     // Disconnect mic nodes but keep the shared auCtx alive — TTS playback

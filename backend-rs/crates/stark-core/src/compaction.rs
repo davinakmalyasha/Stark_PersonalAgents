@@ -17,7 +17,7 @@ use std::env;
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use stark_providers::{ChatMessage, Provider, ProviderEvent};
+use stark_providers::{ChatMessage, Provider, ProviderEvent, ProviderSession};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CONTEXT_WINDOW: usize = 500_000;
@@ -222,10 +222,16 @@ pub async fn compact_history(
     cancel: &CancellationToken,
     messages: &[ChatMessage],
     policy: &CompactionPolicy,
+    session_id: &str,
+    affinity: &str,
 ) -> Option<CompactionOutcome> {
     let cut = split_index(messages, policy.tail_tokens)?;
     let tokens_before = estimate_tokens(messages);
-    let summary = summarize(provider, cancel, &messages[1..cut], policy).await?;
+    let session = ProviderSession {
+        session_id,
+        affinity,
+    };
+    let summary = summarize(provider, cancel, &messages[1..cut], policy, session).await?;
     let tail = &messages[cut..];
     let tail_text = tail_transcript(tail);
     let checkpoint = format_checkpoint(&summary, &tail_text);
@@ -303,6 +309,7 @@ async fn summarize(
     cancel: &CancellationToken,
     messages: &[ChatMessage],
     policy: &CompactionPolicy,
+    session: ProviderSession<'_>,
 ) -> Option<String> {
     let update = messages.first().is_some_and(is_checkpoint);
     let budget = policy
@@ -323,11 +330,11 @@ async fn summarize(
         ChatMessage::user(input),
         ChatMessage::user(prompt),
     ];
-    let mut text = stream_summary(provider, cancel, &request).await?;
+    let mut text = stream_summary(provider, cancel, &request, session).await?;
     if !has_summary_heading(&text) {
         let mut retry = request;
         retry.push(ChatMessage::user(NUDGE));
-        text = stream_summary(provider, cancel, &retry).await?;
+        text = stream_summary(provider, cancel, &retry, session).await?;
     }
     if !has_summary_heading(&text) {
         return None;
@@ -346,8 +353,12 @@ async fn stream_summary(
     provider: &Provider,
     cancel: &CancellationToken,
     request: &[ChatMessage],
+    session: ProviderSession<'_>,
 ) -> Option<String> {
-    let mut stream = provider.stream_chat(request, &[], 0.0).await.ok()?;
+    let mut stream = provider
+        .stream_chat_for_session(request, &[], 0.0, session)
+        .await
+        .ok()?;
     let mut text = String::new();
     loop {
         let event = tokio::select! {
@@ -588,7 +599,16 @@ mod tests {
         use axum::routing::post;
         use axum::{Json, Router};
 
-        async fn mock_provider(Json(_body): Json<Value>) -> Response {
+        async fn mock_provider(
+            headers: axum::http::HeaderMap,
+            Json(_body): Json<Value>,
+        ) -> Response {
+            assert_eq!(
+                headers
+                    .get("x-opencode-session")
+                    .and_then(|value| value.to_str().ok()),
+                Some("chat-test")
+            );
             let body = concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"## Objective\\n- ship it\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -611,7 +631,7 @@ mod tests {
             .unwrap();
         });
         let provider = Provider::new(stark_providers::ProviderConfig {
-            mode: "deepseek".to_string(),
+            mode: "opencode".to_string(),
             base_url: format!("http://{address}"),
             api_key: "test".to_string(),
             model: "mock".to_string(),
@@ -624,9 +644,16 @@ mod tests {
             tail_tokens: 12,
         };
         let messages = conversation(20);
-        let outcome = compact_history(&provider, &CancellationToken::new(), &messages, &policy)
-            .await
-            .expect("compacted");
+        let outcome = compact_history(
+            &provider,
+            &CancellationToken::new(),
+            &messages,
+            &policy,
+            "chat-test",
+            "chat-test",
+        )
+        .await
+        .expect("compacted");
         assert!(outcome.summary.contains("ship it"));
         assert_eq!(outcome.messages.len(), 2);
         assert_eq!(outcome.messages[1].role, "user");

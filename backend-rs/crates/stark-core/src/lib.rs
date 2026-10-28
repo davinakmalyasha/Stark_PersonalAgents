@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
-use stark_providers::{ChatMessage, ImagePart, Provider, ProviderEvent, ToolCall};
+use stark_providers::{ChatMessage, ImagePart, Provider, ProviderEvent, ProviderSession, ToolCall};
 use stark_store::{ChatStore, StoreError};
 use stark_tools::{Checkpoint, PlanStore, QuestionBroker, ToolContext, ToolOutcome};
 use thiserror::Error;
@@ -168,6 +168,15 @@ impl RunContext {
             .map(|agent| agent.display.to_string())
             .or_else(|| self.role.clone())
             .unwrap_or_else(|| "Stark".to_string())
+    }
+
+    /// Provider cache/routing affinity: a child chat shares its parent's
+    /// affinity, so opencode-go can reuse the parent's prompt cache.
+    pub async fn affinity(&self) -> String {
+        self.store
+            .chat_affinity(&self.chat_id)
+            .await
+            .unwrap_or_else(|_| self.chat_id.clone())
     }
 }
 
@@ -374,7 +383,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     } else {
         messages.push(ChatMessage::user_with_images(&prompt, ctx.images.clone()));
     }
-    maybe_compact(&ctx, &mut messages).await;
+    let affinity = ctx.affinity().await;
+    maybe_compact(&ctx, &mut messages, &affinity).await;
 
     let mut state = AppState {
         active_node: "agent".to_string(),
@@ -464,7 +474,15 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
         let mut stream = match ctx
             .provider
-            .stream_chat(&messages, &tool_specs, ctx.temperature)
+            .stream_chat_for_session(
+                &messages,
+                &tool_specs,
+                ctx.temperature,
+                ProviderSession {
+                    session_id: &ctx.chat_id,
+                    affinity: &affinity,
+                },
+            )
             .await
         {
             Ok(stream) => stream,
@@ -817,7 +835,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 .thoughts
                 .insert(format!("step-{}", state.state_version), reasoning);
         }
-        maybe_compact(&ctx, &mut messages).await;
+        maybe_compact(&ctx, &mut messages, &affinity).await;
     }
 }
 
@@ -862,7 +880,7 @@ fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
-async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>) {
+async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, affinity: &str) {
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
     let tokens = compaction::estimate_tokens(messages);
     if tokens >= policy.hard_limit_tokens {
@@ -875,8 +893,15 @@ async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>) {
     if !compaction::should_compact(messages, &policy) {
         return;
     }
-    let Some(outcome) =
-        compaction::compact_history(&ctx.provider, &ctx.cancel, messages, &policy).await
+    let Some(outcome) = compaction::compact_history(
+        &ctx.provider,
+        &ctx.cancel,
+        messages,
+        &policy,
+        &ctx.chat_id,
+        affinity,
+    )
+    .await
     else {
         return;
     };

@@ -381,6 +381,14 @@ pub struct Provider {
     config: ProviderConfig,
 }
 
+/// Routing/cache identity for a provider request. opencode's gateway uses
+/// `affinity` for cache routing and `session_id` for the concrete session.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderSession<'a> {
+    pub session_id: &'a str,
+    pub affinity: &'a str,
+}
+
 impl Provider {
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
@@ -399,6 +407,30 @@ impl Provider {
         tools: &[Value],
         temperature: f64,
     ) -> Result<EventStream, ProviderError> {
+        self.stream_chat_inner(messages, tools, temperature, None)
+            .await
+    }
+
+    /// Stream a request with the session/affinity headers opencode's gateway
+    /// needs. Other providers ignore the extra headers.
+    pub async fn stream_chat_for_session(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        temperature: f64,
+        session: ProviderSession<'_>,
+    ) -> Result<EventStream, ProviderError> {
+        self.stream_chat_inner(messages, tools, temperature, Some(session))
+            .await
+    }
+
+    async fn stream_chat_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        temperature: f64,
+        session: Option<ProviderSession<'_>>,
+    ) -> Result<EventStream, ProviderError> {
         if !self.config.has_key() {
             return Err(ProviderError::MissingApiKey);
         }
@@ -415,15 +447,17 @@ impl Provider {
             body["tool_choice"] = Value::String("auto".to_string());
         }
 
+        let headers = session_headers(&self.config, session);
         let mut attempt = 0usize;
         let response = loop {
-            let response = self
+            let mut request = self
                 .client
                 .post(self.config.endpoint())
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send()
-                .await?;
+                .bearer_auth(&self.config.api_key);
+            for (name, value) in &headers {
+                request = request.header(*name, value);
+            }
+            let response = request.json(&body).send().await?;
             if response.status().is_success() {
                 break response;
             }
@@ -450,6 +484,29 @@ impl Provider {
 
         Ok(Box::pin(stream))
     }
+}
+
+fn session_headers(
+    config: &ProviderConfig,
+    session: Option<ProviderSession<'_>>,
+) -> Vec<(&'static str, String)> {
+    if config.mode != "opencode" {
+        return Vec::new();
+    }
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    let affinity = session.affinity.trim();
+    if affinity.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ("x-opencode-session", affinity.to_string()),
+        ("x-session-affinity", affinity.to_string()),
+        ("X-Session-Id", affinity.to_string()),
+        ("x-opencode-session-id", session.session_id.to_string()),
+        ("x-opencode-client", "stark-rs".to_string()),
+    ]
 }
 
 pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
@@ -691,6 +748,43 @@ mod tests {
             config.resolve_model("some-custom-model"),
             "some-custom-model"
         );
+    }
+
+    #[test]
+    fn opencode_session_headers_use_affinity_not_just_session_id() {
+        let config = ProviderConfig {
+            mode: "opencode".to_string(),
+            base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            api_key: "test".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+        };
+        let headers = session_headers(
+            &config,
+            Some(ProviderSession {
+                session_id: "chat-child",
+                affinity: "chat-parent",
+            }),
+        );
+        assert!(headers.contains(&("x-opencode-session", "chat-parent".to_string())));
+        assert!(headers.contains(&("x-opencode-session-id", "chat-child".to_string())));
+        assert!(headers.contains(&("x-session-affinity", "chat-parent".to_string())));
+        assert!(headers.contains(&("X-Session-Id", "chat-parent".to_string())));
+
+        let openrouter = ProviderConfig {
+            mode: "openrouter".to_string(),
+            ..config.clone()
+        };
+        assert!(
+            session_headers(
+                &openrouter,
+                Some(ProviderSession {
+                    session_id: "chat",
+                    affinity: "chat",
+                })
+            )
+            .is_empty()
+        );
+        assert!(session_headers(&config, None).is_empty());
     }
 
     #[test]

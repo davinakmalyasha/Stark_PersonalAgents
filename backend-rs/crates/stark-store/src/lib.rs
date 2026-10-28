@@ -171,6 +171,18 @@ impl ChatStore {
             .unwrap_or_else(|| path.to_string())
     }
 
+    /// Cache/routing affinity for a chat: a child shares its parent's id,
+    /// because provider prompt caches are keyed by conversation family.
+    pub async fn chat_affinity(&self, chat_id: &str) -> Result<String, StoreError> {
+        let affinity = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(NULLIF(parent_chat_id, ''), id) FROM chats WHERE id = ?",
+        )
+        .bind(chat_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(affinity.unwrap_or_else(|| chat_id.to_string()))
+    }
+
     pub async fn chat_workspace_id(&self, chat_id: &str) -> Result<Option<String>, StoreError> {
         validate_chat_id(chat_id)?;
         let row = sqlx::query("SELECT workspace_id FROM chats WHERE id = ?")
@@ -1304,6 +1316,7 @@ mod tests {
             store.chat_workspace_id(chat_id).await.unwrap().as_deref(),
             Some(record.id.as_str())
         );
+        assert_eq!(store.chat_affinity(chat_id).await.unwrap(), chat_id);
 
         let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
         assert_eq!(loaded["messages"][0]["content"], "hello");
@@ -1325,6 +1338,7 @@ mod tests {
         let loaded = store.get_chat(chat_id).await.unwrap().unwrap();
         assert_eq!(loaded["parentChatId"], "parent-chat");
         assert_eq!(loaded["title"], "Delegated task");
+        assert_eq!(store.chat_affinity(chat_id).await.unwrap(), "parent-chat");
     }
 
     #[tokio::test]

@@ -284,7 +284,7 @@ Optional comparisons:
 | `protocol` + `app-server` | `stark-contract` + `stark-server` | SSE/WS instead of JSON-RPC for the UI |
 | `exec` | `stark-cli` | Optional headless mode |
 | `tui` | `stark-cli` (optional) | React is the primary UI |
-| `tools` + `apply-patch` | `stark-tools` | 42 tools; port descriptions verbatim |
+| `tools` + `apply-patch` | `stark-tools` | 69 tools; Developer v2 copies DeepSeek/Codex descriptions verbatim |
 | `execpolicy` | `stark-policy` | Port `_cmdpolicy` semantics |
 | `sandboxing`, `linux-sandbox`, `windows-sandbox-rs` | `stark-policy::sandbox` | Windows first; Landlock later |
 | `file-search`, `file-watcher` | `stark-tools::search` | tree-sitter + ignore |

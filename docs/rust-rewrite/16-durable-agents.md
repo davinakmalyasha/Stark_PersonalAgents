@@ -12,13 +12,20 @@ Orchestrator (level 0)
   └── workspace agent ...
 ```
 
+Developer uses the Codex multi-agent v2 tools (`spawn_agent`, `send_message`,
+`followup_task`, `wait_agent`, `list_agents`, `interrupt_agent`,
+`close_agent`). Its children share the parent workspace, inherit write tools,
+use task paths (`/root/<task_name>`), default `fork_turns=all`, and are limited
+to depth 1 and 6 open children. The `agent` tool below is the legacy v1 surface
+used by Orchestrator, General, House, DFD, and UI until they are migrated.
+
 - **Orchestrator** coordinates and routes. It does not own a workspace or write files.
 - **Workspace agent** is durable, one per `(workspace_id, scope)`, and is the single
   writer for its workspace. It has its own chat/session and can spawn subagents.
 - **Subagent** is a child of a workspace agent. It is hidden from the normal
   chat list, cannot spawn further agents, and returns a compact report.
 
-The tool is `agent`:
+Legacy tool `agent`:
 
 ```text
 spawn   kind=workspace|subagent, agent=Developer|General|..., task, title, workspace_id?, workspace_path?, wait_seconds?
@@ -45,7 +52,7 @@ agent_messages(id, sender_id, recipient_id, kind, body, metadata_json,
                delivery, created_at, consumed_at)
 ```
 
-`status`: `idle | queued | running | interrupted | completed | failed | cancelled`
+`status`: `idle | queued | running | interrupted | completed | failed | cancelled | closed`
 
 `delivery`:
 - `trigger` — wake an idle agent;
@@ -80,11 +87,13 @@ again queues a new task instead of creating a duplicate workspace agent.
 
 ## Limits
 
-- Max depth 2: subagents cannot spawn.
+- Legacy v1: max depth 2; subagents cannot spawn.
+- Developer v2: max depth 1; max 6 open children; children share the parent
+  workspace and inherit write tools.
 - Only the orchestrator can spawn workspace agents.
 - Only workspace agents can spawn subagents.
-- Workspace agents are the only writers; subagents should default to read-only
-  unless isolated in a worktree.
+- Legacy workspace agents are the only writers; v1 subagents default to
+  read-only unless isolated in a worktree.
 
 ## Agent tree UI
 
@@ -107,9 +116,11 @@ uses the durable subagent store for list/status/message/stop. The old
 `action=run` still executes synchronously, but persists the agent record and
 result.
 
-## Worktree isolation
+## Worktree isolation (legacy v1 agents)
 
-Spawned write-capable agents run in a git worktree on their own branch:
+The legacy `agent` tool can isolate spawned write-capable agents in a git
+worktree on their own branch. Developer v2 does **not** use this: Codex-style
+children share the parent workspace and rely on disjoint write sets.
 
 - Developer/UI/DevOps spawns default to `worktree`; level-2 subagents default
   to `read` unless `write_access=true` creates a nested worktree.

@@ -8,6 +8,7 @@ export interface AskQuestion {
   detail?: string;
   header?: string;
   multiSelect?: boolean;
+  multi_select?: boolean;
   options?: (string | AskOption)[];
   intent?: { kind: string; approve?: string };
 }

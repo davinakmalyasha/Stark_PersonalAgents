@@ -2,14 +2,13 @@
 
 ## Code mode
 
-`run_code` is a developer-scope tool that runs a short JavaScript program
-against the same tool registry as the normal agent loop.
+`run_code` is the legacy QuickJS code-mode tool. It is **not** part of the
+Developer v2 default surface; DeepSeek Harness keeps PTC/code mode in a separate
+`ptc` preset. It remains implemented for tests and for agents that opt into it
+explicitly.
 
-```js
-const text = tools.read_file({ file_path: "backend-rs/crates/stark-tools/src/lib.rs" });
-const hits = JSON.parse(search("compaction"));
-return { bytes: text.length, hits: hits.map((hit) => hit.name) };
-```
+`run_code` runs a short JavaScript program against the same tool registry as
+the normal agent loop.
 
 Tool calls are synchronous. Their text result is returned directly; use
 `JSON.parse` for structured output. A failing tool throws a JavaScript error

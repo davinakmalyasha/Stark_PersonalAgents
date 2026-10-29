@@ -27,6 +27,24 @@ cargo run -p stark-server
 # STARK_PORT=8124 STARK_HARNESS_ROOT=<repo> cargo run -p stark-server
 ```
 
+Developer v2 uses Git Bash for the `bash` tool. Install Git for Windows and
+ensure `bash.exe` is on `PATH` or at the standard Git for Windows location.
+WSL is not required. `working_directory`, `read`, `write`, `edit`, `glob`, and
+`grep` resolve relative paths from the session cwd and stay inside the
+workspace root.
+
+Web tools:
+
+```bash
+# Search (DeepSeek Search API)
+STARK_SEARCH_API_KEY=<deepseek-key>
+# optional override; defaults to https://api.deepseek.com
+STARK_SEARCH_BASE_URL=https://api.deepseek.com
+```
+
+`web_fetch` is a local HTTP GET with an SSRF guard; it does not need a search
+provider.
+
 Release (MSVC + voice):
 
 ```bash

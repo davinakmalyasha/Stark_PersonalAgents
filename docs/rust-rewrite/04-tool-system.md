@@ -1,8 +1,26 @@
 # 04 — Tool System
 
-45 tools in the frozen contract (`backend-rs/specs/tool-specs.json`,
-enforced by `stark-contract` tests). The model sees these strings; changing
-them changes behavior.
+69 tools in the contract (`backend-rs/specs/tool-specs.json`), enforced by
+`stark-contract` tests. The model sees these strings; changing them changes
+behavior.
+
+The contract has two surfaces:
+
+- **v1** — legacy Stark tools used by General, House, DFD, UI, DevOps, Explore,
+  and Orchestrator.
+- **v2 Developer** — 24 tools copied from DeepSeek Harness `standard` and Codex
+  multi-agent v2. See [18 — DeepSeek / Codex Parity](./18-deepseek-parity.md).
+
+Developer v2 catalog:
+
+```
+bash, job_kill, job_list, job_output,
+read, write, edit, read_image, glob, grep,
+working_directory, todo_write, exit_plan_mode, ask_user_question,
+skill, web_search, web_fetch,
+spawn_agent, send_message, followup_task, wait_agent,
+list_agents, interrupt_agent, close_agent
+```
 
 Dropped and no longer exposed: `ast_search`, `github_apply_gate`
 (never implemented). Also unexposed: `browser_navigate/extract/screenshot/close`
@@ -25,7 +43,7 @@ Dropped and no longer exposed: `ast_search`, `github_apply_gate`
 
 **Rule:** descriptions and parameter schemas are frozen. A wording change is
 a product change: update the JSON, the `stark-contract` tests, and the
-`docs/tools/*.md` page together.
+`docs/rust-rewrite/18-deepseek-parity.md` together.
 
 ---
 
@@ -34,6 +52,9 @@ a product change: update the JSON, the `stark-contract` tests, and the
 - A tool is defined **once**; scope assignment is data (`scope_map`).
 - `tool_specs_for_scope_with_access(mode, scope, access)` filters by scope,
   plan mode (`PLAN_WRITE_TOOLS`), and read-only access.
+- Developer v2 keeps the same catalog in plan and build modes (DeepSeek
+  request-cache stability); `plan_mode_denial` is the execution boundary.
+- Legacy scopes still hide write tools in plan mode.
 - Read-only agents lose write tools from their spec list — but the backend
   `dispatch` denial is the real boundary, not the hidden spec.
 - Unknown tool names are rejected.
@@ -59,7 +80,7 @@ Denial is a `[BLOCKED] ...` tool result, not a crash.
 
 ## 4. Read-only enforcement
 
-`FileAccess::Read` agents (Orchestrator, House, Explore, level-2 subagents):
+`FileAccess::Read` agents (Orchestrator, House, Explore, level-2 v1 subagents):
 
 - Blocked: `edit_file`, `run_code`, `call_subagent`, document/project writes,
   device/scene writes, `schedule`, `canvas_mode`, `give_note`, MCP tools.
@@ -70,6 +91,10 @@ Denial is a `[BLOCKED] ...` tool result, not a crash.
 - `memory`: reads allowed; `remember`/`forget`/`pin` blocked.
 - `agent`: `spawn`/`send`/`list`/`status`/`report` allowed (orchestration is
   not a write); `merge`/`discard` blocked (they change the tree).
+
+Developer v2 is intentionally different: Codex-style subagents inherit the
+parent's write tools and share the workspace. There is no Developer worktree
+isolation or read-only subagent default.
 
 ---
 
@@ -110,7 +135,14 @@ Denial is a `[BLOCKED] ...` tool result, not a crash.
 
 | Area | Module | Tools |
 |---|---|---|
-| Files | `read`, `edit`, `search`, `changes` | `read_file`, `edit_file`, `search_code`, `files_changed` |
+| Files v2 | `ds_fs` | `read`, `write`, `edit`, `read_image`, `glob`, `grep` |
+| Shell v2 | `ds_shell` | `bash`, `job_list`, `job_output`, `job_kill` |
+| Session v2 | `ds_session` | `working_directory`, `todo_write`, `ask_user_question` |
+| Web v2 | `ds_web` | `web_search`, `web_fetch` |
+| Skills v2 | `skills` | `skill` |
+| Delegation v2 | `stark-core::codex_agents` | `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
+| Plan v2 | `stark-core` | `exit_plan_mode` |
+| Files v1 | `read`, `edit`, `search`, `changes` | `read_file`, `edit_file`, `search_code`, `files_changed` |
 | Shell | `command` | `run_command` (foreground, background sessions, process actions) |
 | Plans | `update_plan`, `ask` | `update_plan`, `ask_user` |
 | Agents | `agents_tools` (via `stark-core`) | `agent` (spawn/list/status/send/report/cancel/diff/merge/discard) |

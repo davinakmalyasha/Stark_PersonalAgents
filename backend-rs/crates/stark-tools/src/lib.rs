@@ -7,6 +7,10 @@ mod codemode;
 mod command;
 mod dfd;
 mod docs;
+mod ds_fs;
+mod ds_session;
+mod ds_shell;
+mod ds_web;
 mod edit;
 mod head_tail;
 mod house;
@@ -21,11 +25,13 @@ mod questions;
 mod read;
 mod screen;
 mod search;
+mod skills;
 mod verify;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use stark_contract::{PlanItem, ToolSpecFile};
@@ -41,6 +47,7 @@ pub use questions::QuestionBroker;
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
+pub use skills::catalog_block_for;
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
 const IMPLEMENTED: &[&str] = &[
@@ -80,6 +87,30 @@ const IMPLEMENTED: &[&str] = &[
     "canvas_mode",
     "run_code",
     "agent",
+    "bash",
+    "job_kill",
+    "job_list",
+    "job_output",
+    "read",
+    "write",
+    "edit",
+    "read_image",
+    "glob",
+    "grep",
+    "working_directory",
+    "todo_write",
+    "exit_plan_mode",
+    "ask_user_question",
+    "skill",
+    "web_search",
+    "web_fetch",
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "wait_agent",
+    "list_agents",
+    "interrupt_agent",
+    "close_agent",
     "memory",
 ];
 
@@ -101,6 +132,16 @@ pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "set_screen_share",
     "run_code",
     "agent",
+    "bash",
+    "job_kill",
+    "write",
+    "edit",
+    "todo_write",
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "interrupt_agent",
+    "close_agent",
 ];
 
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
@@ -108,6 +149,12 @@ static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
+    /// Session working directory. `working_directory` changes this without
+    /// moving the workspace root used by old tools and checkpoints.
+    pub cwd: Arc<Mutex<PathBuf>>,
+    /// Files observed with `read` in this run. DeepSeek's fs policy requires
+    /// a read before an existing file can be written or edited.
+    pub read_paths: Arc<Mutex<HashSet<PathBuf>>>,
     pub workspace_id: String,
     pub chat_id: String,
     pub questions: Arc<QuestionBroker>,
@@ -118,6 +165,8 @@ pub struct ToolContext {
     pub harness_root: PathBuf,
     pub scope: String,
     pub mode: String,
+    /// Agent depth. Codex subagents run with non-interactive approvals.
+    pub depth: u32,
     /// "read" blocks writes at dispatch; "write"/"worktree" allow them.
     pub access: String,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
@@ -133,6 +182,8 @@ impl ToolContext {
         Self {
             plan_store: Arc::new(PlanStore::new(&workspace)),
             harness_root: workspace.clone(),
+            cwd: Arc::new(Mutex::new(workspace.clone())),
+            read_paths: Arc::new(Mutex::new(HashSet::new())),
             workspace,
             workspace_id: "default".to_string(),
             chat_id: chat_id.into(),
@@ -142,6 +193,7 @@ impl ToolContext {
             approvals: Arc::new(ApprovalCache::new()),
             scope: "agent".to_string(),
             mode: "build".to_string(),
+            depth: 0,
             access: "write".to_string(),
             code_delta: None,
         }
@@ -177,6 +229,11 @@ impl ToolContext {
         self
     }
 
+    pub fn with_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
     pub fn with_access(mut self, access: impl Into<String>) -> Self {
         self.access = access.into();
         self
@@ -188,6 +245,32 @@ impl ToolContext {
     ) -> Self {
         self.code_delta = Some(delta);
         self
+    }
+
+    pub fn current_dir(&self) -> PathBuf {
+        self.cwd
+            .lock()
+            .map(|cwd| cwd.clone())
+            .unwrap_or_else(|_| self.workspace.clone())
+    }
+
+    pub fn set_current_dir(&self, path: impl Into<PathBuf>) {
+        if let Ok(mut cwd) = self.cwd.lock() {
+            *cwd = path.into();
+        }
+    }
+
+    pub fn mark_read(&self, path: impl Into<PathBuf>) {
+        if let Ok(mut paths) = self.read_paths.lock() {
+            paths.insert(path.into());
+        }
+    }
+
+    pub fn was_read(&self, path: &Path) -> bool {
+        self.read_paths
+            .lock()
+            .map(|paths| paths.contains(path))
+            .unwrap_or(false)
     }
 }
 
@@ -265,6 +348,9 @@ pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -
     let scope = scope.trim().to_lowercase();
     let allowed = contract().scope_map.get(&scope);
     let read_only = access == "read";
+    // DeepSeek Harness keeps the tool catalog stable across plan/build. The
+    // Developer v2 surface follows that; older scopes keep the legacy filter.
+    let plan_filter = mode == "plan" && scope != "developer";
     let mut specs: Vec<Value> = contract()
         .tools
         .iter()
@@ -272,13 +358,22 @@ pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -
             tool.exposed
                 && IMPLEMENTED.contains(&tool.name.as_str())
                 && allowed.is_none_or(|names| names.contains(&tool.name))
-                && !(mode == "plan" && PLAN_WRITE_TOOLS.contains(&tool.name.as_str()))
+                && !(plan_filter && PLAN_WRITE_TOOLS.contains(&tool.name.as_str()))
                 && !(read_only
                     && matches!(
                         tool.name.as_str(),
                         "edit_file"
                             | "run_code"
                             | "call_subagent"
+                            | "write"
+                            | "edit"
+                            | "bash"
+                            | "job_kill"
+                            | "spawn_agent"
+                            | "send_message"
+                            | "followup_task"
+                            | "interrupt_agent"
+                            | "close_agent"
                             | "create_docx"
                             | "create_xlsx"
                             | "create_coding_project"
@@ -370,7 +465,7 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
             "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. ({name} is a write-class tool.)"
         ));
     }
-    if name == "run_command" {
+    if name == "run_command" || name == "bash" {
         let process_action = args
             .get("process_action")
             .and_then(Value::as_str)
@@ -379,7 +474,11 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
         let background = args
             .get("background")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || args
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         if !process_action.is_empty() || background {
             return Some(
                 "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. (background processes and process actions are blocked.)"
@@ -389,7 +488,7 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
         let command = args.get("command").and_then(Value::as_str).unwrap_or("");
         if let Err(reason) = stark_policy::check_read_only(command) {
             return Some(format!(
-                "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. (run_command with write/side-effect verbs is blocked: {reason})"
+                "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. ({name} with write/side-effect verbs is blocked: {reason})"
             ));
         }
     }
@@ -404,6 +503,15 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
         "edit_file"
         | "run_code"
         | "call_subagent"
+        | "write"
+        | "edit"
+        | "job_kill"
+        | "todo_write"
+        | "spawn_agent"
+        | "send_message"
+        | "followup_task"
+        | "interrupt_agent"
+        | "close_agent"
         | "create_docx"
         | "create_xlsx"
         | "create_coding_project"
@@ -419,7 +527,7 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
         | "give_note" => Some(format!(
             "[BLOCKED] Read-only agent cannot call {name}. Report findings or a proposed patch instead."
         )),
-        "run_command" => {
+        "run_command" | "bash" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             if let Err(reason) = stark_policy::check_read_only(command) {
                 Some(format!(
@@ -465,6 +573,14 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
 }
 
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
+    if let Some(tool) = contract().tool(name)
+        && let Some(required) = tool
+            .required
+            .iter()
+            .find(|required| args.get(required.as_str()).is_none())
+    {
+        return ToolOutcome::err(format!("Error: {name} requires {required}"));
+    }
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
         return ToolOutcome::err(reason);
     }
@@ -489,6 +605,22 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "edit_file" => edit::edit_file(ctx, args).await,
         "search_code" => search::search_code(ctx, args).await,
         "run_command" => command::run_command(ctx, args).await,
+        "bash" => ds_shell::bash(ctx, args).await,
+        "job_kill" => ds_shell::job_kill(ctx, args).await,
+        "job_list" => ds_shell::job_list(ctx, args).await,
+        "job_output" => ds_shell::job_output(ctx, args).await,
+        "read" => ds_fs::read(ctx, args).await,
+        "write" => ds_fs::write(ctx, args).await,
+        "edit" => ds_fs::edit(ctx, args).await,
+        "read_image" => ds_fs::read_image(ctx, args).await,
+        "glob" => ds_fs::glob(ctx, args).await,
+        "grep" => ds_fs::grep(ctx, args).await,
+        "working_directory" => ds_session::working_directory(ctx, args).await,
+        "todo_write" => ds_session::todo_write(ctx, args).await,
+        "ask_user_question" => ds_session::ask_user_question(ctx, args).await,
+        "skill" => skills::skill(ctx, args).await,
+        "web_search" => ds_web::web_search(ctx, args).await,
+        "web_fetch" => ds_web::web_fetch(ctx, args).await,
         "ask_user" => ask::ask_user(ctx, args).await,
         "update_plan" => update_plan(ctx, args).await,
         "browser_act" => browser::browser_act(ctx, args).await,
@@ -581,10 +713,13 @@ mod tests {
     fn scope_limits_tools_to_agent_acl() {
         let developer = tool_specs_for_scope("build", "developer");
         let names = tool_names(&developer);
-        assert!(names.contains(&"edit_file"));
-        assert!(names.contains(&"call_subagent"));
-        assert!(names.contains(&"update_plan"));
-        assert!(names.contains(&"run_code"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"write"));
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"spawn_agent"));
+        assert!(names.contains(&"todo_write"));
+        assert!(names.contains(&"web_fetch"));
+        assert!(!names.contains(&"read_file"));
         assert!(!names.contains(&"read_pdf"));
 
         let general = tool_specs_for_scope("build", "general");
@@ -632,7 +767,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            37
+            61
         );
     }
 
@@ -912,5 +1047,81 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("[USER ANSWERS]"));
         assert!(result.content.contains("q1: Yes"));
+    }
+}
+
+#[cfg(test)]
+mod v2_surface_tests {
+    use super::*;
+
+    #[test]
+    fn developer_v2_surface_matches_the_frozen_manifest() {
+        let names: Vec<String> = tool_specs_for_scope("build", "developer")
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        let expected = [
+            "bash",
+            "job_kill",
+            "job_list",
+            "job_output",
+            "read",
+            "write",
+            "edit",
+            "read_image",
+            "glob",
+            "grep",
+            "working_directory",
+            "todo_write",
+            "exit_plan_mode",
+            "ask_user_question",
+            "skill",
+            "web_search",
+            "web_fetch",
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "list_agents",
+            "interrupt_agent",
+            "close_agent",
+        ];
+        assert_eq!(
+            names,
+            expected
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        );
+        for legacy in [
+            "read_file",
+            "edit_file",
+            "run_command",
+            "search_code",
+            "ask_user",
+            "update_plan",
+            "call_subagent",
+            "run_code",
+            "agent",
+            "memory",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == legacy),
+                "legacy Developer tool {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn developer_plan_mode_keeps_the_same_catalog() {
+        let build: Vec<String> = tool_specs_for_scope("build", "developer")
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        let plan: Vec<String> = tool_specs_for_scope("plan", "developer")
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(build, plan);
     }
 }

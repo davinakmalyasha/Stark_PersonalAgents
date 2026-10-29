@@ -56,6 +56,8 @@ never a silent hang.
 Specs live in `stark-core::agents`: Developer, General, House, DFD, UI,
 DevOps, Explore, Orchestrator.
 
+Legacy v1:
+
 - `call_subagent` actions: `run` (synchronous, persisted), `spawn`
   (supervisor-driven), `status`, `message`, `stop`, `list`.
 - Subagents see only the task + workspace memory index. No parent history.
@@ -63,13 +65,24 @@ DevOps, Explore, Orchestrator.
 - Level-2 subagents are read-only unless the parent passes `write_access`
   (nested worktree).
 
+Developer v2 (`stark-core::codex_agents`):
+
+- `spawn_agent`, `send_message`, `followup_task`, `wait_agent`,
+  `list_agents`, `interrupt_agent`, `close_agent`.
+- Task paths are `/root/<root-id>/<task_name>`; `fork_turns=all|none`.
+- Children share the parent workspace and inherit write tools.
+- Max depth 1, max 6 open children; child approvals fail non-interactively.
+
 ---
 
 ## 5. Plan mode
 
-- Plan mode hides write/execute tools from the spec list and blocks them
+- Legacy scopes hide write/execute tools from the spec list and block them
   in `dispatch` and in code mode.
-- `update_plan` replaces the plan dock; at most one `in_progress`.
+- Developer v2 keeps the same tool catalog in plan/build for request-cache
+  stability; `plan_mode_denial` blocks writes.
+- `todo_write` replaces the plan dock for Developer; `exit_plan_mode`
+  presents the plan for approval.
 - The plan block is appended to the prompt when a plan exists.
 - Plans persist per chat/scope and appear in `AppState.plan`.
 

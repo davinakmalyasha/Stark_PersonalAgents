@@ -167,7 +167,7 @@ graph TD
 ## Features
 
 - Multi-agent orchestration with automatic task routing
-- 45-tool frozen contract across coding, research, smart home, and business
+- 69-tool contract (24-tool DeepSeek/Codex Developer surface + legacy scopes)
 - OpenAI-compatible providers with affinity/cache routing
 - Native Rust voice input/output with real-time STT/TTS
 - Tauri desktop application
@@ -408,7 +408,7 @@ graph TD
 ## Features
 
 - Multi-agent orchestration with automatic task routing
-- 45-tool frozen contract across coding, research, smart home, and business
+- 69-tool contract (24-tool DeepSeek/Codex Developer surface + legacy scopes)
 - OpenAI-compatible providers with affinity/cache routing
 - Native Rust voice input/output with real-time STT/TTS
 - Tauri desktop application

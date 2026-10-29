@@ -49,7 +49,7 @@ export function normalizeAgentName(name: string): string {
  * hard-code a subset — otherwise delegated children detach from their call
  * site and fall back to the top-hoisted card.
  */
-const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'call_subagent', 'delegate']);
+const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'call_subagent', 'delegate', 'spawn_agent']);
 
 export function isDelegationToolName(name: string | undefined): boolean {
   return !!name && DELEGATION_TOOL_NAMES.has(name);
@@ -64,6 +64,9 @@ export function delegationTarget(args?: string): { name: string; task: string } 
   if (!args) return { name: '', task: '' };
   try {
     const parsed = JSON.parse(args) as Record<string, unknown>;
+    if (typeof parsed.task_name === 'string') {
+      return { name: normalizeAgentName(String(parsed.task_name)), task: String(parsed.message || '') };
+    }
     if (typeof parsed.name === 'string' || typeof parsed.task === 'string') {
       return { name: normalizeAgentName(String(parsed.name || '')), task: String(parsed.task || '') };
     }
@@ -399,7 +402,7 @@ export function groupTraceSteps(steps: TraceStep[]): GroupedTraceStep[] {
         continue;
       }
 
-      const isEdit = step.toolName === 'write_file' || step.toolName === 'edit_file';
+      const isEdit = step.toolName === 'write_file' || step.toolName === 'write' || step.toolName === 'edit_file' || step.toolName === 'edit';
       const expectedType = isEdit ? 'edit' : 'exploration';
 
       if (currentGroup && currentGroup.type === expectedType) {

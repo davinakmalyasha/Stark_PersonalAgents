@@ -48,7 +48,7 @@ export default function QuestionModal({ visible, onClose }: Props) {
     setAnswers((prev) => {
       const cur = prev[q.id] ?? { selected: [], custom: '' };
       let selected: string[];
-      if (q.multiSelect) {
+      if ((q.multiSelect ?? q.multi_select)) {
         selected = cur.selected.includes(label) ? cur.selected.filter((s) => s !== label) : [...cur.selected, label];
       } else {
         selected = [label];
@@ -75,10 +75,6 @@ export default function QuestionModal({ visible, onClose }: Props) {
       const a = answers[q.id] ?? { selected: [], custom: '' };
       return { id: q.id, selected: a.selected, custom: a.custom.trim() };
     });
-    if (activeBatch.questions.length > 0 && payload.some((p) => p.selected.length === 0 && !p.custom)) {
-      setError('Answer all questions before submitting.');
-      return;
-    }
     setSubmitting(true);
     setError(null);
     const ok = await submitAskAnswers(activeBatch.batch_id, payload);
@@ -132,7 +128,7 @@ export default function QuestionModal({ visible, onClose }: Props) {
                               : 'border-zinc-800 bg-zinc-900/40 hover:border-zinc-700'
                           }`}
                         >
-                          <span className={`flex-shrink-0 w-4 h-4 rounded ${q.multiSelect ? 'rounded-md' : 'rounded-full'} border flex items-center justify-center ${
+                          <span className={`flex-shrink-0 w-4 h-4 rounded ${(q.multiSelect ?? q.multi_select) ? 'rounded-md' : 'rounded-full'} border flex items-center justify-center ${
                             selected ? 'border-indigo-400 bg-indigo-500/30' : 'border-zinc-600'
                           }`}>
                             {selected && <Check size={11} className="text-indigo-300" />}

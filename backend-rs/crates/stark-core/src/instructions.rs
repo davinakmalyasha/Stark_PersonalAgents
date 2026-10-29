@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_FILE: &str = "AGENTS.md";
 const OVERRIDE_FILE: &str = "AGENTS.override.md";
-const MAX_BYTES: usize = 32 * 1024;
+const MAX_BYTES: usize = 64 * 1024;
 
 fn read_doc(dir: &Path) -> Option<(PathBuf, String)> {
     for name in [OVERRIDE_FILE, DEFAULT_FILE] {
@@ -66,7 +66,7 @@ fn chain(root: &Path, workspace: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Returns the combined instruction text for a workspace, bounded to 32KB.
+/// Returns the combined instruction text for a workspace, bounded to 64KB.
 pub fn load(harness_root: &Path, workspace: &Path) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let global = harness_root.join(".deep_agents");

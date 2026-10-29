@@ -8,8 +8,12 @@ Codex-style project instructions are loaded from:
 2. every directory from the project root (nearest `.git`) down to the
    workspace, with `AGENTS.override.md` preferred over `AGENTS.md`.
 
-The concatenated text is capped at 32KB and appended to the system prompt as
+The concatenated text is capped at 64KB and appended to the system prompt as
 `[PROJECT INSTRUCTIONS]`. It is not long-term memory and not a repo map.
+
+Developer v2 injects `AGENTS.md` directly (no `[PROJECT INSTRUCTIONS]` wrapper)
+and does **not** inject workspace memory or expose the `memory` tool. The
+memory subsystem remains for legacy agents and the Memory UI.
 
 `project.md` and generated repo maps are intentionally not used.
 

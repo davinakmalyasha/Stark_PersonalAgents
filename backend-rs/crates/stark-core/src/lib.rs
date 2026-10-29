@@ -20,7 +20,9 @@ use tokio_util::sync::CancellationToken;
 pub mod agents;
 mod agents_tools;
 pub mod canvas;
+mod codex_agents;
 mod compaction;
+mod deepseek_prompt;
 mod delegation;
 mod groups;
 mod instructions;
@@ -298,52 +300,61 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
     let role = ctx.role.as_deref().unwrap_or("a coding agent");
-    let preamble = match agent_for_scope(&ctx.scope) {
-        Some(agent) => agent.instructions.to_string(),
-        None => format!("You are Stark, {role}."),
-    };
-    let mut system_prompt = format!(
-        "{preamble} Working in {workspace_label}. \
-         Use the provided tools to inspect and change files. Read before editing. \
-         Never invent tool results. Keep the final answer concise."
-    );
-    if ctx.file_access.is_read_only() {
-        system_prompt.push_str(
-            " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
-             Inspect with read_file/search_code/memory and report findings or a proposed patch.",
-        );
-    }
-    if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&instructions);
-    }
-    if stark_store::memory_enabled()
-        && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
-        && let Some(index) = memory
-            .index(&ctx.workspace_id, stark_store::memory_max_chars())
+    let mut system_prompt = if ctx.scope == "developer" {
+        // Developer v2: DeepSeek Harness standard preset shape. Behavior is
+        // carried by the tool descriptions; memory/worktree/read-only blocks
+        // are intentionally absent.
+        deepseek_prompt::system_prompt(&ctx.workspace, ctx.store.harness_root(), &ctx.model, &mode)
             .await
-    {
-        system_prompt.push_str(
-            "
+    } else {
+        let preamble = match agent_for_scope(&ctx.scope) {
+            Some(agent) => agent.instructions.to_string(),
+            None => format!("You are Stark, {role}."),
+        };
+        let mut prompt = format!(
+            "{preamble} Working in {workspace_label}. \
+             Use the provided tools to inspect and change files. Read before editing. \
+             Never invent tool results. Keep the final answer concise."
+        );
+        if ctx.file_access.is_read_only() {
+            prompt.push_str(
+                " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
+                 Inspect with read_file/search_code/memory and report findings or a proposed patch.",
+            );
+        }
+        if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&instructions);
+        }
+        if stark_store::memory_enabled()
+            && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
+            && let Some(index) = memory
+                .index(&ctx.workspace_id, stark_store::memory_max_chars())
+                .await
+        {
+            prompt.push_str(
+                "
 
 [WORKSPACE MEMORY]
 ",
-        );
-        system_prompt.push_str(&index);
-        system_prompt.push_str(
-            "
+            );
+            prompt.push_str(&index);
+            prompt.push_str(
+                "
 Memory is a hint, not the source of truth. Verify current code.              Use the memory tool (action=\"read\") for topic details.",
-        );
-    }
-    if mode == "plan" {
+            );
+        }
+        if mode == "plan" {
+            prompt.push_str(
+                " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
+                 Do not edit files, spawn subagents, or run commands with side effects.",
+            );
+        }
+        prompt
+    };
+    if ctx.scope == "developer" && ctx.depth > 0 {
         system_prompt.push_str(
-            " You are in PLAN mode: inspect and plan only. Use update_plan to maintain the plan. \
-             Do not edit files, spawn subagents, or run commands with side effects.",
-        );
-    }
-    if mode != "plan" && ctx.scope == "developer" {
-        system_prompt.push_str(
-            " For multi-step coding work, prefer run_code: one short JavaScript program can call              tools.read_file/search_code/edit_file/run_command synchronously, loop over results,              and return one compact value without putting every intermediate result in context.",
+            "\n\nYou are a subagent. Your final message is your report to the parent: state what changed, the files you touched, verification evidence, and unresolved risks. Do not ask the user questions; report blockers to the parent.",
         );
     }
     let mut messages = vec![ChatMessage::system(system_prompt)];
@@ -363,7 +374,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     } else {
         messages.extend(session_messages(&session_entries));
     }
-    if let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
+    if ctx.scope != "developer"
+        && let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
         && !block.is_empty()
     {
         messages.push(ChatMessage::user(block));
@@ -402,7 +414,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     .with_workspace_id(ctx.workspace_id.clone())
     .with_scope(ctx.scope.clone())
     .with_access(ctx.file_access.as_str())
-    .with_mode(mode.clone());
+    .with_mode(mode.clone())
+    .with_depth(ctx.depth);
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());
     }
@@ -631,6 +644,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             state.outputs = json!({"agent_report": text});
             ctx.emit_state(&mut state);
             if ctx.depth <= 1
+                && ctx.scope != "developer"
                 && stark_store::memory_enabled()
                 && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
             {
@@ -735,6 +749,29 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                     ToolOutcome::err(reason)
                 } else {
                     run_subagent_tool(&ctx, &args).await
+                }
+            } else if call.function.name == "exit_plan_mode" {
+                if mode == "plan" {
+                    exit_plan_mode_tool(&ctx, &args).await
+                } else {
+                    ToolOutcome::err("[BLOCKED] exit_plan_mode is only available in plan mode.")
+                }
+            } else if matches!(
+                call.function.name.as_str(),
+                "spawn_agent"
+                    | "send_message"
+                    | "followup_task"
+                    | "wait_agent"
+                    | "list_agents"
+                    | "interrupt_agent"
+                    | "close_agent"
+            ) {
+                if let Some(reason) =
+                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
+                {
+                    ToolOutcome::err(reason)
+                } else {
+                    codex_agents::handle(&ctx, &call.function.name, &args).await
                 }
             } else if call.function.name == "create_coding_project" {
                 if let Some(reason) =
@@ -875,6 +912,54 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     }
 }
 
+async fn exit_plan_mode_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
+    let Some(plan) = args.get("plan").and_then(Value::as_str) else {
+        return ToolOutcome::err("Error: exit_plan_mode requires plan");
+    };
+    if plan.trim().is_empty() {
+        return ToolOutcome::err("Error: exit_plan_mode requires a non-empty plan");
+    }
+    let question = json!({
+        "id": "plan-review",
+        "question": "Approve this plan?",
+        "header": "Plan review",
+        "detail": plan,
+        "options": ["Approve plan", "Keep planning"],
+        "intent": {"kind": "plan-review", "approve": "Approve plan"}
+    });
+    let answers = match ctx.questions.ask(&ctx.chat_id, vec![question], 600).await {
+        Ok(answers) => answers,
+        Err(error) => return ToolOutcome::err(format!("Error: plan review failed: {error}")),
+    };
+    let answer = answers.first().cloned().unwrap_or_else(|| json!({}));
+    let approved = answer
+        .get("selected")
+        .and_then(Value::as_array)
+        .is_some_and(|selected| {
+            selected
+                .iter()
+                .any(|value| value.as_str() == Some("Approve plan"))
+        });
+    if approved {
+        let _ = ctx.store.set_chat_mode(&ctx.chat_id, "build").await;
+        return ToolOutcome::ok(
+            "[PLAN APPROVED] Stop here. Implementation begins on the next turn in build mode.",
+        );
+    }
+    let feedback = answer
+        .get("custom")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if feedback.is_empty() {
+        ToolOutcome::ok("[PLAN NOT APPROVED] Keep planning and present a revised plan.")
+    } else {
+        ToolOutcome::ok(format!(
+            "[PLAN NOT APPROVED] Feedback: {feedback}\nKeep planning and present a revised plan."
+        ))
+    }
+}
+
 pub fn run_agent(
     ctx: RunContext,
     prompt: String,
@@ -901,7 +986,19 @@ fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
         "read_file"
+            | "read"
+            | "read_image"
             | "search_code"
+            | "grep"
+            | "glob"
+            | "job_list"
+            | "job_output"
+            | "list_agents"
+            | "wait_agent"
+            | "web_search"
+            | "web_fetch"
+            | "skill"
+            | "working_directory"
             | "read_pdf"
             | "look_at_screen"
             | "house_get_state"

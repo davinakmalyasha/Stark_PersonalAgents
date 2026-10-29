@@ -25,7 +25,8 @@ function primaryArg(args?: string): string {
       return text.length > 72 ? `${text.slice(0, 72)}…` : text;
     }
     const value = parsed.file_path ?? parsed.path ?? parsed.command ?? parsed.cmd
-      ?? parsed.pattern ?? parsed.name ?? parsed.task ?? parsed.query ?? parsed.prompt ?? '';
+      ?? parsed.pattern ?? parsed.name ?? parsed.task ?? parsed.task_name ?? parsed.target
+      ?? parsed.job_id ?? parsed.url ?? parsed.cd ?? parsed.query ?? parsed.queries ?? parsed.prompt ?? '';
     const text = String(value || '');
     return text.length > 72 ? `${text.slice(0, 72)}…` : text;
   } catch {
@@ -37,17 +38,41 @@ function primaryArg(args?: string): string {
 function toolLabel(event: LiveToolEvent): { verb: string; subject: string } {
   const subject = primaryArg(event.args);
   const verb = {
+    read: 'Read',
     read_file: 'Read',
     list_files: 'Listed files',
+    write: 'Wrote',
     write_file: 'Wrote',
+    edit: 'Edited',
     edit_file: 'Edited',
+    read_image: 'Read image',
+    bash: 'Ran command',
     run_command: 'Ran command',
+    grep: 'Searched',
+    glob: 'Listed files',
     search_code: 'Searched',
+    web_search: 'Searched web',
+    web_fetch: 'Fetched',
     task: 'Delegated',
     call_subagent: 'Delegated',
     delegate: 'Delegated',
+    spawn_agent: 'Spawned agent',
+    send_message: 'Messaged agent',
+    followup_task: 'Followed up',
+    wait_agent: 'Waited for agent',
+    list_agents: 'Listed agents',
+    interrupt_agent: 'Interrupted agent',
+    close_agent: 'Closed agent',
+    job_list: 'Listed jobs',
+    job_output: 'Read job',
+    job_kill: 'Killed job',
+    todo_write: 'Updated todo list',
     update_plan: 'Updated plan',
+    exit_plan_mode: 'Proposed plan',
     ask_user: 'Asked',
+    ask_user_question: 'Asked',
+    skill: 'Loaded skill',
+    working_directory: 'Changed directory',
     memory: 'Recalled memory',
   }[event.name] || event.name;
   return { verb, subject };
@@ -55,17 +80,40 @@ function toolLabel(event: LiveToolEvent): { verb: string; subject: string } {
 
 function toolSummaryPart(event: LiveToolEvent): string {
   return {
+    read: 'read files',
     read_file: 'read files',
     list_files: 'explored files',
+    write: 'wrote files',
     write_file: 'wrote files',
+    edit: 'edited files',
     edit_file: 'edited files',
+    bash: 'ran commands',
     run_command: 'ran commands',
+    grep: 'searched code',
+    glob: 'explored files',
     search_code: 'searched code',
+    web_search: 'searched the web',
+    web_fetch: 'fetched pages',
     task: 'created an agent',
     call_subagent: 'created an agent',
     delegate: 'created an agent',
+    spawn_agent: 'created an agent',
+    send_message: 'messaged an agent',
+    followup_task: 'sent a follow-up',
+    wait_agent: 'waited for an agent',
+    list_agents: 'listed agents',
+    interrupt_agent: 'interrupted an agent',
+    close_agent: 'closed an agent',
+    job_list: 'listed jobs',
+    job_output: 'read a job',
+    job_kill: 'killed a job',
+    todo_write: 'updated the todo list',
     update_plan: 'updated the plan',
+    exit_plan_mode: 'proposed a plan',
     ask_user: 'asked a question',
+    ask_user_question: 'asked a question',
+    skill: 'loaded a skill',
+    working_directory: 'changed directory',
     memory: 'recalled memory',
   }[event.name] || 'used tools';
 }

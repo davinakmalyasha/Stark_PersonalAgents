@@ -68,13 +68,26 @@ loop:
 
 ## 3. Prompts and history
 
-System prompt, fixed order:
+Legacy agent system prompt, fixed order:
 
 1. Role instructions (`stark-core::agents` specs).
-2. Project instructions (`AGENTS.md` hierarchy, 32KB cap).
+2. Project instructions (`AGENTS.md` hierarchy, 64KB cap).
 3. Workspace memory index (`MEMORY.md`, capped).
 4. Read-only notice when `FileAccess::Read`.
 5. Plan block when a plan exists.
+
+Developer uses the v2 prompt instead:
+
+1. `You are an AI agent powered by Stark.`
+2. `You are a coding agent powered by the {model} model.`
+3. Runtime context (cwd, platform, Git Bash, time).
+4. Plan section in plan mode.
+5. Tool guidance.
+6. `AGENTS.md` hierarchy (64KB cap).
+7. `[SKILLS]` catalog.
+
+Developer has no `MEMORY.md` injection and no `run_code` nudge. Behavior lives
+in the tool descriptions, matching DeepSeek Harness.
 
 Message history derives from the per-chat session JSONL plus the current
 turn. Compaction uses the opencode checkpoint model (see doc 14).
@@ -91,15 +104,18 @@ pub enum FileAccess { Read, Write, Worktree }
 - Orchestrator: routes, delegates, coordinates.
 - Workspace agents: Developer, General, House, DFD, UI (+ DevOps/Explore
   specialists for subagents).
-- Workspace agents are the only writers; subagents default to read-only
-  unless the parent passes `write_access` (nested worktree).
-- `default_access(scope, depth, spawned)` decides; `STARK_WORKTREES`
-  controls the non-git fallback.
+- Legacy workspace agents are the only writers; v1 subagents default to
+  read-only unless the parent passes `write_access` (nested worktree).
+- Developer v2 subagents inherit write tools and share the parent workspace
+  (Codex semantics); they are limited to depth 1 and 6 open children.
+- `default_access(scope, depth, spawned)` decides the legacy path;
+  `STARK_WORKTREES` controls the non-git fallback.
 
 ### Subagents
 
-- Self-contained task: goal, constraints, paths, acceptance. No parent
-  history — the parent passes what matters.
+- Legacy v1: self-contained task, no parent history.
+- Developer v2: `spawn_agent` supports `fork_turns=all|none`; default `all`.
+  The child receives the task path and reports its final message to the parent.
 - `call_subagent` run blocks and persists the record; `spawn` is
   supervisor-driven.
 

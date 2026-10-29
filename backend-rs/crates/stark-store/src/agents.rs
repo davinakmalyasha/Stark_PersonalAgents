@@ -545,6 +545,23 @@ impl AgentStore {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        // A follow-up delivered while the agent was running must start a new
+        // turn when the current one settles. Closed agents stay closed.
+        sqlx::query(
+            r#"
+            UPDATE agents SET status = 'queued', updated_at = ?
+            WHERE id = ? AND status IN ('completed', 'failed', 'interrupted')
+              AND EXISTS (
+                SELECT 1 FROM agent_messages
+                WHERE recipient_id = ? AND consumed_at IS NULL AND delivery = 'trigger'
+              )
+            "#,
+        )
+        .bind(&moment)
+        .bind(id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

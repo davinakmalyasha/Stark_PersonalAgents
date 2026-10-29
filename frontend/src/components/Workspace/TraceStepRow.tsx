@@ -153,11 +153,11 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
       const parsed = JSON.parse(step.args);
       const rawPath = parsed.file_path || parsed.path || '';
       if (rawPath) fileName = rawPath.split(/[/\\]/).pop() || '';
-      if (step.toolName === 'run_command' && parsed.command) {
+      if ((step.toolName === 'run_command' || step.toolName === 'bash') && parsed.command) {
         cmdDisplay = parsed.command.length > 60 ? parsed.command.substring(0, 60) + '...' : parsed.command;
       }
-      if (step.toolName === 'search_code' && parsed.pattern) cmdDisplay = parsed.pattern;
-      if (step.toolName === 'list_files' && parsed.path) cmdDisplay = parsed.path.split(/[/\\]/).pop() || parsed.path;
+      if ((step.toolName === 'search_code' || step.toolName === 'grep') && parsed.pattern) cmdDisplay = parsed.pattern;
+      if ((step.toolName === 'list_files' || step.toolName === 'glob') && parsed.path) cmdDisplay = parsed.path.split(/[/\\]/).pop() || parsed.path;
 
       const offset = parsed.offset || 1, limit = parsed.limit;
       if (limit) lineRange = `#L${offset}-${offset + limit - 1}`;
@@ -171,12 +171,12 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
   }
 
   // Extract line range from read_file output: "(lines 1-15 of 15)"
-  if (step.content && step.toolName === 'read_file') {
+  if (step.content && (step.toolName === 'read_file' || step.toolName === 'read')) {
     const match = step.content.match(/\(lines (\d+)-(\d+)/);
     if (match) lineRange = `#L${match[1]}-${match[2]}`;
   }
 
-  if (step.toolName === 'read_file') {
+  if ((step.toolName === 'read_file' || step.toolName === 'read')) {
     return (
       <div className="flex items-center gap-2 py-0.5 text-zinc-400 font-sans text-[13.5px] leading-relaxed">
         {getFileIcon(fileName, 'text-orange-400')}
@@ -186,7 +186,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'write_file') {
+  if ((step.toolName === 'write_file' || step.toolName === 'write')) {
     const lines = step.content ? parseLineCount(step.content) : null;
     return (
       <div className="flex items-center gap-2 py-0.5 text-zinc-400 font-sans text-[13.5px] leading-relaxed">
@@ -199,7 +199,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'edit_file') {
+  if ((step.toolName === 'edit_file' || step.toolName === 'edit')) {
     const diff = step.content ? parseDiffStats(step.content) : null;
     const hasDiff = !!step.content && step.content.includes('@@');
     return (
@@ -234,7 +234,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'search_code') {
+  if ((step.toolName === 'search_code' || step.toolName === 'grep')) {
     return (
       <div className="flex items-center gap-1.5 py-0.5 text-zinc-400 font-sans text-[13.5px] leading-relaxed">
         <span>Searched</span>
@@ -243,7 +243,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'run_command') {
+  if ((step.toolName === 'run_command' || step.toolName === 'bash')) {
     return (
       <div className="flex flex-col py-0.5 text-zinc-400 font-sans text-[13.5px]">
         <div className="flex items-center gap-1.5">
@@ -259,7 +259,7 @@ export default function TraceStepRow({ step, onOpenSubagent, onOpenSubagentSessi
     );
   }
 
-  if (step.toolName === 'list_files') {
+  if ((step.toolName === 'list_files' || step.toolName === 'glob')) {
     return (
       <div className="flex items-center gap-1.5 py-0.5 text-zinc-400 font-sans text-[13.5px] leading-relaxed">
         <span>Listed files in</span>

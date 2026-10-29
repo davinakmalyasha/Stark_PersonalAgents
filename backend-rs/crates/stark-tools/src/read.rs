@@ -54,7 +54,11 @@ async fn read_one(ctx: &ToolContext, raw_path: &str, args: &Value) -> ToolOutcom
 
     let lines: Vec<String> = content.lines().map(trim_line).collect();
     let total = lines.len();
-    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
@@ -63,20 +67,21 @@ async fn read_one(ctx: &ToolContext, raw_path: &str, args: &Value) -> ToolOutcom
         .unwrap_or(DEFAULT_LIMIT)
         .min(MAX_LIMIT);
 
-    if total > 0 && offset >= total {
+    if total > 0 && offset > total {
         return ToolOutcome::err(format!(
             "Error: offset {offset} is beyond the end of {raw_path} ({total} lines)"
         ));
     }
 
-    let start = offset.min(total);
+    let start = offset.saturating_sub(1).min(total);
     let end = (start + limit).min(total);
     let start_line = if total == 0 { 0 } else { start + 1 };
     let mut output = format!("[FILE] {raw_path} (lines {start_line}-{end} of {total})\n");
     if end < total {
         output.push_str(&format!(
             "[PARTIAL view: returned lines {start_line}-{end} of {total}. \
-             Use read_file(offset={end}) to continue, or search_code to locate specific lines.]\n"
+             Use read_file(offset={}) to continue, or search_code to locate specific lines.]\n",
+            end + 1
         ));
     }
     if start < end {

@@ -35,8 +35,17 @@ const STACK_LIMIT: usize = 512 * 1024;
 const DISALLOWED: &[&str] = &[
     "run_code",
     "ask_user",
+    "ask_user_question",
+    "exit_plan_mode",
     "delegate",
     "call_subagent",
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "wait_agent",
+    "list_agents",
+    "interrupt_agent",
+    "close_agent",
     "job_message",
     "job_cancel",
     "schedule",
@@ -364,7 +373,7 @@ mod tests {
             &ctx,
             &json!({
                 "code": r#"
-const text = tools.read_file({ file_path: "a.txt" });
+const text = tools.read({ file_path: "a.txt" });
 return { found: text.includes("hello code mode") };
 "#
             }),
@@ -383,8 +392,9 @@ return { found: text.includes("hello code mode") };
             &ctx,
             &json!({
                 "code": r#"
-tools.edit_file({ file_path: "a.txt", old_string: "hello", new_string: "bye" });
-return tools.read_file({ file_path: "a.txt" });
+tools.read({ file_path: "a.txt" });
+tools.edit({ file_path: "a.txt", old_string: "hello", new_string: "bye" });
+return tools.read({ file_path: "a.txt" });
 "#
             }),
         )
@@ -404,7 +414,7 @@ return tools.read_file({ file_path: "a.txt" });
                 "code": r#"
 const hits = JSON.parse(search("read"));
 return {
-  hasRead: hits.some((item) => item.name === "read_file"),
+  hasRead: hits.some((item) => item.name === "read"),
   hasAsk: typeof tools.ask_user,
   hasProcess: typeof process,
   hasRequire: typeof require
@@ -432,7 +442,7 @@ return {
                 "code": r#"
 let n = 0;
 for (let i = 0; i < 5; i++) {
-  tools.read_file({ file_path: "a.txt" });
+  tools.read({ file_path: "a.txt" });
   n++;
 }
 return n;

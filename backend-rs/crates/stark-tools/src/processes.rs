@@ -239,9 +239,9 @@ impl ProcessManager {
         let name = name.unwrap_or_else(|| format!("exec-{id}"));
         let output = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let (io, pid) = if tty {
-            self.spawn_pty(command, workdir, output.clone())?
+            self.spawn_pty(command, workdir, owner, output.clone())?
         } else {
-            self.spawn_pipes(command, workdir, output.clone())?
+            self.spawn_pipes(command, workdir, owner, output.clone())?
         };
         let io = Box::new(io);
         let managed = Arc::new(ManagedProcess {
@@ -267,13 +267,19 @@ impl ProcessManager {
         &self,
         command: &str,
         workdir: &Path,
+        owner: &str,
         output: Arc<Mutex<HeadTailBuffer>>,
     ) -> Result<(ProcessIo, u32), String> {
         let mut process = Command::new(find_bash());
         process
-            .arg("-lc")
+            .args(["--noprofile", "--norc", "-c"])
             .arg(command)
             .current_dir(workdir)
+            .env("DSH_WORKSPACE", workdir)
+            .env("DSH_HOME", workdir)
+            .env("DSH_SESSION_ID", owner)
+            .env("STARK_WORKSPACE", workdir)
+            .env("STARK_SESSION_ID", owner)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -307,15 +313,21 @@ impl ProcessManager {
         &self,
         command: &str,
         workdir: &Path,
+        owner: &str,
         output: Arc<Mutex<HeadTailBuffer>>,
     ) -> Result<(ProcessIo, u32), String> {
         let pair = native_pty_system()
             .openpty(PtySize::default())
             .map_err(|error| format!("failed to allocate PTY: {error}"))?;
         let mut builder = CommandBuilder::new(find_bash());
-        builder.args(["--noprofile", "--norc", "-lc", command]);
+        builder.args(["--noprofile", "--norc", "-c", command]);
         builder.cwd(workdir);
         builder.env("TERM", "dumb");
+        builder.env("DSH_WORKSPACE", workdir.to_string_lossy().as_ref());
+        builder.env("DSH_HOME", workdir.to_string_lossy().as_ref());
+        builder.env("DSH_SESSION_ID", owner);
+        builder.env("STARK_WORKSPACE", workdir.to_string_lossy().as_ref());
+        builder.env("STARK_SESSION_ID", owner);
 
         let child = pair
             .slave
@@ -386,6 +398,33 @@ impl ProcessManager {
         rows.join("\n")
     }
 
+    pub fn list_for(&self, owner: &str) -> String {
+        let mut rows: Vec<String> = self
+            .by_id
+            .iter()
+            .filter(|entry| entry.value().owner == owner)
+            .map(|entry| {
+                let process = entry.value();
+                process.refresh_status();
+                let status = process.status.lock().unwrap().label();
+                format!(
+                    "- #{} {} (PID {}, {}, {}s) — {}",
+                    process.id,
+                    process.name,
+                    process.pid,
+                    status,
+                    process.started.elapsed().as_secs(),
+                    process.command
+                )
+            })
+            .collect();
+        if rows.is_empty() {
+            return "No background jobs.".to_string();
+        }
+        rows.sort();
+        rows.join("\n")
+    }
+
     pub fn logs(&self, target: &str, tail_lines: usize) -> Result<String, String> {
         let process = self.get(target)?;
         process.refresh_status();
@@ -396,6 +435,19 @@ impl ProcessManager {
         let lines: Vec<&str> = output.lines().collect();
         let start = lines.len().saturating_sub(tail_lines.max(1));
         Ok(lines[start..].join("\n"))
+    }
+
+    /// Output since the previous read. Matches DeepSeek's `job_output`
+    /// contract for streaming jobs.
+    pub fn read_output(&self, target: &str) -> Result<String, String> {
+        let process = self.get(target)?;
+        process.refresh_status();
+        let text = process.pending_text();
+        if text.is_empty() {
+            Ok("(no new output)".to_string())
+        } else {
+            Ok(text)
+        }
     }
 
     pub fn kill(&self, target: &str) -> Result<(), String> {

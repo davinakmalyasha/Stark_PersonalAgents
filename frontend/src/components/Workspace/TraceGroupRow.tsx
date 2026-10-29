@@ -53,7 +53,7 @@ export default function TraceGroupRow({ group, isLastActive, onOpenSubagent, onO
     }
     if (group.type === 'exploration' || group.type === 'edit') {
       const stepCount = group.steps.length;
-      const searchCount = group.steps.filter(s => s.toolName === 'search_code').length;
+      const searchCount = group.steps.filter(s => s.toolName === 'search_code' || s.toolName === 'grep').length;
       if (group.type === 'exploration' && searchCount > 0) {
         return `Explored ${stepCount - searchCount} file${(stepCount - searchCount) !== 1 ? 's' : ''}, ${searchCount} search${searchCount !== 1 ? 'es' : ''}`;
       }

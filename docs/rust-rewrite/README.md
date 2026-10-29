@@ -23,7 +23,7 @@ with a compact injected index plus on-demand detail.
 | Platform | **Windows first**, Linux/macOS later |
 | Persistence | SQLite (`.deep_agents/chats.db`) + JSONL sessions, readable across restarts |
 | Voice | Native Rust (Moonshine STT + Pocket TTS), no Python sidecar |
-| Tool contract | Descriptions and JSON Schemas are **frozen** in `backend-rs/specs/tool-specs.json` |
+| Tool contract | `backend-rs/specs/tool-specs.json`; v2 Developer surface + v1 legacy scopes |
 | Dropped tools | `ast_search`, `github_apply_gate` were never implemented and are not exposed |
 | Admin surface | Removed — no `#/admin`, no `/api/agentsadmin` |
 | Definition of done | Existing frontend works against Rust with no UI changes |
@@ -50,6 +50,7 @@ with a compact injected index plus on-demand detail.
 | 15 | [Provider Affinity](./15-provider-affinity.md) | opencode-go session/affinity headers and cache routing |
 | 16 | [Durable Agents](./16-durable-agents.md) | Orchestrator → workspace → subagent tree, mailboxes, supervisor |
 | 17 | [Instructions, Memory & Costs](./17-memory-instructions-costs.md) | AGENTS.md, workspace memory, usage/pricing, DFD approval |
+| 18 | [DeepSeek / Codex Parity](./18-deepseek-parity.md) | Developer v2 tool surface, sources, deviations, behavior |
 
 Deleted as Python-era history: `00`, `10`, `11`, `12-setup-and-branching`,
 `Structure.md`, `group-projects/`, `memory/fixed-concept.md`,

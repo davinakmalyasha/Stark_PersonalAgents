@@ -1,339 +1,258 @@
 # 08 — Server Contract
 
-The Rust server must be a drop-in replacement for the FastAPI surface the
-React/Electron UI, Telegram bot, and voice overlay already use.
-
-Source: `server/api_server.py`, `server/routers/*`, `frontend/src/services/api/*`.
+The Rust `stark-server` is the only backend. It serves the HTTP/SSE/WS API and,
+for remote mode, the frontend on the same origin.
 
 ---
 
-## 1. Axum layout
+## 1. Process and ports
 
-```
-stark-server/
-  src/
-    app.rs            # router assembly, middleware, state
-    state.rs          # AppState, EventBus, RunManager
-    routes/
-      run.rs          # /api/run, /api/stream, steer, followup, abort
-      chats.rs        # workspaces, chats, messages, files, rules
-      groups.rs       # groups, approvals, update
-      notes.rs
-      canvas.rs
-      house.rs
-      voice.rs        # proxy to Python sidecar
-      mcp.rs
-      snapshots.rs
-      admin.rs        # health, models, provider, pairing, ui, usage
-    sse.rs            # SSE formatting, replay, heartbeat
-    ws.rs             # voice WebSocket proxy
-    static_files.rs   # frontend dist
-    auth.rs           # pairing token
-```
+| Setting | Default |
+|---|---|
+| `STARK_HOST` / `STARK_BIND` | `127.0.0.1` |
+| `STARK_PORT` | `8124` dev, `8123` desktop |
+| `STARK_HARNESS_ROOT` | app data dir (dev may point at the repo) |
+| `STARK_FRONTEND_DIST` | `<harness>/frontend/dist` |
 
-`AppState` (server state, not the UI snapshot):
-
-```rust
-pub struct ServerState {
-    pub store: Arc<Store>,
-    pub runs: Arc<RunManager>,
-    pub bus: Arc<EventBus>,
-    pub agents: Arc<AgentRuntime>,
-    pub groups: Arc<GroupService>,
-    pub voice: Arc<VoiceProxy>,
-    pub config: Arc<Config>,
-    pub started_at: Instant,
-}
-```
+One Tokio multi-thread runtime. In-process loops: agent supervisor (1s),
+group supervisor (15s), schedule dispatcher, canvas wake dispatcher.
 
 ---
 
-## 2. Route groups
-
-Paths are frozen. Keep the exact strings, including `/api/ask/...` and
-`/api/runs/...`.
+## 2. Route inventory
 
 ### 2.1 Run / stream
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/run` | Start a run; returns SSE |
-| GET | `/api/stream/{chat_id}` | Reattach to an active run |
-| POST | `/api/steer` | Queue a steering message |
-| POST | `/api/followup` | Queue a follow-up turn |
-| POST | `/api/abort` | Cancel a run |
-| GET | `/api/runs/active` | Current run info |
-| POST | `/api/runs/{run_id}/undo` | Run-scoped undo |
-| GET | `/api/state` | Current state snapshot |
-| GET | `/api/history` | Recent prompts |
-| GET | `/api/models` | Model options |
-| GET/POST | `/api/provider` | Provider mode |
-| POST | `/api/session/reset` | Reset session state |
 
-### 2.2 Workspaces / chats
-`GET|POST /api/workspaces`, `GET /api/workspaces/{id}`,
-`GET|POST /api/workspaces/{id}/chats`,
-`GET|DELETE /api/workspaces/{id}/chats/{chat_id}`,
-`POST .../chats/{chat_id}/messages`, `POST .../attachments`,
-`POST .../rewind`, `PUT .../title`, `GET .../subagents`,
-`GET /api/workspaces/{id}/subagents/{child_id}`,
-`GET .../files`, `GET .../file`, `GET|POST .../rules`,
-`GET|POST /api/settings/profile`, `GET|POST /api/settings/general-profile`,
-`GET /api/chat/{chat_id}/mode`, `GET /api/chat/{chat_id}/state`.
+```
+POST /api/run
+GET  /api/stream/{chat_id}
+POST /api/abort
+POST /api/steer
+POST /api/followup
+GET  /api/inbox
+```
 
-### 2.3 Groups / notes / canvas
-`GET /api/groups`, `GET /api/groups/{project_id}`,
-`POST /api/groups/{project_id}/items/{item_id}/approval`,
-`POST /api/groups/{project_id}/update`,
-`GET|POST /api/notes`, `GET|PUT|DELETE /api/notes/{note_id}`,
-`GET /api/notes/{scope_type}/{scope_id}`,
-`GET /api/canvas/{chat_id}/status`.
+### 2.2 State / provider
 
-### 2.4 House
-`GET /api/house/state`, `GET /api/house/devices/{device_id}`,
-`POST /api/house/rooms/{room_id}`,
-`POST /api/house/scenes/{scene_id}/run`, `GET /api/house/history`,
-`POST /api/house/reset`.
+```
+GET  /api/health
+GET  /api/state
+GET  /api/history
+GET  /api/runs/active
+GET  /api/models
+GET  /api/provider
+GET  /api/ui/state
+PUT  /api/ui/state
+POST /api/session/reset
+```
 
-Mount the house router under `/api/house`; the Python router is mounted with
-that prefix (`server/house/router.py`).
+### 2.3 Workspaces / chats / files
 
-### 2.5 Voice
-`GET /api/turn_detection`,
-`POST /api/voice/start|stop|mute|interrupt|send`,
-`GET /api/voice/status|peek|tts_status`,
-`POST /api/transcribe`, `POST /api/tts`, `POST /api/tts/cancel`,
-`GET /api/tts/stream`,
-`POST /api/voice/release_asr|release_tts|warm_tts`,
-`POST /api/vision/frame`, `WS /api/voice/ws`.
+```
+GET|POST /api/workspaces
+GET|DELETE /api/workspaces/{id}
+GET  /api/workspaces/{id}/files
+GET  /api/workspaces/{id}/file
+GET|POST /api/workspaces/{id}/chats
+GET|DELETE /api/workspaces/{id}/chats/{chat_id}
+PUT  /api/workspaces/{id}/chats/{chat_id}/title
+POST /api/workspaces/{id}/chats/{chat_id}/messages
+POST /api/workspaces/{id}/chats/{chat_id}/attachments
+POST /api/workspaces/{id}/chats/{chat_id}/rewind
+GET  /api/workspaces/{id}/chats/{chat_id}/subagents
+GET  /api/workspaces/{id}/subagents/{child_id}
+GET  /api/chat/{chat_id}/mode
+POST /api/chat/{chat_id}/mode
+GET  /api/chat/{chat_id}/state
+GET  /api/chats/{chat_id}/snapshots
+POST /api/chats/{chat_id}/snapshots/{snap_id}/restore
+POST /api/chats/{chat_id}/runs/{run_id}/restore
+POST /api/runs/{run_id}/undo
+```
 
-### 2.6 Infra
-`GET /api/health`, `GET /api/pairing`,
-`POST /api/pairing/rotate`, `GET|PUT /api/ui/state`,
-`GET /api/mcp/servers`, `GET|POST|DELETE /api/mcp/servers/{name}`,
-`POST /api/mcp/servers/{name}/restart`,
-`GET /api/chats/{chat_id}/snapshots`,
-`POST /api/chats/{chat_id}/snapshots/{snap_id}/restore`,
-`POST /api/chats/{chat_id}/runs/{run_id}/restore`,
-`GET /api/ask/pending`, `POST /api/ask/answer`, `GET /api/inbox`.
+### 2.4 Agents
 
-Dropped, not ported: the Python `agentsadmin` proxy (`/api/agentsadmin/*`)
-and its `#/admin` frontend page were removed — no caller used them.
-`/api/health/voice`, `/api/settings/*`, and `/api/workspaces/{id}/rules`
-are also not ported and return 404; no frontend surface calls them.
+```
+GET  /api/agents
+GET  /api/agents/{agent_id}
+POST /api/agents/{agent_id}/cancel
+POST /api/agents/{agent_id}/message
+GET  /api/agents/{agent_id}/diff
+POST /api/agents/{agent_id}/merge
+POST /api/agents/{agent_id}/discard
+```
 
-### 2.7 Static
-`GET /{*path}` serves `frontend/dist` from the same origin so a phone only
-needs `http://<laptop>:<port>`; unknown API paths return JSON 404, not
-the SPA. The shell (`/`, `/assets/*`, deep links) is public so the pairing
-gate can load; `/api/*` still requires the pairing token for non-loopback
-clients. `STARK_FRONTEND_DIST` overrides the dist dir; otherwise
-`<harness>/frontend/dist` is used. `STARK_BIND` is accepted as an alias of
-`STARK_HOST`.
+### 2.5 Memory
+
+```
+GET    /api/memory
+GET    /api/memory/{workspace_id}
+PUT    /api/memory/{workspace_id}
+DELETE /api/memory/{workspace_id}
+POST   /api/memory/{workspace_id}/consolidate
+POST   /api/memory/{workspace_id}/notes
+GET    /api/memory/{workspace_id}/topics/{topic}
+DELETE /api/memory/{workspace_id}/entries/{entry_id}
+POST   /api/memory/{workspace_id}/entries/{entry_id}/pin
+```
+
+### 2.6 Groups / schedules / notes / canvas
+
+```
+GET|POST /api/groups
+GET  /api/groups/{project_id}
+POST /api/groups/{project_id}/update
+POST /api/groups/{project_id}/items/{item_id}/approval
+GET|POST /api/schedules
+DELETE /api/schedules/{schedule_id}
+GET  /api/notes/{scope_type}/{scope_id}
+POST /api/notes
+PATCH|DELETE /api/notes/{note_id}
+GET  /api/canvas/{chat_id}/status
+```
+
+### 2.7 MCP
+
+```
+GET    /api/mcp/servers
+POST   /api/mcp/servers/{name}
+DELETE /api/mcp/servers/{name}
+POST   /api/mcp/servers/{name}/restart
+```
+
+### 2.8 House
+
+```
+GET  /api/house/state
+GET  /api/house/devices/{device_id}
+POST /api/house/rooms/{room_id}
+POST /api/house/scenes/{scene_id}/run
+GET  /api/house/history
+POST /api/house/reset
+```
+
+### 2.9 Voice / screen
+
+```
+GET  /api/turn_detection
+GET  /api/voice/status
+GET  /api/voice/peek
+GET  /api/voice/tts_status
+POST /api/voice/start
+POST /api/voice/stop
+POST /api/voice/mute
+POST /api/voice/interrupt
+POST /api/voice/send
+POST /api/voice/release_asr
+POST /api/voice/release_tts
+POST /api/voice/warm_tts
+POST /api/tts
+POST /api/tts/stream
+POST /api/tts/cancel
+POST /api/transcribe
+POST /api/vision/frame
+WS   /api/voice/ws
+```
+
+### 2.10 Pairing / asks
+
+```
+GET  /api/pairing
+POST /api/pairing/rotate
+GET  /api/ask/pending
+POST /api/ask/answer
+```
+
+Dropped and returning 404 by design: `/api/agentsadmin/*`,
+`/api/settings/*`, `/api/workspaces/{id}/rules`, `/api/health/voice`.
+No current frontend surface calls them.
 
 ---
 
 ## 3. SSE contract
 
-Format (exact):
+`GET /api/stream/{chat_id}` emits named events:
 
-```text
-event: delta
-data: {"kind":"text","text":"Hel","agent":"developer","model":"...","ts":123}
-
-```
-
-Events:
 | Event | Payload |
 |---|---|
-| `hello` | `{"chat_id": "..."}` (reattach only) |
-| `delta` | `Delta` |
-| `state` | `AppState` snapshot |
-| `done` | `{"status":"complete"|"error"}` |
+| `hello` | `{ chat_id }` |
+| `state` | full `AppState` |
+| `delta` | `Delta` (`text`, `reasoning`, `usage`, `tool_started`, `tool_finished`, `end`) |
+| `done` | `{ status, error }` |
 
-`Delta`:
-```json
-{
-  "kind": "text|reasoning|usage|end|tool_started|tool_finished",
-  "text": "",
-  "agent": "developer",
-  "model": "...",
-  "ts": 123,
-  "tool": "read_file",
-  "args": "{\"file_path\":\"...\"}",
-  "ok": true,
-  "ms": 12
+- `status`: `complete` | `error` | `aborted`.
+- The agent's terminal status is persisted **before** `done`.
+- A closed stream without `done` means transport loss; the client detaches.
+- Replay: `/api/stream` sends the latest `AppState` before subscribing.
+
+---
+
+## 4. AppState
+
+```ts
+interface AppState {
+  active_node: string;
+  next_agent: string;
+  completed_nodes: string[];
+  thoughts: Record<string, string>;
+  client_request: string;
+  outputs: Record<string, unknown>;
+  project_path: string;
+  agents_plan: string;
+  plan?: Record<string, PlanItem[]>;
+  antigravity_log: unknown[];
+  live_terminal_log: string;
+  selected_model: string;
+  selected_temp: number;
+  token_usage: TokenUsage;
+  artifacts?: RunArtifacts;
+  project_ref?: ProjectRef | null;
+  error?: string;
+  traceback?: string;
+  state_version: number;
 }
 ```
 
-Ordering:
-1. Optional `hello` on reattach.
-2. `delta*` interleaved with `state*`.
-3. Final `state` (complete, with `artifacts`).
-4. `done`.
-
-Heartbeat: send a comment (`: ping\n\n`) every 15s so proxies keep the
-connection open. Do not send a `delta` just to keep alive.
-
-Reattach:
-- `GET /api/stream/{chat_id}` subscribes to the chat bus.
-- Replay the latest `AppState` first.
-- If the run finished while detached, replay the final state + `done`.
-- If no run is active, emit the last known state and close.
-
-Disconnect:
-- Preserve current behavior: a client disconnect cancels the run
-  (`request.is_disconnected()` → cancellation). If this is changed, it is a
-  product decision and must be documented.
+`delta` fields are additive; never rename an existing kind without a frontend
+change.
 
 ---
 
-## 4. `AppState` and `Delta`
+## 5. Auth and pairing
 
-Port the frontend types exactly (`frontend/src/types/index.ts`).
-
-```rust
-#[derive(Serialize, Deserialize, Clone, Default)]
-#[serde(rename_all = "snake_case")]
-pub struct AppState {
-    pub active_node: String,
-    pub next_agent: String,
-    pub completed_nodes: Vec<String>,
-    pub thoughts: HashMap<String, String>,
-    pub client_request: String,
-    pub outputs: AgentOutputs,
-    pub project_path: String,
-    pub agents_plan: String,
-    pub plan: Option<HashMap<String, Vec<PlanItem>>>,
-    pub mcp_servers: Option<Vec<McpServerStatus>>,
-    pub antigravity_log: Vec<LogEntry>,
-    pub live_terminal_log: String,
-    pub selected_model: String,
-    pub selected_temp: f64,
-    pub token_usage: TokenUsage,
-    pub artifacts: Option<RunArtifacts>,
-    pub project_ref: Option<ProjectRef>,
-    pub workspace_created: Option<bool>,
-    pub error: Option<String>,
-    pub traceback: Option<String>,
-}
-```
-
-Notes:
-- `outputs` includes `requirements`, `tech_spec`, `code`, `agent_report`,
-  `test_report`, plus optional `gherkin`, `mermaid`.
-- `state_version` is used for dedupe; include it even if not in the TS
-  interface.
-- `_intermediate: true` may be present on intermediate snapshots; preserve it.
-- Do not rename fields; the UI reads them directly.
+- Loopback clients pass freely.
+- Non-loopback `/api/*` requires `x-api-token` matching the pairing token.
+- `GET /api/pairing` and `POST /api/pairing/rotate` are local-only.
+- The SPA shell (`/`, `/assets/*`, deep links) is **public** so a phone can
+  load the pairing gate before it has a token.
+- Tokens are never logged.
 
 ---
 
-## 5. Run lifecycle
+## 6. Static frontend
 
-```rust
-pub struct RunManager {
-    active: DashMap<ChatId, RunHandle>,
-    tracker: Arc<RunTracker>,
-}
-
-pub struct RunHandle {
-    pub run_id: RunId,
-    pub cancel: CancellationToken,
-    pub steer: mpsc::Sender<SteerMessage>,
-    pub bus: broadcast::Sender<ServerEvent>,
-}
-```
-
-Rules:
-- One active run per chat; a second `POST /api/run` returns 409 with the
-  existing message ("This chat already has a running agent...").
-- Create the user message and session entry before starting the task.
-- Abort: cancel token + settle state; do not leave the chat locked.
-- Steering: enqueue; the loop drains between turns.
-- Follow-up: enqueue a user message for the next turn.
-- On finish: persist assistant message, usage, artifacts; finalize snapshots;
-  publish final state; emit `done`; clear the active run.
-- On error: persist `error`/`traceback` in the final state; emit `done` with
-  `status: "error"`.
-- Run cleanup stops background processes owned by the run (`_procman`
-  `cleanup_owner`).
+- `GET /assets/*` serves `frontend/dist/assets`.
+- `GET /{*path}` serves a real file if present, otherwise `index.html`.
+- Unknown `/api/*` returns JSON 404, never the SPA.
+- Path traversal is rejected by resolving under `dist`.
 
 ---
 
-## 6. Voice WebSocket proxy
+## 7. Lifecycle
 
-During migration, keep the Python voice engine:
-
-- `stark-server` proxies `WS /api/voice/ws` to
-  `ws://127.0.0.1:8125/api/voice/ws`.
-- Proxy `/api/voice/*`, `/api/tts*`, `/api/transcribe`, `/api/vision/*` over
-  HTTP.
-- Do not buffer audio; forward frames as they arrive.
-- Preserve close codes and error payloads.
-- Add a health probe (`/api/health/voice`) that checks the sidecar.
-
-Long-term: replace with Rust STT/TTS; that is a separate project.
+- Startup: open stores, recover interrupted agents/wakes, start loops, load MCP.
+- Shutdown: cancel active runs, stop MCP children, close DB pools.
+- Agent run: claim → mailbox → worktree → run → auto-commit → terminal
+  status → notify parent.
+- Run error: persist `error`/`traceback` in `AppState`, emit `done:error`.
 
 ---
 
-## 7. Auth / pairing
+## 8. Contract tests
 
-Port the existing behavior from `server/api_server.py`:
-
-- Local requests are free.
-- Phone/remote requests need the pairing token.
-- `GET /api/pairing` returns the current pairing info; `POST
-  /api/pairing/rotate` rotates it.
-- Preserve token transport (query/header) exactly; the UI/QR flow depends on
-  it.
-- Do not log tokens.
-
-If the Python middleware is opaque, extract the exact rules into tests before
-porting.
-
----
-
-## 8. Errors
-
-JSON shape:
-```json
-{ "error": "human-readable message", "detail": "optional" }
-```
-
-Status codes:
-- `400` invalid input
-- `404` unknown chat/workspace/project
-- `409` run already active / conflicting op
-- `422` validation / empty transcript
-- `500` unhandled error (also persisted into the run state)
-
-Never return HTML for API errors. Never leak stack traces to remote clients;
-keep them in the run state/logs.
-
----
-
-## 9. Single instance, CORS, shutdown
-
-- Bind `8123` (or `STARK_PORT`); if occupied by another Stark, exit quietly.
-- CORS: allow the Electron/Vite origins used today; do not widen to `*` in
-  production.
-- Graceful shutdown:
-  - stop accepting requests,
-  - cancel active runs,
-  - stop supervisor/schedulers,
-  - flush session logs and SQLite,
-  - stop sidecar processes the server started.
-- Log a startup banner with version, port, DB paths, and provider mode.
-
----
-
-## 10. Contract tests
-
-- Route inventory diff: every Python route has a Rust route (method + path).
-- SSE replay: recorded run → same event sequence and final state.
-- `AppState` JSON schema diff against `frontend/src/types/index.ts`.
-- Chat CRUD/attachment/rewind parity on a fixture DB.
-- Reattach: disconnect mid-run, reconnect, receive state + done.
-- Abort: no messages after cancellation; final state marked.
-- Voice proxy: binary frames unchanged; close codes preserved.
-- Auth: local allowed, remote without token rejected, rotated token works.
+- Route inventory: every frontend-used path exists; dropped paths 404.
+- SSE replay and final state.
+- `AppState` JSON matches `frontend/src/types`.
+- Chat CRUD/attachment/rewind on fixture DBs.
+- Auth: local free, remote without token 401, rotated token works.
+- Static: shell public, assets correct type, API 404 JSON, traversal contained.

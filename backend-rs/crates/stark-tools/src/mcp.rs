@@ -861,36 +861,53 @@ mod live_tests {
 
     fn fake_server_script() -> &'static str {
         r#"
-import json, sys
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    req = json.loads(line)
-    method = req.get("method")
-    if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
-    elif method == "tools/list":
-        result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
-    elif method == "tools/call":
-        text = (req.get("params") or {}).get("arguments", {}).get("text", "")
-        result = {"content": [{"type": "text", "text": "echo:" + text}]}
-    elif method == "notifications/initialized":
-        continue
-    else:
-        result = {}
-    if "id" in req:
-        print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result}), flush=True)
+import readline from 'node:readline';
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const text = line.trim();
+  if (!text) return;
+  const req = JSON.parse(text);
+  const method = req.method;
+  let result = {};
+  if (method === 'initialize') {
+    result = {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      serverInfo: { name: 'fake', version: '1' },
+    };
+  } else if (method === 'tools/list') {
+    result = {
+      tools: [{
+        name: 'echo',
+        description: 'Echo text',
+        inputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string' } },
+          required: ['text'],
+        },
+      }],
+    };
+  } else if (method === 'tools/call') {
+    const value = (req.params || {}).arguments?.text ?? '';
+    result = { content: [{ type: 'text', text: 'echo:' + value }] };
+  } else if (method === 'notifications/initialized') {
+    return;
+  }
+  if (Object.hasOwn(req, 'id')) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\n');
+  }
+});
 "#
     }
 
     #[tokio::test]
     async fn stdio_server_lists_and_calls_a_tool() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake_mcp.py");
+        let script = dir.path().join("fake_mcp.mjs");
         std::fs::write(&script, fake_server_script()).unwrap();
         let config = json!({"servers": {"fake": {
-            "command": "python",
+            "command": "node",
             "args": [script.to_string_lossy()],
             "scopes": ["developer"],
             "approval": "auto",

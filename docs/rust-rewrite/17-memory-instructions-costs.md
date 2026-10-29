@@ -122,7 +122,7 @@ The sidebar agent panel links to the memory page for the active workspace.
 
 ### What we intentionally do not do
 
-- No Python memory daemon.
+- No external memory daemon.
 - No embeddings or vector search; the index plus Markdown topics is enough for
   this scale.
 - No per-turn model call. Capture is deterministic; the model only runs during

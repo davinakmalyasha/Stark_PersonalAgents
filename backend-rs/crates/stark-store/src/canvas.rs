@@ -1,7 +1,6 @@
 //! Durable canvas watch state and wake queue.
 //!
-//! Schema-compatible with the Python `server/store/agent_wakes.py` tables so
-//! both runtimes can share `.deep_agents/chats.db`: `pending_wakes`,
+//! Canvas wake tables in `.deep_agents/chats.db`: `pending_wakes`,
 //! `canvas_watches`, `canvas_events`.
 
 use std::path::PathBuf;

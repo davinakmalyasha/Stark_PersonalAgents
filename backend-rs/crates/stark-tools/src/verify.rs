@@ -1,6 +1,6 @@
 //! Minimal acceptance-criteria evaluation for group work items.
 //!
-//! Python parity (agents/group/criteria.py) judges every item against its own
+//! Acceptance verification judges every item against its own
 //! acceptance criteria. This is the deterministic subset: file/dir existence,
 //! minimum size, regex content matches, and glob presence — all resolved
 //! strictly under the project root. Anything else (`manual`, `llm`,

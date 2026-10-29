@@ -711,6 +711,57 @@ async fn group_loop(state: ServerState) {
     }
 }
 
+fn group_member_agent(owner: &str, detail: &Value) -> Option<stark_core::AgentSpec> {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return None;
+    }
+    if let Some(agent) = agent_for_scope(owner) {
+        return Some(agent);
+    }
+    let alias = match owner.to_ascii_lowercase().as_str() {
+        "dev" | "coding" | "coder" | "engineer" => "developer",
+        "research" | "researcher" | "writer" | "analyst" => "general",
+        "design" | "designer" | "frontend" | "front-end" => "ui",
+        "ops" | "operations" | "sre" | "infra" => "devops",
+        "scout" | "explorer" => "explore",
+        _ => "",
+    };
+    if !alias.is_empty()
+        && let Some(agent) = agent_for_scope(alias)
+    {
+        return Some(agent);
+    }
+    let members = detail.get("members").and_then(Value::as_array)?;
+    for member in members {
+        let matches = ["name", "display", "kind", "derived_from"]
+            .iter()
+            .filter_map(|key| member.get(*key).and_then(Value::as_str))
+            .any(|value| value.eq_ignore_ascii_case(owner));
+        if !matches {
+            continue;
+        }
+        for key in ["kind", "derived_from", "name", "display"] {
+            if let Some(candidate) = member.get(key).and_then(Value::as_str)
+                && let Some(agent) = agent_for_scope(candidate)
+            {
+                return Some(agent);
+            }
+        }
+    }
+    None
+}
+
+fn group_item_agent(item: &Value, detail: &Value) -> stark_core::AgentSpec {
+    item.get("owner_member")
+        .and_then(Value::as_str)
+        .and_then(|owner| group_member_agent(owner, detail))
+        .or_else(|| agent_for_scope("developer"))
+        .expect("the developer agent is registered")
+}
+
+const GROUP_RUNTIME_NOTICE: &str = "Group projects run in their project folder. owner_member selects the agent; items tagged needs-approval (or flagged requires_approval) park for approval.";
+
 async fn run_group_item(state: ServerState, groups: GroupStore, project_id: String, item: Value) {
     let item_id = item["id"].as_str().unwrap_or("").to_string();
     // Pre-run approval gate: a tagged (or flagged) item parks for the owner
@@ -767,9 +818,13 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state.harness_root.clone());
-    let agent = agent_for_scope("developer").expect("the developer agent is registered");
+    let agent = group_item_agent(&item, &detail);
     let model = state.provider.config().resolve_model("");
-    let title = format!("Group: {}", item["title"].as_str().unwrap_or("Task"));
+    let title = format!(
+        "Group: {} ({})",
+        item["title"].as_str().unwrap_or("Task"),
+        agent.display
+    );
     let chat = match state
         .store
         .create_chat(
@@ -849,12 +904,13 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     let acceptance =
         serde_json::to_string_pretty(&item["acceptance"]).unwrap_or_else(|_| "[]".to_string());
     let prompt = format!(
-        "Execute one item for this group project.\n\nProject goal:\n{}\n\nMilestone:\n{}\n\nItem:\n{}\n\nDetails:\n{}\n\nAcceptance criteria (all must be met):\n{}\n\nWork only on this item. Report what changed and how each criterion was met.",
+        "You are acting as the {display} member for one group-project item.\n\nProject goal:\n{}\n\nMilestone:\n{}\n\nItem:\n{}\n\nDetails:\n{}\n\nAcceptance criteria (all must be met):\n{}\n\nWork only on this item. Report what changed and how each criterion was met.",
         detail["project"]["goal"].as_str().unwrap_or(""),
         item["milestone_title"].as_str().unwrap_or(""),
         item["title"].as_str().unwrap_or(""),
         item["detail"].as_str().unwrap_or(""),
         acceptance,
+        display = agent.display,
     );
     let result = run_agent(ctx, prompt).await;
     checkpoint.finalize();
@@ -2691,7 +2747,7 @@ async fn create_group_handler(
         "id": id,
         "path": detail["path"],
         "title": goal,
-        "runtime_notice": "Rust group projects share the Python project store. The Rust runner uses one workspace agent per item; member-specific routing and approval gates are not yet implemented.",
+        "runtime_notice": GROUP_RUNTIME_NOTICE,
         "project": detail["project"],
     })))
 }
@@ -2932,9 +2988,7 @@ async fn group_handler(
     if detail["project"]["status"] == "active" {
         detail["project"]["status"] = json!("running");
     }
-    detail["runtime_notice"] = json!(
-        "Rust group projects share the Python project store. The Rust runner uses one workspace agent per item; member-specific routing and approval gates are not yet implemented."
-    );
+    detail["runtime_notice"] = json!(GROUP_RUNTIME_NOTICE);
     Ok(Json(detail))
 }
 
@@ -3974,7 +4028,7 @@ async fn auth_middleware(
 ) -> axum::response::Response {
     // The SPA shell (/, /assets/*) stays public so a remote phone can load
     // the UI and reach the pairing gate. Only API calls require the token.
-    // Python guards every path; Rust deliberately exempts the shell.
+    // Only /api/* is guarded; the shell must stay public for the pairing gate.
     let path = request.uri().path();
     if !path.starts_with("/api/") {
         return next.run(request).await;
@@ -4663,6 +4717,37 @@ mod tests {
         let mut value = json!({});
         hydrate_plan(dir.path(), &mut value, Some("chat-1")).await;
         assert_eq!(value["plan"]["agent"][0]["step"], "inspect");
+    }
+
+    #[test]
+    fn group_owner_member_selects_the_agent() {
+        let detail = json!({
+            "members": [
+                {"name": "Nova", "display": "Nova", "kind": "ui"},
+                {"name": "Ops", "display": "Ops", "kind": "devops"}
+            ]
+        });
+        assert_eq!(
+            group_item_agent(&json!({"owner_member": "UI"}), &detail).key,
+            "ui"
+        );
+        assert_eq!(
+            group_item_agent(&json!({"owner_member": "research"}), &detail).key,
+            "general"
+        );
+        assert_eq!(
+            group_item_agent(&json!({"owner_member": "Nova"}), &detail).key,
+            "ui"
+        );
+        assert_eq!(
+            group_item_agent(&json!({"owner_member": "ops"}), &detail).key,
+            "devops"
+        );
+        assert_eq!(
+            group_item_agent(&json!({"owner_member": "unknown"}), &detail).key,
+            "developer"
+        );
+        assert_eq!(group_item_agent(&json!({}), &detail).key, "developer");
     }
 
     #[test]

@@ -8,9 +8,7 @@ use sqlx::{Row, SqlitePool};
 
 /// Group projects are folders, not a separate database.
 ///
-/// The Python group runtime owns the canonical on-disk layout:
-/// `<project>/.gp/state.db` plus a `PROJECT.md` manifest. Rust uses the same
-/// layout so switching backends does not make existing projects disappear.
+/// Canonical layout: `<project>/.gp/state.db` plus a `PROJECT.md` manifest.
 #[derive(Clone, Debug)]
 pub struct GroupStore {
     root: PathBuf,
@@ -70,8 +68,8 @@ impl GroupStore {
                 .map_err(|error| error.to_string())?;
         }
 
-        // A JSON object is valid YAML. Keeping it in the Python fence means
-        // the Python manifest parser can read a Rust-created project too.
+        // A JSON object is valid YAML; keep the manifest in a fenced block so
+        // both humans and tools can read it.
         let yaml = serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?;
         tokio::fs::write(
             path.join("PROJECT.md"),

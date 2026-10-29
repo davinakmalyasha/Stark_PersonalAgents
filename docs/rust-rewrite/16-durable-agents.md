@@ -139,6 +139,6 @@ The sidebar tree shows status text, relative activity, model, an access badge,
 and pending counts, with a detail drawer (overview/mailbox/worktree), send,
 merge (confirmed, diff-first), discard, and cancel.
 
-## Not implemented yet
+## Intentional omission
 
-- Telegram bot (DFD approval is in-app now).
+- Telegram bot — DFD approval is in-app now.

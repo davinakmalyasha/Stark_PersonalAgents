@@ -16,8 +16,10 @@ fn root_dir(app: &AppHandle) -> PathBuf {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // The repo root is the directory containing backend-rs/ (dev) or the
+    // current directory. No Python-tree probing: the backend is Rust-only.
     for candidate in [cwd.join("..").join(".."), cwd.clone()] {
-        if candidate.join("server").join("api_server.py").exists() {
+        if candidate.join("backend-rs").join("Cargo.toml").exists() {
             return candidate;
         }
     }
@@ -49,31 +51,6 @@ fn packaged_backend(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
-fn python_command(root: &Path) -> Option<(PathBuf, Vec<String>)> {
-    for relative in [
-        "venv/Scripts/python.exe",
-        ".venv/Scripts/python.exe",
-        "venv312/Scripts/python.exe",
-    ] {
-        let path = root.join(relative);
-        if path.exists() {
-            return Some((
-                path,
-                vec!["-B".to_string(), "server/api_server.py".to_string()],
-            ));
-        }
-    }
-    let python = if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python3"
-    };
-    Some((
-        PathBuf::from(python),
-        vec!["-B".to_string(), "server/api_server.py".to_string()],
-    ))
-}
-
 #[cfg(windows)]
 fn hidden_command(program: &Path) -> Command {
     use std::os::windows::process::CommandExt;
@@ -101,11 +78,6 @@ pub fn ensure_running(app: &AppHandle) {
         .ok()
         .map(PathBuf::from)
         .filter(|path| path.exists());
-    // Rust is the runtime. Python remains only as an explicit fallback
-    // (STARK_BACKEND=python) until the Python tree is deleted.
-    let prefer_rust = std::env::var("STARK_BACKEND").ok().as_deref() != Some("python");
-    let python = python_command(&root);
-    let python_ready = root.join("server").join("api_server.py").exists();
 
     fn rust_dev_binary(root: &Path) -> Option<PathBuf> {
         let exe = if cfg!(windows) {
@@ -128,41 +100,18 @@ pub fn ensure_running(app: &AppHandle) {
             .filter(|path| path.exists())
     }
 
-    let (program, args, cwd) = if let Some(binary) = configured {
-        (binary, Vec::new(), root.clone())
+    let (program, cwd) = if let Some(binary) = configured {
+        (binary, root.clone())
     } else if let Some(binary) = packaged_backend(app) {
-        (binary, Vec::new(), root.clone())
-    } else if prefer_rust {
-        if let Some(binary) = rust_dev_binary(&root) {
-            (binary, Vec::new(), root.clone())
-        } else if python_ready {
-            if let Some((python, args)) = python {
-                log::warn!("Rust dev binary not found; falling back to Python backend");
-                (python, args, root.clone())
-            } else {
-                log::error!("no Rust backend binary and no Python interpreter found");
-                return;
-            }
-        } else {
-            log::error!("no Stark backend binary found (set STARK_BACKEND_BIN)");
-            return;
-        }
-    } else if python_ready {
-        if let Some((python, args)) = python {
-            (python, args, root.clone())
-        } else {
-            log::error!("Python backend is present but no interpreter was found");
-            return;
-        }
-    } else if let Some((python, args)) = python {
-        (python, args, root.clone())
+        (binary, root.clone())
+    } else if let Some(binary) = rust_dev_binary(&root) {
+        (binary, root.clone())
     } else {
-        log::error!("no Stark backend binary or Python venv found");
+        log::error!("no Stark backend binary found (set STARK_BACKEND_BIN)");
         return;
     };
 
     match hidden_command(&program)
-        .args(args)
         .current_dir(cwd)
         .env("STARK_PORT", crate::api_port().to_string())
         .env("STARK_HARNESS_ROOT", &root)

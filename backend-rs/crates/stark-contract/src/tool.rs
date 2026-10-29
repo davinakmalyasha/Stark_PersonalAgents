@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(file.tool_count, 45);
         assert_eq!(file.tools.len(), 45);
         assert_eq!(file.scope_map.len(), 8);
-        assert_eq!(file.exposed_tools().count(), 39);
+        assert_eq!(file.exposed_tools().count(), 37);
 
         let hidden: BTreeSet<&str> = file
             .tools
@@ -174,10 +174,12 @@ mod tests {
         assert_eq!(
             hidden,
             BTreeSet::from([
+                "ast_search",
                 "browser_navigate",
                 "browser_extract",
                 "browser_screenshot",
                 "browser_close",
+                "github_apply_gate",
                 "update_feature",
                 "update_project_meta",
             ])
@@ -195,7 +197,7 @@ mod tests {
         assert_eq!(file.scope_map["house"].len(), 11);
         assert_eq!(file.scope_map["dfd"].len(), 9);
         assert_eq!(file.scope_map["orchestrator"].len(), 16);
-        assert_eq!(file.scope_map["devops"].len(), 7);
+        assert_eq!(file.scope_map["devops"].len(), 6);
         assert_eq!(file.scope_map["explore"].len(), 4);
         assert_eq!(file.scope_map["ui"].len(), 9);
 

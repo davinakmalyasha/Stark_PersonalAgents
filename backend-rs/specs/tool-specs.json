@@ -1,6 +1,6 @@
 {
   "contract_version": 1,
-  "source": "tools/_schemas.py",
+  "source": "frozen: backend-rs/specs/tool-specs.json (Python tree removed)",
   "tool_count": 45,
   "tools": [
     {
@@ -368,7 +368,7 @@
           "rule"
         ]
       },
-      "exposed": true,
+      "exposed": false,
       "required": [
         "rule"
       ],
@@ -708,7 +708,7 @@
           "repo"
         ]
       },
-      "exposed": true,
+      "exposed": false,
       "required": [
         "repo"
       ],
@@ -1906,7 +1906,6 @@
       "memory"
     ],
     "devops": [
-      "github_apply_gate",
       "run_command",
       "read_file",
       "edit_file",

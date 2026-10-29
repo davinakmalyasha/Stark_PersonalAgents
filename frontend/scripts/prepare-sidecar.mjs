@@ -42,7 +42,6 @@ if (fs.existsSync(modelsSource)) {
 const onnxCandidates = [
   process.env.STARK_ONNXRUNTIME_DLL,
   path.resolve(frontend, '..', 'backend-rs', 'onnxruntime.dll'),
-  path.resolve(frontend, '..', '..', 'venv', 'Lib', 'site-packages', 'onnxruntime', 'capi', 'onnxruntime.dll'),
 ].filter(Boolean);
 const onnx = onnxCandidates.find((candidate) => fs.existsSync(candidate));
 if (onnx) {

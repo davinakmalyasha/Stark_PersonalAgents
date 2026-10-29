@@ -12,7 +12,7 @@ Closes #<!-- issue number -->
 
 ## Testing
 
-- [ ] Local tests pass (`pytest`)
+- [ ] Local tests pass (`cargo test --workspace` in `backend-rs/`)
 - [ ] CI checks pass
 - [ ] Manual verification (what you ran/clicked)
 

@@ -72,7 +72,7 @@ A multi-agent AI orchestration system that delegates tasks to specialized agents
 
 **Example:**
 ```markdown
-![Python](https://img.shields.io/badge/Python-3.11-blue)
+![Rust](https://img.shields.io/badge/Rust-1.99-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 ```
@@ -167,12 +167,11 @@ graph TD
 ## Features
 
 - Multi-agent orchestration with automatic task routing
-- 60+ tools across coding, research, smart home, and business
-- 15+ LLM providers with automatic fallback
-- Voice input/output with real-time STT/TTS
-- Telegram bot integration
-- Electron desktop application
-- Multitenant architecture for multiple clients
+- 45-tool frozen contract across coding, research, smart home, and business
+- OpenAI-compatible providers with affinity/cache routing
+- Native Rust voice input/output with real-time STT/TTS
+- Tauri desktop application
+- Isolated workspaces and git worktrees for delegated agents
 ```
 
 ---
@@ -194,11 +193,11 @@ graph TD
 
 | Category | Technologies |
 |----------|-------------|
-| Backend | Python, FastAPI, Pydantic AI |
-| Frontend | React, TypeScript, Electron |
-| Database | SQLite, Supabase |
-| AI/ML | LLM agents, OpenAI, Local LLMs |
-| Voice | Moonshine STT, Pocket TTS |
+| Backend | Rust, Axum, SQLx |
+| Frontend | React 19, TypeScript, Tauri |
+| Database | SQLite (WAL) |
+| AI/ML | Multi-agent loop, OpenAI-compatible providers |
+| Voice | Moonshine STT, Pocket TTS (native Rust) |
 ```
 
 ---
@@ -223,14 +222,20 @@ graph TD
 git clone https://github.com/username/project.git
 cd project
 
-# Install
-pip install -r requirements.txt
+# Build backend
+cd backend-rs
+cargo build --release -p stark-server
 
-# Run
-python main.py
+# Build frontend
+cd ../frontend
+npm ci
+npm run build
+
+# Run desktop
+npm run tauri:dev
 ```
 
-**Prerequisites:** Python 3.11+, Node.js 18+
+**Prerequisites:** Rust 1.99+, Node.js 24+
 ```
 
 ---
@@ -252,15 +257,13 @@ python main.py
 
 ```
 stark/
-├── agents/           # Agent definitions
-│   ├── orchestrator.py
-│   ├── developer.py
-│   └── general.py
-├── tools/            # Tool implementations
-├── llm/              # LLM provider configs
-├── memory/           # Memory systems
-├── frontend/         # Electron app
-└── config/           # Configuration files
+├── backend-rs/       # Rust workspace
+│   ├── crates/       # core, tools, store, server, voice
+│   ├── specs/        # frozen tool contract
+│   └── scripts/      # release tooling
+├── frontend/         # React 19 + Tauri desktop app
+├── docs/             # architecture and setup
+└── .github/          # Rust + frontend CI
 ```
 ```
 
@@ -284,8 +287,10 @@ stark/
 Create `.env` file:
 
 ```env
-OPENAI_API_KEY=your-key-here
-DATABASE_URL=sqlite:///data.db
+STARK_API_KEY=your-key
+STARK_PROVIDER=opencode
+STARK_MODEL=deepseek-v4.1-flash
+STARK_HARNESS_ROOT=./.deep_agents
 ```
 ```
 
@@ -363,7 +368,7 @@ Here's a complete README example for a project like Stark:
 
 A multi-agent AI orchestration system that delegates tasks to specialized agents.
 
-![Python](https://img.shields.io/badge/Python-3.11-blue)
+![Rust](https://img.shields.io/badge/Rust-1.99-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Demo](docs/demo.gif)
@@ -391,35 +396,34 @@ graph TD
     General --> Tools
     House --> Tools
     
-    Tools --> DB[(Supabase)]
-    Tools --> LLM[15+ LLM Providers]
+    Tools --> DB[(SQLite)]
+    Tools --> LLM[OpenAI-compatible gateway]
 ```
 
 **Key decisions:**
 - 3-tier hierarchy for separation of concerns
 - Tool Warehouse pattern: tools registered once, assigned by scope
-- LLM proxy for billing control and provider rotation
+- Provider affinity for stable prompt-cache routing
 
 ## Features
 
 - Multi-agent orchestration with automatic task routing
-- 60+ tools across coding, research, smart home, and business
-- 15+ LLM providers with automatic fallback
-- Voice input/output with real-time STT/TTS
-- Telegram bot integration
-- Electron desktop application
-- Context compaction for long conversations
+- 45-tool frozen contract across coding, research, smart home, and business
+- OpenAI-compatible providers with affinity/cache routing
+- Native Rust voice input/output with real-time STT/TTS
+- Tauri desktop application
+- Checkpoint compaction for long conversations
 - Crash recovery and session persistence
 
 ## Tech Stack
 
 | Category | Technologies |
 |----------|-------------|
-| Backend | Python 3.11, FastAPI, Pydantic AI |
-| Frontend | React 19, TypeScript, Electron |
-| Database | SQLite (mmap), Supabase |
-| AI/ML | Pydantic AI, Pydantic Graph, FastEmbed |
-| Voice | Moonshine STT, Pocket TTS |
+| Backend | Rust, Axum, SQLx |
+| Frontend | React 19, TypeScript, Tauri |
+| Database | SQLite (WAL) |
+| AI/ML | Hand-rolled agent loop, OpenAI-compatible providers |
+| Voice | Moonshine STT, Pocket TTS (native Rust) |
 
 ## Quick Start
 
@@ -428,35 +432,33 @@ graph TD
 git clone https://github.com/username/stark.git
 cd stark
 
-# Install
-pip install -r requirements.txt
+# Build
+cd backend-rs && cargo build --release -p stark-server
+cd ../frontend && npm ci && npm run build
 
 # Configure
 cp .env.example .env
 # Edit .env with your API keys
 
-# Run
-python main.py
+# Run desktop
+npm run tauri:dev
 ```
 
-**Prerequisites:** Python 3.11+, Node.js 18+ (for frontend)
+**Prerequisites:** Rust 1.99+, Node.js 24+
 
 ## Project Structure
 
 ```
 stark/
-├── agents/              # Agent definitions
-│   ├── orchestrator.py  # Main orchestrator
-│   ├── developer.py     # Coding agent
-│   ├── general.py       # Research agent
-│   └── house.py         # Smart home agent
-├── tools/               # 60+ tool implementations
-├── llm/                 # LLM provider configs
-├── memory/              # Memory and context systems
-├── frontend/            # Electron desktop app
-├── Telegram/            # Telegram bot
-├── Voice/               # STT/TTS systems
-└── config/              # Configuration files
+├── backend-rs/
+│   ├── crates/stark-core/      # agent loop, worktrees, memory
+│   ├── crates/stark-tools/     # tool dispatch + built-ins
+│   ├── crates/stark-store/     # SQLite/JSONL persistence
+│   ├── crates/stark-server/    # Axum API + SSE + static SPA
+│   └── specs/tool-specs.json   # frozen tool contract
+├── frontend/                   # React 19 + Tauri
+├── docs/rust-rewrite/          # architecture docs
+└── .github/workflows/          # Rust + frontend CI
 ```
 
 ## Configuration
@@ -464,15 +466,16 @@ stark/
 Create `.env` file:
 
 ```env
-# LLM Providers (at least one required)
-OPENAI_API_KEY=your-key
-GROQ_API_KEY=your-key
+# Provider
+STARK_API_KEY=your-key
+STARK_PROVIDER=opencode
+STARK_MODEL=deepseek-v4.1-flash
 
-# Database
-DATABASE_URL=sqlite:///data.db
-
-# Optional
-TELEGRAM_BOT_TOKEN=your-token
+# Runtime
+STARK_PORT=8123
+STARK_HARNESS_ROOT=./.deep_agents
+STARK_WORKTREES=auto
+STARK_MEMORY=on
 ```
 
 ## License

@@ -15,37 +15,120 @@ The concatenated text is capped at 32KB and appended to the system prompt as
 
 ## Workspace memory
 
-Completed workspace/orchestrator turns create a stage-1 record in
-`.deep_agents/chats.db`:
+Memory is split into two layers, following the useful part of the Codex and
+Claude Code designs:
+
+1. **Deterministic capture.** Every completed workspace/orchestrator turn writes
+   a stage-1 record to SQLite. This is cheap and always runs:
+   request, outcome, chat, agent, timestamp. Secrets are redacted before disk.
+2. **Model-assisted distillation/consolidation.** Background work turns pending
+   stage-1 records into durable entries, a compact index, and topic files. If the
+   model fails or returns invalid JSON, deterministic consolidation is used.
+
+The injected context is intentionally small:
+
+- `MEMORY.md` — compact index, injected at run start (capped by
+  `STARK_MEMORY_MAX_CHARS`, default 8KB).
+- `topics/<topic>.md` — details, read on demand with the `memory` tool.
+- `summary.md` — long-form consolidated memory.
+
+Layout per workspace:
 
 ```text
-memory_stage1(id, workspace_id, chat_id, agent_id, request, summary,
-              raw_memory, created_at, usage_count, last_usage,
-              selected_for_phase2, consolidated_at)
-memory_summary(workspace_id, summary, updated_at, consolidated_count)
+.deep_agents/memory/<workspace_id>/
+  MEMORY.md              # compact index, injected
+  summary.md             # long-form summary, on demand
+  topics/
+    decisions.md
+    facts.md
+    commands.md
+    pitfalls.md
+    preferences.md
+    tasks.md
+    recent.md
+    notes.md
 ```
 
-Consolidation folds the newest 30 records into one bounded Markdown summary,
-stores it in `memory_summary`, and writes
-`.deep_agents/memory/<workspace>.md`. The next run injects at most
-`STARK_MEMORY_MAX_CHARS` (default 8000) as `[WORKSPACE MEMORY]`.
+Memory is scoped by workspace. Worktrees and subdirectories of the same
+workspace share the same memory because they share the workspace id. Different
+projects, House, DFD, and General do not see each other's memory. The
+orchestrator only sees its own workspace memory; delegated agents receive their
+target workspace's memory.
+
+`AGENTS.md` remains the manual instruction layer and is always separate from
+learned memory. A repo map is not injected by default; the agent should search
+or read the working tree, or use an explicit repo-map tool if one is added later.
+
+### The `memory` tool
+
+The compact index is already in context. The tool provides the long-form path:
+
+- `index` / `summary` — read the index or long-form summary
+- `list` — list topic files
+- `read topic=...` — read a topic and record usage
+- `search query=...` — search durable entries
+- `remember text=...` — add a durable note immediately
+- `forget entry_id=...` / `pin entry_id=...` — remove or pin an entry
+- `status` — counts and last consolidation metadata
+
+Read-only agents and plan mode can read memory but cannot write it.
+
+### Background consolidation
+
+The model pass runs when pending stage-1 records reach
+`STARK_MEMORY_CONSOLIDATE_AFTER` (default 8), or when you click **Consolidate**
+in the memory UI. It is per-workspace locked, so two runs cannot rewrite the
+same memory at once.
 
 Configuration:
 
 ```text
-STARK_MEMORY=on|off          default on
-STARK_MEMORY_MAX_CHARS=8000
+STARK_MEMORY=on|off                       default on
+STARK_MEMORY_MAX_CHARS=8000               index/summary cap
+STARK_MEMORY_CONSOLIDATE_AFTER=8          pending records before auto-consolidation
+STARK_MEMORY_MODEL=                       optional model override
 ```
 
-Routes:
+If `STARK_MEMORY_MODEL` is empty, the current run model is used. The override
+must be one of the curated Stark models.
 
-- `GET /api/memory/{workspace_id}` — status + summary
-- `POST /api/memory/{workspace_id}/consolidate`
-- `DELETE /api/memory/{workspace_id}` — reset
+### Routes
 
-This follows Codex’s stage-1/consolidation shape without the Python memory
-daemon or embeddings. Consolidation is deterministic in this version; a
-model-assisted extractor can replace it later without changing the schema.
+- `GET /api/memory` — workspace list + status
+- `GET /api/memory/{workspace_id}?records=30` — status, index, summary, topics,
+  entries, recent stage-1 records
+- `PUT /api/memory/{workspace_id}` — save a manually edited summary
+- `POST /api/memory/{workspace_id}/consolidate` — `{"mode":"model"}` or
+  `{"mode":"deterministic"}`
+- `POST /api/memory/{workspace_id}/notes` — add a durable note
+- `GET /api/memory/{workspace_id}/topics/{topic}` — read a topic
+- `DELETE /api/memory/{workspace_id}/entries/{entry_id}` — forget an entry
+- `POST /api/memory/{workspace_id}/entries/{entry_id}/pin` — pin/unpin
+- `DELETE /api/memory/{workspace_id}` — reset memory
+
+### Memory UI
+
+`#/memory` shows the workspace list, injected index, long-form summary, durable
+entries, topic files, and recent captured turns. It supports:
+
+- model consolidation and deterministic rebuild;
+- editing the long-form summary;
+- adding a durable note;
+- pinning/forgetting entries;
+- viewing topic files;
+- clearing a workspace's memory.
+
+The sidebar agent panel links to the memory page for the active workspace.
+
+### What we intentionally do not do
+
+- No Python memory daemon.
+- No embeddings or vector search; the index plus Markdown topics is enough for
+  this scale.
+- No per-turn model call. Capture is deterministic; the model only runs during
+  distillation/consolidation.
+- No default repo-map injection. A stale map in every prompt is worse than
+  letting the agent search the current code.
 
 ## Token usage and pricing
 
@@ -102,8 +185,5 @@ The durable agent scheduler and mailbox are documented in
 
 ## Not yet implemented
 
-- Model-assisted memory extraction/consolidation
-- Memory UI
-- Agent-tree UI
-- Active cancellation propagation
 - Worktree isolation for write subagents
+- Full agent-tree mailbox/send controls

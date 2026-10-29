@@ -8,4 +8,5 @@ export * from './api/notes';
 export * from './api/maintenance';
 export * from './api/canvas';
 export * from './api/agents';
+export * from './api/memory';
 export * from './api/stream';

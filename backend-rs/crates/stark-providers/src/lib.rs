@@ -430,6 +430,12 @@ pub enum ProviderError {
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
+#[derive(Debug, Clone, Default)]
+pub struct Completion {
+    pub text: String,
+    pub usage: Usage,
+}
+
 #[derive(Clone)]
 pub struct Provider {
     client: reqwest::Client,
@@ -454,6 +460,47 @@ impl Provider {
 
     pub fn config(&self) -> &ProviderConfig {
         &self.config
+    }
+
+    /// Clone this provider with a different model. Used by background memory
+    /// work so extraction/consolidation can run on a cheaper model without
+    /// changing the foreground agent's model.
+    pub fn with_model(&self, model: &str) -> Result<Self, ProviderError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut config = self.config.clone();
+        config.model = self.config.resolve_model(model);
+        Self::new(config)
+    }
+
+    /// Collect a non-tool stream into one text result. Memory extraction and
+    /// consolidation never call tools, so a plain helper keeps those paths
+    /// small and testable.
+    pub async fn complete_text_for_session(
+        &self,
+        messages: &[ChatMessage],
+        temperature: f64,
+        session: ProviderSession<'_>,
+    ) -> Result<Completion, ProviderError> {
+        let mut stream = self
+            .stream_chat_for_session(messages, &[], temperature, session)
+            .await?;
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        while let Some(event) = stream.next().await {
+            match event? {
+                ProviderEvent::Text(chunk) => text.push_str(&chunk),
+                ProviderEvent::Usage(value) => usage = value,
+                ProviderEvent::Done { .. } => break,
+                ProviderEvent::Reasoning(_) | ProviderEvent::ToolCall { .. } => {}
+            }
+        }
+        Ok(Completion {
+            text: text.trim().to_string(),
+            usage,
+        })
     }
 
     pub async fn stream_chat(

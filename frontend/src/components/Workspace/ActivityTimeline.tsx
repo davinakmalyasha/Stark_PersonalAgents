@@ -48,6 +48,7 @@ function toolLabel(event: LiveToolEvent): { verb: string; subject: string } {
     delegate: 'Delegated',
     update_plan: 'Updated plan',
     ask_user: 'Asked',
+    memory: 'Recalled memory',
   }[event.name] || event.name;
   return { verb, subject };
 }
@@ -65,6 +66,7 @@ function toolSummaryPart(event: LiveToolEvent): string {
     delegate: 'created an agent',
     update_plan: 'updated the plan',
     ask_user: 'asked a question',
+    memory: 'recalled memory',
   }[event.name] || 'used tools';
 }
 

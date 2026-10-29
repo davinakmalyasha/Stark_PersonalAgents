@@ -19,7 +19,11 @@ pub use agents::{AgentRecord, AgentStore};
 pub use canvas::CanvasStore;
 pub use groups::GroupStore;
 pub use jobs::{JobRecord, JobStore};
-pub use memory::{MemoryStore, enabled as memory_enabled, max_chars as memory_max_chars};
+pub use memory::{
+    MemoryEntry, MemoryStore, NewEntry, Stage1Record,
+    consolidate_after as memory_consolidate_after, enabled as memory_enabled,
+    max_chars as memory_max_chars,
+};
 pub use schedules::{
     ScheduleRecord, ScheduleStore, parse_time as parse_schedule_time, record_json as schedule_json,
 };

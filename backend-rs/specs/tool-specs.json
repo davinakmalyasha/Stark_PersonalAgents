@@ -1,7 +1,7 @@
 {
   "contract_version": 1,
   "source": "tools/_schemas.py",
-  "tool_count": 44,
+  "tool_count": 45,
   "tools": [
     {
       "name": "read_file",
@@ -1754,6 +1754,67 @@
         "action"
       ],
       "doc": "agent(action, kind?, agent?, task?, title?, workspace_id?, workspace_path?, agent_id?, message?, quiet?, wait_seconds?) — Durable spawn/list/status/send/report for orchestrator → workspace → subagent."
+    },
+    {
+      "name": "memory",
+      "description": "Read or update durable workspace memory. The compact MEMORY.md index is injected at run start; use this tool to read topic details, search entries, or explicitly remember/forget/pin a note.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "index",
+              "summary",
+              "list",
+              "read",
+              "search",
+              "remember",
+              "forget",
+              "pin",
+              "status"
+            ],
+            "default": "index"
+          },
+          "topic": {
+            "type": "string",
+            "description": "Topic name, e.g. decisions, facts, commands, pitfalls, preferences, tasks, notes."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search text for action=search."
+          },
+          "text": {
+            "type": "string",
+            "description": "Memory text for action=remember."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "decision",
+              "fact",
+              "command",
+              "pitfall",
+              "preference",
+              "task",
+              "note"
+            ]
+          },
+          "entry_id": {
+            "type": "string",
+            "description": "Entry id for forget/pin."
+          },
+          "pinned": {
+            "type": "boolean",
+            "default": true,
+            "description": "Pin or unpin an entry."
+          }
+        },
+        "required": []
+      },
+      "exposed": true,
+      "required": [],
+      "doc": "memory(action?, topic?, query?, text?, kind?, entry_id?, pinned?) — Read/search durable workspace memory or add/forget/pin notes."
     }
   ],
   "scope_map": {
@@ -1766,7 +1827,8 @@
       "update_plan",
       "call_subagent",
       "run_code",
-      "agent"
+      "agent",
+      "memory"
     ],
     "general": [
       "run_command",
@@ -1779,7 +1841,8 @@
       "files_changed",
       "look_at_screen",
       "set_screen_share",
-      "agent"
+      "agent",
+      "memory"
     ],
     "house": [
       "house_get_state",
@@ -1791,7 +1854,8 @@
       "browser_act",
       "ask_user",
       "update_plan",
-      "agent"
+      "agent",
+      "memory"
     ],
     "dfd": [
       "dfd_bridge",
@@ -1801,7 +1865,8 @@
       "ask_user",
       "update_plan",
       "files_changed",
-      "agent"
+      "agent",
+      "memory"
     ],
     "orchestrator": [
       "create_coding_project",
@@ -1818,7 +1883,8 @@
       "schedule",
       "give_note",
       "canvas_mode",
-      "agent"
+      "agent",
+      "memory"
     ],
     "devops": [
       "github_apply_gate",
@@ -1826,12 +1892,14 @@
       "read_file",
       "edit_file",
       "search_code",
-      "update_plan"
+      "update_plan",
+      "memory"
     ],
     "explore": [
       "read_file",
       "search_code",
-      "run_command"
+      "run_command",
+      "memory"
     ],
     "ui": [
       "browser_act",
@@ -1841,7 +1909,8 @@
       "edit_file",
       "ask_user",
       "update_plan",
-      "agent"
+      "agent",
+      "memory"
     ]
   },
   "missing_docs": [

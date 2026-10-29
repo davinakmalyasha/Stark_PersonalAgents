@@ -12,6 +12,7 @@ mod head_tail;
 mod house;
 mod images;
 mod mcp;
+mod memory;
 mod patch;
 mod paths;
 mod plan;
@@ -79,6 +80,7 @@ const IMPLEMENTED: &[&str] = &[
     "canvas_mode",
     "run_code",
     "agent",
+    "memory",
 ];
 
 pub const PLAN_WRITE_TOOLS: &[&str] = &[
@@ -106,6 +108,7 @@ static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
+    pub workspace_id: String,
     pub chat_id: String,
     pub questions: Arc<QuestionBroker>,
     pub processes: Arc<ProcessManager>,
@@ -129,6 +132,7 @@ impl ToolContext {
             plan_store: Arc::new(PlanStore::new(&workspace)),
             harness_root: workspace.clone(),
             workspace,
+            workspace_id: "default".to_string(),
             chat_id: chat_id.into(),
             questions,
             processes: Arc::new(ProcessManager::new()),
@@ -157,6 +161,11 @@ impl ToolContext {
 
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = scope.into();
+        self
+    }
+
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = workspace_id.into();
         self
     }
 
@@ -385,6 +394,7 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "read_pdf" => docs::read_pdf(ctx, args).await,
         "create_docx" => docs::create_docx(ctx, args).await,
         "create_xlsx" => docs::create_xlsx(ctx, args).await,
+        "memory" => memory::handle(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -468,7 +478,7 @@ mod tests {
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"run_command"));
         assert!(names.contains(&"update_plan"));
         assert!(names.contains(&"read_pdf"));
@@ -480,7 +490,7 @@ mod tests {
 
         let dfd = tool_specs_for_scope("build", "dfd");
         let names = tool_names(&dfd);
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 9);
         assert!(names.contains(&"create_coding_project"));
         assert!(names.contains(&"dfd_bridge"));
         assert!(names.contains(&"create_client"));
@@ -488,13 +498,13 @@ mod tests {
 
         let house = tool_specs_for_scope("build", "house");
         let names = tool_names(&house);
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         assert!(names.contains(&"house_set_device"));
         assert!(names.contains(&"house_run_scene"));
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         let names = tool_names(&orchestrator);
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
         assert!(names.contains(&"canvas_mode"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"create_group"));
@@ -511,7 +521,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            36
+            37
         );
     }
 

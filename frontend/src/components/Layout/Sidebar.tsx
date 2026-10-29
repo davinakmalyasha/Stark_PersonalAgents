@@ -458,6 +458,7 @@ export default function Sidebar({
             collapsed={collapsed}
             onOpen={openAgent}
             refreshSignal={refreshSignal}
+            workspaceId={activeWorkspaceId}
           />
 
         </div>

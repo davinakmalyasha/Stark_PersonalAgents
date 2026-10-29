@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Code2, House as HouseIcon, ShieldCheck, User } from 'lucide-react';
+import { Brain, Code2, House as HouseIcon, ShieldCheck, User } from 'lucide-react';
 import App from './App';
 import House from './house/House';
 import HomeOrb from './house/HomeOrb';
@@ -7,10 +7,11 @@ import HousePortal from './house/HousePortal';
 import HouseWorkspace from './house-workspace/HouseWorkspace';
 import PersonalWorkspace from './personal-workspace/PersonalWorkspace';
 import AgentsAdminWorkspace from './agentsadmin/AgentsAdminWorkspace';
+import MemoryWorkspace from './memory/MemoryWorkspace';
 import PairingGate from './components/Layout/PairingGate';
 import { onAuthRejected } from './services/remoteAuth';
 
-type Route = 'home' | 'coding' | 'house' | 'personal' | 'admin'
+type Route = 'home' | 'coding' | 'house' | 'personal' | 'admin' | 'memory'
 
 function getRoute(): Route {
   const hash = window.location.hash
@@ -18,6 +19,7 @@ function getRoute(): Route {
   if (hash.startsWith('#/house')) return 'house'
   if (hash.startsWith('#/personal')) return 'personal'
   if (hash.startsWith('#/admin')) return 'admin'
+  if (hash.startsWith('#/memory')) return 'memory'
   // OpenDesign is a workspace addon now; #/design is a compatibility alias.
   if (hash.startsWith('#/design')) return 'coding'
   return 'home'
@@ -119,6 +121,20 @@ export default function AppShell() {
           <HousePortal
             label="Entering Agents Admin"
             icon={<ShieldCheck size={22} />}
+            leaving={portalLeaving}
+          />
+        )}
+      </>
+    )
+  }
+  if (route === 'memory') {
+    return (
+      <>
+        <MemoryWorkspace />
+        {portalVisible && (
+          <HousePortal
+            label="Entering Workspace Memory"
+            icon={<Brain size={22} />}
             leaving={portalLeaving}
           />
         )}

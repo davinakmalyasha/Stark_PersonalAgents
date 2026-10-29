@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, ChevronDown, ChevronRight, X } from 'lucide-react';
+import { Bot, Brain, ChevronDown, ChevronRight, X } from 'lucide-react';
 import type { AgentNode } from '../../types';
 import { cancelAgent, fetchAgents } from '../../services/api';
 
@@ -7,6 +7,7 @@ interface Props {
   collapsed: boolean;
   onOpen: (agent: AgentNode) => void;
   refreshSignal?: number;
+  workspaceId?: string | null;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -19,7 +20,7 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: 'bg-zinc-600',
 };
 
-export default function AgentTreePanel({ collapsed, onOpen, refreshSignal = 0 }: Props) {
+export default function AgentTreePanel({ collapsed, onOpen, refreshSignal = 0, workspaceId }: Props) {
   const [agents, setAgents] = useState<AgentNode[]>([]);
   const [open, setOpen] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -102,7 +103,20 @@ export default function AgentTreePanel({ collapsed, onOpen, refreshSignal = 0 }:
         <span className="ml-auto text-[9px] text-zinc-600">{agents.length}</span>
         <ChevronDown size={12} className={`transition-transform ${open ? '' : '-rotate-90'}`} />
       </button>
-      {open && <div className="mt-1 flex flex-col gap-0.5">{render(null, 0)}</div>}
+      {open && (
+        <>
+          <button
+            type="button"
+            onClick={() => { window.location.hash = workspaceId ? `#/memory?ws=${encodeURIComponent(workspaceId)}` : '#/memory'; }}
+            className="mt-1 flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-[10px] text-zinc-500 hover:bg-white/[0.04] hover:text-zinc-300"
+            title="Inspect workspace memory"
+          >
+            <Brain size={11} />
+            <span>Workspace memory</span>
+          </button>
+          <div className="mt-0.5 flex flex-col gap-0.5">{render(null, 0)}</div>
+        </>
+      )}
     </div>
   );
 }

@@ -24,6 +24,7 @@ mod compaction;
 mod delegation;
 mod groups;
 mod instructions;
+pub mod memory_agent;
 mod notes;
 mod projects;
 mod schedules;
@@ -306,15 +307,23 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&instructions);
     }
-    if ctx.depth <= 1
-        && stark_store::memory_enabled()
+    if stark_store::memory_enabled()
         && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
-        && let Some(summary) = memory
-            .summary(&ctx.workspace_id, stark_store::memory_max_chars())
+        && let Some(index) = memory
+            .index(&ctx.workspace_id, stark_store::memory_max_chars())
             .await
     {
-        system_prompt.push_str("\n\n[WORKSPACE MEMORY]\n");
-        system_prompt.push_str(&summary);
+        system_prompt.push_str(
+            "
+
+[WORKSPACE MEMORY]
+",
+        );
+        system_prompt.push_str(&index);
+        system_prompt.push_str(
+            "
+Memory is a hint, not the source of truth. Verify current code.              Use the memory tool (action=\"read\") for topic details.",
+        );
     }
     if mode == "plan" {
         system_prompt.push_str(
@@ -379,6 +388,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     )
     .with_plan_store(Arc::new(plan_store))
     .with_harness_root(ctx.store.harness_root().to_path_buf())
+    .with_workspace_id(ctx.workspace_id.clone())
     .with_scope(ctx.scope.clone())
     .with_mode(mode.clone());
     if let Some(checkpoint) = &ctx.checkpoint {
@@ -615,7 +625,27 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 let _ = memory
                     .record(&ctx.workspace_id, &ctx.chat_id, None, &prompt, &text)
                     .await;
-                let _ = memory.consolidate(&ctx.workspace_id, 30).await;
+                // Distillation/consolidation is background work. The
+                // deterministic stage-1 record above is the durable capture;
+                // the model pass only decides what deserves long-term memory.
+                if !cfg!(test) {
+                    let provider = crate::memory_agent::provider_for_memory(&ctx.provider);
+                    let cancel = ctx.cancel.clone();
+                    let memory = memory.clone();
+                    let workspace_id = ctx.workspace_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::memory_agent::maybe_consolidate(
+                            &provider,
+                            &cancel,
+                            &memory,
+                            &workspace_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!("background memory consolidation failed: {error}");
+                        }
+                    });
+                }
             }
             return Ok(());
         }

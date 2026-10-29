@@ -23,8 +23,8 @@ use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, agent_for_scope, resolve_agent, run_agent};
 use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
 use stark_store::{
-    AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, ScheduleRecord,
-    ScheduleStore, WorkspaceRegistry, parse_schedule_time, schedule_json,
+    AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, NewEntry,
+    ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time, schedule_json,
 };
 use stark_tools::{
     Checkpoint, HouseStore, PlanStore, QuestionBroker, evaluate_acceptance, public_device,
@@ -446,13 +446,32 @@ async fn main() -> anyhow::Result<()> {
             "/api/notes/{note_id}",
             patch(update_note_handler).delete(delete_note_handler),
         )
+        .route("/api/memory", get(memory_list_handler))
         .route(
             "/api/memory/{workspace_id}",
-            get(memory_status_handler).delete(memory_clear_handler),
+            get(memory_status_handler)
+                .put(memory_save_handler)
+                .delete(memory_clear_handler),
         )
         .route(
             "/api/memory/{workspace_id}/consolidate",
             post(memory_consolidate_handler),
+        )
+        .route(
+            "/api/memory/{workspace_id}/notes",
+            post(memory_note_handler),
+        )
+        .route(
+            "/api/memory/{workspace_id}/topics/{topic}",
+            get(memory_topic_handler),
+        )
+        .route(
+            "/api/memory/{workspace_id}/entries/{entry_id}",
+            delete(memory_forget_handler),
+        )
+        .route(
+            "/api/memory/{workspace_id}/entries/{entry_id}/pin",
+            post(memory_pin_handler),
         )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -1568,9 +1587,84 @@ async fn agent_cancel_handler(
     Json(json!({"ok": true, "cancelled": cancelled}))
 }
 
+#[derive(Debug, Deserialize)]
+struct MemoryQuery {
+    records: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MemoryConsolidateRequest {
+    #[serde(default)]
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemorySummaryRequest {
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryNoteRequest {
+    text: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(default = "default_pin")]
+    pinned: bool,
+}
+
+fn default_pin() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MemoryPinRequest {
+    #[serde(default = "default_pin")]
+    pinned: bool,
+}
+
+async fn memory_list_handler(State(state): State<ServerState>) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    let mut workspaces = Vec::new();
+    for (id, name, _, kind) in VIRTUAL_WORKSPACES {
+        let status = store
+            .status(id)
+            .await
+            .unwrap_or_else(|error| json!({"error": error.to_string()}));
+        workspaces.push(json!({
+            "id": id,
+            "name": name,
+            "kind": kind,
+            "status": status,
+        }));
+    }
+    for record in state.registry.list() {
+        let status = store
+            .status(&record.id)
+            .await
+            .unwrap_or_else(|error| json!({"error": error.to_string()}));
+        workspaces.push(json!({
+            "id": record.id,
+            "name": record.name,
+            "kind": "project",
+            "path": record.path,
+            "status": status,
+        }));
+    }
+    Json(json!({
+        "enabled": stark_store::memory_enabled(),
+        "maxChars": stark_store::memory_max_chars(),
+        "workspaces": workspaces,
+    }))
+}
+
 async fn memory_status_handler(
     State(state): State<ServerState>,
     Path(workspace_id): Path<String>,
+    Query(query): Query<MemoryQuery>,
 ) -> Json<Value> {
     let Ok(store) = MemoryStore::open(&state.harness_root).await else {
         return Json(json!({"error": "memory store unavailable"}));
@@ -1582,19 +1676,175 @@ async fn memory_status_handler(
     let summary = store
         .summary(&workspace_id, stark_store::memory_max_chars())
         .await;
-    Json(json!({"status": status, "summary": summary}))
+    let index = store
+        .index(&workspace_id, stark_store::memory_max_chars())
+        .await;
+    let topics = store.topics(&workspace_id).await.unwrap_or_default();
+    let entries = store
+        .entries(&workspace_id, None)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(stark_store::MemoryEntry::to_json)
+        .collect::<Vec<_>>();
+    let records = store
+        .records(&workspace_id, query.records.unwrap_or(20).clamp(1, 200))
+        .await
+        .unwrap_or_default();
+    Json(json!({
+        "status": status,
+        "index": index,
+        "summary": summary,
+        "topics": topics,
+        "entries": entries,
+        "records": records,
+    }))
+}
+
+async fn memory_save_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<MemorySummaryRequest>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    match store.save_summary(&workspace_id, &request.summary).await {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
 }
 
 async fn memory_consolidate_handler(
     State(state): State<ServerState>,
     Path(workspace_id): Path<String>,
+    request: Option<Json<MemoryConsolidateRequest>>,
 ) -> Json<Value> {
     let Ok(store) = MemoryStore::open(&state.harness_root).await else {
         return Json(json!({"error": "memory store unavailable"}));
     };
-    match store.consolidate(&workspace_id, 30).await {
-        Ok(summary) => Json(json!({"ok": true, "summary": summary})),
+    let mode = request
+        .and_then(|Json(request)| {
+            let mode = request.mode.trim().to_ascii_lowercase();
+            (!mode.is_empty()).then_some(mode)
+        })
+        .unwrap_or_else(|| "model".to_string());
+    let mode = if matches!(mode.as_str(), "deterministic" | "rebuild" | "local") {
+        stark_core::memory_agent::ConsolidateMode::Deterministic
+    } else {
+        stark_core::memory_agent::ConsolidateMode::Model
+    };
+    let cancel = CancellationToken::new();
+    match stark_core::memory_agent::consolidate_workspace(
+        &state.provider,
+        &cancel,
+        &store,
+        &workspace_id,
+        mode,
+    )
+    .await
+    {
+        Ok(outcome) => Json(json!({
+            "ok": true,
+            "summary": outcome.summary,
+            "entries": outcome.entries,
+            "source": outcome.source,
+            "model": outcome.model,
+            "fallback": outcome.fallback,
+        })),
+        Err(error) => Json(json!({"error": error})),
+    }
+}
+
+async fn memory_note_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<MemoryNoteRequest>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    let text = request.text.trim();
+    if text.is_empty() {
+        return Json(json!({"error": "text is required"}));
+    }
+    match store
+        .add_entry(
+            &workspace_id,
+            NewEntry {
+                chat_id: String::new(),
+                agent_id: None,
+                kind: if request.kind.trim().is_empty() {
+                    "note".to_string()
+                } else {
+                    request.kind
+                },
+                topic: if request.topic.trim().is_empty() {
+                    "notes".to_string()
+                } else {
+                    request.topic
+                },
+                text: text.to_string(),
+                source: "manual".to_string(),
+                model: String::new(),
+                pinned: request.pinned,
+            },
+        )
+        .await
+    {
+        Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(error) => Json(json!({"error": error.to_string()})),
+    }
+}
+
+async fn memory_forget_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, entry_id)): Path<(String, String)>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    match store.forget_entry(&workspace_id, &entry_id).await {
+        Ok(true) => Json(json!({"ok": true})),
+        Ok(false) => Json(json!({"error": "memory entry not found"})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
+}
+
+async fn memory_pin_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, entry_id)): Path<(String, String)>,
+    request: Option<Json<MemoryPinRequest>>,
+) -> Json<Value> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "memory store unavailable"}));
+    };
+    let pinned = request.map(|Json(request)| request.pinned).unwrap_or(true);
+    match store.pin_entry(&workspace_id, &entry_id, pinned).await {
+        Ok(true) => Json(json!({"ok": true})),
+        Ok(false) => Json(json!({"error": "memory entry not found"})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
+}
+
+async fn memory_topic_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, topic)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Ok(store) = MemoryStore::open(&state.harness_root).await else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "memory store unavailable"})),
+        ));
+    };
+    let _ = store.mark_topic_used(&workspace_id, &topic).await;
+    match store.read_topic(&workspace_id, &topic).await {
+        Ok(Some(text)) => Ok(Json(json!({"topic": topic, "content": text}))),
+        Ok(None) => Err(not_found("memory topic not found")),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string()})),
+        )),
     }
 }
 

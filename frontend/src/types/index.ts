@@ -306,18 +306,6 @@ export interface SubagentSession {
   entries: SubagentSessionEntry[];
 }
 
-export interface UserProfile {
-  user_info: {
-    name: string;
-  };
-  global_rules: string[];
-}
-
-export interface WorkspaceRules {
-  stack: Record<string, string[]>;
-  workspace_rules: string[];
-}
-
 // ── Session tabs (main workspace top bar) ───────────────────────────────────
 
 export type SessionTabType = 'chat' | 'coding';

@@ -1,13 +1,12 @@
-# Stark Rust Rewrite — Design Docs
+# Stark — Rust Backend Design Docs
 
-Status: **core implemented in `backend-rs`; parity work continues**
-Scope: replace the Python backend with a Rust backend that preserves the
-existing product contract — features, tool descriptions/schemas, HTTP/SSE API,
-persistence, and the multi-agent concept — while following the architecture
-and technology choices of **OpenAI Codex CLI (`codex-rs`)**.
+Status: **the Rust backend in `backend-rs` is the only backend.**
+The Python tree was removed at `571781c` (`pre-python-removal` is the
+rollback tag). These docs describe the current Rust system, not a migration.
 
-This directory is the source of truth for the rewrite. If a future decision
-conflicts with these docs, update the doc first, then the code.
+Reference architecture: **OpenAI Codex CLI (`codex-rs`)** — checkpoint
+compaction, provider session affinity, durable agent tree, staged memory
+with a compact injected index plus on-demand detail.
 
 ---
 
@@ -19,13 +18,15 @@ conflicts with these docs, update the doc first, then the code.
 | Agent loop | **Hand-rolled** on `tokio` + `reqwest` + `eventsource-stream` |
 | Frameworks | **None.** No `rig`, `swiftide`, `langchain-rust`, `kalosm`, `async-openai`, LangGraph port |
 | Language/toolchain | Rust **stable 1.99.x** (or newer), **edition 2024**, MSVC on Windows |
-| Placement | `backend-rs/` in the same repo; Python stays runnable side-by-side |
-| Branch | `rust-rewrite`, created after a safety snapshot of the current work |
+| Placement | `backend-rs/` in the same repo |
+| Branch | `master`; `rust-rewrite` and other work branches are history |
 | Platform | **Windows first**, Linux/macOS later |
-| Persistence | Rust reads/writes the **existing** SQLite + JSONL formats |
-| Voice/Telegram | Stay as **Python sidecars** until the Rust core reaches parity |
-| Tool contract | Descriptions and JSON Schemas are **frozen**; export from Python, diff in CI |
-| Definition of done | Existing frontend + Telegram + voice work against Rust with no UI changes |
+| Persistence | SQLite (`.deep_agents/chats.db`) + JSONL sessions, readable across restarts |
+| Voice | Native Rust (Moonshine STT + Pocket TTS), no Python sidecar |
+| Tool contract | Descriptions and JSON Schemas are **frozen** in `backend-rs/specs/tool-specs.json` |
+| Dropped tools | `ast_search`, `github_apply_gate` were never implemented and are not exposed |
+| Admin surface | Removed — no `#/admin`, no `/api/agentsadmin` |
+| Definition of done | Existing frontend works against Rust with no UI changes |
 
 ---
 
@@ -33,45 +34,45 @@ conflicts with these docs, update the doc first, then the code.
 
 | # | Document | What it answers |
 |---|---|---|
-| 00 | [Current System](./00-current-system.md) | What exists today: tiers, features, 42 registered tools, API, persistence, invariants |
 | 01 | [Codex Reference](./01-codex-reference.md) | How Codex is built; what to copy; what not to copy; license |
-| 02 | [Architecture](./02-architecture.md) | Target workspace, crates, dependency direction, concurrency, data flow |
+| 02 | [Architecture](./02-architecture.md) | Workspace, crates, dependency direction, concurrency, data flow |
 | 03 | [Tech Stack](./03-tech-stack.md) | Exact crates/versions, build profiles, lints, toolchain |
-| 04 | [Tool System](./04-tool-system.md) | Tool registry, schemas, dispatcher, policy, approvals, per-tool port notes |
+| 04 | [Tool System](./04-tool-system.md) | Tool registry, schemas, dispatcher, policy, approvals |
 | 05 | [Agent Runtime](./05-agent-runtime.md) | Provider client, agent loop, streaming, cancellation, compaction, sessions |
 | 06 | [Orchestration](./06-orchestration.md) | Routing, durable graph, delegation, specialists, subagents |
 | 07 | [Group Projects](./07-group-projects.md) | Event-sourced store, supervisor tick, leases, approvals, recovery |
-| 08 | [Server Contract](./08-server-contract.md) | Axum routes, SSE/WS, AppState/Delta, auth, lifecycle |
+| 08 | [Server Contract](./08-server-contract.md) | Axum routes, SSE/WS, AppState/Delta, auth, lifecycle, static SPA |
 | 09 | [Persistence](./09-persistence.md) | SQLite schemas, JSONL, snapshots, migrations, compatibility |
-| 10 | [Parity Testing](./10-parity-testing.md) | Golden fixtures, Python-vs-Rust harness, CI gates |
-| 11 | [Migration Plan](./11-migration-plan.md) | Phases, acceptance criteria, estimates, risks, cutover |
-| 12 | [Setup & Branching](./12-setup-and-branching.md) | Rust install, repo snapshot, branch, Codex clone, bootstrap |
+| 12 | [Setup](./12-setup.md) | Rust-only toolchain, backend, frontend, desktop builds |
+| 12 | [Voice](./12-voice.md) | Native Rust voice: STT/TTS models, asset prep, packaging |
 | 13 | [Canvas & MCP](./13-canvas-mcp.md) | Canvas watches, wake loop, MCP stdio/HTTP, approvals |
 | 14 | [Code Mode & Compaction](./14-code-mode-compaction.md) | QuickJS tool programs, checkpoint compaction, run budgets |
 | 15 | [Provider Affinity](./15-provider-affinity.md) | opencode-go session/affinity headers and cache routing |
 | 16 | [Durable Agents](./16-durable-agents.md) | Orchestrator → workspace → subagent tree, mailboxes, supervisor |
 | 17 | [Instructions, Memory & Costs](./17-memory-instructions-costs.md) | AGENTS.md, workspace memory, usage/pricing, DFD approval |
 
+Deleted as Python-era history: `00`, `10`, `11`, `12-setup-and-branching`,
+`Structure.md`, `group-projects/`, `memory/fixed-concept.md`,
+`tools/ast_search.md`, `tools/github_apply_gate.md`, `tools/update_feature.md`,
+`tools/update_project_meta.md`, `tools/create_project.md`,
+`tools/propose_plan.md`, `tools/_SCOPE_MAP.md`.
+
 ---
 
 ## Hard rules
 
-1. **Port the contract, not the code.** The Python implementation is the
-   reference behavior; the Rust implementation is a new codebase.
-2. **Tool descriptions and parameter schemas are prompt API.** They are copied
-   verbatim from `tools/_schemas.py`; no paraphrasing, no reordering of
-   properties without a parity diff.
-3. **No agent framework.** The loop, tool dispatch, retries, approvals, and
-   context management are ours. This is what Codex, Goose, Forge, and Aichat
-   do.
-4. **Policy lives outside tools.** A tool never decides whether it is allowed;
-   the dispatcher classifies the action against the envelope.
-5. **Events are the only truth for group projects.** Tables are projections.
-6. **One writer per group project.** A single supervisor task owns transitions.
-7. **No silent behavior changes.** Any intentional deviation is recorded in
-   `11-migration-plan.md` under "Accepted deviations".
-8. **Never commit secrets.** `.env` stays ignored; no keys in docs or tests.
-9. **Reference only.** Codex is cloned outside the repo; it is not vendored,
+1. **The frozen contract is the prompt API.** Tool descriptions and parameter
+   schemas live in `backend-rs/specs/tool-specs.json`, enforced by
+   `stark-contract` tests. No edits without updating the tests.
+2. **No agent framework.** The loop, tool dispatch, retries, approvals, and
+   context management are ours.
+3. **Policy lives outside tools.** A tool never decides whether it is allowed;
+   the dispatcher classifies the action against the envelope and file access.
+4. **Events are the only truth for group projects.** Tables are projections.
+5. **One writer per group project.** A single supervisor task owns transitions.
+6. **Read-only means read-only at dispatch**, not just hidden specs.
+7. **Never commit secrets.** `.env` stays ignored; no keys in docs or tests.
+8. **Reference only.** Codex is cloned outside the repo; it is not vendored,
    forked, or added as a Cargo dependency.
 
 ---
@@ -85,6 +86,7 @@ conflicts with these docs, update the doc first, then the code.
 | **Chat** | A persistent conversation; owns a session JSONL and UI stream |
 | **Workspace** | A folder/domain an agent is scoped to (`_general`, `_house`, project path) |
 | **Scope** | The tool allowlist for an agent role (`developer`, `general`, …) |
+| **File access** | `read` / `write` / `worktree` — enforced at dispatch |
 | **Envelope** | A group project's declared autonomy tiers |
 | **Projection** | A SQLite table derived from the event log |
 | **Delta** | A streaming chunk (`text`, `reasoning`, `usage`, `tool_started`, …) |

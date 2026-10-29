@@ -1,8 +1,6 @@
 # 09 — Persistence
 
-The Rust backend must open, read, and write the **existing** data files. This
-is a hard compatibility requirement: old chats and group projects must work
-without migration.
+The Rust backend owns these files. Old chats, group projects, and sessions open without migration.
 
 ---
 
@@ -80,18 +78,16 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
   content, title, content='messages', content_rowid='rowid', tokenize='porter'
 );
 ```
-Keep the insert/delete/update triggers exactly as in `server/store/chat_store.py`.
+Keep the insert/delete/update FTS triggers exactly as defined here.
 
 ### 2.2 Rules
 - `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`
-- `check_same_thread=False` equivalent: `SqlitePool` with max connections > 1;
-  writes serialized by SQLite.
+- `SqlitePool` with max connections > 1; writes serialized by SQLite.
 - Per-chat lock in memory for read-modify-write sequences.
 - `message_count` maintained on insert/delete.
 - `mode` is `build` or `plan`; preserve.
 - `pinned` integer (0/1).
-- Lazy migration from legacy `.deep_agents/chats/{ws}/{chat}.json` if the DB
-  is empty (parity behavior).
+- Schemas are created with `CREATE TABLE IF NOT EXISTS`; upgrades only ever add columns.
 
 ### 2.3 Repository API
 
@@ -146,7 +142,7 @@ Content blocks:
 - `compaction.retained_tail` is a self-contained checkpoint; rebuilding starts
   there.
 - A child session has `parent_session` and `delegation_depth`.
-- Keep field names/casing exactly as `server/session/log.py` emits them.
+- Keep field names/casing exactly as the JSONL schema above.
 
 Rust:
 ```rust
@@ -165,9 +161,7 @@ pub enum SessionEntry {
 }
 ```
 
-**Important:** Python uses `parentId`? Inspect the actual JSON before
-implementing; the model uses `parent_id` with aliases in Pydantic. Match the
-on-disk output, not the field names in Rust.
+Field names/casing on disk are frozen (e.g. `parentId` in JSONL headers). Match the on-disk output exactly.
 
 ---
 
@@ -181,7 +175,7 @@ Additional rules:
 - One transaction per event + projection + checkpoint.
 - `projection_checkpoint` is per project.
 - `rebuild()` replays from `seq=0`.
-- `PRAGMA foreign_keys` is not required (Python does not rely on it).
+- `PRAGMA foreign_keys` is not required.
 - `ops.state`: `pending|applied|rejected`; one event per applied op.
 
 ---
@@ -216,7 +210,7 @@ CREATE INDEX ix_jobs_project ON jobs(project_id, status);
 ```
 
 `entry_json` carries the full delegation entry; columns are the queryable
-projection. Keep both in sync (Python merges JSON + columns).
+projection. Keep both in sync (columns are the queryable projection of the JSON).
 
 ---
 
@@ -305,8 +299,7 @@ CREATE TABLE orchestrator_schedules (
 CREATE INDEX idx_orch_schedules_due ON orchestrator_schedules(status, next_run_at);
 ```
 
-Recurrence parsing (`none`, `daily-HH:MM`, `every-Nm`, …) must match
-`server/store/schedules.py`.
+Recurrence parsing supports `none`, `daily-HH:MM`, and `every-Nm`.
 
 ---
 
@@ -335,7 +328,7 @@ on it. Use atomic writes (temp + rename).
 ```
 
 - Snapshot before every file mutation; best-effort, never blocks the write.
-- `snap_id` format and metadata must match `tools/checkpoints.py`.
+- `snap_id` format is `run-<millis>-<hex8>` with a per-run manifest.
 - Restore writes bytes back and updates the index.
 - LRU cap 100 runs per chat (configurable).
 
@@ -343,14 +336,8 @@ on it. Use atomic writes (temp + rename).
 
 ## 11. Migrations
 
-- Use `sqlx::migrate!` for Rust-owned DBs.
-- For existing DBs, migrations must be additive and idempotent:
-  - `ALTER TABLE ... ADD COLUMN` guarded by `PRAGMA table_info`.
-  - `CREATE TABLE IF NOT EXISTS`.
-  - Never drop/rename a column in the parity phase.
-- Keep a `schema_version` table or use sqlx's `_sqlx_migrations`.
-- A Python-created DB must open without migration errors.
-- A Rust-created DB must open in Python (for rollback).
+- Migrations are additive and idempotent (`ALTER TABLE ... ADD COLUMN`,
+  `CREATE TABLE IF NOT EXISTS` via guarded init). Never drop/rename a column.
 
 ---
 
@@ -369,9 +356,9 @@ on it. Use atomic writes (temp + rename).
 
 ## 13. Compatibility tests
 
-- Open a copy of a real `chats.db`; list/read/search; append; reopen in Python.
-- Open a real `.gp/state.db`; replay; compare board; append; replay in Python.
-- Load a real session JSONL; rebuild context; append; reload in Python.
+- Open a copy of a real `chats.db`; list/read/search; append; reopen and compare.
+- Open a real `.gp/state.db`; replay and compare the board.
+- Load a real session JSONL; rebuild context; append; reload and compare.
 - Restore a snapshot and compare SHA-256.
 - Jobs/notes/wakes/schedules round-trip.
 - House JSON both legacy shapes.

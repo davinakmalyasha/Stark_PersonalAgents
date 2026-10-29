@@ -1,7 +1,7 @@
 # 02 — Architecture
 
 Target layout, crate boundaries, runtime topology, and the rules that keep the
-rewrite maintainable.
+codebase maintainable. This describes the current Rust system.
 
 ---
 
@@ -9,44 +9,33 @@ rewrite maintainable.
 
 ```
 D:\MyProject\LangChain\
-├── server/                  # Python backend (unchanged, reference)
-├── agents/ llm/ tools/ ...  # Python (unchanged)
-├── frontend/                # React/Electron (unchanged)
-├── backend-rs/              # NEW Rust workspace
+├── backend-rs/              # Rust workspace (the only backend)
 │   ├── Cargo.toml           # workspace
-│   ├── rust-toolchain.toml
 │   ├── crates/
-│   ├── specs/
-│   ├── tests/parity/
-│   └── xtask/               # optional dev tasks
+│   ├── specs/               # frozen tool contract
+│   └── scripts/             # release tooling (Node)
+├── frontend/                # React/Tauri (unchanged product surface)
 └── docs/rust-rewrite/       # these docs
 ```
 
-- The Rust backend lives on the `rust-rewrite` branch.
-- Python remains runnable on `:8123`; Rust runs on `:8124` during migration.
-- The Electron shell can be pointed at either port via an env var.
-- Cutover flips the port and removes the Python startup path; the Python tree
-  can then be deleted or archived.
+- The Tauri shell launches the `stark-server` sidecar binary.
+- The same binary serves the SPA + API for remote/mobile mode.
+- Port defaults: `8123` desktop, `8124` dev. `STARK_BIND` is an alias of `STARK_HOST`.
 
 ---
 
 ## 2. Workspace crates
 
-Start with 8 crates; split only when there is a reason.
-
 ```
 backend-rs/crates/
 ├── stark-contract/     # shared types: AppState, Delta, SSE, ToolSpec, errors
-├── stark-providers/    # OpenAI-compatible client, SSE, model registry, fallback
-├── stark-core/         # RunCtx, AgentLoop, event bus, cancellation, compaction
-├── stark-tools/        # Tool trait, registry, dispatcher, built-in tools
-├── stark-policy/       # command policy, fs permissions, envelope, approvals, sandbox
-├── stark-store/        # sqlx SQLite, JSONL sessions, snapshots, migrations
-├── stark-agents/       # AgentRegistry, routing, orchestrator graph, delegation
-├── stark-groups/       # event-sourced group projects + supervisor
-├── stark-memory/       # repo map, summaries, embeddings (feature-gated)
-├── stark-server/       # axum routes, SSE/WS, static files, pairing
-└── stark-cli/          # optional headless CLI / TUI
+├── stark-providers/    # provider client, SSE, model registry, affinity
+├── stark-core/         # RunCtx, agent loop, worktrees, memory consolidation, delegation
+├── stark-tools/        # Tool trait, registry, dispatcher, built-in tools, code mode
+├── stark-policy/       # read-only command policy, approvals
+├── stark-store/        # sqlx SQLite, JSONL sessions, memory, groups, schedules
+├── stark-server/       # axum routes, SSE, static files, pairing, loops
+└── stark-voice/        # native STT/TTS (Moonshine + Pocket TTS)
 ```
 
 ### Dependency direction
@@ -55,24 +44,20 @@ backend-rs/crates/
 stark-contract  ◄────────────── everything
 stark-providers ◄────── stark-core
 stark-policy    ◄────── stark-tools
-stark-store     ◄────── stark-core, stark-groups
-stark-tools     ◄────── stark-core, stark-agents
-stark-core      ◄────── stark-agents, stark-groups, stark-memory
-stark-agents    ◄────── stark-server
-stark-groups    ◄────── stark-server
-stark-memory    ◄────── stark-agents, stark-server
-stark-server    ◄────── stark-cli
+stark-store     ◄────── stark-core, stark-server
+stark-tools     ◄────── stark-core
+stark-core      ◄────── stark-server
+stark-voice     ◄────── stark-server (feature: voice-stt)
 ```
 
 Rules:
 - No cycles.
-- `stark-contract` has no runtime dependencies beyond `serde`, `schemars`,
+- `stark-contract` has no runtime dependencies beyond `serde`,
   `ts-rs`, `uuid`, `chrono`, `thiserror`.
-- `stark-core` never imports `stark-server` or `stark-cli`.
-- `stark-tools` never imports `stark-agents` or `stark-groups` (tools receive
-  data, not orchestration).
-- `stark-policy` is pure where possible: `classify()` takes data and returns a
-  decision; only `sandbox` touches the OS.
+- `stark-core` never imports `stark-server`.
+- `stark-tools` is dispatch + tools; orchestration lives in `stark-core`.
+- `stark-policy` is pure where possible: `check_read_only()` takes a command
+  and returns a decision; nothing else touches the OS for policy.
 - `stark-store` owns all SQL; no other crate writes SQL directly.
 
 ---
@@ -90,24 +75,16 @@ stark-server (axum)
  │                                 └─ Provider (stark-providers)
  ├─ GET /api/stream/{chat} ─────► SSE (broadcast + replay)
  ├─ POST /api/steer|followup|abort
- ├─ /api/workspaces|chats|groups|notes|house|...
- ├─ WS /api/voice/ws ───────────► proxy to Python voice sidecar (:8125)
- ├─ GroupSupervisor task ───────► 15s tick (stark-groups)
- ├─ ScheduleScheduler task ─────► 1s tick  (stark-store + core)
- └─ WakeDispatcher task ────────► due wakes (stark-store + core)
+ ├─ /api/workspaces|chats|groups|notes|house|memory|agents|...
+ ├─ GET /{*path} ───────────────► static frontend/dist (SPA fallback)
+ ├─ AgentSupervisor task ───────► 1s mailbox tick (durable agents)
+ ├─ GroupSupervisor task ───────► 15s tick
+ ├─ ScheduleScheduler task ─────► due schedules
+ └─ WakeDispatcher task ────────► due canvas wakes
 ```
 
-### Process boundary during migration
-
-```
-Electron/React ──► Rust :8124 ──► Python voice :8125
-                       │
-                       └──► Python Telegram bot (sidecar) ──► Rust API
-```
-
-- Voice stays Python (Moonshine/Pocket TTS).
-- Telegram stays Python; it only needs the HTTP API to remain stable.
-- Once parity is proven, the sidecars can be ported (`sherpa-rs`, `teloxide`).
+No sidecars. Voice runs in-process. The only external processes are MCP
+stdio servers and user-configured commands.
 
 ---
 
@@ -115,20 +92,20 @@ Electron/React ──► Rust :8124 ──► Python voice :8125
 
 | Concern | Mechanism |
 |---|---|
-| Active run per chat | `DashMap<ChatId, RunHandle>` + `RunGuard` drop cleanup |
+| Active run per chat | `DashMap<ChatId, RunHandle>` |
 | Cancellation | `tokio_util::sync::CancellationToken` per run |
-| Steering | `mpsc::Receiver<SteerMessage>` checked between steps |
+| Steering | Lock-free queues checked between steps |
 | SSE fan-out | `tokio::sync::broadcast::Sender<ServerEvent>` per chat |
-| State snapshots | `RwLock<AppState>` per chat + version counter |
-| Approvals | `DashMap<ApprovalId, oneshot::Sender<Decision>>` |
+| State snapshots | `Mutex<Option<AppState>>` per run + version counter |
+| Approvals | In-app question broker (`ask_user`) |
 | Group supervisor | one dedicated task; `tokio::time::interval(15s)` |
-| Schedules/wakes | one task each; `interval(1s)`; DB-backed due queries |
-| SQLite | `sqlx::SqlitePool` (WAL, busy_timeout); single writer for group events |
-| CPU work | `spawn_blocking` (tree-sitter, embeddings, hashing, file IO) |
-| Subprocesses | `tokio::process` + per-run process registry (`_procman` semantics) |
+| Agent loop | one task; `interval(1s)`; DB-backed due queries |
+| SQLite | `sqlx::SqlitePool` (WAL, busy_timeout) |
+| CPU work | `spawn_blocking` (file IO, snapshots) |
+| Subprocesses | per-run process registry with named sessions |
 
-Never hold a `std::sync::Mutex` across `.await`. Use `tokio::sync` for async
-locks. Clippy denies `await_holding_lock`.
+Never hold a `std::sync::Mutex` across `.await`. Clippy denies
+`await_holding_lock`.
 
 ---
 
@@ -139,16 +116,16 @@ locks. Clippy denies `await_holding_lock`.
 ```
 POST /api/run
   validate chat/workspace
-  create RunCtx (deps: path, chat, role, allowlist, window, caps, envelope)
-  persist user message (chat_store) + append session entry
+  ensure agent record (running)
+  create RunCtx (workspace, scope, depth, file access)
+  persist user message + append session entry
   create run task
   return SSE stream
 
 run task:
-  route(prompt, ctx) -> AgentKind
-  build agent (provider, tools, system prompt, history)
+  build system prompt (AGENTS.md + memory index)
   loop:
-    provider.stream_chat(messages, tool_specs_tools)
+    provider.stream_chat(messages, tool_specs)
       emit Delta(text/reasoning/usage)
       if tool calls:
         emit Delta(tool_started)
@@ -156,9 +133,10 @@ run task:
         emit Delta(tool_finished)
         append tool result
     compact if over budget
-    check cancellation / steering
+    check cancellation / steering / budgets
   persist assistant message + session entries
-  finalize snapshot/checkpoint
+  record stage-1 memory; maybe consolidate in background
+  persist terminal agent status BEFORE done
   emit State(final) + Done
 ```
 
@@ -168,7 +146,15 @@ run task:
 keeps a per-chat snapshot so `/api/stream/{chat}` can replay the latest state
 before subscribing.
 
-### 5.3 Group projects
+### 5.3 Durable agents
+
+```
+agent tool (spawn) → agent row + mailbox trigger → supervisor tick → claim
+→ child run in worktree → auto-commit → store.finish → notify parent
+→ parent steered or queued → merge/discard via tool or API
+```
+
+### 5.4 Group projects
 
 ```
 tool (group_update) → op row → supervisor tick → one event + projection
@@ -186,17 +172,16 @@ The LLM never writes projections directly. The only mutation channel is an op.
 |---|---|
 | Libraries | `thiserror` enums, specific variants |
 | Binaries/server | `anyhow::Result` at the edge |
-| Tool failures | `ToolResult { is_error, content, exit_code }` — never panic |
+| Tool failures | `ToolOutcome { is_error, content }` — never panic |
 | Provider failures | `ProviderError` (auth, rate limit, transport, protocol, timeout) |
-| Policy refusal | `Decision::Blocked(reason)` / `NeedsApproval` |
-| HTTP | JSON `{ "error": "...", "detail": "..." }` with status codes |
+| Policy refusal | `[BLOCKED] ...` tool text |
+| HTTP | JSON `{ "error": "..." }` with status codes |
 
 Rules:
 - No `unwrap()`/`expect()` in production code (clippy denies them, as Codex
   does).
-- A tool panic is caught at the dispatcher and converted to `[ERR]` text.
-- A supervisor tick catches per-project errors and never dies.
-- A run error persists `error`/`traceback` into the final `AppState` (parity).
+- A run error persists `error` into the final `AppState`.
+- A supervisor tick catches per-agent/per-project errors and never dies.
 
 ---
 
@@ -205,28 +190,24 @@ Rules:
 | Source | Use |
 |---|---|
 | Environment | Provider keys, ports, paths, feature flags |
-| `.deep_agents/` | Existing runtime config (MCP, workspaces, sessions) |
-| `backend-rs/config.toml` | Rust-only defaults (optional) |
-| `PROJECT.md` | Group-project envelope/manifest |
-| `agents/specialists/*.json` | Specialist profiles (unchanged) |
+| `.deep_agents/` | Runtime state (chats.db, memory, workspaces, sessions) |
+| `AGENTS.md` hierarchy | Manual project instructions (global + nested) |
 
-Precedence: explicit env > project/manifest > mode defaults > Rust defaults.
-Do not introduce a second source of truth for provider/model pins while the
-Python modes still exist.
+Precedence: explicit env > workspace state > built-in defaults.
 
-### Feature flags (`stark-server` / `stark-core`)
-- `voice-sidecar` — proxy voice endpoints to Python (default on during migration)
-- `telegram-sidecar` — health/status only (bot runs outside)
-- `embeddings` — fastembed + vector store (default off)
-- `sandbox-windows` — Windows sandbox enforcement (default off until Phase 6)
-- `otel` — OpenTelemetry export (default off)
-- `tui` — ratatui CLI (default off)
+### Environment
+
+- `STARK_PORT` (default `8123` desktop, `8124` dev)
+- `STARK_HOST` / `STARK_BIND` (default `127.0.0.1`; `0.0.0.0` for remote)
+- `STARK_FRONTEND_DIST` (override the served SPA dir)
+- `STARK_PROVIDER`, `STARK_PROVIDER_BASE`, `STARK_API_KEY`, `STARK_MODEL`
+- `STARK_MEMORY`, `STARK_MEMORY_MAX_CHARS`, `STARK_MEMORY_CONSOLIDATE_AFTER`, `STARK_MEMORY_MODEL`
+- `STARK_WORKTREES` (`auto` / `required` / `off`)
+- `STARK_RUN_MAX_SECONDS`, `STARK_RUN_MAX_TOKENS`, `STARK_RUN_MAX_TOOL_CALLS`
 
 ---
 
 ## 8. Build profiles and lints
-
-Mirror Codex (`codex-rs/Cargo.toml`):
 
 ```toml
 [profile.dev]
@@ -235,48 +216,24 @@ debug = "line-tables-only"
 [profile.release]
 lto = "thin"
 debug = "line-tables-only"
-split-debuginfo = "off"
-strip = false
-codegen-units = 4
 ```
 
 Workspace lints (subset):
 - `clippy::unwrap_used = "deny"`
 - `clippy::expect_used = "deny"`
 - `clippy::await_holding_lock = "deny"`
-- `clippy::redundant_clone = "deny"`
-- `clippy::needless_collect = "deny"`
-- `clippy::uninlined_format_args = "deny"`
 
 CI gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, `cargo audit` (optional), tool-spec parity.
+`cargo test --workspace`, plus the `stark-contract` frozen tool-spec test and a
+frontend `tsc` + Vite build.
 
 ---
 
-## 9. Port strategy
-
-**Strangler, side-by-side, contract-first.**
-
-1. Rust runs on `:8124`; Python stays on `:8123`.
-2. Frontend Vite proxy reads `STARK_PORT` (default `8123`) to choose. Electron
-   still launches the Python server, so Phase 1 browser/Vite uses `STARK_PORT=8124`.
-3. Every ported endpoint gets a contract test against the Python response.
-4. A run fixture is replayed through both and normalized-diffed.
-5. Cutover is a config flip, not a big-bang rewrite.
-6. After a stable period, remove Python startup and archive the tree.
-
-This is slower than a hard cutover but it is the only way to preserve 42 tool
-contracts, ~90 routes, and an event-sourced state machine without a long
-regression tail.
-
----
-
-## 10. Non-goals
+## 9. Non-goals
 
 - No new UI framework.
 - No new database engine.
-- No microservices; one binary + sidecars.
+- No microservices; one binary.
 - No agent framework.
-- No behavior redesign while porting. Improvements go through a "deviation"
-  entry and a separate change.
-- No cross-platform desktop work in Phase 1; Windows first.
+- No vector embeddings or repo-map injection.
+- No cross-platform desktop work beyond Windows-first builds.

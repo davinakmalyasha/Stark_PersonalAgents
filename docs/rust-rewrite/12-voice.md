@@ -23,10 +23,8 @@ The vendored config does that, which avoids the native SentencePiece build entir
 
 - Rust MSVC target: `rustup target add x86_64-pc-windows-msvc`
 - LLVM `clang-cl` and `lld-link` in `PATH` (MSVC target linker), or Visual Studio Build Tools.
-- `cargo-xwin` when building without Visual Studio:
-  `pip install cargo-xwin`
-- libclang for `moonshine-sys` bindgen. On this machine:
-  `pip install libclang` and set `LIBCLANG_PATH` to `venv/Lib/site-packages/clang/native`.
+- `cargo-xwin` when building without Visual Studio.
+- libclang for `moonshine-sys` bindgen (set `LIBCLANG_PATH` to a LLVM/clang install).
 - Models in `backend-rs/models` (or `STARK_MODELS_DIR`).
 
 ## Model layout
@@ -54,7 +52,7 @@ models/
 Prepare public assets with:
 
 ```bash
-python backend-rs/scripts/prepare-voice-models.py --jarvis-state path/to/jarvis_18m.safetensors
+node backend-rs/scripts/prepare-voice-models.mjs --jarvis-state path/to/jarvis_18m.safetensors
 ```
 
 ## Build
@@ -63,7 +61,7 @@ python backend-rs/scripts/prepare-voice-models.py --jarvis-state path/to/jarvis_
 cd backend-rs
 export CARGO_TARGET_DIR=D:/cargo-target/stark-msvc
 export XWIN_CACHE_DIR=D:/cargo-target/xwin
-export LIBCLANG_PATH=D:/MyProject/LangChain/venv/Lib/site-packages/clang/native
+export LIBCLANG_PATH=<path-to-libclang-native>
 cargo-xwin build --release -p stark-server --features voice-stt \
   --target x86_64-pc-windows-msvc
 ```
@@ -104,12 +102,12 @@ and is also shown during active voice runs. Verified end to end: a blocked
   server-side `cpal` PCM, not WebM. Add a pure-Rust Opus path or ffmpeg only if file-upload
   fallback parity is required.
 - The 18M model is English-only.
-- The Rust TTS sampler is deterministic but not sample-identical to Python.
+- The bundled `onnxruntime.dll` lives at `backend-rs/onnxruntime.dll`
+  (gitignored build input, copied from the ONNX Runtime 1.26.x release);
+  override with `STARK_ONNXRUNTIME_DLL`.
 
 ## Measured on this machine (Ryzen 5 7520U, 7.8 GB RAM)
 
-- Python 100M JARVIS, quantized PyTorch: warm **24.4 s**, warm RSS **983 MB**; one sentence took
-  **3.28 s**.
 - Rust 18M JARVIS, release, single process: warm **0.64 s**, warm RSS **237 MB**, one sentence
   **0.82 s**, first PCM stream chunk **92 ms**, RSS after streaming **279 MB**.
 - Packaged installer: **131 MB**, including the 18M model, three voice states, Moonshine tiny,

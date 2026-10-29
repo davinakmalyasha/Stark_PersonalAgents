@@ -117,13 +117,7 @@ These are safety rails, not a step count. Compaction handles long contexts.
 Prompt-cache zoning/configuration and transport compression are explicitly
 deferred.
 
-## Removed Python tools
+## Dropped tools
 
-Deleted with their registrations and template-dependent gate paths:
-
-- `tools/AddOnTool/webTools.py`
-- `tools/AddOnTool/templateTools.py`
-- `tools/MainTool/proposePlan.py`
-- Python `github_apply_gate` / `github_apply_observability`
-
-`ast_search` remains intentionally unimplemented in Rust.
+`ast_search` and `github_apply_gate` were never implemented in Rust and are
+no longer exposed in the frozen tool contract (`tool-specs.json`).

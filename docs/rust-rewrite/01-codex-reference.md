@@ -220,7 +220,7 @@ time of writing) unless a pinned rev is required.
 | **Bazel** | Codex needs it at its scale; Stark is one small workspace. Cargo only. |
 | **~170 crates at day one** | Start with 8–10; split only when ownership/compile time demands it. |
 | **OpenAI-specific crates** (`chatgpt`, `cloud-tasks`, `backend-client`, `analytics`, `login` internals) | Stark has its own auth/pairing and providers. |
-| **`realtime-webrtc` / `voice-host`** | Stark keeps Python Moonshine/Pocket TTS as a sidecar initially. |
+| **`realtime-webrtc` / `voice-host`** | Voice runs in-process; no sidecar. |
 | **`code-mode` / `v8-poc`** | Not needed for Stark's tool model. |
 | **Codex's TUI** | Stark has React/Electron; `ratatui` is optional for a CLI. |
 | **Codex's extension set** | Stark's extensions are its own domains (house, DFD, groups). |

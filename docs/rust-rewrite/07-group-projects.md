@@ -4,8 +4,7 @@ Durable, event-sourced multi-agent projects. This is the most behavior-sensitive
 subsystem: a rewrite that changes one reducer rule corrupts every existing
 project.
 
-The design of record is `docs/group-projects/00..07`. This document is the
-Rust implementation contract.
+This document is the Rust implementation contract.
 
 ---
 
@@ -106,7 +105,7 @@ CREATE TABLE projection_checkpoint (
 );
 ```
 
-Foreign keys are logical, not enforced (parity with Python). Do not add
+Foreign keys are logical, not enforced. Do not add
 columns without a migration and a documented deviation.
 
 ### 3.2 Event vocabulary (frozen)
@@ -324,7 +323,7 @@ pub enum Op { AddItem(..), AddMilestone(..), InvalidateItem{..}, /* ... */ }
 pub struct OpRow { pub id: i64, pub kind: String, pub payload: serde_json::Value, pub state: OpState }
 ```
 
-Keep the Python op names/strings exactly; they are stored in `ops.kind`.
+Op names/strings are frozen; they are stored in `ops.kind`. Do not rename them.
 
 ---
 
@@ -367,8 +366,8 @@ stark-groups/
 
 ## 10. Acceptance
 
-- Existing Python `.gp/state.db` opens in Rust and replays to the same board.
-- Rust-created events replay in Python; no unknown kinds.
+- An existing `.gp/state.db` opens and replays to the same board.
+- `rebuild()` from events equals the incremental projection.
 - `rebuild()` equals incremental projection for every fixture.
 - A real project completes end-to-end on a real model.
 - Kill/restart at each tick phase resumes correctly.

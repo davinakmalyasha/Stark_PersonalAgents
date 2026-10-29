@@ -5,8 +5,7 @@
 `canvas_mode` is an orchestrator-scoped tool that watches agent chats and group
 projects and wakes the orchestrator when watched work finishes or fails.
 
-Persistence uses the existing `.deep_agents/chats.db` and the Python-compatible
-tables:
+Persistence uses `.deep_agents/chats.db` with compatible tables:
 
 - `pending_wakes`
 - `canvas_watches`

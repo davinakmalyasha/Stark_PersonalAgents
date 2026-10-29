@@ -40,7 +40,6 @@ interface Props {
   onLaunchPersonal: () => void;
   onLaunchCoding: () => void;
   onLaunchHouse: () => void;
-  onLaunchAdmin: () => void;
 }
 
 interface RowChat extends ChatSummary {
@@ -98,7 +97,7 @@ export default function HouseSidebar({
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onTogglePin,
   onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
-  onLaunchPersonal, onLaunchCoding, onLaunchHouse, onLaunchAdmin,
+  onLaunchPersonal, onLaunchCoding, onLaunchHouse,
 }: Props) {
   const [editing, setEditing] = useState<{ sid: string; title: string } | null>(null);
   const [confirmDeleteSid, setConfirmDeleteSid] = useState<string | null>(null);
@@ -739,7 +738,6 @@ export default function HouseSidebar({
           onLaunchPersonal={onLaunchPersonal}
           onLaunchCoding={onLaunchCoding}
           onLaunchHouse={onLaunchHouse}
-          onLaunchAdmin={onLaunchAdmin}
         />
       </aside>
     </>

@@ -34,6 +34,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -490,10 +491,24 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
-        .with_state(state);
+        ));
 
-    let host = std::env::var("STARK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Remote/mobile mode: serve the production Vite build from the same
+    // origin so a phone only needs http://<laptop>:<port>. The shell stays
+    // public (the pairing gate lives inside it); /api/* is still guarded.
+    let app = if let Some(dist) = frontend_dist(&state.harness_root) {
+        let assets = dist.join("assets");
+        tracing::info!("serving frontend from {}", dist.display());
+        app.nest_service("/assets", ServeDir::new(assets))
+            .fallback(spa_fallback)
+    } else {
+        app
+    }
+    .with_state(state.clone());
+
+    let host = std::env::var("STARK_HOST")
+        .or_else(|_| std::env::var("STARK_BIND"))
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("STARK_PORT").unwrap_or_else(|_| "8124".to_string());
     let address = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -3957,6 +3972,13 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> axum::response::Response {
+    // The SPA shell (/, /assets/*) stays public so a remote phone can load
+    // the UI and reach the pairing gate. Only API calls require the token.
+    // Python guards every path; Rust deliberately exempts the shell.
+    let path = request.uri().path();
+    if !path.starts_with("/api/") {
+        return next.run(request).await;
+    }
     let local = address.ip().is_loopback();
     if local || request.method() == axum::http::Method::OPTIONS {
         return next.run(request).await;
@@ -3984,6 +4006,106 @@ async fn pairing_handler(
         return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
     }
     Ok(Json(json!({"token": state.pairing.token()})))
+}
+
+fn frontend_dist(harness_root: &std::path::Path) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("STARK_FRONTEND_DIST")
+        && !dir.trim().is_empty()
+    {
+        let path = PathBuf::from(dir.trim());
+        if path.join("index.html").is_file() {
+            return Some(path);
+        }
+    }
+    let local = harness_root.join("frontend").join("dist");
+    if local.join("index.html").is_file() {
+        return Some(local);
+    }
+    None
+}
+
+fn spa_content_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn spa_fallback(
+    State(state): State<ServerState>,
+    request: axum::extract::Request,
+) -> Response {
+    let path = request.uri().path();
+    if path.starts_with("/api/") {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    let Some(dist) = frontend_dist(&state.harness_root) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "frontend not built (run npm run build)"})),
+        )
+            .into_response();
+    };
+    let relative = path.trim_start_matches('/');
+    if !relative.is_empty() {
+        let candidate = dist.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        // Contain path traversal inside the dist root.
+        let Ok(absolute) = std::path::absolute(&candidate) else {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+        };
+        let Ok(root) = std::path::absolute(&dist) else {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+        };
+        if absolute.starts_with(&root) && absolute.is_file() {
+            match tokio::fs::read(&absolute).await {
+                Ok(bytes) => {
+                    return (
+                        StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            spa_content_type(&absolute),
+                        )],
+                        bytes,
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+                        .into_response();
+                }
+            }
+        }
+    }
+    match tokio::fs::read(dist.join("index.html")).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "frontend not built (run npm run build)"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn pairing_rotate_handler(

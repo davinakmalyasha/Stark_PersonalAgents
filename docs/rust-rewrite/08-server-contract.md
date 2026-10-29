@@ -106,21 +106,29 @@ that prefix (`server/house/router.py`).
 `POST /api/voice/release_asr|release_tts|warm_tts`,
 `POST /api/vision/frame`, `WS /api/voice/ws`.
 
-### 2.6 Infra / admin
-`GET /api/health`, `GET /api/health/voice`, `GET /api/pairing`,
+### 2.6 Infra
+`GET /api/health`, `GET /api/pairing`,
 `POST /api/pairing/rotate`, `GET|PUT /api/ui/state`,
 `GET /api/mcp/servers`, `GET|POST|DELETE /api/mcp/servers/{name}`,
 `POST /api/mcp/servers/{name}/restart`,
 `GET /api/chats/{chat_id}/snapshots`,
 `POST /api/chats/{chat_id}/snapshots/{snap_id}/restore`,
 `POST /api/chats/{chat_id}/runs/{run_id}/restore`,
-`GET /api/ask/pending`, `POST /api/ask/answer`, `GET /api/inbox`,
-`GET /api/clients`, `GET /api/bots`, `POST /api/bots/{bot_id}/disable`,
-`GET /api/usage`, `GET /api/dead-reminders`.
+`GET /api/ask/pending`, `POST /api/ask/answer`, `GET /api/inbox`.
+
+Dropped, not ported: the Python `agentsadmin` proxy (`/api/agentsadmin/*`)
+and its `#/admin` frontend page were removed — no caller used them.
+`/api/health/voice`, `/api/settings/*`, and `/api/workspaces/{id}/rules`
+are also not ported and return 404; no frontend surface calls them.
 
 ### 2.7 Static
-`GET /{*path}` serves `frontend/dist`; unknown API paths return JSON 404, not
-the SPA. Preserve the current fallback behavior for client-side routes.
+`GET /{*path}` serves `frontend/dist` from the same origin so a phone only
+needs `http://<laptop>:<port>`; unknown API paths return JSON 404, not
+the SPA. The shell (`/`, `/assets/*`, deep links) is public so the pairing
+gate can load; `/api/*` still requires the pairing token for non-loopback
+clients. `STARK_FRONTEND_DIST` overrides the dist dir; otherwise
+`<harness>/frontend/dist` is used. `STARK_BIND` is accepted as an alias of
+`STARK_HOST`.
 
 ---
 

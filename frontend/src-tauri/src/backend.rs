@@ -101,21 +101,59 @@ pub fn ensure_running(app: &AppHandle) {
         .ok()
         .map(PathBuf::from)
         .filter(|path| path.exists());
-    let prefer_rust = std::env::var("STARK_BACKEND").ok().as_deref() == Some("rust");
+    // Rust is the runtime. Python remains only as an explicit fallback
+    // (STARK_BACKEND=python) until the Python tree is deleted.
+    let prefer_rust = std::env::var("STARK_BACKEND").ok().as_deref() != Some("python");
     let python = python_command(&root);
     let python_ready = root.join("server").join("api_server.py").exists();
 
+    fn rust_dev_binary(root: &Path) -> Option<PathBuf> {
+        let exe = if cfg!(windows) {
+            "stark-server.exe"
+        } else {
+            "stark-server"
+        };
+        for candidate in [
+            root.join("backend-rs").join("target").join("debug").join(exe),
+            root.join("target").join("debug").join(exe),
+        ] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        std::env::var("CARGO_TARGET_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .map(|dir| dir.join("debug").join(exe))
+            .filter(|path| path.exists())
+    }
+
     let (program, args, cwd) = if let Some(binary) = configured {
         (binary, Vec::new(), root.clone())
-    } else if !prefer_rust && python_ready {
+    } else if let Some(binary) = packaged_backend(app) {
+        (binary, Vec::new(), root.clone())
+    } else if prefer_rust {
+        if let Some(binary) = rust_dev_binary(&root) {
+            (binary, Vec::new(), root.clone())
+        } else if python_ready {
+            if let Some((python, args)) = python {
+                log::warn!("Rust dev binary not found; falling back to Python backend");
+                (python, args, root.clone())
+            } else {
+                log::error!("no Rust backend binary and no Python interpreter found");
+                return;
+            }
+        } else {
+            log::error!("no Stark backend binary found (set STARK_BACKEND_BIN)");
+            return;
+        }
+    } else if python_ready {
         if let Some((python, args)) = python {
             (python, args, root.clone())
         } else {
             log::error!("Python backend is present but no interpreter was found");
             return;
         }
-    } else if let Some(binary) = packaged_backend(app) {
-        (binary, Vec::new(), root.clone())
     } else if let Some((python, args)) = python {
         (python, args, root.clone())
     } else {

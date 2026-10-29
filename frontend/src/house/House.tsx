@@ -302,15 +302,6 @@ export default function House() {
     }, 320);
   }, [transitioning]);
 
-  const launchAdmin = useCallback(() => {
-    if (transitioning) return;
-    setSidebarOpen(false);
-    setTransitioning(true);
-    setTimeout(() => {
-      window.location.hash = '#/admin';
-    }, 320);
-  }, [transitioning]);
-
   const activeGeneralTitle = useMemo(
     () => chat.chats.find((c) => c.id === chat.activeChatId)?.title ?? 'New conversation',
     [chat.chats, chat.activeChatId],
@@ -505,7 +496,6 @@ export default function House() {
         onLaunchPersonal={launchPersonal}
         onLaunchCoding={launchCoding}
         onLaunchHouse={launchHouse}
-        onLaunchAdmin={launchAdmin}
       />
 
       {projectDialogOpen && (

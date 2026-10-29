@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Search, User, Code2, Home, ShieldCheck, X } from 'lucide-react';
+import { Search, User, Code2, Home, X } from 'lucide-react';
 
 interface WorkspaceItem {
   id: string;
@@ -16,7 +16,6 @@ interface Props {
   onLaunchPersonal: () => void;
   onLaunchCoding: () => void;
   onLaunchHouse: () => void;
-  onLaunchAdmin: () => void;
 }
 
 export default function WorkspaceSwitcher({
@@ -26,7 +25,6 @@ export default function WorkspaceSwitcher({
   onLaunchPersonal,
   onLaunchCoding,
   onLaunchHouse,
-  onLaunchAdmin,
 }: Props) {
   const [filter, setFilter] = useState('');
   const panelRef = useRef<HTMLDivElement>(null);
@@ -36,7 +34,6 @@ export default function WorkspaceSwitcher({
     { id: 'personal', label: 'Personal', icon: <User size={16} />, onSelect: onLaunchPersonal },
     { id: 'coding', label: 'Coding', icon: <Code2 size={16} />, onSelect: onLaunchCoding },
     { id: 'house', label: 'House', icon: <Home size={16} />, onSelect: onLaunchHouse },
-    { id: 'admin', label: 'Agents Admin', icon: <ShieldCheck size={16} />, onSelect: onLaunchAdmin },
   ];
 
   const q = filter.trim().toLowerCase();

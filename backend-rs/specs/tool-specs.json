@@ -894,6 +894,10 @@
                     "type": "string"
                   },
                   "description": "Absolute file paths of image attachments relevant to THIS item. Missing files are silently dropped, so only attach paths you have verified exist."
+                },
+                "isolate": {
+                  "type": "boolean",
+                  "description": "Force git worktree isolation for this delegation."
                 }
               },
               "required": [
@@ -1088,6 +1092,10 @@
             "type": "integer",
             "description": "For status: poll up to this many seconds (max 300) before returning.",
             "default": 0
+          },
+          "write_access": {
+            "type": "boolean",
+            "description": "Grant the subagent write access via an isolated worktree. Default false (read-only)."
           }
         },
         "required": []
@@ -1704,7 +1712,10 @@
               "status",
               "send",
               "report",
-              "cancel"
+              "cancel",
+              "diff",
+              "merge",
+              "discard"
             ]
           },
           "kind": {
@@ -1743,6 +1754,14 @@
           },
           "wait_seconds": {
             "type": "integer"
+          },
+          "write_access": {
+            "type": "boolean",
+            "description": "For subagent spawns: grant write access via an isolated worktree. Level-2 subagents are read-only by default."
+          },
+          "isolate": {
+            "type": "boolean",
+            "description": "Force git worktree isolation for this spawn."
           }
         },
         "required": [

@@ -73,6 +73,65 @@ pub const ORCHESTRATOR: AgentSpec = AgentSpec {
     instructions: "You are the Orchestrator. Route work to the right agent and coordinate jobs.",
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileAccess {
+    Read,
+    Write,
+    Worktree,
+}
+
+impl FileAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Worktree => "worktree",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read" | "readonly" | "read-only" => Self::Read,
+            "worktree" | "isolated" => Self::Worktree,
+            _ => Self::Write,
+        }
+    }
+
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Read)
+    }
+}
+
+pub fn default_access(scope: &str, depth: u32, spawned: bool) -> FileAccess {
+    let scope = scope.trim().to_ascii_lowercase();
+    if scope == "orchestrator" || scope == "house" || scope == "explore" {
+        return FileAccess::Read;
+    }
+    if depth >= 2 {
+        return FileAccess::Read;
+    }
+    if !spawned {
+        return match scope.as_str() {
+            "developer" | "ui" | "devops" => FileAccess::Write,
+            "general" | "dfd" => FileAccess::Write,
+            _ => FileAccess::Read,
+        };
+    }
+    match scope.as_str() {
+        "developer" | "ui" | "devops" => FileAccess::Worktree,
+        "general" | "dfd" => FileAccess::Write,
+        _ => FileAccess::Read,
+    }
+}
+
+pub fn worktree_mode() -> String {
+    std::env::var("STARK_WORKTREES")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
 const WORKSPACE_AGENTS: &[AgentSpec] = &[
     DEVELOPER,
     GENERAL,

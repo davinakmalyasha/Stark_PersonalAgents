@@ -107,9 +107,38 @@ uses the durable subagent store for list/status/message/stop. The old
 `action=run` still executes synchronously, but persists the agent record and
 result.
 
+## Worktree isolation
+
+Spawned write-capable agents run in a git worktree on their own branch:
+
+- Developer/UI/DevOps spawns default to `worktree`; level-2 subagents default
+  to `read` unless `write_access=true` creates a nested worktree.
+- General/DFD spawns write directly; House/Explore/Orchestrator are read-only.
+- The child chat targets the worktree path, so tools, checkpoints, and
+  `AGENTS.md` work unchanged. The parent tree is untouched until merge.
+- After each run the worktree auto-commits (excluding `.deep_agents`) and
+  records the diff stat on the agent.
+- The parent merges explicitly (`agent` action `merge`, `POST
+  /api/agents/{id}/merge`) after reviewing the diff; conflicts abort cleanly
+  and keep the worktree. `discard` removes the worktree and branch.
+- `STARK_WORKTREES=auto|required|off` controls the non-git fallback:
+  `auto` warns and writes directly, `required` fails, `off` disables.
+- `delegate` resolves `workspace`/`project` before spawning; Developer
+  delegation requires a project target and never silently uses the harness root.
+- `memory`, `agent` diff/merge/discard, and the tree UI share the same metadata:
+  `access`, branch, base, diff stat, and state
+  (`active|merged|discarded|missing|failed`).
+
+## Agent tree controls
+
+`GET /api/agents` reports access, worktree, pending-message counts, and
+activity timestamps. `GET /api/agents/{id}` adds the pending mailbox, full
+history, and children. `POST /api/agents/{id}/message` steers a running agent
+or queues a trigger for an idle one. Merge/discard/diff have matching routes.
+The sidebar tree shows status text, relative activity, model, an access badge,
+and pending counts, with a detail drawer (overview/mailbox/worktree), send,
+merge (confirmed, diff-first), discard, and cancel.
+
 ## Not implemented yet
 
-- Worktree isolation for write-capable subagents.
-- Full mailbox/send UI controls in the agent tree.
-- Model-assisted long-term memory consolidation (stage-1/summary store exists).
 - Telegram bot (DFD approval is in-app now).

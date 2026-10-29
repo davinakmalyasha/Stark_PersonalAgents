@@ -41,17 +41,26 @@ pub(crate) async fn current_agent(
     {
         return Ok(agent);
     }
-    let kind = if ctx.depth == 0 {
-        "orchestrator"
+    let (kind, path) = if ctx.scope == "orchestrator" {
+        ("orchestrator", format!("orchestrator:{}", ctx.chat_id))
+    } else if ctx.depth == 0 {
+        ("workspace", format!("root:{}", ctx.chat_id))
+    } else if ctx.depth == 1 {
+        (
+            "workspace",
+            format!("workspace:{}:{}", ctx.workspace_id, ctx.scope),
+        )
     } else {
-        "workspace"
+        (
+            "subagent",
+            format!(
+                "workspace:{}:{}:{}",
+                ctx.workspace_id, ctx.scope, ctx.chat_id
+            ),
+        )
     };
-    let path = if kind == "orchestrator" {
-        format!("orchestrator:{}", ctx.chat_id)
-    } else {
-        format!("workspace:{}:{}", ctx.workspace_id, ctx.scope)
-    };
-    store
+    let access = crate::default_access(&ctx.scope, ctx.depth, false);
+    let agent = store
         .create_agent(
             kind,
             &path,
@@ -65,7 +74,13 @@ pub(crate) async fn current_agent(
             ctx.depth as i64,
         )
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let _ = store.set_access(&agent.id, access.as_str()).await;
+    Ok(store
+        .get(&agent.id)
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or(agent))
 }
 
 async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<String, String> {
@@ -125,6 +140,18 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                 .await
                 .map_err(|error| error.to_string())?
             {
+                // Reuse the durable workspace agent. If its previous worktree
+                // is terminal or missing, isolate a fresh one.
+                let access = requested_access(args, spec.key, current.depth + 1);
+                if access == crate::FileAccess::Worktree
+                    && (existing.worktree_state == "merged"
+                        || existing.worktree_state == "discarded"
+                        || existing.worktree_state == "missing"
+                        || existing.worktree_state.is_empty()
+                        || !std::path::Path::new(&existing.worktree_path).exists())
+                {
+                    let _ = attach_worktree(ctx, store, &existing, &workspace_path).await;
+                }
                 (existing, false)
             } else {
                 let chat = ctx
@@ -155,6 +182,17 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                let access = requested_access(args, spec.key, current.depth + 1);
+                if access == crate::FileAccess::Worktree {
+                    let _ = attach_worktree(ctx, store, &agent, &workspace_path).await;
+                } else {
+                    let _ = store.set_access(&agent.id, access.as_str()).await;
+                }
+                let agent = store
+                    .get(&agent.id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or(agent);
                 (agent, true)
             }
         }
@@ -165,11 +203,25 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
             if current.depth >= MAX_DEPTH {
                 return Err("subagent depth limit reached".to_string());
             }
+            // A subagent inherits the parent workspace (which may itself be a
+            // worktree). Nested isolation branches from the parent worktree.
+            let parent_workspace = if !current.worktree_path.trim().is_empty()
+                && std::path::Path::new(&current.worktree_path).exists()
+            {
+                let subdir = current.workspace_subdir.trim().trim_matches('/');
+                if subdir.is_empty() {
+                    std::path::PathBuf::from(&current.worktree_path)
+                } else {
+                    std::path::PathBuf::from(&current.worktree_path).join(subdir)
+                }
+            } else {
+                ctx.workspace.clone()
+            };
             let chat = ctx
                 .store
                 .create_child_chat(
                     &ctx.workspace_id,
-                    ctx.workspace.to_string_lossy().as_ref(),
+                    parent_workspace.to_string_lossy().as_ref(),
                     &title,
                     &ctx.model,
                     &current.chat_id,
@@ -195,6 +247,17 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            let access = requested_access(args, spec.key, current.depth + 1);
+            if access == crate::FileAccess::Worktree {
+                let _ = attach_worktree(ctx, store, &agent, &parent_workspace).await;
+            } else {
+                let _ = store.set_access(&agent.id, access.as_str()).await;
+            }
+            let agent = store
+                .get(&agent.id)
+                .await
+                .map_err(|error| error.to_string())?
+                .unwrap_or(agent);
             (agent, true)
         }
         other => return Err(format!("unknown agent kind '{other}'")),
@@ -215,17 +278,43 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
         .wake(&agent.id)
         .await
         .map_err(|error| error.to_string())?;
+    let fresh = store
+        .get(&agent.id)
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or(agent);
     let mut text = format!(
-        "[AGENT SPAWNED]\nid={}\npath={}\nkind={}\nstatus={}\nchat={}",
-        agent.id, agent.path, agent.kind, agent.status, agent.chat_id
+        "[AGENT SPAWNED]\nid={}\npath={}\nkind={}\nstatus={}\nchat={}\naccess={}",
+        fresh.id,
+        fresh.path,
+        fresh.kind,
+        fresh.status,
+        fresh.chat_id,
+        if fresh.access.is_empty() {
+            "write"
+        } else {
+            &fresh.access
+        },
     );
+    if !fresh.worktree_branch.is_empty() {
+        text.push_str(&format!(
+            "\nworktree branch={} base={}",
+            fresh.worktree_branch, fresh.worktree_base
+        ));
+    }
     if created {
         text.push_str("\nThe server supervisor will start it.");
     } else {
         text.push_str("\nReused the workspace agent and queued the task.");
     }
+    if worktree_policy() == "required"
+        && fresh.access == "worktree"
+        && fresh.worktree_path.is_empty()
+    {
+        return Err("worktree isolation required but unavailable for this workspace".to_string());
+    }
     if wait_seconds > 0 {
-        let detail = wait_for(store, &agent.id, wait_seconds).await?;
+        let detail = wait_for(store, &fresh.id, wait_seconds).await?;
         text.push('\n');
         text.push_str(&detail);
     }
@@ -251,14 +340,149 @@ pub(crate) async fn wait_for(store: &AgentStore, id: &str, seconds: u64) -> Resu
 
 fn format_agent(agent: &AgentRecord) -> String {
     let mut text = format!(
-        "id={}\npath={}\nkind={}\nstatus={}\nchat={}\nrole={}",
-        agent.id, agent.path, agent.kind, agent.status, agent.chat_id, agent.role
+        "id={}\npath={}\nkind={}\nstatus={}\nchat={}\nrole={}\naccess={}",
+        agent.id,
+        agent.path,
+        agent.kind,
+        agent.status,
+        agent.chat_id,
+        agent.role,
+        if agent.access.is_empty() {
+            "write"
+        } else {
+            &agent.access
+        }
     );
+    if !agent.worktree_branch.is_empty() {
+        text.push_str(&format!(
+            "\nworktree branch={} base={} state={} path={}",
+            agent.worktree_branch,
+            agent.worktree_base,
+            if agent.worktree_state.is_empty() {
+                "active"
+            } else {
+                &agent.worktree_state
+            },
+            agent.worktree_path
+        ));
+        if let Some(stat) = agent.worktree_diff.get("stat").and_then(Value::as_str)
+            && !stat.trim().is_empty()
+        {
+            text.push_str("\ndiff:\n");
+            text.push_str(&truncate(stat, 4_000));
+        }
+    }
     if !agent.result.is_empty() {
         text.push_str("\nresult:\n");
         text.push_str(&truncate(&agent.result, 12_000));
     }
     text
+}
+
+fn requested_access(args: &Value, scope: &str, depth: i64) -> crate::FileAccess {
+    let mut access = crate::default_access(scope, depth.max(0) as u32, true);
+    if args
+        .get("write_access")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && access.is_read_only()
+    {
+        access = crate::FileAccess::Worktree;
+    }
+    if args
+        .get("isolate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !access.is_read_only()
+    {
+        access = crate::FileAccess::Worktree;
+    }
+    access
+}
+
+fn worktree_policy() -> String {
+    crate::agents::worktree_mode()
+}
+
+/// Create an isolated worktree for `agent_id` running in `workspace`.
+/// Returns the worktree info and any fallback note. On non-git workspaces
+/// the caller drops back to direct writes unless STARK_WORKTREES=required.
+fn isolate_agent(
+    harness_root: &std::path::Path,
+    workspace: &std::path::Path,
+    agent_id: &str,
+) -> Result<(crate::worktree::WorktreeInfo, Option<String>), String> {
+    match crate::worktree::create(harness_root, workspace, agent_id) {
+        Ok(info) => Ok((info, None)),
+        Err(error) => {
+            if worktree_policy() == "required" {
+                return Err(format!(
+                    "worktree isolation required but unavailable: {error}"
+                ));
+            }
+            Err(format!(
+                "worktree unavailable, using direct writes: {error}"
+            ))
+        }
+    }
+}
+
+async fn attach_worktree(
+    ctx: &RunContext,
+    store: &AgentStore,
+    agent: &AgentRecord,
+    workspace: &std::path::Path,
+) -> (crate::FileAccess, String) {
+    let mode = worktree_policy();
+    if mode == "off" {
+        let _ = store.set_access(&agent.id, "write").await;
+        return (
+            crate::FileAccess::Write,
+            "worktrees disabled (STARK_WORKTREES=off); editing live tree".to_string(),
+        );
+    }
+    match isolate_agent(ctx.store.harness_root(), workspace, &agent.id) {
+        Ok((info, _)) => {
+            let effective = crate::worktree::effective_workspace(&info);
+            let _ = ctx
+                .store
+                .set_chat_workspace_path(&agent.chat_id, &effective.to_string_lossy())
+                .await;
+            let _ = store
+                .set_worktree(
+                    &agent.id,
+                    &info.repo_root.to_string_lossy(),
+                    &info.subdir.to_string_lossy(),
+                    &info.path.to_string_lossy(),
+                    &info.branch,
+                    &info.base,
+                    "active",
+                )
+                .await;
+            let _ = store.set_access(&agent.id, "worktree").await;
+            let _ = store
+                .set_worktree_state(&agent.id, "active", &json!({}), "")
+                .await;
+            (
+                crate::FileAccess::Worktree,
+                format!(
+                    "isolated in worktree branch={} path={}",
+                    info.branch,
+                    info.path.display()
+                ),
+            )
+        }
+        Err(note) => {
+            if mode == "required" {
+                return (
+                    crate::FileAccess::Write,
+                    format!("[WORKTREE REQUIRED] {note}"),
+                );
+            }
+            let _ = store.set_access(&agent.id, "write").await;
+            (crate::FileAccess::Write, note)
+        }
+    }
 }
 
 async fn list(ctx: &RunContext, store: &AgentStore) -> Result<String, String> {
@@ -392,6 +616,137 @@ async fn report(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<St
     Ok(format!("[OK] reported to {parent_id}"))
 }
 
+fn worktree_info(agent: &AgentRecord) -> Result<crate::worktree::WorktreeInfo, String> {
+    if agent.worktree_path.trim().is_empty() || agent.worktree_branch.trim().is_empty() {
+        return Err("agent has no worktree".to_string());
+    }
+    Ok(crate::worktree::WorktreeInfo {
+        path: std::path::PathBuf::from(&agent.worktree_path),
+        branch: agent.worktree_branch.clone(),
+        base: agent.worktree_base.clone(),
+        repo_root: std::path::PathBuf::from(&agent.repo_root),
+        subdir: std::path::PathBuf::from(&agent.workspace_subdir),
+    })
+}
+
+async fn diff_agent(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<String, String> {
+    let current = current_agent(ctx, store).await?;
+    let id = args
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "diff requires agent_id".to_string())?;
+    let target = store
+        .get(id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("unknown agent {id}"))?;
+    if target.parent_id.as_deref() != Some(current.id.as_str()) && target.id != current.id {
+        return Err("agent is not a child of this agent".to_string());
+    }
+    let info = worktree_info(&target)?;
+    let diff = crate::worktree::diff(&info.path, &info.base).map_err(|error| error.to_string())?;
+    let _ = store
+        .set_worktree_state(&target.id, &target.worktree_state, &diff, "")
+        .await;
+    let stat = diff.get("stat").and_then(Value::as_str).unwrap_or("");
+    let mut text = format!(
+        "[WORKTREE DIFF] {} branch={} base={} state={}\n{}",
+        target.id, info.branch, info.base, target.worktree_state, stat
+    );
+    if let Some(files) = diff.get("files") {
+        text.push_str(&format!("\nfiles: {files}"));
+    }
+    Ok(text)
+}
+
+async fn merge_agent(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<String, String> {
+    let current = current_agent(ctx, store).await?;
+    let id = args
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "merge requires agent_id".to_string())?;
+    let target = store
+        .get(id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("unknown agent {id}"))?;
+    if target.parent_id.as_deref() != Some(current.id.as_str()) {
+        return Err("agent is not a child of this agent".to_string());
+    }
+    if matches!(target.status.as_str(), "running" | "queued" | "idle") {
+        return Err("child is still running; wait for a terminal status before merge".to_string());
+    }
+    let info = worktree_info(&target)?;
+    match crate::worktree::merge(&info) {
+        Ok(_) => {
+            let _ = store
+                .set_worktree_state(&target.id, "merged", &json!({}), "")
+                .await;
+            Ok(format!(
+                "[WORKTREE MERGED] {} branch={} merged into {}",
+                target.id,
+                info.branch,
+                info.repo_root.display()
+            ))
+        }
+        Err(error) => {
+            let _ = store
+                .set_worktree_state(&target.id, "active", &json!({}), &error)
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn discard_agent(
+    ctx: &RunContext,
+    store: &AgentStore,
+    args: &Value,
+) -> Result<String, String> {
+    let current = current_agent(ctx, store).await?;
+    let id = args
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "discard requires agent_id".to_string())?;
+    let target = store
+        .get(id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("unknown agent {id}"))?;
+    if target.parent_id.as_deref() != Some(current.id.as_str()) {
+        return Err("agent is not a child of this agent".to_string());
+    }
+    crate::cancel_agent_run(&target.id);
+    let _ = store.set_status(&target.id, "cancelled", false).await;
+    if target.worktree_path.trim().is_empty() {
+        return Ok(format!("[OK] discarded {} (no worktree)", target.id));
+    }
+    let repo = if target.repo_root.trim().is_empty() {
+        std::path::PathBuf::from(&target.worktree_path)
+    } else {
+        std::path::PathBuf::from(&target.repo_root)
+    };
+    match crate::worktree::discard(
+        &repo,
+        &std::path::PathBuf::from(&target.worktree_path),
+        &target.worktree_branch,
+    ) {
+        Ok(_) => {
+            let _ = store
+                .set_worktree_state(&target.id, "discarded", &json!({}), "")
+                .await;
+            Ok(format!("[WORKTREE DISCARDED] {}", target.id))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn handle(ctx: &RunContext, args: &Value) -> ToolOutcome {
     let store = match AgentStore::open(ctx.store.harness_root()).await {
         Ok(store) => store,
@@ -434,8 +789,11 @@ pub async fn handle(ctx: &RunContext, args: &Value) -> ToolOutcome {
         "send" => send(ctx, &store, args).await,
         "report" => report(ctx, &store, args).await,
         "cancel" => cancel(ctx, &store, args).await,
+        "diff" => diff_agent(ctx, &store, args).await,
+        "merge" => merge_agent(ctx, &store, args).await,
+        "discard" => discard_agent(ctx, &store, args).await,
         other => Err(format!(
-            "unknown action '{other}' (spawn|list|status|send|report|cancel)"
+            "unknown action '{other}' (spawn|list|status|send|report|cancel|diff|merge|discard)"
         )),
     };
     match result {
@@ -472,6 +830,7 @@ mod tests {
             role: Some("Developer".to_string()),
             scope: scope.to_string(),
             depth,
+            file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
             temperature: 0.0,
             images: Vec::new(),

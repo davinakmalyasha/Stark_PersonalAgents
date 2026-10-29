@@ -39,11 +39,23 @@ pub struct AgentRecord {
     pub last_active: Option<String>,
     pub result: String,
     pub usage: Value,
+    pub access: String,
+    pub repo_root: String,
+    pub workspace_subdir: String,
+    pub worktree_path: String,
+    pub worktree_branch: String,
+    pub worktree_base: String,
+    pub worktree_state: String,
+    pub worktree_diff: Value,
+    pub worktree_error: String,
 }
 
 fn row_agent(row: &sqlx::sqlite::SqliteRow) -> AgentRecord {
     let usage: String = row
         .try_get("usage_json")
+        .unwrap_or_else(|_| "{}".to_string());
+    let diff: String = row
+        .try_get("worktree_diff_json")
         .unwrap_or_else(|_| "{}".to_string());
     AgentRecord {
         id: row.get("id"),
@@ -63,6 +75,15 @@ fn row_agent(row: &sqlx::sqlite::SqliteRow) -> AgentRecord {
         last_active: row.try_get("last_active").ok().flatten(),
         result: row.try_get("result").unwrap_or_default(),
         usage: serde_json::from_str(&usage).unwrap_or_else(|_| json!({})),
+        access: row.try_get("access").unwrap_or_default(),
+        repo_root: row.try_get("repo_root").unwrap_or_default(),
+        workspace_subdir: row.try_get("workspace_subdir").unwrap_or_default(),
+        worktree_path: row.try_get("worktree_path").unwrap_or_default(),
+        worktree_branch: row.try_get("worktree_branch").unwrap_or_default(),
+        worktree_base: row.try_get("worktree_base").unwrap_or_default(),
+        worktree_state: row.try_get("worktree_state").unwrap_or_default(),
+        worktree_diff: serde_json::from_str(&diff).unwrap_or_else(|_| json!({})),
+        worktree_error: row.try_get("worktree_error").unwrap_or_default(),
     }
 }
 
@@ -109,6 +130,17 @@ impl AgentRecord {
             "lastActive": self.last_active,
             "result": self.result,
             "usage": self.usage,
+            "access": self.access,
+            "repoRoot": self.repo_root,
+            "workspaceSubdir": self.workspace_subdir,
+            "worktree": {
+                "path": self.worktree_path,
+                "branch": self.worktree_branch,
+                "base": self.worktree_base,
+                "state": self.worktree_state,
+                "diff": self.worktree_diff,
+                "error": self.worktree_error,
+            },
         })
     }
 }
@@ -167,6 +199,19 @@ impl AgentStore {
         let _ = sqlx::query("ALTER TABLE agents ADD COLUMN result TEXT DEFAULT ''")
             .execute(&self.pool)
             .await;
+        for column in [
+            "ALTER TABLE agents ADD COLUMN access TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN repo_root TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN workspace_subdir TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN worktree_path TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN worktree_branch TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN worktree_base TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN worktree_state TEXT DEFAULT ''",
+            "ALTER TABLE agents ADD COLUMN worktree_diff_json TEXT DEFAULT '{}'",
+            "ALTER TABLE agents ADD COLUMN worktree_error TEXT DEFAULT ''",
+        ] {
+            let _ = sqlx::query(column).execute(&self.pool).await;
+        }
         sqlx::query("CREATE INDEX IF NOT EXISTS ix_agents_parent ON agents(parent_id, status)")
             .execute(&self.pool)
             .await?;
@@ -264,13 +309,80 @@ impl AgentStore {
         scope: &str,
     ) -> Result<Option<AgentRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT * FROM agents WHERE kind = 'workspace' AND workspace_id = ? AND scope = ? ORDER BY created_at ASC LIMIT 1",
+            "SELECT * FROM agents WHERE kind = 'workspace' AND workspace_id = ? AND scope = ? AND parent_id IS NOT NULL ORDER BY created_at ASC LIMIT 1",
         )
         .bind(workspace_id)
         .bind(scope)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(row_agent))
+    }
+
+    pub async fn set_access(&self, id: &str, access: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE agents SET access = ?, updated_at = ? WHERE id = ?")
+            .bind(access)
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_worktree(
+        &self,
+        id: &str,
+        repo_root: &str,
+        subdir: &str,
+        path: &str,
+        branch: &str,
+        base: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE agents SET repo_root = ?, workspace_subdir = ?, worktree_path = ?, worktree_branch = ?, worktree_base = ?, worktree_state = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(repo_root)
+        .bind(subdir)
+        .bind(path)
+        .bind(branch)
+        .bind(base)
+        .bind(state)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_worktree_state(
+        &self,
+        id: &str,
+        state: &str,
+        diff: &Value,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE agents SET worktree_state = ?, worktree_diff_json = ?, worktree_error = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(state)
+        .bind(diff.to_string())
+        .bind(error)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_messages_count(&self, recipient_id: &str) -> Result<i64, StoreError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_messages WHERE recipient_id = ? AND consumed_at IS NULL",
+        )
+        .bind(recipient_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 
     pub async fn list(&self, parent_id: Option<&str>) -> Result<Vec<AgentRecord>, StoreError> {
@@ -618,12 +730,50 @@ mod tests {
     #[tokio::test]
     async fn workspace_agent_lookup_is_scoped() {
         let (_dir, store) = store().await;
+        let parent = store
+            .create_agent(
+                "orchestrator",
+                "orchestrator:test",
+                None,
+                "chat-orch",
+                "proj",
+                "orchestrator",
+                "Orchestrator",
+                "",
+                "mock",
+                0,
+            )
+            .await
+            .unwrap();
+        // Root workspace agents (no parent) are never reused by delegation.
         store
             .create_agent(
                 "workspace",
                 "workspace:proj:developer",
                 None,
                 "chat-proj-dev",
+                "proj",
+                "developer",
+                "Developer",
+                "Dev",
+                "mock",
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .workspace_agent("proj", "developer")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .create_agent(
+                "workspace",
+                "workspace:proj:developer:delegated",
+                Some(&parent.id),
+                "chat-proj-dev-2",
                 "proj",
                 "developer",
                 "Developer",

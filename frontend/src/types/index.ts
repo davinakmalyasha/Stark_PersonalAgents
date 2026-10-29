@@ -149,6 +149,19 @@ export interface AppState {
   traceback?: string;
 }
 
+export interface AgentWorktree {
+  path: string;
+  branch: string;
+  base: string;
+  state: string;
+  diff?: {
+    stat?: string;
+    files?: Array<{ status: string; path: string }>;
+    base?: string;
+  } | null;
+  error?: string;
+}
+
 export interface AgentNode {
   id: string;
   kind: 'orchestrator' | 'workspace' | 'subagent';
@@ -163,6 +176,31 @@ export interface AgentNode {
   model: string;
   depth: number;
   result?: string;
+  access?: 'read' | 'write' | 'worktree' | string;
+  worktree?: AgentWorktree | null;
+  pendingMessages?: number;
+  lastActive?: string | null;
+  updatedAt?: string;
+  usage?: Record<string, unknown>;
+}
+
+export interface AgentMessage {
+  id: string;
+  senderId?: string | null;
+  recipientId: string;
+  kind: string;
+  body: string;
+  metadata?: Record<string, unknown>;
+  delivery: string;
+  createdAt: string;
+  consumedAt?: string | null;
+}
+
+export interface AgentDetail {
+  agent: AgentNode;
+  messages: AgentMessage[];
+  history: AgentMessage[];
+  children: AgentNode[];
 }
 
 export interface ModelOption {

@@ -28,7 +28,10 @@ pub mod memory_agent;
 mod notes;
 mod projects;
 mod schedules;
-pub use agents::{AgentSpec, for_scope as agent_for_scope, resolve_agent};
+pub mod worktree;
+pub use agents::{
+    AgentSpec, FileAccess, default_access, for_scope as agent_for_scope, resolve_agent,
+};
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -87,6 +90,7 @@ pub struct RunContext {
     pub role: Option<String>,
     pub scope: String,
     pub depth: u32,
+    pub file_access: FileAccess,
     pub model: String,
     pub temperature: f64,
     /// Images attached to this run (uploads, screen frames). Sent once with
@@ -303,6 +307,12 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
          Use the provided tools to inspect and change files. Read before editing. \
          Never invent tool results. Keep the final answer concise."
     );
+    if ctx.file_access.is_read_only() {
+        system_prompt.push_str(
+            " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
+             Inspect with read_file/search_code/memory and report findings or a proposed patch.",
+        );
+    }
     if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&instructions);
@@ -379,7 +389,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     };
     ctx.emit_state(&mut state);
 
-    let tool_specs = stark_tools::tool_specs_for_scope(&mode, &ctx.scope);
+    let tool_specs =
+        stark_tools::tool_specs_for_scope_with_access(&mode, &ctx.scope, ctx.file_access.as_str());
     let agent_label = ctx.agent_label();
     let mut tools = ToolContext::new(
         ctx.workspace.clone(),
@@ -390,6 +401,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     .with_harness_root(ctx.store.harness_root().to_path_buf())
     .with_workspace_id(ctx.workspace_id.clone())
     .with_scope(ctx.scope.clone())
+    .with_access(ctx.file_access.as_str())
     .with_mode(mode.clone());
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());
@@ -1076,9 +1088,17 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
             if task.is_empty() {
                 return ToolOutcome::err(format!("Error: action='{action}' requires task"));
             }
+            let write_access = args
+                .get("write_access")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let spec = agent_for_scope(name)
                 .or_else(|| agent_for_scope("general"))
                 .unwrap_or(crate::agents::GENERAL);
+            let mut access = crate::default_access(spec.key, current.depth.max(0) as u32 + 1, true);
+            if write_access && access.is_read_only() {
+                access = crate::FileAccess::Worktree;
+            }
             let title: String = args
                 .get("title")
                 .and_then(Value::as_str)
@@ -1086,11 +1106,25 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| task.chars().take(60).collect());
+            // A subagent inherits the parent workspace (which may itself be a
+            // worktree checkout).
+            let parent_workspace = if !current.worktree_path.trim().is_empty()
+                && std::path::Path::new(&current.worktree_path).exists()
+            {
+                let subdir = current.workspace_subdir.trim().trim_matches('/');
+                if subdir.is_empty() {
+                    std::path::PathBuf::from(&current.worktree_path)
+                } else {
+                    std::path::PathBuf::from(&current.worktree_path).join(subdir)
+                }
+            } else {
+                ctx.workspace.clone()
+            };
             let chat = match ctx
                 .store
                 .create_child_chat(
                     &ctx.workspace_id,
-                    ctx.workspace.to_string_lossy().as_ref(),
+                    parent_workspace.to_string_lossy().as_ref(),
                     &title,
                     &ctx.model,
                     &current.chat_id,
@@ -1121,6 +1155,47 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 Ok(agent) => agent,
                 Err(error) => return ToolOutcome::err(format!("Error: {error}")),
             };
+            let _ = store.set_access(&agent.id, access.as_str()).await;
+            let mut effective_workspace = parent_workspace.clone();
+            if access == crate::FileAccess::Worktree {
+                match crate::worktree::create(
+                    ctx.store.harness_root(),
+                    &parent_workspace,
+                    &agent.id,
+                ) {
+                    Ok(info) => {
+                        effective_workspace = crate::worktree::effective_workspace(&info);
+                        let _ = ctx
+                            .store
+                            .set_chat_workspace_path(
+                                &chat_id,
+                                &effective_workspace.to_string_lossy(),
+                            )
+                            .await;
+                        let _ = store
+                            .set_worktree(
+                                &agent.id,
+                                &info.repo_root.to_string_lossy(),
+                                &info.subdir.to_string_lossy(),
+                                &info.path.to_string_lossy(),
+                                &info.branch,
+                                &info.base,
+                                "active",
+                            )
+                            .await;
+                    }
+                    Err(error) => {
+                        if crate::agents::worktree_mode() == "required" {
+                            return ToolOutcome::err(format!(
+                                "Error: worktree isolation required but unavailable: {error}"
+                            ));
+                        }
+                        let _ = store.set_access(&agent.id, "write").await;
+                        access = crate::FileAccess::Write;
+                    }
+                }
+            }
+            let agent = store.get(&agent.id).await.ok().flatten().unwrap_or(agent);
             if action == "spawn" {
                 let _ = store
                     .enqueue(
@@ -1134,8 +1209,8 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                     .await;
                 let _ = store.wake(&agent.id).await;
                 return ToolOutcome::ok(format!(
-                    "[SPAWNED] child={} name={}; use action=status/child_id",
-                    agent.id, agent.role
+                    "[SPAWNED] child={} name={} access={}; use action=status/child_id",
+                    agent.id, agent.role, agent.access
                 ))
                 .with_children(vec![json!({
                     "agentId": agent.id,
@@ -1150,8 +1225,15 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
             }
             let cancel = ctx.cancel.child_token();
             let steering = Arc::new(Mutex::new(VecDeque::new()));
-            let (child, latest) =
-                child_context(ctx, &agent.chat_id, spec.display, steering, cancel.clone());
+            let (child, latest) = child_context_with_access(
+                ctx,
+                &agent.chat_id,
+                spec.display,
+                access,
+                effective_workspace,
+                steering,
+                cancel.clone(),
+            );
             let result = Box::pin(run_agent(child, task.to_string())).await;
             let status = if cancel.is_cancelled() {
                 "cancelled"
@@ -1160,7 +1242,7 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
             } else {
                 "failed"
             };
-            let report = if result.is_ok() {
+            let mut report = if result.is_ok() {
                 read_report(&latest)
             } else {
                 result
@@ -1168,6 +1250,38 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
                     .map(|error| error.to_string())
                     .unwrap_or_default()
             };
+            if access == crate::FileAccess::Worktree {
+                let info = crate::worktree::WorktreeInfo {
+                    path: std::path::PathBuf::from(&agent.worktree_path),
+                    branch: agent.worktree_branch.clone(),
+                    base: agent.worktree_base.clone(),
+                    repo_root: std::path::PathBuf::from(&agent.repo_root),
+                    subdir: std::path::PathBuf::from(&agent.workspace_subdir),
+                };
+                if !info.path.as_os_str().is_empty() {
+                    match crate::worktree::commit_changes(&info, &format!("stark {}", agent.id)) {
+                        Ok(outcome) => {
+                            let diff = crate::worktree::diff(&info.path, &info.base)
+                                .unwrap_or_else(|_| json!({}));
+                            let _ = store
+                                .set_worktree_state(&agent.id, "active", &diff, "")
+                                .await;
+                            if outcome["committed"].as_bool().unwrap_or(false) {
+                                report.push_str(&format!(
+                                    "\n[WORKTREE] branch={}\n{}",
+                                    info.branch,
+                                    outcome["stat"].as_str().unwrap_or("")
+                                ));
+                            }
+                        }
+                        Err(commit_error) => {
+                            let _ = store
+                                .set_worktree_state(&agent.id, "failed", &json!({}), &commit_error)
+                                .await;
+                        }
+                    }
+                }
+            }
             let _ = store.finish(&agent.id, status, &report, json!({})).await;
             if status == "failed" {
                 return ToolOutcome::err(format!("[ERR] Subagent {}: {report}", agent.role))
@@ -1237,9 +1351,22 @@ async fn run_subagent_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
 
 fn format_subagent(agent: &stark_store::AgentRecord) -> String {
     let mut text = format!(
-        "child={}\nname={}\nstatus={}",
-        agent.id, agent.role, agent.status
+        "child={}\nname={}\nstatus={}\naccess={}",
+        agent.id,
+        agent.role,
+        agent.status,
+        if agent.access.is_empty() {
+            "write"
+        } else {
+            &agent.access
+        },
     );
+    if !agent.worktree_branch.is_empty() {
+        text.push_str(&format!(
+            "\nworktree branch={} base={} state={}",
+            agent.worktree_branch, agent.worktree_base, agent.worktree_state
+        ));
+    }
     if !agent.result.is_empty() {
         text.push('\n');
         text.push_str(&agent.result.chars().take(12_000).collect::<String>());
@@ -1270,10 +1397,32 @@ pub(crate) fn read_report(latest: &Arc<Mutex<Option<AppState>>>) -> String {
         .unwrap_or_else(|| "(no report)".to_string())
 }
 
+#[allow(dead_code)]
 pub(crate) fn child_context(
     ctx: &RunContext,
     child_id: &str,
     name: &str,
+    steering: Arc<Mutex<VecDeque<String>>>,
+    cancel: CancellationToken,
+) -> (RunContext, Arc<Mutex<Option<AppState>>>) {
+    child_context_with_access(
+        ctx,
+        child_id,
+        name,
+        crate::FileAccess::Read,
+        ctx.workspace.clone(),
+        steering,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn child_context_with_access(
+    ctx: &RunContext,
+    child_id: &str,
+    name: &str,
+    access: crate::FileAccess,
+    workspace: PathBuf,
     steering: Arc<Mutex<VecDeque<String>>>,
     cancel: CancellationToken,
 ) -> (RunContext, Arc<Mutex<Option<AppState>>>) {
@@ -1282,10 +1431,11 @@ pub(crate) fn child_context(
     let child = RunContext {
         chat_id: child_id.to_string(),
         workspace_id: ctx.workspace_id.clone(),
-        workspace: ctx.workspace.clone(),
+        workspace,
         role: Some(format!("the {name} specialist subagent")),
         scope: name.to_lowercase(),
         depth: ctx.depth + 1,
+        file_access: access,
         model: ctx.model.clone(),
         temperature: ctx.temperature,
         images: Vec::new(),
@@ -1437,6 +1587,7 @@ mod tests {
             role: None,
             scope: "agent".to_string(),
             depth: 0,
+            file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
             temperature: 0.0,
             images: Vec::new(),
@@ -1497,6 +1648,7 @@ mod tests {
             role: Some("Developer".to_string()),
             scope: "developer".to_string(),
             depth: 1,
+            file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
             temperature: 0.0,
             images: Vec::new(),
@@ -1600,6 +1752,7 @@ mod tests {
             role: None,
             scope: "agent".to_string(),
             depth: 0,
+            file_access: crate::FileAccess::Write,
             model: "mock".to_string(),
             temperature: 0.0,
             images: Vec::new(),

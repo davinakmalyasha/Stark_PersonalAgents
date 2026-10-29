@@ -172,6 +172,9 @@ export default function App() {
       wasRunning.current = true;
     } else if (wasRunning.current) {
       wasRunning.current = false;
+      // The server persists the terminal agent status before `done`, so
+      // refresh the tree immediately — do not wait for chat persistence.
+      setSidebarRefreshTick((t) => t + 1);
       // Backend/provider failures also end the stream, but they must not be
       // persisted as completed runs or empty assistant traces.
       if (state?.error) {

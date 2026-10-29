@@ -4,7 +4,7 @@
 //! workspace agent and queues the task; the server supervisor runs it.
 
 use serde_json::{Value, json};
-use stark_store::{AgentRecord, AgentStore};
+use stark_store::{AgentRecord, AgentStore, WorkspaceRegistry};
 use stark_tools::ToolOutcome;
 
 use crate::{RunContext, agent_for_scope, agents_tools};
@@ -17,6 +17,9 @@ struct JobItem {
     outcome: String,
     acceptance: String,
     title: String,
+    workspace: String,
+    project: String,
+    isolate: bool,
 }
 
 pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
@@ -32,6 +35,10 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
     let mut rows = Vec::new();
     let mut children = Vec::new();
     for item in items {
+        let (workspace_id, workspace_path) = match resolve_target(ctx, &item) {
+            Ok(target) => target,
+            Err(error) => return ToolOutcome::err(error),
+        };
         let task = job_prompt(&item);
         let result = agents_tools::handle(
             ctx,
@@ -41,8 +48,9 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 "agent": item.agent.display,
                 "task": task,
                 "title": item.title,
-                "workspace_id": ctx.workspace_id,
-                "workspace_path": ctx.workspace.to_string_lossy(),
+                "workspace_id": workspace_id,
+                "workspace_path": workspace_path,
+                "isolate": item.isolate,
                 "wait_seconds": 0
             }),
         )
@@ -51,7 +59,7 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
             return result;
         }
         let Some(agent) = store
-            .workspace_agent(&ctx.workspace_id, item.agent.key)
+            .workspace_agent(&workspace_id, item.agent.key)
             .await
             .ok()
             .flatten()
@@ -67,7 +75,7 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
             "chatId": agent.chat_id,
             "agentName": agent.role,
             "label": item.title,
-            "workspaceId": ctx.workspace_id,
+            "workspaceId": workspace_id,
         }));
     }
     ToolOutcome::ok(format!(
@@ -75,6 +83,91 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
         rows.join("\n")
     ))
     .with_children(children)
+}
+
+fn resolve_target(ctx: &RunContext, item: &JobItem) -> Result<(String, String), String> {
+    let harness = ctx.store.harness_root();
+    let registry = WorkspaceRegistry::new(harness);
+    if !item.workspace.trim().is_empty() {
+        let query = item.workspace.trim();
+        if let Some(record) = registry
+            .get(query)
+            .or_else(|| registry.find_by_path(query))
+            .or_else(|| {
+                registry.list().into_iter().find(|workspace| {
+                    workspace.name.eq_ignore_ascii_case(query)
+                        || workspace.id.eq_ignore_ascii_case(query)
+                })
+            })
+        {
+            return Ok((record.id, record.path));
+        }
+        // Virtual workspaces (_general, _house, ...) have no registry entry.
+        if query.starts_with('_') {
+            let path = if query == ctx.workspace_id {
+                ctx.workspace.to_string_lossy().to_string()
+            } else {
+                harness.to_string_lossy().to_string()
+            };
+            return Ok((query.to_string(), path));
+        }
+        // A raw filesystem path is also acceptable.
+        if std::path::Path::new(query).is_dir() {
+            let id = ctx.store.workspace_id_for_path(query);
+            return Ok((id, query.to_string()));
+        }
+        return Err(format!("Error: unknown workspace '{}'", item.workspace));
+    }
+    if !item.project.trim().is_empty() {
+        let query = item.project.trim().to_ascii_lowercase();
+        let mut matches: Vec<_> = registry
+            .list()
+            .into_iter()
+            .filter(|workspace| {
+                workspace.name.to_ascii_lowercase().contains(&query)
+                    || workspace.id.to_ascii_lowercase().contains(&query)
+                    || workspace.path.to_ascii_lowercase().contains(&query)
+            })
+            .collect();
+        if matches.is_empty() {
+            return Err(format!("Error: unknown project '{}'", item.project));
+        }
+        matches.sort_by_key(|workspace| workspace.name.len());
+        let record = matches.remove(0);
+        return Ok((record.id, record.path));
+    }
+    match item.agent.key {
+        "house" => Ok((
+            "_house".to_string(),
+            harness.join("_house").to_string_lossy().to_string(),
+        )),
+        "general" => Ok((
+            "_general".to_string(),
+            harness.to_string_lossy().to_string(),
+        )),
+        "dfd" => Ok((
+            "_dfd".to_string(),
+            harness.join("_dfd").to_string_lossy().to_string(),
+        )),
+        "developer" | "ui" | "devops" => {
+            // Never silently write a project agent into the harness root.
+            let in_project = ctx.workspace != *harness && !ctx.workspace_id.starts_with('_');
+            if in_project {
+                return Ok((
+                    ctx.workspace_id.clone(),
+                    ctx.workspace.to_string_lossy().to_string(),
+                ));
+            }
+            Err(format!(
+                "Error: {} delegation requires a workspace or project target; current chat is not in a project",
+                item.agent.display
+            ))
+        }
+        _ => Ok((
+            ctx.workspace_id.clone(),
+            ctx.workspace.to_string_lossy().to_string(),
+        )),
+    }
 }
 
 pub(crate) async fn job_message(ctx: &RunContext, args: &Value) -> ToolOutcome {
@@ -227,6 +320,22 @@ fn parse_items(args: &Value) -> Result<Vec<JobItem>, String> {
                 .trim()
                 .to_string(),
             title,
+            workspace: object
+                .get("workspace")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            project: object
+                .get("project")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            isolate: object
+                .get("isolate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         });
     }
     Ok(parsed)

@@ -811,6 +811,21 @@ impl ChatStore {
         }))
     }
 
+    pub async fn set_chat_workspace_path(
+        &self,
+        chat_id: &str,
+        workspace_path: &str,
+    ) -> Result<bool, StoreError> {
+        validate_chat_id(chat_id)?;
+        let result =
+            sqlx::query("UPDATE chats SET workspace_path = ?, updated_at = ? WHERE id = ?")
+                .bind(workspace_path)
+                .bind(now_iso())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn messages_from(
         &self,
         chat_id: &str,

@@ -208,7 +208,7 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or(DEFAULT_MAX_TOOL_CALLS)
         .clamp(1, MAX_MAX_TOOL_CALLS);
 
-    let specs = crate::tool_specs_for_scope(&ctx.mode, &ctx.scope);
+    let specs = crate::tool_specs_for_scope_with_access(&ctx.mode, &ctx.scope, &ctx.access);
     let mut catalog = Vec::new();
     let mut allowed = HashSet::new();
     for spec in specs {

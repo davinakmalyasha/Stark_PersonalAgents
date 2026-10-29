@@ -204,6 +204,8 @@ struct RunTarget {
     role: Option<String>,
     model: String,
     temperature: f64,
+    depth: u32,
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +376,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}", get(agent_handler))
         .route("/api/agents/{agent_id}/cancel", post(agent_cancel_handler))
+        .route(
+            "/api/agents/{agent_id}/message",
+            post(agent_message_handler),
+        )
+        .route("/api/agents/{agent_id}/diff", get(agent_diff_handler))
+        .route("/api/agents/{agent_id}/merge", post(agent_merge_handler))
+        .route(
+            "/api/agents/{agent_id}/discard",
+            post(agent_discard_handler),
+        )
         .route("/api/mcp/servers", get(mcp_servers_handler))
         .route(
             "/api/mcp/servers/{server_name}",
@@ -596,6 +608,8 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
         role: Some(agent.display.to_string()),
         model,
         temperature: 0.2,
+        depth: 0,
+        agent_id: None,
     }
 }
 
@@ -636,6 +650,8 @@ async fn schedule_loop(state: ServerState) {
                     role: record.role.clone(),
                     model: record.model.clone(),
                     temperature: record.temperature,
+                    depth: 0,
+                    agent_id: None,
                 },
                 record.prompt.clone(),
             );
@@ -800,6 +816,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         role: Some(agent.display.to_string()),
         scope: agent.key.to_string(),
         depth: 0,
+        file_access: stark_core::FileAccess::Write,
         model,
         temperature: 0.2,
         images: Vec::new(),
@@ -1009,6 +1026,8 @@ Attached files:
         role: Some(agent.display.to_string()),
         model,
         temperature: request.temperature,
+        depth: 0,
+        agent_id: None,
     };
     // Image attachments (uploads, voice screen frames) ride the opening user
     // message as real vision parts; the text note in the prompt stays for
@@ -1024,13 +1043,18 @@ Attached files:
             })
             .collect();
     let latest = Arc::new(Mutex::new(None));
+    let root_access = stark_core::default_access(&target.scope, 0, false);
+    // Ensure the root agent exists before the run so status transitions are
+    // visible in the tree for the whole run.
+    let target = ensure_root_agent(&state, target, root_access.as_str()).await;
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
         workspace_id: target.workspace_id.clone(),
         workspace: target.workspace.clone(),
         role: target.role.clone(),
         scope: target.scope.clone(),
-        depth: 0,
+        depth: target.depth,
+        file_access: root_access,
         model: target.model.clone(),
         temperature: target.temperature,
         images: run_images,
@@ -1052,7 +1076,6 @@ Attached files:
     let canvas_chat = chat_id.clone();
     let status_state = state.clone();
     let status_chat = chat_id.clone();
-    mark_agent_status(&state, &chat_id, "running").await;
     let prompt_for_run = prompt;
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt_for_run).await;
@@ -1075,12 +1098,18 @@ Attached files:
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let usage = final_state
+            .as_ref()
+            .map(|state| serde_json::to_value(&state.token_usage).unwrap_or_else(|_| json!({})))
+            .unwrap_or_else(|| json!({}));
+        // Persist the terminal agent status BEFORE the client sees `done`.
+        // Otherwise the tree polls and still sees `running`.
+        finish_agent_status(&status_state, &status_chat, status, &report, &usage).await;
         manager.finish(&chat_id, final_state);
         let _ = done_tx.send(ServerEvent::new(
             "done",
             json!({"status": status, "error": error}),
         ));
-        mark_agent_status(&status_state, &status_chat, "idle").await;
         spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
 
@@ -1116,13 +1145,16 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
 
     let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
     let latest = Arc::new(Mutex::new(None));
+    let follow_access =
+        stark_core::default_access(&target.scope, target.depth, target.agent_id.is_some());
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
         workspace_id: target.workspace_id.clone(),
         workspace: target.workspace.clone(),
         role: target.role.clone(),
         scope: target.scope.clone(),
-        depth: 0,
+        depth: target.depth,
+        file_access: follow_access,
         model: target.model.clone(),
         temperature: target.temperature,
         images: Vec::new(),
@@ -1172,14 +1204,82 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let usage = final_state
+            .as_ref()
+            .map(|state| serde_json::to_value(&state.token_usage).unwrap_or_else(|_| json!({})))
+            .unwrap_or_else(|| json!({}));
+        finish_agent_status(&status_state, &status_chat, status, &report, &usage).await;
         manager.finish(&chat_id, final_state);
         let _ = done_tx.send(ServerEvent::new(
             "done",
             json!({"status": status, "error": error}),
         ));
-        mark_agent_status(&status_state, &status_chat, "idle").await;
         spawn_canvas_notification(canvas_state, canvas_chat, report, status);
     });
+}
+
+async fn ensure_root_agent(state: &ServerState, target: RunTarget, access: &str) -> RunTarget {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return target;
+    };
+    let (kind, path) = if target.scope == "orchestrator" {
+        ("orchestrator", format!("orchestrator:{}", target.chat_id))
+    } else {
+        ("workspace", format!("root:{}", target.chat_id))
+    };
+    let agent_id = match store.by_chat(&target.chat_id).await {
+        Ok(Some(agent)) => {
+            let _ = store.set_status(&agent.id, "running", true).await;
+            let _ = store.set_access(&agent.id, access).await;
+            Some(agent.id)
+        }
+        _ => match store
+            .create_agent(
+                kind,
+                &path,
+                None,
+                &target.chat_id,
+                &target.workspace_id,
+                &target.scope,
+                target.role.as_deref().unwrap_or("Agent"),
+                "",
+                &target.model,
+                0,
+            )
+            .await
+        {
+            Ok(agent) => {
+                let _ = store.set_status(&agent.id, "running", true).await;
+                let _ = store.set_access(&agent.id, access).await;
+                Some(agent.id)
+            }
+            Err(_) => None,
+        },
+    };
+    RunTarget { agent_id, ..target }
+}
+
+async fn finish_agent_status(
+    state: &ServerState,
+    chat_id: &str,
+    run_status: &str,
+    report: &str,
+    usage: &Value,
+) {
+    let agent_status = match run_status {
+        "complete" => "completed",
+        "aborted" => "cancelled",
+        _ => "failed",
+    };
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return;
+    };
+    let Ok(Some(agent)) = store.by_chat(chat_id).await else {
+        return;
+    };
+    let _ = store
+        .finish(&agent.id, agent_status, report, usage.clone())
+        .await;
 }
 
 async fn mark_agent_status(state: &ServerState, chat_id: &str, status: &str) {
@@ -1227,13 +1327,22 @@ async fn agent_loop(state: ServerState) {
 }
 
 async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
-    let workspace_path = state
+    let mut workspace_path = state
         .store
         .chat_workspace_path(&agent.chat_id)
         .await
         .ok()
         .flatten()
         .unwrap_or_default();
+    // An isolated agent runs in its worktree, not the parent workspace.
+    if !agent.worktree_path.trim().is_empty() {
+        let subdir = agent.workspace_subdir.trim().trim_matches('/');
+        if subdir.is_empty() {
+            workspace_path = agent.worktree_path.clone();
+        } else {
+            workspace_path = format!("{}/{}", agent.worktree_path.trim_end_matches('/'), subdir);
+        }
+    }
     let workspace = if workspace_path.trim().is_empty() {
         state.harness_root.clone()
     } else {
@@ -1252,6 +1361,8 @@ async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
         role: (!agent.role.is_empty()).then(|| agent.role.clone()),
         model,
         temperature: 0.2,
+        depth: agent.depth.max(0) as u32,
+        agent_id: Some(agent.id.clone()),
     }
 }
 
@@ -1309,6 +1420,7 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         .join("\n\n");
     let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);
     let latest = Arc::new(Mutex::new(None));
+    let access = stark_core::FileAccess::from_str(&agent.access);
     let ctx = RunContext {
         chat_id: target.chat_id.clone(),
         workspace_id: target.workspace_id.clone(),
@@ -1316,6 +1428,7 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         role: target.role.clone(),
         scope: target.scope.clone(),
         depth: agent.depth.max(0) as u32,
+        file_access: access,
         model: target.model.clone(),
         temperature: target.temperature,
         images: Vec::new(),
@@ -1335,6 +1448,9 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
     let done_tx = tx.clone();
     let canvas_state = state.clone();
     let canvas_chat = target.chat_id.clone();
+    let worktree_path = agent.worktree_path.clone();
+    let worktree_branch = agent.worktree_branch.clone();
+    let worktree_base = agent.worktree_base.clone();
     tokio::spawn(async move {
         let result = run_agent(ctx, prompt).await;
         stark_core::unregister_agent_cancel(&agent.id);
@@ -1361,14 +1477,50 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
             .as_ref()
             .and_then(|state| serde_json::to_value(&state.token_usage).ok())
             .unwrap_or_else(|| json!({}));
+        // Commit isolated work before the parent sees the result, then
+        // persist the terminal status before `done` so the tree is accurate.
+        let mut worktree_note = String::new();
+        if !worktree_path.trim().is_empty() {
+            let info = stark_core::worktree::WorktreeInfo {
+                path: std::path::PathBuf::from(&worktree_path),
+                branch: worktree_branch.clone(),
+                base: worktree_base.clone(),
+                repo_root: std::path::PathBuf::from(agent.repo_root.clone()),
+                subdir: std::path::PathBuf::from(agent.workspace_subdir.clone()),
+            };
+            match stark_core::worktree::commit_changes(&info, &format!("stark {}", agent.id)) {
+                Ok(outcome) => {
+                    let diff = stark_core::worktree::diff(&info.path, &info.base)
+                        .unwrap_or_else(|_| json!({}));
+                    let _ = store
+                        .set_worktree_state(&agent.id, "active", &diff, "")
+                        .await;
+                    if outcome["committed"].as_bool().unwrap_or(false) {
+                        worktree_note = format!(
+                            "\n[WORKTREE] branch={} base={}\n{}",
+                            info.branch,
+                            info.base,
+                            outcome["stat"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+                Err(commit_error) => {
+                    let _ = store
+                        .set_worktree_state(&agent.id, "failed", &json!({}), &commit_error)
+                        .await;
+                    worktree_note = format!("\n[WORKTREE ERROR] {commit_error}");
+                }
+            }
+        }
+        let full_report = format!("{report}{worktree_note}");
+        let _ = store.finish(&agent.id, status, &full_report, usage).await;
         manager.finish(&canvas_chat, final_state);
         let _ = done_tx.send(ServerEvent::new(
             "done",
             json!({"status": status, "error": error}),
         ));
-        let _ = store.finish(&agent.id, status, &report, usage).await;
-        if let Ok(Some(message_id)) = store.notify_parent(&agent, &report, status).await {
-            wake_parent_agent(&store, &canvas_state, &agent, &report, message_id).await;
+        if let Ok(Some(message_id)) = store.notify_parent(&agent, &full_report, status).await {
+            wake_parent_agent(&store, &canvas_state, &agent, &full_report, message_id).await;
         }
         if store
             .messages(&agent.id)
@@ -1537,13 +1689,14 @@ async fn agents_handler(State(state): State<ServerState>) -> Json<Value> {
     let Ok(store) = AgentStore::open(&state.harness_root).await else {
         return Json(json!({"agents": []}));
     };
-    let agents = store
-        .list(None)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(AgentRecord::to_json)
-        .collect::<Vec<_>>();
+    let records = store.list(None).await.unwrap_or_default();
+    let mut agents = Vec::with_capacity(records.len());
+    for record in records {
+        let mut value = record.to_json();
+        value["pendingMessages"] =
+            json!(store.pending_messages_count(&record.id).await.unwrap_or(0));
+        agents.push(value);
+    }
     Json(json!({"agents": agents}))
 }
 
@@ -1556,8 +1709,24 @@ async fn agent_handler(
     };
     match store.get(&agent_id).await {
         Ok(Some(agent)) => {
-            let messages = store.messages(&agent_id).await.unwrap_or_default();
-            Json(json!({"agent": agent.to_json(), "messages": messages}))
+            let pending = store.messages(&agent_id).await.unwrap_or_default();
+            let history = store.messages_all(&agent_id).await.unwrap_or_default();
+            let children = store
+                .list(Some(&agent.id))
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(AgentRecord::to_json)
+                .collect::<Vec<_>>();
+            let mut value = agent.to_json();
+            value["pendingMessages"] =
+                json!(store.pending_messages_count(&agent.id).await.unwrap_or(0));
+            Json(json!({
+                "agent": value,
+                "messages": pending,
+                "history": history,
+                "children": children,
+            }))
         }
         Ok(None) => Json(json!({"error": "agent not found"})),
         Err(error) => Json(json!({"error": error.to_string()})),
@@ -1585,6 +1754,170 @@ async fn agent_cancel_handler(
         }
     }
     Json(json!({"ok": true, "cancelled": cancelled}))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AgentMessageRequest {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    delivery: String,
+}
+
+async fn agent_message_handler(
+    State(state): State<ServerState>,
+    Path(agent_id): Path<String>,
+    Json(request): Json<AgentMessageRequest>,
+) -> Json<Value> {
+    if request.message.trim().is_empty() {
+        return Json(json!({"error": "message is required"}));
+    }
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "agent store unavailable"}));
+    };
+    let Ok(Some(agent)) = store.get(&agent_id).await else {
+        return Json(json!({"error": "agent not found"}));
+    };
+    let body = request.message.trim().to_string();
+    // Running agents get steered immediately; idle agents get a trigger.
+    if state.runs.is_running(&agent.chat_id) {
+        let id = store
+            .enqueue(
+                Some(&agent.id),
+                &agent.id,
+                "message",
+                &body,
+                "queue",
+                json!({"from": "ui"}),
+            )
+            .await
+            .unwrap_or_default();
+        let steered = state.runs.steer(&agent.chat_id, &body);
+        if steered && !id.is_empty() {
+            let _ = store.consume_message(&id).await;
+        }
+        return Json(json!({"ok": true, "steered": steered, "status": agent.status}));
+    }
+    let id = match store
+        .enqueue(
+            Some(&agent.id),
+            &agent.id,
+            "message",
+            &body,
+            if request.delivery == "queue" {
+                "queue"
+            } else {
+                "trigger"
+            },
+            json!({"from": "ui"}),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => return Json(json!({"error": error.to_string()})),
+    };
+    let _ = store.wake(&agent.id).await;
+    Json(json!({"ok": true, "steered": false, "messageId": id}))
+}
+
+async fn agent_diff_handler(
+    State(state): State<ServerState>,
+    Path(agent_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "agent store unavailable"}));
+    };
+    let Ok(Some(agent)) = store.get(&agent_id).await else {
+        return Json(json!({"error": "agent not found"}));
+    };
+    if agent.worktree_path.trim().is_empty() || agent.worktree_branch.trim().is_empty() {
+        return Json(json!({
+            "agent": agent.to_json(),
+            "diff": Value::Null,
+            "note": "agent has no worktree",
+        }));
+    }
+    let path = std::path::PathBuf::from(&agent.worktree_path);
+    let diff =
+        stark_core::worktree::diff(&path, &agent.worktree_base).unwrap_or_else(|_| json!({}));
+    let _ = store
+        .set_worktree_state(&agent.id, &agent.worktree_state, &diff, "")
+        .await;
+    Json(json!({"agent": agent.to_json(), "diff": diff}))
+}
+
+async fn agent_merge_handler(
+    State(state): State<ServerState>,
+    Path(agent_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "agent store unavailable"}));
+    };
+    let Ok(Some(agent)) = store.get(&agent_id).await else {
+        return Json(json!({"error": "agent not found"}));
+    };
+    if matches!(agent.status.as_str(), "running" | "queued") {
+        return Json(json!({"error": "agent is still running; cancel or wait first"}));
+    }
+    if agent.worktree_path.trim().is_empty() {
+        return Json(json!({"error": "agent has no worktree to merge"}));
+    }
+    let info = stark_core::worktree::WorktreeInfo {
+        path: std::path::PathBuf::from(&agent.worktree_path),
+        branch: agent.worktree_branch.clone(),
+        base: agent.worktree_base.clone(),
+        repo_root: std::path::PathBuf::from(&agent.repo_root),
+        subdir: std::path::PathBuf::from(&agent.workspace_subdir),
+    };
+    match stark_core::worktree::merge(&info) {
+        Ok(outcome) => {
+            let _ = store
+                .set_worktree_state(&agent.id, "merged", &json!({}), "")
+                .await;
+            Json(json!({"ok": true, "result": outcome}))
+        }
+        Err(error) => {
+            let _ = store
+                .set_worktree_state(&agent.id, "active", &json!({}), &error)
+                .await;
+            Json(json!({"error": error}))
+        }
+    }
+}
+
+async fn agent_discard_handler(
+    State(state): State<ServerState>,
+    Path(agent_id): Path<String>,
+) -> Json<Value> {
+    let Ok(store) = AgentStore::open(&state.harness_root).await else {
+        return Json(json!({"error": "agent store unavailable"}));
+    };
+    let Ok(Some(agent)) = store.get(&agent_id).await else {
+        return Json(json!({"error": "agent not found"}));
+    };
+    stark_core::cancel_agent_run(&agent.id);
+    let _ = store.set_status(&agent.id, "cancelled", false).await;
+    if agent.worktree_path.trim().is_empty() {
+        return Json(json!({"ok": true, "discarded": false}));
+    }
+    let repo = if agent.repo_root.trim().is_empty() {
+        std::path::PathBuf::from(&agent.worktree_path)
+    } else {
+        std::path::PathBuf::from(&agent.repo_root)
+    };
+    match stark_core::worktree::discard(
+        &repo,
+        &std::path::PathBuf::from(&agent.worktree_path),
+        &agent.worktree_branch,
+    ) {
+        Ok(outcome) => {
+            let _ = store
+                .set_worktree_state(&agent.id, "discarded", &json!({}), "")
+                .await;
+            Json(json!({"ok": true, "result": outcome}))
+        }
+        Err(error) => Json(json!({"error": error})),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4162,6 +4495,8 @@ mod tests {
                 role: Some("Orchestrator".to_string()),
                 model: "mock".to_string(),
                 temperature: 0.0,
+                depth: 0,
+                agent_id: None,
             },
             "[DELEGATION RESULT] job done".to_string(),
         );

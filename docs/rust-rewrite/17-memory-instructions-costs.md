@@ -177,13 +177,16 @@ compatibility. Telegram itself is not a dependency.
 
 ## Agent API
 
-- `GET /api/agents` — flat agent list
-- `GET /api/agents/{agent_id}` — agent + unconsumed mailbox
+- `GET /api/agents` — agent list with access, worktree, pending counts
+- `GET /api/agents/{agent_id}` — agent + pending mailbox + history + children
+- `POST /api/agents/{agent_id}/message` — steer a running agent or queue a trigger
+- `GET /api/agents/{agent_id}/diff`, `POST .../merge`, `POST .../discard`
 
 The durable agent scheduler and mailbox are documented in
 [16-durable-agents.md](./16-durable-agents.md).
 
-## Not yet implemented
+## Status ordering
 
-- Worktree isolation for write subagents
-- Full agent-tree mailbox/send controls
+The server persists the terminal agent status (`completed`/`failed`/`cancelled`)
+before sending the stream `done` event, and the client refreshes the sidebar
+tree as soon as the run ends. Follow-up runs keep their depth and agent id.

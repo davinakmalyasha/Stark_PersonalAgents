@@ -118,6 +118,8 @@ pub struct ToolContext {
     pub harness_root: PathBuf,
     pub scope: String,
     pub mode: String,
+    /// "read" blocks writes at dispatch; "write"/"worktree" allow them.
+    pub access: String,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
 }
 
@@ -140,6 +142,7 @@ impl ToolContext {
             approvals: Arc::new(ApprovalCache::new()),
             scope: "agent".to_string(),
             mode: "build".to_string(),
+            access: "write".to_string(),
             code_delta: None,
         }
     }
@@ -171,6 +174,11 @@ impl ToolContext {
 
     pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
         self.mode = mode.into();
+        self
+    }
+
+    pub fn with_access(mut self, access: impl Into<String>) -> Self {
+        self.access = access.into();
         self
     }
 
@@ -250,8 +258,13 @@ pub fn tool_specs_for(mode: &str) -> Vec<Value> {
 }
 
 pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
+    tool_specs_for_scope_with_access(mode, scope, "write")
+}
+
+pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -> Vec<Value> {
     let scope = scope.trim().to_lowercase();
     let allowed = contract().scope_map.get(&scope);
+    let read_only = access == "read";
     let mut specs: Vec<Value> = contract()
         .tools
         .iter()
@@ -260,6 +273,26 @@ pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
                 && IMPLEMENTED.contains(&tool.name.as_str())
                 && allowed.is_none_or(|names| names.contains(&tool.name))
                 && !(mode == "plan" && PLAN_WRITE_TOOLS.contains(&tool.name.as_str()))
+                && !(read_only
+                    && matches!(
+                        tool.name.as_str(),
+                        "edit_file"
+                            | "run_code"
+                            | "call_subagent"
+                            | "create_docx"
+                            | "create_xlsx"
+                            | "create_coding_project"
+                            | "create_group"
+                            | "create_client"
+                            | "house_set_device"
+                            | "house_run_scene"
+                            | "look_at_screen"
+                            | "set_screen_share"
+                            | "group_update"
+                            | "schedule"
+                            | "canvas_mode"
+                            | "give_note"
+                    ))
         })
         .map(|tool| {
             let mut spec = json!({
@@ -363,11 +396,89 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
     None
 }
 
+pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<String> {
+    if ctx.access != "read" {
+        return None;
+    }
+    match name {
+        "edit_file"
+        | "run_code"
+        | "call_subagent"
+        | "create_docx"
+        | "create_xlsx"
+        | "create_coding_project"
+        | "create_group"
+        | "create_client"
+        | "house_set_device"
+        | "house_run_scene"
+        | "look_at_screen"
+        | "set_screen_share"
+        | "group_update"
+        | "schedule"
+        | "canvas_mode"
+        | "give_note" => Some(format!(
+            "[BLOCKED] Read-only agent cannot call {name}. Report findings or a proposed patch instead."
+        )),
+        "run_command" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            if let Err(reason) = stark_policy::check_read_only(command) {
+                Some(format!(
+                    "[BLOCKED] Read-only agent cannot run mutating commands ({reason}). Use read_file/search_code."
+                ))
+            } else {
+                None
+            }
+        }
+        "browser_act" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+            match action {
+                "navigate" | "extract" | "screenshot" | "close" | "" => None,
+                _ => Some(format!(
+                    "[BLOCKED] Read-only agent cannot use browser_act '{action}'. Allowed: navigate, extract, screenshot, close."
+                )),
+            }
+        }
+        "memory" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("index");
+            match action {
+                "remember" | "forget" | "pin" => Some(
+                    "[BLOCKED] Read-only agent cannot write memory. Use read/search instead."
+                        .to_string(),
+                ),
+                _ => None,
+            }
+        }
+        "agent" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+            match action {
+                "merge" | "discard" => Some(format!(
+                    "[BLOCKED] Read-only agent cannot use agent action '{action}'."
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
         return ToolOutcome::err(reason);
     }
+    if ctx.access == "read"
+        && let Some(reason) = read_only_denial(name, args, ctx)
+    {
+        return ToolOutcome::err(reason);
+    }
     if name.starts_with("mcp__") {
+        if ctx.access == "read" {
+            return ToolOutcome::err(
+                "[BLOCKED] Read-only agent cannot call MCP tools. Report findings instead.",
+            );
+        }
         return mcp::call(name, args, ctx).await;
     }
     if name == "run_code" {
@@ -522,6 +633,52 @@ mod tests {
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
             37
+        );
+    }
+
+    #[test]
+    fn read_only_access_hides_write_tools_and_blocks_dispatch() {
+        let read = tool_specs_for_scope_with_access("build", "explore", "read");
+        let names = tool_names(&read);
+        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"run_code"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search_code"));
+
+        let ctx = ToolContext::new(
+            std::path::Path::new("."),
+            "chat",
+            Arc::new(QuestionBroker::new()),
+        )
+        .with_access("read");
+        assert!(read_only_denial("edit_file", &json!({"file_path": "a"}), &ctx).is_some());
+        assert!(
+            read_only_denial("run_command", &json!({"command": "echo x > out.txt"}), &ctx)
+                .is_some()
+        );
+        assert!(read_only_denial("run_command", &json!({"command": "ls"}), &ctx).is_none());
+        assert!(
+            read_only_denial(
+                "browser_act",
+                &json!({"action": "click", "selector": "a"}),
+                &ctx
+            )
+            .is_some()
+        );
+        assert!(
+            read_only_denial(
+                "browser_act",
+                &json!({"action": "extract", "selector": "a"}),
+                &ctx
+            )
+            .is_none()
+        );
+        assert!(
+            read_only_denial("memory", &json!({"action": "remember", "text": "x"}), &ctx).is_some()
+        );
+        assert!(
+            read_only_denial("memory", &json!({"action": "read", "topic": "facts"}), &ctx)
+                .is_none()
         );
     }
 

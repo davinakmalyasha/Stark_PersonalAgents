@@ -10,7 +10,7 @@ const rs = fs.readFileSync(
   path.join(root, 'backend-rs', 'crates', 'stark-tools', 'src', 'inventory.rs'),
   'utf8',
 );
-const re = /ToolMeta\s*\{\s*name:\s*"([^"]+)",\s*plan_write:\s*(?:true|false),\s*read_blocked:\s*(?:true|false),\s*verb:\s*"([^"]+)",\s*summary:\s*"([^"]+)"\s*\}/g;
+const re = /ToolMeta\s*\{\s*name:\s*"([^"]+)",\s*plan_write:\s*(?:true|false),\s*read_blocked:\s*(?:true|false),\s*program:\s*(?:true|false),\s*verb:\s*"([^"]+)",\s*summary:\s*"([^"]+)",?\s*\}/g;
 const entries = [...rs.matchAll(re)].map((m) => ({ name: m[1], verb: m[2], summary: m[3] }));
 if (!entries.length) throw new Error('no ToolMeta entries parsed from inventory.rs');
 entries.sort((a, b) => a.name.localeCompare(b.name));

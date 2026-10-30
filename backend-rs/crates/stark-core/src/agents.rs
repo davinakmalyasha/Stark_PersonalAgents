@@ -17,6 +17,14 @@ pub const DEVELOPER: AgentSpec = AgentSpec {
     instructions: "You are the Developer agent. Implement, test, and verify code. Read files before editing. Keep the plan current for multi-step work.",
 };
 
+pub const CODER: AgentSpec = AgentSpec {
+    key: "coder",
+    display: "Coder",
+    plan_scope: "coder",
+    tier: "workspace",
+    instructions: "You are the Coder agent. Implement, test, and verify code through programs that call tools. Read files before editing. Keep the plan current for multi-step work.",
+};
+
 pub const GENERAL: AgentSpec = AgentSpec {
     key: "general",
     display: "General",
@@ -113,13 +121,13 @@ pub fn default_access(scope: &str, depth: u32, spawned: bool) -> FileAccess {
     }
     if !spawned {
         return match scope.as_str() {
-            "developer" | "ui" | "devops" => FileAccess::Write,
+            "developer" | "coder" | "ui" | "devops" => FileAccess::Write,
             "general" | "dfd" => FileAccess::Write,
             _ => FileAccess::Read,
         };
     }
     match scope.as_str() {
-        "developer" | "ui" | "devops" => FileAccess::Worktree,
+        "developer" | "coder" | "ui" | "devops" => FileAccess::Worktree,
         "general" | "dfd" => FileAccess::Write,
         _ => FileAccess::Read,
     }
@@ -134,6 +142,7 @@ pub fn worktree_mode() -> String {
 
 const WORKSPACE_AGENTS: &[AgentSpec] = &[
     DEVELOPER,
+    CODER,
     GENERAL,
     HOUSE,
     DFD,
@@ -198,8 +207,16 @@ mod tests {
     #[test]
     fn scopes_resolve_case_insensitively() {
         assert_eq!(for_scope("Developer"), Some(DEVELOPER));
+        assert_eq!(for_scope("Coder"), Some(CODER));
         assert_eq!(for_scope("UI"), Some(UI));
         assert_eq!(for_scope("missing"), None);
+    }
+
+    #[test]
+    fn coder_matches_developer_access() {
+        assert_eq!(default_access("coder", 0, false), FileAccess::Write);
+        assert_eq!(default_access("coder", 1, true), FileAccess::Worktree);
+        assert_eq!(default_access("coder", 2, false), FileAccess::Read);
     }
 
     #[test]

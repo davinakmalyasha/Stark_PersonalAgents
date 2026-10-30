@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(file.contract_version, 3);
         assert_eq!(file.tool_count, 63);
         assert_eq!(file.tools.len(), 63);
-        assert_eq!(file.scope_map.len(), 8);
+        assert_eq!(file.scope_map.len(), 9);
         assert_eq!(file.exposed_tools().count(), 55);
 
         let hidden: BTreeSet<&str> = file
@@ -193,6 +193,8 @@ mod tests {
         assert!(file.tool("propose_plan").is_none());
 
         assert_eq!(file.scope_map["developer"].len(), 18);
+        assert_eq!(file.scope_map["coder"].len(), 19);
+        assert!(file.scope_map["coder"].contains(&"run_code".to_string()));
         assert_eq!(file.scope_map["general"].len(), 12);
         assert_eq!(file.scope_map["house"].len(), 11);
         assert_eq!(file.scope_map["dfd"].len(), 9);

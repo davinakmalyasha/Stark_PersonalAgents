@@ -44,6 +44,11 @@ Make the plan decision-complete: state the goal and success criteria; group impl
 
 When ready, call ask_user_question with the complete plan markdown (starting with a # title) in the question detail and options ["Approve plan", "Keep planning"] with intent {"kind": "plan-review", "approve": "Approve plan"}. Make it the only and final tool call in that assistant response: approval flips the chat to build mode and implementation begins on a later turn; rejection keeps plan mode and returns feedback to incorporate. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation."#;
 
+pub const CODEMODE_SECTION: &str = r#"# Program tool calls
+You have `run_code`: one call runs a JavaScript program that calls Stark tools for you and returns one compact value. Prefer it when the work is a predictable multi-step sequence (read several files, compute over the results, edit, verify) and the program can return a smaller result than the raw tool outputs. Keep using direct tool calls for single lookups, for exploration where each result steers the next step, and for anything needing approval.
+
+Inside a program: tools are synchronous on the global `tools` object (`const text = tools.read({ file_path: "src/lib.rs" });`), and `search("query")` lists available tools by name and description. Return one compact JSON-serializable value; intermediate tool output never enters the conversation, so do the filtering inside the program. Programs have no filesystem, network, process, or import access except through tools. Subagents, user questions, jobs, schedules, and canvas stay outside programs: call those tools directly, never from inside `run_code`."#;
+
 fn platform_label() -> &'static str {
     if cfg!(windows) {
         "Windows"
@@ -60,6 +65,7 @@ pub async fn system_prompt(
     model: &str,
     mode: &str,
     depth: u32,
+    code_mode: bool,
 ) -> String {
     // Stable first: identity, persona, project instructions, skills.
     let mut prompt = format!(
@@ -81,6 +87,10 @@ pub async fn system_prompt(
     if depth > 0 {
         prompt.push_str("\n\n");
         prompt.push_str(SUBAGENT_NOTE);
+    }
+    if code_mode {
+        prompt.push_str("\n\n");
+        prompt.push_str(CODEMODE_SECTION);
     }
     // Volatile last: the date changes daily, so the tail recomputes at most
     // once a day instead of breaking the cached prefix every turn.
@@ -110,7 +120,15 @@ mod tests {
             "---\nname: review\ndescription: Review code.\n---\n# Review\n",
         )
         .unwrap();
-        let prompt = system_prompt(dir.path(), dir.path(), "deepseek-v4.1-flash", "build", 0).await;
+        let prompt = system_prompt(
+            dir.path(),
+            dir.path(),
+            "deepseek-v4.1-flash",
+            "build",
+            0,
+            false,
+        )
+        .await;
         assert!(prompt.starts_with("You are an AI agent powered by Stark."));
         assert!(prompt.contains("powered by the deepseek-v4.1-flash model"));
         assert!(prompt.contains("Shell: bash (`bash -c`)"));
@@ -140,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn plan_prompt_uses_ask_user_question_for_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = system_prompt(dir.path(), dir.path(), "model", "plan", 0).await;
+        let prompt = system_prompt(dir.path(), dir.path(), "model", "plan", 0, false).await;
         assert!(prompt.contains("ask_user_question"));
         assert!(prompt.contains("plan-review"));
         assert!(!prompt.contains("exit_plan_mode"));
@@ -154,10 +172,24 @@ mod tests {
     #[tokio::test]
     async fn subagent_note_comes_before_the_runtime_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = system_prompt(dir.path(), dir.path(), "model", "build", 1).await;
+        let prompt = system_prompt(dir.path(), dir.path(), "model", "build", 1, false).await;
         assert!(prompt.contains("Your final message is your report to the parent"));
         let note = prompt.find("Your final message is your report").unwrap();
         let runtime = prompt.find("Current runtime context.").unwrap();
         assert!(note < runtime);
+    }
+
+    #[tokio::test]
+    async fn codemode_section_only_with_flag_and_before_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = system_prompt(dir.path(), dir.path(), "model", "build", 0, false).await;
+        assert!(!plain.contains("# Program tool calls"));
+        let coded = system_prompt(dir.path(), dir.path(), "model", "build", 0, true).await;
+        assert!(coded.contains("# Program tool calls"));
+        assert!(coded.contains("`run_code`"));
+        assert!(coded.contains("call those tools directly, never from inside `run_code`"));
+        let section = coded.find("# Program tool calls").unwrap();
+        let runtime = coded.find("Current runtime context.").unwrap();
+        assert!(section < runtime);
     }
 }

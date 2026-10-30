@@ -41,7 +41,7 @@ pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
-pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_read_blocked};
+pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_program, is_read_blocked};
 pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
@@ -261,9 +261,10 @@ pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -
     let scope = scope.trim().to_lowercase();
     let allowed = contract().scope_map.get(&scope);
     let read_only = access == "read";
-    // DeepSeek Harness keeps the tool catalog stable across plan/build. The
-    // Developer v2 surface follows that; older scopes keep the legacy filter.
-    let plan_filter = mode == "plan" && scope != "developer";
+    // New v2 surfaces (developer, coder) keep the tool catalog stable across
+    // plan/build for prefix-cache reuse; writes are blocked at dispatch.
+    // Older scopes keep the legacy filter.
+    let plan_filter = mode == "plan" && !matches!(scope.as_str(), "developer" | "coder");
     let mut specs: Vec<Value> = contract()
         .tools
         .iter()
@@ -673,6 +674,26 @@ mod tests {
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
             55
         );
+    }
+
+    #[test]
+    fn coder_scope_is_developer_plus_run_code() {
+        let developer_specs = tool_specs_for_scope("build", "developer");
+        let developer: std::collections::BTreeSet<&str> =
+            tool_names(&developer_specs).into_iter().collect();
+        let coder_specs = tool_specs_for_scope("build", "coder");
+        let coder: std::collections::BTreeSet<&str> =
+            tool_names(&coder_specs).into_iter().collect();
+        assert_eq!(developer.len(), 18);
+        assert_eq!(coder.len(), 19);
+        assert!(coder.contains("run_code"));
+        assert!(!developer.contains("run_code"));
+        let extra: Vec<&&str> = coder.difference(&developer).collect();
+        assert_eq!(extra, vec![&"run_code"]);
+        // Plan mode keeps the catalog stable for the coder surface.
+        let plan_specs = tool_specs_for_scope("plan", "coder");
+        let plan = tool_names(&plan_specs);
+        assert!(plan.contains(&"run_code"));
     }
 
     #[test]

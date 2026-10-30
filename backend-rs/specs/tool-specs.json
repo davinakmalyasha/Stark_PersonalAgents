@@ -2391,6 +2391,27 @@
       "interrupt_agent",
       "close_agent"
     ],
+    "coder": [
+      "bash",
+      "job",
+      "read",
+      "write",
+      "edit",
+      "glob",
+      "grep",
+      "todo_write",
+      "ask_user_question",
+      "skill",
+      "web_search",
+      "web_fetch",
+      "spawn_agent",
+      "message_agent",
+      "wait_agent",
+      "list_agents",
+      "interrupt_agent",
+      "close_agent",
+      "run_code"
+    ],
     "general": [
       "run_command",
       "read_pdf",

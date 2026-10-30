@@ -300,16 +300,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
     let role = ctx.role.as_deref().unwrap_or("a coding agent");
-    let system_prompt = if ctx.scope == "developer" {
+    let system_prompt = if ctx.scope == "developer" || ctx.scope == "coder" {
         // Developer: OpenCode-shaped prompt, stable content first and the
         // volatile runtime snapshot last so prefix-cache reuse survives plan
         // switches. Memory/worktree blocks are intentionally absent.
+        // Coder shares the shape and adds the program-tool-calling section.
         deepseek_prompt::system_prompt(
             &ctx.workspace,
             ctx.store.harness_root(),
             &ctx.model,
             &mode,
             ctx.depth,
+            ctx.scope == "coder",
         )
         .await
     } else {
@@ -376,6 +378,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         messages.extend(session_messages(&session_entries));
     }
     if ctx.scope != "developer"
+        && ctx.scope != "coder"
         && let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
         && !block.is_empty()
     {
@@ -1610,6 +1613,90 @@ mod tests {
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    async fn mock_coder_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let code = "const t = tools.read({ file_path: \"a.txt\" }); tools.edit({ file_path: \"a.txt\", old_string: \"hello\", new_string: \"bye\" }); return { done: t.includes(\"hello\") };";
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"run_code","arguments": serde_json::to_string(&json!({"code": code})).unwrap()}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn coder_turn_completes_multistep_work_in_one_program() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_coder_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "coder-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Coder".to_string()),
+            scope: "coder".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            on_job_done: None,
+        };
+        run_agent(ctx, "rename hello to bye".to_string())
+            .await
+            .unwrap();
+
+        // One outer program call did the read, edit, and verify.
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        let saved = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(saved, "bye");
     }
 
     #[tokio::test]

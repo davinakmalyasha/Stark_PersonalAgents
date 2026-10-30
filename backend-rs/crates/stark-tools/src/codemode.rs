@@ -31,24 +31,11 @@ const STACK_LIMIT: usize = 512 * 1024;
 
 /// Tools that are deliberately not reachable from inside a program. They are
 /// interactive, recursive, or manage long-running work that belongs to the
-/// outer agent loop.
-const DISALLOWED: &[&str] = &[
-    "run_code",
-    "ask_user",
-    "ask_user_question",
-    "delegate",
-    "call_subagent",
-    "spawn_agent",
-    "message_agent",
-    "wait_agent",
-    "list_agents",
-    "interrupt_agent",
-    "close_agent",
-    "job_message",
-    "job_cancel",
-    "schedule",
-    "canvas_mode",
-];
+/// outer agent loop. Derived from the inventory `program` flag (Codex
+/// `allowed_callers` direct-only); the canonical list lives in `inventory`.
+fn program_blocked(name: &str) -> bool {
+    !crate::is_program(name)
+}
 
 const BOOTSTRAP: &str = r#"
 (function () {
@@ -225,15 +212,23 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         let Some(name) = function.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if DISALLOWED.contains(&name) || !allowed.insert(name.to_string()) {
+        if program_blocked(name) || !allowed.insert(name.to_string()) {
             continue;
         }
+        // Required arg names ride along so programs construct calls
+        // correctly without paying full parameter schemas every turn.
+        let required: Vec<&str> = function
+            .pointer("/parameters/required")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
         catalog.push(json!({
             "name": name,
             "description": function
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("Stark tool"),
+            "required": required,
         }));
     }
 
@@ -427,6 +422,23 @@ return {
         assert_eq!(value["hasAsk"], "undefined");
         assert_eq!(value["hasProcess"], "undefined");
         assert_eq!(value["hasRequire"], "undefined");
+        // Program-visible catalog carries required arg names.
+        let catalog = handle(&ctx, &json!({"code": "return JSON.parse(search(\"\"));"})).await;
+        assert!(!catalog.is_error, "{}", catalog.content);
+        let read = result_json(&catalog)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "read")
+            .cloned()
+            .expect("read in catalog");
+        assert!(
+            read["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("file_path")),
+            "{read}"
+        );
     }
 
     #[tokio::test]
@@ -454,6 +466,53 @@ return n;
             outcome.content.contains("tool call limit"),
             "{}",
             outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_tools_are_absent_inside_programs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        // Excluded from the program catalog, so the properties are undefined
+        // and any call attempt throws before reaching the bridge.
+        let outcome = handle(
+            &ctx,
+            &json!({"code": "return { spawn: typeof tools.spawn_agent, msg: typeof tools.message_agent, ask: typeof tools.ask_user_question };"}),
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        let value = result_json(&outcome);
+        assert_eq!(value["spawn"], "undefined");
+        assert_eq!(value["msg"], "undefined");
+        assert_eq!(value["ask"], "undefined");
+    }
+
+    #[tokio::test]
+    async fn inner_calls_emit_timeline_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let ctx = context(dir.path()).with_code_delta(Arc::new(move |delta| {
+            seen_clone
+                .lock()
+                .unwrap()
+                .push((delta.kind.clone(), delta.tool.clone().unwrap_or_default()));
+        }));
+        let outcome = handle(
+            &ctx,
+            &json!({"code": "return tools.read({ file_path: \"a.txt\" });"}),
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        let events = seen.lock().unwrap().clone();
+        assert!(
+            events.contains(&("tool_started".to_string(), "read".to_string())),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&("tool_finished".to_string(), "read".to_string())),
+            "{events:?}"
         );
     }
 

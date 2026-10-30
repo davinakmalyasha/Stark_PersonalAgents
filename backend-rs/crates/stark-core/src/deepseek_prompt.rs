@@ -1,13 +1,36 @@
-//! Developer v2 prompt: the DeepSeek Harness `standard` preset shape.
+//! Developer prompt: OpenCode v2 system shape, adapted for Stark.
 //!
-//! Most behavior lives in the tool descriptions. This module owns the short
-//! identity/persona/runtime/plan sections plus the project instruction block.
+//! Block 0 is adapted from OpenCode's `system.txt` (identity, Harness,
+//! Communication, Working-in-codebases) with a software-engineering slant.
+//! Most behavior lives in the tool descriptions. Stable content comes first
+//! and volatile content last so prefix-cache reuse survives plan switches:
+//! identity → persona → AGENTS.md → skills → plan → subagent note → runtime.
 
 use chrono::Local;
 
 use crate::instructions;
 
 const IDENTITY: &str = "You are an AI agent powered by Stark.";
+
+const HARNESS: &str = r#"# Harness
+- Responses are rendered as Markdown.
+- `<system-reminder>` blocks are harness instructions, not user-authored content. Read and follow them.
+- Prefer parallelizing independent tool calls.
+- Check the [exit code: N] marker on every bash result; investigate failures before moving on."#;
+
+const COMMUNICATION: &str = r#"# Communication
+- Use clear file paths when referring to files.
+- Keep responses clear and concise, and avoid unnecessary technical jargon."#;
+
+const WORKING_IN_CODEBASES: &str = r#"# Working in codebases
+- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.
+- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.
+- Read a file before editing or overwriting it. Use exact literal matches for edits.
+- Verify changes with the project's tests or build when available.
+- Persist until the task is fully resolved: implement, verify, then report. Do not stop at analysis.
+- Never run destructive commands (git reset --hard, git checkout --, rm -rf) unless explicitly requested."#;
+
+const SUBAGENT_NOTE: &str = "You are a subagent. Your final message is your report to the parent: state what changed, the files you touched, verification evidence, and unresolved risks. Do not ask the user questions; report blockers to the parent.";
 
 const PLAN_SECTION: &str = r#"You are in plan mode. Stay in plan mode until the user approves your plan or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and present it for approval.
 
@@ -20,11 +43,6 @@ Resolve discoverable facts by inspection. Use ask_user_question only for user-ow
 Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
 
 When ready, call ask_user_question with the complete plan markdown (starting with a # title) in the question detail and options ["Approve plan", "Keep planning"] with intent {"kind": "plan-review", "approve": "Approve plan"}. Make it the only and final tool call in that assistant response: approval flips the chat to build mode and implementation begins on a later turn; rejection keeps plan mode and returns feedback to incorporate. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation."#;
-
-const TOOL_GUIDANCE: &str = r#"Tool guidance:
-- Check the [exit code: N] marker on every bash result; investigate failures before moving on.
-- Read a file before editing or overwriting it. Use exact literal matches for edits.
-- The working directory is shown above; relative paths resolve from it. Use bash workdir for per-command directories."#;
 
 fn platform_label() -> &'static str {
     if cfg!(windows) {
@@ -41,21 +59,12 @@ pub async fn system_prompt(
     harness_root: &std::path::Path,
     model: &str,
     mode: &str,
+    depth: u32,
 ) -> String {
-    let now = Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    // Stable first: identity, persona, project instructions, skills.
     let mut prompt = format!(
-        "{IDENTITY}\n\nYou are a coding agent powered by the {model} model.\n\n\
-         Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n\
-         Working directory: {}\nPlatform: {}\nShell: Git Bash (`bash -c`)\nCurrent time: {now}",
-        workspace.to_string_lossy(),
-        platform_label()
+        "{IDENTITY}\n\nYou are a coding agent powered by the {model} model, helping the user accomplish their software engineering goals.\n\n{HARNESS}\n\n{COMMUNICATION}\n\n{WORKING_IN_CODEBASES}"
     );
-    if mode == "plan" {
-        prompt.push_str("\n\n");
-        prompt.push_str(PLAN_SECTION);
-    }
-    prompt.push_str("\n\n");
-    prompt.push_str(TOOL_GUIDANCE);
     if let Some(instructions) = instructions::load(harness_root, workspace) {
         prompt.push_str("\n\n");
         prompt.push_str(&instructions);
@@ -64,6 +73,25 @@ pub async fn system_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(&skills);
     }
+    // Mode- and depth-varying sections stay after the stable prefix.
+    if mode == "plan" {
+        prompt.push_str("\n\n");
+        prompt.push_str(PLAN_SECTION);
+    }
+    if depth > 0 {
+        prompt.push_str("\n\n");
+        prompt.push_str(SUBAGENT_NOTE);
+    }
+    // Volatile last: the date changes daily, so the tail recomputes at most
+    // once a day instead of breaking the cached prefix every turn.
+    let date = Local::now().format("%Y-%m-%d");
+    prompt.push_str(&format!(
+        "\n\nCurrent runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n\
+         Working directory: {}\nPlatform: {}\nShell: bash (`bash -c`)\nCurrent date: {date}\n\
+         Relative paths resolve from the working directory; use bash workdir for per-command directories.",
+        workspace.to_string_lossy(),
+        platform_label()
+    ));
     prompt
 }
 
@@ -82,23 +110,54 @@ mod tests {
             "---\nname: review\ndescription: Review code.\n---\n# Review\n",
         )
         .unwrap();
-        let prompt = system_prompt(dir.path(), dir.path(), "deepseek-v4.1-flash", "build").await;
+        let prompt = system_prompt(dir.path(), dir.path(), "deepseek-v4.1-flash", "build", 0).await;
         assert!(prompt.starts_with("You are an AI agent powered by Stark."));
         assert!(prompt.contains("powered by the deepseek-v4.1-flash model"));
-        assert!(prompt.contains("Git Bash"));
+        assert!(prompt.contains("Shell: bash (`bash -c`)"));
         assert!(prompt.contains("Project rule."));
         assert!(prompt.contains("review: Review code."));
         assert!(!prompt.contains("[WORKSPACE MEMORY]"));
         assert!(!prompt.contains("prefer run_code"));
+        // OpenCode-adapted Block 0 with the software-engineering slant.
+        assert!(prompt.contains("# Harness"));
+        assert!(prompt.contains("# Communication"));
+        assert!(prompt.contains("# Working in codebases"));
+        assert!(prompt.contains("software engineering goals"));
+        assert!(prompt.contains("Persist until the task is fully resolved"));
+        assert!(prompt.contains("Never run destructive commands"));
+        assert!(prompt.contains("Verify changes with the project's tests or build"));
+        // Stable content precedes the volatile runtime tail.
+        let harness = prompt.find("# Harness").unwrap();
+        let instructions = prompt.find("Project rule.").unwrap();
+        let skills = prompt.find("review: Review code.").unwrap();
+        let runtime = prompt.find("Current runtime context.").unwrap();
+        assert!(harness < instructions && instructions < skills && skills < runtime);
+        // Day-precision date keeps the cached prefix stable intraday.
+        assert!(prompt.contains("Current date:"));
+        assert!(!prompt.contains("Current time:"));
     }
 
     #[tokio::test]
     async fn plan_prompt_uses_ask_user_question_for_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = system_prompt(dir.path(), dir.path(), "model", "plan").await;
+        let prompt = system_prompt(dir.path(), dir.path(), "model", "plan", 0).await;
         assert!(prompt.contains("ask_user_question"));
         assert!(prompt.contains("plan-review"));
         assert!(!prompt.contains("exit_plan_mode"));
         assert!(prompt.contains("Do not use todo_write"));
+        // Plan section sits after stable content, before the runtime tail.
+        let plan = prompt.find("You are in plan mode.").unwrap();
+        let runtime = prompt.find("Current runtime context.").unwrap();
+        assert!(plan < runtime);
+    }
+
+    #[tokio::test]
+    async fn subagent_note_comes_before_the_runtime_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = system_prompt(dir.path(), dir.path(), "model", "build", 1).await;
+        assert!(prompt.contains("Your final message is your report to the parent"));
+        let note = prompt.find("Your final message is your report").unwrap();
+        let runtime = prompt.find("Current runtime context.").unwrap();
+        assert!(note < runtime);
     }
 }

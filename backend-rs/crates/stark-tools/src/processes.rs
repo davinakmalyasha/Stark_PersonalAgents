@@ -275,9 +275,6 @@ impl ProcessManager {
             .args(["--noprofile", "--norc", "-c"])
             .arg(command)
             .current_dir(workdir)
-            .env("DSH_WORKSPACE", workdir)
-            .env("DSH_HOME", workdir)
-            .env("DSH_SESSION_ID", owner)
             .env("STARK_WORKSPACE", workdir)
             .env("STARK_SESSION_ID", owner)
             .stdin(Stdio::piped())
@@ -323,9 +320,6 @@ impl ProcessManager {
         builder.args(["--noprofile", "--norc", "-c", command]);
         builder.cwd(workdir);
         builder.env("TERM", "dumb");
-        builder.env("DSH_WORKSPACE", workdir.to_string_lossy().as_ref());
-        builder.env("DSH_HOME", workdir.to_string_lossy().as_ref());
-        builder.env("DSH_SESSION_ID", owner);
         builder.env("STARK_WORKSPACE", workdir.to_string_lossy().as_ref());
         builder.env("STARK_SESSION_ID", owner);
 

@@ -300,12 +300,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
     let role = ctx.role.as_deref().unwrap_or("a coding agent");
-    let mut system_prompt = if ctx.scope == "developer" {
-        // Developer v2: DeepSeek Harness standard preset shape. Behavior is
-        // carried by the tool descriptions; memory/worktree/read-only blocks
-        // are intentionally absent.
-        deepseek_prompt::system_prompt(&ctx.workspace, ctx.store.harness_root(), &ctx.model, &mode)
-            .await
+    let system_prompt = if ctx.scope == "developer" {
+        // Developer: OpenCode-shaped prompt, stable content first and the
+        // volatile runtime snapshot last so prefix-cache reuse survives plan
+        // switches. Memory/worktree blocks are intentionally absent.
+        deepseek_prompt::system_prompt(
+            &ctx.workspace,
+            ctx.store.harness_root(),
+            &ctx.model,
+            &mode,
+            ctx.depth,
+        )
+        .await
     } else {
         let preamble = match agent_for_scope(&ctx.scope) {
             Some(agent) => agent.instructions.to_string(),
@@ -352,11 +358,6 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         }
         prompt
     };
-    if ctx.scope == "developer" && ctx.depth > 0 {
-        system_prompt.push_str(
-            "\n\nYou are a subagent. Your final message is your report to the parent: state what changed, the files you touched, verification evidence, and unresolved risks. Do not ask the user questions; report blockers to the parent.",
-        );
-    }
     let mut messages = vec![ChatMessage::system(system_prompt)];
     if session_entries.is_empty() {
         for message in history {

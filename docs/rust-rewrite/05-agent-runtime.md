@@ -76,19 +76,25 @@ Legacy agent system prompt, fixed order:
 4. Read-only notice when `FileAccess::Read`.
 5. Plan block when a plan exists.
 
-Developer uses the prompt instead:
+Developer uses the prompt instead (OpenCode v2 shape, stable first for
+prefix-cache reuse):
 
 1. `You are an AI agent powered by Stark.`
-2. `You are a coding agent powered by the {model} model.`
-3. Runtime context (cwd Zone 1, platform, Git Bash, time).
-4. Plan section in plan mode (inspect-only; approval via `ask_user_question`
+2. `You are a coding agent powered by the {model} model, ... software
+   engineering goals.`
+3. `# Harness`, `# Communication`, `# Working in codebases` (OpenCode-adapted:
+   exit-code checks, read-before-edit, verify with tests, persist to report,
+   no destructive commands).
+4. `AGENTS.md` hierarchy (64KB cap).
+5. `[SKILLS]` catalog.
+6. Plan section in plan mode (inspect-only; approval via `ask_user_question`
    plan-review; writes blocked at dispatch).
-5. Tool guidance.
-6. `AGENTS.md` hierarchy (64KB cap).
-7. `[SKILLS]` catalog.
+7. Subagent report note when depth > 0.
+8. Runtime snapshot last: cwd, platform, bash, current date (day
+   precision), path-resolution note.
 
 Developer has no `MEMORY.md` injection and no `run_code` nudge. Behavior lives
-in the tool descriptions, matching DeepSeek Harness.
+in the tool descriptions and the Block 0 sections.
 
 Message history derives from the per-chat session JSONL plus the current
 turn. Compaction uses the opencode checkpoint model (see doc 14).

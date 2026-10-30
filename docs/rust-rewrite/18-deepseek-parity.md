@@ -9,11 +9,16 @@ the v1 Stark tools until they are migrated deliberately.
 |---|---|---|
 | Core coding tools | `deepseek-ai/deepseek-harness` | `f3803c9` (0.2.2-alpha.2, 2026-10-27) |
 | Delegation | `openai/codex` | `79be2e2` (2026-10-29) |
+| Prompt shape | `sst/opencode` | system `system.txt` + two-block assembly (`model-request.ts`) |
 
 The DeepSeek source is the `standard` preset at
 `packages/bundle/web-app/presets/standard.patch.yml` and the generated
 `docs/tool-catalog.md`. The Codex source is
-`codex-rs/core/src/tools/handlers/multi_agents_spec.rs` (v2).
+`codex-rs/core/src/tools/handlers/multi_agents_spec.rs` (v2). The prompt
+source is OpenCode's identity/Harness/Communication/Working-in-codebases
+block with per-tool guidance, plus its `[agent.system, initial]` assembly
+where the volatile environment/date snapshot comes last to preserve the
+prompt cache.
 
 ## Developer manifest (18)
 
@@ -50,6 +55,24 @@ Removed from Developer: `read_file`, `edit_file`, `run_command`,
 8. No `exit_plan_mode` tool: plan approval is `ask_user_question` with
    plan-review intent (server auto-flips plan to build on approve) plus the
    composer Approve button calling `POST /api/chat/{id}/mode`.
+
+## Prompt shape (OpenCode-adapted, cache-ordered)
+
+One `system` message, stable content first, volatile content last:
+
+1. Identity (`You are an AI agent powered by Stark.`) + persona (coding
+   agent, software-engineering goals, model name).
+2. `# Harness` / `# Communication` / `# Working in codebases` (exit-code
+   checks, read-before-edit, verify with tests, persist to report, no
+   destructive commands).
+3. `AGENTS.md` hierarchy (64KB cap), then `[SKILLS]` catalog.
+4. Plan section in plan mode only.
+5. Subagent report note when depth > 0.
+6. Runtime snapshot last: cwd, platform, Git Bash, current date (day
+   precision).
+
+Mode switches recompute only the tail; intraday turns share the stable
+prefix. The date is day-precision so it does not break the cache every turn.
 
 ## Behavior
 
@@ -92,4 +115,5 @@ Removed from Developer: `read_file`, `edit_file`, `run_command`,
   plan-review marker.
 - `codex_agents` tests cover spawn/list/message/close and the depth limit.
 - `stark-core` plan test covers the `[PLAN APPROVED]` -> build flip.
-- `deepseek_prompt` tests cover identity, persona, skills, and plan text.
+- `deepseek_prompt` tests cover identity, persona, OpenCode sections,
+  autonomy/safety lines, skills, plan text, and stable-before-volatile order.

@@ -1,10 +1,12 @@
 name: release
 
 # Signed desktop release with updater artifacts.
-# Tag a version: git tag v2.1.0 && git push origin v2.1.0
+# Tag a version: git tag v2.1.2 && git push origin v2.1.2
 # The tag MUST match frontend/src-tauri/tauri.conf.json "version".
-# Required repo secrets: TAURI_SIGNING_PRIVATE_KEY (content of the .key file;
-# never commit it). TAURI_SIGNING_PRIVATE_KEY_PASSWORD only if the key has one.
+# Artifacts publish to the PUBLIC repo davinakmalyasha/Stark_Releases because
+# the source repo is private and unauthenticated updater downloads 404.
+# Required secrets: TAURI_SIGNING_PRIVATE_KEY (+ optional password) and a
+# RELEASES_TOKEN with repo scope for the public releases repo.
 
 on:
   push:
@@ -32,14 +34,33 @@ jobs:
       - name: Backend release binary (sidecar source)
         run: cargo build --release -p stark-server
         working-directory: backend-rs
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build signed bundle
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: frontend
-          tagName: ${{ github.ref_name }}
-          releaseName: "Stark ${{ github.ref_name }}"
-          releaseDraft: false
-          updaterJsonKeepUniversal: true
+        run: npx tauri build --bundles nsis
+        working-directory: frontend
+      - name: Publish to public releases repo
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          dir="frontend/src-tauri/target/release/bundle/nsis"
+          [ -d "$dir" ] || dir="D:/cargo-target/stark/release/bundle/nsis"
+          node -e "
+            const fs=require('fs');
+            const sig=fs.readFileSync('$dir/Stark_${version}_x64-setup.exe.sig','utf8').trim();
+            fs.writeFileSync('$dir/latest.json', JSON.stringify({
+              version:'${version}',
+              pub_date:new Date().toISOString(),
+              platforms:{'windows-x86_64':{signature:sig,url:'https://github.com/davinakmalyasha/Stark_Releases/releases/download/v${version}/Stark_${version}_x64-setup.exe'}}
+            },null,2));
+          "
+          gh release create "v${version}" \
+            "$dir/Stark_${version}_x64-setup.exe" \
+            "$dir/Stark_${version}_x64-setup.exe.sig" \
+            "$dir/latest.json" \
+            -R davinakmalyasha/Stark_Releases \
+            --title "Stark ${version}" --notes "See source repo for changes."

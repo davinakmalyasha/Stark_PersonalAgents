@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Stark",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "identifier": "com.stark.workspace",
   "build": {
     "frontendDist": "../dist",
@@ -53,7 +53,7 @@
       "active": true,
       "dialog": false,
       "endpoints": [
-        "https://github.com/davinakmalyasha/Stark_PersonalAgents/releases/latest/download/latest.json"
+        "https://github.com/davinakmalyasha/Stark_Releases/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZEMjIzOUM3OUYyQzZCQUIKUldTcmF5eWZ4emtpL2JXZlBRQjF4ckE2R0VNbUtjK3hNRkQ0SDMzMU80R0xHVVBXWjFvUFFnTzYK"
     }

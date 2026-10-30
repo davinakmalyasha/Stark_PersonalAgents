@@ -904,6 +904,7 @@ export default function App() {
           hasActiveChat={!!activeWorkspace && !!activeChat}
           notification={notification}
           chatMode={chatModeState}
+          onModeChange={setChatModeState}
           onSend={handleSend}
           onCancel={handleCancelPipeline}
           onModelChange={setModel}
@@ -958,7 +959,7 @@ export default function App() {
           </div>
         </div>
       )}
-      <QuestionModal visible={isRunning || isPersisting || !!voiceLiveRun?.active} />
+      <QuestionModal visible={isRunning || isPersisting || !!voiceLiveRun?.active} onModeChange={setChatModeState} />
 
       {/* OpenDesign module launcher — opens the design room bound to this workspace/chat */}
       <button

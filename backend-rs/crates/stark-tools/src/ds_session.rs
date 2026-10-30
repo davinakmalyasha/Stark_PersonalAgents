@@ -1,36 +1,12 @@
-//! DeepSeek Harness-compatible session tools: working_directory,
-//! todo_write, and ask_user_question.
-
-use std::path::PathBuf;
+//! Session tools: todo_write and ask_user_question.
+//!
+//! The working directory is runtime context (Zone 1), not a tool: it is
+//! injected into the system prompt every turn and relative paths resolve
+//! server-side. Navigation uses `bash` with a per-call `workdir`.
 
 use serde_json::{Value, json};
 
-use crate::paths::resolve_workspace_path;
 use crate::{ToolContext, ToolOutcome};
-
-pub async fn working_directory(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    let Some(raw) = args.get("cd").and_then(Value::as_str).map(str::trim) else {
-        return ToolOutcome::ok(ctx.current_dir().to_string_lossy().to_string());
-    };
-    if raw.is_empty() {
-        return ToolOutcome::ok(ctx.current_dir().to_string_lossy().to_string());
-    }
-    let candidate = PathBuf::from(raw);
-    let joined = if candidate.is_absolute() {
-        candidate
-    } else {
-        ctx.current_dir().join(candidate)
-    };
-    let path = match resolve_workspace_path(&ctx.workspace, &joined.to_string_lossy()) {
-        Ok(path) => path,
-        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
-    };
-    if !path.is_dir() {
-        return ToolOutcome::err(format!("Error: not a directory: {raw}"));
-    }
-    ctx.set_current_dir(path.clone());
-    ToolOutcome::ok(path.to_string_lossy().to_string())
-}
 
 pub async fn todo_write(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(todos) = args.get("todos").and_then(Value::as_array) else {
@@ -98,7 +74,7 @@ pub async fn ask_user_question(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Err(error) => return ToolOutcome::err(format!("Error: ask_user_question {error}")),
     };
     let mut lines = vec!["[USER ANSWERS]".to_string()];
-    for answer in answers {
+    for answer in &answers {
         let id = answer.get("id").and_then(Value::as_str).unwrap_or("?");
         let selected = answer
             .get("selected")
@@ -131,6 +107,46 @@ pub async fn ask_user_question(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         };
         lines.push(format!("- {id}: {text}"));
     }
+    // Plan-review approval marker (replaces exit_plan_mode): when a question
+    // carries intent.kind == "plan-review" and the user selects the approve
+    // option, the run loop flips the chat to build mode. Rejection keeps the
+    // chat in plan mode.
+    let mut approved = false;
+    for question in questions.iter() {
+        let is_review = question
+            .get("intent")
+            .and_then(|intent| intent.get("kind"))
+            .and_then(Value::as_str)
+            == Some("plan-review");
+        if !is_review {
+            continue;
+        }
+        let approve = question
+            .get("intent")
+            .and_then(|intent| intent.get("approve"))
+            .and_then(Value::as_str)
+            .unwrap_or("Approve plan");
+        let qid = question.get("id").and_then(Value::as_str).unwrap_or("");
+        if answers.iter().any(|answer| {
+            answer.get("id").and_then(Value::as_str) == Some(qid)
+                && answer
+                    .get("selected")
+                    .and_then(Value::as_array)
+                    .is_some_and(|selected| {
+                        selected.iter().any(|value| {
+                            selected_text(value) == approve || value.as_str() == Some(approve)
+                        })
+                    })
+        }) {
+            approved = true;
+        }
+    }
+    if approved {
+        lines.push(
+            "[PLAN APPROVED] Stop here. Implementation begins on the next turn in build mode."
+                .to_string(),
+        );
+    }
     ToolOutcome::ok(lines.join("\n"))
 }
 
@@ -143,18 +159,6 @@ mod tests {
 
     fn context(dir: &std::path::Path) -> ToolContext {
         ToolContext::new(dir, "v2-session", Arc::new(QuestionBroker::new()))
-    }
-
-    #[tokio::test]
-    async fn working_directory_reads_and_changes_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        let ctx = context(dir.path());
-        let changed = working_directory(&ctx, &json!({"cd": "sub"})).await;
-        assert!(!changed.is_error, "{}", changed.content);
-        assert!(ctx.current_dir().ends_with("sub"));
-        let read = working_directory(&ctx, &json!({})).await;
-        assert!(read.content.ends_with("sub"), "{}", read.content);
     }
 
     #[tokio::test]
@@ -178,5 +182,66 @@ mod tests {
             .unwrap();
         assert_eq!(saved.len(), 2);
         assert_eq!(saved[1].status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn plan_review_approval_adds_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let broker = ctx.questions.clone();
+        let task = tokio::spawn(async move {
+            ask_user_question(
+                &ctx,
+                &json!({"questions": [{
+                    "id": "plan-review",
+                    "question": "Approve this plan?",
+                    "header": "Plan review",
+                    "options": ["Approve plan", "Keep planning"],
+                    "intent": {"kind": "plan-review", "approve": "Approve plan"}
+                }]}),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let batches = broker.pending_batches();
+        assert_eq!(batches.len(), 1);
+        let batch_id = batches[0]["batch_id"].as_str().unwrap().to_string();
+        assert!(broker.answer(
+            &batch_id,
+            vec![json!({"id": "plan-review", "selected": ["Approve plan"]})],
+        ));
+        let out = task.await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("[PLAN APPROVED]"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn plan_review_rejection_has_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let broker = ctx.questions.clone();
+        let task = tokio::spawn(async move {
+            ask_user_question(
+                &ctx,
+                &json!({"questions": [{
+                    "id": "plan-review",
+                    "question": "Approve this plan?",
+                    "options": ["Approve plan", "Keep planning"],
+                    "intent": {"kind": "plan-review", "approve": "Approve plan"}
+                }]}),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let batches = broker.pending_batches();
+        assert_eq!(batches.len(), 1);
+        let batch_id = batches[0]["batch_id"].as_str().unwrap().to_string();
+        assert!(broker.answer(
+            &batch_id,
+            vec![json!({"id": "plan-review", "selected": ["Keep planning"]})],
+        ));
+        let out = task.await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!out.content.contains("[PLAN APPROVED]"), "{}", out.content);
     }
 }

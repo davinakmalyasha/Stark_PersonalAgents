@@ -1,40 +1,47 @@
-# Tool contract v2
+# Tool contract v3 (Developer Pi-simplified)
 
 `tool-specs.json` is the single model-facing tool contract for the Rust server.
 It now contains two surfaces:
 
 - **v1 tools** — legacy Stark tools still used by General, House, DFD, UI,
   DevOps, Explore, and Orchestrator.
-- **v2 Developer tools** — the 24-tool Developer surface copied from DeepSeek
+- **Developer tools** — the 18-tool Pi-simplified surface derived from DeepSeek
   Harness `standard` and Codex multi-agent v2.
 
-## Developer v2 sources
+## Developer sources
 
 | Source | Pin | Used for |
 |---|---|---|
-| `deepseek-ai/deepseek-harness` | `f3803c9` (0.2.2-alpha.2, 2026-10-27) | `bash`, `job_*`, `read`, `write`, `edit`, `read_image`, `glob`, `grep`, `working_directory`, `todo_write`, `exit_plan_mode`, `ask_user_question`, `skill`, `web_search`, `web_fetch` |
-| `openai/codex` | `79be2e2` (2026-10-29) | `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
+| `deepseek-ai/deepseek-harness` | `f3803c9` (0.2.2-alpha.2, 2026-10-27) | `bash`, `job`, `read`, `write`, `edit`, `glob`, `grep`, `todo_write`, `ask_user_question`, `skill`, `web_search`, `web_fetch` |
+| `openai/codex` | `79be2e2` (2026-10-29) | `spawn_agent`, `message_agent`, `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
 
-The model-facing names, descriptions, parameter descriptions, and required
-lists are intended to be byte-compatible with those sources. The only
-documented deviations are:
+Pi simplifications on top of the sources (documented, not byte-identical):
 
-1. The system identity says **Stark**, not DeepSeek Harness.
-2. Windows uses Git Bash for `bash` instead of DeepSeek's `pwsh`.
-3. Codex v2 delegation replaces DeepSeek's `subagent`/`subagent_fork` tools.
-4. DeepSeek's optional `goal_*`, `schedule_*`, `workflow`, `present`, and
-   plugin-manager tools are omitted.
-5. Stark's `memory` tool, worktree isolation, and merge/discard tools are
-   removed from the Developer surface for strict parity.
+1. `read_image` folded into `read` (images return inline parts).
+2. `job_list`/`job_output`/`job_kill` merged into one `job(action, ...)` tool.
+3. `send_message`/`followup_task` merged into one `message_agent(target, message, wake?)` tool.
+4. `working_directory` deleted; cwd is Zone 1 runtime context in the prompt.
+5. `exit_plan_mode` deleted; approval is `ask_user_question` with plan-review
+   intent (auto-flips plan to build) plus the composer Approve button.
 
-## Developer v2 manifest
+Other deviations (unchanged):
+
+- The system identity says **Stark**, not DeepSeek Harness.
+- Windows uses Git Bash for `bash` instead of DeepSeek's `pwsh`.
+- Codex v2 delegation replaces DeepSeek's `subagent`/`subagent_fork`.
+- DeepSeek's optional `goal_*`, `schedule_*`, `workflow`, `present`, and
+  plugin-manager tools are omitted.
+- Stark's `memory` tool, worktree isolation, and merge/discard tools are
+  removed from the Developer surface.
+
+## Developer manifest (18)
 
 ```
-bash, job_kill, job_list, job_output,
-read, write, edit, read_image, glob, grep,
-working_directory, todo_write, exit_plan_mode, ask_user_question,
+bash, job,
+read, write, edit, glob, grep,
+todo_write, ask_user_question,
 skill, web_search, web_fetch,
-spawn_agent, send_message, followup_task, wait_agent,
+spawn_agent, message_agent, wait_agent,
 list_agents, interrupt_agent, close_agent
 ```
 
@@ -49,5 +56,5 @@ PTC/code mode in a separate preset.
 `stark-tools/src/lib.rs` and implementing a dispatch arm.
 
 `docs/tools/README.md` points at the contract and the v2 parity doc; the old
-per-tool pages were deleted. The v2 Developer surface is documented by the
+per-tool pages were deleted. The Developer surface is documented by the
 contract itself and `docs/rust-rewrite/18-deepseek-parity.md`.

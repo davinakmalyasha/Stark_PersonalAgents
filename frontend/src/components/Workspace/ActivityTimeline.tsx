@@ -26,7 +26,7 @@ function primaryArg(args?: string): string {
     }
     const value = parsed.file_path ?? parsed.path ?? parsed.command ?? parsed.cmd
       ?? parsed.pattern ?? parsed.name ?? parsed.task ?? parsed.task_name ?? parsed.target
-      ?? parsed.job_id ?? parsed.url ?? parsed.cd ?? parsed.query ?? parsed.queries ?? parsed.prompt ?? '';
+      ?? parsed.job_id ?? parsed.url ?? parsed.query ?? parsed.queries ?? parsed.prompt ?? parsed.message ?? '';
     const text = String(value || '');
     return text.length > 72 ? `${text.slice(0, 72)}…` : text;
   } catch {
@@ -57,12 +57,14 @@ function toolLabel(event: LiveToolEvent): { verb: string; subject: string } {
     call_subagent: 'Delegated',
     delegate: 'Delegated',
     spawn_agent: 'Spawned agent',
+    message_agent: 'Messaged agent',
     send_message: 'Messaged agent',
     followup_task: 'Followed up',
     wait_agent: 'Waited for agent',
     list_agents: 'Listed agents',
     interrupt_agent: 'Interrupted agent',
     close_agent: 'Closed agent',
+    job: 'Managed job',
     job_list: 'Listed jobs',
     job_output: 'Read job',
     job_kill: 'Killed job',
@@ -98,12 +100,14 @@ function toolSummaryPart(event: LiveToolEvent): string {
     call_subagent: 'created an agent',
     delegate: 'created an agent',
     spawn_agent: 'created an agent',
+    message_agent: 'messaged an agent',
     send_message: 'messaged an agent',
     followup_task: 'sent a follow-up',
     wait_agent: 'waited for an agent',
     list_agents: 'listed agents',
     interrupt_agent: 'interrupted an agent',
     close_agent: 'closed an agent',
+    job: 'managed a job',
     job_list: 'listed jobs',
     job_output: 'read a job',
     job_kill: 'killed a job',
@@ -125,9 +129,9 @@ function toolGroupTitle(events: LiveToolEvent[]): string {
 }
 
 function ToolIcon({ name }: { name: string }) {
-  if (name === 'run_command') return <Terminal size={13} />;
-  if (name === 'search_code') return <Search size={13} />;
-  if (name === 'read_file' || name === 'write_file' || name === 'edit_file' || name === 'list_files') return <FileText size={13} />;
+  if (name === 'bash' || name === 'run_command' || name === 'job') return <Terminal size={13} />;
+  if (name === 'grep' || name === 'glob' || name === 'search_code' || name === 'web_search') return <Search size={13} />;
+  if (name === 'read' || name === 'read_image' || name === 'read_file' || name === 'write' || name === 'write_file' || name === 'edit' || name === 'edit_file' || name === 'list_files') return <FileText size={13} />;
   return <Wrench size={13} />;
 }
 

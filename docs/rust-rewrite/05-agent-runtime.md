@@ -76,12 +76,13 @@ Legacy agent system prompt, fixed order:
 4. Read-only notice when `FileAccess::Read`.
 5. Plan block when a plan exists.
 
-Developer uses the v2 prompt instead:
+Developer uses the prompt instead:
 
 1. `You are an AI agent powered by Stark.`
 2. `You are a coding agent powered by the {model} model.`
-3. Runtime context (cwd, platform, Git Bash, time).
-4. Plan section in plan mode.
+3. Runtime context (cwd Zone 1, platform, Git Bash, time).
+4. Plan section in plan mode (inspect-only; approval via `ask_user_question`
+   plan-review; writes blocked at dispatch).
 5. Tool guidance.
 6. `AGENTS.md` hierarchy (64KB cap).
 7. `[SKILLS]` catalog.

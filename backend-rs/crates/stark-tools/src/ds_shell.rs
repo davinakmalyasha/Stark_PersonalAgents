@@ -179,39 +179,47 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     }
 }
 
-pub async fn job_list(ctx: &ToolContext, _args: &Value) -> ToolOutcome {
-    ToolOutcome::ok(ctx.processes.list_for(&ctx.chat_id))
-}
-
-pub async fn job_output(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    let Some(job_id) = args.get("job_id").and_then(Value::as_str) else {
-        return ToolOutcome::err("Error: job_output requires job_id");
+pub async fn job(ctx: &ToolContext, args: &Value) -> ToolOutcome {
+    let Some(action) = args.get("action").and_then(Value::as_str) else {
+        return ToolOutcome::err("Error: job requires action");
     };
-    if args.get("wait").and_then(Value::as_bool).unwrap_or(false) {
-        let timeout = args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(30_000)
-            .min(3_600_000);
-        let _ = ctx.processes.wait_status(job_id, timeout).await;
-    }
-    match ctx.processes.read_output(job_id) {
-        Ok(text) => ToolOutcome::ok(text),
-        Err(error) => ToolOutcome::err(format!("Error: {error}")),
-    }
-}
-
-pub async fn job_kill(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    let Some(job_id) = args.get("job_id").and_then(Value::as_str) else {
-        return ToolOutcome::err("Error: job_kill requires job_id");
-    };
-    let reason = args
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("requested by the agent");
-    match ctx.processes.kill(job_id) {
-        Ok(()) => ToolOutcome::ok(format!("[OK] Kill requested for job {job_id} ({reason})")),
-        Err(error) => ToolOutcome::err(format!("Error: {error}")),
+    match action {
+        "list" => ToolOutcome::ok(ctx.processes.list_for(&ctx.chat_id)),
+        "output" => {
+            let Some(job_id) = args.get("job_id").and_then(Value::as_str) else {
+                return ToolOutcome::err("Error: job output requires job_id");
+            };
+            if args.get("wait").and_then(Value::as_bool).unwrap_or(false) {
+                let timeout = args
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30_000)
+                    .min(3_600_000);
+                let _ = ctx.processes.wait_status(job_id, timeout).await;
+            }
+            match ctx.processes.read_output(job_id) {
+                Ok(text) => ToolOutcome::ok(text),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+        "kill" => {
+            let Some(job_id) = args.get("job_id").and_then(Value::as_str) else {
+                return ToolOutcome::err("Error: job kill requires job_id");
+            };
+            let reason = args
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("requested by the agent");
+            match ctx.processes.kill(job_id) {
+                Ok(()) => {
+                    ToolOutcome::ok(format!("[OK] Kill requested for job {job_id} ({reason})"))
+                }
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+        other => ToolOutcome::err(format!(
+            "Error: unknown job action '{other}' (use list | output | kill)"
+        )),
     }
 }
 
@@ -255,11 +263,24 @@ mod tests {
         .await;
         assert!(!started.is_error, "{}", started.content);
         let value: Value = serde_json::from_str(&started.content).unwrap();
-        let job = value["jobId"].as_str().unwrap().to_string();
-        let listed = job_list(&ctx, &json!({})).await;
+        let job_id = value["jobId"].as_str().unwrap().to_string();
+        let listed = job(&ctx, &json!({"action": "list"})).await;
         assert!(!listed.is_error, "{}", listed.content);
-        assert!(listed.content.contains(&job), "{}", listed.content);
-        let killed = job_kill(&ctx, &json!({"job_id": job})).await;
+        assert!(listed.content.contains(&job_id), "{}", listed.content);
+        let read = job(&ctx, &json!({"action": "output", "job_id": job_id})).await;
+        assert!(!read.is_error, "{}", read.content);
+        let killed = job(&ctx, &json!({"action": "kill", "job_id": job_id})).await;
         assert!(!killed.is_error, "{}", killed.content);
+    }
+
+    #[tokio::test]
+    async fn job_rejects_unknown_actions_and_missing_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let unknown = job(&ctx, &json!({"action": "stop"})).await;
+        assert!(unknown.is_error);
+        let missing = job(&ctx, &json!({"action": "kill"})).await;
+        assert!(missing.is_error);
+        assert!(missing.content.contains("job_id"));
     }
 }

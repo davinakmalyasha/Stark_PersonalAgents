@@ -1,9 +1,11 @@
-//! Codex multi-agent v2 tools: spawn_agent, send_message, followup_task,
+//! Codex multi-agent v2 tools (Pi-simplified): spawn_agent, message_agent,
 //! wait_agent, list_agents, interrupt_agent, close_agent.
 //!
-//! Stark's durable agent store and mailbox provide the execution substrate.
-//! Developer subagents share the parent workspace, matching Codex rather than
-//! Stark's old worktree isolation.
+//! `message_agent` merges Codex send_message (queue only) and followup_task
+//! (trigger a turn): `wake=true` triggers an idle agent, `wake=false`
+//! (default) only queues. Stark's durable agent store and mailbox provide the
+//! execution substrate. Developer subagents share the parent workspace,
+//! matching Codex rather than Stark's old worktree isolation.
 
 use std::time::{Duration, Instant};
 
@@ -284,19 +286,20 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
     Ok(json!({"task_name": task_name, "nickname": task_name}).to_string())
 }
 
-async fn send_message(ctx: &RunContext, args: &Value) -> Result<String, String> {
+async fn message_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
     let store = store(ctx).await?;
     let current = current(ctx, &store).await?;
     let target = args
         .get("target")
         .and_then(Value::as_str)
-        .ok_or_else(|| "send_message requires target".to_string())?;
+        .ok_or_else(|| "message_agent requires target".to_string())?;
     let message = args
         .get("message")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|message| !message.is_empty())
-        .ok_or_else(|| "send_message requires message".to_string())?;
+        .ok_or_else(|| "message_agent requires message".to_string())?;
+    let wake = args.get("wake").and_then(Value::as_bool).unwrap_or(false);
     let target = resolve_target(&store, &current, target).await?;
     if matches!(target.status.as_str(), "closed") {
         return Err(format!("agent {} is closed", target.path));
@@ -305,48 +308,19 @@ async fn send_message(ctx: &RunContext, args: &Value) -> Result<String, String> 
         .enqueue(
             Some(&current.id),
             &target.id,
-            "message",
+            if wake { "followup" } else { "message" },
             message,
-            "queue",
+            if wake { "trigger" } else { "queue" },
             json!({"task_path": target.path}),
         )
         .await
         .map_err(|error| error.to_string())?;
-    Ok(json!({"submission_id": id}).to_string())
-}
-
-async fn followup_task(ctx: &RunContext, args: &Value) -> Result<String, String> {
-    let store = store(ctx).await?;
-    let current = current(ctx, &store).await?;
-    let target = args
-        .get("target")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "followup_task requires target".to_string())?;
-    let message = args
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .ok_or_else(|| "followup_task requires message".to_string())?;
-    let target = resolve_target(&store, &current, target).await?;
-    if matches!(target.status.as_str(), "closed") {
-        return Err(format!("agent {} is closed", target.path));
+    if wake {
+        store
+            .wake(&target.id)
+            .await
+            .map_err(|error| error.to_string())?;
     }
-    let id = store
-        .enqueue(
-            Some(&current.id),
-            &target.id,
-            "followup",
-            message,
-            "trigger",
-            json!({"task_path": target.path}),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    store
-        .wake(&target.id)
-        .await
-        .map_err(|error| error.to_string())?;
     Ok(json!({"submission_id": id}).to_string())
 }
 
@@ -487,8 +461,7 @@ async fn close_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
 pub async fn handle(ctx: &RunContext, name: &str, args: &Value) -> ToolOutcome {
     let result = match name {
         "spawn_agent" => spawn_agent(ctx, args).await,
-        "send_message" => send_message(ctx, args).await,
-        "followup_task" => followup_task(ctx, args).await,
+        "message_agent" => message_agent(ctx, args).await,
         "wait_agent" => wait_agent(ctx, args).await,
         "list_agents" => list_agents(ctx, args).await,
         "interrupt_agent" => interrupt_agent(ctx, args).await,
@@ -573,7 +546,7 @@ mod tests {
 
         let message = handle(
             &ctx,
-            "send_message",
+            "message_agent",
             &json!({"target": "task_1", "message": "status?"}),
         )
         .await;
@@ -581,8 +554,8 @@ mod tests {
 
         let followup = handle(
             &ctx,
-            "followup_task",
-            &json!({"target": "task_1", "message": "continue"}),
+            "message_agent",
+            &json!({"target": "task_1", "message": "continue", "wake": true}),
         )
         .await;
         assert!(!followup.is_error, "{}", followup.content);
@@ -606,80 +579,5 @@ mod tests {
         .await;
         assert!(out.is_error);
         assert!(out.content.contains("depth limit"), "{}", out.content);
-    }
-}
-
-#[cfg(test)]
-mod plan_tests {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
-    use stark_providers::{Provider, ProviderConfig};
-    use tokio::sync::broadcast;
-    use tokio_util::sync::CancellationToken;
-
-    #[tokio::test]
-    async fn exit_plan_mode_switches_to_build_after_approval() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = stark_store::ChatStore::open(dir.path()).await.unwrap();
-        store
-            .ensure_chat(
-                "plan-chat",
-                "_general",
-                &dir.path().to_string_lossy(),
-                "mock",
-                "hi",
-            )
-            .await
-            .unwrap();
-        let provider = Provider::new(ProviderConfig {
-            mode: "deepseek".to_string(),
-            base_url: "http://127.0.0.1:1".to_string(),
-            api_key: "test".to_string(),
-            model: "mock".to_string(),
-        })
-        .unwrap();
-        let (tx, _) = broadcast::channel(16);
-        let ctx = RunContext {
-            chat_id: "plan-chat".to_string(),
-            workspace_id: "_general".to_string(),
-            workspace: dir.path().to_path_buf(),
-            role: Some("Developer".to_string()),
-            scope: "developer".to_string(),
-            depth: 0,
-            file_access: crate::FileAccess::Write,
-            model: "mock".to_string(),
-            temperature: 0.2,
-            images: Vec::new(),
-            provider,
-            store: store.clone(),
-            questions: Arc::new(stark_tools::QuestionBroker::new()),
-            tx,
-            latest: Arc::new(Mutex::new(None)),
-            steering: Arc::new(Mutex::new(VecDeque::new())),
-            follow_up: Arc::new(Mutex::new(VecDeque::new())),
-            checkpoint: None,
-            cancel: CancellationToken::new(),
-            on_job_done: None,
-        };
-        let broker = ctx.questions.clone();
-        let task = tokio::spawn(async move {
-            crate::exit_plan_mode_tool(&ctx, &json!({"plan": "# Do the thing"})).await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let batches = broker.pending_batches();
-        assert_eq!(batches.len(), 1);
-        let batch_id = batches[0]["batch_id"].as_str().unwrap().to_string();
-        assert!(broker.answer(
-            &batch_id,
-            vec![json!({"id": "plan-review", "selected": ["Approve plan"]})],
-        ));
-        let out = task.await.unwrap();
-        assert!(!out.is_error, "{}", out.content);
-        assert_eq!(
-            store.chat_mode("plan-chat").await.unwrap().as_deref(),
-            Some("build")
-        );
     }
 }

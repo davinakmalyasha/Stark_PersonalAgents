@@ -1,6 +1,6 @@
 # 04 — Tool System
 
-69 tools in the contract (`backend-rs/specs/tool-specs.json`), enforced by
+63 tools in the contract (`backend-rs/specs/tool-specs.json`), enforced by
 `stark-contract` tests. The model sees these strings; changing them changes
 behavior.
 
@@ -8,17 +8,17 @@ The contract has two surfaces:
 
 - **v1** — legacy Stark tools used by General, House, DFD, UI, DevOps, Explore,
   and Orchestrator.
-- **v2 Developer** — 24 tools copied from DeepSeek Harness `standard` and Codex
-  multi-agent v2. See [18 — DeepSeek / Codex Parity](./18-deepseek-parity.md).
+- **Developer** — 18 Pi-simplified tools derived from DeepSeek Harness
+  `standard` and Codex multi-agent v2. See [18 — DeepSeek / Codex Parity](./18-deepseek-parity.md).
 
-Developer v2 catalog:
+Developer catalog:
 
 ```
-bash, job_kill, job_list, job_output,
-read, write, edit, read_image, glob, grep,
-working_directory, todo_write, exit_plan_mode, ask_user_question,
+bash, job,
+read, write, edit, glob, grep,
+todo_write, ask_user_question,
 skill, web_search, web_fetch,
-spawn_agent, send_message, followup_task, wait_agent,
+spawn_agent, message_agent, wait_agent,
 list_agents, interrupt_agent, close_agent
 ```
 
@@ -53,7 +53,8 @@ a product change: update the JSON, the `stark-contract` tests, and the
 - `tool_specs_for_scope_with_access(mode, scope, access)` filters by scope,
   plan mode (`PLAN_WRITE_TOOLS`), and read-only access.
 - Developer v2 keeps the same catalog in plan and build modes (DeepSeek
-  request-cache stability); `plan_mode_denial` is the execution boundary.
+  request-cache stability); `plan_mode_denial` is the execution boundary
+  (writes blocked, reads allowed).
 - Legacy scopes still hide write tools in plan mode.
 - Read-only agents lose write tools from their spec list — but the backend
   `dispatch` denial is the real boundary, not the hidden spec.
@@ -135,13 +136,12 @@ isolation or read-only subagent default.
 
 | Area | Module | Tools |
 |---|---|---|
-| Files v2 | `ds_fs` | `read`, `write`, `edit`, `read_image`, `glob`, `grep` |
-| Shell v2 | `ds_shell` | `bash`, `job_list`, `job_output`, `job_kill` |
-| Session v2 | `ds_session` | `working_directory`, `todo_write`, `ask_user_question` |
-| Web v2 | `ds_web` | `web_search`, `web_fetch` |
-| Skills v2 | `skills` | `skill` |
-| Delegation v2 | `stark-core::codex_agents` | `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
-| Plan v2 | `stark-core` | `exit_plan_mode` |
+| Files | `ds_fs` | `read` (text + images), `write`, `edit`, `glob`, `grep` |
+| Shell | `ds_shell` | `bash`, `job` (list/output/kill) |
+| Session | `ds_session` | `todo_write`, `ask_user_question` (plan-review approval flips plan to build) |
+| Web | `ds_web` | `web_search`, `web_fetch` |
+| Skills | `skills` | `skill` |
+| Delegation | `stark-core::codex_agents` | `spawn_agent`, `message_agent` (queue or wake), `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
 | Files v1 | `read`, `edit`, `search`, `changes` | `read_file`, `edit_file`, `search_code`, `files_changed` |
 | Shell | `command` | `run_command` (foreground, background sessions, process actions) |
 | Plans | `update_plan`, `ask` | `update_plan`, `ask_user` |

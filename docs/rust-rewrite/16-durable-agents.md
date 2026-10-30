@@ -12,8 +12,8 @@ Orchestrator (level 0)
   └── workspace agent ...
 ```
 
-Developer uses the Codex multi-agent v2 tools (`spawn_agent`, `send_message`,
-`followup_task`, `wait_agent`, `list_agents`, `interrupt_agent`,
+Developer uses the Codex multi-agent v2 tools, Pi-simplified (`spawn_agent`,
+`message_agent`, `wait_agent`, `list_agents`, `interrupt_agent`,
 `close_agent`). Its children share the parent workspace, inherit write tools,
 use task paths (`/root/<task_name>`), default `fork_turns=all`, and are limited
 to depth 1 and 6 open children. The `agent` tool below is the legacy v1 surface

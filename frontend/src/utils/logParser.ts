@@ -49,7 +49,7 @@ export function normalizeAgentName(name: string): string {
  * hard-code a subset — otherwise delegated children detach from their call
  * site and fall back to the top-hoisted card.
  */
-const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'call_subagent', 'delegate', 'spawn_agent']);
+const DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'call_subagent', 'delegate', 'spawn_agent', 'message_agent']);
 
 export function isDelegationToolName(name: string | undefined): boolean {
   return !!name && DELEGATION_TOOL_NAMES.has(name);

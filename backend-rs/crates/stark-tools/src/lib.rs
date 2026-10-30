@@ -88,25 +88,19 @@ const IMPLEMENTED: &[&str] = &[
     "run_code",
     "agent",
     "bash",
-    "job_kill",
-    "job_list",
-    "job_output",
+    "job",
     "read",
     "write",
     "edit",
-    "read_image",
     "glob",
     "grep",
-    "working_directory",
     "todo_write",
-    "exit_plan_mode",
     "ask_user_question",
     "skill",
     "web_search",
     "web_fetch",
     "spawn_agent",
-    "send_message",
-    "followup_task",
+    "message_agent",
     "wait_agent",
     "list_agents",
     "interrupt_agent",
@@ -132,14 +126,11 @@ pub const PLAN_WRITE_TOOLS: &[&str] = &[
     "set_screen_share",
     "run_code",
     "agent",
-    "bash",
-    "job_kill",
     "write",
     "edit",
     "todo_write",
     "spawn_agent",
-    "send_message",
-    "followup_task",
+    "message_agent",
     "interrupt_agent",
     "close_agent",
 ];
@@ -149,8 +140,9 @@ static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
-    /// Session working directory. `working_directory` changes this without
-    /// moving the workspace root used by old tools and checkpoints.
+    /// Session working directory (Zone 1 runtime context). Relative paths in
+    /// v2 tools resolve from here; the workspace root stays the containment
+    /// boundary for old tools and checkpoints.
     pub cwd: Arc<Mutex<PathBuf>>,
     /// Files observed with `read` in this run. DeepSeek's fs policy requires
     /// a read before an existing file can be written or edited.
@@ -367,11 +359,9 @@ pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -
                             | "call_subagent"
                             | "write"
                             | "edit"
-                            | "bash"
-                            | "job_kill"
+                            | "todo_write"
                             | "spawn_agent"
-                            | "send_message"
-                            | "followup_task"
+                            | "message_agent"
                             | "interrupt_agent"
                             | "close_agent"
                             | "create_docx"
@@ -492,6 +482,15 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
             ));
         }
     }
+    if name == "job" {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+        if action == "kill" {
+            return Some(
+                "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. (job kill is blocked.)"
+                    .to_string(),
+            );
+        }
+    }
     None
 }
 
@@ -505,11 +504,9 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
         | "call_subagent"
         | "write"
         | "edit"
-        | "job_kill"
         | "todo_write"
         | "spawn_agent"
-        | "send_message"
-        | "followup_task"
+        | "message_agent"
         | "interrupt_agent"
         | "close_agent"
         | "create_docx"
@@ -531,10 +528,20 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             if let Err(reason) = stark_policy::check_read_only(command) {
                 Some(format!(
-                    "[BLOCKED] Read-only agent cannot run mutating commands ({reason}). Use read_file/search_code."
+                    "[BLOCKED] Read-only agent cannot run mutating commands ({reason}). Use read/grep."
                 ))
             } else {
                 None
+            }
+        }
+        "job" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+            match action {
+                "kill" => Some(
+                    "[BLOCKED] Read-only agent cannot kill jobs. Report findings instead."
+                        .to_string(),
+                ),
+                _ => None,
             }
         }
         "browser_act" => {
@@ -606,16 +613,12 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "search_code" => search::search_code(ctx, args).await,
         "run_command" => command::run_command(ctx, args).await,
         "bash" => ds_shell::bash(ctx, args).await,
-        "job_kill" => ds_shell::job_kill(ctx, args).await,
-        "job_list" => ds_shell::job_list(ctx, args).await,
-        "job_output" => ds_shell::job_output(ctx, args).await,
+        "job" => ds_shell::job(ctx, args).await,
         "read" => ds_fs::read(ctx, args).await,
         "write" => ds_fs::write(ctx, args).await,
         "edit" => ds_fs::edit(ctx, args).await,
-        "read_image" => ds_fs::read_image(ctx, args).await,
         "glob" => ds_fs::glob(ctx, args).await,
         "grep" => ds_fs::grep(ctx, args).await,
-        "working_directory" => ds_session::working_directory(ctx, args).await,
         "todo_write" => ds_session::todo_write(ctx, args).await,
         "ask_user_question" => ds_session::ask_user_question(ctx, args).await,
         "skill" => skills::skill(ctx, args).await,
@@ -767,7 +770,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            61
+            55
         );
     }
 
@@ -1062,25 +1065,19 @@ mod v2_surface_tests {
             .collect();
         let expected = [
             "bash",
-            "job_kill",
-            "job_list",
-            "job_output",
+            "job",
             "read",
             "write",
             "edit",
-            "read_image",
             "glob",
             "grep",
-            "working_directory",
             "todo_write",
-            "exit_plan_mode",
             "ask_user_question",
             "skill",
             "web_search",
             "web_fetch",
             "spawn_agent",
-            "send_message",
-            "followup_task",
+            "message_agent",
             "wait_agent",
             "list_agents",
             "interrupt_agent",
@@ -1104,6 +1101,14 @@ mod v2_surface_tests {
             "run_code",
             "agent",
             "memory",
+            "working_directory",
+            "exit_plan_mode",
+            "read_image",
+            "job_kill",
+            "job_list",
+            "job_output",
+            "send_message",
+            "followup_task",
         ] {
             assert!(
                 !names.iter().any(|name| name == legacy),

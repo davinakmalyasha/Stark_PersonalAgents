@@ -7,7 +7,7 @@ import PlanDock from './PlanDock';
 import MessageStream from './MessageStream';
 import NotesButton from '../Notes/NotesButton';
 import CanvasModeBadge from '../Canvas/CanvasModeBadge';
-import { getChatSnapshots, restoreRun, type SnapshotGroup } from '../../services/api';
+import { getChatSnapshots, restoreRun, setChatMode, type SnapshotGroup } from '../../services/api';
 
 interface Props {
   messages: ChatMessage[];
@@ -43,6 +43,8 @@ interface Props {
   onDraftConsumed?: () => void;
   /** Session-keyed subagent drill-in (delegation rows carrying childId). */
   onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
+  /** Reflect server-side mode flips (plan approval) in the App badge/bar. */
+  onModeChange?: (mode: 'plan' | 'build') => void;
   /** 'floating' overlays the workspace; 'docked' sits in a flex column below the canvas. */
   variant?: 'floating' | 'docked';
 }
@@ -53,6 +55,7 @@ export default function ChatView({
   onSend, onCancel, onClearNotification,
   isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
   selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession, onRewind, draft, onDraftConsumed,
+  onModeChange,
   variant = 'floating',
 }: Props) {
   const [minimized, setMinimized] = useState(false);
@@ -60,6 +63,7 @@ export default function ChatView({
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
   const [showRewind, setShowRewind] = useState(false);
+  const [modeBusy, setModeBusy] = useState(false);
 
   // P10/Tier-3: client-side chat search — only show matching messages.
   const visibleMessages = searchQuery.trim()
@@ -213,6 +217,35 @@ export default function ChatView({
       {/* Always visible Bottom Prompt Dock */}
       <div className="border-t border-zinc-800/50 flex-shrink-0">
         <PlanDock plan={state?.plan} />
+        {chatMode === 'plan' && (
+          <div className="mx-4 mt-2.5 mb-1 rounded-xl border border-amber-700/50 bg-amber-950/40 px-3.5 py-2.5">
+            <div className="text-[12px] font-semibold text-amber-200">Plan mode — writes blocked</div>
+            <div className="text-[11.5px] text-amber-200/70 leading-snug mt-0.5">
+              The agent can inspect, research, and propose, but cannot edit, write, or run mutating commands.
+              Review the plan above, then approve to build or keep planning.
+            </div>
+            <div className="flex items-center gap-2 mt-2">
+              <button
+                type="button"
+                disabled={modeBusy || !chatId}
+                onClick={async () => {
+                  if (!chatId || modeBusy) return;
+                  setModeBusy(true);
+                  try {
+                    await setChatMode(chatId, 'build');
+                    onModeChange?.('build');
+                  } finally {
+                    setModeBusy(false);
+                  }
+                }}
+                className="pressable px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-zinc-950 text-[12px] font-semibold transition-colors cursor-pointer"
+              >
+                {modeBusy ? 'Approving…' : 'Approve plan'}
+              </button>
+              <span className="text-[11px] text-amber-200/60">or type <code className="font-mono">/build</code> to approve, <code className="font-mono">/plan</code> to stay planning</span>
+            </div>
+          </div>
+        )}
         <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} onDraftConsumed={onDraftConsumed} />
       </div>
     </div>

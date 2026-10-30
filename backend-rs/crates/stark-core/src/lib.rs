@@ -750,17 +750,10 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 } else {
                     run_subagent_tool(&ctx, &args).await
                 }
-            } else if call.function.name == "exit_plan_mode" {
-                if mode == "plan" {
-                    exit_plan_mode_tool(&ctx, &args).await
-                } else {
-                    ToolOutcome::err("[BLOCKED] exit_plan_mode is only available in plan mode.")
-                }
             } else if matches!(
                 call.function.name.as_str(),
                 "spawn_agent"
-                    | "send_message"
-                    | "followup_task"
+                    | "message_agent"
                     | "wait_agent"
                     | "list_agents"
                     | "interrupt_agent"
@@ -819,6 +812,12 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 canvas::handle(&ctx, &args).await
             } else if call.function.name == "agent" {
                 agents_tools::handle(&ctx, &args).await
+            } else if call.function.name == "ask_user_question" {
+                // Plan-review approval (replaces exit_plan_mode): when the
+                // tool result carries [PLAN APPROVED], flip plan -> build.
+                let outcome = stark_tools::dispatch(&call.function.name, &args, &tools).await;
+                maybe_flip_plan_mode(&ctx, &mode, &outcome).await;
+                outcome
             } else {
                 stark_tools::dispatch(&call.function.name, &args, &tools).await
             };
@@ -912,51 +911,12 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     }
 }
 
-async fn exit_plan_mode_tool(ctx: &RunContext, args: &Value) -> ToolOutcome {
-    let Some(plan) = args.get("plan").and_then(Value::as_str) else {
-        return ToolOutcome::err("Error: exit_plan_mode requires plan");
-    };
-    if plan.trim().is_empty() {
-        return ToolOutcome::err("Error: exit_plan_mode requires a non-empty plan");
-    }
-    let question = json!({
-        "id": "plan-review",
-        "question": "Approve this plan?",
-        "header": "Plan review",
-        "detail": plan,
-        "options": ["Approve plan", "Keep planning"],
-        "intent": {"kind": "plan-review", "approve": "Approve plan"}
-    });
-    let answers = match ctx.questions.ask(&ctx.chat_id, vec![question], 600).await {
-        Ok(answers) => answers,
-        Err(error) => return ToolOutcome::err(format!("Error: plan review failed: {error}")),
-    };
-    let answer = answers.first().cloned().unwrap_or_else(|| json!({}));
-    let approved = answer
-        .get("selected")
-        .and_then(Value::as_array)
-        .is_some_and(|selected| {
-            selected
-                .iter()
-                .any(|value| value.as_str() == Some("Approve plan"))
-        });
-    if approved {
+/// Plan-review approval (replaces the exit_plan_mode tool): when an
+/// ask_user_question result carries [PLAN APPROVED], flip the chat from plan
+/// to build mode. Rejection keeps plan mode; the model presents again.
+async fn maybe_flip_plan_mode(ctx: &RunContext, mode: &str, outcome: &ToolOutcome) {
+    if mode == "plan" && !outcome.is_error && outcome.content.contains("[PLAN APPROVED]") {
         let _ = ctx.store.set_chat_mode(&ctx.chat_id, "build").await;
-        return ToolOutcome::ok(
-            "[PLAN APPROVED] Stop here. Implementation begins on the next turn in build mode.",
-        );
-    }
-    let feedback = answer
-        .get("custom")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if feedback.is_empty() {
-        ToolOutcome::ok("[PLAN NOT APPROVED] Keep planning and present a revised plan.")
-    } else {
-        ToolOutcome::ok(format!(
-            "[PLAN NOT APPROVED] Feedback: {feedback}\nKeep planning and present a revised plan."
-        ))
     }
 }
 
@@ -987,18 +947,15 @@ fn is_read_only_tool(name: &str) -> bool {
         name,
         "read_file"
             | "read"
-            | "read_image"
             | "search_code"
             | "grep"
             | "glob"
-            | "job_list"
-            | "job_output"
+            | "job"
             | "list_agents"
             | "wait_agent"
             | "web_search"
             | "web_fetch"
             | "skill"
-            | "working_directory"
             | "read_pdf"
             | "look_at_screen"
             | "house_get_state"
@@ -1901,6 +1858,79 @@ mod tests {
                 .join("_general")
                 .join("chat.jsonl")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_approval_marker_flips_plan_to_build() {
+        use stark_tools::ToolOutcome;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        store
+            .ensure_chat(
+                "plan-chat",
+                "_general",
+                &dir.path().to_string_lossy(),
+                "mock",
+                "hi",
+            )
+            .await
+            .unwrap();
+        assert!(store.set_chat_mode("plan-chat", "plan").await.unwrap());
+        assert_eq!(
+            store.chat_mode("plan-chat").await.unwrap().as_deref(),
+            Some("plan")
+        );
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _) = broadcast::channel(256);
+        let ctx = RunContext {
+            chat_id: "plan-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Developer".to_string()),
+            scope: "developer".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: Arc::new(Mutex::new(None)),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            on_job_done: None,
+        };
+        let approved = ToolOutcome::ok(
+            "[USER ANSWERS]\n- plan-review: Approve plan\n[PLAN APPROVED] Stop here.",
+        );
+        maybe_flip_plan_mode(&ctx, "plan", &approved).await;
+        assert_eq!(
+            store.chat_mode("plan-chat").await.unwrap().as_deref(),
+            Some("build")
+        );
+        let rejected = ToolOutcome::ok("[USER ANSWERS]\n- plan-review: Keep planning");
+        maybe_flip_plan_mode(&ctx, "plan", &rejected).await;
+        assert_eq!(
+            store.chat_mode("plan-chat").await.unwrap().as_deref(),
+            Some("build")
+        );
+        let build_mode = ToolOutcome::ok("[PLAN APPROVED]");
+        maybe_flip_plan_mode(&ctx, "build", &build_mode).await;
+        assert_eq!(
+            store.chat_mode("plan-chat").await.unwrap().as_deref(),
+            Some("build")
         );
     }
 }

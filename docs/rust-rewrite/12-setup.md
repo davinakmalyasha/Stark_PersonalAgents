@@ -27,11 +27,12 @@ cargo run -p stark-server
 # STARK_PORT=8124 STARK_HARNESS_ROOT=<repo> cargo run -p stark-server
 ```
 
-Developer v2 uses Git Bash for the `bash` tool. Install Git for Windows and
+Developer uses Git Bash for the `bash` tool. Install Git for Windows and
 ensure `bash.exe` is on `PATH` or at the standard Git for Windows location.
-WSL is not required. `working_directory`, `read`, `write`, `edit`, `glob`, and
-`grep` resolve relative paths from the session cwd and stay inside the
-workspace root.
+WSL is not required. `read`, `write`, `edit`, `glob`, and
+`grep` resolve relative paths from the session cwd (shown in the system prompt
+Zone 1 runtime context) and stay inside the workspace root. Per-command
+`bash.workdir` overrides without a persistent `cd`.
 
 Web tools:
 

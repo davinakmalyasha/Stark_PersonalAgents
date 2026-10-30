@@ -1,17 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { X, HelpCircle, Check } from 'lucide-react';
 import type { AskAnswer, AskBatch, AskOption, AskQuestion } from '../../services/api';
-import { fetchPendingQuestions, submitAskAnswers } from '../../services/api';
+import { fetchPendingQuestions, submitAskAnswers, getChatState } from '../../services/api';
 
 interface Props {
   visible: boolean;
   onClose?: () => void;
+  /** Reflect server-side plan -> build flips after a plan-review answer. */
+  onModeChange?: (mode: 'plan' | 'build') => void;
 }
 
 /** Human-in-the-loop: renders pending ask_user batches (agents block until
  * answered). Backend /api/ask/pending + /api/ask/answer already exist — this
  * is the missing frontend wiring (P10/P2). */
-export default function QuestionModal({ visible, onClose }: Props) {
+export default function QuestionModal({ visible, onClose, onModeChange }: Props) {
   const [batches, setBatches] = useState<AskBatch[]>([]);
   const [answers, setAnswers] = useState<Record<string, { selected: string[]; custom: string }>>({});
   const [submitting, setSubmitting] = useState(false);
@@ -82,6 +84,17 @@ export default function QuestionModal({ visible, onClose }: Props) {
     if (!ok) {
       setError('Failed to deliver your answer. The agent may have timed out.');
       return;
+    }
+    // Plan-review approval flips plan -> build server-side. Refetch so the
+    // mode badge and composer bar update without a manual /build.
+    const isPlanReview = activeBatch.questions.some((q) => q.intent?.kind === 'plan-review');
+    if (isPlanReview && activeBatch.chat_id) {
+      try {
+        const state = await getChatState(activeBatch.chat_id);
+        onModeChange?.(state.mode);
+      } catch {
+        // Non-fatal: the badge refreshes on the next chat fetch.
+      }
     }
     setBatches((prev) => prev.filter((b) => b.batch_id !== activeBatch.batch_id));
     setAnswers({});

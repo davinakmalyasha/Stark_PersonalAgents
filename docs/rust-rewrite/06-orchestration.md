@@ -65,9 +65,9 @@ Legacy v1:
 - Level-2 subagents are read-only unless the parent passes `write_access`
   (nested worktree).
 
-Developer v2 (`stark-core::codex_agents`):
+Developer v2 (`stark-core::codex_agents`, Pi-simplified):
 
-- `spawn_agent`, `send_message`, `followup_task`, `wait_agent`,
+- `spawn_agent`, `message_agent` (queue or wake), `wait_agent`,
   `list_agents`, `interrupt_agent`, `close_agent`.
 - Task paths are `/root/<root-id>/<task_name>`; `fork_turns=all|none`.
 - Children share the parent workspace and inherit write tools.
@@ -79,10 +79,12 @@ Developer v2 (`stark-core::codex_agents`):
 
 - Legacy scopes hide write/execute tools from the spec list and block them
   in `dispatch` and in code mode.
-- Developer v2 keeps the same tool catalog in plan/build for request-cache
-  stability; `plan_mode_denial` blocks writes.
-- `todo_write` replaces the plan dock for Developer; `exit_plan_mode`
-  presents the plan for approval.
+- Developer keeps the same tool catalog in plan/build for request-cache
+  stability; `plan_mode_denial` blocks writes (`job kill`, mutating `bash`,
+  `write`/`edit`, delegation) while reads stay available.
+- `todo_write` replaces the plan dock for Developer; `ask_user_question` with
+  plan-review intent presents the plan for approval (server flips plan to
+  build on approve; the composer Approve button does the same via API).
 - The plan block is appended to the prompt when a plan exists.
 - Plans persist per chat/scope and appear in `AppState.plan`.
 

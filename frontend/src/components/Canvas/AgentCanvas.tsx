@@ -22,6 +22,7 @@ interface Props {
   hasActiveChat: boolean;
   notification: string | null;
   chatMode?: 'plan' | 'build';
+  onModeChange?: (mode: 'plan' | 'build') => void;
   onSend: (message: string, files?: File[]) => void;
   onCancel: () => void;
   onModelChange: (model: string) => void;

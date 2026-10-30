@@ -1,5 +1,5 @@
-//! DeepSeek Harness-compatible filesystem tools: read, write, edit, read_image,
-//! glob, and grep. These are model-facing v2 tools; the old read_file/edit_file
+//! DeepSeek Harness-compatible filesystem tools: read, write, edit, glob,
+//! and grep. `read` handles text and images. The old read_file/edit_file
 //! pair remains available to agents that have not migrated.
 
 use std::collections::BTreeMap;
@@ -57,7 +57,8 @@ pub async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| crate::images::mime_for_ext(ext).is_some())
     {
-        return ToolOutcome::err(format!("Error: {raw} is an image; use read_image"));
+        let forwarded = serde_json::json!({"file_path": path.to_string_lossy()});
+        return crate::read::read_file(ctx, &forwarded).await;
     }
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(content) => content,
@@ -100,18 +101,6 @@ pub async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         output.push_str(&format!("{}\t{}\n", start + index + 1, line));
     }
     ToolOutcome::ok(output)
-}
-
-pub async fn read_image(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    let Some(raw) = args.get("file_path").and_then(Value::as_str) else {
-        return ToolOutcome::err("Error: read_image requires file_path");
-    };
-    let path = match resolve(ctx, raw) {
-        Ok(path) => path,
-        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
-    };
-    let forwarded = serde_json::json!({"file_path": path.to_string_lossy()});
-    crate::read::read_file(ctx, &forwarded).await
 }
 
 pub async fn write(ctx: &ToolContext, args: &Value) -> ToolOutcome {
@@ -408,6 +397,16 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("2\ttwo"), "{}", out.content);
         assert!(!out.content.contains("1\tone"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn read_returns_images_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let ctx = context(dir.path());
+        let out = read(&ctx, &serde_json::json!({"file_path": "shot.png"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("[IMAGE]"), "{}", out.content);
     }
 
     #[tokio::test]

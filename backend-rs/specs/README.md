@@ -52,8 +52,10 @@ PTC/code mode in a separate preset.
 
 `tool-specs.json` is validated by `stark-contract` and consumed by
 `stark-tools::tool_specs_for_scope_with_access`. Do not add a tool to
-`scope_map.developer` without also adding it to `IMPLEMENTED` in
-`stark-tools/src/lib.rs` and implementing a dispatch arm.
+`scope_map.developer` without also adding one `ToolMeta` entry to the
+unified inventory in `stark-tools/src/inventory.rs` and implementing a
+dispatch arm, then regenerating labels with
+`node backend-rs/specs/generate-labels.mjs`.
 
 `docs/tools/README.md` points at the contract and the v2 parity doc; the old
 per-tool pages were deleted. The Developer surface is documented by the

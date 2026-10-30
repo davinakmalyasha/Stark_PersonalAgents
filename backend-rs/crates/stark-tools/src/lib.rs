@@ -15,6 +15,7 @@ mod edit;
 mod head_tail;
 mod house;
 mod images;
+mod inventory;
 mod mcp;
 mod memory;
 mod patch;
@@ -40,6 +41,7 @@ pub use approvals::ApprovalCache;
 pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
+pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_read_blocked};
 pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
@@ -50,91 +52,10 @@ pub use screen::{
 pub use skills::catalog_block_for;
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
-const IMPLEMENTED: &[&str] = &[
-    "read_file",
-    "edit_file",
-    "run_command",
-    "search_code",
-    "ask_user",
-    "call_subagent",
-    "update_plan",
-    "browser_act",
-    "delegate",
-    "delegation_status",
-    "job_message",
-    "job_cancel",
-    "give_note",
-    "house_get_state",
-    "house_get_device",
-    "house_set_device",
-    "house_run_scene",
-    "house_get_history",
-    "dfd_bridge",
-    "create_client",
-    "files_changed",
-    "read_pdf",
-    "create_docx",
-    "create_xlsx",
-    "create_coding_project",
-    "create_group",
-    "group_board",
-    "group_item_detail",
-    "group_events",
-    "group_update",
-    "schedule",
-    "look_at_screen",
-    "set_screen_share",
-    "canvas_mode",
-    "run_code",
-    "agent",
-    "bash",
-    "job",
-    "read",
-    "write",
-    "edit",
-    "glob",
-    "grep",
-    "todo_write",
-    "ask_user_question",
-    "skill",
-    "web_search",
-    "web_fetch",
-    "spawn_agent",
-    "message_agent",
-    "wait_agent",
-    "list_agents",
-    "interrupt_agent",
-    "close_agent",
-    "memory",
-];
-
-pub const PLAN_WRITE_TOOLS: &[&str] = &[
-    "edit_file",
-    "create_project",
-    "create_coding_project",
-    "create_group",
-    "create_client",
-    "github_apply_gate",
-    "house_set_device",
-    "house_run_scene",
-    "group_update",
-    "create_docx",
-    "create_xlsx",
-    "delegate",
-    "call_subagent",
-    "look_at_screen",
-    "set_screen_share",
-    "run_code",
-    "agent",
-    "write",
-    "edit",
-    "todo_write",
-    "spawn_agent",
-    "message_agent",
-    "interrupt_agent",
-    "close_agent",
-];
-
+/// Tool membership and guard flags now live in [`inventory`]: one `ToolMeta`
+/// entry per tool derives the implemented set, the plan-write guard, the
+/// read-only guard, and the frontend labels. The frozen wire schema stays in
+/// `backend-rs/specs/tool-specs.json`.
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
 
 #[derive(Clone)]
@@ -348,9 +269,9 @@ pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -
         .iter()
         .filter(|tool| {
             tool.exposed
-                && IMPLEMENTED.contains(&tool.name.as_str())
+                && is_implemented(tool.name.as_str())
                 && allowed.is_none_or(|names| names.contains(&tool.name))
-                && !(plan_filter && PLAN_WRITE_TOOLS.contains(&tool.name.as_str()))
+                && !(plan_filter && is_plan_write(tool.name.as_str()))
                 && !(read_only
                     && matches!(
                         tool.name.as_str(),
@@ -450,7 +371,7 @@ pub fn plan_mode_denial(mode: &str, name: &str, args: &Value) -> Option<String> 
     if mode != "plan" {
         return None;
     }
-    if PLAN_WRITE_TOOLS.contains(&name) {
+    if is_plan_write(name) {
         return Some(format!(
             "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. ({name} is a write-class tool.)"
         ));
@@ -498,32 +419,12 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
     if ctx.access != "read" {
         return None;
     }
-    match name {
-        "edit_file"
-        | "run_code"
-        | "call_subagent"
-        | "write"
-        | "edit"
-        | "todo_write"
-        | "spawn_agent"
-        | "message_agent"
-        | "interrupt_agent"
-        | "close_agent"
-        | "create_docx"
-        | "create_xlsx"
-        | "create_coding_project"
-        | "create_group"
-        | "create_client"
-        | "house_set_device"
-        | "house_run_scene"
-        | "look_at_screen"
-        | "set_screen_share"
-        | "group_update"
-        | "schedule"
-        | "canvas_mode"
-        | "give_note" => Some(format!(
+    if is_read_blocked(name) {
+        return Some(format!(
             "[BLOCKED] Read-only agent cannot call {name}. Report findings or a proposed patch instead."
-        )),
+        ));
+    }
+    match name {
         "run_command" | "bash" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             if let Err(reason) = stark_policy::check_read_only(command) {

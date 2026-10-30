@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Bot, CheckCircle2, ChevronDown, ChevronRight, FileText, Loader2, Search, Terminal, Wrench, X } from 'lucide-react';
 import { delegationTarget, isDelegationToolName, type TraceStep } from '../../utils/logParser';
 import { buildEntries, resolveDelegations, type ToolGroupEntry } from '../../utils/delegationMatch';
+import { TOOL_SUMMARIES, TOOL_VERBS } from '../../utils/toolLabels.generated';
 import type { LiveToolEvent, StreamSegment } from '../../utils/streamAccum';
 
 interface Props {
@@ -35,91 +36,41 @@ function primaryArg(args?: string): string {
   }
 }
 
+// Historical tool names no longer emitted (kept so old transcripts still label).
+const LEGACY_VERBS: Record<string, string> = {
+  read_image: 'Read image',
+  list_files: 'Listed files',
+  task: 'Delegated',
+  send_message: 'Messaged agent',
+  followup_task: 'Followed up',
+  job_list: 'Listed jobs',
+  job_output: 'Read job',
+  job_kill: 'Killed job',
+  exit_plan_mode: 'Proposed plan',
+  working_directory: 'Changed directory',
+};
+
+const LEGACY_SUMMARIES: Record<string, string> = {
+  read_image: 'read images',
+  list_files: 'explored files',
+  task: 'created an agent',
+  send_message: 'messaged an agent',
+  followup_task: 'sent a follow-up',
+  job_list: 'listed jobs',
+  job_output: 'read a job',
+  job_kill: 'killed a job',
+  exit_plan_mode: 'proposed a plan',
+  working_directory: 'changed directory',
+};
+
 function toolLabel(event: LiveToolEvent): { verb: string; subject: string } {
   const subject = primaryArg(event.args);
-  const verb = {
-    read: 'Read',
-    read_file: 'Read',
-    list_files: 'Listed files',
-    write: 'Wrote',
-    write_file: 'Wrote',
-    edit: 'Edited',
-    edit_file: 'Edited',
-    read_image: 'Read image',
-    bash: 'Ran command',
-    run_command: 'Ran command',
-    grep: 'Searched',
-    glob: 'Listed files',
-    search_code: 'Searched',
-    web_search: 'Searched web',
-    web_fetch: 'Fetched',
-    task: 'Delegated',
-    call_subagent: 'Delegated',
-    delegate: 'Delegated',
-    spawn_agent: 'Spawned agent',
-    message_agent: 'Messaged agent',
-    send_message: 'Messaged agent',
-    followup_task: 'Followed up',
-    wait_agent: 'Waited for agent',
-    list_agents: 'Listed agents',
-    interrupt_agent: 'Interrupted agent',
-    close_agent: 'Closed agent',
-    job: 'Managed job',
-    job_list: 'Listed jobs',
-    job_output: 'Read job',
-    job_kill: 'Killed job',
-    todo_write: 'Updated todo list',
-    update_plan: 'Updated plan',
-    exit_plan_mode: 'Proposed plan',
-    ask_user: 'Asked',
-    ask_user_question: 'Asked',
-    skill: 'Loaded skill',
-    working_directory: 'Changed directory',
-    memory: 'Recalled memory',
-  }[event.name] || event.name;
+  const verb = TOOL_VERBS[event.name] || LEGACY_VERBS[event.name] || event.name;
   return { verb, subject };
 }
 
 function toolSummaryPart(event: LiveToolEvent): string {
-  return {
-    read: 'read files',
-    read_file: 'read files',
-    list_files: 'explored files',
-    write: 'wrote files',
-    write_file: 'wrote files',
-    edit: 'edited files',
-    edit_file: 'edited files',
-    bash: 'ran commands',
-    run_command: 'ran commands',
-    grep: 'searched code',
-    glob: 'explored files',
-    search_code: 'searched code',
-    web_search: 'searched the web',
-    web_fetch: 'fetched pages',
-    task: 'created an agent',
-    call_subagent: 'created an agent',
-    delegate: 'created an agent',
-    spawn_agent: 'created an agent',
-    message_agent: 'messaged an agent',
-    send_message: 'messaged an agent',
-    followup_task: 'sent a follow-up',
-    wait_agent: 'waited for an agent',
-    list_agents: 'listed agents',
-    interrupt_agent: 'interrupted an agent',
-    close_agent: 'closed an agent',
-    job: 'managed a job',
-    job_list: 'listed jobs',
-    job_output: 'read a job',
-    job_kill: 'killed a job',
-    todo_write: 'updated the todo list',
-    update_plan: 'updated the plan',
-    exit_plan_mode: 'proposed a plan',
-    ask_user: 'asked a question',
-    ask_user_question: 'asked a question',
-    skill: 'loaded a skill',
-    working_directory: 'changed directory',
-    memory: 'recalled memory',
-  }[event.name] || 'used tools';
+  return TOOL_SUMMARIES[event.name] || LEGACY_SUMMARIES[event.name] || 'used tools';
 }
 
 function toolGroupTitle(events: LiveToolEvent[]): string {

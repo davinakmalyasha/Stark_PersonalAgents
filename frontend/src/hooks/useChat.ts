@@ -381,10 +381,30 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         onActive?.({ wsId: ws.id, chatId: chatId! });
       },
       (err) => {
-        setNotification(typeof err === 'string' ? err : 'Error occurred.');
-        resetStream();
+        const errText = typeof err === 'string' ? err : 'Error occurred.';
+        setNotification(errText);
+        // Failure keeps the same persist path as completion/cancel: the
+        // worked steps must survive as an expandable trace, not vanish with
+        // the live stream. Empty runs persist nothing.
+        const partialText = streamRef.current.text;
+        const partialReasoning = streamRef.current.reasoning;
+        const segments = [...streamRef.current.segments];
+        const log = liveStateRef.current?.live_terminal_log || '';
+        const hasPartial = !!(partialText.trim() || partialReasoning.trim() || log.trim() || segments.length);
+        const ws = runWsRef.current;
+        const chatId = runChatIdRef.current;
         setIsRunning(false);
         setLiveState(null);
+        if (ws && chatId && hasPartial) {
+          const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
+          finishHouseMessage(ws, chatId, liveStateRef.current, duration, {
+            thinking: partialReasoning,
+            liveTimeline: segments,
+            stopped: true,
+            textOverride: partialText || `Run failed: ${errText}`,
+          }).then(setMessages).catch(() => {});
+        }
+        resetStream();
         sendInFlightRef.current = false;
       },
       workspaceKind,

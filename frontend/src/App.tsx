@@ -175,10 +175,17 @@ export default function App() {
       // The server persists the terminal agent status before `done`, so
       // refresh the tree immediately — do not wait for chat persistence.
       setSidebarRefreshTick((t) => t + 1);
-      // Backend/provider failures also end the stream, but they must not be
-      // persisted as completed runs or empty assistant traces.
-      if (state?.error) {
-        return;
+      // Backend/provider failures also end the stream: persist the partial
+      // trace like a Stop so worked steps survive (empty runs still persist
+      // nothing). The error pill stays the visible failure signal.
+      const runError = state?.error || null;
+      if (runError) {
+        const { steps: errSteps } = parseLogToSteps(state?.live_terminal_log ?? '');
+        const errLive = lastStreamingRef.current;
+        const errTimeline = errLive.segments?.length ? errLive.segments : streaming.segments;
+        if (!errSteps.length && !errTimeline.length && !(state?.outputs?.agent_report || '')) {
+          return;
+        }
       }
       // Stop (not done): keep the partial, marked stopped. Capture + reset
       // here — cancel() already cleared the live stream by the time we run.
@@ -209,7 +216,7 @@ export default function App() {
               // terminal log. Use it as the same unified trace response.
               // On Stop, the visible streamed partial wins (it never lands in
               // the log).
-              const finalResponse = stoppedText.trim() || assistantResponse || state?.outputs?.agent_report || '';
+              const finalResponse = stoppedText.trim() || assistantResponse || state?.outputs?.agent_report || (runError ? `Run failed: ${runError}` : '');
               const duration = runStartTime.current
                 ? Math.round((Date.now() - runStartTime.current) / 1000) + 's'
                 : undefined;
@@ -230,7 +237,7 @@ export default function App() {
                 activeChat.id,
                 'agent',
                 finalResponse,
-                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined, thinking: (stoppedThinking || successThinking) || undefined, liveTimeline: successTimeline.length ? successTimeline : undefined, ...(wasStopped ? { stopped: true } : {}) }
+                { isTrace: true, steps: chatSteps, duration, artifacts: state?.artifacts, project_ref: state?.project_ref ?? undefined, usage: state?.token_usage ?? undefined, thinking: (stoppedThinking || successThinking) || undefined, liveTimeline: successTimeline.length ? successTimeline : undefined, ...((wasStopped || runError) ? { stopped: true } : {}) }
               );
             }
             // Now re-fetch to sync messages and token stats

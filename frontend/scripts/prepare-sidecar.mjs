@@ -8,15 +8,53 @@ const candidates = [
   'D:/cargo-target/stark-server/release/stark-server.exe',
   path.resolve(frontend, '..', 'backend-rs', 'target', 'release', 'stark-server.exe'),
   path.resolve(frontend, '..', '..', 'cargo-target', 'stark-server', 'release', 'stark-server.exe'),
+  path.resolve(frontend, '..', '..', 'cargo-target', 'stark', 'release', 'stark-server.exe'),
 ].filter(Boolean);
-const source = candidates.find((candidate) => fs.existsSync(candidate));
-const destination = path.join(frontend, 'src-tauri', 'binaries', `stark-server-${triple}.exe`);
-
-if (!source) {
-  console.error(`[sidecar] no Rust server binary found; checked:\n${candidates.join('\n')}`);
+// Freshness beats order: an explicit env override wins, otherwise the newest
+// binary wins. A stale leftover silently shipped once (Oct 27 backend with an
+// Oct 30 frontend), resurrecting removed behavior. Never again.
+const existing = candidates
+  .filter((candidate) => fs.existsSync(candidate))
+  .map((candidate) => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
+  .sort((a, b) => b.mtime - a.mtime);
+if (!existing.length) {
+  console.error('[sidecar] no Rust server binary found; checked:');
+  for (const candidate of candidates) console.error(`  - ${candidate}`);
   console.error('[sidecar] build it with: cargo build --release -p stark-server (backend-rs)');
   process.exit(1);
 }
+const explicit = process.env.STARK_SERVER_BIN;
+const chosen = explicit && fs.existsSync(explicit)
+  ? { candidate: explicit, mtime: fs.statSync(explicit).mtimeMs }
+  : existing[0];
+const source = chosen.candidate;
+const destination = path.join(frontend, 'src-tauri', 'binaries', `stark-server-${triple}.exe`);
+
+// Refuse to bundle a backend older than the newest Rust source: that means the
+// build is stale and the app would ship old tool behavior under a new UI.
+const backendRoot = path.resolve(frontend, '..', 'backend-rs');
+let newestSource = 0;
+const walk = (dir) => {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (entry.name === 'target' || entry.name === 'models' || entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(full);
+    else if (entry.name.endsWith('.rs') || entry.name.endsWith('.toml')) {
+      try { newestSource = Math.max(newestSource, fs.statSync(full).mtimeMs); } catch { /* ignore */ }
+    }
+  }
+};
+walk(backendRoot);
+if (!explicit && newestSource > 0 && chosen.mtime + 5_000 < newestSource) {
+  console.error('[sidecar] refusing stale backend binary:');
+  console.error(`  chosen: ${source} (${new Date(chosen.mtime).toISOString()})`);
+  console.error(`  newest backend source: ${new Date(newestSource).toISOString()}`);
+  console.error('[sidecar] rebuild first: cargo build --release -p stark-server');
+  process.exit(1);
+}
+console.log(`[sidecar] ${source} (${new Date(chosen.mtime).toISOString()}) -> ${destination}`);
 
 fs.mkdirSync(path.dirname(destination), { recursive: true });
 fs.copyFileSync(source, destination);

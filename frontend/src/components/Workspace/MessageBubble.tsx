@@ -378,7 +378,7 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
           {/* Main response text content */}
           {responseContent && responseContent !== '(Execution Trace)' && !message.metadata?.project_ref && (
             <div className="agent-message-response text-[15.5px] text-zinc-200 leading-relaxed">
-              {activitySegments.length > 0 && (
+              {activitySegments.length > 0 && !streamingActive && message.duration !== 'active' && (
                 <div className="agent-response-kicker">Final response</div>
               )}
               {streamingActive ? (

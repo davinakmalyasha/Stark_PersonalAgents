@@ -209,7 +209,7 @@ pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOut
         let wait = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(0)
+            .unwrap_or(60)
             .min(300);
         let detail = if wait == 0 {
             match store.get(id).await {

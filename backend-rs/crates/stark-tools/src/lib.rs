@@ -482,6 +482,11 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
 }
 
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
+    if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
+        return ToolOutcome::err(
+            "[BLOCKED] Subagents run non-interactively: the user cannot answer here. Do not ask questions. Decide with the information you have, or report the decision/blocker to your parent in your final message.",
+        );
+    }
     if let Some(tool) = contract().tool(name)
         && let Some(required) = tool
             .required
@@ -694,6 +699,27 @@ mod tests {
         let plan_specs = tool_specs_for_scope("plan", "coder");
         let plan = tool_names(&plan_specs);
         assert!(plan.contains(&"run_code"));
+    }
+
+    #[tokio::test]
+    async fn subagents_cannot_ask_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = context(dir.path()).with_depth(1);
+        let out = dispatch(
+            "ask_user_question",
+            &json!({"questions": [{"question": "which image source?", "options": ["svg", "photos"]}]}),
+            &child,
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("Subagents run non-interactively"),
+            "{}",
+            out.content
+        );
+        // The root agent keeps the channel.
+        let root = context(dir.path()).with_depth(0);
+        assert!(read_only_denial("ask_user_question", &json!({}), &root).is_none());
     }
 
     #[test]

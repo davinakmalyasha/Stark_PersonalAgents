@@ -731,6 +731,43 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             )
             .await;
 
+        // A response cut by the output limit must never execute its tool
+        // calls: the arguments are a partial payload (this silently truncated
+        // a heredoc once). Answer every call id with a clear retry
+        // instruction so history stays valid and the model splits the work.
+        if !tool_calls.is_empty()
+            && matches!(
+                finish_reason.as_deref(),
+                Some("length") | Some("max_tokens")
+            )
+        {
+            let notice = "[ERROR] Your response hit the output token limit mid-tool-call, so nothing was executed. Retry with a smaller payload: split large files or heredocs into several write/edit/append calls.";
+            for call in &tool_calls {
+                messages.push(ChatMessage::tool(&call.id, notice));
+                let _ = ctx
+                    .store
+                    .append_session_entry_for(
+                        &ctx.workspace_id,
+                        &ctx.workspace,
+                        &ctx.chat_id,
+                        json!({
+                            "type": "message",
+                            "role": "toolResult",
+                            "tool_call_id": call.id,
+                            "tool_name": call.function.name,
+                            "is_error": true,
+                            "content": notice,
+                        }),
+                    )
+                    .await;
+                ctx.emit_delta(
+                    Delta::tool_finished(&call.function.name, "{}", false, 0, notice)
+                        .with_agent(agent_label.clone()),
+                );
+            }
+            continue;
+        }
+
         for call in tool_calls {
             if ctx.cancel.is_cancelled() {
                 finish_aborted(&ctx, &mut state).await;
@@ -1641,6 +1678,87 @@ mod tests {
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    async fn mock_truncated_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":"{\"file_path\":\"big.txt\",\"content\":\"partial"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Split it"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_calls_never_execute() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_truncated_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "truncated-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Coder".to_string()),
+            scope: "coder".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            on_job_done: None,
+        };
+        run_agent(ctx, "write a big file".to_string())
+            .await
+            .unwrap();
+
+        // The partial payload never reached disk, and the model got one retry.
+        assert!(!dir.path().join("big.txt").exists());
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

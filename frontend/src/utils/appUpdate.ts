@@ -1,14 +1,8 @@
-// Startup auto-update: check the signed release feed, prompt once per day,
-// download + install in the background, relaunch to finish. The updater
-// covers the app and the stark-server sidecar. No-ops outside Tauri.
+// Startup auto-update: check the signed release feed on every launch,
+// prompt once, download + install in the background, relaunch to finish.
+// The updater covers the app and the stark-server sidecar. No-ops outside
+// Tauri. Offline or an unreachable feed stays silent.
 export async function checkForAppUpdate(notify: (message: string) => void): Promise<void> {
-  try {
-    const last = localStorage.getItem('stark-update-check');
-    if (last && Date.now() - Number(last) < 24 * 3600 * 1000) return;
-    localStorage.setItem('stark-update-check', String(Date.now()));
-  } catch {
-    return;
-  }
   let updater: typeof import('@tauri-apps/plugin-updater');
   let dialog: typeof import('@tauri-apps/plugin-dialog');
   let proc: typeof import('@tauri-apps/plugin-process');
@@ -36,7 +30,7 @@ export async function checkForAppUpdate(notify: (message: string) => void): Prom
   try {
     await update.downloadAndInstall();
   } catch {
-    notify('Update download failed. It will retry tomorrow.');
+    notify('Update download failed. It will retry next launch.');
     return;
   }
   notify(`Stark ${update.version} installed — restarting…`);

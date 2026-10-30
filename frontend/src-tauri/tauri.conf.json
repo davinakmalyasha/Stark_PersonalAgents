@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Stark",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "identifier": "com.stark.workspace",
   "build": {
     "frontendDist": "../dist",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [],
     "security": {
-      "csp": "default-src 'self' tauri: asset: http://tauri.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:8123 ws://127.0.0.1:8123 http://localhost:9000 ws://localhost:9000; img-src 'self' asset: http://asset.localhost http://127.0.0.1:8123 data: blob:; media-src 'self' blob: http://127.0.0.1:8123; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; frame-src 'self' data: blob:; worker-src 'self' blob:; base-uri 'self'",
+      "csp": "default-src 'self' tauri: asset: http://tauri.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:8123 ws://127.0.0.1:8123 http://localhost:9000 ws://localhost:9000 https://github.com; img-src 'self' asset: http://asset.localhost http://127.0.0.1:8123 data: blob:; media-src 'self' blob: http://127.0.0.1:8123; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' 'unsafe-eval'; frame-src 'self' data: blob:; worker-src 'self' blob:; base-uri 'self'",
       "capabilities": [
         "main",
         "voice"
@@ -22,6 +22,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": [
       "nsis"
     ],
@@ -45,6 +46,16 @@
         "type": "downloadBootstrapper",
         "silent": true
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/davinakmalyasha/Stark_PersonalAgents/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZEMjIzOUM3OUYyQzZCQUIKUldTcmF5eWZ4emtpL2JXZlBRQjF4ckE2R0VNbUtjK3hNRkQ0SDMzMU80R0xHVVBXWjFvUFFnTzYK"
     }
   }
 }

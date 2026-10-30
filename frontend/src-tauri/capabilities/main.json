@@ -12,6 +12,8 @@
   },
   "permissions": [
     "core:default",
+    "updater:default",
+    "process:allow-restart",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",

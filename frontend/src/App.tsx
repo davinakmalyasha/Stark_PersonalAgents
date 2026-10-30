@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, FolderGit2, Palette } from 'lucide-react';
+import { checkForAppUpdate } from './utils/appUpdate';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
@@ -119,6 +120,8 @@ export default function App() {
     }
 
     fetchModels().then((m) => { if (m.length) setModels(m); }).catch(() => {});
+    // Signed auto-update (Tauri only, once per day, silent when offline).
+    checkForAppUpdate(setNotification).catch(() => {});
     fetchWorkspaces().then(async (ws) => {
       if (ws.length === 0) return;
       let initialWs = ws.find(isProjectWorkspace) || ws.find((w) => w.isGeneral) || ws[0];

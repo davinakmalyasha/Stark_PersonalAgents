@@ -1,0 +1,45 @@
+name: release
+
+# Signed desktop release with updater artifacts.
+# Tag a version: git tag v2.1.0 && git push origin v2.1.0
+# The tag MUST match frontend/src-tauri/tauri.conf.json "version".
+# Required repo secrets: TAURI_SIGNING_PRIVATE_KEY (content of the .key file;
+# never commit it). TAURI_SIGNING_PRIVATE_KEY_PASSWORD only if the key has one.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            backend-rs -> target
+            frontend/src-tauri -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Backend release binary (sidecar source)
+        run: cargo build --release -p stark-server
+        working-directory: backend-rs
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: frontend
+          tagName: ${{ github.ref_name }}
+          releaseName: "Stark ${{ github.ref_name }}"
+          releaseDraft: false
+          updaterJsonKeepUniversal: true

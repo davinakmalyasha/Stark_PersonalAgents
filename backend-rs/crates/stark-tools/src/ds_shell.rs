@@ -73,13 +73,20 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         return ToolOutcome::err("Error: bash requires a non-empty description");
     }
     let policy = stark_policy::evaluate_command(command);
+    let permission = crate::permissions::effect(ctx, "bash", &[command.to_string()]);
+    if matches!(permission, stark_policy::Effect::Deny) {
+        return ToolOutcome::err(format!(
+            "[BLOCKED] Command denied by permissions.json: {command}"
+        ));
+    }
     if matches!(policy.decision, stark_policy::Decision::Forbidden) {
         return ToolOutcome::err(format!(
             "[BLOCKED] Command denied by policy: {}",
             policy.reason.unwrap_or_else(|| "forbidden".to_string())
         ));
     }
-    if matches!(policy.decision, stark_policy::Decision::Prompt)
+    if (matches!(policy.decision, stark_policy::Decision::Prompt)
+        || matches!(permission, stark_policy::Effect::Ask))
         && !ctx.approvals.is_approved(command)
     {
         if ctx.depth > 0 {
@@ -232,6 +239,28 @@ mod tests {
 
     fn context(dir: &std::path::Path) -> ToolContext {
         ToolContext::new(dir, "v2-shell", Arc::new(QuestionBroker::new()))
+    }
+
+    #[tokio::test]
+    async fn denied_bash_never_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join(".deep_agents");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(
+            rules.join("permissions.json"),
+            r#"{"permissions":[{"action":"bash","resource":"*","effect":"deny"}]}"#,
+        )
+        .unwrap();
+        let ctx = context(dir.path()).with_harness_root(dir.path());
+        let out = bash(
+            &ctx,
+            &json!({"description": "should not run", "command": "echo hi > marker.txt"}),
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("permissions.json"), "{}", out.content);
+        // Proof the process layer was never reached.
+        assert!(!dir.path().join("marker.txt").exists());
     }
 
     #[tokio::test]

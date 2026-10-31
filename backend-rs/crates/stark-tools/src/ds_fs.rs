@@ -52,6 +52,10 @@ pub async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
+    let resource = crate::paths::relative_display(&ctx.workspace, &path);
+    if let Some(blocked) = crate::permissions::gate(ctx, "read", &[resource], raw).await {
+        return blocked;
+    }
     if path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -114,6 +118,10 @@ pub async fn write(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
+    let resource = crate::paths::relative_display(&ctx.workspace, &path);
+    if let Some(blocked) = crate::permissions::gate(ctx, "edit", &[resource], raw).await {
+        return blocked;
+    }
     if path.exists() && !ctx.was_read(&path) {
         return ToolOutcome::err(format!("Error: read {raw} before overwriting it"));
     }
@@ -150,6 +158,10 @@ pub async fn edit(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
+    let resource = crate::paths::relative_display(&ctx.workspace, &path);
+    if let Some(blocked) = crate::permissions::gate(ctx, "edit", &[resource], raw).await {
+        return blocked;
+    }
     if !ctx.was_read(&path) {
         return ToolOutcome::err(format!("Error: read {raw} before editing it"));
     }
@@ -248,6 +260,11 @@ pub async fn glob(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
         return ToolOutcome::err("Error: glob requires pattern");
     };
+    if let Some(blocked) =
+        crate::permissions::gate(ctx, "glob", &[pattern.to_string()], pattern).await
+    {
+        return blocked;
+    }
     let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let root = match resolve(ctx, raw_root) {
         Ok(path) => path,
@@ -312,6 +329,11 @@ pub async fn grep(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
         return ToolOutcome::err("Error: grep requires pattern");
     };
+    if let Some(blocked) =
+        crate::permissions::gate(ctx, "grep", &[pattern.to_string()], pattern).await
+    {
+        return blocked;
+    }
     let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let root = match resolve(ctx, raw_root) {
         Ok(path) => path,

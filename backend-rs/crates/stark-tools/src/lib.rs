@@ -20,6 +20,7 @@ mod mcp;
 mod memory;
 mod patch;
 mod paths;
+mod permissions;
 mod plan;
 mod processes;
 mod questions;

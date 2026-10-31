@@ -1,0 +1,9 @@
+[package]
+name = "stark-sandbox"
+version = "0.1.0"
+edition = "2024"
+description = "Process sandbox configuration and spawn hooks for Stark"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["process"] }

@@ -281,6 +281,7 @@ impl ProcessManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        stark_sandbox::for_workspace(workdir).wrap_tokio_command(&mut process);
 
         let mut child = process
             .spawn()
@@ -322,6 +323,9 @@ impl ProcessManager {
         builder.env("TERM", "dumb");
         builder.env("STARK_WORKSPACE", workdir.to_string_lossy().as_ref());
         builder.env("STARK_SESSION_ID", owner);
+        for (key, value) in stark_sandbox::for_workspace(workdir).env() {
+            builder.env(key, value);
+        }
 
         let child = pair
             .slave

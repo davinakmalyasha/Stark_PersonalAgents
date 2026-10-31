@@ -5,6 +5,7 @@ members = [
     "crates/stark-policy",
     "crates/stark-providers",
     "crates/stark-tools",
+    "crates/stark-sandbox",
     "crates/stark-store",
     "crates/stark-core",
     "crates/stark-server",

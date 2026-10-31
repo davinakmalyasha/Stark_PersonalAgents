@@ -99,10 +99,12 @@ pub async fn system_prompt(
         "\n\nCurrent runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n\
          Working directory: {}\nPlatform: {}\nShell: bash (`bash -c`)\nCurrent date: {date}\n\
          File access: writes are not OS-sandboxed; stay inside the project unless the task requires otherwise.\n\
+         {sandbox}\n\
          Approvals: destructive shell commands may pause for user approval.\n\
          Relative paths resolve from the working directory; use bash workdir for per-command directories.",
         workspace.to_string_lossy(),
-        platform_label()
+        platform_label(),
+        sandbox = stark_tools::sandbox_prompt_line(workspace)
     ));
     prompt
 }

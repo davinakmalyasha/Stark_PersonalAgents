@@ -42,6 +42,17 @@ pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
 pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_program, is_read_blocked};
+pub use stark_sandbox::{ApprovalPolicy, SandboxMode, SandboxProfile};
+
+/// Prompt line stating the requested sandbox mode and the real backend.
+pub fn sandbox_prompt_line(workspace: &Path) -> String {
+    SandboxProfile::from_env(workspace).prompt_line()
+}
+
+/// Startup log line for the server.
+pub fn sandbox_status(workspace: &Path) -> String {
+    SandboxProfile::from_env(workspace).prompt_line()
+}
 pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp, search_tools};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};

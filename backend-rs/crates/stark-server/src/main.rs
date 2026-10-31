@@ -259,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let provider = Provider::new(provider_config)?;
+    tracing::info!("{}", stark_tools::sandbox_status(&harness_root));
     // Learn the real context window per model from the provider instead of
     // guessing. Best-effort; compaction keeps the conservative default if the
     // metadata endpoint is unavailable.

@@ -455,6 +455,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     let mut repeat_counts: HashMap<(String, String), usize> = HashMap::new();
     // Provider-reported context usage for this turn, when the gateway returns it.
     let mut measured_tokens: Option<usize> = None;
+    // One reactive compaction retry per run on a context-window rejection.
+    let mut overflow_recovered = false;
     let context_window =
         compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model).hard_limit_tokens as u64;
     state.context_window = context_window;
@@ -513,6 +515,12 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         {
             Ok(stream) => stream,
             Err(error) => {
+                if !overflow_recovered && is_context_overflow(&error) {
+                    overflow_recovered = true;
+                    if force_compact(&ctx, &mut messages, &affinity).await {
+                        continue;
+                    }
+                }
                 fail(&ctx, &mut state, error.to_string()).await;
                 return Err(RunError::Provider(error));
             }
@@ -522,6 +530,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         let mut reasoning = String::new();
         let mut calls: BTreeMap<usize, PartialCall> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
+        let mut retry_after_compaction = false;
 
         loop {
             let event = tokio::select! {
@@ -603,6 +612,13 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                     break;
                 }
                 Err(error) => {
+                    // A context-window rejection is recoverable: compact hard
+                    // and retry once instead of killing the run.
+                    if !overflow_recovered && is_context_overflow(&error) {
+                        overflow_recovered = true;
+                        retry_after_compaction = true;
+                        break;
+                    }
                     fail(&ctx, &mut state, error.to_string()).await;
                     return Err(RunError::Provider(error));
                 }
@@ -612,6 +628,16 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         if ctx.cancel.is_cancelled() {
             finish_aborted(&ctx, &mut state).await;
             return Ok(());
+        }
+
+        if retry_after_compaction {
+            if force_compact(&ctx, &mut messages, &affinity).await {
+                continue;
+            }
+            let message = "Provider rejected the context size and compaction could not reduce it."
+                .to_string();
+            fail(&ctx, &mut state, message.clone()).await;
+            return Err(RunError::Message(message));
         }
 
         if calls.is_empty() {
@@ -1138,6 +1164,53 @@ fn is_read_only_tool(name: &str) -> bool {
             | "canvas_mode"
             | "files_changed"
     )
+}
+
+/// Does this provider error mean "the prompt no longer fits the window"?
+fn is_context_overflow(error: &impl std::fmt::Display) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("context length")
+        || text.contains("maximum context")
+        || text.contains("too many tokens")
+        || text.contains("context_length_exceeded")
+}
+
+/// Compact unconditionally (reactive recovery from a context-window 400).
+async fn force_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, affinity: &str) -> bool {
+    let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
+    let Some(outcome) = compaction::compact_history(
+        &ctx.provider,
+        &ctx.cancel,
+        messages,
+        &policy,
+        &ctx.chat_id,
+        affinity,
+    )
+    .await
+    else {
+        return false;
+    };
+    if compaction::estimate_tokens(&outcome.messages) >= compaction::estimate_tokens(messages) {
+        return false;
+    }
+    *messages = outcome.messages;
+    let _ = ctx
+        .store
+        .append_session_entry_for(
+            &ctx.workspace_id,
+            &ctx.workspace,
+            &ctx.chat_id,
+            json!({
+                "type": "compaction",
+                "checkpoint_format": "opencode-v1",
+                "summary": outcome.summary,
+                "retained_tail": outcome.retained_tail,
+                "tokens_before": outcome.tokens_before,
+                "first_kept_entry_id": null,
+            }),
+        )
+        .await;
+    true
 }
 
 async fn maybe_compact(
@@ -2304,6 +2377,17 @@ mod tests {
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(messages[3].content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn context_overflow_errors_are_detected() {
+        assert!(is_context_overflow(&"maximum context length exceeded"));
+        assert!(is_context_overflow(
+            &"This model's context length is 128000"
+        ));
+        assert!(is_context_overflow(&"context_length_exceeded"));
+        assert!(!is_context_overflow(&"rate limited (HTTP 429)"));
+        assert!(!is_context_overflow(&"connection lost"));
     }
 
     #[test]

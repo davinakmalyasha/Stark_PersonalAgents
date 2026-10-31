@@ -55,6 +55,12 @@ pub struct AppState {
     pub selected_temp: f64,
     #[serde(default)]
     pub token_usage: TokenUsage,
+    /// Provider-reported context used by the last call (input + output).
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// Model context window used for compaction (0 when unknown).
+    #[serde(default)]
+    pub context_window: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +90,8 @@ impl Default for AppState {
             selected_model: String::new(),
             selected_temp: 0.7,
             token_usage: TokenUsage::default(),
+            context_tokens: 0,
+            context_window: 0,
             artifacts: None,
             project_ref: None,
             error: None,

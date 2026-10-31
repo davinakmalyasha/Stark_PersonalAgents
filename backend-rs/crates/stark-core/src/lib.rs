@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -413,7 +413,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         messages.push(ChatMessage::user_with_images(&prompt, ctx.images.clone()));
     }
     let affinity = ctx.affinity().await;
-    maybe_compact(&ctx, &mut messages, &affinity).await;
+    maybe_compact(&ctx, &mut messages, &affinity, None).await;
 
     let mut state = AppState {
         active_node: "agent".to_string(),
@@ -455,6 +455,11 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     }
     let mut last_continuous_screen: Option<Instant> = None;
     let mut repeat_counts: HashMap<(String, String), usize> = HashMap::new();
+    // Provider-reported context usage for this turn, when the gateway returns it.
+    let mut measured_tokens: Option<usize> = None;
+    let context_window =
+        compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model).hard_limit_tokens as u64;
+    state.context_window = context_window;
     let mut consecutive_errors = 0usize;
 
     loop {
@@ -530,6 +535,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 Ok(ProviderEvent::Usage(usage)) => {
                     let cached = usage.cached_tokens.min(usage.input_tokens);
                     let miss = usage.input_tokens.saturating_sub(cached);
+                    measured_tokens = Some((usage.input_tokens + usage.output_tokens) as usize);
+                    state.context_tokens = usage.input_tokens + usage.output_tokens;
                     let pricing = pricing_for(&ctx.model);
                     let cost = if usage.cost > 0.0 {
                         usage.cost
@@ -768,7 +775,42 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             continue;
         }
 
-        for call in tool_calls {
+        // Codex-style batch: independent read-only calls in one assistant
+        // message run concurrently. Writes, shell, subagents and group tools
+        // stay sequential (we have no OS sandbox to make them atomic).
+        let parallel_batch = tool_calls.len() > 1
+            && tool_calls
+                .iter()
+                .all(|call| parallel_safe(&call.function.name))
+            && {
+                let mut keys = HashSet::new();
+                tool_calls.iter().all(|call| {
+                    keys.insert((call.function.name.clone(), call.function.arguments.clone()))
+                })
+            };
+        let mut precomputed: Vec<Option<ToolOutcome>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        if parallel_batch {
+            let mut futures = Vec::with_capacity(tool_calls.len());
+            for (index, call) in tool_calls.iter().enumerate() {
+                let name = call.function.name.clone();
+                let args: Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
+                let args_text = serde_json::to_string(&args).unwrap_or_default();
+                ctx.emit_delta(
+                    Delta::tool_started(&name, &args_text).with_agent(agent_label.clone()),
+                );
+                let tools_ctx = tools.clone();
+                futures.push(async move {
+                    (index, stark_tools::dispatch(&name, &args, &tools_ctx).await)
+                });
+            }
+            for (index, outcome) in futures_util::future::join_all(futures).await {
+                precomputed[index] = Some(outcome);
+            }
+        }
+
+        for (call_index, call) in tool_calls.into_iter().enumerate() {
             if ctx.cancel.is_cancelled() {
                 finish_aborted(&ctx, &mut state).await;
                 return Ok(());
@@ -777,10 +819,13 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             let args: Value =
                 serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
             let args_text = serde_json::to_string(&args).unwrap_or_default();
-            ctx.emit_delta(
-                Delta::tool_started(&call.function.name, &args_text)
-                    .with_agent(agent_label.clone()),
-            );
+            let ready = precomputed[call_index].is_some();
+            if !ready {
+                ctx.emit_delta(
+                    Delta::tool_started(&call.function.name, &args_text)
+                        .with_agent(agent_label.clone()),
+                );
+            }
 
             // Repeat guard blocks only this duplicate call and tells the model,
             // instead of killing a long-horizon run.
@@ -830,7 +875,9 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             }
 
             let started = Instant::now();
-            let outcome = if call.function.name == "call_subagent" {
+            let outcome = if let Some(outcome) = precomputed[call_index].take() {
+                outcome
+            } else if call.function.name == "call_subagent" {
                 if let Some(reason) =
                     stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
                 {
@@ -978,7 +1025,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 .thoughts
                 .insert(format!("step-{}", state.state_version), reasoning);
         }
-        maybe_compact(&ctx, &mut messages, &affinity).await;
+        maybe_compact(&ctx, &mut messages, &affinity, measured_tokens).await;
     }
 }
 
@@ -996,6 +1043,25 @@ pub fn run_agent(
     prompt: String,
 ) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
     Box::pin(run_agent_inner(ctx, prompt))
+}
+
+/// Tools safe to run concurrently within one assistant message: pure reads and
+/// network fetches. Mutating tools stay ordered.
+fn parallel_safe(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "read_file"
+            | "glob"
+            | "grep"
+            | "search_code"
+            | "web_search"
+            | "web_fetch"
+            | "skill"
+            | "memory"
+            | "read_pdf"
+            | "files_changed"
+    )
 }
 
 fn is_read_only_tool(name: &str) -> bool {
@@ -1026,9 +1092,17 @@ fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
-async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, affinity: &str) {
+async fn maybe_compact(
+    ctx: &RunContext,
+    messages: &mut Vec<ChatMessage>,
+    affinity: &str,
+    measured_tokens: Option<usize>,
+) {
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
-    let tokens = compaction::estimate_tokens(messages);
+    // Provider-reported usage beats the character estimate whenever we have it.
+    let tokens = measured_tokens
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or_else(|| compaction::estimate_tokens(messages));
     if tokens >= policy.hard_limit_tokens {
         tracing::warn!(
             "chat {} is above the compaction hard limit ({} tokens)",
@@ -1036,7 +1110,7 @@ async fn maybe_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, affini
             tokens
         );
     }
-    if !compaction::should_compact(messages, &policy) {
+    if !compaction::should_compact_with(messages, &policy, tokens) {
         return;
     }
     let Some(outcome) = compaction::compact_history(
@@ -1722,6 +1796,36 @@ mod tests {
             .unwrap()
     }
 
+    async fn mock_parallel_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c1","function":{"name":"read","arguments":"{\"file_path\":\"a.txt\"}"}},
+                    {"index":1,"id":"c2","function":{"name":"read","arguments":"{\"file_path\":\"b.txt\"}"}}
+                ]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn truncated_tool_calls_never_execute() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1774,6 +1878,77 @@ mod tests {
         // The partial payload never reached disk, and the model got one retry.
         assert!(!dir.path().join("big.txt").exists());
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_reads_preserve_call_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_parallel_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "parallel-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Coder".to_string()),
+            scope: "coder".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            on_job_done: None,
+        };
+        run_agent(ctx, "read both".to_string()).await.unwrap();
+
+        // Both reads ran in one batch; results are appended in call order.
+        let entries = store
+            .read_session_entries("_general", dir.path(), "parallel-chat")
+            .await
+            .unwrap();
+        let results: Vec<(String, String)> = entries
+            .iter()
+            .filter(|entry| entry["role"] == "toolResult")
+            .map(|entry| {
+                (
+                    entry["tool_call_id"].as_str().unwrap_or("").to_string(),
+                    entry["content"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0].0, "c1");
+        assert!(results[0].1.contains("alpha"), "{results:?}");
+        assert_eq!(results[1].0, "c2");
+        assert!(results[1].1.contains("beta"), "{results:?}");
     }
 
     #[tokio::test]

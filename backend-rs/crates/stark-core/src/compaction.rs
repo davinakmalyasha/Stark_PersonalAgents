@@ -175,8 +175,14 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     messages.iter().map(message_tokens).sum()
 }
 
-pub fn should_compact(messages: &[ChatMessage], policy: &CompactionPolicy) -> bool {
-    estimate_tokens(messages) >= policy.trigger_tokens
+/// Compaction decision from a known token count (provider usage when
+/// available, estimate otherwise).
+pub fn should_compact_with(
+    _messages: &[ChatMessage],
+    policy: &CompactionPolicy,
+    tokens: usize,
+) -> bool {
+    tokens >= policy.trigger_tokens
 }
 
 pub fn message_to_entry(message: &ChatMessage) -> Value {
@@ -551,6 +557,18 @@ mod tests {
             messages.push(ChatMessage::assistant("done"));
         }
         messages
+    }
+
+    #[test]
+    fn measured_tokens_drive_the_compaction_decision() {
+        let policy = CompactionPolicy {
+            trigger_tokens: 1_000,
+            hard_limit_tokens: 1_200,
+            summary_output_tokens: 4_000,
+            tail_tokens: 400,
+        };
+        assert!(should_compact_with(&[], &policy, 1_200));
+        assert!(!should_compact_with(&[], &policy, 900));
     }
 
     #[test]

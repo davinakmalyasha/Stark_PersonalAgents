@@ -997,13 +997,6 @@ pub fn run_agent(
 ) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
     Box::pin(run_agent_inner(ctx, prompt))
 }
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
 
 fn is_read_only_tool(name: &str) -> bool {
     matches!(

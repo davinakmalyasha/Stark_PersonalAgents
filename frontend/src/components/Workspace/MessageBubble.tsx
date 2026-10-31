@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Copy, AlertTriangle, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
+import { Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import type { StreamSegment } from '../../utils/streamAccum';
@@ -436,20 +436,14 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
       )}
 
       {/* ────────────────────────────────────
-          ERROR MESSAGE — alert/error block
+          ERROR MESSAGE — inline, no banner box
           ──────────────────────────────────── */}
       {isError && (
-        <div 
-          className="flex items-start gap-2.5 rounded-lg bg-red-500/5 border border-red-500/15"
-          style={{ padding: '12px' }}
-        >
-          <AlertTriangle size={14} className="text-red-400 flex-shrink-0 mt-0.5" />
-          <div className="min-w-0">
-            <span className="text-[14.5px] font-semibold text-red-400">Error</span>
-            <p className="text-[14.5px] text-red-300/80 mt-0.5 leading-relaxed whitespace-pre-wrap">
-              {message.content}
-            </p>
-          </div>
+        <div className="flex items-start gap-2.5 py-1">
+          <CircleAlert size={15} className="text-red-400/90 flex-shrink-0 mt-[3px]" />
+          <p className="min-w-0 text-[13px] text-red-300/90 leading-relaxed whitespace-pre-wrap break-words">
+            {message.content}
+          </p>
         </div>
       )}
 

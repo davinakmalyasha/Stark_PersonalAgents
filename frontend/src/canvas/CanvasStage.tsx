@@ -343,7 +343,7 @@ export default function CanvasStage({
       )}
 
       {items.length === 0 && (
-        <div className="pointer-events-none absolute left-8 top-20 w-[300px]">
+        <div className="pointer-events-none absolute left-6 top-5 w-[300px]">
           <div className="flex flex-col items-start gap-2 text-left">
             <LayoutGrid size={22} className="text-zinc-700" />
             <p className="text-[13px] font-medium text-zinc-400">Your canvas is empty</p>

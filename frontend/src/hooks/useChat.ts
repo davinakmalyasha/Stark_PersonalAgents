@@ -6,7 +6,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, StreamDelta } from '../types';
-import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, abortRun, rewindChat } from '../services/api';
+import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, abortRun, rewindChat, addChatMessage } from '../services/api';
 import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from '../house/houseChatService';
 import { getAssistantName } from '../house/assistant';
 import { parseLogToSteps } from '../utils/logParser';
@@ -382,27 +382,36 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       },
       (err) => {
         const errText = typeof err === 'string' ? err : 'Error occurred.';
-        setNotification(errText);
         // Failure keeps the same persist path as completion/cancel: the
-        // worked steps must survive as an expandable trace, not vanish with
-        // the live stream. Empty runs persist nothing.
+        // worked steps must survive as an expandable trace, and the error is
+        // appended inline after them — never a banner that replaces history.
         const partialText = streamRef.current.text;
         const partialReasoning = streamRef.current.reasoning;
         const segments = [...streamRef.current.segments];
         const log = liveStateRef.current?.live_terminal_log || '';
         const hasPartial = !!(partialText.trim() || partialReasoning.trim() || log.trim() || segments.length);
+        const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
         const ws = runWsRef.current;
         const chatId = runChatIdRef.current;
         setIsRunning(false);
         setLiveState(null);
-        if (ws && chatId && hasPartial) {
-          const duration = startedAtRef.current ? Math.round((Date.now() - startedAtRef.current) / 1000) : undefined;
-          finishHouseMessage(ws, chatId, liveStateRef.current, duration, {
-            thinking: partialReasoning,
-            liveTimeline: segments,
-            stopped: true,
-            textOverride: partialText || `Run failed: ${errText}`,
-          }).then(setMessages).catch(() => {});
+        if (ws && chatId) {
+          (async () => {
+            if (hasPartial) {
+              const updated = await finishHouseMessage(ws, chatId, liveStateRef.current, duration, {
+                thinking: partialReasoning,
+                liveTimeline: segments,
+                stopped: true,
+                textOverride: partialText,
+              });
+              setMessages(updated);
+            }
+            await addChatMessage(ws.id, chatId, 'error', errText).catch(() => {});
+            const chat = await fetchChat(ws.id, chatId).catch(() => null);
+            if (chat) setMessages(chat.messages || []);
+          })().catch(() => {});
+        } else {
+          setNotification(errText);
         }
         resetStream();
         sendInFlightRef.current = false;

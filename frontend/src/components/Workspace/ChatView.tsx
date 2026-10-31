@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { X, Minimize2, Maximize2, Search, Download, RotateCcw } from 'lucide-react';
+import { X, Minimize2, Maximize2, Search, Download, RotateCcw, CircleAlert } from 'lucide-react';
 import type { ChatMessage, AppState, ModelOption } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
@@ -93,7 +93,7 @@ export default function ChatView({
     <div 
       className={`${
         variant === 'docked'
-          ? 'relative w-full max-w-[680px] mx-auto flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/60 bg-[#0c0c0f] shadow-2xl'
+          ? 'relative w-full max-w-[780px] mx-auto flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/60 bg-[#0c0c0f] shadow-2xl'
           : 'absolute bottom-6 left-3 right-3 z-40 w-auto max-w-none flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/50 backdrop-blur-md shadow-2xl transition-all duration-300 premium-surface'
       }`}
       style={{
@@ -187,11 +187,12 @@ export default function ChatView({
           opacity: minimized ? 0 : 1,
         }}
       >
-        {/* Notifications */}
+        {/* Notifications — inline line, no banner box */}
         {notification && (
-          <div className="flex items-center gap-2.5 mx-4 mt-2 px-3 py-2 rounded-lg bg-blue-500/10 border border-blue-500/20 text-[11px] text-blue-300 flex-shrink-0">
-            <span className="flex-1 truncate">{notification}</span>
-            <button onClick={onClearNotification} className="p-0.5 text-blue-400 hover:text-blue-200">
+          <div className={`mx-4 mt-2 flex items-start gap-2 text-[12px] leading-relaxed flex-shrink-0 ${/error|fail|blocked|stopped|expired|denied/i.test(notification) ? 'text-red-300/90' : 'text-zinc-400'}`}>
+            <CircleAlert size={13} className={`mt-[2px] flex-shrink-0 ${/error|fail|blocked|stopped|expired|denied/i.test(notification) ? 'text-red-400/80' : 'text-zinc-500'}`} />
+            <span className="flex-1">{notification}</span>
+            <button onClick={onClearNotification} className="mt-[1px] p-0.5 text-zinc-500 hover:text-zinc-300">
               <X size={12} />
             </button>
           </div>

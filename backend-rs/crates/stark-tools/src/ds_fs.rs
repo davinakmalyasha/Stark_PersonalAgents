@@ -17,8 +17,8 @@ use crate::{ToolContext, ToolOutcome};
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_READ_LIMIT: usize = 10_000;
 const MAX_LINE_CHARS: usize = 2000;
-const GLOB_LIMIT: usize = 100;
-const GREP_LIMIT: usize = 250;
+const GLOB_LIMIT: usize = 300;
+const GREP_LIMIT: usize = 500;
 
 fn resolve(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
     let raw = raw.trim();

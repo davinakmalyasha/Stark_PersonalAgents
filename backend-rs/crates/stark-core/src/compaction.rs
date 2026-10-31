@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use stark_providers::{ChatMessage, Provider, ProviderEvent, ProviderSession};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CONTEXT_WINDOW: usize = 500_000;
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 const DEFAULT_OUTPUT_TOKENS: usize = 32_000;
 const DEFAULT_SUMMARY_TOKENS: usize = 8_000;
 const DEFAULT_KEEP_TOKENS: usize = 15_000;
@@ -301,7 +301,9 @@ fn message_tokens(message: &ChatMessage) -> usize {
             chars += call.function.name.len() + call.function.arguments.len();
         }
     }
-    chars.div_ceil(4) + 12
+    // ~3.6 chars/token: slightly conservative so compaction fires before a
+    // provider context overflow on code-heavy transcripts.
+    (chars * 10).div_ceil(36) + 12
 }
 
 async fn summarize(

@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use stark_store::{AgentRecord, AgentStore, WorkspaceRegistry};
 use stark_tools::ToolOutcome;
 
+use std::time::{Duration, Instant};
+
 use crate::{RunContext, agent_for_scope, agents_tools};
 
 const MAX_JOBS: usize = 8;
@@ -209,7 +211,7 @@ pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOut
         let wait = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(60)
+            .unwrap_or(300)
             .min(300);
         let detail = if wait == 0 {
             match store.get(id).await {
@@ -229,7 +231,31 @@ pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOut
         Ok(agent) => agent,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
-    let agents = store.list(Some(&current.id)).await.unwrap_or_default();
+    // Long-poll instead of tight polling: wait until the children settle, the
+    // user sends another message, or the deadline (default 300s) passes. This
+    // is one tool call, so repeated identical calls (and the repeat guard)
+    // never fire.
+    let wait = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .min(300);
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    let agents = loop {
+        let agents = store.list(Some(&current.id)).await.unwrap_or_default();
+        let busy = agents
+            .iter()
+            .any(|agent| matches!(agent.status.as_str(), "running" | "queued"));
+        let steered = ctx
+            .steering
+            .lock()
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false);
+        if !busy || steered || ctx.cancel.is_cancelled() || Instant::now() >= deadline {
+            break agents;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     if agents.is_empty() {
         return ToolOutcome::ok("[DELEGATIONS]\nNo active delegations.".to_string());
     }

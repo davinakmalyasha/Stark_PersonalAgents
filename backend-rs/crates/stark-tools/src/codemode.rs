@@ -18,10 +18,10 @@ use serde_json::{Value, json};
 
 use crate::{ToolContext, ToolOutcome};
 
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const MAX_TIMEOUT_MS: u64 = 120_000;
-const DEFAULT_MAX_TOOL_CALLS: usize = 50;
-const MAX_MAX_TOOL_CALLS: usize = 100;
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const MAX_TIMEOUT_MS: u64 = 600_000;
+const DEFAULT_MAX_TOOL_CALLS: usize = 200;
+const MAX_MAX_TOOL_CALLS: usize = 500;
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_RESULT_CHARS: usize = 32 * 1024;
 const MAX_LOG_LINES: usize = 50;

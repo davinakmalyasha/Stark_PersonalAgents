@@ -15,6 +15,39 @@ pub struct ProviderConfig {
     pub model: String,
 }
 
+/// Output cap for one model response (not the run). Defaults to 16k so large
+/// file writes fit while the gateway never reserves the model's full 128k+
+/// window; `STARK_MAX_OUTPUT_TOKENS` overrides it.
+fn max_output_tokens() -> u64 {
+    std::env::var("STARK_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(16_384)
+        .clamp(256, 65_536)
+}
+
+/// OpenRouter-style 402s state what the balance can cover: "…can only afford
+/// 26688". Returns that number so the request can retry with an affordable cap.
+fn affordable_output_tokens(body: &str) -> Option<u64> {
+    let marker = "can only afford ";
+    let start = body.find(marker)? + marker.len();
+    let digits: String = body[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// One-line credit error instead of the gateway's nested JSON dump.
+fn credit_error(body: &str, affordable: Option<u64>) -> String {
+    match affordable {
+        Some(tokens) => format!(
+            "OpenRouter: balance covers {tokens} output tokens. Reduce STARK_MAX_OUTPUT_TOKENS or top up credits."
+        ),
+        None => format!("OpenRouter rejected the request (402): {body}"),
+    }
+}
+
 /// The only models the Stark UI offers. Single-provider setup: everything
 /// runs through opencode go; the dropdown is a curated shortlist, not a
 /// provider matrix.
@@ -544,6 +577,11 @@ impl Provider {
             "temperature": temperature,
             "stream_options": {"include_usage": true},
         });
+        // Per-response output cap (not the run budget). Omitting it makes the
+        // gateway reserve the model's full 128k+ window, which fails with 402
+        // on low balances. The 402 handler lowers it to what is affordable.
+        let mut max_output = max_output_tokens();
+        body["max_tokens"] = json!(max_output);
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
             body["tool_choice"] = Value::String("auto".to_string());
@@ -564,13 +602,34 @@ impl Provider {
                 break response;
             }
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body_text = response.text().await.unwrap_or_default();
             if matches!(status, 429 | 500 | 502 | 503 | 504) && attempt < 2 {
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(700 * attempt as u64)).await;
                 continue;
             }
-            return Err(ProviderError::HttpStatus { status, body });
+            // Low balance: ask for only what the account can cover and retry
+            // instead of failing the whole turn.
+            if status == 402 {
+                let affordable = affordable_output_tokens(&body_text);
+                if let Some(tokens) = affordable {
+                    let retry_cap = tokens.clamp(256, max_output);
+                    if attempt < 2 && retry_cap < max_output {
+                        attempt += 1;
+                        max_output = retry_cap;
+                        body["max_tokens"] = json!(max_output);
+                        continue;
+                    }
+                }
+                return Err(ProviderError::HttpStatus {
+                    status,
+                    body: credit_error(&body_text, affordable),
+                });
+            }
+            return Err(ProviderError::HttpStatus {
+                status,
+                body: body_text,
+            });
         };
 
         let events = response.bytes_stream().eventsource();
@@ -733,6 +792,26 @@ fn parse_usage(value: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_affordability_parses_and_clamps() {
+        let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 131072 tokens, but can only afford 26688. To increase, visit https://openrouter.ai/settings/credits and upgrade to a paid account"}}"#;
+        assert_eq!(affordable_output_tokens(body), Some(26_688));
+        assert_eq!(affordable_output_tokens("no numbers here"), None);
+        // Default cap stays well under the model window and above tiny floors.
+        let cap = max_output_tokens();
+        assert!((256..=65_536).contains(&cap));
+    }
+
+    #[test]
+    fn credit_error_is_one_line() {
+        let text = credit_error("ignored", Some(26_688));
+        assert!(
+            text.contains("balance covers 26688 output tokens"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'));
+    }
 
     #[test]
     fn parses_text_and_reasoning() {

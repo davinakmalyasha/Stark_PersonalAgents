@@ -17,7 +17,7 @@ use crate::{RunContext, agent_for_scope, agents_tools};
 
 const MAX_CHILDREN: usize = 6;
 const MAX_DEPTH: i64 = 1;
-const DEFAULT_WAIT_MS: u64 = 30_000;
+const DEFAULT_WAIT_MS: u64 = 120_000;
 const MAX_WAIT_MS: u64 = 3_600_000;
 
 fn now() -> String {

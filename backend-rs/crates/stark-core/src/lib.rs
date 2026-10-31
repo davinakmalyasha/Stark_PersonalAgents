@@ -37,13 +37,13 @@ pub use agents::{
 
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
 
-const HISTORY_LIMIT: usize = 40;
-const DEFAULT_RUN_SECONDS: u64 = 3_600;
-const DEFAULT_RUN_TOKENS: u64 = 4_000_000;
-const DEFAULT_RUN_TOOL_CALLS: usize = 500;
+const HISTORY_LIMIT: usize = 200;
+const DEFAULT_RUN_SECONDS: u64 = 86_400;
+const DEFAULT_RUN_TOKENS: u64 = 50_000_000;
+const DEFAULT_RUN_TOOL_CALLS: usize = 5_000;
 const REPEAT_READ_LIMIT: usize = 4;
 const REPEAT_WRITE_LIMIT: usize = 5;
-const MAX_CONSECUTIVE_ERRORS: usize = 5;
+const MAX_CONSECUTIVE_ERRORS: usize = 12;
 
 static AGENT_CANCELS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
 
@@ -145,9 +145,27 @@ impl RunContext {
 }
 
 fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
-    let start = entries.len().saturating_sub(80);
     let mut messages = Vec::new();
-    if start > 0
+    // Resume from the newest compaction: its summary replaces everything that
+    // came before. A fixed message cap (previously 80) discarded real history
+    // on long tasks; token-based compaction is the only limit now.
+    let start = if let Some(index) = entries
+        .iter()
+        .rposition(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction"))
+    {
+        if let Some(summary) = entries[index].get("summary").and_then(Value::as_str)
+            && !summary.is_empty()
+        {
+            messages.push(ChatMessage::user(format!(
+                "<conversation-checkpoint>\n{summary}\n</conversation-checkpoint>"
+            )));
+        }
+        index + 1
+    } else {
+        0
+    };
+    // Legacy: the first entry may be a system summary or a checkpoint.
+    if start == 0
         && let Some(first) = entries.first()
     {
         let role = first.get("role").and_then(Value::as_str).unwrap_or("");
@@ -166,8 +184,14 @@ fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
             }
         }
     }
+    let mut seen_message = false;
     for entry in &entries[start..] {
         let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+        // A compaction boundary can cut a tool call from its result; drop
+        // leading orphans so the provider never sees an unanswered tool.
+        if !seen_message && role == "toolResult" {
+            continue;
+        }
         if role == "system" {
             let content = entry.get("content").map(content_text).unwrap_or_default();
             if !content.is_empty() {
@@ -190,6 +214,7 @@ fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
         let content = entry.get("content").cloned().unwrap_or(Value::Null);
         if role == "user" {
             messages.push(ChatMessage::user(content_text(&content)));
+            seen_message = true;
             continue;
         }
         if let Some(blocks) = content.as_array() {
@@ -227,6 +252,7 @@ fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
         } else {
             messages.push(ChatMessage::assistant(content_text(&content)));
         }
+        seen_message = true;
     }
     messages
 }
@@ -782,6 +808,53 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                     .with_agent(agent_label.clone()),
             );
 
+            // Repeat guard blocks only this duplicate call and tells the model,
+            // instead of killing a long-horizon run.
+            if !matches!(
+                call.function.name.as_str(),
+                "delegation_status" | "wait_agent"
+            ) {
+                let repeat_key = (call.function.name.clone(), args_text.clone());
+                let count = {
+                    let entry = repeat_counts.entry(repeat_key).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+                let limit = if is_read_only_tool(&call.function.name) {
+                    REPEAT_READ_LIMIT
+                } else {
+                    REPEAT_WRITE_LIMIT
+                };
+                if count >= limit {
+                    let notice = format!(
+                        "[BLOCKED] {} was already called {} times with identical arguments. The previous result still applies; use it or change the approach.",
+                        call.function.name, count
+                    );
+                    messages.push(ChatMessage::tool(&call.id, &notice));
+                    let _ = ctx
+                        .store
+                        .append_session_entry_for(
+                            &ctx.workspace_id,
+                            &ctx.workspace,
+                            &ctx.chat_id,
+                            json!({
+                                "type": "message",
+                                "role": "toolResult",
+                                "tool_call_id": call.id,
+                                "tool_name": call.function.name,
+                                "is_error": true,
+                                "content": notice,
+                            }),
+                        )
+                        .await;
+                    ctx.emit_delta(
+                        Delta::tool_finished(&call.function.name, &args_text, false, 0, &notice)
+                            .with_agent(agent_label.clone()),
+                    );
+                    continue;
+                }
+            }
+
             let started = Instant::now();
             let outcome = if call.function.name == "call_subagent" {
                 if let Some(reason) =
@@ -903,22 +976,6 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 consecutive_errors += 1;
             } else {
                 consecutive_errors = 0;
-            }
-            let repeat_key = (call.function.name.clone(), args_text.clone());
-            let repeat_count = repeat_counts.entry(repeat_key).or_insert(0);
-            *repeat_count += 1;
-            let repeat_limit = if is_read_only_tool(&call.function.name) {
-                REPEAT_READ_LIMIT
-            } else {
-                REPEAT_WRITE_LIMIT
-            };
-            if *repeat_count >= repeat_limit {
-                let message = format!(
-                    "Run stopped: {} was called {} times with identical arguments. Use the previous result or change the approach.",
-                    call.function.name, repeat_count
-                );
-                fail(&ctx, &mut state, message.clone()).await;
-                return Err(RunError::Message(message));
             }
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                 let message =
@@ -1976,6 +2033,29 @@ mod tests {
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(messages[3].content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn session_messages_resume_from_latest_compaction() {
+        let entries = vec![
+            json!({"type": "message", "role": "user", "content": "old work"}),
+            json!({"type": "message", "role": "assistant", "content": "old reply"}),
+            json!({"type": "compaction", "summary": "## Objective\n- coffee site"}),
+            json!({"type": "message", "role": "toolResult", "tool_call_id": "orphan", "content": "stale"}),
+            json!({"type": "message", "role": "user", "content": "continue"}),
+        ];
+        let messages = session_messages(&entries);
+        // Checkpoint summary first, the earlier turns gone, and the orphan
+        // tool result dropped so the provider never sees an unanswered tool.
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("coffee site")
+        );
+        assert_eq!(messages[1].content.as_deref(), Some("continue"));
     }
 
     #[tokio::test]

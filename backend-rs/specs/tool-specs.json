@@ -1,7 +1,7 @@
 {
   "contract_version": 3,
   "source": "DeepSeek Harness standard core (f3803c9) + Codex multi-agent v2 (79be2e2); Developer Pi-simplified v3 surface",
-  "tool_count": 63,
+  "tool_count": 65,
   "tools": [
     {
       "name": "bash",
@@ -2368,6 +2368,58 @@
       "exposed": true,
       "required": [],
       "doc": "memory(action?, topic?, query?, text?, kind?, entry_id?, pinned?) — Read/search durable workspace memory or add/forget/pin notes."
+    },
+    {
+      "name": "resume_agent",
+      "description": "Resume a closed or finished agent with a new message and run it again. Use when an agent was closed, failed, or completed but still has useful work; use message_agent for agents that are still open and idle.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Agent id to resume (from spawn_agent)."
+          },
+          "message": {
+            "type": "string",
+            "description": "New instruction for the resumed agent."
+          }
+        },
+        "required": [
+          "target",
+          "message"
+        ]
+      },
+      "exposed": true,
+      "required": [
+        "target",
+        "message"
+      ],
+      "doc": "Resume a closed or finished agent with a new message and run it again. Use when an agent was closed, failed, or completed but still has useful work; use message_agent for agents that are still open and idle."
+    },
+    {
+      "name": "tool_search",
+      "description": "Search MCP tools by keyword and enable them for the next request. Use this when a task needs a capability missing from the current tool list (for example GitHub, Supabase, browser automation, or deployment). Returns the matching tool schemas; call them by their full mcp__server__tool name afterwards.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Keywords describing the capability, e.g. \"create github issue\" or \"query supabase table\"."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum matches to return (1-20, default 8)."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "exposed": true,
+      "required": [
+        "query"
+      ],
+      "doc": "Search MCP tools by keyword and enable them for the next request. Use this when a task needs a capability missing from the current tool list (for example GitHub, Supabase, browser automation, or deployment). Returns the matching tool schemas; call them by their full mcp__server__tool name afterwards."
     }
   ],
   "scope_map": {
@@ -2389,7 +2441,9 @@
       "wait_agent",
       "list_agents",
       "interrupt_agent",
-      "close_agent"
+      "close_agent",
+      "resume_agent",
+      "tool_search"
     ],
     "coder": [
       "bash",
@@ -2410,7 +2464,9 @@
       "list_agents",
       "interrupt_agent",
       "close_agent",
-      "run_code"
+      "run_code",
+      "resume_agent",
+      "tool_search"
     ],
     "general": [
       "run_command",

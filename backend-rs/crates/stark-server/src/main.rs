@@ -370,6 +370,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/workspaces/{workspace_id}/chats/{chat_id}/rewind",
             post(rewind_chat_handler),
         )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/fork",
+            post(fork_chat_handler),
+        )
         .route("/api/chat/{chat_id}/mode", post(chat_mode_handler))
         .route("/api/chat/{chat_id}/state", get(chat_state_handler))
         .route("/api/steer", post(steer_handler))
@@ -3791,6 +3795,34 @@ struct RewindRequest {
     restore_files: Option<bool>,
     #[serde(default)]
     force: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ForkRequest {
+    #[serde(default)]
+    title: String,
+}
+
+async fn fork_chat_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, chat_id)): Path<(String, String)>,
+    Json(request): Json<ForkRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(workspace) = workspace_path(&state, &workspace_id) else {
+        return Err(not_found("workspace not found"));
+    };
+    if state.runs.is_running(&chat_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "This chat is still running. Stop it before forking."})),
+        ));
+    }
+    let chat = state
+        .store
+        .fork_chat(&workspace_id, &workspace, &chat_id, &request.title)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(chat))
 }
 
 async fn rewind_chat_handler(

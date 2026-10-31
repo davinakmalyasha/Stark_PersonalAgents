@@ -426,6 +426,53 @@ async fn interrupt_agent(ctx: &RunContext, args: &Value) -> Result<String, Strin
     Ok(json!({"previous_status": previous}).to_string())
 }
 
+async fn resume_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
+    let store = store(ctx).await?;
+    let current = current(ctx, &store).await?;
+    let target = args
+        .get("target")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "resume_agent requires target".to_string())?;
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(|| "resume_agent requires message".to_string())?;
+    let target = resolve_target(&store, &current, target).await?;
+    if !is_descendant_of(&store, &target, &current).await? {
+        return Err(format!(
+            "agent {} is not in your delegation tree",
+            target.path
+        ));
+    }
+    if matches!(target.status.as_str(), "running" | "queued") {
+        return Err(format!(
+            "agent {} is already active; use message_agent",
+            target.path
+        ));
+    }
+    let id = store
+        .enqueue(
+            Some(&current.id),
+            &target.id,
+            "resume",
+            message,
+            "trigger",
+            json!({"task_path": target.path}),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if !store
+        .reopen(&target.id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!("agent {} could not be resumed", target.path));
+    }
+    Ok(json!({"resumed": target.id, "submission_id": id}).to_string())
+}
+
 async fn close_tree(store: &AgentStore, agent: &AgentRecord) -> Result<(), String> {
     for child in store
         .list(Some(&agent.id))
@@ -466,6 +513,7 @@ pub async fn handle(ctx: &RunContext, name: &str, args: &Value) -> ToolOutcome {
         "list_agents" => list_agents(ctx, args).await,
         "interrupt_agent" => interrupt_agent(ctx, args).await,
         "close_agent" => close_agent(ctx, args).await,
+        "resume_agent" => resume_agent(ctx, args).await,
         other => Err(format!("unknown multi-agent tool '{other}'")),
     };
     match result {

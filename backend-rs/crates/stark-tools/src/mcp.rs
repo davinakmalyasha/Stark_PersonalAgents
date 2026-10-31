@@ -530,6 +530,12 @@ impl McpManager {
         specs
     }
 
+    /// Rank MCP specs for `tool_search`. Pure matching so it can be tested
+    /// without a live server.
+    pub fn search(&self, scope: &str, query: &str, limit: usize) -> Vec<Value> {
+        rank_tools(&self.tool_specs_for_scope(scope), query, limit)
+    }
+
     pub fn status_snapshot(&self) -> Vec<Value> {
         let servers = match self.servers.read() {
             Ok(servers) => servers.values().cloned().collect::<Vec<_>>(),
@@ -701,6 +707,102 @@ pub fn tool_specs_for_scope(scope: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Rank specs by case-insensitive token match on name + description.
+pub(crate) fn rank_tools(specs: &[Value], query: &str, limit: usize) -> Vec<Value> {
+    let limit = limit.clamp(1, 20);
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    let mut scored: Vec<(usize, &Value)> = specs
+        .iter()
+        .map(|spec| {
+            let function = spec.get("function").unwrap_or(&Value::Null);
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let score = if terms.is_empty() {
+                1
+            } else {
+                terms
+                    .iter()
+                    .map(|term| {
+                        let mut score = 0;
+                        if name.contains(term) {
+                            score += 3;
+                        }
+                        if description.contains(term) {
+                            score += 1;
+                        }
+                        score
+                    })
+                    .sum()
+            };
+            (score, spec)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by_key(|left| std::cmp::Reverse(left.0));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, spec)| spec.clone())
+        .collect()
+}
+
+/// `tool_search`: find MCP tools by keyword, return their schemas, and enable
+/// them for the next provider request.
+pub async fn search_tools(ctx: &ToolContext, args: &Value) -> ToolOutcome {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(8)
+        .clamp(1, 20) as usize;
+    let Some(manager) = McpManager::global() else {
+        return ToolOutcome::ok("[MCP] no MCP servers are configured".to_string());
+    };
+    let specs = manager.search(&ctx.scope, &query, limit);
+    if specs.is_empty() {
+        return ToolOutcome::ok(format!(
+            "[MCP] no tools matched '{query}'. Try a broader keyword."
+        ));
+    }
+    if let Ok(mut active) = ctx.active_mcp.lock() {
+        for spec in &specs {
+            if let Some(name) = spec
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            {
+                active.insert(name.to_string());
+            }
+        }
+    }
+    let functions: Vec<Value> = specs
+        .iter()
+        .filter_map(|spec| spec.get("function").cloned())
+        .collect();
+    ToolOutcome::ok(format!(
+        "[MCP TOOLS] {} tool(s) enabled for the next request. Call them by the full name.\n{}",
+        functions.len(),
+        serde_json::to_string_pretty(&functions).unwrap_or_else(|_| "[]".to_string())
+    ))
+}
+
 pub async fn call(fq_name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     let Some(manager) = McpManager::global() else {
         return ToolOutcome::err("Error: MCP is not initialized");
@@ -808,6 +910,23 @@ fn truncate(value: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_search_ranks_name_matches_first() {
+        let specs = vec![
+            json!({"function": {"name": "mcp__gh__create_issue", "description": "Open a GitHub issue"}}),
+            json!({"function": {"name": "mcp__db__query", "description": "Run SQL"}}),
+        ];
+        let hits = rank_tools(&specs, "create issue", 8);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0]["function"]["name"].as_str(),
+            Some("mcp__gh__create_issue")
+        );
+        // Empty query lists everything up to the limit.
+        assert_eq!(rank_tools(&specs, "", 8).len(), 2);
+        assert_eq!(rank_tools(&specs, "run sql", 1).len(), 1);
+    }
 
     #[test]
     fn fq_names_round_trip_and_sanitize() {

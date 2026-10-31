@@ -591,6 +591,96 @@ impl ChatStore {
         }))
     }
 
+    /// Duplicate a chat into a new one (messages + session transcript), so the
+    /// copy can be rewound or continued independently. File state is shared;
+    /// use checkpoints/rewind for file rollback.
+    pub async fn fork_chat(
+        &self,
+        workspace_id: &str,
+        workspace_path: &str,
+        source_chat_id: &str,
+        title: &str,
+    ) -> Result<Value, StoreError> {
+        validate_chat_id(source_chat_id)?;
+        let source = sqlx::query("SELECT title, model, mode FROM chats WHERE id = ?")
+            .bind(source_chat_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::Invalid(format!("unknown chat {source_chat_id}")))?;
+        let source_title: String = source.try_get("title").unwrap_or_default();
+        let model: String = source.try_get("model").unwrap_or_default();
+        let mode: String = source
+            .try_get::<String, _>("mode")
+            .unwrap_or_else(|_| "build".to_string());
+        let id = format!("chat-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        validate_chat_id(&id)?;
+        let title = if title.trim().is_empty() {
+            format!("{source_title} (fork)")
+        } else {
+            title.trim().to_string()
+        };
+        let now = now_iso();
+        sqlx::query(
+            r#"
+            INSERT INTO chats
+                (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(workspace_id)
+        .bind(workspace_path)
+        .bind(&title)
+        .bind(&model)
+        .bind(&now)
+        .bind(&now)
+        .bind(&mode)
+        .execute(&self.pool)
+        .await?;
+
+        let rows = sqlx::query(
+            "SELECT role, content, timestamp, is_trace, metadata_json FROM messages WHERE chat_id = ? ORDER BY rowid",
+        )
+        .bind(source_chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in &rows {
+            sqlx::query(
+                "INSERT INTO messages (id, chat_id, role, content, timestamp, is_trace, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(format!("msg-{}", Uuid::new_v4().simple()))
+            .bind(&id)
+            .bind(row.try_get::<String, _>("role").unwrap_or_default())
+            .bind(row.try_get::<String, _>("content").unwrap_or_default())
+            .bind(row.try_get::<String, _>("timestamp").unwrap_or_default())
+            .bind(row.try_get::<i64, _>("is_trace").unwrap_or(0))
+            .bind(row.try_get::<Option<String>, _>("metadata_json").unwrap_or(None))
+            .execute(&self.pool)
+            .await?;
+        }
+        sqlx::query("UPDATE chats SET message_count = ? WHERE id = ?")
+            .bind(rows.len() as i64)
+            .bind(&id)
+            .execute(&self.pool)
+            .await?;
+
+        let source_path = session_path_for(Path::new(workspace_path), workspace_id, source_chat_id);
+        if source_path.is_file() {
+            let target = session_path_for(Path::new(workspace_path), workspace_id, &id);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &target)?;
+        }
+        Ok(json!({
+            "id": id,
+            "title": title,
+            "model": model,
+            "createdAt": now,
+            "updatedAt": now,
+        }))
+    }
+
     pub async fn create_child_chat(
         &self,
         workspace_id: &str,
@@ -1211,6 +1301,62 @@ fn recent_text(entries: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fork_chat_copies_messages_and_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let workspace = dir.path().to_string_lossy().to_string();
+        let chat = store
+            .create_chat("_general", &workspace, "Source", "model")
+            .await
+            .unwrap();
+        let source_id = chat["id"].as_str().unwrap().to_string();
+        store
+            .append_message(&source_id, "user", "hello", false)
+            .await
+            .unwrap();
+        store
+            .append_session_entry_for(
+                "_general",
+                dir.path(),
+                &source_id,
+                json!({"type": "message", "role": "user", "content": "hello"}),
+            )
+            .await
+            .unwrap();
+
+        let fork = store
+            .fork_chat("_general", &workspace, &source_id, "")
+            .await
+            .unwrap();
+        let fork_id = fork["id"].as_str().unwrap().to_string();
+        assert_ne!(fork_id, source_id);
+        assert_eq!(fork["title"], "Source (fork)");
+        assert_eq!(
+            store.get_chat(&fork_id).await.unwrap().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .read_session_entries("_general", dir.path(), &fork_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // The source chat is untouched.
+        assert_eq!(
+            store.get_chat(&source_id).await.unwrap().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn notes_round_trip() {

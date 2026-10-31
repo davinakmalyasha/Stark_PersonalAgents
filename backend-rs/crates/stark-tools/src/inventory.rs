@@ -463,6 +463,22 @@ pub const INVENTORY: &[ToolMeta] = &[
         summary: "closed an agent",
     },
     ToolMeta {
+        name: "resume_agent",
+        plan_write: true,
+        read_blocked: true,
+        program: false,
+        verb: "Resumed agent",
+        summary: "resumed an agent",
+    },
+    ToolMeta {
+        name: "tool_search",
+        plan_write: false,
+        read_blocked: false,
+        program: false,
+        verb: "Searched tools",
+        summary: "searched tools",
+    },
+    ToolMeta {
         name: "memory",
         plan_write: false,
         read_blocked: false,
@@ -576,6 +592,8 @@ mod tests {
             "job_cancel",
             "schedule",
             "canvas_mode",
+            "resume_agent",
+            "tool_search",
         ];
         for tool in INVENTORY {
             assert_eq!(

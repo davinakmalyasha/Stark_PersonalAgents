@@ -42,7 +42,7 @@ pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
 pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_program, is_read_blocked};
-pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp};
+pub use mcp::{McpManager, ServerConfig as McpServerConfig, init as init_mcp, search_tools};
 pub use plan::{PlanError, PlanStore, update_plan};
 pub use processes::{ProcessManager, ProcessStatus};
 pub use questions::QuestionBroker;
@@ -56,6 +56,8 @@ pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_
 /// entry per tool derives the implemented set, the plan-write guard, the
 /// read-only guard, and the frontend labels. The frozen wire schema stays in
 /// `backend-rs/specs/tool-specs.json`.
+pub const MCP_EAGER_LIMIT: usize = 8;
+
 static CONTRACT: OnceLock<ToolSpecFile> = OnceLock::new();
 
 #[derive(Clone)]
@@ -82,6 +84,9 @@ pub struct ToolContext {
     pub depth: u32,
     /// "read" blocks writes at dispatch; "write"/"worktree" allow them.
     pub access: String,
+    /// MCP tools activated by `tool_search` for this run. Large MCP catalogs
+    /// are deferred: only these names are sent to the provider.
+    pub active_mcp: Arc<Mutex<HashSet<String>>>,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
 }
 
@@ -108,6 +113,7 @@ impl ToolContext {
             mode: "build".to_string(),
             depth: 0,
             access: "write".to_string(),
+            active_mcp: Arc::new(Mutex::new(HashSet::new())),
             code_delta: None,
         }
     }
@@ -258,6 +264,18 @@ pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
 }
 
 pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -> Vec<Value> {
+    tool_specs_for_run(mode, scope, access, &HashSet::new())
+}
+
+/// Like [`tool_specs_for_scope_with_access`] but honors MCP deferral: when a
+/// scope has more than [`MCP_EAGER_LIMIT`] MCP tools, only the ones activated
+/// by `tool_search` are sent.
+pub fn tool_specs_for_run(
+    mode: &str,
+    scope: &str,
+    access: &str,
+    active_mcp: &HashSet<String>,
+) -> Vec<Value> {
     let scope = scope.trim().to_lowercase();
     let allowed = contract().scope_map.get(&scope);
     let read_only = access == "read";
@@ -364,7 +382,16 @@ pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -
             spec
         })
         .collect();
-    specs.extend(mcp::tool_specs_for_scope(&scope));
+    let mut mcp_specs = mcp::tool_specs_for_scope(&scope);
+    if mcp_specs.len() > MCP_EAGER_LIMIT {
+        mcp_specs.retain(|spec| {
+            spec.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| active_mcp.contains(name))
+        });
+    }
+    specs.extend(mcp_specs);
     specs
 }
 
@@ -529,6 +556,7 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "todo_write" => ds_session::todo_write(ctx, args).await,
         "ask_user_question" => ds_session::ask_user_question(ctx, args).await,
         "skill" => skills::skill(ctx, args).await,
+        "tool_search" => mcp::search_tools(ctx, args).await,
         "web_search" => ds_web::web_search(ctx, args).await,
         "web_fetch" => ds_web::web_fetch(ctx, args).await,
         "ask_user" => ask::ask_user(ctx, args).await,
@@ -677,7 +705,7 @@ mod tests {
         assert!(names.contains(&"give_note"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            55
+            57
         );
     }
 
@@ -689,8 +717,8 @@ mod tests {
         let coder_specs = tool_specs_for_scope("build", "coder");
         let coder: std::collections::BTreeSet<&str> =
             tool_names(&coder_specs).into_iter().collect();
-        assert_eq!(developer.len(), 18);
-        assert_eq!(coder.len(), 19);
+        assert_eq!(developer.len(), 20);
+        assert_eq!(coder.len(), 21);
         assert!(coder.contains("run_code"));
         assert!(!developer.contains("run_code"));
         let extra: Vec<&&str> = coder.difference(&developer).collect();
@@ -1030,6 +1058,8 @@ mod v2_surface_tests {
             "list_agents",
             "interrupt_agent",
             "close_agent",
+            "resume_agent",
+            "tool_search",
         ];
         assert_eq!(
             names,

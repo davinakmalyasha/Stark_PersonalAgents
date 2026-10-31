@@ -428,8 +428,6 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     };
     ctx.emit_state(&mut state);
 
-    let tool_specs =
-        stark_tools::tool_specs_for_scope_with_access(&mode, &ctx.scope, ctx.file_access.as_str());
     let agent_label = ctx.agent_label();
     let mut tools = ToolContext::new(
         ctx.workspace.clone(),
@@ -473,6 +471,19 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         if let Some(message) = ctx.steering.lock().unwrap().pop_front() {
             messages.push(ChatMessage::user(&message));
         }
+
+        // Recompute per turn so `tool_search` can enable deferred MCP tools.
+        let active_mcp = tools
+            .active_mcp
+            .lock()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let tool_specs = stark_tools::tool_specs_for_run(
+            &mode,
+            &ctx.scope,
+            ctx.file_access.as_str(),
+            &active_mcp,
+        );
 
         if last_continuous_screen.is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
             && let Some(image) = stark_tools::latest_continuous_image()
@@ -909,6 +920,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                     | "list_agents"
                     | "interrupt_agent"
                     | "close_agent"
+                    | "resume_agent"
             ) {
                 if let Some(reason) =
                     stark_tools::plan_mode_denial(&mode, &call.function.name, &args)

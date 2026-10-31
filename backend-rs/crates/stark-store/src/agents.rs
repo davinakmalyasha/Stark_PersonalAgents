@@ -627,6 +627,19 @@ impl AgentStore {
         Ok(())
     }
 
+    /// Reopen a closed agent so a new turn can run (Codex `resume_agent`).
+    /// Running agents are left untouched.
+    pub async fn reopen(&self, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE agents SET status = 'queued', updated_at = ? WHERE id = ? AND status IN ('idle','interrupted','completed','failed','cancelled','closed')",
+        )
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn messages(&self, recipient_id: &str) -> Result<Vec<Value>, StoreError> {
         let rows = sqlx::query(
             "SELECT * FROM agent_messages WHERE recipient_id = ? AND consumed_at IS NULL ORDER BY created_at ASC",
@@ -646,6 +659,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AgentStore::open(dir.path()).await.unwrap();
         (dir, store)
+    }
+
+    #[tokio::test]
+    async fn closed_agents_can_be_reopened() {
+        let (_dir, store) = store().await;
+        let agent = store
+            .create_agent(
+                "workspace",
+                "root:1",
+                None,
+                "child-chat",
+                "_general",
+                "developer",
+                "Developer",
+                "task",
+                "model",
+                0,
+            )
+            .await
+            .unwrap();
+        store.set_status(&agent.id, "closed", false).await.unwrap();
+        assert!(store.reopen(&agent.id).await.unwrap());
+        let reopened = store.get(&agent.id).await.unwrap().unwrap();
+        assert_eq!(reopened.status, "queued");
+        // Running agents are not reopened.
+        store.set_status(&agent.id, "running", true).await.unwrap();
+        assert!(!store.reopen(&agent.id).await.unwrap());
     }
 
     #[tokio::test]

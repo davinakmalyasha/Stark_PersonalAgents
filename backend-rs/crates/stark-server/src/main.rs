@@ -259,6 +259,24 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let provider = Provider::new(provider_config)?;
+    // Learn the real context window per model from the provider instead of
+    // guessing. Best-effort; compaction keeps the conservative default if the
+    // metadata endpoint is unavailable.
+    {
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            loop {
+                match provider.refresh_model_contexts().await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("learned context windows for {count} model(s)")
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!("model metadata unavailable: {error}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            }
+        });
+    }
     let store = ChatStore::open(&harness_root).await?;
     let voice = stark_voice::resolve_models_dir(&harness_root).map(|dir| {
         tracing::info!("voice models: {}", dir.display());

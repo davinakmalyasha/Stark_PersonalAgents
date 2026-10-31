@@ -507,6 +507,62 @@ pub struct Provider {
     config: ProviderConfig,
 }
 
+/// Context windows reported by the provider's `/models` endpoint. Populated at
+/// startup so compaction uses the real window instead of a hardcoded guess.
+static MODEL_CONTEXTS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn model_contexts() -> &'static std::sync::RwLock<std::collections::HashMap<String, usize>> {
+    MODEL_CONTEXTS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Real context window for a model, when the provider reported one.
+pub fn context_window(model: &str) -> Option<usize> {
+    model_contexts()
+        .read()
+        .ok()
+        .and_then(|map| map.get(model).copied())
+}
+
+pub fn remember_context_window(model: &str, window: usize) {
+    if window == 0 || model.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut map) = model_contexts().write() {
+        map.insert(model.to_string(), window);
+    }
+}
+
+/// Parse OpenAI/OpenRouter model lists into `(id, context window)` pairs.
+fn parse_model_windows(value: &Value) -> Vec<(String, usize)> {
+    let models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut windows = Vec::new();
+    for model in models {
+        let Some(id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let window = model
+            .get("context_length")
+            .or_else(|| model.get("max_context_length"))
+            .or_else(|| {
+                model
+                    .get("top_provider")
+                    .and_then(|provider| provider.get("context_length"))
+            })
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0);
+        if let Some(window) = window {
+            windows.push((id.to_string(), window as usize));
+        }
+    }
+    windows
+}
+
 /// Routing/cache identity for a provider request. opencode's gateway uses
 /// `affinity` for cache routing and `session_id` for the concrete session.
 #[derive(Clone, Copy, Debug)]
@@ -516,6 +572,32 @@ pub struct ProviderSession<'a> {
 }
 
 impl Provider {
+    /// Fetch model metadata (context window) from the OpenAI-compatible
+    /// `/models` endpoint and cache it for compaction. Best-effort: failures
+    /// leave the conservative default in place.
+    pub async fn refresh_model_contexts(&self) -> Result<usize, ProviderError> {
+        let url = format!("{}/models", self.config.endpoint().trim_end_matches('/'));
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.config.api_key)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                body: "model metadata unavailable".to_string(),
+            });
+        }
+        let value: Value = response.json().await?;
+        let windows = parse_model_windows(&value);
+        for (id, window) in &windows {
+            remember_context_window(id, *window);
+        }
+        Ok(windows.len())
+    }
+
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .user_agent("stark-rs/0.1")
@@ -872,6 +954,21 @@ mod tests {
         assert_eq!(affordable_output_tokens("no numbers here"), None);
         // No default cap (Codex parity); an explicit env value is clamped.
         assert!(max_output_tokens().is_none());
+    }
+
+    #[test]
+    fn parses_context_windows_from_model_list() {
+        let value = json!({"data": [
+            {"id": "test-context-model", "context_length": 262144},
+            {"id": "mimo-v2.6-pro", "top_provider": {"context_length": 131072}},
+            {"id": "no-window"}
+        ]});
+        let windows = parse_model_windows(&value);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].1, 262_144);
+        assert_eq!(windows[1].1, 131_072);
+        remember_context_window("test-context-model", 262_144);
+        assert_eq!(context_window("test-context-model"), Some(262_144));
     }
 
     #[test]

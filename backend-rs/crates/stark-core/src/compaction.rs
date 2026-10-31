@@ -88,6 +88,7 @@ impl CompactionPolicy {
         let model_key = env_key(model);
         let context_window = positive_env(&format!("STARK_MODEL_CONTEXT_{model_key}"))
             .or_else(|| positive_env("STARK_MODEL_CONTEXT"))
+            .or_else(|| stark_providers::context_window(model))
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         let output_tokens = positive_env(&format!("STARK_MODEL_OUTPUT_{model_key}"))
             .or_else(|| positive_env("STARK_MODEL_OUTPUT"))

@@ -15,15 +15,14 @@ pub struct ProviderConfig {
     pub model: String,
 }
 
-/// Output cap for one model response (not the run). Defaults to 16k so large
-/// file writes fit while the gateway never reserves the model's full 128k+
-/// window; `STARK_MAX_OUTPUT_TOKENS` overrides it.
-fn max_output_tokens() -> u64 {
+/// Optional per-response output cap. Unset by default (Codex parity: the
+/// gateway applies the model's own limit). Set `STARK_MAX_OUTPUT_TOKENS` only
+/// to bound spend; the 402 handler otherwise adapts automatically.
+fn max_output_tokens() -> Option<u64> {
     std::env::var("STARK_MAX_OUTPUT_TOKENS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(16_384)
-        .clamp(256, 65_536)
+        .map(|value| value.clamp(256, 65_536))
 }
 
 /// OpenRouter-style 402s state what the balance can cover: "…can only afford
@@ -45,6 +44,37 @@ fn credit_error(body: &str, affordable: Option<u64>) -> String {
             "OpenRouter: balance covers {tokens} output tokens. Reduce STARK_MAX_OUTPUT_TOKENS or top up credits."
         ),
         None => format!("OpenRouter rejected the request (402): {body}"),
+    }
+}
+
+/// Extract the useful bit of a gateway error body.
+fn gateway_message(body: &str) -> String {
+    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/error/0/message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(body)
+        .trim();
+    message.chars().take(400).collect()
+}
+
+fn friendly_status(status: u16, body: &str, attempts: usize) -> String {
+    let message = gateway_message(body);
+    match status {
+        401 | 403 => format!(
+            "Authentication failed (HTTP {status}). Check STARK_API_KEY / OPENCODE_API_KEY. {message}"
+        ),
+        404 => format!("Model or endpoint not found (HTTP 404). Check the model id. {message}"),
+        402 => format!("Insufficient credits (HTTP 402). {message}"),
+        408 => format!("Provider timed out (HTTP 408) after {attempts} attempt(s). {message}"),
+        429 => format!("Rate limited (HTTP 429) after {attempts} attempt(s). {message}"),
+        500..=599 => {
+            format!("Provider unavailable (HTTP {status}) after {attempts} attempt(s). {message}")
+        }
+        400 => format!("Request rejected (HTTP 400). {message}"),
+        _ => format!("Provider error (HTTP {status}). {message}"),
     }
 }
 
@@ -451,10 +481,12 @@ pub enum ProviderEvent {
 pub enum ProviderError {
     #[error("missing API key; set STARK_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY")]
     MissingApiKey,
-    #[error("provider HTTP {status}: {body}")]
+    #[error("{body}")]
     HttpStatus { status: u16, body: String },
     #[error("provider request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("{0}")]
+    Transport(String),
     #[error("provider stream failed: {0}")]
     Stream(String),
     #[error("provider returned invalid JSON: {0}")]
@@ -487,6 +519,10 @@ impl Provider {
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .user_agent("stark-rs/0.1")
+            // Fail fast instead of hanging on a dead network, and cap a single
+            // request so a stalled stream surfaces as an error, not silence.
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(1_800))
             .build()?;
         Ok(Self { client, config })
     }
@@ -577,11 +613,13 @@ impl Provider {
             "temperature": temperature,
             "stream_options": {"include_usage": true},
         });
-        // Per-response output cap (not the run budget). Omitting it makes the
-        // gateway reserve the model's full 128k+ window, which fails with 402
-        // on low balances. The 402 handler lowers it to what is affordable.
+        // No max_tokens by default: the provider applies the model's own
+        // limit, exactly like Codex. Only an explicit env cap or a 402 retry
+        // adds one.
         let mut max_output = max_output_tokens();
-        body["max_tokens"] = json!(max_output);
+        if let Some(cap) = max_output {
+            body["max_tokens"] = json!(cap);
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
             body["tool_choice"] = Value::String("auto".to_string());
@@ -597,7 +635,25 @@ impl Provider {
             for (name, value) in &headers {
                 request = request.header(*name, value);
             }
-            let response = request.json(&body).send().await?;
+            let response = request.json(&body).send().await.map_err(|error| {
+                if error.is_timeout() {
+                    ProviderError::Transport(format!(
+                        "Timed out connecting to {} after {}s. Check your network or the provider status.",
+                        self.config.endpoint(),
+                        15
+                    ))
+                } else if error.is_connect() {
+                    ProviderError::Transport(format!(
+                        "Cannot reach {} (connection failed). Check your network, proxy, or VPN.",
+                        self.config.endpoint()
+                    ))
+                } else {
+                    ProviderError::Transport(format!(
+                        "Connection to {} failed: {error}",
+                        self.config.endpoint()
+                    ))
+                }
+            })?;
             if response.status().is_success() {
                 break response;
             }
@@ -613,11 +669,12 @@ impl Provider {
             if status == 402 {
                 let affordable = affordable_output_tokens(&body_text);
                 if let Some(tokens) = affordable {
-                    let retry_cap = tokens.clamp(256, max_output);
-                    if attempt < 2 && retry_cap < max_output {
+                    let retry_cap = tokens.clamp(256, 65_536);
+                    let current = max_output.unwrap_or(u64::MAX);
+                    if attempt < 2 && retry_cap < current {
                         attempt += 1;
-                        max_output = retry_cap;
-                        body["max_tokens"] = json!(max_output);
+                        max_output = Some(retry_cap);
+                        body["max_tokens"] = json!(retry_cap);
                         continue;
                     }
                 }
@@ -628,16 +685,31 @@ impl Provider {
             }
             return Err(ProviderError::HttpStatus {
                 status,
-                body: body_text,
+                body: friendly_status(status, &body_text, attempt + 1),
             });
         };
 
         let events = response.bytes_stream().eventsource();
         let stream = async_stream::try_stream! {
             let mut events = Box::pin(events);
-            while let Some(event) = events.next().await {
-                let event = event.map_err(|err| ProviderError::Stream(err.to_string()))?;
-                for parsed in parse_sse_data(&event.data)? {
+            loop {
+                // A stalled connection must surface as an error, not a hang.
+                let next = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    events.next(),
+                )
+                .await
+                {
+                    Err(_) => Err(ProviderError::Stream(
+                        "no data from the provider for 120s (stream stalled or connection lagging)".to_string(),
+                    ))?,
+                    Ok(None) => break,
+                    Ok(Some(Err(error))) => Err(ProviderError::Stream(format!(
+                        "connection lost mid-stream: {error}"
+                    )))?,
+                    Ok(Some(Ok(event))) => event,
+                };
+                for parsed in parse_sse_data(&next.data)? {
                     yield parsed;
                 }
             }
@@ -798,9 +870,8 @@ mod tests {
         let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 131072 tokens, but can only afford 26688. To increase, visit https://openrouter.ai/settings/credits and upgrade to a paid account"}}"#;
         assert_eq!(affordable_output_tokens(body), Some(26_688));
         assert_eq!(affordable_output_tokens("no numbers here"), None);
-        // Default cap stays well under the model window and above tiny floors.
-        let cap = max_output_tokens();
-        assert!((256..=65_536).contains(&cap));
+        // No default cap (Codex parity); an explicit env value is clamped.
+        assert!(max_output_tokens().is_none());
     }
 
     #[test]

@@ -38,9 +38,6 @@ pub use agents::{
 pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
 
 const HISTORY_LIMIT: usize = 200;
-const DEFAULT_RUN_SECONDS: u64 = 86_400;
-const DEFAULT_RUN_TOKENS: u64 = 50_000_000;
-const DEFAULT_RUN_TOOL_CALLS: usize = 5_000;
 const REPEAT_READ_LIMIT: usize = 4;
 const REPEAT_WRITE_LIMIT: usize = 5;
 const MAX_CONSECUTIVE_ERRORS: usize = 12;
@@ -457,9 +454,6 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         }));
     }
     let mut last_continuous_screen: Option<Instant> = None;
-    let (max_wall, max_tokens, max_tool_calls) = run_limits();
-    let run_started = Instant::now();
-    let mut tool_calls_used = 0usize;
     let mut repeat_counts: HashMap<(String, String), usize> = HashMap::new();
     let mut consecutive_errors = 0usize;
 
@@ -468,28 +462,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             finish_aborted(&ctx, &mut state).await;
             return Ok(());
         }
-        if run_started.elapsed() >= max_wall {
-            let message = format!(
-                "Run stopped: wall-clock budget of {} seconds exhausted.",
-                max_wall.as_secs()
-            );
-            fail(&ctx, &mut state, message.clone()).await;
-            return Err(RunError::Message(message));
-        }
-        let used_tokens = state
-            .token_usage
-            .total_input_tokens
-            .saturating_add(state.token_usage.total_output_tokens);
-        if used_tokens >= max_tokens {
-            let message = format!("Run stopped: token budget of {max_tokens} exhausted.");
-            fail(&ctx, &mut state, message.clone()).await;
-            return Err(RunError::Message(message));
-        }
-        if tool_calls_used >= max_tool_calls {
-            let message = format!("Run stopped: tool-call budget of {max_tool_calls} exhausted.");
-            fail(&ctx, &mut state, message.clone()).await;
-            return Err(RunError::Message(message));
-        }
+        // No wall-clock, token, or tool-call budgets: the run continues until
+        // the task is done or the user cancels. Codex parity.
 
         if let Some(message) = ctx.steering.lock().unwrap().pop_front() {
             messages.push(ChatMessage::user(&message));
@@ -971,7 +945,6 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 )
                 .await;
 
-            tool_calls_used += 1;
             if outcome.is_error {
                 consecutive_errors += 1;
             } else {
@@ -1030,14 +1003,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
-}
-
-fn run_limits() -> (Duration, u64, usize) {
-    (
-        Duration::from_secs(env_u64("STARK_RUN_MAX_SECONDS", DEFAULT_RUN_SECONDS)),
-        env_u64("STARK_RUN_MAX_TOKENS", DEFAULT_RUN_TOKENS),
-        env_u64("STARK_RUN_MAX_TOOL_CALLS", DEFAULT_RUN_TOOL_CALLS as u64) as usize,
-    )
 }
 
 fn is_read_only_tool(name: &str) -> bool {

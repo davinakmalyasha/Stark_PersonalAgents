@@ -78,6 +78,24 @@ export interface RewindResult {
   };
 }
 
+export async function forkChat(
+  workspaceId: string,
+  chatId: string,
+  title = '',
+): Promise<{ id: string; title: string }> {
+  const res = await fetch(
+    `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/fork`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || `Fork failed (HTTP ${res.status})`);
+  return data as { id: string; title: string };
+}
+
 export async function rewindChat(
   workspaceId: string,
   chatId: string,

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { X, Minimize2, Maximize2, Search, Download, RotateCcw, CircleAlert } from 'lucide-react';
+import { X, Minimize2, Maximize2, Search, Download, RotateCcw, CircleAlert, GitBranch } from 'lucide-react';
 import type { ChatMessage, AppState, ModelOption } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
@@ -7,7 +7,7 @@ import PlanDock from './PlanDock';
 import MessageStream from './MessageStream';
 import NotesButton from '../Notes/NotesButton';
 import CanvasModeBadge from '../Canvas/CanvasModeBadge';
-import { getChatSnapshots, restoreRun, setChatMode, type SnapshotGroup } from '../../services/api';
+import { getChatSnapshots, restoreRun, setChatMode, forkChat, type SnapshotGroup } from '../../services/api';
 
 interface Props {
   messages: ChatMessage[];
@@ -64,6 +64,18 @@ export default function ChatView({
   const [showSearch, setShowSearch] = useState(false);
   const [showRewind, setShowRewind] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
+  const [forkNote, setForkNote] = useState<string | null>(null);
+
+  const forkChatNow = async () => {
+    if (!workspaceId || !chatId) return;
+    try {
+      const fork = await forkChat(workspaceId, chatId);
+      setForkNote(`Forked to "${fork.title}" — open it from the sidebar.`);
+      window.dispatchEvent(new CustomEvent('stark:refresh-sidebar'));
+    } catch (error) {
+      setForkNote(error instanceof Error ? error.message : 'Fork failed.');
+    }
+  };
 
   // P10/Tier-3: client-side chat search — only show matching messages.
   const visibleMessages = searchQuery.trim()
@@ -153,7 +165,19 @@ export default function ChatView({
         >
           <RotateCcw size={14} />
         </button>
+        <button
+          onClick={forkChatNow}
+          disabled={!workspaceId || !chatId || isRunning}
+          className="pressable p-2 bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 hover:border-zinc-700/80 rounded-xl text-zinc-400 hover:text-zinc-100 transition-all cursor-pointer shadow-xl flex items-center justify-center disabled:opacity-40"
+          title="Fork this chat into a copy"
+          style={{ width: '32px', height: '32px' }}
+        >
+          <GitBranch size={14} />
+        </button>
       </div>
+      {forkNote && (
+        <div className="mx-4 mt-1 text-[11.5px] text-zinc-500">{forkNote}</div>
+      )}
       {showRewind && workspaceId && chatId && (
         <RewindPopover
           chatId={chatId}

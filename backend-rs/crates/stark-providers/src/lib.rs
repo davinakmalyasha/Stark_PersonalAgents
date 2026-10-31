@@ -25,6 +25,18 @@ fn max_output_tokens() -> Option<u64> {
         .map(|value| value.clamp(256, 65_536))
 }
 
+/// Optional reasoning effort, passed through to providers that support it.
+fn reasoning_effort() -> Option<&'static str> {
+    let value = std::env::var("STARK_REASONING_EFFORT").ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        _ => None,
+    }
+}
+
 /// OpenRouter-style 402s state what the balance can cover: "…can only afford
 /// 26688". Returns that number so the request can retry with an affordable cap.
 fn affordable_output_tokens(body: &str) -> Option<u64> {
@@ -701,6 +713,13 @@ impl Provider {
         let mut max_output = max_output_tokens();
         if let Some(cap) = max_output {
             body["max_tokens"] = json!(cap);
+        }
+        if let Some(effort) = reasoning_effort() {
+            if self.config.mode == "openrouter" {
+                body["reasoning"] = json!({ "effort": effort });
+            } else {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());

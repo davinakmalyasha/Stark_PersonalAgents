@@ -51,6 +51,14 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [chatModeState, setChatModeState] = useState<'plan' | 'build'>('build');
   const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
+
+  // Components outside App (ChatView fork, subagent views) can request a
+  // sidebar refresh without prop-drilling the tick setter.
+  useEffect(() => {
+    const refresh = () => setSidebarRefreshTick((tick) => tick + 1);
+    window.addEventListener('stark:refresh-sidebar', refresh);
+    return () => window.removeEventListener('stark:refresh-sidebar', refresh);
+  }, []);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [designOpen, setDesignOpen] = useState(false);

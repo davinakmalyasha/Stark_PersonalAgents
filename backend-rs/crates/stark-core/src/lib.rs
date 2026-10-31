@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -775,38 +775,54 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             continue;
         }
 
-        // Codex-style batch: independent read-only calls in one assistant
-        // message run concurrently. Writes, shell, subagents and group tools
-        // stay sequential (we have no OS sandbox to make them atomic).
+        // Codex-style batch: independent calls in one assistant message run
+        // concurrently. Calls touching the same file are grouped and run in
+        // order, so parallel edits cannot race. Shell, subagents, groups and
+        // long-running work stay sequential.
         let parallel_batch = tool_calls.len() > 1
             && tool_calls
                 .iter()
-                .all(|call| parallel_safe(&call.function.name))
-            && {
-                let mut keys = HashSet::new();
-                tool_calls.iter().all(|call| {
-                    keys.insert((call.function.name.clone(), call.function.arguments.clone()))
-                })
-            };
+                .all(|call| parallel_safe(&call.function.name));
         let mut precomputed: Vec<Option<ToolOutcome>> =
             (0..tool_calls.len()).map(|_| None).collect();
         if parallel_batch {
-            let mut futures = Vec::with_capacity(tool_calls.len());
+            let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for (index, call) in tool_calls.iter().enumerate() {
-                let name = call.function.name.clone();
                 let args: Value =
                     serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
                 let args_text = serde_json::to_string(&args).unwrap_or_default();
                 ctx.emit_delta(
-                    Delta::tool_started(&name, &args_text).with_agent(agent_label.clone()),
+                    Delta::tool_started(&call.function.name, &args_text)
+                        .with_agent(agent_label.clone()),
                 );
+                groups
+                    .entry(resource_key(&call.function.name, &args, index))
+                    .or_default()
+                    .push(index);
+            }
+            let mut group_futures = Vec::new();
+            for indices in groups.into_values() {
+                let mut work = Vec::new();
+                for index in indices {
+                    let call = &tool_calls[index];
+                    let name = call.function.name.clone();
+                    let args: Value = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| json!({}));
+                    work.push((index, name, args));
+                }
                 let tools_ctx = tools.clone();
-                futures.push(async move {
-                    (index, stark_tools::dispatch(&name, &args, &tools_ctx).await)
+                group_futures.push(async move {
+                    let mut out = Vec::new();
+                    for (index, name, args) in work {
+                        out.push((index, stark_tools::dispatch(&name, &args, &tools_ctx).await));
+                    }
+                    out
                 });
             }
-            for (index, outcome) in futures_util::future::join_all(futures).await {
-                precomputed[index] = Some(outcome);
+            for group in futures_util::future::join_all(group_futures).await {
+                for (index, outcome) in group {
+                    precomputed[index] = Some(outcome);
+                }
             }
         }
 
@@ -1045,13 +1061,17 @@ pub fn run_agent(
     Box::pin(run_agent_inner(ctx, prompt))
 }
 
-/// Tools safe to run concurrently within one assistant message: pure reads and
-/// network fetches. Mutating tools stay ordered.
+/// Tools that may run inside a parallel batch. Same-path calls are grouped and
+/// serialized; shell, subagents, group and schedule tools stay sequential.
 fn parallel_safe(name: &str) -> bool {
     matches!(
         name,
         "read"
             | "read_file"
+            | "write"
+            | "write_file"
+            | "edit"
+            | "edit_file"
             | "glob"
             | "grep"
             | "search_code"
@@ -1062,6 +1082,22 @@ fn parallel_safe(name: &str) -> bool {
             | "read_pdf"
             | "files_changed"
     )
+}
+
+/// Serialization key for the parallel batch: file tools share a key per path,
+/// everything else is independent.
+fn resource_key(name: &str, args: &Value, index: usize) -> String {
+    if matches!(
+        name,
+        "read" | "read_file" | "write" | "write_file" | "edit" | "edit_file" | "read_pdf"
+    ) && let Some(path) = args
+        .get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(Value::as_str)
+    {
+        return format!("path:{}", path.trim().to_ascii_lowercase());
+    }
+    format!("call:{index}")
 }
 
 fn is_read_only_tool(name: &str) -> bool {
@@ -1949,6 +1985,96 @@ mod tests {
         assert!(results[0].1.contains("alpha"), "{results:?}");
         assert_eq!(results[1].0, "c2");
         assert!(results[1].1.contains("beta"), "{results:?}");
+    }
+
+    async fn mock_write_batch_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"w1","function":{"name":"write","arguments":"{\"file_path\":\"a.txt\",\"content\":\"one\"}"}},
+                    {"index":1,"id":"w2","function":{"name":"write","arguments":"{\"file_path\":\"b.txt\",\"content\":\"two\"}"}},
+                    {"index":2,"id":"w3","function":{"name":"write","arguments":"{\"file_path\":\"a.txt\",\"content\":\"three\"}"}}
+                ]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parallel_writes_serialize_same_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_write_batch_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "write-batch".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("Coder".to_string()),
+            scope: "coder".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            on_job_done: None,
+        };
+        run_agent(ctx, "write files".to_string()).await.unwrap();
+
+        // Different files were written; the two writes to a.txt ran in order,
+        // so the last one wins instead of racing.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "three"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "two"
+        );
     }
 
     #[tokio::test]

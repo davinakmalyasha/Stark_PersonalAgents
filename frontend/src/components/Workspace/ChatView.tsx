@@ -28,6 +28,7 @@ interface Props {
   onToggleVoice: () => void;
   voiceInputText?: string;
   onOpenStats: () => void;
+  onOpenAgentConfig?: () => void;
   totalCost: number;
   totalInput: number;
   totalOutput: number;
@@ -53,7 +54,7 @@ export default function ChatView({
   messages, isRunning,
   hasActiveChat, notification, chatMode = 'build',
   onSend, onCancel, onClearNotification,
-  isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
+  isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
   selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession, onRewind, draft, onDraftConsumed,
   onModeChange,
   variant = 'floating',
@@ -271,7 +272,7 @@ export default function ChatView({
             </div>
           </div>
         )}
-        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} onDraftConsumed={onDraftConsumed} />
+        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} onOpenAgentConfig={onOpenAgentConfig} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} onDraftConsumed={onDraftConsumed} />
       </div>
     </div>
   );

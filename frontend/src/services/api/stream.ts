@@ -116,12 +116,26 @@ import type { ModelOption } from '../../types';
 export type ProviderMode = 'free' | 'deepseek' | 'opencode' | 'command' | 'openrouter';
 export interface ProviderInfo {
   provider: ProviderMode;
+  provider_label?: string;
   modes?: ProviderMode[];
   matrix?: Record<string, { backend?: string; model?: string; iter_effort?: string; think_bias?: boolean }>;
   base_url: string;
   model_flash: string;
   model_pro: string;
   has_key: boolean;
+  issues?: string[];
+  config_file?: boolean;
+  legacy_env?: string[];
+  health?: Record<string, string>;
+  providers?: Array<{
+    id: string;
+    label: string;
+    base_url: string;
+    key_env: string[];
+    has_key: boolean;
+    default_model: string;
+    models: Array<{ key: string; id: string; label: string; reasoning: boolean }>;
+  }>;
 }
 export async function fetchModels(): Promise<ModelOption[]> {
   const res = await fetchWithRetry(`${API_BASE}/models`);
@@ -136,7 +150,7 @@ export async function fetchProvider(): Promise<ProviderInfo> {
   return res.json();
 }
 
-export async function setProvider(provider: ProviderMode): Promise<ProviderInfo> {
+export async function setProvider(provider: string): Promise<{ ok: boolean; provider: string }> {
   const res = await fetch(`${API_BASE}/provider`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -144,6 +158,88 @@ export async function setProvider(provider: ProviderMode): Promise<ProviderInfo>
   });
   if (!res.ok) throw new Error('Failed to set provider');
   return res.json();
+}
+
+export interface AgentOverride {
+  key?: string;
+  provider?: string | null;
+  model?: string | null;
+  thinking?: string | null;
+  tools?: string[] | null;
+  skills?: string[] | null;
+  mcp?: string[] | null;
+  system_prompt?: string | null;
+}
+
+export interface EffectiveAgent {
+  key: string;
+  display: string;
+  tier: string;
+  provider: string;
+  provider_label: string;
+  base_url: string;
+  model_key: string;
+  model: string;
+  thinking: string | null;
+  reasoning?: boolean;
+  tools: string[] | null;
+  skills: string[] | null;
+  mcp: string[] | null;
+  system_prompt: string | null;
+  key_env: string[];
+  has_key: boolean;
+}
+
+export interface AgentConfigEntry {
+  key: string;
+  display: string;
+  tier: string;
+  configured: boolean;
+  override: AgentOverride | null;
+  effective: EffectiveAgent;
+}
+
+export interface AgentConfigPayload {
+  agents: AgentConfigEntry[];
+  issues: string[];
+  active_provider: string;
+  providers: Array<{
+    id: string;
+    label: string;
+    base_url: string;
+    key_env: string[];
+    has_key: boolean;
+    default_model: string;
+    models: Array<{ key: string; id: string; label: string; reasoning: boolean }>;
+  }>;
+  config_file: boolean;
+  legacy_env: string[];
+  health?: Record<string, string>;
+}
+
+export async function fetchAgentConfigs(): Promise<AgentConfigPayload> {
+  const res = await fetchWithRetry(`${API_BASE}/config/agents`);
+  if (!res.ok) throw new Error(`Could not load agent config (HTTP ${res.status})`);
+  return res.json();
+}
+
+export async function saveAgentConfig(key: string, override: AgentOverride): Promise<{ ok: boolean; effective: EffectiveAgent }> {
+  const res = await fetch(`${API_BASE}/config/agents/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(override),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || `Could not save ${key}`);
+  return data;
+}
+
+export async function deleteAgentConfig(key: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/config/agents/${encodeURIComponent(key)}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data?.error || `Could not reset ${key}`);
+  }
 }
 
 export async function resetSession(): Promise<void> {

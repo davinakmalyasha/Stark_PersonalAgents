@@ -181,7 +181,10 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty())
     {
-        return Err("reasoning_effort is not supported by this provider yet".to_string());
+        return Err(
+            "reasoning_effort is configured per agent in Agents & providers, not per spawn"
+                .to_string(),
+        );
     }
     if let Some(agent_type) = args.get("agent_type").and_then(Value::as_str) {
         let normalized = agent_type.trim().to_ascii_lowercase();
@@ -562,6 +565,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         }
     }

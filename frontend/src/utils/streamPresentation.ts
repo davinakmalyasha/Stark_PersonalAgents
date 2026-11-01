@@ -105,25 +105,34 @@ function splitLeadingHandoffStatus(text: string): { status: string; answer: stri
  * would render the same answer twice (once inside the "Worked for" block,
  * once below it) and hide a copy of the answer when the block is closed.
  */
-export function presentStream(segments: StreamSegment[], fallbackText: string): StreamPresentation {
+export function presentStream(segments: StreamSegment[], fallbackText: string, streaming = false): StreamPresentation {
   const safeSegments = Array.isArray(segments) ? segments : [];
-  const lastToolIndex = safeSegments.reduce((last, segment, index) => (
-    segment.type === 'tool' ? index : last
-  ), -1);
 
-  let finalText = (fallbackText || '').trim();
+  // While a run is live, render everything in strict chronological order:
+  // reasoning, text, tools, text… Hoisting the last text into a separate
+  // bottom block makes it look "stuck" when more reasoning arrives after it.
+  if (streaming && safeSegments.length > 0) {
+    return { finalText: '', activitySegments: safeSegments };
+  }
+
+  // Messages without a timeline (legacy persisted runs) only have the
+  // flattened assistant string.
+  let finalText = safeSegments.length === 0 ? (fallbackText || '').trim() : '';
   let activitySegments = safeSegments;
 
-  if (lastToolIndex >= 0) {
-    const trailing = textOf(safeSegments.slice(lastToolIndex + 1));
-    // A reconnect can leave a stream snapshot that does not match the
-    // persisted answer. Only promote the trailing stream text when it is part
-    // of the persisted content (or when there is no persisted content yet).
-    if (trailing && (!finalText || finalText.includes(trailing) || trailing.includes(finalText))) {
-      finalText = trailing;
-      activitySegments = safeSegments.filter((segment, index) => (
-        !(index > lastToolIndex && segment.type === 'text')
-      ));
+  // The final answer is the *last contiguous text run*, and only when it is
+  // actually at the end of the stream. Text followed by reasoning or a tool is
+  // an intermediate update and stays in the activity lane.
+  if (safeSegments.length > 0) {
+    const last = safeSegments[safeSegments.length - 1];
+    if (last.type === 'text') {
+      let start = safeSegments.length - 1;
+      while (start > 0 && safeSegments[start - 1].type === 'text') start -= 1;
+      const trailing = textOf(safeSegments.slice(start));
+      if (trailing) {
+        finalText = trailing;
+        activitySegments = safeSegments.slice(0, start);
+      }
     }
   }
 

@@ -516,6 +516,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         (dir, ctx)
@@ -601,6 +602,7 @@ mod notify_tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         }
     }

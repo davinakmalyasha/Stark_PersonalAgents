@@ -83,6 +83,23 @@ async fn read_skill(path: &Path) -> Option<(String, String, String)> {
 }
 
 pub async fn catalog_block_for(workspace: &Path, harness_root: &Path) -> Option<String> {
+    catalog_block_for_agent(workspace, harness_root, None).await
+}
+
+/// Same catalog, filtered to an agent's configured skill names. `None` means
+/// all discovered skills.
+pub async fn catalog_block_for_agent(
+    workspace: &Path,
+    harness_root: &Path,
+    allowed: Option<&[String]>,
+) -> Option<String> {
+    let allowed: Option<std::collections::HashSet<String>> = allowed.map(|names| {
+        names
+            .iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect()
+    });
     let mut roots = vec![
         workspace.join(".agents").join("skills"),
         harness_root.join(".agents").join("skills"),
@@ -108,6 +125,11 @@ pub async fn catalog_block_for(workspace: &Path, harness_root: &Path) -> Option<
             let Some((name, description, _)) = read_skill(&skill_path).await else {
                 continue;
             };
+            if let Some(allowed) = &allowed
+                && !allowed.contains(&name.to_ascii_lowercase())
+            {
+                continue;
+            }
             if !seen.insert(name.to_ascii_lowercase()) {
                 continue;
             }

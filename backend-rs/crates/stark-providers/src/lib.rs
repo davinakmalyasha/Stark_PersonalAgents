@@ -26,8 +26,8 @@ fn max_output_tokens() -> Option<u64> {
 }
 
 /// Optional reasoning effort, passed through to providers that support it.
-fn reasoning_effort() -> Option<&'static str> {
-    let value = std::env::var("STARK_REASONING_EFFORT").ok()?;
+/// Resolved per run from the agent config, never from a global env var.
+fn normalize_reasoning_effort(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "minimal" => Some("minimal"),
         "low" => Some("low"),
@@ -76,7 +76,7 @@ fn friendly_status(status: u16, body: &str, attempts: usize) -> String {
     let message = gateway_message(body);
     match status {
         401 | 403 => format!(
-            "Authentication failed (HTTP {status}). Check STARK_API_KEY / OPENCODE_API_KEY. {message}"
+            "Authentication failed (HTTP {status}). Check the provider's key_env variable (OPENCODE_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY). {message}"
         ),
         404 => format!("Model or endpoint not found (HTTP 404). Check the model id. {message}"),
         402 => format!("Insufficient credits (HTTP 402). {message}"),
@@ -120,74 +120,16 @@ pub fn canonical_opencode_model(requested: &str) -> String {
 }
 
 impl ProviderConfig {
+    /// Legacy constructor: environment variables supply the **key only**.
+    /// Provider/base/model come from `.deep_agents/config/providers.json`
+    /// (see `stark-config`); this fallback is OpenCode Go so a stale
+    /// `STARK_PROVIDER=openrouter` in a workspace `.env` can never hijack it.
     pub fn from_env() -> Self {
-        let requested_mode = std::env::var("STARK_PROVIDER")
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase();
-        let explicit_base = first_env(&["STARK_PROVIDER_BASE", "OPENAI_BASE_URL"]);
-        let explicit_key = first_env(&["STARK_API_KEY", "OPENAI_API_KEY"]);
-        let explicit_model = first_env(&["STARK_MODEL", "OPENAI_MODEL"]);
-
-        if requested_mode == "openrouter" {
-            return Self {
-                mode: "openrouter".to_string(),
-                base_url: explicit_base
-                    .or_else(|| first_env(&["OPENROUTER_BASE_URL"]))
-                    .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
-                api_key: explicit_key
-                    .or_else(|| first_env(&["OPENROUTER_API_KEY"]))
-                    .or_else(|| first_key(&["OPENROUTER_API_KEYS"]))
-                    .unwrap_or_default(),
-                model: explicit_model
-                    .or_else(|| first_env(&["OPENROUTER_MODEL", "STARK_MODEL"]))
-                    .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".to_string()),
-            };
-        }
-
-        if requested_mode == "command" || requested_mode == "commandcode" {
-            return Self {
-                mode: "command".to_string(),
-                base_url: explicit_base
-                    .or_else(|| first_env(&["COMMAND_CODE_BASE_URL"]))
-                    .unwrap_or_else(|| "https://api.commandcode.ai/provider/v1".to_string()),
-                api_key: explicit_key
-                    .or_else(|| first_env(&["COMMAND_CODE_API_KEY"]))
-                    .unwrap_or_default(),
-                model: explicit_model
-                    .or_else(|| first_env(&["COMMAND_CODE_MODEL_FLASH", "COMMAND_CODE_MODEL_ORCH"]))
-                    .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash".to_string()),
-            };
-        }
-
-        // No explicit provider: opencode go is the default. Explicit
-        // STARK_PROVIDER values (including "deepseek") still work as before.
-        if requested_mode.is_empty() || requested_mode == "opencode" {
-            return Self {
-                mode: "opencode".to_string(),
-                base_url: explicit_base
-                    .or_else(|| first_env(&["DEEPSEEK_BASE_URL"]))
-                    .unwrap_or_else(|| "https://opencode.ai/zen/go/v1".to_string()),
-                api_key: explicit_key
-                    .or_else(|| first_env(&["OPENCODE_API_KEY", "DEEPSEEK_API_KEY"]))
-                    .unwrap_or_default(),
-                model: explicit_model
-                    .or_else(|| first_env(&["DEEPSEEK_MODEL_FLASH", "DEEPSEEK_MODEL"]))
-                    .unwrap_or_else(|| "deepseek-v4.1-flash".to_string()),
-            };
-        }
-
         Self {
-            mode: requested_mode,
-            base_url: explicit_base
-                .or_else(|| first_env(&["DEEPSEEK_BASE_URL"]))
-                .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
-            api_key: explicit_key
-                .or_else(|| first_env(&["DEEPSEEK_API_KEY", "OPENCODE_API_KEY"]))
-                .unwrap_or_default(),
-            model: explicit_model
-                .or_else(|| first_env(&["DEEPSEEK_MODEL", "DEEPSEEK_MODEL_FLASH"]))
-                .unwrap_or_else(|| "deepseek-chat".to_string()),
+            mode: "opencode".to_string(),
+            base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            api_key: first_env(&["OPENCODE_API_KEY", "DEEPSEEK_API_KEY"]).unwrap_or_default(),
+            model: "deepseek-v4.1-flash".to_string(),
         }
     }
 
@@ -240,17 +182,6 @@ fn first_env(names: &[&str]) -> Option<String> {
         std::env::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
-    })
-}
-
-fn first_key(names: &[&str]) -> Option<String> {
-    first_env(names).map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .find(|part| !part.is_empty())
-            .unwrap_or("")
-            .to_string()
     })
 }
 
@@ -581,6 +512,12 @@ fn parse_model_windows(value: &Value) -> Vec<(String, usize)> {
 pub struct ProviderSession<'a> {
     pub session_id: &'a str,
     pub affinity: &'a str,
+    /// Agent-configured reasoning effort. `None` inherits the provider/model.
+    pub reasoning_effort: Option<&'a str>,
+}
+
+fn models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
 }
 
 impl Provider {
@@ -588,7 +525,7 @@ impl Provider {
     /// `/models` endpoint and cache it for compaction. Best-effort: failures
     /// leave the conservative default in place.
     pub async fn refresh_model_contexts(&self) -> Result<usize, ProviderError> {
-        let url = format!("{}/models", self.config.endpoint().trim_end_matches('/'));
+        let url = models_url(&self.config.base_url);
         let response = self
             .client
             .get(url)
@@ -597,9 +534,11 @@ impl Provider {
             .send()
             .await?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
             return Err(ProviderError::HttpStatus {
-                status: response.status().as_u16(),
-                body: "model metadata unavailable".to_string(),
+                status,
+                body: format!("HTTP {status}: {}", gateway_message(&body)),
             });
         }
         let value: Value = response.json().await?;
@@ -714,7 +653,10 @@ impl Provider {
         if let Some(cap) = max_output {
             body["max_tokens"] = json!(cap);
         }
-        if let Some(effort) = reasoning_effort() {
+        if let Some(effort) = session
+            .and_then(|session| session.reasoning_effort)
+            .and_then(normalize_reasoning_effort)
+        {
             if self.config.mode == "openrouter" {
                 body["reasoning"] = json!({ "effort": effort });
             } else {
@@ -1129,6 +1071,19 @@ mod tests {
     }
 
     #[test]
+    fn models_url_uses_the_base_not_the_chat_endpoint() {
+        assert_eq!(
+            models_url("https://opencode.ai/zen/go/v1"),
+            "https://opencode.ai/zen/go/v1/models"
+        );
+        assert_eq!(
+            models_url("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1/models"
+        );
+        assert!(!models_url("https://example.invalid/v1").contains("chat/completions"));
+    }
+
+    #[test]
     fn opencode_aliases_canonicalize_to_curated_ids() {
         let config = ProviderConfig {
             mode: "opencode".to_string(),
@@ -1175,6 +1130,7 @@ mod tests {
             Some(ProviderSession {
                 session_id: "chat-child",
                 affinity: "chat-parent",
+                reasoning_effort: None,
             }),
         );
         assert!(headers.contains(&("x-opencode-session", "chat-parent".to_string())));
@@ -1192,6 +1148,7 @@ mod tests {
                 Some(ProviderSession {
                     session_id: "chat",
                     affinity: "chat",
+                    reasoning_effort: None,
                 })
             )
             .is_empty()

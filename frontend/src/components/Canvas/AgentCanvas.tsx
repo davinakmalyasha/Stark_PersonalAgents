@@ -33,6 +33,7 @@ interface Props {
   onToggleVoice: () => void;
   voiceInputText?: string;
   onOpenStats: () => void;
+  onOpenAgentConfig?: () => void;
   onOpenProject?: (ref: { workspace_id: string; chat_id: string }) => void;
   onRetry?: (prompt: string) => void;
   onOpenChat?: (workspaceId: string, chatId: string) => void;

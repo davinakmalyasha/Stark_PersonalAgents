@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,9 +19,10 @@ use dashmap::mapref::entry::Entry;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use stark_config::{AgentFile, ConfigStore, EffectiveAgent};
 use stark_contract::{AppState, ServerEvent};
 use stark_core::{RunContext, agent_for_scope, resolve_agent, run_agent};
-use stark_providers::{CURATED_MODELS, ImagePart, Provider, ProviderConfig};
+use stark_providers::{ImagePart, Provider, ProviderConfig};
 use stark_store::{
     AgentRecord, AgentStore, CanvasStore, ChatStore, GroupStore, MemoryStore, NewEntry,
     ScheduleRecord, ScheduleStore, WorkspaceRegistry, parse_schedule_time, schedule_json,
@@ -187,6 +188,13 @@ impl RunManager {
 struct ServerState {
     store: ChatStore,
     provider: Provider,
+    /// Declarative provider + agent config (hot-reloaded from disk).
+    config: Arc<ConfigStore>,
+    /// One client per configured provider, so agents can run on different
+    /// gateways in the same process.
+    providers: Arc<HashMap<String, Provider>>,
+    /// Last `/models` auth/connectivity error per provider (empty = healthy).
+    provider_health: Arc<Mutex<HashMap<String, String>>>,
     questions: Arc<QuestionBroker>,
     runs: Arc<RunManager>,
     registry: WorkspaceRegistry,
@@ -207,6 +215,125 @@ struct RunTarget {
     temperature: f64,
     depth: u32,
     agent_id: Option<String>,
+    /// Resolved provider/model/effort/tools for this run.
+    effective: Arc<EffectiveAgent>,
+}
+
+impl ServerState {
+    /// Client for the provider an agent resolved to. Falls back to the active
+    /// provider only if the registry entry is missing.
+    fn provider_for(&self, effective: &EffectiveAgent) -> Provider {
+        if let Some(provider) = self.providers.get(&effective.provider) {
+            let resolved = self.config.resolve_key(&effective.provider);
+            let current = provider.config();
+            // An empty resolution means the env var is unset; keep the key the
+            // provider was built with instead of blanking a working client.
+            let key = if resolved.is_empty() {
+                current.api_key.clone()
+            } else {
+                resolved
+            };
+            let stale = !current.base_url.eq_ignore_ascii_case(&effective.base_url)
+                || current.api_key != key
+                || !current.mode.eq_ignore_ascii_case(&effective.provider);
+            if !stale && current.model.eq_ignore_ascii_case(&effective.model) {
+                return provider.clone();
+            }
+            // Hot reload: rebuild the client with the edited base/key/model.
+            let mut config = current.clone();
+            config.mode = effective.provider.clone();
+            config.base_url = effective.base_url.clone();
+            config.api_key = key;
+            config.model = effective.model.clone();
+            return Provider::new(config).unwrap_or_else(|error| {
+                tracing::warn!(
+                    "provider '{}' could not apply the edited config: {error}",
+                    effective.provider
+                );
+                provider.clone()
+            });
+        }
+        // A provider added to providers.json after startup is not in the
+        // prebuilt map yet. Build it on demand so hot-reload covers new
+        // gateways, not just edits to existing ones.
+        Provider::new(ProviderConfig {
+            mode: effective.provider.clone(),
+            base_url: effective.base_url.clone(),
+            api_key: self.config.resolve_key(&effective.provider),
+            model: effective.model.clone(),
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                "provider '{}' could not be built on demand: {error}",
+                effective.provider
+            );
+            self.provider.clone()
+        })
+    }
+}
+
+/// Resolve an agent's configuration, falling back to the built-in defaults when
+/// a user-edited agent file is invalid. A broken file must not brick a chat.
+fn effective_for(state: &ServerState, scope: &str, tier: &str) -> Arc<EffectiveAgent> {
+    match state.config.effective(scope, tier) {
+        Ok(effective) => Arc::new(effective),
+        Err(error) => {
+            tracing::warn!(
+                "agent config for '{scope}' is invalid: {error}; using built-in defaults"
+            );
+            Arc::new(
+                state
+                    .config
+                    .effective("__default__", tier)
+                    .unwrap_or_else(|_| stark_config::builtin_effective(tier)),
+            )
+        }
+    }
+}
+
+fn legacy_env_names() -> Vec<&'static str> {
+    [
+        "STARK_PROVIDER",
+        "STARK_PROVIDER_BASE",
+        "STARK_MODEL",
+        "STARK_API_KEY",
+    ]
+    .into_iter()
+    .filter(|name| std::env::var(name).is_ok())
+    .collect()
+}
+
+fn build_provider_map(config: &ConfigStore) -> HashMap<String, Provider> {
+    let mut providers = HashMap::new();
+    for summary in config.provider_summaries() {
+        let id = summary.id.clone();
+        let requested = if summary.default_model.trim().is_empty() {
+            summary
+                .models
+                .first()
+                .map(|model| model.id.clone())
+                .unwrap_or_default()
+        } else {
+            summary.default_model.clone()
+        };
+        let model = config
+            .resolve_model(&id, &requested)
+            .map(|(_, model)| model)
+            .unwrap_or_else(|_| requested.clone());
+        let provider_config = ProviderConfig {
+            mode: id.clone(),
+            base_url: summary.base_url.clone(),
+            api_key: config.resolve_key(&id),
+            model,
+        };
+        match Provider::new(provider_config) {
+            Ok(provider) => {
+                providers.insert(id, provider);
+            }
+            Err(error) => tracing::warn!("provider '{id}' could not be initialized: {error}"),
+        }
+    }
+    providers
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,27 +379,58 @@ async fn main() -> anyhow::Result<()> {
     if app_env.is_file() {
         let _ = dotenvy::from_path(&app_env);
     }
-    let provider_config = ProviderConfig::from_env();
-    if !provider_config.has_key() {
+    // Provider/base/model come from `.deep_agents/config/providers.json`.
+    // Environment variables only supply keys (referenced by `key_env`).
+    let config = Arc::new(ConfigStore::open(&harness_root));
+    for issue in config.issues() {
+        tracing::warn!("config: {issue}");
+    }
+    let providers = Arc::new(build_provider_map(&config));
+    let active_id = config.active_provider();
+    let provider = providers
+        .get(&active_id)
+        .cloned()
+        .or_else(|| providers.values().next().cloned())
+        .unwrap_or(Provider::new(ProviderConfig::from_env())?);
+    if !provider.config().has_key() {
         tracing::warn!(
-            "no provider API key found; set STARK_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY"
+            "no API key found for provider '{active_id}' (checked {:?}); set it in the environment",
+            provider.config().mode
         );
     }
-    let provider = Provider::new(provider_config)?;
+    tracing::info!(
+        "provider: {active_id} · {} · model={}",
+        provider.config().base_url,
+        provider.config().model
+    );
     tracing::info!("{}", stark_tools::sandbox_status(&harness_root));
-    // Learn the real context window per model from the provider instead of
-    // guessing. Best-effort; compaction keeps the conservative default if the
-    // metadata endpoint is unavailable.
+    // Learn the real context window per model from every configured provider
+    // instead of guessing. Best-effort.
+    let provider_health = Arc::new(Mutex::new(HashMap::new()));
     {
-        let provider = provider.clone();
+        let providers = providers.clone();
+        let health = provider_health.clone();
         tokio::spawn(async move {
             loop {
-                match provider.refresh_model_contexts().await {
-                    Ok(count) if count > 0 => {
-                        tracing::info!("learned context windows for {count} model(s)")
+                let mut learned = 0;
+                for (id, provider) in providers.iter() {
+                    match provider.refresh_model_contexts().await {
+                        Ok(count) => {
+                            learned += count;
+                            if let Ok(mut health) = health.lock() {
+                                health.remove(id);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("provider '{id}' model check failed: {error}");
+                            if let Ok(mut health) = health.lock() {
+                                health.insert(id.clone(), error.to_string());
+                            }
+                        }
                     }
-                    Ok(_) => {}
-                    Err(error) => tracing::debug!("model metadata unavailable: {error}"),
+                }
+                if learned > 0 {
+                    tracing::info!("learned context windows for {learned} model(s)");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
             }
@@ -290,6 +448,9 @@ async fn main() -> anyhow::Result<()> {
     let state = ServerState {
         store,
         provider,
+        config: config.clone(),
+        providers: providers.clone(),
+        provider_health: provider_health.clone(),
         questions: Arc::new(QuestionBroker::new()),
         runs: Arc::new(RunManager::default()),
         registry: WorkspaceRegistry::new(&harness_root),
@@ -317,7 +478,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/ask/pending", get(pending_handler))
         .route("/api/ask/answer", post(answer_handler))
         .route("/api/models", get(models_handler))
-        .route("/api/provider", get(provider_handler))
+        .route(
+            "/api/provider",
+            get(provider_handler).post(set_provider_handler),
+        )
+        .route("/api/config/agents", get(agents_config_handler))
+        .route(
+            "/api/config/agents/{key}",
+            get(agent_config_handler)
+                .put(save_agent_handler)
+                .delete(delete_agent_handler),
+        )
         .route(
             "/api/workspaces",
             get(workspaces_handler).post(add_workspace_handler),
@@ -633,11 +804,20 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
     };
     let agent = stark_core::agent_for_scope(scope)
         .unwrap_or_else(|| stark_core::agent_for_scope("general").expect("general agent"));
+    let mut effective = (*effective_for(state, agent.key, agent.tier)).clone();
     let model = chat["model"]
         .as_str()
         .filter(|model| !model.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| state.provider.config().resolve_model(""));
+        .and_then(|requested| {
+            state
+                .config
+                .resolve_model(&effective.provider, requested)
+                .ok()
+                .map(|(_, model)| model)
+        })
+        .unwrap_or_else(|| effective.model.clone());
+    effective.model = model.clone();
+    let effective = Arc::new(effective);
     RunTarget {
         chat_id: chat["id"].as_str().unwrap_or("").to_string(),
         workspace_id: workspace_id.to_string(),
@@ -648,6 +828,7 @@ fn canvas_target(state: &ServerState, chat: &Value) -> RunTarget {
         temperature: 0.2,
         depth: 0,
         agent_id: None,
+        effective,
     }
 }
 
@@ -678,6 +859,17 @@ async fn schedule_loop(state: ServerState) {
             } else {
                 PathBuf::from(&record.workspace_path)
             };
+            let tier = stark_core::agent_for_scope(&record.scope)
+                .map(|agent| agent.tier)
+                .unwrap_or("workspace");
+            let mut effective = (*effective_for(&state, &record.scope, tier)).clone();
+            let model = state
+                .config
+                .resolve_model(&effective.provider, &record.model)
+                .map(|(_, model)| model)
+                .unwrap_or_else(|_| effective.model.clone());
+            effective.model = model.clone();
+            let effective = Arc::new(effective);
             spawn_follow_up_run(
                 state.clone(),
                 RunTarget {
@@ -686,10 +878,11 @@ async fn schedule_loop(state: ServerState) {
                     workspace,
                     scope: record.scope.clone(),
                     role: record.role.clone(),
-                    model: record.model.clone(),
+                    model,
                     temperature: record.temperature,
                     depth: 0,
                     agent_id: None,
+                    effective,
                 },
                 record.prompt.clone(),
             );
@@ -842,7 +1035,9 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         .map(PathBuf::from)
         .unwrap_or_else(|| state.harness_root.clone());
     let agent = group_item_agent(&item, &detail);
-    let model = state.provider.config().resolve_model("");
+    let effective = effective_for(&state, agent.key, agent.tier);
+    let model = effective.model.clone();
+    let provider = state.provider_for(&effective);
     let title = format!(
         "Group: {} ({})",
         item["title"].as_str().unwrap_or("Task"),
@@ -913,7 +1108,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         model,
         temperature: 0.2,
         images: Vec::new(),
-        provider: state.provider.clone(),
+        provider,
         store: state.store.clone(),
         questions: state.questions.clone(),
         tx,
@@ -922,6 +1117,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel,
+        config: Some(effective.clone()),
         on_job_done: None,
     };
     let acceptance =
@@ -1074,7 +1270,28 @@ Attached files:
     };
     let agent = resolve_agent(&request.workspace_kind, &workspace, &state.harness_root);
 
-    let model = state.provider.config().resolve_model(&request.model);
+    let mut effective = (*effective_for(&state, agent.key, agent.tier)).clone();
+    let model = if request.model.trim().is_empty() {
+        effective.model.clone()
+    } else {
+        match state
+            .config
+            .resolve_model(&effective.provider, request.model.trim())
+        {
+            Ok((_, model)) => model,
+            Err(error) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": error.to_string()})),
+                ));
+            }
+        }
+    };
+    // The model picker is a per-run override; keep the provider client in sync
+    // with it (the agent config remains the default for the next run).
+    effective.model = model.clone();
+    let effective = Arc::new(effective);
+    let provider = state.provider_for(&effective);
     let workspace_id = if !request.workspace_id.trim().is_empty() {
         request.workspace_id.trim().to_string()
     } else if let Ok(Some(existing)) = state.store.chat_workspace_id(&chat_id).await {
@@ -1101,6 +1318,14 @@ Attached files:
         follow_up.clone(),
         workspace.to_string_lossy().as_ref(),
     ) {
+        // Mid-run message: deliver it as steering and attach this request to
+        // the existing run's event stream instead of returning HTTP 409.
+        if state.runs.steer(&chat_id, &prompt)
+            && let Some(receiver) = state.runs.subscribe(&chat_id)
+        {
+            let stream: SseStream = Box::pin(sse_stream(receiver));
+            return Ok(Sse::new(stream));
+        }
         return Err((
             StatusCode::CONFLICT,
             Json(json!({"error": "This chat already has a running agent."})),
@@ -1122,6 +1347,7 @@ Attached files:
         temperature: request.temperature,
         depth: 0,
         agent_id: None,
+        effective: effective.clone(),
     };
     // Image attachments (uploads, voice screen frames) ride the opening user
     // message as real vision parts; the text note in the prompt stays for
@@ -1152,7 +1378,7 @@ Attached files:
         model: target.model.clone(),
         temperature: target.temperature,
         images: run_images,
-        provider: state.provider.clone(),
+        provider: provider.clone(),
         store: state.store.clone(),
         questions: state.questions.clone(),
         tx: tx.clone(),
@@ -1161,6 +1387,7 @@ Attached files:
         follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel,
+        config: Some(effective.clone()),
         on_job_done: Some(job_hook(state.clone(), target)),
     };
 
@@ -1220,7 +1447,15 @@ fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
     })
 }
 
-fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
+fn spawn_follow_up_run(state: ServerState, mut target: RunTarget, message: String) {
+    // Re-resolve on every follow-up so config edits apply without waiting for
+    // a new chat.
+    let tier = agent_for_scope(&target.scope)
+        .map(|agent| agent.tier)
+        .unwrap_or("workspace");
+    let effective = effective_for(&state, &target.scope, tier);
+    target.model = effective.model.clone();
+    target.effective = effective;
     let (tx, _) = broadcast::channel(256);
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
@@ -1252,7 +1487,7 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
         model: target.model.clone(),
         temperature: target.temperature,
         images: Vec::new(),
-        provider: state.provider.clone(),
+        provider: state.provider_for(&target.effective),
         store: state.store.clone(),
         questions: state.questions.clone(),
         tx: tx.clone(),
@@ -1261,6 +1496,7 @@ fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
         follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel,
+        config: Some(target.effective.clone()),
         on_job_done: Some(job_hook(state.clone(), target.clone())),
     };
     let manager = state.runs.clone();
@@ -1442,21 +1678,23 @@ async fn agent_target(state: &ServerState, agent: &AgentRecord) -> RunTarget {
     } else {
         PathBuf::from(workspace_path)
     };
-    let model = if agent.model.trim().is_empty() {
-        state.provider.config().resolve_model("")
-    } else {
-        agent.model.clone()
-    };
+    let tier = stark_core::agent_for_scope(&agent.scope)
+        .map(|spec| spec.tier)
+        .unwrap_or("workspace");
+    // Config is authoritative. The stored `agent.model` is a snapshot from
+    // creation time and may reference a provider the app no longer uses.
+    let effective = effective_for(state, &agent.scope, tier);
     RunTarget {
         chat_id: agent.chat_id.clone(),
         workspace_id: agent.workspace_id.clone(),
         workspace,
         scope: agent.scope.clone(),
         role: (!agent.role.is_empty()).then(|| agent.role.clone()),
-        model,
+        model: effective.model.clone(),
         temperature: 0.2,
         depth: agent.depth.max(0) as u32,
         agent_id: Some(agent.id.clone()),
+        effective,
     }
 }
 
@@ -1526,7 +1764,7 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         model: target.model.clone(),
         temperature: target.temperature,
         images: Vec::new(),
-        provider: state.provider.clone(),
+        provider: state.provider_for(&target.effective),
         store: state.store.clone(),
         questions: state.questions.clone(),
         tx: tx.clone(),
@@ -1535,6 +1773,7 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
         follow_up,
         checkpoint: Some(checkpoint.clone()),
         cancel: cancel.clone(),
+        config: Some(target.effective.clone()),
         on_job_done: Some(job_hook(state.clone(), target.clone())),
     };
     stark_core::register_agent_cancel(&agent.id, cancel.clone());
@@ -1606,7 +1845,10 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
                 }
             }
         }
-        let full_report = format!("{report}{worktree_note}");
+        let full_report = match &error {
+            Some(error) => format!("{report}{worktree_note}\n\n[ERROR] {error}"),
+            None => format!("{report}{worktree_note}"),
+        };
         let _ = store.finish(&agent.id, status, &full_report, usage).await;
         manager.finish(&canvas_chat, final_state);
         let _ = done_tx.send(ServerEvent::new(
@@ -1614,7 +1856,15 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
             json!({"status": status, "error": error}),
         ));
         if let Ok(Some(message_id)) = store.notify_parent(&agent, &full_report, status).await {
-            wake_parent_agent(&store, &canvas_state, &agent, &full_report, message_id).await;
+            wake_parent_agent(
+                &store,
+                &canvas_state,
+                &agent,
+                &full_report,
+                status,
+                message_id,
+            )
+            .await;
         }
         if store
             .messages(&agent.id)
@@ -1634,6 +1884,7 @@ async fn wake_parent_agent(
     state: &ServerState,
     child: &AgentRecord,
     report: &str,
+    status: &str,
     message_id: String,
 ) {
     let Some(parent_id) = child.parent_id.as_deref() else {
@@ -1647,7 +1898,7 @@ async fn wake_parent_agent(
         "[AGENT RESULT] {} · {} · {}\nchat: {}\n{}\nReview the child result and continue.",
         child.path,
         child.role,
-        child.status,
+        status,
         child.chat_id,
         report.chars().take(12_000).collect::<String>()
     );
@@ -2162,8 +2413,10 @@ async fn memory_consolidate_handler(
         stark_core::memory_agent::ConsolidateMode::Model
     };
     let cancel = CancellationToken::new();
+    let memory_effective = effective_for(&state, "__memory__", "workspace");
+    let memory_provider = state.provider_for(&memory_effective);
     match stark_core::memory_agent::consolidate_workspace(
-        &state.provider,
+        &memory_provider,
         &cancel,
         &store,
         &workspace_id,
@@ -2368,24 +2621,216 @@ async fn answer_handler(
     }
 }
 
-async fn models_handler(State(state): State<ServerState>) -> Json<Value> {
-    let mode = state.provider.config().mode.clone();
-    let models: Vec<Value> = CURATED_MODELS
-        .iter()
-        .map(|(id, name)| json!({"id": id, "name": name, "provider": mode}))
-        .collect();
-    Json(json!({ "models": models }))
+#[derive(Debug, Deserialize)]
+struct ProviderQuery {
+    #[serde(default)]
+    agent: Option<String>,
 }
 
-async fn provider_handler(State(state): State<ServerState>) -> Json<Value> {
-    let config = state.provider.config();
+#[derive(Debug, Deserialize)]
+struct ProviderRequest {
+    provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentQuery {
+    #[serde(default)]
+    tier: Option<String>,
+}
+
+async fn models_handler(State(state): State<ServerState>) -> Json<Value> {
+    let active = state.config.active_provider();
+    let summaries = state.config.provider_summaries();
+    let models: Vec<Value> = summaries
+        .iter()
+        .find(|provider| provider.id == active)
+        .map(|provider| {
+            provider
+                .models
+                .iter()
+                .map(|model| {
+                    json!({
+                        "id": model.id,
+                        "name": model.label,
+                        "key": model.key,
+                        "provider": active,
+                        "reasoning": model.reasoning,
+                        "context": model.context,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(json!({ "models": models, "provider": active }))
+}
+
+async fn provider_handler(
+    State(state): State<ServerState>,
+    Query(query): Query<ProviderQuery>,
+) -> Json<Value> {
+    let active = state.config.active_provider();
+    let summaries = state.config.provider_summaries();
+    let active_provider = summaries.iter().find(|provider| provider.id == active);
+    let effective = query.agent.as_deref().map(|agent| {
+        let tier = agent_for_scope(agent)
+            .map(|spec| spec.tier)
+            .unwrap_or("workspace");
+        effective_for(&state, agent, tier)
+    });
+    let legacy_env: Vec<&str> = legacy_env_names();
     Json(json!({
-        "provider": config.mode,
-        "base_url": config.base_url,
-        "model_flash": config.model,
-        "model_pro": config.model,
-        "has_key": config.has_key(),
+        "provider": active,
+        "provider_label": active_provider.map(|provider| provider.label.clone()).unwrap_or_default(),
+        "base_url": active_provider.map(|provider| provider.base_url.clone()).unwrap_or_default(),
+        "model_flash": active_provider
+            .and_then(|provider| provider.models.first())
+            .map(|model| model.id.clone())
+            .unwrap_or_default(),
+        "model_pro": active_provider
+            .and_then(|provider| provider.models.first())
+            .map(|model| model.id.clone())
+            .unwrap_or_default(),
+        "has_key": active_provider.is_some_and(|provider| provider.has_key),
+        "models": active_provider.map(|provider| provider.models.clone()).unwrap_or_default(),
+        "providers": summaries,
+        "issues": state.config.issues(),
+        "config_file": state.config.has_file(),
+        "legacy_env": legacy_env,
+        "health": state.provider_health.lock().map(|health| health.clone()).unwrap_or_default(),
+        "effective": effective,
     }))
+}
+
+async fn set_provider_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<ProviderRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state
+        .config
+        .set_active(request.provider.trim())
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+        })?;
+    Ok(Json(json!({
+        "ok": true,
+        "provider": state.config.active_provider(),
+        "message": "Provider saved. The next run uses it; no restart needed.",
+    })))
+}
+
+async fn agents_config_handler(State(state): State<ServerState>) -> Json<Value> {
+    let mut agents = Vec::new();
+    for key in [
+        "orchestrator",
+        "developer",
+        "coder",
+        "general",
+        "house",
+        "dfd",
+        "ui",
+        "devops",
+        "explore",
+    ] {
+        let Some(spec) = agent_for_scope(key) else {
+            continue;
+        };
+        let effective = effective_for(&state, key, spec.tier);
+        agents.push(json!({
+            "key": spec.key,
+            "display": spec.display,
+            "tier": spec.tier,
+            "configured": state.config.agent(key).is_some(),
+            "override": state.config.agent(key),
+            "effective": effective,
+        }));
+    }
+    Json(json!({
+        "agents": agents,
+        "issues": state.config.issues(),
+        "active_provider": state.config.active_provider(),
+        "providers": state.config.provider_summaries(),
+        "config_file": state.config.has_file(),
+        "legacy_env": legacy_env_names(),
+        "health": state.provider_health.lock().map(|health| health.clone()).unwrap_or_default(),
+    }))
+}
+
+async fn agent_config_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Query(query): Query<AgentQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let spec = agent_for_scope(&key).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        )
+    })?;
+    let tier = query
+        .tier
+        .filter(|tier| !tier.trim().is_empty())
+        .unwrap_or_else(|| spec.tier.to_string());
+    let effective = effective_for(&state, spec.key, &tier);
+    Ok(Json(json!({
+        "key": spec.key,
+        "display": spec.display,
+        "tier": spec.tier,
+        "override": state.config.agent(spec.key),
+        "effective": effective,
+    })))
+}
+
+async fn save_agent_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Json(agent): Json<AgentFile>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let spec = agent_for_scope(&key).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        )
+    })?;
+    state.config.save_agent(spec.key, agent).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    let effective = effective_for(&state, spec.key, spec.tier);
+    Ok(Json(json!({
+        "ok": true,
+        "key": spec.key,
+        "override": state.config.agent(spec.key),
+        "effective": effective,
+    })))
+}
+
+async fn delete_agent_handler(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let spec = agent_for_scope(&key).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent '{key}'")})),
+        )
+    })?;
+    state.config.delete_agent(spec.key).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+    })?;
+    let effective = effective_for(&state, spec.key, spec.tier);
+    Ok(Json(json!({
+        "ok": true,
+        "key": spec.key,
+        "effective": effective,
+    })))
 }
 
 const VIRTUAL_WORKSPACES: [(&str, &str, &str, &str); 4] = [
@@ -4267,7 +4712,40 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn write_mock_provider_config(root: &std::path::Path, base_url: &str) {
+        let dir = root.join(".deep_agents").join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = json!({
+            "version": 1,
+            "active": "opencode",
+            "providers": {
+                "opencode": {
+                    "label": "Mock",
+                    "base_url": base_url,
+                    "key_env": "STARK_TEST_MOCK_KEY",
+                    "default_model": "mock",
+                    "models": {
+                        "mock": {"id": "mock", "label": "Mock", "reasoning": false}
+                    }
+                }
+            },
+            "matrix": {
+                "opencode": {
+                    "orchestrator": {"model": "mock", "thinking": "none"},
+                    "workspace": {"model": "mock", "thinking": "none"},
+                    "specialist": {"model": "mock", "thinking": "none"}
+                }
+            }
+        });
+        std::fs::write(
+            dir.join("providers.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
     async fn group_test_state(root: &std::path::Path, base_url: String) -> ServerState {
+        write_mock_provider_config(root, &base_url);
         let store = ChatStore::open(root).await.unwrap();
         let provider = Provider::new(ProviderConfig {
             mode: "deepseek".to_string(),
@@ -4276,9 +4754,15 @@ mod tests {
             model: "mock".to_string(),
         })
         .unwrap();
+        let config = Arc::new(ConfigStore::open(root));
+        let mut provider_map = HashMap::new();
+        provider_map.insert("opencode".to_string(), provider.clone());
         ServerState {
             store,
             provider,
+            config,
+            providers: Arc::new(provider_map),
+            provider_health: Arc::new(Mutex::new(HashMap::new())),
             questions: Arc::new(QuestionBroker::new()),
             runs: Arc::new(RunManager::default()),
             registry: WorkspaceRegistry::new(root),
@@ -4694,16 +5178,25 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = ChatStore::open(dir.path()).await.unwrap();
+        let base_url = format!("http://{address}");
+        write_mock_provider_config(dir.path(), &base_url);
         let provider = Provider::new(ProviderConfig {
             mode: "deepseek".to_string(),
-            base_url: format!("http://{address}"),
+            base_url,
             api_key: "test".to_string(),
             model: "mock".to_string(),
         })
         .unwrap();
+        let config = Arc::new(ConfigStore::open(dir.path()));
+        let mut provider_map = HashMap::new();
+        provider_map.insert("opencode".to_string(), provider.clone());
+        let providers = Arc::new(provider_map);
         let state = ServerState {
             store: store.clone(),
             provider,
+            config,
+            providers,
+            provider_health: Arc::new(Mutex::new(HashMap::new())),
             questions: Arc::new(QuestionBroker::new()),
             runs: Arc::new(RunManager::default()),
             registry: WorkspaceRegistry::new(dir.path()),
@@ -4724,6 +5217,7 @@ mod tests {
                 temperature: 0.0,
                 depth: 0,
                 agent_id: None,
+                effective: effective_for(&state, "orchestrator", "orchestrator"),
             },
             "[DELEGATION RESULT] job done".to_string(),
         );

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import type { ModelOption } from '../../types';
+import { fetchProvider, type ProviderInfo } from '../../services/api';
 
 interface Props {
   onSend: (message: string, files: File[]) => void;
@@ -10,6 +11,7 @@ interface Props {
   onToggleVoice: () => void;
   voiceInputText?: string;
   onOpenStats: () => void;
+  onOpenAgentConfig?: () => void;
   totalCost: number;
   totalInput: number;
   totalOutput: number;
@@ -28,7 +30,7 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 const isImage = (file: File) => file.type.startsWith('image/');
 
-export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, onDraftConsumed }: Props) {
+export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, onDraftConsumed }: Props) {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [dragActive, setDragActive] = useState(false);
@@ -39,6 +41,34 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
 
   const [openMenu, setOpenMenu] = useState<'model' | null>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
+  const [providerInfo, setProviderInfo] = useState<ProviderInfo | null>(null);
+
+  // The old label was hardcoded to "OpenCode Go" even when the server was on
+  // another gateway. Read the live provider from the backend instead.
+  useEffect(() => {
+    let active = true;
+    const load = () => {
+      fetchProvider()
+        .then((info) => { if (active) setProviderInfo(info); })
+        .catch(() => {});
+    };
+    load();
+    const timer = window.setInterval(load, 30_000);
+    window.addEventListener('stark-provider-changed', load);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.removeEventListener('stark-provider-changed', load);
+    };
+  }, []);
+
+  const providerHealth = providerInfo?.health?.[providerInfo.provider] || '';
+  const providerLabel = providerInfo
+    ? (providerInfo.provider === 'opencode' ? 'OpenCode Go' : providerInfo.provider_label || providerInfo.provider)
+    : 'Provider';
+  const providerTitle = providerInfo
+    ? `${providerInfo.provider_label || providerInfo.provider}\n${providerInfo.base_url}\nmodel: ${providerInfo.model_flash || '—'}${providerInfo.has_key ? '' : '\nAPI key missing'}${providerHealth ? `\nprovider error: ${providerHealth}` : ''}\nClick to configure agents and providers`
+    : 'Loading provider…';
 
   // Close dropup on outside click / Escape
   useEffect(() => {
@@ -151,9 +181,16 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
           <div className="flex items-center gap-2">
             <span className="hidden sm:block text-[10px] text-zinc-600">{files.length ? `${files.length} attachment${files.length > 1 ? 's' : ''}` : ''}</span>
             <div className="usage-control"><button type="button" className="usage-orb" title="Usage" aria-label="Usage"><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100` }}/></svg><span>{Math.round(cacheRate)}</span></button><div className="usage-popover"><div className="usage-popover-title">Usage</div><div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div><div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div><div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div><div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div><button type="button" onClick={onOpenStats} className="usage-details">View details</button></div></div>
-            <span className="provider-trigger" title="LLM provider: OpenCode Go" aria-label="LLM provider">
-              <span className="truncate">OpenCode Go</span>
-            </span>
+            <button
+              type="button"
+              className={`provider-trigger ${providerInfo && (!providerInfo.has_key || providerHealth) ? 'is-warning' : ''}`}
+              title={providerTitle}
+              aria-label={`LLM provider: ${providerLabel}. Configure agents`}
+              onClick={() => onOpenAgentConfig?.()}
+              style={providerInfo && (!providerInfo.has_key || providerHealth) ? { color: '#fbbf24' } : undefined}
+            >
+              <span className="truncate">{providerLabel}</span>
+            </button>
             {models.length > 0 && onModelChange && (
               <div className="provider-dropup" ref={modelMenuRef}>
                 <button

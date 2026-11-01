@@ -228,9 +228,9 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
     : persistedThinking
       ? [{ type: 'reasoning' as const, text: persistedThinking }]
       : [];
-  const streamPresentation = presentStream(timelineSegments, message.content);
+  const streamPresentation = presentStream(timelineSegments, message.content, streamingActive);
   const delegationSteps = Array.isArray(message.metadata?.steps) ? message.metadata.steps as TraceStep[] : [];
-  const responseContent = stripDelegationNarration(streamPresentation.finalText || message.content, delegationSteps);
+  const responseContent = stripDelegationNarration(streamPresentation.finalText, delegationSteps);
   const activitySegments = streamPresentation.activitySegments;
   // The "Worked for" block owns reasoning/tool history only. Plain Q&A has
   // neither, so render no collapsible at all — the answer below stays the

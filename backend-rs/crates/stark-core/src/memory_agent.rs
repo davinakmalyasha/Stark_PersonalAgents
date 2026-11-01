@@ -160,6 +160,7 @@ pub async fn consolidate_workspace(
     let session = ProviderSession {
         session_id: &session_key,
         affinity: &session_key,
+        reasoning_effort: None,
     };
     let messages = vec![
         ChatMessage::system(

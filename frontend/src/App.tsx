@@ -5,6 +5,7 @@ import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
 import TokenStatsModal from './components/Layout/TokenStatsModal';
+import AgentConfigModal from './components/Layout/AgentConfigModal';
 import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 const DesignWorkspace = lazy(() => import('./modules/design-workspace/DesignWorkspace'));
@@ -43,6 +44,7 @@ export default function App() {
   const [activeChat, setActiveChat] = useState<ChatData | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [isTokenStatsOpen, setIsTokenStatsOpen] = useState(false);
+  const [isAgentConfigOpen, setIsAgentConfigOpen] = useState(false);
 
   const [model, setModel] = useState('Automatic Fallback');
   const [temperature] = useState(0.7);
@@ -933,6 +935,7 @@ export default function App() {
           onToggleVoice={toggleVoice}
           voiceInputText={voiceInputText}
           onOpenStats={() => setIsTokenStatsOpen(true)}
+          onOpenAgentConfig={() => setIsAgentConfigOpen(true)}
           onOpenProject={handleOpenProject}
           onOpenChat={handleCwActivate}
           onOpenAddon={(addonId) => { if (addonId === 'design') setDesignOpen(true); }}
@@ -952,6 +955,10 @@ export default function App() {
         onClose={() => setIsTokenStatsOpen(false)}
         tokenUsage={combinedTokenUsage}
         lastModelName={lastModelName}
+      />
+      <AgentConfigModal
+        isOpen={isAgentConfigOpen}
+        onClose={() => setIsAgentConfigOpen(false)}
       />
       {showShortcuts && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowShortcuts(false)}>          <div className="modal-panel-enter w-full max-w-sm rounded-2xl border border-zinc-800 bg-[#141417] shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>

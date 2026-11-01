@@ -175,6 +175,7 @@ fn project_context(
         follow_up: Arc::new(Mutex::new(VecDeque::new())),
         checkpoint: None,
         cancel: ctx.cancel.child_token(),
+        config: None,
         on_job_done: None,
     };
     (child, latest)
@@ -310,6 +311,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         let result = create_project_in(

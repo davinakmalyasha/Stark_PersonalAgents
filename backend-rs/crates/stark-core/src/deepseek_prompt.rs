@@ -59,6 +59,7 @@ fn platform_label() -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub async fn system_prompt(
     workspace: &std::path::Path,
     harness_root: &std::path::Path,
@@ -66,6 +67,19 @@ pub async fn system_prompt(
     mode: &str,
     depth: u32,
     code_mode: bool,
+) -> String {
+    system_prompt_for_agent(workspace, harness_root, model, mode, depth, code_mode, None).await
+}
+
+/// Same prompt, with the agent's configured skill allowlist.
+pub async fn system_prompt_for_agent(
+    workspace: &std::path::Path,
+    harness_root: &std::path::Path,
+    model: &str,
+    mode: &str,
+    depth: u32,
+    code_mode: bool,
+    skills: Option<&[String]>,
 ) -> String {
     // Stable first: identity, persona, project instructions, skills.
     let mut prompt = format!(
@@ -75,7 +89,9 @@ pub async fn system_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(&instructions);
     }
-    if let Some(skills) = stark_tools::catalog_block_for(workspace, harness_root).await {
+    if let Some(skills) =
+        stark_tools::catalog_block_for_agent(workspace, harness_root, skills).await
+    {
         prompt.push_str("\n\n");
         prompt.push_str(&skills);
     }

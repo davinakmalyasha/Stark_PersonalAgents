@@ -237,6 +237,7 @@ pub async fn compact_history(
     let session = ProviderSession {
         session_id,
         affinity,
+        reasoning_effort: None,
     };
     let summary = summarize(provider, cancel, &messages[1..cut], policy, session).await?;
     let tail = &messages[cut..];

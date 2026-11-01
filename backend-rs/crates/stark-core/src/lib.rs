@@ -104,6 +104,9 @@ pub struct RunContext {
     pub follow_up: Arc<Mutex<VecDeque<String>>>,
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub cancel: CancellationToken,
+    /// Effective agent configuration resolved from `.deep_agents/config`.
+    /// `None` in tests and background jobs keeps the built-in contract.
+    pub config: Option<Arc<stark_config::EffectiveAgent>>,
     pub on_job_done: Option<JobDoneHook>,
 }
 
@@ -129,6 +132,15 @@ impl RunContext {
             .map(|agent| agent.display.to_string())
             .or_else(|| self.role.clone())
             .unwrap_or_else(|| "Stark".to_string())
+    }
+
+    /// Reasoning effort resolved from the agent config, if any. Providers and
+    /// models that do not advertise reasoning support get `None`.
+    fn thinking(&self) -> Option<&str> {
+        self.config
+            .as_ref()
+            .filter(|config| config.reasoning)
+            .and_then(|config| config.thinking.as_deref())
     }
 
     /// Provider cache/routing affinity: a child chat shares its parent's
@@ -328,20 +340,36 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         // volatile runtime snapshot last so prefix-cache reuse survives plan
         // switches. Memory/worktree blocks are intentionally absent.
         // Coder shares the shape and adds the program-tool-calling section.
-        deepseek_prompt::system_prompt(
+        let mut prompt = deepseek_prompt::system_prompt_for_agent(
             &ctx.workspace,
             ctx.store.harness_root(),
             &ctx.model,
             &mode,
             ctx.depth,
             ctx.scope == "coder",
+            ctx.config
+                .as_ref()
+                .and_then(|config| config.skills.as_deref()),
         )
-        .await
+        .await;
+        if let Some(custom) = ctx
+            .config
+            .as_ref()
+            .and_then(|config| config.system_prompt.as_deref())
+        {
+            prompt.push_str("\n\n# Agent instructions\n");
+            prompt.push_str(custom);
+        }
+        prompt
     } else {
-        let preamble = match agent_for_scope(&ctx.scope) {
-            Some(agent) => agent.instructions.to_string(),
-            None => format!("You are Stark, {role}."),
-        };
+        let preamble = ctx
+            .config
+            .as_ref()
+            .and_then(|config| config.system_prompt.clone())
+            .unwrap_or_else(|| match agent_for_scope(&ctx.scope) {
+                Some(agent) => agent.instructions.to_string(),
+                None => format!("You are Stark, {role}."),
+            });
         let mut prompt = format!(
             "{preamble} Working in {workspace_label}. \
              Use the provided tools to inspect and change files. Read before editing. \
@@ -440,7 +468,9 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     .with_scope(ctx.scope.clone())
     .with_access(ctx.file_access.as_str())
     .with_mode(mode.clone())
-    .with_depth(ctx.depth);
+    .with_depth(ctx.depth)
+    .with_allowed_tools(ctx.config.as_ref().and_then(|config| config.tools.clone()))
+    .with_mcp_servers(ctx.config.as_ref().and_then(|config| config.mcp.clone()));
     if let Some(checkpoint) = &ctx.checkpoint {
         tools = tools.with_checkpoint(checkpoint.clone());
     }
@@ -462,6 +492,11 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model).hard_limit_tokens as u64;
     state.context_window = context_window;
     let mut consecutive_errors = 0usize;
+    // Provider output-cap recovery: a text response cut by `finish_reason:
+    // length` is incomplete, not an answer. Ask the model to continue instead
+    // of silently ending the run (this truncated real work before).
+    let mut length_continuations = 0usize;
+    let mut carried_text = String::new();
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -471,8 +506,22 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         // No wall-clock, token, or tool-call budgets: the run continues until
         // the task is done or the user cancels. Codex parity.
 
-        if let Some(message) = ctx.steering.lock().unwrap().pop_front() {
+        let steering_message = { ctx.steering.lock().unwrap().pop_front() };
+        if let Some(message) = steering_message {
             messages.push(ChatMessage::user(&message));
+            let _ = ctx
+                .store
+                .append_session_entry_for(
+                    &ctx.workspace_id,
+                    &ctx.workspace,
+                    &ctx.chat_id,
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": message,
+                    }),
+                )
+                .await;
         }
 
         // Recompute per turn so `tool_search` can enable deferred MCP tools.
@@ -486,6 +535,10 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             &ctx.scope,
             ctx.file_access.as_str(),
             &active_mcp,
+            ctx.config
+                .as_ref()
+                .and_then(|config| config.tools.as_deref()),
+            ctx.config.as_ref().and_then(|config| config.mcp.as_deref()),
         );
 
         if last_continuous_screen.is_none_or(|last| last.elapsed() >= Duration::from_secs(15))
@@ -510,6 +563,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 ProviderSession {
                     session_id: &ctx.chat_id,
                     affinity: &affinity,
+                    reasoning_effort: ctx.thinking(),
                 },
             )
             .await
@@ -642,9 +696,34 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         }
 
         if calls.is_empty() {
-            if !text.is_empty() {
+            if !text.trim().is_empty()
+                && matches!(
+                    finish_reason.as_deref(),
+                    Some("length") | Some("max_tokens")
+                )
+            {
+                const MAX_LENGTH_CONTINUATIONS: usize = 8;
+                length_continuations += 1;
+                if length_continuations > MAX_LENGTH_CONTINUATIONS {
+                    let message = format!(
+                        "Run stopped: the provider returned an output-limit stop {MAX_LENGTH_CONTINUATIONS} times in a row. Split the remaining work into smaller writes."
+                    );
+                    fail(&ctx, &mut state, message.clone()).await;
+                    return Err(RunError::Message(message));
+                }
+                carried_text.push_str(&text);
+                messages.push(ChatMessage::assistant(&text));
+                messages.push(ChatMessage::user(
+                    "Your previous message was cut by the provider output limit. Continue exactly where you stopped. Do not repeat completed text. If a single write/edit is too large, split it into several smaller calls.",
+                ));
+                continue;
+            }
+            let final_text = format!("{carried_text}{text}");
+            carried_text.clear();
+            length_continuations = 0;
+            if !final_text.is_empty() {
                 ctx.store
-                    .append_message(&ctx.chat_id, "assistant", &text, false)
+                    .append_message(&ctx.chat_id, "assistant", &final_text, false)
                     .await?;
                 ctx.store
                     .append_session_entry_for(
@@ -654,7 +733,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                         json!({
                             "type": "message",
                             "role": "assistant",
-                            "content": text.clone(),
+                            "content": final_text.clone(),
                             "provider": "stark-rs",
                             "model": ctx.model.clone(),
                             "stop_reason": finish_reason,
@@ -664,8 +743,8 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             }
             let next_follow_up = ctx.follow_up.lock().unwrap().pop_front();
             if let Some(follow_up) = next_follow_up {
-                if !text.is_empty() {
-                    messages.push(ChatMessage::assistant(&text));
+                if !final_text.is_empty() {
+                    messages.push(ChatMessage::assistant(&final_text));
                 }
                 if !is_internal_delegation_result(&follow_up) {
                     let user_id = ctx
@@ -690,7 +769,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 continue;
             }
             state.active_node = "done".to_string();
-            state.outputs = json!({"agent_report": text});
+            state.outputs = json!({"agent_report": final_text});
             ctx.emit_state(&mut state);
             if ctx.depth <= 1
                 && ctx.scope != "developer"
@@ -698,7 +777,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
             {
                 let _ = memory
-                    .record(&ctx.workspace_id, &ctx.chat_id, None, &prompt, &text)
+                    .record(&ctx.workspace_id, &ctx.chat_id, None, &prompt, &final_text)
                     .await;
                 // Distillation/consolidation is background work. The
                 // deterministic stage-1 record above is the durable capture;
@@ -736,18 +815,27 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             })
             .collect();
 
+        // A continuation text burst followed by a tool call belongs to the
+        // same assistant turn in history.
+        let assistant_text = if carried_text.is_empty() {
+            text.clone()
+        } else {
+            format!("{carried_text}{text}")
+        };
+        carried_text.clear();
+        length_continuations = 0;
         messages.push(ChatMessage::assistant_tool_calls(
-            if text.is_empty() {
+            if assistant_text.is_empty() {
                 None
             } else {
-                Some(text.clone())
+                Some(assistant_text.clone())
             },
             tool_calls.clone(),
         ));
 
         let mut assistant_blocks = Vec::new();
-        if !text.is_empty() {
-            assistant_blocks.push(json!({"type": "text", "text": text}));
+        if !assistant_text.is_empty() {
+            assistant_blocks.push(json!({"type": "text", "text": assistant_text}));
         }
         for call in &tool_calls {
             let arguments = serde_json::from_str::<Value>(&call.function.arguments)
@@ -1764,6 +1852,7 @@ pub(crate) fn child_context_with_access(
         follow_up: Arc::new(Mutex::new(VecDeque::new())),
         checkpoint: None,
         cancel,
+        config: None,
         on_job_done: None,
     };
     (child, latest)
@@ -1928,6 +2017,33 @@ mod tests {
             .unwrap()
     }
 
+    async fn mock_text_truncated_provider(
+        axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let payload = if turn == 0 {
+            vec![
+                json!({"choices":[{"delta":{"content":"Now I'll build"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            ]
+        } else {
+            vec![
+                json!({"choices":[{"delta":{"content":" the page."}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        };
+        let mut body = String::new();
+        for item in payload {
+            body.push_str(&format!("data: {item}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     async fn mock_parallel_provider(
         axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
         Json(_body): Json<Value>,
@@ -2001,6 +2117,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         run_agent(ctx, "write a big file".to_string())
@@ -2010,6 +2127,62 @@ mod tests {
         // The partial payload never reached disk, and the model got one retry.
         assert!(!dir.path().join("big.txt").exists());
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn text_output_limit_continues_instead_of_ending_the_run() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_text_truncated_provider))
+            .with_state(counter.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let provider = Provider::new(ProviderConfig {
+            mode: "deepseek".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "test".to_string(),
+            model: "mock".to_string(),
+        })
+        .unwrap();
+        let (tx, _rx) = broadcast::channel(256);
+        let latest = Arc::new(Mutex::new(None));
+        let ctx = RunContext {
+            chat_id: "text-truncated-chat".to_string(),
+            workspace_id: "_general".to_string(),
+            workspace: dir.path().to_path_buf(),
+            role: Some("General".to_string()),
+            scope: "general".to_string(),
+            depth: 0,
+            file_access: crate::FileAccess::Write,
+            model: "mock".to_string(),
+            temperature: 0.0,
+            images: Vec::new(),
+            provider,
+            store: store.clone(),
+            questions: Arc::new(QuestionBroker::new()),
+            tx,
+            latest: latest.clone(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+            follow_up: Arc::new(Mutex::new(VecDeque::new())),
+            checkpoint: None,
+            cancel: CancellationToken::new(),
+            config: None,
+            on_job_done: None,
+        };
+        run_agent(ctx, "build the page".to_string()).await.unwrap();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        let final_state = latest.lock().unwrap().clone().expect("final state");
+        assert_eq!(
+            final_state.outputs["agent_report"].as_str().unwrap(),
+            "Now I'll build the page."
+        );
     }
 
     #[tokio::test]
@@ -2057,6 +2230,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         run_agent(ctx, "read both".to_string()).await.unwrap();
@@ -2157,6 +2331,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         run_agent(ctx, "write files".to_string()).await.unwrap();
@@ -2217,6 +2392,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         run_agent(ctx, "rename hello to bye".to_string())
@@ -2272,6 +2448,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
 
@@ -2333,6 +2510,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         run_agent(ctx, "delegate".to_string()).await.unwrap();
@@ -2471,6 +2649,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
 
@@ -2562,6 +2741,7 @@ mod tests {
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             checkpoint: None,
             cancel: CancellationToken::new(),
+            config: None,
             on_job_done: None,
         };
         let approved = ToolOutcome::ok(

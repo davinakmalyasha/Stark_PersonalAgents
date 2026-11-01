@@ -62,7 +62,7 @@ pub use questions::QuestionBroker;
 pub use screen::{
     PendingImage, ScreenBridge, drain_images, latest_continuous_image, queue_image, screen_bridge,
 };
-pub use skills::catalog_block_for;
+pub use skills::{catalog_block_for, catalog_block_for_agent};
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
 /// Tool membership and guard flags now live in [`inventory`]: one `ToolMeta`
@@ -100,6 +100,12 @@ pub struct ToolContext {
     /// MCP tools activated by `tool_search` for this run. Large MCP catalogs
     /// are deferred: only these names are sent to the provider.
     pub active_mcp: Arc<Mutex<HashSet<String>>>,
+    /// Optional per-agent allowlist. `None` keeps the scope contract; `Some`
+    /// is enforced both when advertising tools and at dispatch time.
+    pub allowed_tools: Option<Arc<HashSet<String>>>,
+    /// Optional per-agent MCP server allowlist (`["github"]`). Tool names are
+    /// shaped `mcp__<server>__<tool>`.
+    pub mcp_servers: Option<Arc<HashSet<String>>>,
     pub code_delta: Option<Arc<dyn Fn(stark_contract::Delta) + Send + Sync>>,
 }
 
@@ -127,6 +133,8 @@ impl ToolContext {
             depth: 0,
             access: "write".to_string(),
             active_mcp: Arc::new(Mutex::new(HashSet::new())),
+            allowed_tools: None,
+            mcp_servers: None,
             code_delta: None,
         }
     }
@@ -169,6 +177,53 @@ impl ToolContext {
     pub fn with_access(mut self, access: impl Into<String>) -> Self {
         self.access = access.into();
         self
+    }
+
+    pub fn with_allowed_tools(mut self, allowed: Option<Vec<String>>) -> Self {
+        self.allowed_tools = allowed.map(|names| {
+            Arc::new(
+                names
+                    .into_iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect(),
+            )
+        });
+        self
+    }
+
+    pub fn with_mcp_servers(mut self, servers: Option<Vec<String>>) -> Self {
+        self.mcp_servers = servers.map(|names| {
+            Arc::new(
+                names
+                    .into_iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect(),
+            )
+        });
+        self
+    }
+
+    fn tool_allowed(&self, name: &str) -> bool {
+        // MCP tools are governed by the server allowlist, not the tool list:
+        // `tools: ["read"]` + `mcp: ["github"]` must still expose GitHub tools.
+        if name.starts_with("mcp__") {
+            if let Some(servers) = &self.mcp_servers {
+                let server = name
+                    .trim_start_matches("mcp__")
+                    .split("__")
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                return servers.contains(&server);
+            }
+            return true;
+        }
+        if let Some(allowed) = &self.allowed_tools
+            && !allowed.contains(&name.to_ascii_lowercase())
+        {
+            return false;
+        }
+        true
     }
 
     pub fn with_code_delta(
@@ -277,7 +332,7 @@ pub fn tool_specs_for_scope(mode: &str, scope: &str) -> Vec<Value> {
 }
 
 pub fn tool_specs_for_scope_with_access(mode: &str, scope: &str, access: &str) -> Vec<Value> {
-    tool_specs_for_run(mode, scope, access, &HashSet::new())
+    tool_specs_for_run(mode, scope, access, &HashSet::new(), None, None)
 }
 
 /// Like [`tool_specs_for_scope_with_access`] but honors MCP deferral: when a
@@ -288,9 +343,25 @@ pub fn tool_specs_for_run(
     scope: &str,
     access: &str,
     active_mcp: &HashSet<String>,
+    allowed_tools: Option<&[String]>,
+    mcp_servers: Option<&[String]>,
 ) -> Vec<Value> {
     let scope = scope.trim().to_lowercase();
     let allowed = contract().scope_map.get(&scope);
+    let agent_allowed: Option<HashSet<String>> = allowed_tools.map(|names| {
+        names
+            .iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect()
+    });
+    let mcp_allowed: Option<HashSet<String>> = mcp_servers.map(|names| {
+        names
+            .iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect()
+    });
     let read_only = access == "read";
     // New v2 surfaces (developer, coder) keep the tool catalog stable across
     // plan/build for prefix-cache reuse; writes are blocked at dispatch.
@@ -303,6 +374,9 @@ pub fn tool_specs_for_run(
             tool.exposed
                 && is_implemented(tool.name.as_str())
                 && allowed.is_none_or(|names| names.contains(&tool.name))
+                && agent_allowed
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&tool.name.to_ascii_lowercase()))
                 && !(plan_filter && is_plan_write(tool.name.as_str()))
                 && !(read_only
                     && matches!(
@@ -396,6 +470,22 @@ pub fn tool_specs_for_run(
         })
         .collect();
     let mut mcp_specs = mcp::tool_specs_for_scope(&scope);
+    if let Some(servers) = &mcp_allowed {
+        mcp_specs.retain(|spec| {
+            let name = spec
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let server = name
+                .trim_start_matches("mcp__")
+                .split("__")
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            servers.contains(&server)
+        });
+    }
     if mcp_specs.len() > MCP_EAGER_LIMIT {
         mcp_specs.retain(|spec| {
             spec.get("function")
@@ -522,6 +612,11 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
 }
 
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
+    if !ctx.tool_allowed(name) {
+        return ToolOutcome::err(format!(
+            "[BLOCKED] Tool '{name}' is not enabled for this agent. Change the agent's tools config or continue without it."
+        ));
+    }
     if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
         return ToolOutcome::err(
             "[BLOCKED] Subagents run non-interactively: the user cannot answer here. Do not ask questions. Decide with the information you have, or report the decision/blocker to your parent in your final message.",
@@ -608,6 +703,34 @@ mod tests {
             .iter()
             .filter_map(|spec| spec["function"]["name"].as_str())
             .collect()
+    }
+
+    #[test]
+    fn agent_allowlists_gate_advertised_tools_and_dispatch() {
+        let ctx =
+            context(std::path::Path::new(".")).with_allowed_tools(Some(vec!["read".to_string()]));
+        assert!(ctx.tool_allowed("read"));
+        assert!(!ctx.tool_allowed("bash"));
+        assert!(ctx.tool_allowed("mcp__github__create_issue"));
+
+        let ctx = context(std::path::Path::new("."))
+            .with_allowed_tools(Some(vec!["read".to_string()]))
+            .with_mcp_servers(Some(vec!["github".to_string()]));
+        assert!(ctx.tool_allowed("read"));
+        assert!(!ctx.tool_allowed("bash"));
+        assert!(ctx.tool_allowed("mcp__github__create_issue"));
+        assert!(!ctx.tool_allowed("mcp__sentry__list_issues"));
+
+        let specs = tool_specs_for_run(
+            "build",
+            "developer",
+            "write",
+            &HashSet::new(),
+            Some(&["read".to_string()]),
+            Some(&[]),
+        );
+        let names = tool_names(&specs);
+        assert_eq!(names, vec!["read"]);
     }
 
     #[test]

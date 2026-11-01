@@ -43,6 +43,7 @@ pub use checkpoint::{Checkpoint, RestoreReport, SnapshotGroup};
 pub use house::{HouseStore, public_device, public_state};
 pub use images::{InlineImage, collect_inline_images, is_image_mime, mime_for_ext};
 pub use inventory::{INVENTORY, is_implemented, is_plan_write, is_program, is_read_blocked};
+pub use permissions::doom_loop_gate;
 pub use stark_sandbox::{ApprovalPolicy, SandboxMode, SandboxProfile};
 
 /// Prompt line stating the requested sandbox mode and the real backend.

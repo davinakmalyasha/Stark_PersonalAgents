@@ -42,20 +42,27 @@ async fn approve_command(ctx: &ToolContext, command: &str, reason: &str) -> bool
         "question": format!("Allow this command?\n\n{command}"),
         "header": "Approval",
         "detail": reason,
-        "options": ["Approve", "Deny"],
+        "options": ["Approve", "Allow for session", "Deny"],
     });
-    match ctx.questions.ask(&ctx.chat_id, vec![question], 300).await {
-        Ok(answers) => answers.iter().any(|answer| {
-            answer
-                .get("selected")
-                .and_then(Value::as_array)
-                .is_some_and(|selected| {
-                    selected
-                        .iter()
-                        .any(|value| value.as_str() == Some("Approve"))
-                })
-        }),
-        Err(_) => false,
+    let Ok(answers) = ctx.questions.ask(&ctx.chat_id, vec![question], 300).await else {
+        return false;
+    };
+    let selected = answers.iter().find_map(|answer| {
+        answer
+            .get("selected")
+            .and_then(Value::as_array)
+            .and_then(|selected| selected.first())
+            .and_then(Value::as_str)
+    });
+    match selected {
+        Some("Approve") => true,
+        Some("Allow for session") => {
+            if let Some(tokens) = shlex::split(command) {
+                ctx.approvals.approve(&tokens);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -73,7 +80,7 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         return ToolOutcome::err("Error: bash requires a non-empty description");
     }
     let policy = stark_policy::evaluate_command(command);
-    let permission = crate::permissions::effect(ctx, "bash", &[command.to_string()]);
+    let permission = crate::permissions::effect(ctx, "bash", &[command.to_string()]).await;
     if matches!(permission, stark_policy::Effect::Deny) {
         return ToolOutcome::err(format!(
             "[BLOCKED] Command denied by permissions.json: {command}"
@@ -85,9 +92,39 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             policy.reason.unwrap_or_else(|| "forbidden".to_string())
         ));
     }
+    let auto = stark_policy::auto_approve(&ctx.harness_root);
+    // Paths outside the workspace fall under external_directory.
+    let outside = crate::permissions::external_paths(command, &ctx.workspace);
+    if !outside.is_empty() && !auto {
+        match crate::permissions::effect(ctx, "external_directory", &outside).await {
+            stark_policy::Effect::Deny => {
+                return ToolOutcome::err(format!(
+                    "[BLOCKED] external_directory denied: {}",
+                    outside.join(", ")
+                ));
+            }
+            stark_policy::Effect::Ask => {
+                if ctx.depth > 0
+                    || !approve_command(
+                        ctx,
+                        command,
+                        "This command touches paths outside the workspace.",
+                    )
+                    .await
+                {
+                    return ToolOutcome::err(format!(
+                        "[BLOCKED] external_directory requires approval: {}",
+                        outside.join(", ")
+                    ));
+                }
+            }
+            stark_policy::Effect::Allow => {}
+        }
+    }
     if (matches!(policy.decision, stark_policy::Decision::Prompt)
         || matches!(permission, stark_policy::Effect::Ask))
         && !ctx.approvals.is_approved(command)
+        && !auto
     {
         if ctx.depth > 0 {
             return ToolOutcome::err(format!(

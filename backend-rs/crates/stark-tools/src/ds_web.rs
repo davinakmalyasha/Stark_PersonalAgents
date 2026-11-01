@@ -104,10 +104,14 @@ fn strip_html(html: &str) -> String {
     text.chars().take(MAX_FETCH_CHARS).collect()
 }
 
-pub async fn web_fetch(_ctx: &ToolContext, args: &Value) -> ToolOutcome {
+pub async fn web_fetch(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(raw) = args.get("url").and_then(Value::as_str) else {
         return ToolOutcome::err("Error: web_fetch requires url");
     };
+    if let Some(blocked) = crate::permissions::gate(ctx, "webfetch", &[raw.to_string()], raw).await
+    {
+        return blocked;
+    }
     let url = match validate_public_url(raw).await {
         Ok(url) => url,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
@@ -207,19 +211,25 @@ fn search_key() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub async fn web_search(_ctx: &ToolContext, args: &Value) -> ToolOutcome {
+pub async fn web_search(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(queries) = args.get("queries").and_then(Value::as_array) else {
         return ToolOutcome::err("Error: web_search requires queries");
     };
-    let queries: Vec<&str> = queries
+    let queries: Vec<String> = queries
         .iter()
         .filter_map(Value::as_str)
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .take(4)
+        .map(str::to_string)
         .collect();
     if queries.is_empty() {
         return ToolOutcome::err("Error: web_search requires 1-4 non-empty queries");
+    }
+    if let Some(blocked) =
+        crate::permissions::gate(ctx, "websearch", &[queries.join(" | ")], "web search").await
+    {
+        return blocked;
     }
     let Some(key) = search_key() else {
         return ToolOutcome::err(

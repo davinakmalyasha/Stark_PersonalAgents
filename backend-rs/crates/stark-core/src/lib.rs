@@ -453,6 +453,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
     }
     let mut last_continuous_screen: Option<Instant> = None;
     let mut repeat_counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut doom_allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Provider-reported context usage for this turn, when the gateway returns it.
     let mut measured_tokens: Option<usize> = None;
     // One reactive compaction retry per run on a context-window rejection.
@@ -897,33 +898,43 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 } else {
                     REPEAT_WRITE_LIMIT
                 };
-                if count >= limit {
-                    let notice = format!(
-                        "[BLOCKED] {} was already called {} times with identical arguments. The previous result still applies; use it or change the approach.",
-                        call.function.name, count
-                    );
-                    messages.push(ChatMessage::tool(&call.id, &notice));
-                    let _ = ctx
-                        .store
-                        .append_session_entry_for(
-                            &ctx.workspace_id,
-                            &ctx.workspace,
-                            &ctx.chat_id,
-                            json!({
-                                "type": "message",
-                                "role": "toolResult",
-                                "tool_call_id": call.id,
-                                "tool_name": call.function.name,
-                                "is_error": true,
-                                "content": notice,
-                            }),
-                        )
-                        .await;
-                    ctx.emit_delta(
-                        Delta::tool_finished(&call.function.name, &args_text, false, 0, &notice)
+                if count >= limit && !doom_allowed.contains(&call.function.name) {
+                    // The doom_loop rule decides: deny blocks, ask prompts, allow
+                    // lets the repeat through for the rest of this run.
+                    if let Some(blocked) =
+                        stark_tools::doom_loop_gate(&tools, &call.function.name).await
+                    {
+                        let notice = blocked.content;
+                        messages.push(ChatMessage::tool(&call.id, &notice));
+                        let _ = ctx
+                            .store
+                            .append_session_entry_for(
+                                &ctx.workspace_id,
+                                &ctx.workspace,
+                                &ctx.chat_id,
+                                json!({
+                                    "type": "message",
+                                    "role": "toolResult",
+                                    "tool_call_id": call.id,
+                                    "tool_name": call.function.name,
+                                    "is_error": true,
+                                    "content": notice,
+                                }),
+                            )
+                            .await;
+                        ctx.emit_delta(
+                            Delta::tool_finished(
+                                &call.function.name,
+                                &args_text,
+                                false,
+                                0,
+                                &notice,
+                            )
                             .with_agent(agent_label.clone()),
-                    );
-                    continue;
+                        );
+                        continue;
+                    }
+                    doom_allowed.insert(call.function.name.clone());
                 }
             }
 

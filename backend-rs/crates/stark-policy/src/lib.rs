@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 pub use decision::Decision;
 pub use error::{Error, ErrorLocation, Result, TextPosition, TextRange};
 pub use parser::PolicyParser;
-pub use permissions::{Effect, PermissionSet, Rule as PermissionRule};
+pub use permissions::{Effect, PermissionSet, Rule as PermissionRule, auto_approve};
 pub use policy::{Evaluation, MatchOptions, Policy, RequirementsExecPolicy};
 pub use read_only::{check_read_only, is_read_only_command};
 pub use rule::{PatternToken, PrefixPattern, PrefixRule, Rule, RuleMatch, RuleRef};

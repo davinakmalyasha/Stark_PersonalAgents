@@ -2,8 +2,7 @@
 
 Stark's safety layer is an OpenCode-style permission engine. It runs **before**
 a tool executes: `deny` blocks the call, `ask` prompts you, `allow` runs it.
-
-No OS sandbox, no admin setup. Enforcement is in the tool path, not the prompt.
+No OS sandbox and no admin setup — enforcement is in the tool path.
 
 ## Configuration
 
@@ -11,61 +10,70 @@ No OS sandbox, no admin setup. Enforcement is in the tool path, not the prompt.
 
 ```json
 {
+  "auto_approve": false,
   "permissions": [
     { "action": "bash", "resource": "*", "effect": "ask" },
     { "action": "bash", "resource": "git *", "effect": "allow" },
     { "action": "bash", "resource": "npm *", "effect": "allow" },
     { "action": "bash", "resource": "rm *", "effect": "deny" },
 
-    { "action": "edit", "resource": "*", "effect": "allow" },
-    { "action": "edit", "resource": "secrets/*", "effect": "deny" },
-
     { "action": "read", "resource": "*.env", "effect": "ask" },
-    { "action": "glob", "resource": "*", "effect": "allow" },
-    { "action": "grep", "resource": "*", "effect": "allow" },
+    { "action": "webfetch", "resource": "*", "effect": "allow" },
+    { "action": "websearch", "resource": "*", "effect": "allow" },
 
+    { "action": "external_directory", "resource": "*", "effect": "ask" },
     { "action": "doom_loop", "resource": "*", "effect": "ask" }
-  ]
+  ],
+  "agents": {
+    "explore": {
+      "permissions": [{ "action": "edit", "resource": "*", "effect": "deny" }]
+    }
+  }
 }
 ```
 
-## Semantics (copied from OpenCode)
+## Semantics
 
-- **Last matching rule wins.** Put the catch-all first, specifics after.
-- An operation that touches several resources: **any deny wins**, otherwise
-  **any ask**, otherwise allow.
+- **Last matching rule wins.** Catch-all first, specifics after.
+- Multiple resources in one operation: **any deny wins**, then any ask.
 - Wildcards: `*` matches any run (within one path segment for path actions),
-  `**` crosses directories, `?` matches one character.
-- `~` / `$HOME` expand to your home directory.
+  `**` crosses directories, `?` one character.
+- `~` / `$HOME` expand to the home directory.
+- Agent rules are appended after global rules, so they win on overlap.
 
 ## Actions
 
 | Action | Resource | Wired |
 |---|---|---|
-| `bash` | the command string | ✅ `bash` tool |
-| `read` | file path (relative to workspace) | ✅ `read` |
-| `edit` | file path (write/edit) | ✅ `write`, `edit` |
-| `glob` | glob pattern | ✅ |
-| `grep` | search pattern | ✅ |
-| `doom_loop` | tool name | ⚠️ repeat guard reports it, not yet routed through rules |
-| `external_directory` | absolute path | ⚠️ file tools already refuse paths outside the workspace |
-| `webfetch` / `websearch` | URL / query | ⚠️ not gated yet |
+| `bash` | command string | ✅ |
+| `read` | file path | ✅ |
+| `edit` | file path (write/edit) | ✅ |
+| `glob` / `grep` | pattern | ✅ |
+| `webfetch` | URL | ✅ |
+| `websearch` | queries | ✅ |
+| `doom_loop` | tool name | ✅ (same tool + args at the repeat limit) |
+| `external_directory` | absolute path | ✅ for shell paths outside the workspace |
 
-## Defaults (no config file)
+## Ask outcomes
 
-- Everything is **allow**.
-- `external_directory` and `doom_loop` are **ask**.
-- `.env` and `.env.*` reads are **ask** (`.env.example` is allowed).
+`Allow once`, `Allow for session` (saved for the run), `Deny`.
+Subagents are non-interactive: `ask` becomes a hard block.
 
-## Subagents
+## Auto mode
 
-Subagents are non-interactive: an `ask` result is a hard block for them. They
-never silently inherit an approval.
+`STARK_AUTO_APPROVE=1` (or `"auto_approve": true`) turns asks into allows.
+Explicit `deny` rules always win.
+
+## Defaults without a config file
+
+- Everything **allow**.
+- `.env` / `.env.*` reads **ask** (`.env.example` allowed).
+- `external_directory` and `doom_loop` **ask**.
 
 ## Evidence
 
-- `stark-policy/src/permissions.rs` — evaluator + tests (last-match, deny-wins,
-  defaults, wildcards).
-- `stark-tools/src/permissions.rs` — gate wired into `bash`, `read`, `write`,
-  `edit`, `glob`, `grep`.
-- A denied call never spawns: the gate returns before the process layer.
+- `stark-policy/src/permissions.rs` — evaluator, agent merge, auto-approve,
+  tests (last-match, deny-wins, defaults, wildcards, disk merge).
+- `stark-tools/src/permissions.rs` — gate (session allow, ask outcomes, auto).
+- Canary test `denied_bash_never_spawns`: a denied command with a redirect
+  leaves no file, proving the process layer is never reached.

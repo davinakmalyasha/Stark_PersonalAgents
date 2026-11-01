@@ -6,7 +6,6 @@
 //! `external_directory` and `doom_loop` ask, and `.env` reads ask.
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -48,8 +47,6 @@ pub struct PermissionSet {
     rules: Vec<Rule>,
 }
 
-static DEFAULT_SET: OnceLock<PermissionSet> = OnceLock::new();
-
 impl PermissionSet {
     pub fn from_json(value: &Value) -> Self {
         let mut rules = Vec::new();
@@ -77,20 +74,40 @@ impl PermissionSet {
     }
 
     /// Load `.deep_agents/permissions.json` under the harness root. Missing or
-    /// invalid files fall back to the empty (default) set.
+    /// invalid files fall back to the default (empty) set.
     pub fn load(harness_root: &Path) -> Self {
-        let path = harness_root.join(".deep_agents").join("permissions.json");
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return DEFAULT_SET
-                .get_or_init(|| Self::from_json(&Value::Null))
-                .clone();
+        Self::read(harness_root)
+            .map(|value| Self::from_json(&value))
+            .unwrap_or_default()
+    }
+
+    /// Load global rules and append the matching agent's rules, so agent rules
+    /// win where they overlap (OpenCode merge order).
+    pub fn load_for(harness_root: &Path, scope: &str) -> Self {
+        let Some(value) = Self::read(harness_root) else {
+            return Self::default();
         };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(value) => Self::from_json(&value),
-            Err(_) => DEFAULT_SET
-                .get_or_init(|| Self::from_json(&Value::Null))
-                .clone(),
+        let mut set = Self::from_json(&value);
+        let scope = scope.to_ascii_lowercase();
+        if let Some(agents) = value.get("agents").and_then(Value::as_object) {
+            let mut append = |agent: &Value| {
+                let extra = Self::from_json(agent);
+                set.rules.extend(extra.rules);
+            };
+            if let Some(agent) = agents.get(&scope) {
+                append(agent);
+            }
+            if let Some(agent) = agents.get("*") {
+                append(agent);
+            }
         }
+        set
+    }
+
+    fn read(harness_root: &Path) -> Option<Value> {
+        let path = harness_root.join(".deep_agents").join("permissions.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<Value>(&text).ok()
     }
 
     /// Evaluate one operation over all its resources.
@@ -124,6 +141,19 @@ impl PermissionSet {
     }
 }
 
+/// Auto-approve asks (never denies), unless the user opted out.
+pub fn auto_approve(harness_root: &Path) -> bool {
+    if let Ok(value) = std::env::var("STARK_AUTO_APPROVE") {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    PermissionSet::read(harness_root)
+        .and_then(|value| value.get("auto_approve").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn default_effect(action: &str, resource: &str) -> Effect {
     match action {
         "external_directory" | "doom_loop" => Effect::Ask,
@@ -150,6 +180,10 @@ fn action_matches(pattern: &str, action: &str) -> bool {
 }
 
 fn resource_matches(pattern: &str, resource: &str, action: &str) -> bool {
+    // A bare `*` is the universal catch-all, even for paths with separators.
+    if pattern == "*" {
+        return true;
+    }
     let pattern = expand_home(pattern);
     let resource = expand_home(resource);
     // Commands are whole strings; paths use glob semantics (`*` stays within a
@@ -267,6 +301,60 @@ mod tests {
             set.evaluate("read", &[".env.example".to_string()]),
             Effect::Allow
         );
+    }
+
+    #[test]
+    fn agent_rules_override_global() {
+        let value = json!({
+            "permissions": [
+                {"action": "edit", "resource": "*", "effect": "allow"}
+            ],
+            "agents": {
+                "explore": {
+                    "permissions": [
+                        {"action": "edit", "resource": "*", "effect": "deny"}
+                    ]
+                }
+            }
+        });
+        let global = PermissionSet::from_json(&value);
+        assert_eq!(
+            global.evaluate("edit", &["src/main.rs".to_string()]),
+            Effect::Allow
+        );
+        let mut merged = PermissionSet::from_json(&value);
+        let agent = value["agents"]["explore"].clone();
+        merged.rules.extend(PermissionSet::from_json(&agent).rules);
+        assert_eq!(
+            merged.evaluate("edit", &["src/main.rs".to_string()]),
+            Effect::Deny
+        );
+    }
+
+    #[test]
+    fn load_for_merges_agent_rules_from_disk() {
+        let dir = std::env::temp_dir().join(format!("stark-perm-{}", std::process::id()));
+        let agents = dir.join(".deep_agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("permissions.json"),
+            r#"{
+                "permissions": [{"action":"edit","resource":"*","effect":"allow"}],
+                "agents": {"explore": {"permissions": [{"action":"edit","resource":"*","effect":"deny"}]}}
+            }"#,
+        )
+        .unwrap();
+        let global = PermissionSet::load(&dir);
+        assert_eq!(
+            global.evaluate("edit", &["src/main.rs".to_string()]),
+            Effect::Allow
+        );
+        let explore = PermissionSet::load_for(&dir, "explore");
+        assert_eq!(
+            explore.evaluate("edit", &["src/main.rs".to_string()]),
+            Effect::Deny
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

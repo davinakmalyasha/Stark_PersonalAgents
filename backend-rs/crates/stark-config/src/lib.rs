@@ -375,7 +375,10 @@ impl ProvidersFile {
             return Err(ConfigError::UnknownProvider(provider_id.to_string()));
         };
         let requested = requested.trim();
-        if requested.is_empty() {
+        if requested.is_empty()
+            || requested.eq_ignore_ascii_case("Automatic Fallback")
+            || requested.eq_ignore_ascii_case("auto")
+        {
             return self.default_model(provider_id, provider);
         }
         if let Some((key, model)) = provider
@@ -1130,6 +1133,7 @@ fn validate_agent(providers: &ProvidersFile, agent: &AgentFile) -> Result<(), Co
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| !value.eq_ignore_ascii_case("Automatic Fallback"))
     {
         let provider_id = agent
             .provider
@@ -1195,6 +1199,22 @@ mod tests {
         let (key, id) = providers.resolve_model("opencode", "flash").unwrap();
         assert_eq!(key, "flash");
         assert_eq!(id, "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn automatic_fallback_inherits_the_tier_default() {
+        let providers = ProvidersFile::builtin();
+        let (key, id) = providers
+            .resolve_model("opencode", "Automatic Fallback")
+            .unwrap();
+        assert_eq!(key, "flash");
+        assert_eq!(id, "deepseek-v4.1-flash");
+        assert_eq!(
+            providers
+                .resolve_model("opencode", "automatic fallback")
+                .unwrap(),
+            ("flash".to_string(), "deepseek-v4.1-flash".to_string())
+        );
     }
 
     #[test]

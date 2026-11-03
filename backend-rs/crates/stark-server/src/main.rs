@@ -2947,9 +2947,15 @@ async fn migration_import_handler(
     State(state): State<ServerState>,
     Json(request): Json<MigrationImportRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source_id = request.source.trim().to_ascii_lowercase();
+    let source_raw = request.source.trim();
+    if source_raw.is_empty() {
+        return Err(bad_request("pick a migration source"));
+    }
+    // Either a known candidate id or an explicit folder path (e.g. a repo
+    // root that currently holds the harness data). Paths are validated: they
+    // must exist, contain `.deep_agents`, and differ from the active root.
     let status = migration_status_handler(State(state.clone())).await;
-    let candidate = status
+    let mut source = status
         .get("candidates")
         .and_then(serde_json::Value::as_array)
         .and_then(|candidates| {
@@ -2957,25 +2963,31 @@ async fn migration_import_handler(
                 candidate
                     .get("id")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| id.eq_ignore_ascii_case(&source_id))
+                    .is_some_and(|id| id.eq_ignore_ascii_case(source_raw))
             })
         })
-        .cloned()
-        .ok_or_else(|| bad_request(format!("unknown migration source '{source_id}'")))?;
-    if candidate
-        .get("active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
-    {
+        .and_then(|candidate| {
+            candidate
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        });
+    if source.is_none() {
+        let candidate = PathBuf::from(source_raw);
+        if candidate.is_absolute() && candidate.join(".deep_agents").is_dir() {
+            source = Some(candidate);
+        }
+    }
+    let Some(source) = source else {
+        return Err(bad_request(format!(
+            "unknown migration source '{source_raw}' (use a listed id or a folder containing .deep_agents)"
+        )));
+    };
+    if same_path(&source, &state.harness_root) {
         return Err(bad_request(
             "that source is already the active harness root",
         ));
     }
-    let source = candidate
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| bad_request("migration source has no path"))?;
     let deep = |name: &str| {
         (
             source.join(".deep_agents").join(name),

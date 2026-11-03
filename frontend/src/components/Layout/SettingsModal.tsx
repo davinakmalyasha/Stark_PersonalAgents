@@ -83,6 +83,23 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
+  const importFromFolder = async () => {
+    setBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      const folder = await pickFolder();
+      if (!folder) return;
+      const result = await importMigration(folder);
+      setStatus(`${result.message} Copied: ${result.copied.join(', ')}.`);
+      await load();
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : 'Migration failed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (!isOpen) return null;
 
   const rowClass = 'flex items-start justify-between gap-3 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2';
@@ -212,6 +229,14 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             {!candidates.filter((candidate) => !candidate.active).length && (
               <div className="text-[11px] text-zinc-500">No other harness roots with data were found.</div>
             )}
+            <button
+              type="button"
+              onClick={() => void importFromFolder()}
+              disabled={busy}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+            >
+              <FolderOpen size={14} /> Import from a folder…
+            </button>
           </section>
 
           {error && <div className="text-[11px] text-red-300">{error}</div>}

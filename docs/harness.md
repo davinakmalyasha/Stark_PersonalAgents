@@ -42,7 +42,9 @@ workspaces, with a folder picker to move the harness root (restart to apply).
 
 Settings → Migration lists old roots (AppData, repo) holding chats/sessions/
 config. Import copies them into the active root after backing the active files
-up to `.bak`. Nothing merges automatically.
+up to `.bak`. Nothing merges automatically. A folder picker also allows
+importing from any explicit path containing `.deep_agents` (e.g. a repo that
+currently holds the live harness data).
 
 ## Endpoints
 

@@ -362,7 +362,6 @@ fn default_temperature() -> f64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
     let _ = tracing_log::LogTracer::init();
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
@@ -372,9 +371,26 @@ async fn main() -> anyhow::Result<()> {
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    let harness_root = std::env::var("STARK_HARNESS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // Fail-closed: the launcher always sets STARK_HARNESS_ROOT (persisted
+    // `D:\StarkData` by default). Falling back to the launch cwd would silently
+    // mix workspaces with harness data and read the wrong `.env`.
+    let harness_root = match std::env::var("STARK_HARNESS_ROOT") {
+        Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw.trim()),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "STARK_HARNESS_ROOT is not set. Launch via the Stark desktop app (it sets the persisted harness root) or set it explicitly."
+            ));
+        }
+    };
+    std::fs::create_dir_all(&harness_root).map_err(|error| {
+        anyhow::anyhow!(
+            "harness root {} unavailable: {error}. Pick a writable folder.",
+            harness_root.display()
+        )
+    })?;
+    // Keys come ONLY from <harness_root>/.env. Never load the process cwd
+    // .env: that file belongs to a workspace the agent can edit, and must
+    // never supply provider keys.
     let app_env = harness_root.join(".env");
     if app_env.is_file() {
         let _ = dotenvy::from_path(&app_env);
@@ -466,6 +482,21 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         mcp_manager.start_all().await;
     });
+    // Daily chats.db backup (plus one at startup). Best-effort.
+    {
+        let backup_store = state.store.clone();
+        tokio::spawn(async move {
+            if let Err(error) = backup_store.backup_database().await {
+                tracing::warn!("startup chats.db backup failed: {error}");
+            }
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                if let Err(error) = backup_store.backup_database().await {
+                    tracing::warn!("daily chats.db backup failed: {error}");
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/api/run", post(run_handler))
@@ -526,6 +557,9 @@ async fn main() -> anyhow::Result<()> {
             get(ui_state_handler).put(save_ui_state_handler),
         )
         .route("/api/session/reset", post(session_reset_handler))
+        .route("/api/harness", get(harness_handler))
+        .route("/api/migration/status", get(migration_status_handler))
+        .route("/api/migration/import", post(migration_import_handler))
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/subagents",
             get(subagents_handler),
@@ -2831,6 +2865,182 @@ async fn delete_agent_handler(
         "key": spec.key,
         "effective": effective,
     })))
+}
+
+/// Harness locations for Settings. Never includes secrets.
+async fn harness_handler(State(state): State<ServerState>) -> Json<Value> {
+    let exe = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Json(json!({
+        "harness_root": state.harness_root.to_string_lossy(),
+        "install_path": exe,
+        "workspaces": state.registry.list(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationImportRequest {
+    source: String,
+}
+
+fn migration_candidate(label: &str, root: PathBuf, active: &std::path::Path) -> Value {
+    let chats = root.join(".deep_agents").join("chats.db");
+    let sessions = root.join(".deep_agents").join("sessions");
+    let config_dir = root.join(".deep_agents").join("config");
+    let is_active = same_path(&root, active);
+    json!({
+        "id": label,
+        "path": root.to_string_lossy(),
+        "active": is_active,
+        "has_chats_db": chats.is_file(),
+        "has_sessions": sessions.is_dir(),
+        "has_config": config_dir.is_dir(),
+    })
+}
+
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let normalize = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .map(|path| path.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|_| p.to_string_lossy().to_ascii_lowercase())
+    };
+    normalize(left) == normalize(right)
+}
+
+/// One-time import sources. Never merged automatically; the user picks a
+/// source in Settings and this copies it over the active harness root after
+/// backing the active files up to `.bak`.
+async fn migration_status_handler(State(state): State<ServerState>) -> Json<Value> {
+    let active = state.harness_root.clone();
+    let mut candidates = Vec::new();
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Users\Public"));
+        candidates.push(migration_candidate(
+            "appdata",
+            appdata.join("com.stark.workspace"),
+            &active,
+        ));
+    }
+    // Repo root heuristic: only listed when it actually holds harness data.
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in [cwd.clone()]
+            .into_iter()
+            .chain(cwd.ancestors().map(PathBuf::from))
+            .take(4)
+        {
+            if ancestor.join("backend-rs").join("Cargo.toml").exists()
+                && !same_path(&ancestor, &active)
+            {
+                candidates.push(migration_candidate("repo", ancestor, &active));
+                break;
+            }
+        }
+    }
+    Json(json!({ "active": active.to_string_lossy(), "candidates": candidates }))
+}
+
+async fn migration_import_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<MigrationImportRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source_id = request.source.trim().to_ascii_lowercase();
+    let status = migration_status_handler(State(state.clone())).await;
+    let candidate = status
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|candidates| {
+            candidates.iter().find(|candidate| {
+                candidate
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&source_id))
+            })
+        })
+        .cloned()
+        .ok_or_else(|| bad_request(format!("unknown migration source '{source_id}'")))?;
+    if candidate
+        .get("active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        return Err(bad_request(
+            "that source is already the active harness root",
+        ));
+    }
+    let source = candidate
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| bad_request("migration source has no path"))?;
+    let deep = |name: &str| {
+        (
+            source.join(".deep_agents").join(name),
+            state.harness_root.join(".deep_agents").join(name),
+        )
+    };
+    let mut copied: Vec<String> = Vec::new();
+    for name in ["chats.db", "sessions", "config", "workspaces.json"] {
+        let (from, to) = deep(name);
+        if !from.exists() {
+            continue;
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| bad_request(format!("cannot create harness dir: {error}")))?;
+        }
+        if to.exists() {
+            let backup = to.with_extension(format!(
+                "{}.bak",
+                to.extension().and_then(|ext| ext.to_str()).unwrap_or("db")
+            ));
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::remove_dir_all(&backup);
+            if std::fs::rename(&to, &backup).is_err() {
+                let _ = std::fs::copy(&to, &backup);
+            }
+        }
+        let outcome = if from.is_dir() {
+            copy_dir_all(&from, &to).map_err(bad_request)
+        } else {
+            std::fs::copy(&from, &to)
+                .map(|_| ())
+                .map_err(|error| bad_request(format!("cannot copy {name}: {error}")))
+        };
+        outcome?;
+        copied.push(name.to_string());
+    }
+    if copied.is_empty() {
+        return Err(bad_request(
+            "nothing to import: source has no chats, sessions, or config",
+        ));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "source": source.to_string_lossy(),
+        "copied": copied,
+        "message": "Imported. Restart the app to use the migrated data.",
+    })))
+}
+
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|error| format!("cannot create dir: {error}"))?;
+    for entry in std::fs::read_dir(from).map_err(|error| format!("cannot list dir: {error}"))? {
+        let entry = entry.map_err(|error| format!("cannot read entry: {error}"))?;
+        let dest = to.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("cannot stat: {error}"))?;
+        if kind.is_dir() {
+            copy_dir_all(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest).map_err(|error| format!("cannot copy: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 const VIRTUAL_WORKSPACES: [(&str, &str, &str, &str); 4] = [

@@ -943,8 +943,7 @@ impl ConfigStore {
         std::fs::create_dir_all(&dir).map_err(|error| ConfigError::Io(error.to_string()))?;
         let text = serde_json::to_string_pretty(&agent)
             .map_err(|error| ConfigError::Parse(error.to_string()))?;
-        std::fs::write(dir.join(format!("{key}.json")), text)
-            .map_err(|error| ConfigError::Io(error.to_string()))?;
+        atomic_write_json(&dir.join(format!("{key}.json")), &text)?;
         self.reload();
         Ok(())
     }
@@ -957,7 +956,11 @@ impl ConfigStore {
             .join("config")
             .join("agents")
             .join(format!("{key}.json"));
-        match std::fs::remove_file(path) {
+        if path.is_file() {
+            let backup = path.with_extension("json.bak");
+            let _ = std::fs::copy(&path, &backup);
+        }
+        match std::fs::remove_file(&path) {
             Ok(()) => {
                 self.reload();
                 Ok(())
@@ -976,8 +979,7 @@ impl ConfigStore {
             .map_or(Ok(()), |error| Err(ConfigError::Parse(error)))?;
         let text = serde_json::to_string_pretty(file)
             .map_err(|error| ConfigError::Parse(error.to_string()))?;
-        std::fs::write(dir.join("providers.json"), text)
-            .map_err(|error| ConfigError::Io(error.to_string()))?;
+        atomic_write_json(&dir.join("providers.json"), &text)?;
         self.reload();
         Ok(())
     }
@@ -1003,6 +1005,42 @@ impl ConfigStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+/// Atomic JSON write: temp file in the same directory + rename, keeping a
+/// `.bak` of the previous version. A crash mid-write can never leave a
+/// half-written config.
+fn atomic_write_json(path: &Path, text: &str) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| ConfigError::Io(error.to_string()))?;
+    }
+    if path.is_file() {
+        let backup = path.with_extension("json.bak");
+        // Best-effort: a missing backup must not block the save.
+        let _ = std::fs::copy(path, &backup);
+    }
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, text).map_err(|error| ConfigError::Io(error.to_string()))?;
+    std::fs::rename(&temp, path).map_err(|error| ConfigError::Io(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_keeps_backup_of_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        atomic_write_json(&path, "{\"a\":1}").unwrap();
+        atomic_write_json(&path, "{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            "{\"a\":1}"
+        );
     }
 }
 

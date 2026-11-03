@@ -44,6 +44,16 @@ pub fn select_folder(app: AppHandle) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+pub fn harness_info(app: AppHandle) -> Value {
+    crate::backend::harness_info(&app)
+}
+
+#[tauri::command]
+pub fn set_harness_root(app: AppHandle, path: String) -> Result<String, String> {
+    crate::backend::set_harness_root(&app, &path)
+}
+
 fn projects_root() -> PathBuf {
     std::env::var("STARK_PROJECTS_ROOT")
         .map(PathBuf::from)

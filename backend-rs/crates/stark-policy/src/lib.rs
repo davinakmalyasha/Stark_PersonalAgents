@@ -39,6 +39,8 @@ prefix_rule(pattern = ["rm", "-rf", "/"], decision = "forbidden", justification 
 prefix_rule(pattern = ["rm", "-fr", "/"], decision = "forbidden", justification = "filesystem-root deletion")
 prefix_rule(pattern = ["rm", "-rf", "~"], decision = "forbidden", justification = "home-directory deletion")
 prefix_rule(pattern = ["rm", "-rf", "C:\\"], decision = "forbidden", justification = "system-drive deletion")
+prefix_rule(pattern = ["env"], decision = "forbidden", justification = "secret exfiltration: process environment may hold provider keys")
+prefix_rule(pattern = ["printenv"], decision = "forbidden", justification = "secret exfiltration: process environment may hold provider keys")
 "#;
 
 static DEFAULT_POLICY: OnceLock<Policy> = OnceLock::new();
@@ -79,6 +81,18 @@ pub fn evaluate_command(command: &str) -> PolicyDecision {
 
 fn heuristics_decision(tokens: &[String]) -> Decision {
     let normalized = tokens.join(" ").to_lowercase();
+    // Secret exfiltration: environment dumps and direct .env reads are denied
+    // at the policy layer, not just in the read tool. `.env.example` stays
+    // allowed (it is a template, not a secret).
+    if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("set") {
+        return Decision::Forbidden;
+    }
+    if normalized == "export -p" || normalized.starts_with("export -p ") {
+        return Decision::Forbidden;
+    }
+    if normalized.contains(".env") && !normalized.contains(".env.example") {
+        return Decision::Forbidden;
+    }
     if normalized.contains("rm -rf /")
         || normalized.contains("rm -fr /")
         || normalized.contains("rm -rf ~")
@@ -127,5 +141,32 @@ mod tests {
     #[test]
     fn policy_prompts_for_publish() {
         assert_eq!(evaluate_command("npm publish").decision, Decision::Prompt);
+    }
+
+    #[test]
+    fn policy_denies_secret_exfiltration() {
+        assert_eq!(evaluate_command("env").decision, Decision::Forbidden);
+        assert_eq!(
+            evaluate_command("env | grep KEY").decision,
+            Decision::Forbidden
+        );
+        assert_eq!(evaluate_command("printenv").decision, Decision::Forbidden);
+        assert_eq!(
+            evaluate_command("printenv OPENCODE_API_KEY").decision,
+            Decision::Forbidden
+        );
+        assert_eq!(evaluate_command("set").decision, Decision::Forbidden);
+        assert_eq!(evaluate_command("export -p").decision, Decision::Forbidden);
+        assert_eq!(evaluate_command("cat .env").decision, Decision::Forbidden);
+        assert_eq!(
+            evaluate_command("cat D:\\StarkData\\.env").decision,
+            Decision::Forbidden
+        );
+        // Templates stay allowed.
+        assert_ne!(
+            evaluate_command("cat .env.example").decision,
+            Decision::Forbidden
+        );
+        assert_eq!(evaluate_command("ls -la").decision, Decision::Allow);
     }
 }

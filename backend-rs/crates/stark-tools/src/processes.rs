@@ -326,6 +326,11 @@ impl ProcessManager {
         for (key, value) in stark_sandbox::for_workspace(workdir).env() {
             builder.env(key, value);
         }
+        // PTY builders inherit the parent env via get_base_env: strip secrets
+        // explicitly since there is no wrap_tokio_command equivalent here.
+        for name in stark_sandbox::secrets::secret_var_names() {
+            builder.env_remove(name);
+        }
 
         let child = pair
             .slave

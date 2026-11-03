@@ -151,6 +151,8 @@ async fn raw_command(args: &[&str], timeout: Duration) -> String {
     let mut command = browser_command();
     command.args(args);
     command.kill_on_drop(true);
+    // Browser automation never needs provider keys.
+    stark_sandbox::secrets::scrub_tokio_command(&mut command);
     match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();

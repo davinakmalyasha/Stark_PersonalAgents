@@ -52,7 +52,14 @@ impl WorkspaceRegistry {
         }
         let text = serde_json::to_string_pretty(registry)
             .map_err(|error| format!("failed to serialize workspace registry: {error}"))?;
-        std::fs::write(&path, text)
+        // Atomic: temp + rename with a .bak of the previous registry.
+        if path.is_file() {
+            let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+        }
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, text)
+            .map_err(|error| format!("failed to write workspace registry: {error}"))?;
+        std::fs::rename(&temp, &path)
             .map_err(|error| format!("failed to write workspace registry: {error}"))
     }
 

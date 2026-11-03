@@ -215,6 +215,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::ping,
             commands::runtime_info,
+            commands::harness_info,
+            commands::set_harness_root,
             commands::pairing_base,
             commands::select_folder,
             commands::reveal_path,

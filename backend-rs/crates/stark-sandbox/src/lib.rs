@@ -14,6 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod secrets;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
     ReadOnly,
@@ -139,16 +141,19 @@ impl SandboxProfile {
     }
 
     /// Apply the sandbox hook to a std process. Every spawn path must call
-    /// this; a spawn that skips it escapes the policy.
+    /// this; a spawn that skips it escapes the policy. Secrets are scrubbed
+    /// first so children never inherit provider keys.
     pub fn wrap_command(&self, command: &mut Command) {
+        secrets::scrub_command(command);
         for (key, value) in self.env() {
             command.env(key, value);
         }
         backend::wrap(command, self);
     }
 
-    /// Tokio variant used by the process manager.
+    /// Tokio variant used by the process manager. Also scrubs secrets.
     pub fn wrap_tokio_command(&self, command: &mut tokio::process::Command) {
+        secrets::scrub_tokio_command(command);
         for (key, value) in self.env() {
             command.env(key, value);
         }

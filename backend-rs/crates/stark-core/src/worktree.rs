@@ -27,7 +27,9 @@ pub struct WorktreeInfo {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    stark_sandbox::secrets::scrub_command(&mut command);
+    let output = command
         .arg("-C")
         .arg(root)
         .args(args)

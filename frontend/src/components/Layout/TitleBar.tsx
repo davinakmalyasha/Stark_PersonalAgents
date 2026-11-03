@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Smartphone, X } from 'lucide-react';
+import { Smartphone, Settings, X } from 'lucide-react';
 import PairingModal from './PairingModal';
 import WindowControls from './WindowControls';
 import { apiUrl } from '../../services/api';
@@ -19,6 +19,7 @@ interface TitleBarProps {
   onActivateTab?: (wsId: string, chatId: string) => void;
   onCloseTab?: (wsId: string, chatId: string) => void;
   onDropTab?: (data: string) => void;
+  onOpenSettings?: () => void;
 }
 
 function wsColor(name: string): string {
@@ -28,7 +29,7 @@ function wsColor(name: string): string {
   return colors[hash % colors.length];
 }
 
-export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseTab, onDropTab }: TitleBarProps) {
+export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseTab, onDropTab, onOpenSettings }: TitleBarProps) {
   const [pairingOpen, setPairingOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [liveChatIds, setLiveChatIds] = useState<Set<string>>(new Set());
@@ -131,6 +132,17 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
         <Smartphone size={13} />
         Phone
       </button>
+      {onOpenSettings && (
+        <button
+          onClick={onOpenSettings}
+          title="Settings — app, harness data, migration"
+          aria-label="Open settings"
+          className="grid place-items-center w-7 h-7 rounded-md text-zinc-500 hover:bg-zinc-800/70 hover:text-zinc-300 transition-colors shrink-0"
+          style={{ WebkitAppRegion: 'no-drag' } as AppRegionStyle}
+        >
+          <Settings size={14} />
+        </button>
+      )}
       <WindowControls />
       <PairingModal open={pairingOpen} onClose={() => setPairingOpen(false)} />
     </header>

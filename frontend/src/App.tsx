@@ -6,6 +6,7 @@ import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
 import TokenStatsModal from './components/Layout/TokenStatsModal';
 import AgentConfigModal from './components/Layout/AgentConfigModal';
+import SettingsModal from './components/Layout/SettingsModal';
 import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 const DesignWorkspace = lazy(() => import('./modules/design-workspace/DesignWorkspace'));
@@ -45,6 +46,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [isTokenStatsOpen, setIsTokenStatsOpen] = useState(false);
   const [isAgentConfigOpen, setIsAgentConfigOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const [model, setModel] = useState('Automatic Fallback');
   const [temperature] = useState(0.7);
@@ -900,6 +902,7 @@ export default function App() {
         onActivateTab={handleCwActivate}
         onCloseTab={handleCwClose}
         onDropTab={handleCwDrop}
+        onOpenSettings={() => setIsSettingsOpen(true)}
       />
       <div className="app-shell flex flex-1 min-h-0" style={{ backgroundColor: '#0c0c0e' }}>
         <Sidebar
@@ -959,6 +962,10 @@ export default function App() {
       <AgentConfigModal
         isOpen={isAgentConfigOpen}
         onClose={() => setIsAgentConfigOpen(false)}
+      />
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
       />
       {showShortcuts && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowShortcuts(false)}>          <div className="modal-panel-enter w-full max-w-sm rounded-2xl border border-zinc-800 bg-[#141417] shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>

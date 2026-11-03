@@ -242,6 +242,68 @@ export async function deleteAgentConfig(key: string): Promise<void> {
   }
 }
 
+export interface HarnessInfo {
+  harness_root: string;
+  install_path: string;
+  error?: string | null;
+  workspaces?: Array<{ id: string; name: string; path: string }>;
+}
+
+export interface MigrationCandidate {
+  id: string;
+  path: string;
+  active: boolean;
+  has_chats_db: boolean;
+  has_sessions: boolean;
+  has_config: boolean;
+}
+
+export async function fetchHarness(): Promise<HarnessInfo> {
+  const res = await fetchWithRetry(`${API_BASE}/harness`);
+  if (!res.ok) throw new Error(`Could not load harness info (HTTP ${res.status})`);
+  return res.json();
+}
+
+export async function fetchMigrationStatus(): Promise<{ active: string; candidates: MigrationCandidate[] }> {
+  const res = await fetchWithRetry(`${API_BASE}/migration/status`);
+  if (!res.ok) throw new Error(`Could not load migration status (HTTP ${res.status})`);
+  return res.json();
+}
+
+export async function importMigration(source: string): Promise<{ ok: boolean; copied: string[]; message: string }> {
+  const res = await fetch(`${API_BASE}/migration/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || 'Migration failed');
+  return data;
+}
+
+export function invokeDesktop<T>(name: string, args?: Record<string, unknown>): Promise<T> {
+  const invoke = (window as unknown as { __TAURI__?: { core?: { invoke?: (name: string, args?: unknown) => Promise<T> } } }).__TAURI__?.core?.invoke;
+  if (!invoke) return Promise.reject(new Error('Desktop bridge unavailable'));
+  return invoke(name, args);
+}
+
+export async function fetchDesktopHarness(): Promise<{ harness_root: string; install_path: string; default_root: string; dev: boolean; error?: string | null }> {
+  return invokeDesktop('harness_info');
+}
+
+export async function setDesktopHarnessRoot(path: string): Promise<string> {
+  return invokeDesktop('set_harness_root', { path });
+}
+
+export async function pickFolder(): Promise<string | null> {
+  try {
+    const result = await invokeDesktop<string | null>('select_folder');
+    return result ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function resetSession(): Promise<void> {
   await fetch(`${API_BASE}/session/reset`, { method: 'POST' });
 }

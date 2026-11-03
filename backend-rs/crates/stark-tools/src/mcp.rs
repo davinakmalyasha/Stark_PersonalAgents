@@ -173,6 +173,10 @@ impl Transport {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
+        // MCP servers inherit the parent env by default. Strip secrets first;
+        // only explicitly configured env (config.env / config.env_vars) is
+        // re-added below, so a server only gets what its config allows.
+        stark_sandbox::secrets::scrub_tokio_command(&mut command);
         if !config.cwd.trim().is_empty() {
             command.current_dir(&config.cwd);
         }

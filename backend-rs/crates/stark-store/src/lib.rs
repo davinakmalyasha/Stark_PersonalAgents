@@ -191,6 +191,50 @@ impl ChatStore {
         Ok(affinity.unwrap_or_else(|| chat_id.to_string()))
     }
 
+    /// Daily `VACUUM INTO` snapshot of chats.db, keeping the newest 7.
+    /// Runs on startup and once a day from the server loop. Best-effort:
+    /// a failed backup never breaks the run.
+    pub async fn backup_database(&self) -> Result<PathBuf, StoreError> {
+        let dir = self.harness_root.join(".deep_agents").join("backups");
+        tokio::fs::create_dir_all(&dir).await?;
+        let date = chrono::Utc::now().format("%Y%m%d").to_string();
+        let dest = dir.join(format!("chats-{date}.db"));
+        // VACUUM INTO fails if the destination exists; remove yesterday's
+        // partial file first so the backup is always fresh.
+        let _ = tokio::fs::remove_file(&dest).await;
+        let dest_text = dest.to_string_lossy().replace('\'', "''");
+        // The path is generated, not user input (date-stamped filename under
+        // our own backups dir); single quotes are escaped above. sqlx 0.9
+        // requires an explicit opt-in for dynamic SQL.
+        let sql = format!("VACUUM INTO '{dest_text}'");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&self.pool)
+            .await?;
+        // Prune to the newest 7 snapshots.
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        let mut snaps: Vec<PathBuf> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("chats-") && name.ends_with(".db"))
+            {
+                snaps.push(path);
+            }
+        }
+        snaps.sort();
+        while snaps.len() > 7 {
+            if let Some(oldest) = snaps.first().cloned() {
+                let _ = tokio::fs::remove_file(&oldest).await;
+                snaps.remove(0);
+            } else {
+                break;
+            }
+        }
+        Ok(dest)
+    }
+
     pub async fn chat_workspace_id(&self, chat_id: &str) -> Result<Option<String>, StoreError> {
         validate_chat_id(chat_id)?;
         let row = sqlx::query("SELECT workspace_id FROM chats WHERE id = ?")

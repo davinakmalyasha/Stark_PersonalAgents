@@ -5,12 +5,15 @@ import {
   fetchDesktopHarness,
   fetchHarness,
   fetchMigrationStatus,
+  fetchPairedDevices,
   importMigration,
   importStarkData,
   pickFolder,
+  revokePairedDevice,
   setDesktopHarnessRoot,
   type HarnessInfo,
   type MigrationCandidate,
+  type PairedDevice,
 } from '../../services/api';
 
 interface Props {
@@ -29,6 +32,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupRoot, setBackupRoot] = useState('');
   const [backupFile, setBackupFile] = useState<File | null>(null);
+  const [devices, setDevices] = useState<PairedDevice[]>([]);
 
   const load = useCallback(async () => {
     setError('');
@@ -47,6 +51,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       } catch {
         setDesktop(null);
       }
+      setDevices(await fetchPairedDevices().catch(() => []));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Could not load settings.');
     }
@@ -137,6 +142,17 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
+  const revokeDevice = async (device: PairedDevice) => {
+    setError('');
+    try {
+      await revokePairedDevice(device.id);
+      setDevices((current) => current.filter((item) => item.id !== device.id));
+      setStatus(`Revoked "${device.name}". That device must pair again.`);
+    } catch (revokeError) {
+      setError(revokeError instanceof Error ? revokeError.message : 'Could not revoke device.');
+    }
+  };
+
   if (!isOpen) return null;
 
   const rowClass = 'flex items-start justify-between gap-3 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2';
@@ -217,6 +233,42 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     )}
                   </div>
                 </div>
+              </div>
+            )}
+          </section>
+
+          <section className="space-y-2">
+            <div className="flex items-center gap-2">
+              <SettingsIcon size={13} className="text-zinc-500" />
+              <span className={labelClass}>Paired devices</span>
+            </div>
+            <p className="text-[11px] text-zinc-500">
+              Each device has its own token. Revoking one signs that device out without touching the others.
+            </p>
+            {devices.length === 0 ? (
+              <div className="text-[11px] text-zinc-500">
+                No per-device tokens yet — devices paired with the legacy token won't appear here.
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {devices.map((device) => (
+                  <div key={device.id} className={rowClass}>
+                    <div className="min-w-0">
+                      <div className="text-[12px] text-zinc-200 font-medium truncate">{device.name}</div>
+                      <div className="text-[10.5px] text-zinc-500 font-mono truncate">
+                        {device.id} · created {new Date(device.created_at).toLocaleDateString()}
+                        {device.last_seen ? ` · seen ${new Date(device.last_seen).toLocaleString()}` : ' · never seen'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void revokeDevice(device)}
+                      className="flex-shrink-0 px-2.5 py-1 rounded-lg border border-red-500/30 text-[11px] text-red-300 hover:bg-red-500/10"
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
           </section>

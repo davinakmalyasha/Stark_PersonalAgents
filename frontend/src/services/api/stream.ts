@@ -331,6 +331,25 @@ export async function importStarkData(file: File, projectsRoot?: string): Promis
   return data as { ok: boolean; restart_required: boolean; from_root: string; to_root: string };
 }
 
+export interface PairedDevice {
+  id: string;
+  name: string;
+  created_at: string;
+  last_seen: string;
+}
+
+export async function fetchPairedDevices(): Promise<PairedDevice[]> {
+  const res = await fetch(`${API_BASE}/pairing/devices`);
+  if (!res.ok) throw new Error(`Could not load devices (HTTP ${res.status})`);
+  const data = await res.json();
+  return (data?.devices ?? []) as PairedDevice[];
+}
+
+export async function revokePairedDevice(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/pairing/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Could not revoke device (HTTP ${res.status})`);
+}
+
 export async function pickFolder(): Promise<string | null> {
   try {
     const result = await invokeDesktop<string | null>('select_folder');

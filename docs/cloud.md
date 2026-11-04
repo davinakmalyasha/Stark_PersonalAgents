@@ -111,3 +111,20 @@ due several times during downtime collapses into one run (no burst replay).
   fails the run instead of hanging forever.
 - Drain marker refuses new runs during deploys.
 - 2GB swap on the 20GB disk; `vm.swappiness=10`.
+- `STARK_LANDLOCK=1` (Linux) confines spawned children: reads/exec allowed
+  everywhere; writes only inside the workspace, `/tmp`, `~/.cargo`,
+  `~/.rustup`, `~/.npm`, `~/.cache`, `~/.config`, `~/.local`, and `/dev/null`.
+  Read-only mode allows no writes; `danger-full-access` skips Landlock.
+  Failure to apply fails the spawn (no silent fallback). PTY sessions are not
+  covered (portable-pty has no `pre_exec` hook). The system prompt and startup
+  log report `landlock (opt-in)` only when it is actually enabled.
+
+## Phone behaviour
+
+- PWA manifest + icons → installable; the service worker keeps the shell
+  offline and never caches `/api`.
+- Offline outbox: text prompts are queued in `localStorage` and sent on
+  reconnect (and every 30s); attachments require connectivity and are never
+  queued.
+- Notifications: one completion notification while the page is hidden. Closed
+  tabs need server push (not wired yet).

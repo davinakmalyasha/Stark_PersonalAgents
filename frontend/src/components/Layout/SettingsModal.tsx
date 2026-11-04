@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import { FolderOpen, HardDrive, RefreshCw, Settings as SettingsIcon, X } from 'lucide-react';
+import { Download, FolderOpen, HardDrive, RefreshCw, Settings as SettingsIcon, Upload, X } from 'lucide-react';
 import {
+  exportStarkData,
   fetchDesktopHarness,
   fetchHarness,
   fetchMigrationStatus,
   importMigration,
+  importStarkData,
   pickFolder,
   setDesktopHarnessRoot,
   type HarnessInfo,
@@ -24,6 +26,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupRoot, setBackupRoot] = useState('');
+  const [backupFile, setBackupFile] = useState<File | null>(null);
 
   const load = useCallback(async () => {
     setError('');
@@ -97,6 +102,38 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       setError(importError instanceof Error ? importError.message : 'Migration failed.');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runExport = async () => {
+    setBackupBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      const name = await exportStarkData();
+      setStatus(`Exported ${name}. Keep it safe — it contains chats and config, never API keys.`);
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : 'Export failed.');
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const runBackupImport = async () => {
+    if (!backupFile) return;
+    setBackupBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      const result = await importStarkData(backupFile, backupRoot);
+      setStatus(
+        `Backup staged (${result.from_root || 'unknown'} → ${result.to_root}). Restart the app/server to apply it. A pre-import copy was kept.`,
+      );
+      setBackupFile(null);
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : 'Import failed.');
+    } finally {
+      setBackupBusy(false);
     }
   };
 
@@ -182,6 +219,62 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 </div>
               </div>
             )}
+          </section>
+
+          <section className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Download size={13} className="text-zinc-500" />
+              <span className={labelClass}>Backup &amp; move</span>
+            </div>
+            <p className="text-[11px] text-zinc-500">
+              One portable zip: chats, sessions, config, memory, workspaces (relative paths) and a
+              consistent database snapshot. API keys, voice models, logs and WAL files are excluded.
+            </p>
+            <div className={rowClass}>
+              <div className="min-w-0">
+                <div className="text-[12px] text-zinc-200 font-medium">Export this machine</div>
+                <div className="text-[10.5px] text-zinc-500 mt-0.5">
+                  Downloads a timestamped zip you can import on another machine.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void runExport()}
+                disabled={backupBusy || busy}
+                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-500/90 text-[11.5px] font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
+              >
+                <Download size={14} /> Export
+              </button>
+            </div>
+            <div className={rowClass}>
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <div className="text-[12px] text-zinc-200 font-medium">Import a backup</div>
+                <div className="text-[10.5px] text-zinc-500">
+                  Applied on the next start, after backing up the current data. Workspace paths are
+                  rebased onto the projects root below.
+                </div>
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  onChange={(event) => setBackupFile(event.target.files?.[0] ?? null)}
+                  className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded-md file:border-0 file:bg-white/10 file:px-2 file:py-1 file:text-[11px] file:text-zinc-200"
+                />
+                <input
+                  value={backupRoot}
+                  onChange={(event) => setBackupRoot(event.target.value)}
+                  placeholder={`Projects root here (default: ${desktop?.harness_root ? 'STARK_PROJECTS_ROOT' : 'D:\\\\MyProject'})`}
+                  className="block w-full rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-indigo-500/60 focus:outline-none"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => void runBackupImport()}
+                disabled={backupBusy || busy || !backupFile}
+                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+              >
+                <Upload size={14} /> Import
+              </button>
+            </div>
           </section>
 
           <section className="space-y-2">

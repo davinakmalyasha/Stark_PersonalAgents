@@ -19,8 +19,7 @@ use stark_tools::ToolOutcome;
 
 use crate::RunContext;
 
-const DEFAULT_PROJECTS_ROOT: &str = r"D:\MyProject";
-const DFD_CLIENTS_ROOT: &str = r"D:\MyProject\DFDClientProjects";
+const DFD_CLIENTS_DIR: &str = "DFDClientProjects";
 
 /// Virtual workspaces hardcoded in the server (`main.rs` VIRTUAL_WORKSPACES).
 /// Never stored in `workspaces.json`; listed here so `list`/`info` see them.
@@ -71,9 +70,10 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 path.display()
             ));
         }
-        if ctx.scope == "dfd" && !path_is_within(&path, Path::new(DFD_CLIENTS_ROOT)) {
+        if ctx.scope == "dfd" && !path_is_within(&path, &dfd_clients_root()) {
             return ToolOutcome::err(format!(
-                "Error: DFD workspaces must live inside {DFD_CLIENTS_ROOT}; got '{}'.",
+                "Error: DFD workspaces must live inside {}; got '{}'.",
+                dfd_clients_root().display(),
                 path.display()
             ));
         }
@@ -128,9 +128,10 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 root.display()
             ));
         }
-        if ctx.scope == "dfd" && !path_is_within(&root, Path::new(DFD_CLIENTS_ROOT)) {
+        if ctx.scope == "dfd" && !path_is_within(&root, &dfd_clients_root()) {
             return ToolOutcome::err(format!(
-                "Error: DFD workspaces must live inside {DFD_CLIENTS_ROOT}; got '{}'.",
+                "Error: DFD workspaces must live inside {}; got '{}'.",
+                dfd_clients_root().display(),
                 root.display()
             ));
         }
@@ -294,9 +295,14 @@ async fn remove(ctx: &RunContext, args: &Value) -> ToolOutcome {
 }
 
 fn projects_root() -> PathBuf {
-    std::env::var("STARK_PROJECTS_ROOT")
+    // Delegates to the portable resolver: env wins, then platform default.
+    stark_store::projects_root()
+}
+
+fn dfd_clients_root() -> PathBuf {
+    std::env::var("DFD_CLIENTS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROJECTS_ROOT))
+        .unwrap_or_else(|_| projects_root().join(DFD_CLIENTS_DIR))
 }
 
 fn sanitize_name(value: &str) -> Option<String> {

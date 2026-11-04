@@ -586,12 +586,25 @@ Memory is a hint, not the source of truth. Verify current code.              Use
         let mut calls: BTreeMap<usize, PartialCall> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
         let mut retry_after_compaction = false;
+        // Watchdog: a provider that stops emitting (dead socket, stalled
+        // gateway) must not hang a run forever and burn wall-clock. Reset on
+        // every event; 0 disables it.
+        let idle_timeout = std::env::var("STARK_RUN_IDLE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(900);
 
         loop {
             let event = tokio::select! {
                 _ = ctx.cancel.cancelled() => {
                     finish_aborted(&ctx, &mut state).await;
                     return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(idle_timeout)), if idle_timeout > 0 => {
+                    ctx.emit_state(&mut state);
+                    return Err(RunError::Message(format!(
+                        "run stalled: no provider output for {idle_timeout}s (set STARK_RUN_IDLE_TIMEOUT_SEC to change)"
+                    )));
                 }
                 event = stream.next() => event,
             };

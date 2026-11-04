@@ -20,11 +20,30 @@ impl GroupStore {
     }
 
     pub fn default_root() -> Self {
-        Self::new(
-            std::env::var("STARK_PROJECTS_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(r"D:\StarkProjects")),
-        )
+        // One portable data root: group projects live inside the harness root
+        // (`<harness>/.deep_agents/groups`) so a backup/import carries them.
+        // Legacy installs that still have D:\StarkProjects keep using it until
+        // the user migrates; STARK_GROUPS_ROOT always wins.
+        if let Ok(raw) = std::env::var("STARK_GROUPS_ROOT") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Self::new(PathBuf::from(trimmed));
+            }
+        }
+        if let Ok(harness) = std::env::var("STARK_HARNESS_ROOT") {
+            let trimmed = harness.trim();
+            if !trimmed.is_empty() {
+                return Self::new(PathBuf::from(trimmed).join(".deep_agents").join("groups"));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let legacy = PathBuf::from(r"D:\StarkProjects");
+            if legacy.is_dir() {
+                return Self::new(legacy);
+            }
+        }
+        Self::new(crate::projects_root().join(".groups"))
     }
 
     pub async fn create(

@@ -39,6 +39,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+mod data_transfer;
 mod pairing;
 mod screen_routes;
 mod voice;
@@ -98,6 +99,10 @@ impl RunManager {
 
     fn is_running(&self, chat_id: &str) -> bool {
         self.runs.contains_key(chat_id)
+    }
+
+    fn running_count(&self) -> usize {
+        self.runs.len()
     }
 
     fn steer(&self, chat_id: &str, message: &str) -> bool {
@@ -452,7 +457,20 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // A staged import replaces files before the store opens; afterwards the
+    // chat rows still carry the old absolute workspace prefix, so rebase them.
+    let pending_import = data_transfer::apply_pending_import(&harness_root);
     let store = ChatStore::open(&harness_root).await?;
+    if let Some((from_root, to_root)) = pending_import {
+        match store.rebase_workspace_paths(&from_root, &to_root).await {
+            Ok(changed) => tracing::info!(
+                "import applied: rebased {changed} workspace path(s) from {} to {}",
+                from_root.display(),
+                to_root.display()
+            ),
+            Err(error) => tracing::warn!("import applied but path rebase failed: {error}"),
+        }
+    }
     let voice = stark_voice::resolve_models_dir(&harness_root).map(|dir| {
         tracing::info!("voice models: {}", dir.display());
         Arc::new(voice::VoiceRuntime::new(dir))
@@ -494,6 +512,26 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(error) = backup_store.backup_database().await {
                     tracing::warn!("daily chats.db backup failed: {error}");
                 }
+            }
+        });
+    }
+    // Daily portable snapshot (encrypted when STARK_SNAPSHOT_PASSPHRASE is
+    // set). This is the backup that can be restored on another machine.
+    {
+        let snapshot_root = state.harness_root.clone();
+        let snapshot_store = state.store.clone();
+        tokio::spawn(async move {
+            loop {
+                match data_transfer::snapshot_once(&snapshot_root, &snapshot_store).await {
+                    Ok(path) => tracing::info!("snapshot written: {}", path.display()),
+                    Err(error) => tracing::warn!("snapshot failed: {error}"),
+                }
+                let hours = std::env::var("STARK_SNAPSHOT_HOURS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(24);
+                tokio::time::sleep(std::time::Duration::from_secs(hours * 3600)).await;
             }
         });
     }
@@ -558,6 +596,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/session/reset", post(session_reset_handler))
         .route("/api/harness", get(harness_handler))
+        .route("/api/data/export", get(export_data_handler))
+        .route(
+            "/api/data/import",
+            post(import_data_handler).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .route("/api/migration/status", get(migration_status_handler))
         .route("/api/migration/import", post(migration_import_handler))
         .route(
@@ -597,6 +640,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/runs/{run_id}/undo", post(undo_run_handler))
         .route("/api/pairing", get(pairing_handler))
         .route("/api/pairing/rotate", post(pairing_rotate_handler))
+        .route(
+            "/api/pairing/devices",
+            get(pairing_devices_handler).post(pairing_issue_handler),
+        )
+        .route(
+            "/api/pairing/devices/{device_id}",
+            delete(pairing_revoke_handler),
+        )
         .route(
             "/api/groups",
             get(groups_handler).post(create_group_handler),
@@ -1289,6 +1340,39 @@ Attached files:
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "prompt is required"})),
+        ));
+    }
+    // Drain gate: deploys write this marker, wait for active runs to settle,
+    // swap the binary, then remove it. New runs are refused meanwhile so a
+    // restart can never kill a delegation mid-flight.
+    if state.harness_root.join(".drain").exists() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Stark is deploying a new version. Your message was not started — retry in a moment.",
+                "draining": true,
+            })),
+        ));
+    }
+    // Concurrency cap: 1GB of RAM cannot host an unbounded number of runs.
+    // Overflow is a clear 429 the client can show, never an OOM kill.
+    let cap = std::env::var("STARK_MAX_CONCURRENT_RUNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2);
+    let running = state.runs.running_count();
+    if running >= cap {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": format!(
+                    "Stark is already running {running} session(s) (limit {cap}). Wait for one to finish or raise STARK_MAX_CONCURRENT_RUNS."
+                ),
+                "busy": true,
+                "running": running,
+                "limit": cap,
+            })),
         ));
     }
 
@@ -2865,6 +2949,79 @@ async fn delete_agent_handler(
         "key": spec.key,
         "effective": effective,
     })))
+}
+
+/// Build one portable backup zip. Excludes `.env`, models, logs and WAL.
+async fn export_data_handler(
+    State(state): State<ServerState>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let path = data_transfer::export(&state.harness_root, &state.store)
+        .await
+        .map_err(server_error)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| server_error(format!("cannot read export {}: {error}", path.display())))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("stark-backup.zip")
+        .to_string();
+    let mut response = Response::new(axum::body::Body::from(bytes));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/zip"),
+    );
+    if let Ok(value) =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
+}
+
+/// Stage an uploaded backup. Applied on the next start (the DB is live here).
+async fn import_data_handler(
+    State(state): State<ServerState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut bytes: Option<Vec<u8>> = None;
+    let mut projects_root: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| bad_request(format!("invalid upload: {error}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "projects_root" {
+            projects_root = Some(
+                field
+                    .text()
+                    .await
+                    .map_err(|error| bad_request(format!("invalid projects_root: {error}")))?,
+            );
+        } else if name == "file" {
+            bytes = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|error| bad_request(format!("cannot read upload: {error}")))?
+                    .to_vec(),
+            );
+        }
+    }
+    let bytes = bytes.ok_or_else(|| bad_request("upload a Stark backup zip as 'file'"))?;
+    let staged = data_transfer::stage_import(&state.harness_root, &bytes, projects_root.as_deref())
+        .map_err(bad_request)?;
+    Ok(Json(staged))
+}
+
+fn server_error(message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": message.into() })),
+    )
 }
 
 /// Harness locations for Settings. Never includes secrets.
@@ -4760,7 +4917,7 @@ async fn auth_middleware(
         .get("x-api-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if token == state.pairing.token() {
+    if state.pairing.authorize(token) {
         return next.run(request).await;
     }
     (
@@ -4778,6 +4935,51 @@ async fn pairing_handler(
         return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
     }
     Ok(Json(json!({"token": state.pairing.token()})))
+}
+
+#[derive(Debug, Deserialize)]
+struct IssuePairingRequest {
+    #[serde(default)]
+    name: String,
+}
+
+async fn pairing_devices_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !address.ip().is_loopback() {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
+    }
+    Ok(Json(json!({ "devices": state.pairing.devices() })))
+}
+
+async fn pairing_issue_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<IssuePairingRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !address.ip().is_loopback() {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
+    }
+    let device = state.pairing.issue(&request.name);
+    Ok(Json(json!({
+        "id": device.id,
+        "name": device.name,
+        "token": device.token,
+        "created_at": device.created_at,
+    })))
+}
+
+async fn pairing_revoke_handler(
+    State(state): State<ServerState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !address.ip().is_loopback() {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
+    }
+    let removed = state.pairing.revoke(&device_id);
+    Ok(Json(json!({ "ok": removed, "id": device_id })))
 }
 
 fn frontend_dist(harness_root: &std::path::Path) -> Option<PathBuf> {

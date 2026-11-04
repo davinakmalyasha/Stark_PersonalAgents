@@ -27,7 +27,32 @@ pub use memory::{
 pub use schedules::{
     ScheduleRecord, ScheduleStore, parse_time as parse_schedule_time, record_json as schedule_json,
 };
-pub use workspaces::{WorkspaceRecord, WorkspaceRegistry};
+pub use workspaces::{
+    PROJECTS_ROOT_TOKEN, WorkspaceRecord, WorkspaceRegistry, projects_root, rebase_record,
+    resolve_record,
+};
+
+/// Rebases `path` from `old_root` (lowercased, backslash-normalized) onto
+/// `new_root`. Returns `None` when the path is outside the old root.
+fn rebase_path(path: &str, old_root: &str, new_root: &Path) -> Option<String> {
+    let candidate = path.trim().replace('/', "\\").to_lowercase();
+    if candidate == old_root {
+        return Some(new_root.to_string_lossy().to_string());
+    }
+    let rest = candidate.strip_prefix(old_root)?.trim_start_matches('\\');
+    if rest.is_empty() {
+        return Some(new_root.to_string_lossy().to_string());
+    }
+    // Use the original case for the relative segments; only the prefix match
+    // is case-insensitive (Windows), the rest is copied verbatim.
+    let offset = path.replace('/', "\\").len().saturating_sub(rest.len());
+    let original_rest = &path.replace('/', "\\")[offset..];
+    let mut out = new_root.to_path_buf();
+    for part in original_rest.split('\\').filter(|part| !part.is_empty()) {
+        out.push(part);
+    }
+    Some(out.to_string_lossy().to_string())
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -189,6 +214,90 @@ impl ChatStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(affinity.unwrap_or_else(|| chat_id.to_string()))
+    }
+
+    /// Rewrites stored absolute workspace paths after data is moved to a new
+    /// machine/root. Chat rows, queued canvas wakes and watches all carry a
+    /// copy of the path, so a prefix sweep is required for imports to resolve.
+    /// Returns the number of rows changed.
+    pub async fn rebase_workspace_paths(
+        &self,
+        old_root: &Path,
+        new_root: &Path,
+    ) -> Result<u64, StoreError> {
+        let old = old_root
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
+            .to_lowercase();
+        if old.is_empty() {
+            return Ok(0);
+        }
+        let mut changed = 0u64;
+
+        let rows = sqlx::query("SELECT id, workspace_path FROM chats")
+            .fetch_all(&self.pool)
+            .await?;
+        for row in rows {
+            let path: String = row.try_get("workspace_path").unwrap_or_default();
+            let Some(replacement) = rebase_path(&path, &old, new_root) else {
+                continue;
+            };
+            let id: String = row.try_get("id").unwrap_or_default();
+            sqlx::query("UPDATE chats SET workspace_path = ? WHERE id = ?")
+                .bind(&replacement)
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+            changed += 1;
+        }
+
+        // Optional tables: present only when the canvas feature has run.
+        for table in ["canvas_watches", "pending_wakes"] {
+            let exists: Option<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&self.pool)
+            .await?;
+            if exists.is_none() {
+                continue;
+            }
+            let select = format!("SELECT rowid, workspace_path FROM {table}");
+            let rows = sqlx::query(sqlx::AssertSqlSafe(select))
+                .fetch_all(&self.pool)
+                .await?;
+            for row in rows {
+                let path: String = row.try_get("workspace_path").unwrap_or_default();
+                let Some(replacement) = rebase_path(&path, &old, new_root) else {
+                    continue;
+                };
+                let rowid: i64 = row.try_get("rowid").unwrap_or_default();
+                let update = format!("UPDATE {table} SET workspace_path = ? WHERE rowid = ?");
+                sqlx::query(sqlx::AssertSqlSafe(update))
+                    .bind(&replacement)
+                    .bind(rowid)
+                    .execute(&self.pool)
+                    .await?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Write a consistent snapshot of the database to `dest` (VACUUM INTO).
+    /// Used by export so the zip never contains a half-written DB or WAL.
+    pub async fn vacuum_into(&self, dest: &Path) -> Result<(), StoreError> {
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let _ = tokio::fs::remove_file(dest).await;
+        let dest_text = dest.to_string_lossy().replace('\'', "''");
+        let sql = format!("VACUUM INTO '{dest_text}'");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Daily `VACUUM INTO` snapshot of chats.db, keeping the newest 7.
@@ -1345,6 +1454,32 @@ fn recent_text(entries: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebase_path_moves_a_project_between_roots() {
+        let moved = rebase_path(
+            r"D:\MyProject\coffee-shop",
+            r"d:\myproject",
+            Path::new("/srv/stark-projects"),
+        );
+        let expected = Path::new("/srv/stark-projects")
+            .join("coffee-shop")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(moved.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn rebase_path_leaves_unrelated_paths_alone() {
+        assert!(
+            rebase_path(
+                r"D:\Other\app",
+                r"d:\myproject",
+                Path::new("/srv/stark-projects")
+            )
+            .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn fork_chat_copies_messages_and_transcript() {

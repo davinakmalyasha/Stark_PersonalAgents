@@ -295,6 +295,42 @@ export async function setDesktopHarnessRoot(path: string): Promise<string> {
   return invokeDesktop('set_harness_root', { path });
 }
 
+/** Download one portable backup zip (no keys, no models, consistent DB). */
+export async function exportStarkData(): Promise<string> {
+  const res = await fetch(`${API_BASE}/data/export`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error((data as { error?: string })?.error || `Export failed (HTTP ${res.status})`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename="([^"]+)"/);
+  const name = match?.[1] || `stark-backup-${new Date().toISOString().slice(0, 10)}.zip`;
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  URL.revokeObjectURL(url);
+  return name;
+}
+
+/** Upload a backup. Staged; takes effect the next time the server starts. */
+export async function importStarkData(file: File, projectsRoot?: string): Promise<{
+  ok: boolean;
+  restart_required: boolean;
+  from_root: string;
+  to_root: string;
+}> {
+  const form = new FormData();
+  form.append('file', file);
+  if (projectsRoot?.trim()) form.append('projects_root', projectsRoot.trim());
+  const res = await fetch(`${API_BASE}/data/import`, { method: 'POST', body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((data as { error?: string })?.error || `Import failed (HTTP ${res.status})`);
+  return data as { ok: boolean; restart_required: boolean; from_root: string; to_root: string };
+}
+
 export async function pickFolder(): Promise<string | null> {
   try {
     const result = await invokeDesktop<string | null>('select_folder');

@@ -51,7 +51,18 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
+if [ ! -f /etc/stark/stark.env ]; then
+  cat > /etc/stark/stark.env <<'EOF'
+STARK_HARNESS_ROOT=/var/lib/stark-data
+STARK_FRONTEND_DIST=/opt/stark/current/frontend
+STARK_HOST=0.0.0.0
+STARK_PORT=8123
+RUST_LOG=stark_server=info,tower_http=info
+EOF
+  chown stark:stark /etc/stark/stark.env
+fi
 sed -i "s#^STARK_FRONTEND_DIST=.*#STARK_FRONTEND_DIST=/opt/stark/current/frontend#" /etc/stark/stark.env || true
+grep -q '^STARK_FRONTEND_DIST=' /etc/stark/stark.env || echo 'STARK_FRONTEND_DIST=/opt/stark/current/frontend' >> /etc/stark/stark.env
 systemctl daemon-reload
 
 echo "==> drain (refuse new runs, wait for active ones)"

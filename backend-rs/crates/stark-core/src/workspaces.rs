@@ -39,12 +39,119 @@ pub(crate) async fn workspace(ctx: &RunContext, args: &Value) -> ToolOutcome {
         .to_ascii_lowercase();
     match action.as_str() {
         "create" => create(ctx, args).await,
+        "clone" => clone_workspace(ctx, args).await,
         "list" => list(ctx).await,
         "info" => info(ctx, args).await,
         "remove" => remove(ctx, args).await,
         _ => ToolOutcome::err(
-            "Error: workspace requires action (one of: create, list, info, remove).",
+            "Error: workspace requires action (one of: create, clone, list, info, remove).",
         ),
+    }
+}
+
+/// Accepts `github.com/owner/repo`, `owner/repo`, HTTPS, SSH or file URLs.
+/// Anything else is passed through so git can explain the failure.
+fn normalize_repo(repo: &str) -> String {
+    let repo = repo.trim();
+    if repo.is_empty()
+        || repo.contains("://")
+        || repo.starts_with("git@")
+        || repo.starts_with("file:")
+        || repo.starts_with('/')
+        || repo.starts_with('\\')
+        || repo.starts_with('.')
+    {
+        return repo.to_string();
+    }
+    if repo.to_ascii_lowercase().starts_with("github.com/") {
+        return format!("https://{repo}");
+    }
+    let parts: Vec<&str> = repo.split('/').collect();
+    if parts.len() == 2 && !parts[0].contains(' ') && !parts[1].contains(' ') {
+        return format!("https://github.com/{repo}");
+    }
+    repo.to_string()
+}
+
+async fn git_clone(repo: &str, branch: Option<&str>, path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        return Err(format!("cannot create {}: {error}", parent.display()));
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(branch) = branch.map(str::trim).filter(|branch| !branch.is_empty()) {
+        command.arg("--branch").arg(branch);
+    }
+    stark_sandbox::secrets::scrub_tokio_command(&mut command);
+    let output = command
+        .arg(repo)
+        .arg(path)
+        .output()
+        .await
+        .map_err(|error| format!("cannot run git: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: String = stderr
+        .chars()
+        .rev()
+        .take(800)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    // Never leave a half-cloned folder behind: registry would point at junk.
+    let _ = tokio::fs::remove_dir_all(path).await;
+    Err(format!("git clone failed: {}", tail.trim()))
+}
+
+async fn clone_workspace(ctx: &RunContext, args: &Value) -> ToolOutcome {
+    if ctx.file_access.is_read_only() && ctx.scope != "orchestrator" {
+        return ToolOutcome::err(
+            "[BLOCKED] Read-only agent cannot clone workspaces. Report findings instead.",
+        );
+    }
+    let query = args
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("query").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(query) = query else {
+        return ToolOutcome::err("Error: action=clone needs workspace_id (or query).");
+    };
+    let registry = WorkspaceRegistry::new(ctx.store.harness_root());
+    let Some(record) = registry.list().into_iter().find(|record| {
+        record.id.eq_ignore_ascii_case(query) || record.name.eq_ignore_ascii_case(query)
+    }) else {
+        return ToolOutcome::err(format!("Error: no workspace matches '{query}'."));
+    };
+    let Some(repo) = record.repo.as_deref().filter(|repo| !repo.is_empty()) else {
+        return ToolOutcome::err(format!(
+            "Error: workspace '{}' has no repo URL; re-create it with workspace(action=\"create\", name=..., repo=...).",
+            record.name
+        ));
+    };
+    if Path::new(&record.path).is_dir() {
+        return ToolOutcome::err(format!(
+            "Error: workspace '{}' already exists at {}.",
+            record.name, record.path
+        ));
+    }
+    let path = PathBuf::from(&record.path);
+    match git_clone(repo, record.branch.as_deref(), &path).await {
+        Ok(()) => ToolOutcome::ok(format!(
+            "[OK] cloned '{}' into {}.\nWorkspace: {}",
+            record.name, record.path, record.id
+        )),
+        Err(error) => ToolOutcome::err(format!("Error: {error}")),
     }
 }
 
@@ -58,6 +165,17 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
         );
     }
     let registry = WorkspaceRegistry::new(ctx.store.harness_root());
+    let repo = args
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(normalize_repo)
+        .filter(|repo| !repo.is_empty());
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string);
 
     // Register-an-existing-folder path.
     if let Some(raw) = args.get("path").and_then(Value::as_str).map(str::trim)
@@ -88,12 +206,26 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
             .unwrap_or("")
             .trim()
             .to_string();
-        match registry.add(path.to_string_lossy().as_ref(), &name) {
-            Ok(record) => ToolOutcome::ok(format!(
-                "[OK] workspace '{}' registered.\nWorkspace: {}\nPath: {}",
-                record.name, record.id, record.path
-            )),
-            Err(error) => ToolOutcome::err(format!("Error: {error}")),
+        match repo.as_deref() {
+            Some(repo) => match registry.add_with_repo(
+                path.to_string_lossy().as_ref(),
+                &name,
+                repo,
+                branch.as_deref(),
+            ) {
+                Ok(record) => ToolOutcome::ok(format!(
+                    "[OK] workspace '{}' registered.\nWorkspace: {}\nPath: {}\nRepo: {}",
+                    record.name, record.id, record.path, repo
+                )),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            },
+            None => match registry.add(path.to_string_lossy().as_ref(), &name) {
+                Ok(record) => ToolOutcome::ok(format!(
+                    "[OK] workspace '{}' registered.\nWorkspace: {}\nPath: {}",
+                    record.name, record.id, record.path
+                )),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            },
         }
     } else {
         // Create-by-name path.
@@ -141,6 +273,41 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 "Error: Cannot create workspace: '{}' exists and is not a directory.",
                 path.display()
             ));
+        }
+        if let Some(repo) = repo.as_deref() {
+            // Clone instead of mkdir: the folder must come from the repo.
+            if path.is_dir() {
+                let mut entries = match tokio::fs::read_dir(&path).await {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        return ToolOutcome::err(format!(
+                            "Error: cannot inspect '{}': {error}",
+                            path.display()
+                        ));
+                    }
+                };
+                if entries.next_entry().await.ok().flatten().is_some() {
+                    return ToolOutcome::err(format!(
+                        "Error: '{}' already exists and is not empty. Pick another name or use action=clone.",
+                        path.display()
+                    ));
+                }
+            }
+            if let Err(error) = git_clone(repo, branch.as_deref(), &path).await {
+                return ToolOutcome::err(format!("Error: {error}"));
+            }
+            return match registry.add_with_repo(
+                path.to_string_lossy().as_ref(),
+                &name,
+                repo,
+                branch.as_deref(),
+            ) {
+                Ok(record) => ToolOutcome::ok(format!(
+                    "[OK] workspace '{}' cloned.\nWorkspace: {}\nPath: {}\nRepo: {}",
+                    record.name, record.id, record.path, repo
+                )),
+                Err(error) => ToolOutcome::err(format!("Error: {error}")),
+            };
         }
         if let Err(error) = tokio::fs::create_dir_all(&path).await {
             return ToolOutcome::err(format!(
@@ -373,6 +540,9 @@ mod tests {
 
     use super::*;
 
+    /// Env-based tests mutate a process-global; serialize them.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// RAII guard that sets an env var and restores the previous value on
     /// drop, so the confinement check can point at the temp dir.
     struct EnvGuard {
@@ -447,6 +617,7 @@ mod tests {
         let root = dir.path().join("projects");
         // Point the projects root at the temp dir so the confinement check
         // passes without touching the real D:\MyProject.
+        let _lock = ENV_LOCK.lock().await;
         let _guard = EnvGuard::set("STARK_PROJECTS_ROOT", dir.path());
         let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Read).await;
 
@@ -534,5 +705,72 @@ mod tests {
         .await;
         assert!(denied.is_error, "{}", denied.content);
         assert!(denied.content.contains("DFD"));
+    }
+
+    #[test]
+    fn repo_shorthand_normalization() {
+        assert_eq!(
+            normalize_repo("davin/coffee-shop"),
+            "https://github.com/davin/coffee-shop"
+        );
+        assert_eq!(
+            normalize_repo("github.com/davin/coffee-shop"),
+            "https://github.com/davin/coffee-shop"
+        );
+        assert_eq!(
+            normalize_repo("git@github.com:davin/coffee-shop.git"),
+            "git@github.com:davin/coffee-shop.git"
+        );
+        assert_eq!(
+            normalize_repo("https://gitlab.com/group/app.git"),
+            "https://gitlab.com/group/app.git"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_local_repo_clones_and_stores_the_url() {
+        // A local git repo exercises the clone path without network access.
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = ENV_LOCK.lock().await;
+        let _guard = EnvGuard::set("STARK_PROJECTS_ROOT", dir.path());
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("README.md"), "hello").unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&source)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Read).await;
+        let outcome = workspace(
+            &ctx,
+            &json!({
+                "action": "create",
+                "name": "cloned-app",
+                "root": dir.path().join("projects").to_string_lossy(),
+                "repo": source.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        let target = dir.path().join("projects").join("cloned-app");
+        assert!(target.join("README.md").is_file());
+        let record = WorkspaceRegistry::new(dir.path())
+            .list()
+            .into_iter()
+            .find(|record| record.name == "cloned-app")
+            .expect("registered");
+        assert_eq!(
+            record.repo.as_deref(),
+            Some(source.to_string_lossy().as_ref())
+        );
     }
 }

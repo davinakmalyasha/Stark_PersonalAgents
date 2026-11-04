@@ -563,6 +563,10 @@ async fn main() -> anyhow::Result<()> {
             get(workspaces_handler).post(add_workspace_handler),
         )
         .route(
+            "/api/workspaces/{workspace_id}/clone",
+            post(clone_workspace_handler),
+        )
+        .route(
             "/api/workspaces/{workspace_id}",
             get(workspace_handler).delete(remove_workspace_handler),
         )
@@ -3032,7 +3036,22 @@ async fn harness_handler(State(state): State<ServerState>) -> Json<Value> {
     Json(json!({
         "harness_root": state.harness_root.to_string_lossy(),
         "install_path": exe,
-        "workspaces": state.registry.list(),
+        "workspaces": state
+            .registry
+            .list()
+            .into_iter()
+            .map(|record| {
+                let exists = std::path::Path::new(&record.path).is_dir();
+                json!({
+                    "id": record.id,
+                    "name": record.name,
+                    "path": record.path,
+                    "repo": record.repo,
+                    "branch": record.branch,
+                    "exists": exists,
+                })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -3324,6 +3343,71 @@ async fn add_workspace_handler(
         "updatedAt": record.added_at,
         "isGeneral": false,
         "workspaceKind": "project",
+    })))
+}
+
+/// Re-clone a registered workspace whose folder is missing on this machine.
+async fn clone_workspace_handler(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = stark_store::WorkspaceRegistry::new(&state.harness_root);
+    let record = registry
+        .list()
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| not_found(format!("unknown workspace '{workspace_id}'")))?;
+    let Some(repo) = record.repo.as_deref().filter(|repo| !repo.is_empty()) else {
+        return Err(bad_request(format!(
+            "workspace '{}' has no stored repo URL",
+            record.name
+        )));
+    };
+    let path = PathBuf::from(&record.path);
+    if path.is_dir() {
+        return Ok(Json(
+            json!({ "ok": true, "already": true, "path": record.path }),
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| bad_request(format!("cannot create {}: {error}", parent.display())))?;
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(branch) = record.branch.as_deref().filter(|branch| !branch.is_empty()) {
+        command.arg("--branch").arg(branch);
+    }
+    stark_sandbox::secrets::scrub_tokio_command(&mut command);
+    let output = command
+        .arg(repo)
+        .arg(&path)
+        .output()
+        .await
+        .map_err(|error| server_error(format!("cannot run git: {error}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr
+            .chars()
+            .rev()
+            .take(800)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let _ = tokio::fs::remove_dir_all(&path).await;
+        return Err(server_error(format!("git clone failed: {}", tail.trim())));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "already": false,
+        "path": record.path,
+        "repo": repo,
     })))
 }
 

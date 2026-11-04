@@ -246,7 +246,7 @@ export interface HarnessInfo {
   harness_root: string;
   install_path: string;
   error?: string | null;
-  workspaces?: Array<{ id: string; name: string; path: string }>;
+  workspaces?: Array<{ id: string; name: string; path: string; repo?: string | null; branch?: string | null; exists?: boolean }>;
 }
 
 export interface MigrationCandidate {
@@ -348,6 +348,14 @@ export async function fetchPairedDevices(): Promise<PairedDevice[]> {
 export async function revokePairedDevice(id: string): Promise<void> {
   const res = await fetch(`${API_BASE}/pairing/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(`Could not revoke device (HTTP ${res.status})`);
+}
+
+/** Re-clone a registered project folder that is missing on this machine. */
+export async function cloneWorkspace(id: string): Promise<{ ok: boolean; path: string; already?: boolean }> {
+  const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(id)}/clone`, { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((data as { error?: string })?.error || `Clone failed (HTTP ${res.status})`);
+  return data as { ok: boolean; path: string; already?: boolean };
 }
 
 export async function pickFolder(): Promise<string | null> {

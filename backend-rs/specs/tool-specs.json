@@ -1250,14 +1250,14 @@
     },
     {
       "name": "workspace",
-      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root (or registers an existing path) and registers it; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Starting work stays in delegate / agent spawn / create_group — this tool never starts an agent or creates a chat.",
+      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root, or registers an existing path, or clones a git repo with repo=; action=clone re-clones a registered workspace that is missing on this machine; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Starting work stays in delegate / agent spawn / create_group — this tool never starts an agent or creates a chat.",
       "parameters": {
         "type": "object",
         "properties": {
           "action": {
             "type": "string",
-            "enum": ["create", "list", "info", "remove"],
-            "description": "create: new folder under root (or register path). list: all workspaces. info: one workspace by id/name/path. remove: unregister only, files untouched."
+            "enum": ["create", "clone", "list", "info", "remove"],
+            "description": "create: new folder/repo or register path. clone: re-clone a missing registered workspace (needs its stored repo). list/info/remove as named."
           },
           "name": {
             "type": "string",
@@ -1270,6 +1270,14 @@
           "path": {
             "type": "string",
             "description": "Existing folder to register (action=create), or a lookup for action=info. Must exist and be a directory when creating."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Git repository to clone for action=create. Accepts owner/repo, github.com/owner/repo, HTTPS, SSH (git@...) or file:// URLs. The folder is cloned into root/name and the URL is stored so another machine can action=clone it later. Private repos need a deploy key on the server."
+          },
+          "branch": {
+            "type": "string",
+            "description": "Optional branch for repo clone (default: repository default branch)."
           },
           "workspace_id": {
             "type": "string",
@@ -1288,7 +1296,7 @@
       "required": [
         "action"
       ],
-      "doc": "workspace(action, name?, root?, path?, workspace_id?, query?) — Registry counterpart to run_command: create (mkdir under root or register path) + list + info + remove (unregister only, never deletes files). Dispatch stays in delegate / agent spawn / create_group."
+      "doc": "workspace(action, name?, root?, path?, repo?, branch?, workspace_id?, query?) — Registry primitive: create (mkdir, register path, or git clone via repo), clone (re-clone a missing registered workspace from its stored repo), list, info, remove (unregister only, never deletes files). Dispatch stays in delegate / agent spawn / create_group."
     },
     {
       "name": "update_plan",

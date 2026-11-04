@@ -45,6 +45,12 @@ pub struct WorkspaceRecord {
     /// Path relative to `root`, using `/` separators for portability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rel: Option<String>,
+    /// Optional source repository. When present, a missing folder can be
+    /// re-cloned on any machine instead of staying "missing" forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(rename = "addedAt", default)]
     pub added_at: String,
 }
@@ -161,11 +167,41 @@ impl WorkspaceRegistry {
             path,
             root,
             rel,
+            repo: None,
+            branch: None,
             added_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
         registry.workspaces.push(record.clone());
         self.save(&registry)?;
         Ok(resolve_record(record, &projects_root()))
+    }
+
+    /// Adds a folder that came from a repository, persisting the source URL and
+    /// branch so another machine can re-clone it if the folder goes missing.
+    pub fn add_with_repo(
+        &self,
+        folder_path: &str,
+        name: &str,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> Result<WorkspaceRecord, String> {
+        let mut record = self.add(folder_path, name)?;
+        let mut registry = self.load();
+        if let Some(stored) = registry
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == record.id)
+        {
+            stored.repo = Some(repo.trim().to_string()).filter(|repo| !repo.is_empty());
+            stored.branch = branch
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_string);
+            record.repo = stored.repo.clone();
+            record.branch = stored.branch.clone();
+        }
+        self.save(&registry)?;
+        Ok(record)
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -289,6 +325,8 @@ mod tests {
             path: r"D:\MyProject\coffee-shop".to_string(),
             root: Some(PROJECTS_ROOT_TOKEN.to_string()),
             rel: Some("coffee-shop".to_string()),
+            repo: None,
+            branch: None,
             added_at: String::new(),
         };
         let resolved = resolve_record(record, Path::new("/srv/stark-projects"));
@@ -307,6 +345,8 @@ mod tests {
             path: r"D:\MyProject\app".to_string(),
             root: None,
             rel: None,
+            repo: None,
+            branch: None,
             added_at: String::new(),
         };
         let rebased = rebase_record(
@@ -329,6 +369,8 @@ mod tests {
             path: r"D:\Other\app".to_string(),
             root: None,
             rel: None,
+            repo: None,
+            branch: None,
             added_at: String::new(),
         };
         let rebased = rebase_record(

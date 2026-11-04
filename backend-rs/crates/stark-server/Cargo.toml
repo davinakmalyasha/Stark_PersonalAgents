@@ -24,6 +24,7 @@ stark-contract = { path = "../stark-contract" }
 stark-config = { path = "../stark-config" }
 stark-core = { path = "../stark-core" }
 stark-providers = { path = "../stark-providers" }
+stark-sandbox = { path = "../stark-sandbox" }
 stark-store = { path = "../stark-store" }
 stark-tools = { path = "../stark-tools" }
 stark-voice = { path = "../stark-voice" }

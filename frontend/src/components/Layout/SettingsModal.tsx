@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Download, FolderOpen, HardDrive, RefreshCw, Settings as SettingsIcon, Upload, X } from 'lucide-react';
 import {
+  cloneWorkspace,
   exportStarkData,
   fetchDesktopHarness,
   fetchHarness,
@@ -142,6 +143,18 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
+  const cloneMissingWorkspace = async (workspace: { id: string; name: string; repo?: string | null }) => {
+    setError('');
+    setStatus('');
+    try {
+      const result = await cloneWorkspace(workspace.id);
+      setStatus(result.already ? `${workspace.name} already exists.` : `Cloned ${workspace.name} into ${result.path}.`);
+      await load();
+    } catch (cloneError) {
+      setError(cloneError instanceof Error ? cloneError.message : 'Clone failed.');
+    }
+  };
+
   const revokeDevice = async (device: PairedDevice) => {
     setError('');
     try {
@@ -224,8 +237,27 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className={labelClass}>Workspaces ({harness.workspaces.length})</div>
                   <div className="mt-1 space-y-1">
                     {harness.workspaces.slice(0, 8).map((workspace) => (
-                      <div key={workspace.id} className="text-[11px] text-zinc-400 font-mono truncate">
-                        {workspace.name} — {workspace.path}
+                      <div key={workspace.id} className="flex items-center gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[11px] text-zinc-400 font-mono truncate">
+                            {workspace.name} — {workspace.path}
+                          </div>
+                          {workspace.repo && (
+                            <div className="text-[10px] text-zinc-600 font-mono truncate">{workspace.repo}</div>
+                          )}
+                        </div>
+                        {workspace.exists === false && workspace.repo && (
+                          <button
+                            type="button"
+                            onClick={() => void cloneMissingWorkspace(workspace)}
+                            className="flex-shrink-0 px-2 py-0.5 rounded-md border border-white/10 text-[10.5px] text-zinc-300 hover:bg-white/[0.06]"
+                          >
+                            Clone
+                          </button>
+                        )}
+                        {workspace.exists === false && !workspace.repo && (
+                          <span className="flex-shrink-0 text-[10px] text-amber-300/80">folder missing</span>
+                        )}
                       </div>
                     ))}
                     {harness.workspaces.length > 8 && (

@@ -50,10 +50,27 @@ which is the compatible direction). The VPS never compiles.
 - Tailscale is the network boundary: port 8123 is allowed only on
   `tailscale0`, and UFW still denies it on the public interface.
 
+## Projects from repositories
+
+`workspace(action="create", name="coffee-shop", repo="owner/coffee-shop")`
+clones the repository into `<projects root>/coffee-shop`, registers it, and
+stores the URL plus optional branch on the workspace record. Accepted forms:
+`owner/repo`, `github.com/owner/repo`, HTTPS, `git@…`, `file://…`. Private
+repositories need a deploy key on the server (`~stark/.ssh` + GitHub deploy
+key); the tool never receives credentials.
+
+A workspace whose folder is missing on this machine (after an import, a disk
+loss, or a new box) can be restored with:
+
+- `workspace(action="clone", workspace_id="ws-…")` from the agent, or
+- the **Clone** button next to the folder in `Settings → Workspaces`.
+
+Re-cloning keeps the existing workspace id, so chats and sessions reconnect to
+the same project instead of creating a duplicate.
+
 ## Portable data (exports)
 
 `Settings → Backup & move` (or `GET /api/data/export`) produces one zip:
-
 - `manifest.json` — format, app, contract version, export time, projects root
 - `.deep_agents/chats.db` — `VACUUM INTO` snapshot (never a live file or WAL)
 - `.deep_agents/workspaces.json` — portable records (`%PROJECTS_ROOT%` + rel)

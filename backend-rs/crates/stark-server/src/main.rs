@@ -4945,22 +4945,14 @@ struct IssuePairingRequest {
 
 async fn pairing_devices_handler(
     State(state): State<ServerState>,
-    ConnectInfo(address): ConnectInfo<SocketAddr>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !address.ip().is_loopback() {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
-    }
     Ok(Json(json!({ "devices": state.pairing.devices() })))
 }
 
 async fn pairing_issue_handler(
     State(state): State<ServerState>,
-    ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<IssuePairingRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !address.ip().is_loopback() {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
-    }
     let device = state.pairing.issue(&request.name);
     Ok(Json(json!({
         "id": device.id,
@@ -4972,12 +4964,8 @@ async fn pairing_issue_handler(
 
 async fn pairing_revoke_handler(
     State(state): State<ServerState>,
-    ConnectInfo(address): ConnectInfo<SocketAddr>,
     Path(device_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !address.ip().is_loopback() {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Local only"}))));
-    }
     let removed = state.pairing.revoke(&device_id);
     Ok(Json(json!({ "ok": removed, "id": device_id })))
 }

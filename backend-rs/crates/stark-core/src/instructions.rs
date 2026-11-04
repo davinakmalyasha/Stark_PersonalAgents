@@ -1,14 +1,15 @@
-//! Codex-style project instructions.
+//! Project instructions.
 //!
 //! Loads `AGENTS.override.md` or `AGENTS.md` from the global harness home and
 //! from the project root down to the workspace. The files are concatenated in
-//! order, bounded, and injected as a separate instruction block.
+//! order, bounded, and injected as a separate instruction block. Labels are
+//! relative so a transcript never bakes in machine-specific paths.
 
 use std::path::{Path, PathBuf};
 
 const DEFAULT_FILE: &str = "AGENTS.md";
 const OVERRIDE_FILE: &str = "AGENTS.override.md";
-const MAX_BYTES: usize = 64 * 1024;
+const MAX_BYTES: usize = 32 * 1024;
 
 fn read_doc(dir: &Path) -> Option<(PathBuf, String)> {
     for name in [OVERRIDE_FILE, DEFAULT_FILE] {
@@ -66,17 +67,27 @@ fn chain(root: &Path, workspace: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Returns the combined instruction text for a workspace, bounded to 64KB.
+/// Returns the combined instruction text for a workspace, bounded to 32 KiB.
 pub fn load(harness_root: &Path, workspace: &Path) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let global = harness_root.join(".deep_agents");
-    if let Some((_, text)) = read_doc(&global) {
-        parts.push(text);
+    if let Some((path, text)) = read_doc(&global) {
+        let label = path
+            .strip_prefix(harness_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        parts.push(format!("## {label}\n{text}"));
     }
     let root = project_root(workspace);
     for dir in chain(&root, workspace) {
         if let Some((path, text)) = read_doc(&dir) {
-            parts.push(format!("## {}\n{}", path.to_string_lossy(), text));
+            let label = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            parts.push(format!("## {label}\n{text}"));
         }
     }
     if parts.is_empty() {
@@ -116,6 +127,21 @@ mod tests {
         let src_pos = text.find("src override").unwrap();
         let nested_pos = text.find("nested rules").unwrap();
         assert!(root_pos < src_pos && src_pos < nested_pos);
+        // Labels are relative, so the block stays portable.
+        assert!(text.contains("## AGENTS.md"));
+        assert!(text.contains("## src/AGENTS.override.md"));
+        assert!(text.contains("## src/nested/AGENTS.md"));
+        assert!(!text.contains(&root.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn instruction_block_is_capped_at_32_kib() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "x".repeat(40 * 1024)).unwrap();
+        let text = load(root, root).unwrap();
+        assert!(text.len() <= MAX_BYTES);
     }
 
     #[test]

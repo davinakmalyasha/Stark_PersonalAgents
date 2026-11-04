@@ -51,6 +51,46 @@ pub(crate) async fn workspace(ctx: &RunContext, args: &Value) -> ToolOutcome {
 
 /// Accepts `github.com/owner/repo`, `owner/repo`, HTTPS, SSH or file URLs.
 /// Anything else is passed through so git can explain the failure.
+/// Relative folder shown to the model. Absolute paths stay inside the runtime
+/// and UI; the transcript only needs the portable folder name.
+fn folder_label(record: &stark_store::WorkspaceRecord) -> String {
+    record
+        .rel
+        .as_deref()
+        .map(str::trim)
+        .filter(|rel| !rel.is_empty())
+        .map(|rel| rel.trim_matches('/').to_string())
+        .or_else(|| {
+            Path::new(&record.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Short label for an arbitrary folder, never an absolute path.
+fn display_path(path: &Path) -> String {
+    let root = projects_root();
+    if let Ok(rel) = path.strip_prefix(&root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if !rel.is_empty() {
+            return rel;
+        }
+    }
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Removes machine-specific paths from subprocess output before it reaches the
+/// model. Git sometimes echoes the resolved destination directory.
+fn scrub_path(text: &str, path: &Path) -> String {
+    let label = display_path(path);
+    let raw = path.to_string_lossy().to_string();
+    let unix = raw.replace('\\', "/");
+    text.replace(&raw, &label).replace(&unix, &label)
+}
+
 fn normalize_repo(repo: &str) -> String {
     let repo = repo.trim();
     if repo.is_empty()
@@ -107,6 +147,7 @@ async fn git_clone(repo: &str, branch: Option<&str>, path: &Path) -> Result<(), 
         .chars()
         .rev()
         .collect();
+    let tail = scrub_path(&tail, path);
     // Never leave a half-cloned folder behind: registry would point at junk.
     let _ = tokio::fs::remove_dir_all(path).await;
     Err(format!("git clone failed: {}", tail.trim()))
@@ -141,15 +182,18 @@ async fn clone_workspace(ctx: &RunContext, args: &Value) -> ToolOutcome {
     };
     if Path::new(&record.path).is_dir() {
         return ToolOutcome::err(format!(
-            "Error: workspace '{}' already exists at {}.",
-            record.name, record.path
+            "Error: workspace '{}' already exists (folder: {}).",
+            record.name,
+            folder_label(&record)
         ));
     }
     let path = PathBuf::from(&record.path);
     match git_clone(repo, record.branch.as_deref(), &path).await {
         Ok(()) => ToolOutcome::ok(format!(
-            "[OK] cloned '{}' into {}.\nWorkspace: {}",
-            record.name, record.path, record.id
+            "[OK] cloned '{}'.\nWorkspace: {}\nFolder: {}",
+            record.name,
+            record.id,
+            folder_label(&record)
         )),
         Err(error) => ToolOutcome::err(format!("Error: {error}")),
     }
@@ -184,15 +228,14 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
         let path = PathBuf::from(raw);
         if !path.is_dir() {
             return ToolOutcome::err(format!(
-                "Error: workspace path not found (must be an existing directory): {}",
-                path.display()
+                "Error: workspace folder not found (must be an existing directory): {}",
+                display_path(&path)
             ));
         }
         if ctx.scope == "dfd" && !path_is_within(&path, &dfd_clients_root()) {
             return ToolOutcome::err(format!(
-                "Error: DFD workspaces must live inside {}; got '{}'.",
-                dfd_clients_root().display(),
-                path.display()
+                "Error: DFD workspaces must live inside the DFD clients folder; got '{}'.",
+                display_path(&path)
             ));
         }
         if same_path(&path, ctx.store.harness_root()) {
@@ -214,15 +257,20 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 branch.as_deref(),
             ) {
                 Ok(record) => ToolOutcome::ok(format!(
-                    "[OK] workspace '{}' registered.\nWorkspace: {}\nPath: {}\nRepo: {}",
-                    record.name, record.id, record.path, repo
+                    "[OK] workspace '{}' registered.\nWorkspace: {}\nFolder: {}\nRepo: {}",
+                    record.name,
+                    record.id,
+                    folder_label(&record),
+                    repo
                 )),
                 Err(error) => ToolOutcome::err(format!("Error: {error}")),
             },
             None => match registry.add(path.to_string_lossy().as_ref(), &name) {
                 Ok(record) => ToolOutcome::ok(format!(
-                    "[OK] workspace '{}' registered.\nWorkspace: {}\nPath: {}",
-                    record.name, record.id, record.path
+                    "[OK] workspace '{}' registered.\nWorkspace: {}\nFolder: {}",
+                    record.name,
+                    record.id,
+                    folder_label(&record)
                 )),
                 Err(error) => ToolOutcome::err(format!("Error: {error}")),
             },
@@ -255,23 +303,21 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
         let projects = projects_root();
         if !path_is_within(&root, &projects) {
             return ToolOutcome::err(format!(
-                "Error: workspace root must stay inside {}; got '{}'.",
-                projects.display(),
-                root.display()
+                "Error: workspace root must stay inside the projects root; got '{}'.",
+                display_path(&root)
             ));
         }
         if ctx.scope == "dfd" && !path_is_within(&root, &dfd_clients_root()) {
             return ToolOutcome::err(format!(
-                "Error: DFD workspaces must live inside {}; got '{}'.",
-                dfd_clients_root().display(),
-                root.display()
+                "Error: DFD workspaces must live inside the DFD clients folder; got '{}'.",
+                display_path(&root)
             ));
         }
         let path = root.join(&name);
         if path.exists() && !path.is_dir() {
             return ToolOutcome::err(format!(
                 "Error: Cannot create workspace: '{}' exists and is not a directory.",
-                path.display()
+                name
             ));
         }
         if let Some(repo) = repo.as_deref() {
@@ -282,14 +328,14 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
                     Err(error) => {
                         return ToolOutcome::err(format!(
                             "Error: cannot inspect '{}': {error}",
-                            path.display()
+                            name
                         ));
                     }
                 };
                 if entries.next_entry().await.ok().flatten().is_some() {
                     return ToolOutcome::err(format!(
                         "Error: '{}' already exists and is not empty. Pick another name or use action=clone.",
-                        path.display()
+                        name
                     ));
                 }
             }
@@ -303,8 +349,11 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 branch.as_deref(),
             ) {
                 Ok(record) => ToolOutcome::ok(format!(
-                    "[OK] workspace '{}' cloned.\nWorkspace: {}\nPath: {}\nRepo: {}",
-                    record.name, record.id, record.path, repo
+                    "[OK] workspace '{}' cloned.\nWorkspace: {}\nFolder: {}\nRepo: {}",
+                    record.name,
+                    record.id,
+                    folder_label(&record),
+                    repo
                 )),
                 Err(error) => ToolOutcome::err(format!("Error: {error}")),
             };
@@ -312,13 +361,15 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
         if let Err(error) = tokio::fs::create_dir_all(&path).await {
             return ToolOutcome::err(format!(
                 "Error: Failed to create workspace folder '{}': {error}",
-                path.display()
+                name
             ));
         }
         match registry.add(path.to_string_lossy().as_ref(), &name) {
             Ok(record) => ToolOutcome::ok(format!(
-                "[OK] workspace '{}' created.\nWorkspace: {}\nPath: {}",
-                record.name, record.id, record.path
+                "[OK] workspace '{}' created.\nWorkspace: {}\nFolder: {}",
+                record.name,
+                record.id,
+                folder_label(&record)
             )),
             Err(error) => ToolOutcome::err(format!("Error: {error}")),
         }
@@ -343,7 +394,9 @@ async fn list(ctx: &RunContext) -> ToolOutcome {
         };
         lines.push(format!(
             "- {} | {} | {} | chats:{chats} | {exists}",
-            record.id, record.name, record.path
+            record.id,
+            record.name,
+            folder_label(&record)
         ));
     }
     ToolOutcome::ok(format!(
@@ -401,8 +454,10 @@ async fn info(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 "missing"
             };
             ToolOutcome::ok(format!(
-                "[OK] workspace '{}'.\nWorkspace: {}\nPath: {}\nChats: {chats} | {exists}\nUpdated: {updated}",
-                record.name, record.id, record.path
+                "[OK] workspace '{}'.\nWorkspace: {}\nFolder: {}\nChats: {chats} | {exists}\nUpdated: {updated}",
+                record.name,
+                record.id,
+                folder_label(&record)
             ))
         }
         None => ToolOutcome::err(format!("Error: no workspace matches '{query}'.")),
@@ -630,16 +685,33 @@ mod tests {
         .await;
         assert!(!created.is_error, "{}", created.content);
         assert!(created.content.contains("coffee-shop"));
+        assert!(created.content.contains("Folder: projects/coffee-shop"));
+        assert!(
+            !created
+                .content
+                .contains(&dir.path().to_string_lossy().to_string())
+        );
         assert!(root.join("coffee-shop").is_dir());
 
         let listed = workspace(&ctx, &json!({"action": "list"})).await;
         assert!(!listed.is_error, "{}", listed.content);
         assert!(listed.content.contains("coffee-shop"));
         assert!(listed.content.contains("_general"));
+        assert!(
+            !listed
+                .content
+                .contains(&dir.path().to_string_lossy().to_string())
+        );
 
         let info = workspace(&ctx, &json!({"action": "info", "query": "coffee-shop"})).await;
         assert!(!info.is_error, "{}", info.content);
         assert!(info.content.contains("coffee-shop"));
+        assert!(info.content.contains("Folder: projects/coffee-shop"));
+        assert!(
+            !info
+                .content
+                .contains(&dir.path().to_string_lossy().to_string())
+        );
 
         let id = WorkspaceRegistry::new(dir.path())
             .list()
@@ -761,7 +833,13 @@ mod tests {
         )
         .await;
         assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(outcome.content.contains("Folder: projects/cloned-app"));
         let target = dir.path().join("projects").join("cloned-app");
+        assert!(
+            !outcome
+                .content
+                .contains(&target.to_string_lossy().to_string())
+        );
         assert!(target.join("README.md").is_file());
         let record = WorkspaceRegistry::new(dir.path())
             .list()

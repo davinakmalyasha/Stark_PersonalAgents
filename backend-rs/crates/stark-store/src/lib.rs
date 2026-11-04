@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_checkpoint_restores_one_user_message() {
+    async fn checkpoint_restores_one_user_message() {
         let dir = tempfile::tempdir().unwrap();
         let store = ChatStore::open(dir.path()).await.unwrap();
         for entry in [

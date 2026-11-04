@@ -1,8 +1,8 @@
-//! OpenCode-style permission rules.
+//! Stark permission rules.
 //!
 //! Rules are `(action, resource, effect)` triples evaluated last-match-wins.
 //! An operation may touch several resources; **any deny wins, then any ask**,
-//! otherwise it is allowed. Defaults match OpenCode: most actions are allowed,
+//! otherwise it is allowed. Defaults are permissive: most actions are allowed,
 //! `external_directory` and `doom_loop` ask, and `.env` reads ask.
 
 use std::path::Path;
@@ -82,7 +82,7 @@ impl PermissionSet {
     }
 
     /// Load global rules and append the matching agent's rules, so agent rules
-    /// win where they overlap (OpenCode merge order).
+    /// win where they overlap (last-match-wins merge order).
     pub fn load_for(harness_root: &Path, scope: &str) -> Self {
         let Some(value) = Self::read(harness_root) else {
             return Self::default();
@@ -187,7 +187,7 @@ fn resource_matches(pattern: &str, resource: &str, action: &str) -> bool {
     let pattern = expand_home(pattern);
     let resource = expand_home(resource);
     // Commands are whole strings; paths use glob semantics (`*` stays within a
-    // segment, `**` crosses directories), matching OpenCode's examples.
+    // segment, `**` crosses directories).
     let command_like = matches!(action, "bash" | "doom_loop");
     wildcard_match(
         &pattern.replace('\\', "/").to_ascii_lowercase(),
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_opencode() {
+    fn defaults_are_permissive_with_guarded_boundaries() {
         let set = set(json!([]));
         assert_eq!(set.evaluate("bash", &["ls".to_string()]), Effect::Allow);
         assert_eq!(

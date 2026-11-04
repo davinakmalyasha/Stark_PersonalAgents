@@ -1,6 +1,6 @@
 //! Conversation compaction.
 //!
-//! The shape follows opencode's checkpoint model:
+//! The shape follows Stark's checkpoint model:
 //!
 //! 1. When the request approaches the model window, summarize the older
 //!    history into a structured Markdown checkpoint.
@@ -102,8 +102,8 @@ impl CompactionPolicy {
             "SUMMARY_OUTPUT_TOKENS",
             output_tokens.clamp(1_024, DEFAULT_SUMMARY_TOKENS),
         );
-        // A large window can afford more recent verbatim context; 15k is
-        // opencode's default, 30k keeps working state for 500k-class models.
+        // A large window can afford more recent verbatim context; 15k is the
+        // provider default, 30k keeps working state for 500k-class models.
         let default_keep = if context_window >= 400_000 {
             30_000
         } else {
@@ -149,8 +149,7 @@ fn positive_env(name: &str) -> Option<usize> {
 }
 
 /// The largest prompt the model should receive while leaving room for the
-/// reply: 15% of the window, or 16k, whichever is larger. Mirrors opencode's
-/// `calculateCeiling`.
+/// reply: 15% of the window, or 16k, whichever is larger.
 pub fn ceiling_for(window: usize) -> usize {
     if window == 0 {
         return 0;

@@ -1,11 +1,11 @@
-//! Codex multi-agent v2 tools (Pi-simplified): spawn_agent, message_agent,
-//! wait_agent, list_agents, interrupt_agent, close_agent.
+//! Durable multi-agent tools: spawn_agent, message_agent, wait_agent,
+//! list_agents, interrupt_agent, close_agent.
 //!
-//! `message_agent` merges Codex send_message (queue only) and followup_task
-//! (trigger a turn): `wake=true` triggers an idle agent, `wake=false`
-//! (default) only queues. Stark's durable agent store and mailbox provide the
-//! execution substrate. Developer subagents share the parent workspace,
-//! matching Codex rather than Stark's old worktree isolation.
+//! `message_agent` merges queue-only messaging with follow-up turns:
+//! `wake=true` triggers an idle agent, `wake=false` (default) only queues.
+//! Stark's durable agent store and mailbox provide the execution substrate.
+//! Developer subagents share the parent workspace instead of taking a
+//! worktree copy.
 
 use std::time::{Duration, Instant};
 

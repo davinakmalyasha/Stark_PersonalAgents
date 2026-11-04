@@ -1,8 +1,8 @@
 //! The `memory` tool: read the compact workspace index, read topic files on
 //! demand, search durable entries, and add/forget/pin notes.
 //!
-//! This mirrors the Codex/Claude split: the index is injected at the start of
-//! a run; the long-form memory is only read when the agent asks for it.
+//! This keeps a compact index in the prompt: the index is injected at the
+//! start of a run; the long-form memory is only read when the agent asks.
 
 use serde_json::Value;
 use stark_store::{MemoryStore, NewEntry};

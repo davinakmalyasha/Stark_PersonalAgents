@@ -1,12 +1,12 @@
-//! Codex/Claude-style workspace memory.
+//! Workspace memory.
 //!
 //! Completed turns produce deterministic stage-1 records. A bounded,
 //! model-assisted consolidation pass turns those records into durable entries,
 //! a compact `MEMORY.md` index, topic files, and a long-form `summary.md`.
 //!
 //! The agent sees only the compact index by default and reads topic files on
-//! demand through the `memory` tool. This is the same split Codex and Claude
-//! Code use: a small always-on summary plus an on-demand long-form store.
+//! demand through the `memory` tool: a small always-on summary plus an
+//! on-demand long-form store.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};

@@ -17,18 +17,19 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+mod agent_tools;
 pub mod agents;
 mod agents_tools;
 pub mod canvas;
-mod codex_agents;
 mod compaction;
-mod deepseek_prompt;
 mod delegation;
 mod groups;
 mod instructions;
 pub mod memory_agent;
 mod notes;
+mod prompt;
 mod schedules;
+mod workspace_state;
 mod workspaces;
 pub mod worktree;
 pub use agents::{
@@ -336,21 +337,23 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
     let role = ctx.role.as_deref().unwrap_or("a coding agent");
     let system_prompt = if ctx.scope == "developer" || ctx.scope == "coder" {
-        // Developer: OpenCode-shaped prompt, stable content first and the
-        // volatile runtime snapshot last so prefix-cache reuse survives plan
-        // switches. Memory/worktree blocks are intentionally absent.
-        // Coder shares the shape and adds the program-tool-calling section.
-        let mut prompt = deepseek_prompt::system_prompt_for_agent(
-            &ctx.workspace,
-            ctx.store.harness_root(),
-            &ctx.model,
-            &mode,
-            ctx.depth,
-            ctx.scope == "coder",
-            ctx.config
+        // Developer: stable content first and the volatile runtime snapshot
+        // last so prefix-cache reuse survives plan switches. Memory/worktree
+        // blocks are intentionally absent. Coder shares the shape and adds the
+        // program-tool-calling section.
+        let mut prompt = crate::prompt::system_prompt_for_agent(crate::prompt::AgentPrompt {
+            workspace: &ctx.workspace,
+            workspace_id: &ctx.workspace_id,
+            harness_root: ctx.store.harness_root(),
+            model: &ctx.model,
+            mode: &mode,
+            depth: ctx.depth,
+            code_mode: ctx.scope == "coder",
+            skills: ctx
+                .config
                 .as_ref()
                 .and_then(|config| config.skills.as_deref()),
-        )
+        })
         .await;
         if let Some(custom) = ctx
             .config
@@ -371,10 +374,12 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 None => format!("You are Stark, {role}."),
             });
         let mut prompt = format!(
-            "{preamble} Working in {workspace_label}. \
-             Use the provided tools to inspect and change files. Read before editing. \
-             Never invent tool results. Keep the final answer concise."
+            "{preamble} Use the provided tools to inspect and change files. Read before editing. \
+             Never invent tool results. Keep the final answer concise.\n\n{}",
+            workspace_state::render(ctx.store.harness_root(), &ctx.workspace_id, &ctx.workspace)
         );
+        prompt.push('\n');
+        prompt.push_str(workspace_state::USAGE_HINT);
         if ctx.file_access.is_read_only() {
             prompt.push_str(
                 " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
@@ -504,7 +509,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             return Ok(());
         }
         // No wall-clock, token, or tool-call budgets: the run continues until
-        // the task is done or the user cancels. Codex parity.
+        // the task is done or the user cancels.
 
         let steering_message = { ctx.steering.lock().unwrap().pop_front() };
         if let Some(message) = steering_message {
@@ -914,7 +919,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
             continue;
         }
 
-        // Codex-style batch: independent calls in one assistant message run
+        // Parallel batch: independent calls in one assistant message run
         // concurrently. Calls touching the same file are grouped and run in
         // order, so parallel edits cannot race. Shell, subagents, groups and
         // long-running work stay sequential.
@@ -1065,7 +1070,7 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 {
                     ToolOutcome::err(reason)
                 } else {
-                    codex_agents::handle(&ctx, &call.function.name, &args).await
+                    agent_tools::handle(&ctx, &call.function.name, &args).await
                 }
             } else if call.function.name == "workspace" {
                 // Registry primitive: list/info are always fine; create and

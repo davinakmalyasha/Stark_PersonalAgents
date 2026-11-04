@@ -19,9 +19,9 @@ pub struct ToolMeta {
     /// Unconditionally blocked for `access == "read"` agents. Conditional
     /// guards (bash/job/browser_act/memory/agent) stay in `lib.rs`.
     pub read_blocked: bool,
-    /// Callable from inside a `run_code` program (Codex `allowed_callers`
-    /// `programmatic`). Direct-only tools (subagents, user questions, jobs,
-    /// schedules, canvas, `run_code` itself) must be called directly.
+    /// Callable from inside a `run_code` program. Direct-only tools
+    /// (subagents, user questions, jobs, schedules, canvas, `run_code` itself)
+    /// must be called directly.
     pub program: bool,
     /// Short past-tense verb for the activity timeline.
     pub verb: &'static str,

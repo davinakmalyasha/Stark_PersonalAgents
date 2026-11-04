@@ -1,14 +1,13 @@
-//! Developer prompt: OpenCode v2 system shape, adapted for Stark.
+//! Developer prompt composition.
 //!
-//! Block 0 is adapted from OpenCode's `system.txt` (identity, Harness,
-//! Communication, Working-in-codebases) with a software-engineering slant.
-//! Most behavior lives in the tool descriptions. Stable content comes first
-//! and volatile content last so prefix-cache reuse survives plan switches:
-//! identity → persona → AGENTS.md → skills → plan → subagent note → runtime.
+//! Stable content comes first and volatile content last so prefix-cache reuse
+//! survives plan switches: identity → persona → project instructions → skills
+//! → workspace state → plan → subagent note → runtime.
 
 use chrono::Local;
 
 use crate::instructions;
+use crate::workspace_state;
 
 const IDENTITY: &str = "You are an AI agent powered by Stark.";
 
@@ -19,7 +18,7 @@ const HARNESS: &str = r#"# Harness
 - Check the [exit code: N] marker on every bash result; investigate failures before moving on."#;
 
 const COMMUNICATION: &str = r#"# Communication
-- Use clear file paths when referring to files.
+- Refer to files by paths relative to the workspace. Use an absolute path only when the user asks for one.
 - Keep responses clear and concise, and avoid unnecessary technical jargon."#;
 
 const WORKING_IN_CODEBASES: &str = r#"# Working in codebases
@@ -59,6 +58,18 @@ fn platform_label() -> &'static str {
     }
 }
 
+/// Inputs for one agent's system prompt.
+pub struct AgentPrompt<'a> {
+    pub workspace: &'a std::path::Path,
+    pub workspace_id: &'a str,
+    pub harness_root: &'a std::path::Path,
+    pub model: &'a str,
+    pub mode: &'a str,
+    pub depth: u32,
+    pub code_mode: bool,
+    pub skills: Option<&'a [String]>,
+}
+
 #[cfg(test)]
 pub async fn system_prompt(
     workspace: &std::path::Path,
@@ -68,20 +79,32 @@ pub async fn system_prompt(
     depth: u32,
     code_mode: bool,
 ) -> String {
-    system_prompt_for_agent(workspace, harness_root, model, mode, depth, code_mode, None).await
+    system_prompt_for_agent(AgentPrompt {
+        workspace,
+        workspace_id: "test-workspace",
+        harness_root,
+        model,
+        mode,
+        depth,
+        code_mode,
+        skills: None,
+    })
+    .await
 }
 
 /// Same prompt, with the agent's configured skill allowlist.
-pub async fn system_prompt_for_agent(
-    workspace: &std::path::Path,
-    harness_root: &std::path::Path,
-    model: &str,
-    mode: &str,
-    depth: u32,
-    code_mode: bool,
-    skills: Option<&[String]>,
-) -> String {
-    // Stable first: identity, persona, project instructions, skills.
+pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
+    let AgentPrompt {
+        workspace,
+        workspace_id,
+        harness_root,
+        model,
+        mode,
+        depth,
+        code_mode,
+        skills,
+    } = context;
+    // Stable first: identity, persona, project instructions, skills, workspace.
     let mut prompt = format!(
         "{IDENTITY}\n\nYou are a coding agent powered by the {model} model, helping the user accomplish their software engineering goals.\n\n{HARNESS}\n\n{COMMUNICATION}\n\n{WORKING_IN_CODEBASES}"
     );
@@ -95,6 +118,14 @@ pub async fn system_prompt_for_agent(
         prompt.push_str("\n\n");
         prompt.push_str(&skills);
     }
+    prompt.push_str("\n\n");
+    prompt.push_str(&workspace_state::render(
+        harness_root,
+        workspace_id,
+        workspace,
+    ));
+    prompt.push('\n');
+    prompt.push_str(workspace_state::USAGE_HINT);
     // Mode- and depth-varying sections stay after the stable prefix.
     if mode == "plan" {
         prompt.push_str("\n\n");
@@ -113,12 +144,11 @@ pub async fn system_prompt_for_agent(
     let date = Local::now().format("%Y-%m-%d");
     prompt.push_str(&format!(
         "\n\nCurrent runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n\
-         Working directory: {}\nPlatform: {}\nShell: bash (`bash -c`)\nCurrent date: {date}\n\
+         Platform: {}\nShell: bash (`bash -c`)\nCurrent date: {date}\n\
          File access: writes are not OS-sandboxed; stay inside the project unless the task requires otherwise.\n\
          {sandbox}\n\
          Approvals: destructive shell commands may pause for user approval.\n\
-         Relative paths resolve from the working directory; use bash workdir for per-command directories.",
-        workspace.to_string_lossy(),
+         Relative paths resolve from the workspace folder; use bash workdir for per-command directories.",
         platform_label(),
         sandbox = stark_tools::sandbox_prompt_line(workspace)
     ));
@@ -130,7 +160,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn developer_prompt_has_deepseek_shape_and_skills() {
+    async fn developer_prompt_has_stark_shape_and_skills() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "Project rule.").unwrap();
         let skill_dir = dir.path().join(".agents/skills/review");
@@ -156,7 +186,7 @@ mod tests {
         assert!(prompt.contains("review: Review code."));
         assert!(!prompt.contains("[WORKSPACE MEMORY]"));
         assert!(!prompt.contains("prefer run_code"));
-        // OpenCode-adapted Block 0 with the software-engineering slant.
+        // Stark identity blocks with the software-engineering slant.
         assert!(prompt.contains("# Harness"));
         assert!(prompt.contains("# Communication"));
         assert!(prompt.contains("# Working in codebases"));
@@ -164,12 +194,20 @@ mod tests {
         assert!(prompt.contains("Persist until the task is fully resolved"));
         assert!(prompt.contains("Never run destructive commands"));
         assert!(prompt.contains("Verify changes with the project's tests or build"));
+        // Workspace state is identity + relative folder, never machine layout.
+        assert!(prompt.contains("<workspaces>"));
+        assert!(prompt.contains("status=\"ready\""));
+        assert!(prompt.contains("primary=\"true\""));
+        assert!(!prompt.contains("Working directory:"));
+        assert!(!prompt.contains(&dir.path().to_string_lossy().to_string()));
         // Stable content precedes the volatile runtime tail.
         let harness = prompt.find("# Harness").unwrap();
         let instructions = prompt.find("Project rule.").unwrap();
         let skills = prompt.find("review: Review code.").unwrap();
+        let workspace = prompt.find("<workspaces>").unwrap();
         let runtime = prompt.find("Current runtime context.").unwrap();
-        assert!(harness < instructions && instructions < skills && skills < runtime);
+        assert!(harness < instructions && instructions < skills && skills < workspace);
+        assert!(workspace < runtime);
         // Day-precision date keeps the cached prefix stable intraday.
         assert!(prompt.contains("Current date:"));
         assert!(!prompt.contains("Current time:"));

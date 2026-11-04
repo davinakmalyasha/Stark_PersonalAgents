@@ -31,8 +31,8 @@ const STACK_LIMIT: usize = 512 * 1024;
 
 /// Tools that are deliberately not reachable from inside a program. They are
 /// interactive, recursive, or manage long-running work that belongs to the
-/// outer agent loop. Derived from the inventory `program` flag (Codex
-/// `allowed_callers` direct-only); the canonical list lives in `inventory`.
+/// outer agent loop. The inventory `program` flag is the source of truth;
+/// this is the canonical direct-only list.
 fn program_blocked(name: &str) -> bool {
     !crate::is_program(name)
 }

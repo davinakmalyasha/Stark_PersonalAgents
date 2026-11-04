@@ -93,7 +93,7 @@ pub struct ToolContext {
     pub harness_root: PathBuf,
     pub scope: String,
     pub mode: String,
-    /// Agent depth. Codex subagents run with non-interactive approvals.
+    /// Agent depth. Subagents run with non-interactive approvals.
     pub depth: u32,
     /// "read" blocks writes at dispatch; "write"/"worktree" allow them.
     pub access: String,

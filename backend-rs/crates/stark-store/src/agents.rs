@@ -627,7 +627,7 @@ impl AgentStore {
         Ok(())
     }
 
-    /// Reopen a closed agent so a new turn can run (Codex `resume_agent`).
+    /// Reopen a closed agent so a new turn can run.
     /// Running agents are left untouched.
     pub async fn reopen(&self, id: &str) -> Result<bool, StoreError> {
         let result = sqlx::query(

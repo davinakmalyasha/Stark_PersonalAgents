@@ -1,7 +1,7 @@
 //! Tool-side permission gate backed by `.deep_agents/permissions.json`.
 //!
-//! Mirrors OpenCode: `deny` blocks before execution, `ask` prompts the user
-//! (subagents are non-interactive and are blocked), `allow` passes through.
+//! Stark permission gate: `deny` blocks before execution, `ask` prompts the
+//! user (subagents are non-interactive and are blocked), `allow` passes through.
 //! `STARK_AUTO_APPROVE` (or `"auto_approve": true`) turns asks into allows,
 //! but never overrides a deny.
 

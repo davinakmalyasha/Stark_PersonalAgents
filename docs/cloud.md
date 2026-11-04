@@ -20,8 +20,67 @@ laptop ─┘                                   │
 | `/opt/stark/releases/<stamp>/stark-server` | immutable release binaries |
 | `/opt/stark/current` | symlink to the active release (systemd ExecStart) |
 | `/opt/stark/current/frontend` | frontend dist served by the server |
-| `/var/lib/stark-data` | harness root: `chats.db`, `sessions/`, `config/`, `.env`, exports |
+| `/var/lib/stark-data` | harness root: `.deep_agents/` (chats, registry, memory, checkpoints, exports), `config/`, `.env` |
 | `/srv/stark-projects` | project folders (`STARK_PROJECTS_ROOT`) |
+
+## Workspace model
+
+A workspace is an identity, not a path. The registry at
+`<harness>/.deep_agents/workspaces.json` stores one record per project:
+
+```json
+{
+  "id": "ws-a1b2c3d4",
+  "name": "coffee-shop",
+  "root": "%PROJECTS_ROOT%",
+  "rel": "coffee-shop",
+  "repo": "https://github.com/owner/coffee-shop",
+  "branch": "main"
+}
+```
+
+- `id` is stable for the lifetime of the project. Chats, delegated agents,
+  canvas watches, and memory are keyed by it, so re-cloning or moving never
+  forks a project into a duplicate.
+- `rel` is the folder relative to the machine's `STARK_PROJECTS_ROOT`. The
+  absolute `path` is derived at runtime and is never sent to the model.
+- `repo` is optional. When present, a missing folder is recoverable with
+  `workspace(action="clone", workspace_id="ws-…")` or the Settings **Clone**
+  button. The id does not change.
+
+The system prompt describes the run with its identity and relative folder:
+
+```xml
+<workspaces>
+  <workspace id="ws-a1b2c3d4" name="coffee-shop" primary="true" status="ready">
+    <folder>coffee-shop</folder>
+    <repo>owner/coffee-shop</repo>
+  </workspace>
+</workspaces>
+```
+
+`status` is `ready`, `missing`, or `virtual` (General/House/Personal/DFD).
+Tool results use the same relative folder. Absolute paths stay in logs and the
+UI, so transcripts and exports stay portable without a rewrite pass.
+
+### Instructions and memory
+
+- `<projects root>/<rel>/AGENTS.md` (or `AGENTS.override.md`) — user-owned
+  project rules. Loaded from the project root down to the workspace, one file
+  per directory, 32 KiB cap. The agent reads these; it does not silently edit
+  them.
+- `<harness>/.deep_agents/AGENTS.md` — global preferences.
+- `<harness>/.deep_agents/memory/<workspace_id>/` — agent-owned notes and a
+  compact `MEMORY.md` index. Keyed by workspace id, so it survives re-cloning.
+
+### Run checkpoints
+
+Each run starts with a baseline snapshot of the workspace (excluding `.git`,
+`node_modules`, `target`, `dist`, and similar heavy folders) and records files
+before the agent edits them. Restore is available per run, per user message, or
+per file from the server API. Checkpoints are local safety data: they live under
+the workspace's `.deep_agents/snapshots/` and are not part of the portable
+export.
 
 ## Deploy (drain-safe, auto-rollback)
 
@@ -66,7 +125,8 @@ loss, or a new box) can be restored with:
 - the **Clone** button next to the folder in `Settings → Workspaces`.
 
 Re-cloning keeps the existing workspace id, so chats and sessions reconnect to
-the same project instead of creating a duplicate.
+the same project instead of creating a duplicate. The tool reports the id and
+the folder relative to the projects root, never the absolute path.
 
 ## Portable data (exports)
 
@@ -74,15 +134,18 @@ the same project instead of creating a duplicate.
 - `manifest.json` — format, app, contract version, export time, projects root
 - `.deep_agents/chats.db` — `VACUUM INTO` snapshot (never a live file or WAL)
 - `.deep_agents/workspaces.json` — portable records (`%PROJECTS_ROOT%` + rel)
-- `config/`, `sessions/`, `memory/`, `uploads/`, `ui_state.json`
+- `.deep_agents/config/`, `.deep_agents/sessions/`, `.deep_agents/memory/`,
+  `.deep_agents/uploads/`, MCP servers, notes, UI state
 
-Excluded: `.env`, voice models, logs, `*.db-wal`, `*.db-shm`, old backups.
+Excluded: `.env`, checkpoints, voice models, logs, old exports, imports,
+`*.db-wal`, `*.db-shm`.
 
 `workspaces.json` stores `{ "root": "%PROJECTS_ROOT%", "rel": "coffee-shop" }`
 next to the absolute `path`. On read, `path` is recomputed from the machine's
 `STARK_PROJECTS_ROOT` (Windows default `D:\MyProject`, Linux
 `/srv/stark-projects`). A folder that is not under the projects root keeps its
-absolute path and is reported as machine-specific.
+absolute path and is reported as machine-specific. Only the registry and the UI
+see `path`; the model sees `rel`.
 
 ## Import
 

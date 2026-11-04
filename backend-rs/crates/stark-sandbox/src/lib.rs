@@ -1,6 +1,6 @@
 //! Process sandbox configuration and spawn hooks.
 //!
-//! Two axes, mirroring Codex:
+//! Two axes:
 //! - [`SandboxMode`]: what a child process may touch (read-only, workspace
 //!   write, full access).
 //! - [`ApprovalPolicy`]: when to ask the user before escalating.

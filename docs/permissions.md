@@ -1,6 +1,6 @@
 # Permissions
 
-Stark's safety layer is an OpenCode-style permission engine. It runs **before**
+Stark's safety layer is a permission engine. It runs **before**
 a tool executes: `deny` blocks the call, `ask` prompts you, `allow` runs it.
 No OS sandbox and no admin setup — enforcement is in the tool path.
 

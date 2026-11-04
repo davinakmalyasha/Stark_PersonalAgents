@@ -1250,7 +1250,7 @@
     },
     {
       "name": "workspace",
-      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root, or registers an existing path, or clones a git repo with repo=; action=clone re-clones a registered workspace that is missing on this machine; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Starting work stays in delegate / agent spawn / create_group — this tool never starts an agent or creates a chat.",
+      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root, or registers an existing path, or clones a git repo with repo=; action=clone re-clones a registered workspace that is missing on this machine; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Results report the folder relative to the projects root, never an absolute path. Starting work stays in delegate / agent spawn / create_group — this tool never starts an agent or creates a chat.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1265,7 +1265,7 @@
           },
           "root": {
             "type": "string",
-            "description": "Parent folder for action=create with name. Defaults to STARK_PROJECTS_ROOT (D:\\MyProject); must stay inside it. DFD agents must use a client folder under D:\\MyProject\\DFDClientProjects."
+            "description": "Parent folder for action=create with name. Defaults to the projects root (STARK_PROJECTS_ROOT); must stay inside it. DFD agents must use a folder under the DFD clients root."
           },
           "path": {
             "type": "string",

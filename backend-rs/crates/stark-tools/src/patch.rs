@@ -646,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_apply_patch_scenarios_match() {
+    async fn apply_patch_scenarios_match() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")

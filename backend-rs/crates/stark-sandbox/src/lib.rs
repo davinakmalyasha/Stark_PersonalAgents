@@ -16,6 +16,9 @@ use std::process::Command;
 
 pub mod secrets;
 
+#[cfg(target_os = "linux")]
+pub mod landlock;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
     ReadOnly,
@@ -88,10 +91,12 @@ impl ApprovalPolicy {
 /// Which isolation backend this build has. `none` means the hook reports the
 /// mode to the model but cannot enforce it.
 pub fn backend_name() -> &'static str {
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "linux") && landlock_enabled() {
+        "landlock (opt-in)"
+    } else if cfg!(target_os = "windows") {
         "none (AppContainer pending)"
     } else if cfg!(target_os = "linux") {
-        "none (Landlock pending)"
+        "none (Landlock opt-in: STARK_LANDLOCK=1)"
     } else if cfg!(target_os = "macos") {
         "none (Seatbelt pending)"
     } else {
@@ -99,9 +104,19 @@ pub fn backend_name() -> &'static str {
     }
 }
 
-/// True only when a real enforcement backend is compiled in.
-pub fn enforced() -> bool {
+#[cfg(target_os = "linux")]
+fn landlock_enabled() -> bool {
+    landlock::enabled()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn landlock_enabled() -> bool {
     false
+}
+
+/// True only when a real enforcement backend is compiled in and switched on.
+pub fn enforced() -> bool {
+    landlock_enabled()
 }
 
 #[derive(Clone, Debug)]
@@ -206,11 +221,38 @@ mod backend {
     use super::SandboxProfile;
     use std::process::Command;
 
-    /// Placeholder backend: no kernel enforcement yet. Keeping the hook here
-    /// means no spawn site changes when AppContainer/Landlock land.
-    pub fn wrap(_command: &mut Command, _profile: &SandboxProfile) {}
+    /// Kernel enforcement hook. On Linux with `STARK_LANDLOCK=1` the child is
+    /// confined before exec; otherwise this is a no-op that the prompt reports
+    /// honestly as "not enforced".
+    pub fn wrap(command: &mut Command, profile: &SandboxProfile) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            if let Some(prepared) = super::landlock::Prepared::for_profile(profile) {
+                // SAFETY: the closure only performs syscalls on buffers prepared
+                // in the parent; no allocation or locking happens after fork.
+                unsafe {
+                    command.pre_exec(move || prepared.apply());
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (command, profile);
+    }
 
-    pub fn wrap_tokio(_command: &mut tokio::process::Command, _profile: &SandboxProfile) {}
+    pub fn wrap_tokio(command: &mut tokio::process::Command, profile: &SandboxProfile) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(prepared) = super::landlock::Prepared::for_profile(profile) {
+                // SAFETY: see `wrap`; the closure is syscall-only.
+                unsafe {
+                    command.pre_exec(move || prepared.apply());
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (command, profile);
+    }
 }
 
 /// Convenience for callers that only have a workspace path.

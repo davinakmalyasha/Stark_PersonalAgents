@@ -14,6 +14,8 @@ import { usePipeline } from './hooks/usePipeline';
 import { fetchModels, fetchActiveRun, addChatMessage, createChat, fetchChat, fetchWorkspaces, fetchChats, updateChatTitle, uploadChatAttachments, steerRun, setChatMode, getChatSnapshots, restoreRun, undoRun, abortRun, rewindChat, API_BASE, apiUrl } from './services/api';
 import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatAttachment } from './types';
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
+import { flushOutbox, queueMessage } from './services/outbox';
+import { ensureNotificationPermission, notifyRunFinished } from './services/notifications';
 
 const isProjectWorkspace = (w: WorkspaceInfo): boolean =>
   !w.isGeneral && !w.isHouse && !w.isPersonal && !(w as { isDfd?: boolean }).isDfd;
@@ -62,6 +64,30 @@ export default function App() {
     const refresh = () => setSidebarRefreshTick((tick) => tick + 1);
     window.addEventListener('stark:refresh-sidebar', refresh);
     return () => window.removeEventListener('stark:refresh-sidebar', refresh);
+  }, []);
+
+  // Offline outbox: flush queued prompts on reconnect and every 30s. Text-only;
+  // attachments always require connectivity.
+  useEffect(() => {
+    const flush = () => {
+      void flushOutbox(API_BASE)
+        .then((sent) => {
+          if (sent > 0) window.dispatchEvent(new CustomEvent('stark:refresh-sidebar'));
+        })
+        .catch(() => {});
+    };
+    flush();
+    window.addEventListener('online', flush);
+    const timer = window.setInterval(flush, 30_000);
+    return () => {
+      window.removeEventListener('online', flush);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  // Ask once for notification permission; denial is fine and silent.
+  useEffect(() => {
+    void ensureNotificationPermission();
   }, []);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
@@ -187,6 +213,15 @@ export default function App() {
       wasRunning.current = true;
     } else if (wasRunning.current) {
       wasRunning.current = false;
+      // Background completion: one notification, only while hidden and only
+      // when the user granted permission. Never spam per message.
+      void notifyRunFinished(
+        activeChat?.id ?? '',
+        activeChat?.title ?? 'Stark',
+        state?.outputs?.agent_report
+          || [...messages].reverse().find((m) => m.role === 'agent' && m.content?.trim())?.content
+          || 'Run finished.',
+      );
       // The server persists the terminal agent status before `done`, so
       // refresh the tree immediately — do not wait for chat persistence.
       setSidebarRefreshTick((t) => t + 1);
@@ -318,6 +353,27 @@ export default function App() {
     // Stage 4: slash-command pre-dispatch. /plan, /build, /undo, /rewind
     // are intercepted before the prompt reaches the LLM.
     const trimmed = (prompt || '').trim();
+
+    // Offline: keep the text in a durable outbox instead of losing it.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      if (!activeChat || !activeWorkspace) {
+        setNotification('Offline — open a chat first; queued messages need a conversation.');
+        return;
+      }
+      if (files.length > 0) {
+        setNotification('Offline — attachments need a connection (not queued). Text queued instead.');
+      }
+      if (trimmed) {
+        queueMessage({
+          chatId: activeChat.id,
+          workspaceId: activeWorkspace.id,
+          workspacePath: activeWorkspace.path,
+          text: trimmed,
+        });
+        setNotification('Offline — message queued. It will send automatically when you reconnect.');
+      }
+      return;
+    }
     if (trimmed.startsWith('/')) {
       const ws = activeWorkspace;
       const chat = activeChat;

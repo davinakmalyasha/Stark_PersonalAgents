@@ -35,6 +35,11 @@ jobs:
         with:
           workspaces: backend-rs -> target
 
+      # stark-voice -> cpal -> alsa-sys needs the ALSA headers on Linux.
+      # (Runtime needs libasound2t64 on the VPS too — handled at deploy.)
+      - name: System deps (Linux audio headers)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       - name: Contract sanity (frozen v4 tool contract)
         working-directory: backend-rs
         run: cargo test -p stark-contract

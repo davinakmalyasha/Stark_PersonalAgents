@@ -20,7 +20,7 @@ laptop ─┘                                   │
 | `/opt/stark/releases/<stamp>/stark-server` | immutable release binaries |
 | `/opt/stark/current` | symlink to the active release (systemd ExecStart) |
 | `/opt/stark/current/frontend` | frontend dist served by the server |
-| `/var/lib/stark-data` | harness root: `.deep_agents/` (chats, registry, memory, checkpoints, exports), `config/`, `.env` |
+| `/var/lib/stark-data` | harness root: `.deep_agents/` (chats, registry, memory, config, tasks, exports), `.env` |
 | `/srv/stark-projects` | project folders (`STARK_PROJECTS_ROOT`) |
 
 ## Workspace model
@@ -42,6 +42,9 @@ A workspace is an identity, not a path. The registry at
 - `id` is stable for the lifetime of the project. Chats, delegated agents,
   canvas watches, and memory are keyed by it, so re-cloning or moving never
   forks a project into a duplicate.
+- `name` is display metadata. Delegation resolves an exact id first, then an
+  exact unique name; an ambiguous name returns the candidate ids instead of
+  guessing.
 - `rel` is the folder relative to the machine's `STARK_PROJECTS_ROOT`. The
   absolute `path` is derived at runtime and is never sent to the model.
 - `repo` is optional. When present, a missing folder is recoverable with
@@ -59,7 +62,11 @@ The system prompt describes the run with its identity and relative folder:
 </workspaces>
 ```
 
-`status` is `ready`, `missing`, or `virtual` (General/House/Personal/DFD).
+`status` is `ready`, `missing`, `worktree`, or `virtual`
+(General/House/Personal/DFD). Isolated subagents run in a worktree and report
+`worktree` with `<folder>.</folder>`, because their directory is not the
+registered project folder.
+
 Tool results use the same relative folder. Absolute paths stay in logs and the
 UI, so transcripts and exports stay portable without a rewrite pass.
 
@@ -67,11 +74,14 @@ UI, so transcripts and exports stay portable without a rewrite pass.
 
 - `<projects root>/<rel>/AGENTS.md` (or `AGENTS.override.md`) — user-owned
   project rules. Loaded from the project root down to the workspace, one file
-  per directory, 32 KiB cap. The agent reads these; it does not silently edit
-  them.
+  per directory, 32 KiB cap. Files closer to the workspace override earlier
+  guidance, and direct system/developer/user instructions take precedence.
+  The agent reads these; learned notes live in the separate memory store.
 - `<harness>/.deep_agents/AGENTS.md` — global preferences.
 - `<harness>/.deep_agents/memory/<workspace_id>/` — agent-owned notes and a
   compact `MEMORY.md` index. Keyed by workspace id, so it survives re-cloning.
+  Every agent scope receives the compact index; details stay behind the
+  `memory` tool.
 
 ### Run checkpoints
 
@@ -131,13 +141,17 @@ the folder relative to the projects root, never the absolute path.
 ## Portable data (exports)
 
 `Settings → Backup & move` (or `GET /api/data/export`) produces one zip:
-- `manifest.json` — format, app, contract version, export time, projects root
+- `manifest.json` — format, app, contract version, export time, projects root,
+  and the exact `included` / `excluded` lists
 - `.deep_agents/chats.db` — `VACUUM INTO` snapshot (never a live file or WAL)
 - `.deep_agents/workspaces.json` — portable records (`%PROJECTS_ROOT%` + rel)
-- `.deep_agents/config/`, `.deep_agents/sessions/`, `.deep_agents/memory/`,
-  `.deep_agents/uploads/`, MCP servers, notes, UI state
+- `.deep_agents/config/`, `sessions/`, `memory/`, `uploads/`, `skills/`,
+  `tasks/` (plans), `groups/`, `AGENTS.md`, `AGENTS.override.md`,
+  `schedules.db`, `dfd_clients.json`, `house_state.json`, MCP servers, notes,
+  UI state
 
-Excluded: `.env`, checkpoints, voice models, logs, old exports, imports,
+Excluded and listed in the manifest: `.env`, `jobs.db` (transient queue),
+workspace checkpoints, voice models, logs, old exports/imports/backups,
 `*.db-wal`, `*.db-shm`.
 
 `workspaces.json` stores `{ "root": "%PROJECTS_ROOT%", "rel": "coffee-shop" }`

@@ -1,10 +1,10 @@
 //! Portable data export/import.
 //!
-//! Export writes one zip containing everything needed to rebuild this harness
-//! on another machine: a consistent `chats.db` snapshot, sessions, config,
-//! memory, uploads and a portable `workspaces.json`. It never includes `.env`
-//! (provider keys stay on the machine), voice models, logs, WAL files or old
-//! backups.
+//! Export writes one zip containing the durable harness state needed to rebuild
+//! this instance on another machine: a consistent `chats.db` snapshot, sessions,
+//! config, memory, uploads, plans, skills, schedules, groups, and a portable
+//! `workspaces.json`. It never includes `.env` (provider keys stay on the
+//! machine), the transient job queue, logs, WAL files, or old backups.
 //!
 //! Import is staged and applied on the next boot: replacing a live SQLite file
 //! under the connection pool is unsafe, so the endpoint extracts to a staging
@@ -19,18 +19,39 @@ use zip::write::SimpleFileOptions;
 
 const EXPORT_FORMAT: u32 = 1;
 
-/// Files/directories copied into a backup. Paths are relative to the harness
-/// root. Deliberately excluded: `.env`, backups, exports, imports, logs,
-/// `*.db-wal`, `*.db-shm`, voice models.
-const INCLUDE: &[&str] = &[
+/// Durable harness state that must travel. Paths are relative to the harness
+/// root. Everything here is either user-authored or needed to resume work.
+const DURABLE: &[&str] = &[
     ".deep_agents/config",
     ".deep_agents/sessions",
     ".deep_agents/memory",
     ".deep_agents/uploads",
+    ".deep_agents/skills",
+    ".deep_agents/tasks",
+    ".deep_agents/groups",
     ".deep_agents/mcp_servers.json",
     ".deep_agents/ui_state.json",
     ".deep_agents/agent_notes.json",
     ".deep_agents/workspaces.json",
+    ".deep_agents/AGENTS.md",
+    ".deep_agents/AGENTS.override.md",
+    ".deep_agents/dfd_clients.json",
+    ".deep_agents/house_state.json",
+];
+
+/// Deliberately not portable. Listed in the manifest so an operator can audit
+/// exactly what a backup leaves behind.
+const EXCLUDED: &[&str] = &[
+    ".env",
+    ".deep_agents/jobs.db",
+    ".deep_agents/backups",
+    ".deep_agents/exports",
+    ".deep_agents/imports",
+    ".deep_agents/logs",
+    ".deep_agents/snapshots",
+    "voice models",
+    "*.db-wal",
+    "*.db-shm",
 ];
 
 /// Build the export zip and return its path.
@@ -57,25 +78,18 @@ pub async fn export(
     let mut zip = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    // Manifest first so a human can inspect the archive without extracting.
-    let manifest = json!({
-        "format": EXPORT_FORMAT,
-        "app": "stark",
-        "contract_version": stark_tools::contract().contract_version,
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "projects_root": stark_store::projects_root().to_string_lossy(),
-    });
-    add_bytes(
-        &mut zip,
-        "manifest.json",
-        serde_json::to_string_pretty(&manifest)
-            .unwrap_or_default()
-            .as_bytes(),
-        options,
-    )?;
+    // Manifest last: it records the exact entries written, so the archive can
+    // be audited without opening every file.
+    let mut included: Vec<String> = Vec::new();
 
     // DB snapshot under its live name inside `.deep_agents/`.
-    add_file(&mut zip, &snapshot, ".deep_agents/chats.db", options)?;
+    add_file(
+        &mut zip,
+        &snapshot,
+        ".deep_agents/chats.db",
+        options,
+        &mut included,
+    )?;
     let _ = std::fs::remove_file(&snapshot);
 
     // Portable registry: stored records keep the `%PROJECTS_ROOT%` token.
@@ -89,18 +103,67 @@ pub async fn export(
         portable.as_bytes(),
         options,
     )?;
+    included.push(".deep_agents/workspaces.json".to_string());
 
-    for entry in INCLUDE {
+    // Schedules use their own SQLite file; snapshot it instead of copying WAL.
+    let schedules = harness_root.join(".deep_agents").join("schedules.db");
+    if schedules.is_file() {
+        let snapshot_path = exports.join(format!(".schedules-{stamp}.db"));
+        match stark_store::vacuum_sqlite(&schedules, &snapshot_path).await {
+            Ok(()) => {
+                add_file(
+                    &mut zip,
+                    &snapshot_path,
+                    ".deep_agents/schedules.db",
+                    options,
+                    &mut included,
+                )?;
+                let _ = std::fs::remove_file(&snapshot_path);
+            }
+            Err(error) => {
+                tracing::warn!("schedules snapshot failed; exporting the last checkpoint: {error}");
+                add_file(
+                    &mut zip,
+                    &schedules,
+                    ".deep_agents/schedules.db",
+                    options,
+                    &mut included,
+                )?;
+            }
+        }
+    }
+
+    for entry in DURABLE {
         if *entry == ".deep_agents/workspaces.json" {
             continue; // written above in portable form
         }
         let path = harness_root.join(entry);
         if path.is_file() {
-            add_file(&mut zip, &path, entry, options)?;
+            add_file(&mut zip, &path, entry, options, &mut included)?;
         } else if path.is_dir() {
-            add_dir(&mut zip, &path, entry, options)?;
+            add_dir(&mut zip, &path, entry, options, &mut included).await?;
         }
     }
+
+    included.sort();
+    included.push("manifest.json".to_string());
+    let manifest = json!({
+        "format": EXPORT_FORMAT,
+        "app": "stark",
+        "contract_version": stark_tools::contract().contract_version,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "projects_root": stark_store::projects_root().to_string_lossy(),
+        "included": included,
+        "excluded": EXCLUDED,
+    });
+    add_bytes(
+        &mut zip,
+        "manifest.json",
+        serde_json::to_string_pretty(&manifest)
+            .unwrap_or_default()
+            .as_bytes(),
+        options,
+    )?;
 
     zip.finish()
         .map_err(|error| format!("cannot finish zip: {error}"))?;
@@ -115,9 +178,11 @@ fn add_file(
     path: &Path,
     name: &str,
     options: SimpleFileOptions,
+    included: &mut Vec<String>,
 ) -> Result<(), String> {
     let bytes =
         std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    included.push(name.to_string());
     add_bytes(zip, name, &bytes, options)
 }
 
@@ -133,11 +198,12 @@ fn add_bytes(
         .map_err(|error| format!("cannot write {name}: {error}"))
 }
 
-fn add_dir(
+async fn add_dir(
     zip: &mut zip::ZipWriter<std::fs::File>,
     root: &Path,
     prefix: &str,
     options: SimpleFileOptions,
+    included: &mut Vec<String>,
 ) -> Result<(), String> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -161,7 +227,28 @@ fn add_dir(
                 if lower.ends_with(".db-wal") || lower.ends_with(".db-shm") {
                     continue;
                 }
-                add_file(zip, &path, &name, options)?;
+                if lower.ends_with(".db") {
+                    let snapshot = std::env::temp_dir().join(format!(
+                        "stark-export-{}-{}.db",
+                        std::process::id(),
+                        uuid::Uuid::new_v4().simple()
+                    ));
+                    match stark_store::vacuum_sqlite(&path, &snapshot).await {
+                        Ok(()) => {
+                            add_file(zip, &snapshot, &name, options, included)?;
+                            let _ = std::fs::remove_file(&snapshot);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "sqlite snapshot failed for {}; copying last checkpoint: {error}",
+                                name
+                            );
+                            add_file(zip, &path, &name, options, included)?;
+                        }
+                    }
+                } else {
+                    add_file(zip, &path, &name, options, included)?;
+                }
             }
         }
     }
@@ -464,15 +551,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let harness = dir.path();
         std::fs::write(harness.join(".env"), "OPENCODE_API_KEY=secret").unwrap();
-        std::fs::create_dir_all(harness.join(".deep_agents").join("config")).unwrap();
-        std::fs::write(
-            harness
-                .join(".deep_agents")
-                .join("config")
-                .join("providers.json"),
-            "{\"providers\":{}}",
-        )
-        .unwrap();
+        for (path, body) in [
+            (".deep_agents/config/providers.json", "{\"providers\":{}}"),
+            (".deep_agents/AGENTS.md", "global rules"),
+            (".deep_agents/tasks/task_chat.json", "{\"plan\":[]}"),
+            (".deep_agents/skills/review/SKILL.md", "review skill"),
+            (".deep_agents/dfd_clients.json", "[]"),
+            (".deep_agents/house_state.json", "{}"),
+            (".deep_agents/groups/demo/PROJECT.md", "group"),
+        ] {
+            let target = harness.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, body).unwrap();
+        }
+        // Valid SQLite stores: one durable, one transient.
+        stark_store::ScheduleStore::open(harness).await.unwrap();
+        stark_store::JobStore::open(harness).await.unwrap();
         let store = stark_store::ChatStore::open(harness).await.unwrap();
         let zip_path = export(harness, &store).await.expect("export");
         let file = std::fs::File::open(&zip_path).unwrap();
@@ -481,19 +575,55 @@ mod tests {
         for index in 0..archive.len() {
             names.push(archive.by_index(index).unwrap().name().unwrap().to_string());
         }
-        assert!(names.contains(&"manifest.json".to_string()));
-        assert!(names.contains(&".deep_agents/chats.db".to_string()));
-        assert!(names.contains(&".deep_agents/workspaces.json".to_string()));
-        assert!(names.contains(&".deep_agents/config/providers.json".to_string()));
+        for expected in [
+            "manifest.json",
+            ".deep_agents/chats.db",
+            ".deep_agents/workspaces.json",
+            ".deep_agents/config/providers.json",
+            ".deep_agents/AGENTS.md",
+            ".deep_agents/tasks/task_chat.json",
+            ".deep_agents/skills/review/SKILL.md",
+            ".deep_agents/dfd_clients.json",
+            ".deep_agents/house_state.json",
+            ".deep_agents/schedules.db",
+            ".deep_agents/groups/demo/PROJECT.md",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected}: {names:?}"
+            );
+        }
         assert!(
             !names.iter().any(|name| name.ends_with(".env")),
             "export must never contain .env: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with("jobs.db")),
+            "transient jobs must stay local: {names:?}"
         );
         assert!(
             !names
                 .iter()
                 .any(|name| name.contains("-wal") || name.contains("-shm"))
         );
+
+        let mut manifest_file = archive.by_name("manifest.json").unwrap();
+        let mut manifest_text = String::new();
+        std::io::Read::read_to_string(&mut manifest_file, &mut manifest_text).unwrap();
+        let manifest: Value = serde_json::from_str(&manifest_text).unwrap();
+        let included = manifest["included"].as_array().unwrap();
+        assert!(
+            included
+                .iter()
+                .any(|entry| entry.as_str() == Some(".deep_agents/schedules.db"))
+        );
+        let excluded = manifest["excluded"].as_array().unwrap();
+        assert!(
+            excluded
+                .iter()
+                .any(|entry| entry.as_str() == Some(".deep_agents/jobs.db"))
+        );
+        assert!(excluded.iter().any(|entry| entry.as_str() == Some(".env")));
     }
 
     #[test]

@@ -72,6 +72,37 @@ pub struct StoredMessage {
     pub content: String,
 }
 
+/// Consistent snapshot of a standalone SQLite database (schedules, group
+/// state, or any other store without an exposed pool). Uses `VACUUM INTO` so
+/// the copy is valid even while the source is live.
+pub async fn vacuum_sqlite(src: &Path, dest: &Path) -> Result<(), StoreError> {
+    if !src.is_file() {
+        return Err(StoreError::Invalid(format!(
+            "database not found: {}",
+            src.display()
+        )));
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let _ = tokio::fs::remove_file(dest).await;
+    let options = SqliteConnectOptions::new()
+        .filename(src)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let dest_text = dest.to_string_lossy().replace('\'', "''");
+    let sql = format!("VACUUM INTO '{dest_text}'");
+    let result = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
+        .execute(&pool)
+        .await;
+    pool.close().await;
+    result?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ChatStore {
     pool: SqlitePool,

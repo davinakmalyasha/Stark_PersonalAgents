@@ -33,6 +33,23 @@ fn virtual_name(workspace_id: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// True when two paths point at the same folder. Worktree runs deliberately
+/// differ from the registered project folder.
+fn same_path(left: &Path, right: &str) -> bool {
+    let left = std::path::absolute(left).unwrap_or_else(|_| left.to_path_buf());
+    let right =
+        std::path::absolute(Path::new(right)).unwrap_or_else(|_| std::path::PathBuf::from(right));
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 fn folder_for(record: Option<&stark_store::WorkspaceRecord>, workspace: &Path) -> String {
     if let Some(rel) = record
         .and_then(|record| record.rel.as_deref())
@@ -65,14 +82,19 @@ pub fn render(harness_root: &Path, workspace_id: &str, workspace: &Path) -> Stri
                 .map(|name| name.to_string_lossy().to_string())
         })
         .unwrap_or_else(|| "workspace".to_string());
-    let status = if record.is_none() && virtual_name(workspace_id).is_some() {
+    let worktree = record
+        .as_ref()
+        .is_some_and(|record| !record.path.is_empty() && !same_path(workspace, &record.path));
+    let status = if worktree {
+        "worktree"
+    } else if record.is_none() && virtual_name(workspace_id).is_some() {
         "virtual"
     } else if workspace.is_dir() {
         "ready"
     } else {
         "missing"
     };
-    let folder = if record.is_none() && virtual_name(workspace_id).is_some() {
+    let folder = if worktree || (record.is_none() && virtual_name(workspace_id).is_some()) {
         ".".to_string()
     } else {
         folder_for(record.as_ref(), workspace)
@@ -137,5 +159,22 @@ mod tests {
         assert!(rendered.contains("name=\"General\""));
         assert!(rendered.contains("status=\"virtual\""));
         assert!(rendered.contains("<folder>.</folder>"));
+    }
+
+    #[test]
+    fn worktree_run_is_distinct_from_the_registry_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let registry = WorkspaceRegistry::new(dir.path());
+        let record = registry
+            .add(base.to_string_lossy().as_ref(), "project")
+            .unwrap();
+        let rendered = render(dir.path(), &record.id, &worktree);
+        assert!(rendered.contains("status=\"worktree\""));
+        assert!(rendered.contains("<folder>.</folder>"));
+        assert!(!rendered.contains(&worktree.to_string_lossy().to_string()));
     }
 }

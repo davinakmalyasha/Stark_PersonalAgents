@@ -390,23 +390,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             prompt.push_str("\n\n");
             prompt.push_str(&instructions);
         }
-        if stark_store::memory_enabled()
-            && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
-            && let Some(index) = memory
-                .index(&ctx.workspace_id, stark_store::memory_max_chars())
-                .await
+        if let Some(memory) =
+            crate::prompt::memory_block(ctx.store.harness_root(), &ctx.workspace_id).await
         {
-            prompt.push_str(
-                "
-
-[WORKSPACE MEMORY]
-",
-            );
-            prompt.push_str(&index);
-            prompt.push_str(
-                "
-Memory is a hint, not the source of truth. Verify current code.              Use the memory tool (action=\"read\") for topic details.",
-            );
+            prompt.push_str("\n\n");
+            prompt.push_str(&memory);
         }
         if mode == "plan" {
             prompt.push_str(

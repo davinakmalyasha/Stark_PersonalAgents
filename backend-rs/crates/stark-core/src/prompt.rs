@@ -58,6 +58,27 @@ fn platform_label() -> &'static str {
     }
 }
 
+/// Compact workspace memory index, shared by every agent scope.
+///
+/// Memory is a hint, not the source of truth, so it is worded as guidance and
+/// kept bounded. Returns `None` when memory is disabled or the workspace has
+/// nothing recorded yet.
+pub async fn memory_block(harness_root: &std::path::Path, workspace_id: &str) -> Option<String> {
+    if !stark_store::memory_enabled() {
+        return None;
+    }
+    let memory = stark_store::MemoryStore::open(harness_root).await.ok()?;
+    let index = memory
+        .index(workspace_id, stark_store::memory_max_chars())
+        .await?;
+    let mut block = String::from("[WORKSPACE MEMORY]\n");
+    block.push_str(&index);
+    block.push_str(
+        "\nMemory is a hint, not the source of truth. Verify current code. Use the memory tool (action=\"read\") for topic details.",
+    );
+    Some(block)
+}
+
 /// Inputs for one agent's system prompt.
 pub struct AgentPrompt<'a> {
     pub workspace: &'a std::path::Path,
@@ -126,6 +147,10 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
     ));
     prompt.push('\n');
     prompt.push_str(workspace_state::USAGE_HINT);
+    if let Some(memory) = memory_block(harness_root, workspace_id).await {
+        prompt.push_str("\n\n");
+        prompt.push_str(&memory);
+    }
     // Mode- and depth-varying sections stay after the stable prefix.
     if mode == "plan" {
         prompt.push_str("\n\n");

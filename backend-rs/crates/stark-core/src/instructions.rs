@@ -93,7 +93,12 @@ pub fn load(harness_root: &Path, workspace: &Path) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    let mut out = String::from("[PROJECT INSTRUCTIONS]\n");
+    let mut out = String::from(
+        "[PROJECT INSTRUCTIONS]\n\
+         Scope: each file applies to the directory tree rooted at the folder that contains it. \
+         Files closer to the workspace override earlier guidance. \
+         Direct system, developer, and user instructions take precedence over these files.\n",
+    );
     for (index, part) in parts.iter().enumerate() {
         if index > 0 {
             out.push_str("\n\n--- project-doc ---\n\n");
@@ -131,6 +136,8 @@ mod tests {
         assert!(text.contains("## AGENTS.md"));
         assert!(text.contains("## src/AGENTS.override.md"));
         assert!(text.contains("## src/nested/AGENTS.md"));
+        assert!(text.contains("Files closer to the workspace override earlier guidance"));
+        assert!(text.contains("Direct system, developer, and user instructions take precedence"));
         assert!(!text.contains(&root.to_string_lossy().to_string()));
     }
 

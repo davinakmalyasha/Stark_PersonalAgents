@@ -87,56 +87,73 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
     .with_children(children)
 }
 
+const VIRTUAL_WORKSPACE_IDS: [&str; 4] = ["_general", "_house", "_personal", "_dfd"];
+
+/// Exact identity only. Substring matching silently routes work to the wrong
+/// project when names overlap, so an ambiguous name returns the candidate ids
+/// instead of a guess.
+fn match_record<'a>(
+    records: &'a [stark_store::WorkspaceRecord],
+    query: &str,
+) -> Result<Option<&'a stark_store::WorkspaceRecord>, String> {
+    let query = query.trim();
+    if let Some(record) = records
+        .iter()
+        .find(|record| record.id.eq_ignore_ascii_case(query))
+    {
+        return Ok(Some(record));
+    }
+    let mut matches = records
+        .iter()
+        .filter(|record| record.name.eq_ignore_ascii_case(query));
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    let rest: Vec<_> = matches.collect();
+    if rest.is_empty() {
+        return Ok(Some(first));
+    }
+    let mut ids: Vec<&str> = std::iter::once(first.id.as_str())
+        .chain(rest.iter().map(|record| record.id.as_str()))
+        .collect();
+    ids.sort_unstable();
+    Err(format!(
+        "Error: workspace name '{query}' is ambiguous. Retry with workspace_id (one of: {}).",
+        ids.join(", ")
+    ))
+}
+
 fn resolve_target(ctx: &RunContext, item: &JobItem) -> Result<(String, String), String> {
     let harness = ctx.store.harness_root();
     let registry = WorkspaceRegistry::new(harness);
-    if !item.workspace.trim().is_empty() {
-        let query = item.workspace.trim();
-        if let Some(record) = registry
-            .get(query)
-            .or_else(|| registry.find_by_path(query))
-            .or_else(|| {
-                registry.list().into_iter().find(|workspace| {
-                    workspace.name.eq_ignore_ascii_case(query)
-                        || workspace.id.eq_ignore_ascii_case(query)
-                })
-            })
-        {
-            return Ok((record.id, record.path));
-        }
+    let query = if !item.workspace.trim().is_empty() {
+        item.workspace.trim()
+    } else if !item.project.trim().is_empty() {
+        item.project.trim()
+    } else {
+        ""
+    };
+    if !query.is_empty() {
         // Virtual workspaces (_general, _house, ...) have no registry entry.
-        if query.starts_with('_') {
-            let path = if query == ctx.workspace_id {
+        if let Some(virtual_id) = VIRTUAL_WORKSPACE_IDS
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(query))
+        {
+            let path = if virtual_id.eq_ignore_ascii_case(&ctx.workspace_id) {
                 ctx.workspace.to_string_lossy().to_string()
             } else {
                 harness.to_string_lossy().to_string()
             };
-            return Ok((query.to_string(), path));
+            return Ok((virtual_id.to_string(), path));
         }
-        // A raw filesystem path is also acceptable.
-        if std::path::Path::new(query).is_dir() {
-            let id = ctx.store.workspace_id_for_path(query);
-            return Ok((id, query.to_string()));
-        }
-        return Err(format!("Error: unknown workspace '{}'", item.workspace));
-    }
-    if !item.project.trim().is_empty() {
-        let query = item.project.trim().to_ascii_lowercase();
-        let mut matches: Vec<_> = registry
-            .list()
-            .into_iter()
-            .filter(|workspace| {
-                workspace.name.to_ascii_lowercase().contains(&query)
-                    || workspace.id.to_ascii_lowercase().contains(&query)
-                    || workspace.path.to_ascii_lowercase().contains(&query)
-            })
-            .collect();
-        if matches.is_empty() {
-            return Err(format!("Error: unknown project '{}'", item.project));
-        }
-        matches.sort_by_key(|workspace| workspace.name.len());
-        let record = matches.remove(0);
-        return Ok((record.id, record.path));
+        let records = registry.list();
+        return match match_record(&records, query) {
+            Ok(Some(record)) => Ok((record.id.clone(), record.path.clone())),
+            Ok(None) => Err(format!(
+                "Error: unknown workspace '{query}'. Use a workspace id or an exact name."
+            )),
+            Err(error) => Err(error),
+        };
     }
     match item.agent.key {
         "house" => Ok((
@@ -415,5 +432,49 @@ mod tests {
         let prompt = job_prompt(&parsed[0]);
         assert!(prompt.contains("Expected outcome:\nA working build"));
         assert!(prompt.contains("Acceptance criteria:\nTests pass"));
+    }
+
+    fn record(id: &str, name: &str) -> stark_store::WorkspaceRecord {
+        stark_store::WorkspaceRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("C:/projects/{id}"),
+            root: None,
+            rel: None,
+            repo: None,
+            branch: None,
+            added_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolves_exact_id_before_name() {
+        let records = vec![record("ws-1", "api"), record("ws-2", "api-v2")];
+        assert_eq!(
+            match_record(&records, "WS-1")
+                .unwrap()
+                .map(|record| record.id.as_str()),
+            Some("ws-1")
+        );
+        assert_eq!(
+            match_record(&records, "api")
+                .unwrap()
+                .map(|record| record.id.as_str()),
+            Some("ws-1")
+        );
+    }
+
+    #[test]
+    fn ambiguous_names_list_candidate_ids() {
+        let records = vec![record("ws-1", "api"), record("ws-2", "API")];
+        let error = match_record(&records, "api").unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("ws-1") && error.contains("ws-2"), "{error}");
+    }
+
+    #[test]
+    fn unknown_queries_do_not_substring_match() {
+        let records = vec![record("ws-1", "api-gateway")];
+        assert!(match_record(&records, "gateway").unwrap().is_none());
     }
 }

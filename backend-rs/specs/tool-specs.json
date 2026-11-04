@@ -1256,7 +1256,13 @@
         "properties": {
           "action": {
             "type": "string",
-            "enum": ["create", "clone", "list", "info", "remove"],
+            "enum": [
+              "create",
+              "clone",
+              "list",
+              "info",
+              "remove"
+            ],
             "description": "create: new folder/repo or register path. clone: re-clone a missing registered workspace (needs its stored repo). list/info/remove as named."
           },
           "name": {
@@ -1430,11 +1436,11 @@
                 },
                 "project": {
                   "type": "string",
-                  "description": "Registered project name (fuzzy match, e.g. 'my-app'). Set this INSTEAD of workspace/chat_id to continue the project's durable Dev session in its own project chat — no new tab is created. Only with agent Dev (or omitted)."
+                  "description": "Registered project id or exact name (no fuzzy matching). Set this INSTEAD of workspace/chat_id to continue the project's durable Dev session in its own project chat — no new tab is created. Only with agent Dev (or omitted)."
                 },
                 "workspace": {
                   "type": "string",
-                  "description": "Workspace id, folder path, or name. Omit to use the default: current project for Dev, General workspace for General, House workspace for House."
+                  "description": "Workspace id or exact name. An ambiguous name returns the candidate ids instead of guessing. Omit to use the default: current project for Dev, General workspace for General, House workspace for House."
                 },
                 "images": {
                   "type": "array",

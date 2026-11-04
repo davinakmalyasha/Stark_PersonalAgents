@@ -3,7 +3,9 @@
 # The VPS never compiles — it downloads this artifact and runs it.
 #
 # Trigger: manual, or pushes to master that touch backend/frontend.
-# Runner matches the VPS OS (Ubuntu 26.04) so glibc is compatible.
+# Runner is Ubuntu 24.04: its glibc is older than the VPS's 26.04, and glibc
+# is forward-compatible — so the binary runs on 26.04. (Building on 26.04
+# would break the other way.) 24.04 is also the guaranteed runner label.
 
 name: build-linux
 
@@ -22,7 +24,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

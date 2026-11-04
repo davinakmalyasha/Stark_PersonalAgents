@@ -29,6 +29,8 @@ if (-not (Test-Path $archive)) { throw "artifact missing: $archive" }
 Write-Host "==> upload to ${User}@${VpsHost}:$Port"
 scp -P $Port $archive "${User}@${VpsHost}:/root/stark-linux-x86_64.tar.gz"
 scp -P $Port (Join-Path $PSScriptRoot "deploy-vps.sh") "${User}@${VpsHost}:/opt/stark/deploy-vps.sh"
+scp -P $Port (Join-Path $PSScriptRoot "restore-drill.sh") "${User}@${VpsHost}:/opt/stark/restore-drill.sh"
+scp -P $Port (Join-Path $PSScriptRoot "verify-cloud.sh") "${User}@${VpsHost}:/opt/stark/verify-cloud.sh"
 
 Write-Host "==> deploy (drain-safe, auto-rollback)"
 ssh -p $Port "${User}@${VpsHost}" "bash /opt/stark/deploy-vps.sh /root/stark-linux-x86_64.tar.gz"

@@ -113,7 +113,7 @@ prefix. The date is day-precision so it does not break the cache every turn.
 - `ds_fs`, `ds_shell`, `ds_session`, `skills`, and `ds_web` unit tests cover the
   core behavior, including `read` image inline, `job` actions, and the
   plan-review marker.
-- `codex_agents` tests cover spawn/list/message/close and the depth limit.
+- `agent_tools` tests cover spawn/list/message/close and the depth limit.
 - `stark-core` plan test covers the `[PLAN APPROVED]` -> build flip.
-- `deepseek_prompt` tests cover identity, persona, OpenCode sections,
-  autonomy/safety lines, skills, plan text, and stable-before-volatile order.
+- `prompt` tests cover identity, persona, harness sections, autonomy/safety
+  lines, skills, plan text, and stable-before-volatile order.

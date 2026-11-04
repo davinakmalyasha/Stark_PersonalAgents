@@ -141,7 +141,7 @@ isolation or read-only subagent default.
 | Session | `ds_session` | `todo_write`, `ask_user_question` (plan-review approval flips plan to build) |
 | Web | `ds_web` | `web_search`, `web_fetch` |
 | Skills | `skills` | `skill` |
-| Delegation | `stark-core::codex_agents` | `spawn_agent`, `message_agent` (queue or wake), `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
+| Delegation | `stark-core::agent_tools` | `spawn_agent`, `message_agent` (queue or wake), `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
 | Files v1 | `read`, `edit`, `search`, `changes` | `read_file`, `edit_file`, `search_code`, `files_changed` |
 | Shell | `command` | `run_command` (foreground, background sessions, process actions) |
 | Plans | `update_plan`, `ask` | `update_plan`, `ask_user` |

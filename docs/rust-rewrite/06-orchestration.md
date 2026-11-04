@@ -65,7 +65,7 @@ Legacy v1:
 - Level-2 subagents are read-only unless the parent passes `write_access`
   (nested worktree).
 
-Developer v2 (`stark-core::codex_agents`, Pi-simplified):
+Developer v2 (`stark-core::agent_tools`, simplified):
 
 - `spawn_agent`, `message_agent` (queue or wake), `wait_agent`,
   `list_agents`, `interrupt_agent`, `close_agent`.

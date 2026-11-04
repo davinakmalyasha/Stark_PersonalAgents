@@ -92,6 +92,35 @@ per file from the server API. Checkpoints are local safety data: they live under
 the workspace's `.deep_agents/snapshots/` and are not part of the portable
 export.
 
+### Rollout log (canonical trace)
+
+Every chat has one append-only JSONL rollout at
+`<harness>/.deep_agents/rollouts/YYYY/MM/DD/rollout-<timestamp>-<chat_id>.jsonl`.
+Each line is `{"timestamp","ordinal","type","payload"}` with Codex-compatible
+wire names: `session_meta`, `turn_context`, `response_item` (`message`,
+`reasoning`, `function_call`, `function_call_output`), `event_msg` (`error`,
+`warning`, `turn_started`, `turn_complete`), `compacted`, and
+`token_usage_record`.
+
+The rollout is written as work happens: user turns, reasoning bursts,
+assistant text, tool calls/results, usage, compaction, and errors/warnings.
+A failure records the partial text and reasoning first, then an `error` event;
+the `chats.db` projection keeps the same order with an `error` role message
+(the UI renders it inline, never replacing history). Reasoning is durable, not
+SSE-only, and `metadata_json` is persisted so reloads show thinking and the
+timeline.
+
+Resume loads the rollout (legacy `sessions/*.jsonl` is the fallback). A
+truncated final line is ignored and unknown item types are skipped. Unmatched
+tool calls get a synthetic error output on `resume_agent` so the next turn
+never sends an unanswered call. Request retries (default 4) and stream retries
+(default 5) use `Retry-After` when present, otherwise 200ms exponential
+backoff with jitter; connection growth is 5s→60s with a `Reconnecting…`
+warning. Stream idle defaults to 300s (`STARK_STREAM_IDLE_TIMEOUT_SEC`).
+`GET /api/stream/{chat_id}` accepts `Last-Event-ID` (a rollout ordinal) and
+replays later items before attaching live. Rollouts are part of the portable
+export.
+
 ## Deploy (drain-safe, auto-rollback)
 
 ```powershell

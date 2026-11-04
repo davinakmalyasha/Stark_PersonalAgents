@@ -13,6 +13,7 @@ mod canvas;
 mod groups;
 mod jobs;
 mod memory;
+pub mod rollout;
 mod schedules;
 mod workspaces;
 pub use agents::{AgentRecord, AgentStore};
@@ -214,11 +215,70 @@ impl ChatStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rollouts (
+                chat_id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                last_ordinal INTEGER NOT NULL DEFAULT 0,
+                parent_chat_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_agent_notes_scope ON agent_notes(scope_type, scope_id)",
         )
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn record_rollout(
+        &self,
+        chat_id: &str,
+        path: &str,
+        last_ordinal: i64,
+        parent_chat_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        validate_chat_id(chat_id)?;
+        let now = now_iso();
+        sqlx::query(
+            r#"
+            INSERT INTO rollouts (chat_id, path, last_ordinal, parent_chat_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                path = excluded.path,
+                last_ordinal = excluded.last_ordinal,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(chat_id)
+        .bind(path)
+        .bind(last_ordinal)
+        .bind(parent_chat_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn rollout_info(&self, chat_id: &str) -> Result<Option<Value>, StoreError> {
+        validate_chat_id(chat_id)?;
+        let row = sqlx::query("SELECT chat_id, path, last_ordinal FROM rollouts WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| {
+            json!({
+                "chat_id": row.get::<String, _>("chat_id"),
+                "path": row.get::<String, _>("path"),
+                "last_ordinal": row.get::<i64, _>("last_ordinal"),
+            })
+        }))
     }
 
     pub fn workspace_id_for_path(&self, workspace_path: &str) -> String {
@@ -429,12 +489,28 @@ impl ChatStore {
         content: &str,
         is_trace: bool,
     ) -> Result<String, StoreError> {
+        self.append_message_with_metadata(chat_id, role, content, is_trace, None)
+            .await
+    }
+
+    pub async fn append_message_with_metadata(
+        &self,
+        chat_id: &str,
+        role: &str,
+        content: &str,
+        is_trace: bool,
+        metadata: Option<&Value>,
+    ) -> Result<String, StoreError> {
         validate_chat_id(chat_id)?;
         let id = Uuid::new_v4().to_string();
         let now = now_iso();
+        let metadata_text = metadata
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Invalid(e.to_string()))?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO messages (id, chat_id, role, content, timestamp, is_trace, metadata_json) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO messages (id, chat_id, role, content, timestamp, is_trace, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(chat_id)
@@ -442,6 +518,7 @@ impl ChatStore {
         .bind(content)
         .bind(&now)
         .bind(if is_trace { 1 } else { 0 })
+        .bind(metadata_text)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -1190,7 +1267,9 @@ impl ChatStore {
         content: &str,
         metadata: Option<&Value>,
     ) -> Result<Value, StoreError> {
-        let id = self.append_message(chat_id, role, content, false).await?;
+        let id = self
+            .append_message_with_metadata(chat_id, role, content, false, metadata)
+            .await?;
         let mut message = json!({
             "id": id,
             "role": role,
@@ -1838,5 +1917,63 @@ mod tests {
         let raw = tokio::fs::read_to_string(path).await.unwrap();
         assert!(raw.contains("\"type\":\"session\""));
         assert!(raw.contains("\"role\":\"user\""));
+    }
+
+    #[tokio::test]
+    async fn message_metadata_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        store
+            .ensure_chat(
+                "chat-meta",
+                "_general",
+                dir.path().to_string_lossy().as_ref(),
+                "mock",
+                "Hello",
+            )
+            .await
+            .unwrap();
+        let metadata = json!({
+            "thinking": "partial reasoning",
+            "liveTimeline": [{"kind": "reasoning", "text": "partial reasoning"}],
+            "stopped": true,
+        });
+        store
+            .append_message_with_metadata(
+                "chat-meta",
+                "assistant",
+                "partial",
+                false,
+                Some(&metadata),
+            )
+            .await
+            .unwrap();
+        let chat = store.get_chat("chat-meta").await.unwrap().unwrap();
+        let messages = chat["messages"].as_array().cloned().unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["metadata"]["thinking"], "partial reasoning");
+        assert_eq!(messages[0]["metadata"]["stopped"], true);
+        // History projection excludes trace-only fields but keeps content.
+        let history = store.history("chat-meta", 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "partial");
+    }
+
+    #[tokio::test]
+    async fn rollout_index_records_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        store
+            .record_rollout(
+                "chat-roll",
+                ".deep_agents/rollouts/chat-roll.jsonl",
+                7,
+                None,
+            )
+            .await
+            .unwrap();
+        let info = store.rollout_info("chat-roll").await.unwrap().unwrap();
+        assert_eq!(info["last_ordinal"], 7);
+        assert!(info["path"].as_str().unwrap().contains("chat-roll.jsonl"));
     }
 }

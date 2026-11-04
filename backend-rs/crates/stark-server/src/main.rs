@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -1757,6 +1757,47 @@ async fn agent_loop(state: ServerState) {
         && count > 0
     {
         tracing::info!("recovered {count} interrupted agent(s)");
+        // The turn trace stays: mark each interrupted agent's rollout so
+        // resume shows the interruption instead of silent history.
+        if let Ok(interrupted) = store.list_interrupted().await {
+            for agent in interrupted {
+                if let Some(path) =
+                    stark_store::rollout::find_rollout(&state.harness_root, &agent.chat_id)
+                {
+                    let lines = stark_store::rollout::read_rollout(&path);
+                    let needs_warning = !lines.iter().any(|line| {
+                        matches!(
+                            &line.item,
+                            stark_store::rollout::RolloutItem::EventMsg {
+                                payload: stark_store::rollout::EventMsgPayload::TurnComplete { .. }
+                                    | stark_store::rollout::EventMsgPayload::Error { .. },
+                            }
+                        )
+                    });
+                    if needs_warning {
+                        let mut writer = match stark_store::rollout::RolloutWriter::open(
+                            &state.harness_root,
+                            &agent.chat_id,
+                            &agent.workspace_id,
+                            std::path::Path::new(&agent.path),
+                            &agent.model,
+                        )
+                        .await
+                        {
+                            Ok(writer) => writer,
+                            Err(_) => continue,
+                        };
+                        let _ = writer
+                            .append(stark_store::rollout::RolloutItem::EventMsg {
+                                payload: stark_store::rollout::EventMsgPayload::Warning {
+                                    message: "turn interrupted (server restart); resume continues from the last recorded event".to_string(),
+                                },
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
     }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -2044,23 +2085,104 @@ fn spawn_canvas_notification(state: ServerState, chat_id: String, report: String
 async fn stream_handler(
     State(state): State<ServerState>,
     Path(chat_id): Path<String>,
+    headers: HeaderMap,
 ) -> Sse<SseStream> {
     let hello = Event::default()
         .event("hello")
         .data(json!({"chat_id": chat_id}).to_string());
+    // Last-Event-ID replay: the client sends the last rollout ordinal it
+    // processed. Everything after it is replayed from the canonical log
+    // before the live stream attaches, so a dropped phone connection loses
+    // nothing.
+    let replay_events: Vec<Result<Event, Infallible>> = replay_after(&state, &chat_id, &headers)
+        .await
+        .unwrap_or_default();
     if let Some(receiver) = state.runs.subscribe(&chat_id) {
-        let head = stream::once(async move { Ok(hello) });
+        let head = stream::iter(
+            std::iter::once(Ok(hello))
+                .chain(replay_events)
+                .collect::<Vec<_>>(),
+        );
         let body = sse_stream(receiver);
         let combined = head.chain(body);
         let stream: SseStream = Box::pin(combined);
         Sse::new(stream)
     } else {
-        let done = Event::default()
+        let mut events: Vec<Result<Event, Infallible>> = vec![Ok(hello)];
+        events.extend(replay_events);
+        events.push(Ok(Event::default()
             .event("done")
-            .data(json!({"status": "complete"}).to_string());
-        let events: Vec<Result<Event, Infallible>> = vec![Ok(hello), Ok(done)];
+            .data(json!({"status": "complete"}).to_string())));
         let stream: SseStream = Box::pin(stream::iter(events));
         Sse::new(stream)
+    }
+}
+
+async fn replay_after(
+    state: &ServerState,
+    chat_id: &str,
+    headers: &HeaderMap,
+) -> Result<Vec<Result<Event, Infallible>>, String> {
+    let last: Option<u64> = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let Some(last) = last else {
+        return Ok(Vec::new());
+    };
+    let Some(path) = stark_store::rollout::find_rollout(&state.harness_root, chat_id) else {
+        return Ok(Vec::new());
+    };
+    let lines = stark_store::rollout::read_rollout(&path);
+    let mut out = Vec::new();
+    for line in lines
+        .into_iter()
+        .filter(|line| line.ordinal.unwrap_or(0) > last)
+    {
+        let ordinal = line.ordinal.unwrap_or(0).to_string();
+        let (event, data) = rollout_event(&line);
+        out.push(Ok(Event::default().event(event).id(ordinal).data(data)));
+    }
+    Ok(out)
+}
+
+fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, String) {
+    use stark_store::rollout::{EventMsgPayload, ResponseItemPayload, RolloutItem};
+    match &line.item {
+        RolloutItem::ResponseItem { payload, .. } => match payload {
+            ResponseItemPayload::Message { role, content, .. } => {
+                let text = match content {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                ("delta", json!({"kind": "text", "role": role, "text": text}).to_string())
+            }
+            ResponseItemPayload::Reasoning { summary, .. } => {
+                let text = summary.first().map(|entry| entry.text.clone()).unwrap_or_default();
+                ("delta", json!({"kind": "reasoning", "text": text}).to_string())
+            }
+            ResponseItemPayload::FunctionCall { call_id, name, arguments, .. } => (
+                "delta",
+                json!({"kind": "tool_started", "tool": name, "id": call_id, "args": arguments}).to_string(),
+            ),
+            ResponseItemPayload::FunctionCallOutput { call_id, name, output, is_error } => (
+                "delta",
+                json!({"kind": "tool_finished", "tool": name, "id": call_id, "ok": !is_error, "preview": output.chars().take(300).collect::<String>()}).to_string(),
+            ),
+        },
+        RolloutItem::EventMsg { payload } => match payload {
+            EventMsgPayload::Error { message, .. } => ("error", json!({"message": message}).to_string()),
+            EventMsgPayload::Warning { message } => ("warning", json!({"message": message}).to_string()),
+            EventMsgPayload::TurnStarted { turn_id } => ("turn_started", json!({"turn_id": turn_id}).to_string()),
+            EventMsgPayload::TurnComplete { turn_id } => ("turn_complete", json!({"turn_id": turn_id}).to_string()),
+        },
+        RolloutItem::TokenUsageRecord { payload } => (
+            "delta",
+            json!({"kind": "usage", "input": payload.input_tokens, "output": payload.output_tokens}).to_string(),
+        ),
+        RolloutItem::SessionMeta { .. }
+        | RolloutItem::TurnContext { .. }
+        | RolloutItem::Compacted { .. } => ("state", json!({"kind": "rollout", "ordinal": line.ordinal}).to_string()),
     }
 }
 
@@ -3467,7 +3589,71 @@ async fn chat_handler(
     Path((_workspace_id, chat_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match state.store.get_chat(&chat_id).await {
-        Ok(Some(chat)) => Ok(Json(chat)),
+        Ok(Some(chat)) => {
+            // Opening a chat with an unfinished rollout marks the interruption
+            // once, so the trace stays complete without duplicating warnings.
+            if let Some(path) = stark_store::rollout::find_rollout(&state.harness_root, &chat_id) {
+                let lines = stark_store::rollout::read_rollout(&path);
+                let unfinished = !lines.is_empty()
+                    && !lines.iter().any(|line| {
+                        matches!(
+                            &line.item,
+                            stark_store::rollout::RolloutItem::EventMsg {
+                                payload: stark_store::rollout::EventMsgPayload::TurnComplete { .. }
+                                    | stark_store::rollout::EventMsgPayload::Error { .. },
+                            }
+                        )
+                    });
+                let already_warned = lines.iter().any(|line| {
+                    matches!(
+                        &line.item,
+                        stark_store::rollout::RolloutItem::EventMsg {
+                            payload: stark_store::rollout::EventMsgPayload::Warning { message },
+                        } if message.contains("turn interrupted")
+                    )
+                });
+                if unfinished && !already_warned {
+                    let workspace = state
+                        .store
+                        .chat_workspace_path(&chat_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| state.harness_root.clone());
+                    let workspace_id = state
+                        .store
+                        .get_chat(&chat_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|chat| {
+                            chat.get("workspace_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    if let Ok(mut writer) = stark_store::rollout::RolloutWriter::open(
+                        &state.harness_root,
+                        &chat_id,
+                        &workspace_id,
+                        &workspace,
+                        "resumed",
+                    )
+                    .await
+                    {
+                        let _ = writer
+                            .append(stark_store::rollout::RolloutItem::EventMsg {
+                                payload: stark_store::rollout::EventMsgPayload::Warning {
+                                    message: "turn interrupted (open after crash); resume continues from the last recorded event".to_string(),
+                                },
+                            })
+                            .await;
+                    }
+                }
+            }
+            Ok(Json(chat))
+        }
         Ok(None) => Err(not_found("chat not found")),
         Err(error) => Err(bad_request(error.to_string())),
     }

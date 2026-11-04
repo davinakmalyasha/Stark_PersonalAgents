@@ -29,6 +29,7 @@ const DURABLE: &[&str] = &[
     ".deep_agents/skills",
     ".deep_agents/tasks",
     ".deep_agents/groups",
+    ".deep_agents/rollouts",
     ".deep_agents/mcp_servers.json",
     ".deep_agents/ui_state.json",
     ".deep_agents/agent_notes.json",
@@ -559,6 +560,10 @@ mod tests {
             (".deep_agents/dfd_clients.json", "[]"),
             (".deep_agents/house_state.json", "{}"),
             (".deep_agents/groups/demo/PROJECT.md", "group"),
+            (
+                ".deep_agents/rollouts/2025/05/07/rollout-2025-05-07T00-00-00-chat-1.jsonl",
+                "{\"timestamp\":\"t\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"session_id\":\"c\",\"id\":\"c\",\"timestamp\":\"t\",\"cwd\":\"%PROJECTS_ROOT%/api\",\"workspace_id\":\"ws-1\"}}",
+            ),
         ] {
             let target = harness.join(path);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -587,6 +592,7 @@ mod tests {
             ".deep_agents/house_state.json",
             ".deep_agents/schedules.db",
             ".deep_agents/groups/demo/PROJECT.md",
+            ".deep_agents/rollouts/2025/05/07/rollout-2025-05-07T00-00-00-chat-1.jsonl",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

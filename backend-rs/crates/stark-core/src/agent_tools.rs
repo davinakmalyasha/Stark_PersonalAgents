@@ -473,6 +473,10 @@ async fn resume_agent(ctx: &RunContext, args: &Value) -> Result<String, String> 
     {
         return Err(format!("agent {} could not be resumed", target.path));
     }
+    // Resume continues from the rollout: unmatched tool calls get a synthetic
+    // output so the model does not see an unanswered call.
+    crate::rollout_trace::ensure_resumable(&ctx.store, ctx.store.harness_root(), &target.chat_id)
+        .await;
     Ok(json!({"resumed": target.id, "submission_id": id}).to_string())
 }
 

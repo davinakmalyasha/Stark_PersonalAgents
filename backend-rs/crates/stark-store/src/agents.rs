@@ -526,6 +526,13 @@ impl AgentStore {
         Ok(result.rows_affected())
     }
 
+    pub async fn list_interrupted(&self) -> Result<Vec<AgentRecord>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM agents WHERE status = 'interrupted'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(row_agent).collect())
+    }
+
     pub async fn finish(
         &self,
         id: &str,

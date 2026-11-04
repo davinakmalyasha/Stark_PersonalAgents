@@ -438,6 +438,131 @@ pub enum ProviderError {
     Json(#[from] serde_json::Error),
 }
 
+impl ProviderError {
+    /// Terminal errors never retry: auth, not-found, bad request, quota,
+    /// invalid payload. Everything else (transport, stream, 408/425/429/5xx)
+    /// is transient.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::MissingApiKey | Self::Json(_) => false,
+            Self::Request(_) | Self::Transport(_) | Self::Stream(_) => true,
+            Self::HttpStatus { status, .. } => {
+                matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+            }
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !self.is_retryable()
+    }
+
+    /// Server-advised delay is read from the HTTP body when the gateway
+    /// embeds `retry_after_ms` / `retry-after`; otherwise exponential backoff
+    /// with jitter applies. Returns `None` for terminal errors.
+    pub fn retry_delay(&self, attempt: u64) -> Option<std::time::Duration> {
+        if !self.is_retryable() {
+            return None;
+        }
+        if let Self::HttpStatus { body, .. } = self
+            && let Some(delay) = parse_retry_after_ms(body)
+        {
+            return Some(delay);
+        }
+        Some(backoff_delay(attempt))
+    }
+}
+
+/// Retry budget for the HTTP handshake. Defaults match the reference
+/// implementation (4 request retries, 5 stream retries).
+pub fn request_max_retries() -> u64 {
+    std::env::var("STARK_REQUEST_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(4)
+}
+
+pub fn stream_max_retries() -> u64 {
+    std::env::var("STARK_STREAM_MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(5)
+}
+
+/// Idle timeout for SSE streams. Default 300s.
+pub fn stream_idle_timeout() -> std::time::Duration {
+    let secs = std::env::var("STARK_STREAM_IDLE_TIMEOUT_SEC")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs.max(1))
+}
+
+/// Exponential backoff starting at 200ms, doubling per attempt, ±10% jitter.
+/// Attempts 0 and 1 both use the initial delay.
+pub fn backoff_delay(attempt: u64) -> std::time::Duration {
+    let exp = 2f64.powi(attempt.saturating_sub(1) as i32);
+    let base = 200f64 * exp;
+    // Jitter without pulling in rand: hash the attempt + nanos.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as f64)
+        .unwrap_or(0.0);
+    let jitter = 0.9 + (nanos % 1000.0) / 1000.0 * 0.2;
+    std::time::Duration::from_millis((base * jitter) as u64)
+}
+
+fn first_run_ms(text: &str) -> Result<u64, std::num::ParseIntError> {
+    let mut run = String::new();
+    let mut in_run = false;
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+            in_run = true;
+        } else if in_run {
+            break;
+        }
+    }
+    run.parse::<u64>()
+}
+
+fn parse_retry_after_ms(body: &str) -> Option<std::time::Duration> {
+    let lower = body.to_ascii_lowercase();
+    for marker in [
+        "retry_after_ms",
+        "retry-after-ms",
+        "retry_after",
+        "retry-after",
+    ] {
+        if let Some(start) = lower.find(marker)
+            && let Ok(ms) = first_run_ms(&lower[start + marker.len()..])
+            && ms > 0
+            && ms < 300_000
+        {
+            // Heuristic: values under 1000 without a unit are seconds.
+            if marker.contains("ms") || ms >= 1000 {
+                return Some(std::time::Duration::from_millis(ms.min(60_000)));
+            }
+            return Some(std::time::Duration::from_secs(ms.min(60)));
+        }
+    }
+    // Bare `Retry-After: N` header value embedded in the body.
+    None
+}
+
+/// Parses an HTTP `Retry-After` header value (seconds or HTTP date).
+pub fn parse_retry_after_header(value: &str) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs.min(60)));
+    }
+    // HTTP date form: fall back to a short delay; the server deadline is
+    // enforced by the retry budget, not the clock.
+    if value.contains("GMT") {
+        return Some(std::time::Duration::from_secs(5));
+    }
+    None
+}
+
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
 #[derive(Debug, Clone, Default)]
@@ -671,7 +796,8 @@ impl Provider {
         }
 
         let headers = session_headers(&self.config, session);
-        let mut attempt = 0usize;
+        let max_attempts = request_max_retries();
+        let mut attempt = 0u64;
         let response = loop {
             let mut request = self
                 .client
@@ -680,33 +806,53 @@ impl Provider {
             for (name, value) in &headers {
                 request = request.header(*name, value);
             }
-            let response = request.json(&body).send().await.map_err(|error| {
-                if error.is_timeout() {
-                    ProviderError::Transport(format!(
-                        "Timed out connecting to {} after {}s. Check your network or the provider status.",
-                        self.config.endpoint(),
-                        15
-                    ))
-                } else if error.is_connect() {
-                    ProviderError::Transport(format!(
-                        "Cannot reach {} (connection failed). Check your network, proxy, or VPN.",
-                        self.config.endpoint()
-                    ))
-                } else {
-                    ProviderError::Transport(format!(
-                        "Connection to {} failed: {error}",
-                        self.config.endpoint()
-                    ))
+            let response = match request.json(&body).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let failure = if error.is_timeout() {
+                        ProviderError::Transport(format!(
+                            "Timed out connecting to {} after {}s. Check your network or the provider status.",
+                            self.config.endpoint(),
+                            15
+                        ))
+                    } else if error.is_connect() {
+                        ProviderError::Transport(format!(
+                            "Cannot reach {} (connection failed). Check your network, proxy, or VPN.",
+                            self.config.endpoint()
+                        ))
+                    } else {
+                        ProviderError::Transport(format!(
+                            "Connection to {} failed: {error}",
+                            self.config.endpoint()
+                        ))
+                    };
+                    if failure.is_retryable() && attempt < max_attempts {
+                        attempt += 1;
+                        tokio::time::sleep(
+                            failure
+                                .retry_delay(attempt)
+                                .unwrap_or_else(|| backoff_delay(attempt)),
+                        )
+                        .await;
+                        continue;
+                    }
+                    return Err(failure);
                 }
-            })?;
+            };
             if response.status().is_success() {
                 break response;
             }
             let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_header);
             let body_text = response.text().await.unwrap_or_default();
-            if matches!(status, 429 | 500 | 502 | 503 | 504) && attempt < 2 {
+            if matches!(status, 429 | 500 | 502 | 503 | 504 | 408 | 425) && attempt < max_attempts {
                 attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(700 * attempt as u64)).await;
+                let delay = retry_after.unwrap_or_else(|| backoff_delay(attempt));
+                tokio::time::sleep(delay).await;
                 continue;
             }
             // Low balance: ask for only what the account can cover and retry
@@ -730,23 +876,20 @@ impl Provider {
             }
             return Err(ProviderError::HttpStatus {
                 status,
-                body: friendly_status(status, &body_text, attempt + 1),
+                body: friendly_status(status, &body_text, (attempt + 1) as usize),
             });
         };
 
+        let idle = stream_idle_timeout();
         let events = response.bytes_stream().eventsource();
         let stream = async_stream::try_stream! {
             let mut events = Box::pin(events);
             loop {
                 // A stalled connection must surface as an error, not a hang.
-                let next = match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    events.next(),
-                )
-                .await
+                let next = match tokio::time::timeout(idle, events.next()).await
                 {
                     Err(_) => Err(ProviderError::Stream(
-                        "no data from the provider for 120s (stream stalled or connection lagging)".to_string(),
+                        format!("no data from the provider for {}s (stream stalled or connection lagging)", idle.as_secs()),
                     ))?,
                     Ok(None) => break,
                     Ok(Some(Err(error))) => Err(ProviderError::Stream(format!(
@@ -1170,5 +1313,64 @@ mod tests {
                 "muse-spark-1.3-contributor",
             ]
         );
+    }
+
+    #[test]
+    fn retryable_errors_retry_and_terminal_errors_do_not() {
+        let retryable = vec![
+            ProviderError::Transport("down".to_string()),
+            ProviderError::Stream("lost".to_string()),
+            ProviderError::HttpStatus {
+                status: 429,
+                body: "rate limited".to_string(),
+            },
+            ProviderError::HttpStatus {
+                status: 503,
+                body: "unavailable".to_string(),
+            },
+        ];
+        for error in retryable {
+            assert!(error.is_retryable(), "{error:?}");
+            assert!(error.retry_delay(1).is_some());
+        }
+        let terminal = vec![
+            ProviderError::MissingApiKey,
+            ProviderError::HttpStatus {
+                status: 401,
+                body: "auth".to_string(),
+            },
+            ProviderError::HttpStatus {
+                status: 400,
+                body: "bad".to_string(),
+            },
+            ProviderError::HttpStatus {
+                status: 402,
+                body: "credits".to_string(),
+            },
+        ];
+        for error in terminal {
+            assert!(!error.is_retryable(), "{error:?}");
+            assert!(error.retry_delay(1).is_none());
+        }
+    }
+
+    #[test]
+    fn retry_after_header_parses_seconds() {
+        assert_eq!(
+            parse_retry_after_header("3"),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(
+            parse_retry_after_header("120"),
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn backoff_grows_with_attempt() {
+        let first = backoff_delay(1);
+        let third = backoff_delay(3);
+        assert!(third > first);
+        assert!(first.as_millis() >= 180 && first.as_millis() <= 220);
     }
 }

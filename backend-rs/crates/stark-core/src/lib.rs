@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use stark_contract::{AppState, Delta, ServerEvent};
 use stark_providers::{
-    ChatMessage, ImagePart, Provider, ProviderEvent, ProviderSession, ToolCall, pricing_for,
+    ChatMessage, EventStream, ImagePart, Provider, ProviderEvent, ProviderSession, ToolCall,
+    pricing_for,
 };
 use stark_store::{AgentStore, ChatStore, StoreError};
 use stark_tools::{Checkpoint, PlanStore, QuestionBroker, ToolContext, ToolOutcome};
@@ -28,6 +29,7 @@ mod instructions;
 pub mod memory_agent;
 mod notes;
 mod prompt;
+mod rollout_trace;
 mod schedules;
 mod workspace_state;
 mod workspaces;
@@ -304,6 +306,52 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             &prompt,
         )
         .await?;
+
+    // Canonical trace: one rollout file per chat. Open (or resume) first so
+    // every subsequent event is recorded, even when the provider fails.
+    let mut rollout = stark_store::rollout::RolloutWriter::open(
+        ctx.store.harness_root(),
+        &ctx.chat_id,
+        &ctx.workspace_id,
+        &ctx.workspace,
+        &ctx.model,
+    )
+    .await
+    .ok();
+    if let Some(writer) = rollout.as_mut() {
+        let relative = writer.relative_path(ctx.store.harness_root());
+        let _ = ctx
+            .store
+            .record_rollout(&ctx.chat_id, &relative, 0, None)
+            .await;
+        // A previous run that never recorded completion left an interrupted
+        // turn. Mark it once so resume does not silently continue history.
+        let lines = stark_store::rollout::read_rollout(writer.path());
+        let interrupted = !lines.is_empty()
+            && !lines.iter().any(|line| {
+                matches!(
+                    &line.item,
+                    stark_store::rollout::RolloutItem::EventMsg {
+                        payload: stark_store::rollout::EventMsgPayload::TurnComplete { .. }
+                            | stark_store::rollout::EventMsgPayload::Error { .. },
+                    }
+                )
+            });
+        if interrupted {
+            rollout_trace::record_warning(
+                &ctx.store,
+                writer,
+                &ctx.chat_id,
+                "turn interrupted (server restart or crash); resuming from the last recorded event",
+            )
+            .await;
+        }
+    }
+    let turn_id = format!("turn-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    if let Some(writer) = rollout.as_mut() {
+        rollout_trace::record_turn(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model, true)
+            .await;
+    }
     let plan_store = PlanStore::new(ctx.store.harness_root().to_path_buf());
     let mode = ctx
         .store
@@ -332,6 +380,9 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 json!({"type": "message", "role": "user", "content": prompt.clone()}),
             )
             .await?;
+        if let Some(writer) = rollout.as_mut() {
+            rollout_trace::record_user(&ctx.store, writer, &ctx.chat_id, &prompt).await;
+        }
     }
 
     let workspace_label = ctx.workspace.to_string_lossy().to_string();
@@ -405,7 +456,15 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         prompt
     };
     let mut messages = vec![ChatMessage::system(system_prompt)];
-    if session_entries.is_empty() {
+    // Rollout is canonical when present; legacy JSONL/SQLite is the fallback.
+    let rollout_lines = rollout
+        .as_ref()
+        .map(|writer| stark_store::rollout::read_rollout(writer.path()))
+        .unwrap_or_default();
+    let rollout_messages = rollout_trace::messages_from_rollout(&rollout_lines);
+    if !rollout_messages.is_empty() {
+        messages.extend(rollout_messages);
+    } else if session_entries.is_empty() {
         for message in history {
             if message.role == "user" || message.role == "assistant" {
                 messages.push(ChatMessage {
@@ -434,7 +493,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         messages.push(ChatMessage::user_with_images(&prompt, ctx.images.clone()));
     }
     let affinity = ctx.affinity().await;
-    maybe_compact(&ctx, &mut messages, &affinity, None).await;
+    maybe_compact(&ctx, &mut messages, &affinity, None, rollout.as_mut()).await;
 
     let mut state = AppState {
         active_node: "agent".to_string(),
@@ -490,10 +549,23 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     // of silently ending the run (this truncated real work before).
     let mut length_continuations = 0usize;
     let mut carried_text = String::new();
+    let mut stream_retries = 0u64;
+    let stream_budget = stark_providers::stream_max_retries();
 
-    loop {
+    'turn_loop: loop {
         if ctx.cancel.is_cancelled() {
-            finish_aborted(&ctx, &mut state).await;
+            finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "").await;
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_turn(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &turn_id,
+                    &ctx.model,
+                    false,
+                )
+                .await;
+            }
             return Ok(());
         }
         // No wall-clock, token, or tool-call budgets: the run continues until
@@ -515,6 +587,9 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     }),
                 )
                 .await;
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_user(&ctx.store, writer, &ctx.chat_id, &message).await;
+            }
         }
 
         // Recompute per turn so `tool_search` can enable deferred MCP tools.
@@ -547,30 +622,86 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             last_continuous_screen = Some(Instant::now());
         }
 
-        let mut stream = match ctx
-            .provider
-            .stream_chat_for_session(
-                &messages,
-                &tool_specs,
-                ctx.temperature,
-                ProviderSession {
-                    session_id: &ctx.chat_id,
-                    affinity: &affinity,
-                    reasoning_effort: ctx.thinking(),
-                },
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                if !overflow_recovered && is_context_overflow(&error) {
-                    overflow_recovered = true;
-                    if force_compact(&ctx, &mut messages, &affinity).await {
-                        continue;
+        let mut stream: EventStream = {
+            let max_attempts = stark_providers::stream_max_retries();
+            let mut attempt = 0u64;
+            loop {
+                match ctx
+                    .provider
+                    .stream_chat_for_session(
+                        &messages,
+                        &tool_specs,
+                        ctx.temperature,
+                        ProviderSession {
+                            session_id: &ctx.chat_id,
+                            affinity: &affinity,
+                            reasoning_effort: ctx.thinking(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(stream) => break stream,
+                    Err(error) => {
+                        if !overflow_recovered && is_context_overflow(&error) {
+                            overflow_recovered = true;
+                            if force_compact(&ctx, &mut messages, &affinity, rollout.as_mut()).await
+                            {
+                                // Compaction rewrote history; restart the
+                                // turn with the checkpoint instead of
+                                // retrying the same oversized request.
+                                continue 'turn_loop;
+                            }
+                        }
+                        let retryable = error.is_retryable();
+                        if retryable && attempt < max_attempts {
+                            attempt += 1;
+                            let delay = error
+                                .retry_delay(attempt)
+                                .unwrap_or_else(|| stark_providers::backoff_delay(attempt));
+                            if let Some(writer) = rollout.as_mut() {
+                                rollout_trace::record_warning(
+                                    &ctx.store,
+                                    writer,
+                                    &ctx.chat_id,
+                                    &format!(
+                                        "Reconnecting ({attempt}/{max_attempts}) after provider error: {error}"
+                                    ),
+                                )
+                                .await;
+                            }
+                            ctx.emit_delta(
+                                Delta::text(format!("_Reconnecting ({attempt}/{max_attempts})…_"))
+                                    .with_agent(agent_label.clone()),
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        if let Some(writer) = rollout.as_mut() {
+                            fail_with_trace(
+                                &ctx,
+                                &mut state,
+                                writer,
+                                error.to_string(),
+                                "",
+                                "",
+                                None,
+                            )
+                            .await;
+                            rollout_trace::record_turn(
+                                &ctx.store,
+                                writer,
+                                &ctx.chat_id,
+                                &turn_id,
+                                &ctx.model,
+                                false,
+                            )
+                            .await;
+                        } else {
+                            fail(&ctx, &mut state, error.to_string()).await;
+                        }
+                        return Err(RunError::Provider(error));
                     }
                 }
-                fail(&ctx, &mut state, error.to_string()).await;
-                return Err(RunError::Provider(error));
             }
         };
 
@@ -590,14 +721,24 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         loop {
             let event = tokio::select! {
                 _ = ctx.cancel.cancelled() => {
-                    finish_aborted(&ctx, &mut state).await;
+                    finish_aborted(&ctx, &mut state, rollout.as_mut(), &text, &reasoning).await;
+                    if let Some(writer) = rollout.as_mut() {
+                        rollout_trace::record_turn(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model, false).await;
+                    }
                     return Ok(());
                 }
                 _ = tokio::time::sleep(Duration::from_secs(idle_timeout)), if idle_timeout > 0 => {
                     ctx.emit_state(&mut state);
-                    return Err(RunError::Message(format!(
+                    let message = format!(
                         "run stalled: no provider output for {idle_timeout}s (set STARK_RUN_IDLE_TIMEOUT_SEC to change)"
-                    )));
+                    );
+                    if let Some(writer) = rollout.as_mut() {
+                        fail_with_trace(&ctx, &mut state, writer, message.clone(), &text, &reasoning, Some("timeout")).await;
+                        rollout_trace::record_turn(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model, false).await;
+                    } else {
+                        fail(&ctx, &mut state, message.clone()).await;
+                    }
+                    return Err(RunError::Message(message));
                 }
                 event = stream.next() => event,
             };
@@ -648,6 +789,20 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     });
                     state.token_usage.calls.push(call.clone());
                     ctx.emit_delta(Delta::usage(call.to_string()).with_agent(agent_label.clone()));
+                    if let Some(writer) = rollout.as_mut() {
+                        rollout_trace::record_usage(
+                            &ctx.store,
+                            writer,
+                            &ctx.chat_id,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            Some(cached),
+                            Some(usage.reasoning_tokens),
+                            Some(usage.total_tokens),
+                            Some(cost),
+                        )
+                        .await;
+                    }
                 }
                 Ok(ProviderEvent::ToolCall {
                     index,
@@ -680,24 +835,110 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         retry_after_compaction = true;
                         break;
                     }
-                    fail(&ctx, &mut state, error.to_string()).await;
+                    // Transient mid-stream failures retry the turn with a
+                    // warning; the partial text/reasoning of this attempt is
+                    // discarded (never recorded) and rebuilt on retry.
+                    if error.is_retryable() && stream_retries < stream_budget {
+                        stream_retries += 1;
+                        let delay = error
+                            .retry_delay(stream_retries)
+                            .unwrap_or_else(|| stark_providers::backoff_delay(stream_retries));
+                        if let Some(writer) = rollout.as_mut() {
+                            rollout_trace::record_warning(
+                                &ctx.store,
+                                writer,
+                                &ctx.chat_id,
+                                &format!(
+                                    "Reconnecting ({stream_retries}/{stream_budget}) after stream error: {error}"
+                                ),
+                            )
+                            .await;
+                        }
+                        ctx.emit_delta(
+                            Delta::text(format!(
+                                "_Reconnecting ({stream_retries}/{stream_budget})…_"
+                            ))
+                            .with_agent(agent_label.clone()),
+                        );
+                        tokio::time::sleep(delay).await;
+                        // Discard this attempt and restart the turn. The
+                        // per-turn locals are dropped; the next iteration
+                        // rebuilds them from the same messages.
+                        continue 'turn_loop;
+                    }
+                    if let Some(writer) = rollout.as_mut() {
+                        fail_with_trace(
+                            &ctx,
+                            &mut state,
+                            writer,
+                            error.to_string(),
+                            &text,
+                            &reasoning,
+                            None,
+                        )
+                        .await;
+                        rollout_trace::record_turn(
+                            &ctx.store,
+                            writer,
+                            &ctx.chat_id,
+                            &turn_id,
+                            &ctx.model,
+                            false,
+                        )
+                        .await;
+                    } else {
+                        fail(&ctx, &mut state, error.to_string()).await;
+                    }
                     return Err(RunError::Provider(error));
                 }
             }
         }
 
         if ctx.cancel.is_cancelled() {
-            finish_aborted(&ctx, &mut state).await;
+            finish_aborted(&ctx, &mut state, rollout.as_mut(), &text, &reasoning).await;
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_turn(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &turn_id,
+                    &ctx.model,
+                    false,
+                )
+                .await;
+            }
             return Ok(());
         }
 
         if retry_after_compaction {
-            if force_compact(&ctx, &mut messages, &affinity).await {
+            if force_compact(&ctx, &mut messages, &affinity, rollout.as_mut()).await {
                 continue;
             }
             let message = "Provider rejected the context size and compaction could not reduce it."
                 .to_string();
-            fail(&ctx, &mut state, message.clone()).await;
+            if let Some(writer) = rollout.as_mut() {
+                fail_with_trace(
+                    &ctx,
+                    &mut state,
+                    writer,
+                    message.clone(),
+                    &text,
+                    &reasoning,
+                    None,
+                )
+                .await;
+                rollout_trace::record_turn(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &turn_id,
+                    &ctx.model,
+                    false,
+                )
+                .await;
+            } else {
+                fail(&ctx, &mut state, message.clone()).await;
+            }
             return Err(RunError::Message(message));
         }
 
@@ -714,7 +955,29 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     let message = format!(
                         "Run stopped: the provider returned an output-limit stop {MAX_LENGTH_CONTINUATIONS} times in a row. Split the remaining work into smaller writes."
                     );
-                    fail(&ctx, &mut state, message.clone()).await;
+                    if let Some(writer) = rollout.as_mut() {
+                        fail_with_trace(
+                            &ctx,
+                            &mut state,
+                            writer,
+                            message.clone(),
+                            &text,
+                            &reasoning,
+                            None,
+                        )
+                        .await;
+                        rollout_trace::record_turn(
+                            &ctx.store,
+                            writer,
+                            &ctx.chat_id,
+                            &turn_id,
+                            &ctx.model,
+                            false,
+                        )
+                        .await;
+                    } else {
+                        fail(&ctx, &mut state, message.clone()).await;
+                    }
                     return Err(RunError::Message(message));
                 }
                 carried_text.push_str(&text);
@@ -727,10 +990,25 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             let final_text = format!("{carried_text}{text}");
             carried_text.clear();
             length_continuations = 0;
+            if !reasoning.trim().is_empty() {
+                messages.push(ChatMessage::assistant(&reasoning));
+                if let Some(writer) = rollout.as_mut() {
+                    rollout_trace::record_reasoning(&ctx.store, writer, &ctx.chat_id, &reasoning)
+                        .await;
+                }
+            }
             if !final_text.is_empty() {
-                ctx.store
-                    .append_message(&ctx.chat_id, "assistant", &final_text, false)
-                    .await?;
+                let metadata = rollout_trace::projection_metadata(&reasoning, &[], false);
+                let _ = ctx
+                    .store
+                    .append_message_with_metadata(
+                        &ctx.chat_id,
+                        "assistant",
+                        &final_text,
+                        false,
+                        Some(&metadata),
+                    )
+                    .await;
                 ctx.store
                     .append_session_entry_for(
                         &ctx.workspace_id,
@@ -746,6 +1024,17 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         }),
                     )
                     .await?;
+                if let Some(writer) = rollout.as_mut() {
+                    rollout_trace::record_assistant(
+                        &ctx.store,
+                        writer,
+                        &ctx.chat_id,
+                        &final_text,
+                        &ctx.model,
+                        finish_reason.clone(),
+                    )
+                    .await;
+                }
             }
             let next_follow_up = ctx.follow_up.lock().unwrap().pop_front();
             if let Some(follow_up) = next_follow_up {
@@ -762,9 +1051,13 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                             &ctx.workspace_id,
                             &ctx.workspace,
                             &ctx.chat_id,
-                            json!({"type": "message", "role": "user", "content": follow_up}),
+                            json!({"type": "message", "role": "user", "content": follow_up.clone()}),
                         )
                         .await?;
+                    if let Some(writer) = rollout.as_mut() {
+                        rollout_trace::record_user(&ctx.store, writer, &ctx.chat_id, &follow_up)
+                            .await;
+                    }
                     let _ = user_id;
                 }
                 messages.push(ChatMessage::user(&follow_up));
@@ -773,6 +1066,17 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 state.state_version += 1;
                 ctx.emit_state(&mut state);
                 continue;
+            }
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_turn(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &turn_id,
+                    &ctx.model,
+                    false,
+                )
+                .await;
             }
             state.active_node = "done".to_string();
             state.outputs = json!({"agent_report": final_text});
@@ -830,6 +1134,25 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         };
         carried_text.clear();
         length_continuations = 0;
+        if !reasoning.trim().is_empty()
+            && let Some(writer) = rollout.as_mut()
+        {
+            rollout_trace::record_reasoning(&ctx.store, writer, &ctx.chat_id, &reasoning).await;
+        }
+        if !assistant_text.is_empty() {
+            messages.push(ChatMessage::assistant(&assistant_text));
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_assistant(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &assistant_text,
+                    &ctx.model,
+                    finish_reason.clone(),
+                )
+                .await;
+            }
+        }
         messages.push(ChatMessage::assistant_tool_calls(
             if assistant_text.is_empty() {
                 None
@@ -838,6 +1161,19 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             },
             tool_calls.clone(),
         ));
+        for call in &tool_calls {
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_function_call(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &call.id,
+                    &call.function.name,
+                    &call.function.arguments,
+                )
+                .await;
+            }
+        }
 
         let mut assistant_blocks = Vec::new();
         if !assistant_text.is_empty() {
@@ -960,7 +1296,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
         for (call_index, call) in tool_calls.into_iter().enumerate() {
             if ctx.cancel.is_cancelled() {
-                finish_aborted(&ctx, &mut state).await;
+                finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "").await;
+                if let Some(writer) = rollout.as_mut() {
+                    rollout_trace::record_turn(
+                        &ctx.store,
+                        writer,
+                        &ctx.chat_id,
+                        &turn_id,
+                        &ctx.model,
+                        false,
+                    )
+                    .await;
+                }
                 return Ok(());
             }
 
@@ -1158,6 +1505,18 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     }),
                 )
                 .await;
+            if let Some(writer) = rollout.as_mut() {
+                rollout_trace::record_function_output(
+                    &ctx.store,
+                    writer,
+                    &ctx.chat_id,
+                    &call.id,
+                    &call.function.name,
+                    &outcome.content,
+                    outcome.is_error,
+                )
+                .await;
+            }
 
             if outcome.is_error {
                 consecutive_errors += 1;
@@ -1167,7 +1526,29 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                 let message =
                     format!("Run stopped: {MAX_CONSECUTIVE_ERRORS} consecutive tool errors.");
-                fail(&ctx, &mut state, message.clone()).await;
+                if let Some(writer) = rollout.as_mut() {
+                    fail_with_trace(
+                        &ctx,
+                        &mut state,
+                        writer,
+                        message.clone(),
+                        &text,
+                        &reasoning,
+                        None,
+                    )
+                    .await;
+                    rollout_trace::record_turn(
+                        &ctx.store,
+                        writer,
+                        &ctx.chat_id,
+                        &turn_id,
+                        &ctx.model,
+                        false,
+                    )
+                    .await;
+                } else {
+                    fail(&ctx, &mut state, message.clone()).await;
+                }
                 return Err(RunError::Message(message));
             }
         }
@@ -1192,7 +1573,14 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 .thoughts
                 .insert(format!("step-{}", state.state_version), reasoning);
         }
-        maybe_compact(&ctx, &mut messages, &affinity, measured_tokens).await;
+        maybe_compact(
+            &ctx,
+            &mut messages,
+            &affinity,
+            measured_tokens,
+            rollout.as_mut(),
+        )
+        .await;
     }
 }
 
@@ -1289,7 +1677,12 @@ fn is_context_overflow(error: &impl std::fmt::Display) -> bool {
 }
 
 /// Compact unconditionally (reactive recovery from a context-window 400).
-async fn force_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, affinity: &str) -> bool {
+async fn force_compact(
+    ctx: &RunContext,
+    messages: &mut Vec<ChatMessage>,
+    affinity: &str,
+    writer: Option<&mut stark_store::rollout::RolloutWriter>,
+) -> bool {
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
     let Some(outcome) = compaction::compact_history(
         &ctx.provider,
@@ -1323,6 +1716,16 @@ async fn force_compact(ctx: &RunContext, messages: &mut Vec<ChatMessage>, affini
             }),
         )
         .await;
+    if let Some(writer) = writer {
+        rollout_trace::record_compacted(
+            &ctx.store,
+            writer,
+            &ctx.chat_id,
+            &outcome.summary,
+            outcome.retained_tail.clone(),
+        )
+        .await;
+    }
     true
 }
 
@@ -1331,6 +1734,7 @@ async fn maybe_compact(
     messages: &mut Vec<ChatMessage>,
     affinity: &str,
     measured_tokens: Option<usize>,
+    writer: Option<&mut stark_store::rollout::RolloutWriter>,
 ) {
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
     // Provider-reported usage beats the character estimate whenever we have it.
@@ -1386,6 +1790,16 @@ async fn maybe_compact(
     {
         tracing::warn!("failed to persist compaction for {}: {error}", ctx.chat_id);
     }
+    if let Some(writer) = writer {
+        rollout_trace::record_compacted(
+            &ctx.store,
+            writer,
+            &ctx.chat_id,
+            &outcome.summary,
+            outcome.retained_tail.clone(),
+        )
+        .await;
+    }
 }
 
 #[derive(Default)]
@@ -1395,8 +1809,32 @@ struct PartialCall {
     arguments: String,
 }
 
-async fn finish_aborted(ctx: &RunContext, state: &mut AppState) {
+async fn finish_aborted(
+    ctx: &RunContext,
+    state: &mut AppState,
+    writer: Option<&mut stark_store::rollout::RolloutWriter>,
+    partial_text: &str,
+    partial_reasoning: &str,
+) {
     let message = "Run aborted.";
+    if let Some(writer) = writer {
+        if !partial_reasoning.trim().is_empty() {
+            rollout_trace::record_reasoning(&ctx.store, writer, &ctx.chat_id, partial_reasoning)
+                .await;
+        }
+        if !partial_text.trim().is_empty() {
+            rollout_trace::record_assistant(
+                &ctx.store,
+                writer,
+                &ctx.chat_id,
+                partial_text,
+                &ctx.model,
+                None,
+            )
+            .await;
+        }
+        rollout_trace::record_warning(&ctx.store, writer, &ctx.chat_id, message).await;
+    }
     let _ = ctx
         .store
         .append_message(&ctx.chat_id, "assistant", message, false)
@@ -1416,18 +1854,65 @@ async fn finish_aborted(ctx: &RunContext, state: &mut AppState) {
     ctx.emit_delta(Delta::end("").with_agent(ctx.agent_label()));
 }
 
+async fn fail_with_trace(
+    ctx: &RunContext,
+    state: &mut AppState,
+    writer: &mut stark_store::rollout::RolloutWriter,
+    message: String,
+    partial_text: &str,
+    partial_reasoning: &str,
+    code: Option<&str>,
+) {
+    state.active_node = "error".to_string();
+    state.error = Some(message.clone());
+    ctx.emit_state(state);
+    // The partial work stays: reasoning and text are recorded first, then the
+    // error event. Nothing is replaced by the error.
+    if !partial_reasoning.trim().is_empty() {
+        rollout_trace::record_reasoning(&ctx.store, writer, &ctx.chat_id, partial_reasoning).await;
+    }
+    if !partial_text.trim().is_empty() {
+        rollout_trace::record_assistant(
+            &ctx.store,
+            writer,
+            &ctx.chat_id,
+            partial_text,
+            &ctx.model,
+            None,
+        )
+        .await;
+    }
+    rollout_trace::record_error(&ctx.store, writer, &ctx.chat_id, &message, code).await;
+    // Projection keeps the same order: partial assistant output, then the
+    // error as its own `error` role (the UI renders it inline, never as a
+    // banner that replaces history).
+    if !partial_text.trim().is_empty() || !partial_reasoning.trim().is_empty() {
+        let metadata = rollout_trace::projection_metadata(partial_reasoning, &[], true);
+        let _ = ctx
+            .store
+            .append_message_with_metadata(
+                &ctx.chat_id,
+                "assistant",
+                partial_text,
+                false,
+                Some(&metadata),
+            )
+            .await;
+    }
+    let _ = ctx
+        .store
+        .append_message(&ctx.chat_id, "error", &message, false)
+        .await;
+    ctx.emit_delta(Delta::end("").with_agent(ctx.agent_label()));
+}
+
 async fn fail(ctx: &RunContext, state: &mut AppState, message: String) {
     state.active_node = "error".to_string();
     state.error = Some(message.clone());
     ctx.emit_state(state);
     let _ = ctx
         .store
-        .append_message(
-            &ctx.chat_id,
-            "assistant",
-            &format!("Error: {message}"),
-            false,
-        )
+        .append_message(&ctx.chat_id, "error", &message, false)
         .await;
     ctx.emit_delta(Delta::end("").with_agent(ctx.agent_label()));
 }

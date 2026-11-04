@@ -100,6 +100,13 @@ pub enum ResponseItemPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnErrorDetails {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsgPayload {
     Error {
@@ -112,9 +119,32 @@ pub enum EventMsgPayload {
     },
     TurnStarted {
         turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<i64>,
     },
     TurnComplete {
         turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_agent_message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TurnErrorDetails>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed_at: Option<i64>,
+    },
+    TurnAborted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TurnErrorDetails>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed_at: Option<i64>,
     },
 }
 
@@ -296,6 +326,49 @@ pub fn find_rollout(harness_root: &Path, chat_id: &str) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// Returns the newest started turn that has no matching complete/abort.
+/// `None` means the log is settled (or has no turns at all). The recorded
+/// file is never mutated; this is derived on read.
+pub fn unfinished_turn(lines: &[RolloutLine]) -> Option<String> {
+    let mut started: Vec<String> = Vec::new();
+    let mut finished: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in lines {
+        if let RolloutItem::EventMsg { payload } = &line.item {
+            match payload {
+                EventMsgPayload::TurnStarted { turn_id, .. } => {
+                    if !finished.contains(turn_id) {
+                        started.push(turn_id.clone());
+                    }
+                }
+                EventMsgPayload::TurnComplete { turn_id, .. } => {
+                    finished.insert(turn_id.clone());
+                }
+                EventMsgPayload::TurnAborted {
+                    turn_id, reason, ..
+                } => {
+                    if let Some(turn_id) = turn_id {
+                        finished.insert(turn_id.clone());
+                    } else {
+                        // Abort without a turn id settles the newest open turn.
+                        let _ = reason;
+                        if let Some(open) = started.iter().rev().find(|id| !finished.contains(*id))
+                        {
+                            finished.insert(open.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    started.into_iter().rev().find(|id| !finished.contains(id))
+}
+
+/// Convenience for open/resume paths: settled when there is no unfinished turn.
+pub fn is_settled(lines: &[RolloutLine]) -> bool {
+    unfinished_turn(lines).is_none()
 }
 
 /// Reads a rollout file. A truncated final line (crash mid-write) is ignored;
@@ -504,5 +577,112 @@ mod tests {
             }
         }
         assert_eq!(cwd, "%PROJECTS_ROOT%/api");
+    }
+
+    fn started(turn: &str) -> RolloutLine {
+        RolloutLine {
+            timestamp: "t".to_string(),
+            ordinal: Some(0),
+            item: RolloutItem::EventMsg {
+                payload: EventMsgPayload::TurnStarted {
+                    turn_id: turn.to_string(),
+                    root_turn_id: None,
+                    started_at: None,
+                },
+            },
+        }
+    }
+
+    fn completed(turn: &str) -> RolloutLine {
+        RolloutLine {
+            timestamp: "t".to_string(),
+            ordinal: Some(1),
+            item: RolloutItem::EventMsg {
+                payload: EventMsgPayload::TurnComplete {
+                    turn_id: turn.to_string(),
+                    last_agent_message: None,
+                    error: None,
+                    started_at: None,
+                    completed_at: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn unfinished_turn_tracks_started_without_complete() {
+        assert_eq!(unfinished_turn(&[]), None);
+        assert_eq!(unfinished_turn(&[started("a")]), Some("a".to_string()));
+        assert_eq!(unfinished_turn(&[started("a"), completed("a")]), None);
+        assert_eq!(
+            unfinished_turn(&[started("a"), started("b")]),
+            Some("b".to_string())
+        );
+    }
+
+    #[test]
+    fn aborted_turn_counts_as_settled() {
+        let lines = vec![
+            started("a"),
+            RolloutLine {
+                timestamp: "t".to_string(),
+                ordinal: Some(1),
+                item: RolloutItem::EventMsg {
+                    payload: EventMsgPayload::TurnAborted {
+                        turn_id: Some("a".to_string()),
+                        reason: "cancelled".to_string(),
+                        error: None,
+                        started_at: None,
+                        completed_at: None,
+                    },
+                },
+            },
+        ];
+        assert_eq!(unfinished_turn(&lines), None);
+        assert!(is_settled(&lines));
+    }
+
+    #[test]
+    fn turn_abort_wire_round_trip() {
+        let line = RolloutLine {
+            timestamp: "2025-05-07T17:24:21.000Z".to_string(),
+            ordinal: Some(5),
+            item: RolloutItem::EventMsg {
+                payload: EventMsgPayload::TurnAborted {
+                    turn_id: Some("turn-abc".to_string()),
+                    reason: "cancelled".to_string(),
+                    error: None,
+                    started_at: Some(1),
+                    completed_at: Some(2),
+                },
+            },
+        };
+        let text = serde_json::to_string(&line).unwrap();
+        assert!(text.contains("\"type\":\"turn_aborted\""));
+        let parsed: RolloutLine = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, line);
+    }
+
+    #[test]
+    fn turn_complete_carries_error() {
+        let line = RolloutLine {
+            timestamp: "2025-05-07T17:24:21.000Z".to_string(),
+            ordinal: Some(6),
+            item: RolloutItem::EventMsg {
+                payload: EventMsgPayload::TurnComplete {
+                    turn_id: "turn-abc".to_string(),
+                    last_agent_message: Some("partial".to_string()),
+                    error: Some(TurnErrorDetails {
+                        message: "boom".to_string(),
+                        code: Some("timeout".to_string()),
+                    }),
+                    started_at: None,
+                    completed_at: None,
+                },
+            },
+        };
+        let text = serde_json::to_string(&line).unwrap();
+        let parsed: RolloutLine = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, line);
     }
 }

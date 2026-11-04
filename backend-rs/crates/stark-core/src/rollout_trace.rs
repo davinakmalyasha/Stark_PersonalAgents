@@ -82,6 +82,17 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
             | RolloutItem::Compacted { .. } => {}
         }
     }
+    // Drop trailing tool calls with no matching output (crash mid-tool).
+    // Sending an unanswered call would make the provider reject the history;
+    // the next turn re-issues the work instead. The file itself is unchanged.
+    while messages.last().is_some_and(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+    }) {
+        messages.pop();
+    }
     messages
 }
 
@@ -347,27 +358,26 @@ pub async fn record_warning(
     .await;
 }
 
-pub async fn record_turn(
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+pub async fn record_turn_started(
     store: &stark_store::ChatStore,
     writer: &mut RolloutWriter,
     chat_id: &str,
     turn_id: &str,
     model: &str,
-    started: bool,
 ) {
     record(
         store,
         writer,
         chat_id,
         RolloutItem::EventMsg {
-            payload: if started {
-                EventMsgPayload::TurnStarted {
-                    turn_id: turn_id.to_string(),
-                }
-            } else {
-                EventMsgPayload::TurnComplete {
-                    turn_id: turn_id.to_string(),
-                }
+            payload: EventMsgPayload::TurnStarted {
+                turn_id: turn_id.to_string(),
+                root_turn_id: None,
+                started_at: Some(now_secs()),
             },
         },
     )
@@ -387,63 +397,72 @@ pub async fn record_turn(
     .await;
 }
 
-/// Ensures a rollout can be resumed: unmatched function calls get a synthetic
-/// error output so the next turn does not send an unanswered tool call.
-pub async fn ensure_resumable(
+pub async fn record_turn_complete(
     store: &stark_store::ChatStore,
-    harness_root: &std::path::Path,
+    writer: &mut RolloutWriter,
     chat_id: &str,
+    turn_id: &str,
+    last_message: Option<&str>,
+    error: Option<(String, Option<String>)>,
 ) {
-    let Some(path) = stark_store::rollout::find_rollout(harness_root, chat_id) else {
-        return;
-    };
-    let lines = stark_store::rollout::read_rollout(&path);
-    if lines.is_empty() {
-        return;
-    }
-    let mut open: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    for line in &lines {
-        if let RolloutItem::ResponseItem { payload, .. } = &line.item {
-            match payload {
-                ResponseItemPayload::FunctionCall { call_id, name, .. } => {
-                    open.insert(call_id.clone(), (name.clone(), call_id.clone()));
-                }
-                ResponseItemPayload::FunctionCallOutput { call_id, .. } => {
-                    open.remove(call_id);
-                }
-                _ => {}
-            }
-        }
-    }
-    if open.is_empty() {
-        return;
-    }
-    let Ok(mut writer) =
-        RolloutWriter::open(harness_root, chat_id, "", harness_root, "resumed").await
-    else {
-        return;
-    };
-    // Re-open with the stored workspace when available.
-    for (call_id, (name, _)) in open {
-        record_function_output(
-            store,
-            &mut writer,
-            chat_id,
-            &call_id,
-            &name,
-            "Tool call was interrupted (server restart or reconnect). Re-issue it if still needed.",
-            true,
-        )
-        .await;
-    }
-    record_warning(
+    record(
         store,
-        &mut writer,
+        writer,
         chat_id,
-        "resumed after interruption; unmatched tool calls were answered synthetically",
+        RolloutItem::EventMsg {
+            payload: EventMsgPayload::TurnComplete {
+                turn_id: turn_id.to_string(),
+                last_agent_message: last_message.map(str::to_string),
+                error: error.map(|(message, code)| stark_store::rollout::TurnErrorDetails {
+                    message,
+                    code,
+                }),
+                started_at: None,
+                completed_at: Some(now_secs()),
+            },
+        },
     )
     .await;
+}
+
+pub async fn record_turn_aborted(
+    store: &stark_store::ChatStore,
+    writer: &mut RolloutWriter,
+    chat_id: &str,
+    turn_id: Option<&str>,
+    reason: &str,
+    error: Option<(String, Option<String>)>,
+) {
+    record(
+        store,
+        writer,
+        chat_id,
+        RolloutItem::EventMsg {
+            payload: EventMsgPayload::TurnAborted {
+                turn_id: turn_id.map(str::to_string),
+                reason: reason.to_string(),
+                error: error.map(|(message, code)| stark_store::rollout::TurnErrorDetails {
+                    message,
+                    code,
+                }),
+                started_at: None,
+                completed_at: Some(now_secs()),
+            },
+        },
+    )
+    .await;
+}
+
+/// Legacy wrapper removed: call `record_turn_started`, `record_turn_complete`,
+/// or `record_turn_aborted` directly so the turn lifecycle is explicit.
+/// Resume helper: the rollout file is never mutated here. Dangling tool
+/// calls are dropped on read by `messages_from_rollout`, so the next turn
+/// simply re-issues the work. Kept for call-site compatibility.
+pub async fn ensure_resumable(
+    _store: &stark_store::ChatStore,
+    _harness_root: &std::path::Path,
+    _chat_id: &str,
+) {
 }
 
 /// Metadata stored on the `chats.db` projection so reloads show the trace.
@@ -573,5 +592,64 @@ mod tests {
                 .unwrap_or("")
                 .contains("summary")
         );
+    }
+
+    #[test]
+    fn dangling_tool_call_is_dropped_on_resume() {
+        let call = RolloutLine {
+            timestamp: "t0".to_string(),
+            ordinal: Some(0),
+            item: RolloutItem::ResponseItem {
+                payload: ResponseItemPayload::FunctionCall {
+                    id: None,
+                    call_id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                metadata: None,
+            },
+        };
+        let output = RolloutLine {
+            timestamp: "t1".to_string(),
+            ordinal: Some(1),
+            item: RolloutItem::ResponseItem {
+                payload: ResponseItemPayload::FunctionCallOutput {
+                    call_id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    output: "ok".to_string(),
+                    is_error: false,
+                },
+                metadata: None,
+            },
+        };
+        // Matched pair survives.
+        let messages = messages_from_rollout(&[call.clone(), output.clone()]);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("call-1"))
+        );
+
+        // Trailing call without output is dropped so the provider never sees
+        // an unanswered tool call.
+        let dangling = RolloutLine {
+            timestamp: "t2".to_string(),
+            ordinal: Some(2),
+            item: RolloutItem::ResponseItem {
+                payload: ResponseItemPayload::FunctionCall {
+                    id: None,
+                    call_id: "call-2".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                metadata: None,
+            },
+        };
+        let messages = messages_from_rollout(&[call.clone(), output.clone(), dangling]);
+        assert!(!messages.iter().any(|m| {
+            m.tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|c| c.id == "call-2"))
+        }));
     }
 }

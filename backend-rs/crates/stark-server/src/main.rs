@@ -1757,47 +1757,9 @@ async fn agent_loop(state: ServerState) {
         && count > 0
     {
         tracing::info!("recovered {count} interrupted agent(s)");
-        // The turn trace stays: mark each interrupted agent's rollout so
-        // resume shows the interruption instead of silent history.
-        if let Ok(interrupted) = store.list_interrupted().await {
-            for agent in interrupted {
-                if let Some(path) =
-                    stark_store::rollout::find_rollout(&state.harness_root, &agent.chat_id)
-                {
-                    let lines = stark_store::rollout::read_rollout(&path);
-                    let needs_warning = !lines.iter().any(|line| {
-                        matches!(
-                            &line.item,
-                            stark_store::rollout::RolloutItem::EventMsg {
-                                payload: stark_store::rollout::EventMsgPayload::TurnComplete { .. }
-                                    | stark_store::rollout::EventMsgPayload::Error { .. },
-                            }
-                        )
-                    });
-                    if needs_warning {
-                        let mut writer = match stark_store::rollout::RolloutWriter::open(
-                            &state.harness_root,
-                            &agent.chat_id,
-                            &agent.workspace_id,
-                            std::path::Path::new(&agent.path),
-                            &agent.model,
-                        )
-                        .await
-                        {
-                            Ok(writer) => writer,
-                            Err(_) => continue,
-                        };
-                        let _ = writer
-                            .append(stark_store::rollout::RolloutItem::EventMsg {
-                                payload: stark_store::rollout::EventMsgPayload::Warning {
-                                    message: "turn interrupted (server restart); resume continues from the last recorded event".to_string(),
-                                },
-                            })
-                            .await;
-                    }
-                }
-            }
-        }
+        // The rollout file is never mutated here. An unfinished TurnStarted
+        // without a matching TurnComplete/TurnAborted is the interruption
+        // signal; resume derives it on read.
     }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -2173,8 +2135,15 @@ fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, Str
         RolloutItem::EventMsg { payload } => match payload {
             EventMsgPayload::Error { message, .. } => ("error", json!({"message": message}).to_string()),
             EventMsgPayload::Warning { message } => ("warning", json!({"message": message}).to_string()),
-            EventMsgPayload::TurnStarted { turn_id } => ("turn_started", json!({"turn_id": turn_id}).to_string()),
-            EventMsgPayload::TurnComplete { turn_id } => ("turn_complete", json!({"turn_id": turn_id}).to_string()),
+            EventMsgPayload::TurnStarted { turn_id, .. } => ("turn_started", json!({"turn_id": turn_id}).to_string()),
+            EventMsgPayload::TurnComplete { turn_id, error, last_agent_message, .. } => (
+                "turn_complete",
+                json!({"turn_id": turn_id, "error": error, "last_message": last_agent_message}).to_string(),
+            ),
+            EventMsgPayload::TurnAborted { turn_id, reason, error, .. } => (
+                "turn_aborted",
+                json!({"turn_id": turn_id, "reason": reason, "error": error}).to_string(),
+            ),
         },
         RolloutItem::TokenUsageRecord { payload } => (
             "delta",
@@ -3589,67 +3558,18 @@ async fn chat_handler(
     Path((_workspace_id, chat_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match state.store.get_chat(&chat_id).await {
-        Ok(Some(chat)) => {
-            // Opening a chat with an unfinished rollout marks the interruption
-            // once, so the trace stays complete without duplicating warnings.
-            if let Some(path) = stark_store::rollout::find_rollout(&state.harness_root, &chat_id) {
+        Ok(Some(mut chat)) => {
+            // Interruption is derived, never written: an unfinished TurnStarted
+            // without a matching TurnComplete/TurnAborted means the turn did
+            // not settle. New chats have no turns, running chats are skipped
+            // by checking the live run registry first.
+            if state.runs.subscribe(&chat_id).is_none()
+                && let Some(path) =
+                    stark_store::rollout::find_rollout(&state.harness_root, &chat_id)
+            {
                 let lines = stark_store::rollout::read_rollout(&path);
-                let unfinished = !lines.is_empty()
-                    && !lines.iter().any(|line| {
-                        matches!(
-                            &line.item,
-                            stark_store::rollout::RolloutItem::EventMsg {
-                                payload: stark_store::rollout::EventMsgPayload::TurnComplete { .. }
-                                    | stark_store::rollout::EventMsgPayload::Error { .. },
-                            }
-                        )
-                    });
-                let already_warned = lines.iter().any(|line| {
-                    matches!(
-                        &line.item,
-                        stark_store::rollout::RolloutItem::EventMsg {
-                            payload: stark_store::rollout::EventMsgPayload::Warning { message },
-                        } if message.contains("turn interrupted")
-                    )
-                });
-                if unfinished && !already_warned {
-                    let workspace = state
-                        .store
-                        .chat_workspace_path(&chat_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| state.harness_root.clone());
-                    let workspace_id = state
-                        .store
-                        .get_chat(&chat_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|chat| {
-                            chat.get("workspace_id")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_default();
-                    if let Ok(mut writer) = stark_store::rollout::RolloutWriter::open(
-                        &state.harness_root,
-                        &chat_id,
-                        &workspace_id,
-                        &workspace,
-                        "resumed",
-                    )
-                    .await
-                    {
-                        let _ = writer
-                            .append(stark_store::rollout::RolloutItem::EventMsg {
-                                payload: stark_store::rollout::EventMsgPayload::Warning {
-                                    message: "turn interrupted (open after crash); resume continues from the last recorded event".to_string(),
-                                },
-                            })
-                            .await;
-                    }
+                if let Some(turn_id) = stark_store::rollout::unfinished_turn(&lines) {
+                    chat["interrupted_turn_id"] = Value::String(turn_id);
                 }
             }
             Ok(Json(chat))

@@ -324,32 +324,69 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             .store
             .record_rollout(&ctx.chat_id, &relative, 0, None)
             .await;
-        // A previous run that never recorded completion left an interrupted
-        // turn. Mark it once so resume does not silently continue history.
+        // One-time migration: a brand-new rollout with legacy history copies
+        // the old user/assistant messages into the canonical log so the next
+        // turn still sees the conversation. The file itself is the migration;
+        // no separate command is needed. Existing rollouts are untouched.
         let lines = stark_store::rollout::read_rollout(writer.path());
-        let interrupted = !lines.is_empty()
-            && !lines.iter().any(|line| {
-                matches!(
-                    &line.item,
-                    stark_store::rollout::RolloutItem::EventMsg {
-                        payload: stark_store::rollout::EventMsgPayload::TurnComplete { .. }
-                            | stark_store::rollout::EventMsgPayload::Error { .. },
+        let is_new = lines.len() <= 1;
+        if is_new && (!history.is_empty() || !session_entries.is_empty()) {
+            if !history.is_empty() {
+                for message in &history {
+                    if message.role == "user" || message.role == "assistant" {
+                        rollout_trace::record(
+                            &ctx.store,
+                            writer,
+                            &ctx.chat_id,
+                            stark_store::rollout::RolloutItem::ResponseItem {
+                                payload: stark_store::rollout::ResponseItemPayload::Message {
+                                    id: None,
+                                    role: message.role.clone(),
+                                    content: serde_json::Value::String(message.content.clone()),
+                                    provider: None,
+                                    model: None,
+                                    stop_reason: None,
+                                },
+                                metadata: None,
+                            },
+                        )
+                        .await;
                     }
-                )
-            });
-        if interrupted {
-            rollout_trace::record_warning(
-                &ctx.store,
-                writer,
-                &ctx.chat_id,
-                "turn interrupted (server restart or crash); resuming from the last recorded event",
-            )
-            .await;
+                }
+            } else {
+                for entry in &session_entries {
+                    if entry.get("type").and_then(Value::as_str) != Some("message") {
+                        continue;
+                    }
+                    let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+                    if role != "user" && role != "assistant" {
+                        continue;
+                    }
+                    let content = entry.get("content").cloned().unwrap_or(Value::Null);
+                    rollout_trace::record(
+                        &ctx.store,
+                        writer,
+                        &ctx.chat_id,
+                        stark_store::rollout::RolloutItem::ResponseItem {
+                            payload: stark_store::rollout::ResponseItemPayload::Message {
+                                id: None,
+                                role: role.to_string(),
+                                content,
+                                provider: None,
+                                model: None,
+                                stop_reason: None,
+                            },
+                            metadata: None,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
     }
     let turn_id = format!("turn-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     if let Some(writer) = rollout.as_mut() {
-        rollout_trace::record_turn(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model, true)
+        rollout_trace::record_turn_started(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model)
             .await;
     }
     let plan_store = PlanStore::new(ctx.store.harness_root().to_path_buf());
@@ -554,18 +591,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
     'turn_loop: loop {
         if ctx.cancel.is_cancelled() {
-            finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "").await;
-            if let Some(writer) = rollout.as_mut() {
-                rollout_trace::record_turn(
-                    &ctx.store,
-                    writer,
-                    &ctx.chat_id,
-                    &turn_id,
-                    &ctx.model,
-                    false,
-                )
-                .await;
-            }
+            finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "", Some(&turn_id)).await;
             return Ok(());
         }
         // No wall-clock, token, or tool-call budgets: the run continues until
@@ -681,19 +707,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                                 &ctx,
                                 &mut state,
                                 writer,
+                                &turn_id,
                                 error.to_string(),
                                 "",
                                 "",
                                 None,
-                            )
-                            .await;
-                            rollout_trace::record_turn(
-                                &ctx.store,
-                                writer,
-                                &ctx.chat_id,
-                                &turn_id,
-                                &ctx.model,
-                                false,
                             )
                             .await;
                         } else {
@@ -721,10 +739,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         loop {
             let event = tokio::select! {
                 _ = ctx.cancel.cancelled() => {
-                    finish_aborted(&ctx, &mut state, rollout.as_mut(), &text, &reasoning).await;
-                    if let Some(writer) = rollout.as_mut() {
-                        rollout_trace::record_turn(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model, false).await;
-                    }
+                    finish_aborted(&ctx, &mut state, rollout.as_mut(), &text, &reasoning, Some(&turn_id)).await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(Duration::from_secs(idle_timeout)), if idle_timeout > 0 => {
@@ -733,8 +748,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         "run stalled: no provider output for {idle_timeout}s (set STARK_RUN_IDLE_TIMEOUT_SEC to change)"
                     );
                     if let Some(writer) = rollout.as_mut() {
-                        fail_with_trace(&ctx, &mut state, writer, message.clone(), &text, &reasoning, Some("timeout")).await;
-                        rollout_trace::record_turn(&ctx.store, writer, &ctx.chat_id, &turn_id, &ctx.model, false).await;
+                        fail_with_trace(&ctx, &mut state, writer, &turn_id, message.clone(), &text, &reasoning, Some("timeout")).await;
                     } else {
                         fail(&ctx, &mut state, message.clone()).await;
                     }
@@ -871,19 +885,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                             &ctx,
                             &mut state,
                             writer,
+                            &turn_id,
                             error.to_string(),
                             &text,
                             &reasoning,
                             None,
-                        )
-                        .await;
-                        rollout_trace::record_turn(
-                            &ctx.store,
-                            writer,
-                            &ctx.chat_id,
-                            &turn_id,
-                            &ctx.model,
-                            false,
                         )
                         .await;
                     } else {
@@ -895,18 +901,15 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         }
 
         if ctx.cancel.is_cancelled() {
-            finish_aborted(&ctx, &mut state, rollout.as_mut(), &text, &reasoning).await;
-            if let Some(writer) = rollout.as_mut() {
-                rollout_trace::record_turn(
-                    &ctx.store,
-                    writer,
-                    &ctx.chat_id,
-                    &turn_id,
-                    &ctx.model,
-                    false,
-                )
-                .await;
-            }
+            finish_aborted(
+                &ctx,
+                &mut state,
+                rollout.as_mut(),
+                &text,
+                &reasoning,
+                Some(&turn_id),
+            )
+            .await;
             return Ok(());
         }
 
@@ -921,19 +924,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                     &ctx,
                     &mut state,
                     writer,
+                    &turn_id,
                     message.clone(),
                     &text,
                     &reasoning,
                     None,
-                )
-                .await;
-                rollout_trace::record_turn(
-                    &ctx.store,
-                    writer,
-                    &ctx.chat_id,
-                    &turn_id,
-                    &ctx.model,
-                    false,
                 )
                 .await;
             } else {
@@ -960,19 +955,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                             &ctx,
                             &mut state,
                             writer,
+                            &turn_id,
                             message.clone(),
                             &text,
                             &reasoning,
                             None,
-                        )
-                        .await;
-                        rollout_trace::record_turn(
-                            &ctx.store,
-                            writer,
-                            &ctx.chat_id,
-                            &turn_id,
-                            &ctx.model,
-                            false,
                         )
                         .await;
                     } else {
@@ -1067,20 +1054,24 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 ctx.emit_state(&mut state);
                 continue;
             }
+            state.active_node = "done".to_string();
+            state.outputs = json!({"agent_report": final_text});
+            ctx.emit_state(&mut state);
             if let Some(writer) = rollout.as_mut() {
-                rollout_trace::record_turn(
+                rollout_trace::record_turn_complete(
                     &ctx.store,
                     writer,
                     &ctx.chat_id,
                     &turn_id,
-                    &ctx.model,
-                    false,
+                    if final_text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(&final_text)
+                    },
+                    None,
                 )
                 .await;
             }
-            state.active_node = "done".to_string();
-            state.outputs = json!({"agent_report": final_text});
-            ctx.emit_state(&mut state);
             if ctx.depth <= 1
                 && ctx.scope != "developer"
                 && stark_store::memory_enabled()
@@ -1296,18 +1287,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
 
         for (call_index, call) in tool_calls.into_iter().enumerate() {
             if ctx.cancel.is_cancelled() {
-                finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "").await;
-                if let Some(writer) = rollout.as_mut() {
-                    rollout_trace::record_turn(
-                        &ctx.store,
-                        writer,
-                        &ctx.chat_id,
-                        &turn_id,
-                        &ctx.model,
-                        false,
-                    )
-                    .await;
-                }
+                finish_aborted(&ctx, &mut state, rollout.as_mut(), "", "", Some(&turn_id)).await;
                 return Ok(());
             }
 
@@ -1531,19 +1511,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                         &ctx,
                         &mut state,
                         writer,
+                        &turn_id,
                         message.clone(),
                         &text,
                         &reasoning,
                         None,
-                    )
-                    .await;
-                    rollout_trace::record_turn(
-                        &ctx.store,
-                        writer,
-                        &ctx.chat_id,
-                        &turn_id,
-                        &ctx.model,
-                        false,
                     )
                     .await;
                 } else {
@@ -1815,6 +1787,7 @@ async fn finish_aborted(
     writer: Option<&mut stark_store::rollout::RolloutWriter>,
     partial_text: &str,
     partial_reasoning: &str,
+    turn_id: Option<&str>,
 ) {
     let message = "Run aborted.";
     if let Some(writer) = writer {
@@ -1834,6 +1807,15 @@ async fn finish_aborted(
             .await;
         }
         rollout_trace::record_warning(&ctx.store, writer, &ctx.chat_id, message).await;
+        rollout_trace::record_turn_aborted(
+            &ctx.store,
+            writer,
+            &ctx.chat_id,
+            turn_id,
+            "cancelled",
+            None,
+        )
+        .await;
     }
     let _ = ctx
         .store
@@ -1854,10 +1836,12 @@ async fn finish_aborted(
     ctx.emit_delta(Delta::end("").with_agent(ctx.agent_label()));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fail_with_trace(
     ctx: &RunContext,
     state: &mut AppState,
     writer: &mut stark_store::rollout::RolloutWriter,
+    turn_id: &str,
     message: String,
     partial_text: &str,
     partial_reasoning: &str,
@@ -1883,6 +1867,19 @@ async fn fail_with_trace(
         .await;
     }
     rollout_trace::record_error(&ctx.store, writer, &ctx.chat_id, &message, code).await;
+    rollout_trace::record_turn_complete(
+        &ctx.store,
+        writer,
+        &ctx.chat_id,
+        turn_id,
+        if partial_text.trim().is_empty() {
+            None
+        } else {
+            Some(partial_text)
+        },
+        Some((message.clone(), code.map(str::to_string))),
+    )
+    .await;
     // Projection keeps the same order: partial assistant output, then the
     // error as its own `error` role (the UI renders it inline, never as a
     // banner that replaces history).

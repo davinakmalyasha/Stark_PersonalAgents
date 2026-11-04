@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, MessageSquare, Pencil, Trash2, Check, Code2, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, LayoutGrid, Bot, CornerDownRight,
+  ChevronDown, Search, Pin, PinOff, LayoutGrid, Bot, CornerDownRight, Home,
 } from 'lucide-react';
 import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
@@ -91,14 +91,43 @@ function LoadMoreButton({ remaining, onClick }: { remaining: number; onClick: ()
  * dropdown — search + every chat in one list + the workspace launchers.
  * Rows support open, pin, rename and delete.
  */
+const MODE_META: Record<'general' | 'coding' | 'house', { label: string; desc: string }> = {
+  general: { label: 'Main', desc: 'Create, learn, and explore' },
+  coding: { label: 'Coding', desc: 'Build, debug, and ship' },
+  house: { label: 'House', desc: 'Manage home, tasks, and routines' },
+};
+
+function modeOf(filter: ChatsFilter): 'general' | 'coding' | 'house' {
+  if (filter === 'coding') return 'coding';
+  if (filter === 'house' || filter === 'personal') return 'house';
+  return 'general';
+}
+
 export default function HouseSidebar({
   variant = 'full',
   open, onClose, workspaces, chatsByWs,
-  activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onTogglePin,
+  activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
   onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
   onLaunchPersonal, onLaunchCoding, onLaunchHouse,
 }: Props) {
+  const [modeOpen, setModeOpen] = useState(false);
+  const modeRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!modeOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (modeRef.current && !modeRef.current.contains(e.target as Node)) setModeOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setModeOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [modeOpen]);
   const [editing, setEditing] = useState<{ sid: string; title: string } | null>(null);
   const [confirmDeleteSid, setConfirmDeleteSid] = useState<string | null>(null);
   const [deletingSid, setDeletingSid] = useState<string | null>(null);
@@ -114,7 +143,12 @@ export default function HouseSidebar({
   const [collapsedSpawns, setCollapsedSpawns] = useState<Set<string>>(new Set());
   const isPinned = (sid: string) => pinnedChats.includes(sid);
   const general = workspaces.find((w) => w.isGeneral);
-  const projects = workspaces.filter((w) => !w.isGeneral);
+  const houseWs = workspaces.find((w) => (w as { isHouse?: boolean }).isHouse);
+  // Coding folders are real project workspaces only — house/personal rooms
+  // never appear as folders (they live under the House mode).
+  const projects = workspaces.filter(
+    (w) => !w.isGeneral && !(w as { isHouse?: boolean }).isHouse && !(w as { isPersonal?: boolean }).isPersonal && !(w as { isDfd?: boolean }).isDfd,
+  );
   const withWs = (ws: WorkspaceInfo, c: ChatSummary): RowChat => ({ ...c, sid: tabId(ws.id, c.id), ws });
   const pinnedSort = useCallback(
     (rows: RowChat[]): RowChat[] =>
@@ -221,8 +255,9 @@ export default function HouseSidebar({
     let pool: RowChat[] = [];
     if (chatsFilter === 'general' && general) pool = (chatsByWs[general.id] ?? []).map((c) => withWs(general, c));
     else if (chatsFilter === 'coding') pool = projects.flatMap((ws) => (chatsByWs[ws.id] ?? []).map((c) => withWs(ws, c)));
+    else if ((chatsFilter === 'house' || chatsFilter === 'personal') && houseWs) pool = (chatsByWs[houseWs.id] ?? []).map((c) => withWs(houseWs, c));
     return pinnedSort(pool.filter((r) => (r.title || 'untitled').toLowerCase().includes(q)));
-  }, [searching, chatsFilter, general, projects, chatsByWs, q, pinnedSort]);
+  }, [searching, chatsFilter, general, projects, houseWs, chatsByWs, q, pinnedSort]);
 
   const startRename = (row: RowChat) => {
     setConfirmDeleteSid(null);
@@ -461,12 +496,19 @@ export default function HouseSidebar({
 
     if (chatsFilter === 'house' || chatsFilter === 'personal') {
       const roomLabel = chatsFilter === 'house' ? 'House' : 'Personal';
+      const roomWs = houseWs ?? workspaces.find((w) => (w as { isPersonal?: boolean }).isPersonal);
+      const roomChats = roomWs ? pinnedSort((chatsByWs[roomWs.id] ?? []).map((c) => withWs(roomWs, c))) : [];
       return (
-        <div className="flex flex-col items-center gap-2.5 text-center px-6 py-8">
-          <p className="text-[11.5px] text-zinc-600 leading-5">{roomLabel} has no chats — it's a room workspace.</p>
+        <div className="flex flex-col gap-1">
+          {roomChats.map((row) => renderRow(withParentInfo(row), false, { depth: isSpawnedChat(row) ? 1 : 0 }))}
+          {roomChats.length === 0 && (
+            <div className="flex flex-col items-center gap-2.5 text-center px-6 py-8">
+              <p className="text-[11.5px] text-zinc-600 leading-5">No house chats yet.</p>
+            </div>
+          )}
           <button
-            onClick={() => { onOpenRoom?.(chatsFilter); onClose(); }}
-            className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11.5px] text-zinc-300 hover:bg-white/[0.09] transition-colors cursor-pointer"
+            onClick={() => { onOpenRoom?.('house'); onClose(); }}
+            className="mx-3 mt-2 flex items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11.5px] text-zinc-300 hover:bg-white/[0.09] transition-colors cursor-pointer"
           >
             <ChevronRight size={12} />
             Open {roomLabel} Workspace
@@ -677,13 +719,71 @@ export default function HouseSidebar({
         }`}
         aria-label="Chat management"
       >
-        {/* ── Header: source dropdown + adaptive + (full variant only) ── */}
+        {/* ── Header: mode dropdown (Main / Coding / House) + adaptive new chat ── */}
         {variant === 'full' && (
           <div className="px-3.5 pt-4 pb-2 flex items-center gap-1.5">
-            <span className="flex-1 text-[10px] uppercase tracking-widest font-semibold text-zinc-500">Chats</span>
+            <div ref={modeRef} className="relative flex-1 min-w-0">
+              <button
+                onClick={() => setModeOpen((v) => !v)}
+                title="Switch mode"
+                aria-label="Switch mode"
+                aria-expanded={modeOpen}
+                aria-haspopup="menu"
+                className={`flex items-center gap-1.5 rounded-lg px-2 py-1.5 transition-colors cursor-pointer min-w-0 ${
+                  modeOpen ? 'bg-white/[0.07] text-white' : 'text-zinc-200 hover:bg-white/[0.05]'
+                }`}
+              >
+                <span className="truncate text-[15px] font-semibold tracking-tight">
+                  {MODE_META[modeOf(chatsFilter)].label}
+                </span>
+                <ChevronDown size={14} className={`shrink-0 text-zinc-500 transition-transform ${modeOpen ? 'rotate-180' : ''}`} />
+              </button>
+              {modeOpen && (
+                <div
+                  role="menu"
+                  aria-label="Chat mode"
+                  className="absolute left-0 top-[calc(100%+6px)] z-50 w-[248px] rounded-xl border border-white/[0.09] bg-[#15151a] shadow-2xl overflow-hidden"
+                >
+                  {(['general', 'coding', 'house'] as const).map((key) => {
+                    const active = modeOf(chatsFilter) === key;
+                    const Icon = key === 'coding' ? Code2 : key === 'house' ? Home : MessageSquare;
+                    return (
+                      <button
+                        key={key}
+                        role="menuitemradio"
+                        aria-checked={active}
+                        onClick={() => {
+                          onFilterChange?.(key);
+                          setModeOpen(false);
+                        }}
+                        className={`w-full flex items-start gap-2.5 px-3 py-2.5 text-left transition-colors cursor-pointer ${
+                          active ? 'bg-white/[0.05]' : 'hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        <Icon size={15} className={`mt-0.5 shrink-0 ${active ? 'text-zinc-100' : 'text-zinc-500'}`} />
+                        <span className="flex-1 min-w-0">
+                          <span className={`block text-[13px] font-semibold ${active ? 'text-white' : 'text-zinc-200'}`}>
+                            {MODE_META[key].label}
+                          </span>
+                          <span className="block truncate text-[11px] text-zinc-500">{MODE_META[key].desc}</span>
+                        </span>
+                        {active && <Check size={14} className="mt-1 shrink-0 text-zinc-300" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
             <button
-              onClick={() => onNewChat?.()}
-              title="New chat"
+              onClick={() => {
+                if (modeOf(chatsFilter) === 'coding' && projects.length > 0) {
+                  const first = [...projects].sort((a, b) => a.name.localeCompare(b.name))[0];
+                  onNewChatInProject?.(first.id);
+                } else {
+                  onNewChat?.();
+                }
+              }}
+              title={modeOf(chatsFilter) === 'coding' ? 'New coding chat' : modeOf(chatsFilter) === 'house' ? 'New house chat' : 'New chat'}
               aria-label="New chat"
               className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
             >

@@ -114,16 +114,39 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
     return ordered;
   }, []);
 
+  // Single error rendering: keep the red `role: 'error'` bubble, drop an
+  // agent bubble that only repeats the same failure. The backend sometimes
+  // persists the failure both as the agent's final text ("Error: …") and as
+  // a separate error message — rendering both reads as a double error.
+  const normalizeError = (text: string) => text.trim().replace(/\s+/g, ' ').toLowerCase();
+  const errorTexts = new Set(
+    orderedMessages
+      .filter((m) => m.role === 'error' && m.content.trim())
+      .map((m) => normalizeError(m.content)),
+  );
+  const dedupedMessages = orderedMessages.filter((message) => {
+    if (message.role !== 'agent' || !message.content.trim() || errorTexts.size === 0) return true;
+    const text = normalizeError(message.content);
+    if (errorTexts.has(text)) return false;
+    // Agent bubble that is just the error with an "Error:" prefix.
+    if (text.startsWith('error:')) {
+      for (const err of errorTexts) {
+        if (err.includes(text.slice(6).trim()) || text.includes(err.replace(/^error:\s*/, ''))) return false;
+      }
+    }
+    return true;
+  });
+
   // Retry: each agent message knows the last user prompt before it.
   const retryMap = useMemo(() => {
     const map: Record<string, string> = {};
     let lastUserContent = '';
-    for (const msg of orderedMessages) {
+    for (const msg of dedupedMessages) {
       if (msg.role === 'user' && msg.content) lastUserContent = msg.content;
       map[msg.id] = lastUserContent;
     }
     return map;
-  }, [orderedMessages]);
+  }, [dedupedMessages]);
 
   return (
     <div className="relative flex-1 min-h-0">
@@ -139,7 +162,7 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
           </div>
         ) : (
           <div ref={contentRef} className="max-w-[1100px] mx-auto flex flex-col justify-start" style={{ width: '100%' }}>
-            {orderedMessages.map((msg) => (
+            {dedupedMessages.map((msg) => (
               <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} onRewind={onRewind} />
             ))}
           </div>

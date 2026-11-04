@@ -28,8 +28,8 @@ mod groups;
 mod instructions;
 pub mod memory_agent;
 mod notes;
-mod projects;
 mod schedules;
+mod workspaces;
 pub mod worktree;
 pub use agents::{
     AgentSpec, FileAccess, default_access, for_scope as agent_for_scope, resolve_agent,
@@ -1054,13 +1054,21 @@ Memory is a hint, not the source of truth. Verify current code.              Use
                 } else {
                     codex_agents::handle(&ctx, &call.function.name, &args).await
                 }
-            } else if call.function.name == "create_coding_project" {
-                if let Some(reason) =
-                    stark_tools::plan_mode_denial(&mode, &call.function.name, &args)
-                {
-                    ToolOutcome::err(reason)
+            } else if call.function.name == "workspace" {
+                // Registry primitive: list/info are always fine; create and
+                // remove are write-class in plan mode.
+                let action = args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if mode == "plan" && (action == "create" || action == "remove") {
+                    ToolOutcome::err(
+                        "[BLOCKED] Plan mode is read-only. Type /build to leave plan mode. (workspace create/remove is a write-class action.)",
+                    )
                 } else {
-                    projects::create_coding_project(&ctx, &args).await
+                    workspaces::workspace(&ctx, &args).await
                 }
             } else if call.function.name == "delegate" {
                 if let Some(reason) =

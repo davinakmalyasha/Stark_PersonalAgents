@@ -119,9 +119,6 @@ export default function HouseHeader({
               </span>
             )}
           </button>
-          <button type="button" onClick={handleNewTask} title="New task" aria-label="Create a task" className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/70">
-            <Plus size={14} />
-          </button>
         </div>
 
         {/* One atomic announcement rather than a live region per row: a bare

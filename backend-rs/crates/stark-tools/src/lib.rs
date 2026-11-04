@@ -378,33 +378,50 @@ pub fn tool_specs_for_run(
                     .as_ref()
                     .is_none_or(|names| names.contains(&tool.name.to_ascii_lowercase()))
                 && !(plan_filter && is_plan_write(tool.name.as_str()))
-                && !(read_only
-                    && matches!(
-                        tool.name.as_str(),
-                        "edit_file"
-                            | "run_code"
-                            | "call_subagent"
-                            | "write"
-                            | "edit"
-                            | "todo_write"
-                            | "spawn_agent"
-                            | "message_agent"
-                            | "interrupt_agent"
-                            | "close_agent"
-                            | "create_docx"
-                            | "create_xlsx"
-                            | "create_coding_project"
-                            | "create_group"
-                            | "create_client"
-                            | "house_set_device"
-                            | "house_run_scene"
-                            | "look_at_screen"
-                            | "set_screen_share"
-                            | "group_update"
-                            | "schedule"
-                            | "canvas_mode"
-                            | "give_note"
-                    ))
+                && !(read_only && {
+                    // Orchestration tools act through server-owned state
+                    // (registry, groups, schedules, notes, canvas), never
+                    // direct filesystem writes — so the orchestrator keeps
+                    // them even with read-only file access. Every other
+                    // read-only scope still loses them.
+                    let orchestration_exempt = scope == "orchestrator"
+                        && matches!(
+                            tool.name.as_str(),
+                            "workspace"
+                                | "create_group"
+                                | "group_update"
+                                | "schedule"
+                                | "give_note"
+                                | "canvas_mode"
+                        );
+                    !orchestration_exempt
+                        && matches!(
+                            tool.name.as_str(),
+                            "edit_file"
+                                | "run_code"
+                                | "call_subagent"
+                                | "write"
+                                | "edit"
+                                | "todo_write"
+                                | "spawn_agent"
+                                | "message_agent"
+                                | "interrupt_agent"
+                                | "close_agent"
+                                | "create_docx"
+                                | "create_xlsx"
+                                | "workspace"
+                                | "create_group"
+                                | "create_client"
+                                | "house_set_device"
+                                | "house_run_scene"
+                                | "look_at_screen"
+                                | "set_screen_share"
+                                | "group_update"
+                                | "schedule"
+                                | "canvas_mode"
+                                | "give_note"
+                        )
+                })
         })
         .map(|tool| {
             let mut spec = json!({
@@ -811,7 +828,7 @@ mod tests {
         let dfd = tool_specs_for_scope("build", "dfd");
         let names = tool_names(&dfd);
         assert_eq!(names.len(), 9);
-        assert!(names.contains(&"create_coding_project"));
+        assert!(names.contains(&"workspace"));
         assert!(names.contains(&"dfd_bridge"));
         assert!(names.contains(&"create_client"));
         assert!(names.contains(&"files_changed"));
@@ -832,7 +849,7 @@ mod tests {
         assert!(names.contains(&"group_item_detail"));
         assert!(names.contains(&"group_events"));
         assert!(names.contains(&"group_update"));
-        assert!(names.contains(&"create_coding_project"));
+        assert!(names.contains(&"workspace"));
         assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"delegate"));
         assert!(names.contains(&"delegation_status"));
@@ -894,6 +911,34 @@ mod tests {
         assert!(!names.contains(&"run_code"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"search_code"));
+
+        // Orchestrator keeps its orchestration tools with read-only file
+        // access: they act through server-owned state, not direct writes.
+        let orch_read = tool_specs_for_scope_with_access("build", "orchestrator", "read");
+        let orch_names = tool_names(&orch_read);
+        for tool in [
+            "workspace",
+            "create_group",
+            "group_update",
+            "schedule",
+            "give_note",
+            "canvas_mode",
+        ] {
+            assert!(
+                orch_names.contains(&tool),
+                "orchestrator lost {tool} with read access"
+            );
+        }
+        // ...but still loses direct filesystem writes.
+        for tool in ["edit_file", "write", "edit", "create_docx"] {
+            assert!(
+                !orch_names.contains(&tool),
+                "orchestrator kept filesystem write {tool} with read access"
+            );
+        }
+        // Other read-only scopes still lose the orchestration tools.
+        assert!(!names.contains(&"schedule"));
+        assert!(!names.contains(&"canvas_mode"));
 
         let ctx = ToolContext::new(
             std::path::Path::new("."),

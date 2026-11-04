@@ -10,7 +10,6 @@ export const TOOL_VERBS: Record<string, string> = {
   canvas_mode: 'Used canvas',
   close_agent: 'Closed agent',
   create_client: 'Created client',
-  create_coding_project: 'Created project',
   create_docx: 'Created docx',
   create_group: 'Created group',
   create_xlsx: 'Created xlsx',
@@ -57,6 +56,7 @@ export const TOOL_VERBS: Record<string, string> = {
   wait_agent: 'Waited for agent',
   web_fetch: 'Fetched',
   web_search: 'Searched web',
+  workspace: 'Managed workspace',
   write: 'Wrote',
 };
 export const TOOL_SUMMARIES: Record<string, string> = {
@@ -69,7 +69,6 @@ export const TOOL_SUMMARIES: Record<string, string> = {
   canvas_mode: 'used the canvas',
   close_agent: 'closed an agent',
   create_client: 'created a client',
-  create_coding_project: 'created a project',
   create_docx: 'created a docx',
   create_group: 'created a group',
   create_xlsx: 'created an xlsx',
@@ -116,5 +115,6 @@ export const TOOL_SUMMARIES: Record<string, string> = {
   wait_agent: 'waited for an agent',
   web_fetch: 'fetched pages',
   web_search: 'searched the web',
+  workspace: 'managed workspaces',
   write: 'wrote files',
 };

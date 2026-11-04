@@ -1,6 +1,6 @@
 {
-  "contract_version": 3,
-  "source": "DeepSeek Harness standard core (f3803c9) + Codex multi-agent v2 (79be2e2); Developer Pi-simplified v3 surface",
+  "contract_version": 4,
+  "source": "DeepSeek Harness standard core (f3803c9) + Codex multi-agent v2 (79be2e2); Developer Pi-simplified v3 surface; workspace registry v4",
   "tool_count": 65,
   "tools": [
     {
@@ -1249,40 +1249,46 @@
       "doc": "github_apply_gate(repo, stack?, codeql_on?, create?, private?, description?, gate?) — The ONE gate tool: create the repo (create=True) and/or install the security/perf gate (seed + branch protection). Confirms with the user (gate: ask|yes|no)."
     },
     {
-      "name": "create_coding_project",
-      "description": "Create a NEW project: creates the folder (under D:\\MyProject, or under parent_root if given), registers it as a workspace with its own chat, and assigns a durable Dev agent to it. Use ONLY when the user genuinely asks for a new project. NEVER call this for work on an existing project. Pass wait=false when creating SEVERAL projects in one burst — their first Dev turns run in parallel in the background. The DFD agent MUST pass parent_root (the client folder under D:\\MyProject\\DFDClientProjects) so client projects always live inside the client root.",
+      "name": "workspace",
+      "description": "Manage project workspaces (the folder registry in .deep_agents/workspaces.json). action=create makes a new folder under root (or registers an existing path) and registers it; action=list shows registered folders plus the virtual General/House/Personal/DFD workspaces; action=info looks one up by id, name, or path; action=remove unregisters it (files are never deleted, virtual workspaces cannot be removed). Starting work stays in delegate / agent spawn / create_group — this tool never starts an agent or creates a chat.",
       "parameters": {
         "type": "object",
         "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["create", "list", "info", "remove"],
+            "description": "create: new folder under root (or register path). list: all workspaces. info: one workspace by id/name/path. remove: unregister only, files untouched."
+          },
           "name": {
             "type": "string",
-            "description": "Project/folder name. 1-64 chars; filesystem-safe — avoid '/', '\\\\', '..', control characters, and leading dots. Use kebab-case or snake_case."
+            "description": "Folder name for action=create. 1-64 chars; filesystem-safe — avoid '/', '\\', '..', control characters, and leading dots. Use kebab-case or snake_case. Ignored unless creating by name."
           },
-          "concept": {
+          "root": {
             "type": "string",
-            "description": "The user's concept/goal for the project; the Dev agent starts from this."
+            "description": "Parent folder for action=create with name. Defaults to STARK_PROJECTS_ROOT (D:\\MyProject); must stay inside it. DFD agents must use a client folder under D:\\MyProject\\DFDClientProjects."
           },
-          "wait": {
-            "type": "boolean",
-            "default": true,
-            "description": "Wait for the Dev's first turn before returning. Use false for multi-project bursts."
-          },
-          "parent_root": {
+          "path": {
             "type": "string",
-            "description": "Optional parent folder. DFD agent: the client folder under D:\\MyProject\\DFDClientProjects (enforced to stay inside it). Others: leave empty."
+            "description": "Existing folder to register (action=create), or a lookup for action=info. Must exist and be a directory when creating."
+          },
+          "workspace_id": {
+            "type": "string",
+            "description": "Workspace id for action=remove (and preferred lookup for action=info)."
+          },
+          "query": {
+            "type": "string",
+            "description": "Name, id, or path to look up for action=info. Falls back to workspace_id when omitted."
           }
         },
         "required": [
-          "name",
-          "concept"
+          "action"
         ]
       },
       "exposed": true,
       "required": [
-        "concept",
-        "name"
+        "action"
       ],
-      "doc": "create_coding_project(name, concept, wait?, parent_root?) — Create a NEW project: folder (D:\\MyProject, or parent_root for the DFD agent) + workspace + chat + durable Dev. Only for genuinely new projects. wait=false for bursts. DFD agent passes parent_root inside D:\\MyProject\\DFDClientProjects."
+      "doc": "workspace(action, name?, root?, path?, workspace_id?, query?) — Registry counterpart to run_command: create (mkdir under root or register path) + list + info + remove (unregister only, never deletes files). Dispatch stays in delegate / agent spawn / create_group."
     },
     {
       "name": "update_plan",
@@ -2498,7 +2504,7 @@
     "dfd": [
       "dfd_bridge",
       "create_client",
-      "create_coding_project",
+      "workspace",
       "run_command",
       "ask_user",
       "update_plan",
@@ -2507,7 +2513,7 @@
       "memory"
     ],
     "orchestrator": [
-      "create_coding_project",
+      "workspace",
       "ask_user",
       "delegate",
       "delegation_status",

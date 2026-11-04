@@ -159,7 +159,7 @@ mod tests {
     fn frozen_contract_loads_and_validates() {
         let file = ToolSpecFile::load(fixture()).expect("tool contract");
 
-        assert_eq!(file.contract_version, 3);
+        assert_eq!(file.contract_version, 4);
         assert_eq!(file.tool_count, 65);
         assert_eq!(file.tools.len(), 65);
         assert_eq!(file.scope_map.len(), 9);

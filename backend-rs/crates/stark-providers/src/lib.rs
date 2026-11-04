@@ -422,7 +422,9 @@ pub enum ProviderEvent {
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("missing API key; set STARK_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY")]
+    #[error(
+        "missing API key; add OPENCODE_API_KEY to D:\\StarkData\\.env (or configure providers in Settings → Agents)"
+    )]
     MissingApiKey,
     #[error("{body}")]
     HttpStatus { status: u16, body: String },

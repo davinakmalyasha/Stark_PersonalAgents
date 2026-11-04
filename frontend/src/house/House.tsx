@@ -484,7 +484,8 @@ export default function House() {
         activeTabId={sessions.activeTabId}
         runningTabId={sessions.runningTabId}
         pinnedChats={sessions.pinnedChats}
-        chatsFilter="general"
+        chatsFilter={sessions.chatsFilter}
+        onFilterChange={sessions.setChatsFilter}
         onTogglePin={sessions.togglePin}
         onOpenSession={handleOpenSession}
         onNewChat={handleNewSession}

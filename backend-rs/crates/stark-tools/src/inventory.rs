@@ -223,12 +223,12 @@ pub const INVENTORY: &[ToolMeta] = &[
         summary: "created an xlsx",
     },
     ToolMeta {
-        name: "create_coding_project",
-        plan_write: true,
-        read_blocked: true,
+        name: "workspace",
+        plan_write: false,
+        read_blocked: false,
         program: true,
-        verb: "Created project",
-        summary: "created a project",
+        verb: "Managed workspace",
+        summary: "managed workspaces",
     },
     ToolMeta {
         name: "create_group",
@@ -497,9 +497,8 @@ pub fn is_implemented(name: &str) -> bool {
 }
 
 /// Names that are plan-blocked but have no implemented handler (defensive:
-/// `create_project` predates `create_coding_project`; `github_apply_gate` is
-/// intentionally unexposed and returns 404 by design).
-const PLAN_WRITE_EXTRA: &[&str] = &["create_project", "github_apply_gate"];
+/// `github_apply_gate` is intentionally unexposed and returns 404 by design).
+const PLAN_WRITE_EXTRA: &[&str] = &["github_apply_gate"];
 
 pub fn is_plan_write(name: &str) -> bool {
     find(name).is_some_and(|tool| tool.plan_write) || PLAN_WRITE_EXTRA.contains(&name)
@@ -565,8 +564,11 @@ mod tests {
         assert!(is_plan_write("delegate") && !is_read_blocked("delegate"));
         // schedule is read-blocked but allowed in plan mode.
         assert!(is_read_blocked("schedule") && !is_plan_write("schedule"));
+        // workspace is the registry primitive: visible in plan mode and in
+        // read-only specs; create/remove are gated at dispatch by action.
+        assert!(!is_plan_write("workspace") && !is_read_blocked("workspace"));
+        assert!(is_implemented("workspace"));
         // Defensive plan blocks for names with no handler.
-        assert!(is_plan_write("create_project") && !is_implemented("create_project"));
         assert!(is_plan_write("github_apply_gate") && !is_implemented("github_apply_gate"));
         // Standard write tool and read tool.
         assert!(is_plan_write("write") && is_read_blocked("write"));

@@ -89,6 +89,21 @@ set, the zip is encrypted with AES-256-CBC + PBKDF2 via `openssl enc` (secret
 passed through the environment, never argv) and the plaintext is removed. Set
 `STARK_SNAPSHOT_DIR` to also copy the encrypted file to a repo/mount.
 
+Restore drill (safe: extracts to a temp dir, never touches live data):
+
+```bash
+STARK_SNAPSHOT_PASSPHRASE=... bash scripts/restore-drill.sh <backup.zip[.enc]>
+```
+
+It verifies the manifest, extracts `chats.db`, and runs `PRAGMA integrity_check`
+plus a chat count. Run it after the first snapshot and after any restore.
+
+## Schedules
+
+The scheduler queries `next_run_at <= now`, so an overdue wake fires once on
+the first tick after a restart/deploy instead of being skipped. A wake that was
+due several times during downtime collapses into one run (no burst replay).
+
 ## Limits and guardrails
 
 - `STARK_MAX_CONCURRENT_RUNS` (default 2) — overflow gets HTTP 429, never OOM.

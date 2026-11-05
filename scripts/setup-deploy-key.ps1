@@ -48,10 +48,12 @@ if (-not $Install) {
   exit 0
 }
 
-# First contact is still password-authenticated. The key line is piped to the
-# remote command while ssh reads the password from the console.
-Get-Content "$KeyPath.pub" -Raw | & ssh -p $Port "$User@$VpsHost" `
-  "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo KEY_INSTALLED"
+# First contact is still password-authenticated. The key is passed as a remote
+# argument instead of stdin: piping it makes ssh look for the password on the
+# pipe and hang on Windows.
+$pubLine = (Get-Content "$KeyPath.pub" -Raw).Trim()
+& ssh -o StrictHostKeyChecking=accept-new -p $Port "$User@$VpsHost" `
+  "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && (grep -qxF '$pubLine' ~/.ssh/authorized_keys || echo '$pubLine' >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys && echo KEY_INSTALLED"
 if ($LASTEXITCODE -ne 0) { throw "key install failed" }
 
 $sshArgs = @(

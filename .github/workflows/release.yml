@@ -37,6 +37,18 @@ jobs:
       - name: Backend release binary (sidecar source)
         run: cargo build --release -p stark-server
         working-directory: backend-rs
+      - name: Fetch ONNX Runtime 1.26 (STT runtime)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/onnxruntime-win-x64-1.26.0.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "onnxruntime.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "onnxruntime"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $dll = Get-ChildItem $dir -Recurse -Filter onnxruntime.dll | Select-Object -First 1
+          if (-not $dll) { throw "onnxruntime.dll not found in $url" }
+          Copy-Item $dll.FullName "backend-rs\onnxruntime.dll" -Force
+          Write-Host "onnxruntime: $($dll.FullName)"
       - name: Build signed bundle
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

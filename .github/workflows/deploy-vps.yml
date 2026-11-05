@@ -135,6 +135,10 @@ jobs:
         run: |
           set -euo pipefail
           SSH_OPTS="-i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p $VPS_PORT"
+          if ! ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "echo ssh-ok"; then
+            echo "::error::SSH key is not authorized on the VPS. Run scripts/setup-deploy-key.ps1 -Install, then re-run this workflow."
+            exit 1
+          fi
           DIR="/root/stark-deploy-${{ steps.build.outputs.sha }}"
           ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "rm -rf $DIR && mkdir -p $DIR"
           scp -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$VPS_PORT" \

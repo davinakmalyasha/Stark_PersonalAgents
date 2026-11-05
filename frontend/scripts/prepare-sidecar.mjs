@@ -72,6 +72,14 @@ if (fs.existsSync(modelsSource)) {
   fs.cpSync(modelsSource, modelsDest, { recursive: true });
   console.log(`[voice] ${modelsSource} -> ${modelsDest}`);
 } else {
+  // Tauri's build script requires every configured resource path to exist,
+  // even when voice models are intentionally not bundled. An empty marker is
+  // enough; the voice endpoints already report 503 without models.
+  fs.mkdirSync(modelsDest, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelsDest, 'README.txt'),
+    'Voice models are not bundled in this build.\n',
+  );
   console.warn(
     `[voice] models not found at ${modelsSource}; set STARK_MODELS_DIR to bundle TTS/STT`,
   );

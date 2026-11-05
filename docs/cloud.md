@@ -161,7 +161,9 @@ pwsh scripts/deploy-stark.ps1 -VpsHost <ip> -Port <ssh-port> [-Verify]
 
 The laptop checkout syncs with `pwsh scripts/sync-local.ps1` (or `-Build`).
 Installed desktop apps update from the signed release feed on launch, and
-Settings has a manual **App updates → Check** button.
+Settings has a manual **App updates → Check** button. Pushing to `master`
+updates the VPS only; tag `v<version>` when the desktop app should update
+(`release.yml` signs and publishes it to `Stark_Releases`).
 
 ### Recovery when every device is lost
 

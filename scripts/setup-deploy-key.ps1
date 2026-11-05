@@ -69,8 +69,16 @@ $scpArgs = @(
   "-P", "$Port"
 )
 
-# Upload both public halves and the VPS setup script, then run phase 1.
-foreach ($file in @("$KeyPath.pub", "$ActionsKeyPath.pub", (Join-Path $PSScriptRoot "setup-vps-ssh.sh"))) {
+# Upload both public halves, the VPS setup script, and the release scripts.
+$uploads = @(
+  "$KeyPath.pub",
+  "$ActionsKeyPath.pub",
+  (Join-Path $PSScriptRoot "setup-vps-ssh.sh"),
+  (Join-Path $PSScriptRoot "deploy-vps.sh"),
+  (Join-Path $PSScriptRoot "verify-cloud.sh"),
+  (Join-Path $PSScriptRoot "restore-drill.sh")
+)
+foreach ($file in $uploads) {
   $name = Split-Path -Leaf $file
   & scp @scpArgs $file "$User@${VpsHost}:/root/$name"
   if ($LASTEXITCODE -ne 0) { throw "upload failed: $name" }

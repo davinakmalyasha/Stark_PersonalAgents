@@ -1,0 +1,168 @@
+# Push to master -> build-linux succeeds -> deploy the same artifact to the VPS.
+#
+# The VPS never compiles. This workflow only ships the artifact `build-linux`
+# produced for that exact commit, waits for the validation workflows on the
+# same commit, then runs the drain-safe deploy script (health check + automatic
+# rollback). App access stays tailnet-only; this uses key-only public SSH.
+#
+# Required repository secrets:
+#   VPS_SSH_KEY        private key whose public half is in /root/.ssh/authorized_keys
+#   VPS_KNOWN_HOSTS    optional pinned known_hosts line (recommended)
+# Optional repository variables (defaults match the current VPS):
+#   VPS_HOST=103.67.79.106  VPS_PORT=20128  VPS_USER=root
+name: deploy-vps
+
+on:
+  workflow_run:
+    workflows: [build-linux]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  REPO: ${{ github.repository }}
+  VPS_HOST: ${{ vars.VPS_HOST || '103.67.79.106' }}
+  VPS_PORT: ${{ vars.VPS_PORT || '20128' }}
+  VPS_USER: ${{ vars.VPS_USER || 'root' }}
+
+jobs:
+  deploy:
+    # Only a green build on master deploys; manual runs are explicit.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'master')
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 45
+
+    steps:
+      - name: Resolve build run
+        id: build
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            run_id="${{ github.event.workflow_run.id }}"
+            sha="${{ github.event.workflow_run.head_sha }}"
+          else
+            run_id="$(gh run list --repo "$REPO" --workflow build-linux.yml \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+            test -n "$run_id"
+            sha="$(gh run view "$run_id" --repo "$REPO" --json headSha --jq .headSha)"
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "deploying $sha from run $run_id"
+
+      - name: Require green CI for this commit
+        env:
+          SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # deploy-vps and release are not validation gates.
+          filter='[.[] | select(.name != "deploy-vps" and .name != "release")]'
+
+          # Path-filtered workflows only exist when their paths changed.
+          files="$(gh api "repos/$REPO/commits/$SHA" --jq '.files[].filename')"
+          need_rust=false
+          need_front=false
+          grep -q '^backend-rs/' <<<"$files" && need_rust=true || true
+          grep -q '^frontend/' <<<"$files" && need_front=true || true
+          echo "required validation: rust=$need_rust frontend=$need_front"
+
+          for attempt in $(seq 1 60); do
+            runs="$(gh run list --repo "$REPO" --commit "$SHA" --limit 50 \
+              --json name,status,conclusion | jq -c "$filter")"
+            bad="$(jq '[.[] | select(.status == "completed" and
+              (.conclusion == "failure" or .conclusion == "cancelled" or
+               .conclusion == "timed_out" or .conclusion == "action_required"))] | length' <<<"$runs")"
+            if [ "$bad" != "0" ]; then
+              echo "::error::validation failed for $SHA"
+              jq -r '.[] | select(.status == "completed" and .conclusion != "success")
+                | "\(.name): \(.conclusion)"' <<<"$runs"
+              exit 1
+            fi
+
+            rust_ok="$(jq '[.[] | select(.name == "rust-validate" and .conclusion == "success")] | length' <<<"$runs")"
+            front_ok="$(jq '[.[] | select(.name == "frontend" and .conclusion == "success")] | length' <<<"$runs")"
+            ok=true
+            [ "$need_rust" = "true" ] && [ "$rust_ok" = "0" ] && ok=false
+            [ "$need_front" = "true" ] && [ "$front_ok" = "0" ] && ok=false
+            if [ "$ok" = "true" ]; then
+              echo "validation green for $SHA"
+              exit 0
+            fi
+            echo "waiting for validation ($attempt/60, rust=$rust_ok frontend=$front_ok)"
+            sleep 15
+          done
+          echo "::error::timed out waiting for validation of $SHA"
+          exit 1
+
+      - name: Download build artifact
+        run: |
+          set -euo pipefail
+          gh run download "${{ steps.build.outputs.run_id }}" --repo "$REPO" \
+            -n stark-linux-x86_64 -D artifact
+          ls -la artifact
+
+      - name: SSH key and known hosts
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${VPS_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::VPS_KNOWN_HOSTS is not set — pinning on first contact"
+            ssh-keyscan -p "$VPS_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload release
+        run: |
+          set -euo pipefail
+          SSH_OPTS="-i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p $VPS_PORT"
+          DIR="/root/stark-deploy-${{ steps.build.outputs.sha }}"
+          ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "rm -rf $DIR && mkdir -p $DIR"
+          scp -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$VPS_PORT" \
+            artifact/stark-linux-x86_64.tar.gz "$VPS_USER@$VPS_HOST:$DIR/stark-linux-x86_64.tar.gz"
+          for name in deploy-vps.sh verify-cloud.sh restore-drill.sh; do
+            scp -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$VPS_PORT" \
+              "scripts/$name" "$VPS_USER@$VPS_HOST:$DIR/$name"
+          done
+
+      - name: Deploy (drain-safe, auto-rollback)
+        run: |
+          set -euo pipefail
+          DIR="/root/stark-deploy-${{ steps.build.outputs.sha }}"
+          ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            "bash $DIR/deploy-vps.sh $DIR/stark-linux-x86_64.tar.gz ${{ steps.build.outputs.sha }}"
+
+      - name: Verify deployment
+        run: |
+          set -euo pipefail
+          DIR="/root/stark-deploy-${{ steps.build.outputs.sha }}"
+          ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            "bash $DIR/verify-cloud.sh"
+
+      - name: Cleanup upload
+        if: always()
+        run: |
+          ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            "rm -rf /root/stark-deploy-${{ steps.build.outputs.sha }}" || true

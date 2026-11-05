@@ -16,6 +16,7 @@ import {
   type MigrationCandidate,
   type PairedDevice,
 } from '../../services/api';
+import { checkForAppUpdate } from '../../utils/appUpdate';
 
 interface Props {
   isOpen: boolean;
@@ -34,6 +35,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [backupRoot, setBackupRoot] = useState('');
   const [backupFile, setBackupFile] = useState<File | null>(null);
   const [devices, setDevices] = useState<PairedDevice[]>([]);
+  const [updateBusy, setUpdateBusy] = useState(false);
 
   const load = useCallback(async () => {
     setError('');
@@ -163,6 +165,19 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       setStatus(`Revoked "${device.name}". That device must pair again.`);
     } catch (revokeError) {
       setError(revokeError instanceof Error ? revokeError.message : 'Could not revoke device.');
+    }
+  };
+
+  const checkUpdates = async () => {
+    setUpdateBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      await checkForAppUpdate(setStatus, { manual: true });
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : 'Could not check for updates.');
+    } finally {
+      setUpdateBusy(false);
     }
   };
 
@@ -303,6 +318,29 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 ))}
               </div>
             )}
+          </section>
+
+          <section className="space-y-2">
+            <div className="flex items-center gap-2">
+              <RefreshCw size={13} className="text-zinc-500" />
+              <span className={labelClass}>App updates</span>
+            </div>
+            <div className={rowClass}>
+              <div className="min-w-0">
+                <div className="text-[12px] text-zinc-200 font-medium">Desktop app</div>
+                <div className="text-[10.5px] text-zinc-500 mt-0.5">
+                  Checks the signed release feed on every launch. Check now to update immediately.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void checkUpdates()}
+                disabled={updateBusy}
+                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+              >
+                <RefreshCw size={14} className={updateBusy ? 'animate-spin' : ''} /> Check
+              </button>
+            </div>
           </section>
 
           <section className="space-y-2">

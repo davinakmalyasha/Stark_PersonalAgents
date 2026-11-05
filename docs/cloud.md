@@ -127,20 +127,57 @@ backoff with jitter; stream idle defaults to 300s (`STARK_STREAM_IDLE_TIMEOUT_SE
 replays later items before attaching live. Rollouts are part of the portable
 export.
 
-## Deploy (drain-safe, auto-rollback)
+## Deploy (push to master, drain-safe, auto-rollback)
+
+One-time key setup (public SSH is the deploy transport; the app stays
+tailnet-only):
+
+1. `powershell -ExecutionPolicy Bypass -File scripts/setup-deploy-key.ps1 -Install`
+   creates two ed25519 keys (laptop and GitHub Actions), installs both on the
+   VPS, and runs `scripts/setup-vps-ssh.sh` there. It asks for the VPS
+   password once.
+2. `powershell -ExecutionPolicy Bypass -File scripts/setup-actions-secret.ps1`
+   stores the Actions private key as `VPS_SSH_KEY` and pins the host key as
+   `VPS_KNOWN_HOSTS`.
+3. Confirm key login in a second terminal, then disable passwords:
+   `ssh -i ~/.ssh/stark_deploy_ed25519 -p 20128 root@<vps> 'bash /root/setup-vps-ssh.sh --harden'`.
+
+After that, every push to `master`:
+
+1. `build-linux` builds the Linux unit on `ubuntu-24.04` and uploads the
+   artifact. The VPS never compiles.
+2. `deploy-vps` waits for `rust-validate` and `frontend` on the same commit,
+   downloads that artifact, and uploads it over key-only SSH.
+3. `scripts/deploy-vps.sh` writes `<harness>/.drain` (new runs get 503), waits
+   up to 15 min for active runs to settle, swaps `current`, restarts,
+   health-checks, and rolls back automatically when `/api/health` fails.
+4. `verify-cloud.sh` checks health, export completeness, and a restore drill.
+
+Manual deploy of the newest artifact:
 
 ```powershell
-pwsh scripts/deploy-stark.ps1 -VpsHost <ip> -Port <ssh-port>
+pwsh scripts/deploy-stark.ps1 -VpsHost <ip> -Port <ssh-port> [-Verify]
 ```
 
-1. Downloads the newest `build-linux` artifact from Actions.
-2. Uploads it, runs `scripts/deploy-vps.sh` on the server.
-3. The script writes `<harness>/.drain` (new runs get 503), waits up to 15 min
-   for active runs to settle, swaps `current`, restarts, health-checks, and
-   rolls back automatically when `/api/health` fails.
+The laptop checkout syncs with `pwsh scripts/sync-local.ps1` (or `-Build`).
+Installed desktop apps update from the signed release feed on launch, and
+Settings has a manual **App updates → Check** button.
 
-The GitHub workflow builds on `ubuntu-24.04` (older glibc than the 26.04 VPS,
-which is the compatible direction). The VPS never compiles.
+### Recovery when every device is lost
+
+1. Sign in to the Tailscale admin console with the Google account and add the
+   new phone/laptop to the tailnet (or install Tailscale there and sign in).
+2. If `bash /root/setup-vps-ssh.sh --tailscale-ssh` was enabled once, SSH to
+   the VPS as `root@100.98.47.46` using the tailnet identity — no key to copy.
+   Otherwise use the provider console (VPS panel), which always grants root
+   even after password login is disabled.
+3. Issue a new pairing token on the VPS:
+   `curl -s -X POST http://127.0.0.1:8123/api/pairing/devices -H 'Content-Type: application/json' -d '{"name":"new-device"}'`
+   and pair the device. Revoke the old entry in Settings or `DELETE
+   /api/pairing/devices/{id}`.
+
+The provider console is the true break-glass; Tailscale SSH, the deploy key,
+and Tailscale admin are convenience paths, not the last resort.
 
 ## Auth
 

@@ -62,6 +62,11 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "deploying $sha from run $run_id"
 
+      - name: Checkout deploy scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.build.outputs.sha }}
+
       - name: Require green CI for this commit
         env:
           SHA: ${{ steps.build.outputs.sha }}

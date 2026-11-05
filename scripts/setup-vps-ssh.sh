@@ -73,7 +73,9 @@ if [ "${1:-}" = "--harden" ]; then
   test -s /root/.ssh/authorized_keys \
     || { echo "!! no key installed; run phase 1 first"; exit 1; }
 
-  cat > /etc/ssh/sshd_config.d/99-stark-hardening.conf <<'EOF'
+  # Must sort before provider/cloud-init files: sshd keeps the FIRST value it
+  # reads, and those images ship PasswordAuthentication yes in 00-*/60-*.
+  cat > /etc/ssh/sshd_config.d/00-stark-hardening.conf <<'EOF'
 # Stark: key-only SSH. Keep key login for root as break-glass.
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -83,9 +85,19 @@ PermitRootLogin prohibit-password
 AllowAgentForwarding no
 X11Forwarding no
 EOF
+  rm -f /etc/ssh/sshd_config.d/99-stark-hardening.conf
   sshd -t
+  if sshd -T | grep -qi '^passwordauthentication yes'; then
+    echo "!! another sshd config still enables passwords; fix the order"
+    sshd -T | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin)'
+    exit 1
+  fi
   # Ubuntu 26.04 socket-activates ssh; sshd re-reads config per connection.
   systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  if sshd -T | grep -qi '^passwordauthentication yes'; then
+    echo "!! effective config still allows passwords"
+    exit 1
+  fi
 
   configure_fail2ban
   echo "==> hardened: password login disabled, root is key-only"

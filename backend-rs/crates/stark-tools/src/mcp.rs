@@ -1045,8 +1045,11 @@ rl.on('line', (line) => {
             servers: RwLock::new(BTreeMap::new()),
         });
         manager.clone().start_all().await;
+        // start_all spawns the handshake in the background. CI Windows runners
+        // can take several seconds to start `node` (Defender scan), so poll
+        // well past the configured 10s startup timeout instead of 2s.
         let mut tools = Vec::new();
-        for _ in 0..20 {
+        for _ in 0..300 {
             tools = manager.tool_specs_for_scope("developer");
             if !tools.is_empty() {
                 break;

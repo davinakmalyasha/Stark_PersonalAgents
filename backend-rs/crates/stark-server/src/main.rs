@@ -435,6 +435,11 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 let mut learned = 0;
                 for (id, provider) in providers.iter() {
+                    // Unconfigured providers have no key; probing them only
+                    // produces a 401 at every boot and tells us nothing.
+                    if !provider.config().has_key() {
+                        continue;
+                    }
                     match provider.refresh_model_contexts().await {
                         Ok(count) => {
                             learned += count;

@@ -558,6 +558,29 @@ html {
   }
 }
 
+/* Compact markdown for reasoning/activity rows */
+.markdown-compact { font-size: 12.5px; line-height: 1.7; }
+.markdown-compact p { margin: 4px 0; color: #a1a1aa; }
+.markdown-compact ul, .markdown-compact ol { margin: 4px 0; padding-left: 18px; }
+.markdown-compact li { font-size: 12.5px; color: #a1a1aa; }
+.markdown-compact h1, .markdown-compact h2, .markdown-compact h3, .markdown-compact h4 {
+  font-size: 13px; margin: 8px 0 4px; border: 0; padding: 0; color: #d4d4d8;
+}
+.markdown-compact code { font-size: 11.5px; }
+.markdown-compact table { font-size: 12px; }
+.markdown-compact th, .markdown-compact td { padding: 6px 10px; }
+
+/* Narrow screens: mobile chat + dock breathing room */
+@media (max-width: 640px) {
+  .prompt-toolbar { margin: 0 8px; padding: 7px 0 8px; }
+  .prompt-input { min-height: 34px; }
+  .agent-message-response { font-size: 15px; }
+  .markdown-body p { margin: 8px 0; }
+  .markdown-body ul, .markdown-body ol { margin: 6px 0; }
+  .markdown-body pre { font-size: 12.5px; }
+  .markdown-body table { font-size: 13px; }
+}
+
 /* Thinking placeholder — light fade in + staggered dots */
 @keyframes thinkingFadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes thinkingDot { 0%, 80%, 100% { opacity: .28; transform: scale(.85); } 40% { opacity: 1; transform: scale(1); } }

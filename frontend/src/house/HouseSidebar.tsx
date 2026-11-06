@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, MessageSquare, Pencil, Trash2, Check, Code2, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, Bot, CornerDownRight, Home, PanelLeftClose,
+  ChevronDown, Search, Pin, PinOff, Bot, CornerDownRight, Home,
 } from 'lucide-react';
 import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
@@ -20,8 +20,6 @@ interface Props {
   open: boolean;
   /** Home shell: docked flex column, always laid out (no slide-over). */
   persistent?: boolean;
-  /** Collapse the panel from inside it (persistent rail layout). */
-  onCollapse?: () => void;
   onClose: () => void;
   workspaces: WorkspaceInfo[];
   chatsByWs: Record<string, ChatSummary[]>;
@@ -110,7 +108,6 @@ export default function HouseSidebar({
   variant = 'full',
   open, onClose, workspaces, chatsByWs,
   persistent = false,
-  onCollapse,
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
   onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
@@ -720,8 +717,8 @@ export default function HouseSidebar({
       <aside
         className={`house-sidebar-panel flex flex-col select-none ${
           persistent
-            ? 'relative inset-auto z-10 w-[292px] shrink-0 bg-[#0f0f13] border-r house-hairline'
-            : `fixed inset-y-0 left-0 z-50 w-[292px] bg-[#0f0f13] border-r house-hairline transition-transform duration-300 ease-out ${
+            ? 'relative inset-auto z-10 w-[248px] shrink-0 bg-[#0f0f13] border-r house-hairline'
+            : `fixed inset-y-0 left-0 z-50 w-[248px] bg-[#0f0f13] border-r house-hairline transition-transform duration-300 ease-out ${
               open ? 'translate-x-0' : '-translate-x-full'
             }`
         }`}
@@ -797,16 +794,6 @@ export default function HouseSidebar({
             >
               <Plus size={13} />
             </button>
-            {onCollapse && (
-              <button
-                onClick={onCollapse}
-                title="Collapse sidebar"
-                aria-label="Collapse sidebar"
-                className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
-              >
-                <PanelLeftClose size={13} />
-              </button>
-            )}
           </div>
         )}
 

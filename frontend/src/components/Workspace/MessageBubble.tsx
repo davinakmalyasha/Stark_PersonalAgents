@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, MoreHorizontal, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
+import { useState } from 'react';
+import { Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import type { StreamSegment } from '../../utils/streamAccum';
@@ -51,31 +51,50 @@ function StreamingMarkdown({ content }: { content: string }) {
 
   let split = content.length;
 
-  // Unclosed fenced code block: render everything before the ``` as Markdown,
-  // keep the fence + the rest as plain text.
+  // Unclosed fenced code block: render everything before the fence as
+  // Markdown, and show the open fence as a real code block so the user never
+  // sees raw backticks while the model is still writing.
   const fences = content.split('```');
   if (fences.length > 1 && fences.length % 2 === 0) {
     const openIdx = content.lastIndexOf('```');
     const lineStart = content.lastIndexOf('\n', openIdx - 1) + 1;
-    // Only treat as "open" if the opening fence isn't followed by a closer.
     if (openIdx >= 0 && (content.indexOf('```', openIdx + 3) === -1)) {
       split = lineStart;
     }
   }
 
-  // Unclosed inline code / bold — drop the dangling opener so Markdown
-  // doesn't swallow the rest of the message.
-  let trailing = content.slice(split);
-  const dangling = trailing.match(/^.*?(\*\*|`|~~)\s*$/);
-  if (dangling && content.slice(0, split).includes(dangling[1])) {
-    trailing = trailing.replace(/(\*\*|`|~~)\s*$/, '');
+  const stable = content.slice(0, split);
+  const trailing = content.slice(split);
+  if (!trailing) return <Markdown content={stable} />;
+
+  const openFence = trailing.match(/^```([\w+-]*)\n([\s\S]*)$/);
+  if (openFence) {
+    return (
+      <span className="block">
+        {stable ? <Markdown content={stable} /> : null}
+        <div className="my-4 rounded-xl border border-zinc-800/60 overflow-hidden">
+          <div className="flex items-center justify-between border-b border-zinc-800/60 bg-zinc-900/70 px-3 py-1">
+            <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-wider">{openFence[1] || 'text'}</span>
+          </div>
+          <pre className="p-4 bg-zinc-950 text-zinc-300 font-mono text-[13px] whitespace-pre-wrap break-words">
+            <code>{openFence[2]}</code>
+          </pre>
+        </div>
+      </span>
+    );
   }
 
-  const stable = content.slice(0, split);
+  // Unclosed inline code / bold — drop the dangling opener so Markdown
+  // doesn't swallow the rest of the message.
+  const dangling = trailing.match(/^.*?(\*\*|`|~~)\s*$/);
+  const safeTrailing = dangling && stable.includes(dangling[1])
+    ? trailing.replace(/(\*\*|`|~~)\s*$/, '')
+    : trailing;
+
   return (
     <span className="whitespace-pre-wrap break-words">
       {stable ? <Markdown content={stable} /> : null}
-      {trailing}
+      {safeTrailing}
     </span>
   );
 }
@@ -211,9 +230,7 @@ function ThinkingPlaceholder() {
 }
 
 export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
-  const [revertMenuOpen, setRevertMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const revertMenuRef = useRef<HTMLDivElement | null>(null);
   const copyMessage = async () => {
     try {
       await navigator.clipboard.writeText(message.content);
@@ -223,21 +240,6 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
       /* clipboard unavailable */
     }
   };
-  useEffect(() => {
-    if (!revertMenuOpen) return;
-    const onDown = (e: PointerEvent) => {
-      if (revertMenuRef.current && !revertMenuRef.current.contains(e.target as Node)) setRevertMenuOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setRevertMenuOpen(false);
-    };
-    document.addEventListener('pointerdown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('pointerdown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [revertMenuOpen]);
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -295,49 +297,31 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
           </div>
         </div>
       )}
-      {isUser && onRewind && (
-        <div className="flex justify-end">
-          <div className="relative" ref={revertMenuRef}>
+      {isUser && (
+        <div className="flex items-center justify-end gap-1 mt-1 pr-0.5">
+          <span className="text-[10px] text-zinc-600 tabular-nums">
+            {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
+          <button
+            type="button"
+            onClick={() => { void copyMessage(); }}
+            title={copied ? 'Copied' : 'Copy message'}
+            aria-label="Copy message"
+            className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-zinc-200 hover:bg-white/[0.07] transition-colors cursor-pointer"
+          >
+            {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+          </button>
+          {onRewind && (
             <button
               type="button"
-              onClick={() => setRevertMenuOpen((v) => !v)}
-              title="Message actions"
-              aria-label="Message actions"
-              aria-expanded={revertMenuOpen}
-              className="mt-1 grid place-items-center w-6 h-6 rounded-md text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-zinc-200 hover:bg-white/[0.07] focus-visible:opacity-100 transition-all cursor-pointer"
+              onClick={() => onRewind(message)}
+              title="Revert to before this message"
+              aria-label="Revert message"
+              className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-red-300 hover:bg-red-500/10 transition-colors cursor-pointer"
             >
-              <MoreHorizontal size={13} />
+              <RotateCcw size={12} />
             </button>
-            {revertMenuOpen && (
-              <div
-                role="menu"
-                aria-label="Message actions"
-                className="absolute right-0 top-[calc(100%+4px)] z-30 w-56 rounded-xl border border-white/[0.09] bg-[#15151a] shadow-2xl overflow-hidden py-1"
-              >
-                <div className="px-3 py-1.5 text-[10.5px] text-zinc-500">
-                  {new Date(message.timestamp).toLocaleString()}
-                </div>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { void copyMessage(); }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-zinc-300 hover:bg-white/[0.05] transition-colors cursor-pointer"
-                >
-                  {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} className="text-zinc-500" />}
-                  {copied ? 'Copied' : 'Copy message'}
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { setRevertMenuOpen(false); onRewind(message); }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-red-300 hover:bg-red-500/10 transition-colors cursor-pointer"
-                >
-                  <RotateCcw size={13} />
-                  Revert message
-                </button>
-              </div>
-            )}
-          </div>
+          )}
         </div>
       )}
 

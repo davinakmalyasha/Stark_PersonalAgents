@@ -5,7 +5,6 @@ import {
 } from 'lucide-react';
 import HouseChat from '../../house/HouseChat';
 import SubagentSessionView from '../../house/SubagentSessionView';
-import QuestionModal from '../../components/Workspace/QuestionModal';
 import type { WorkspaceFileEntry } from '../../services/api';
 import { useDesignSession } from './useDesignSession';
 
@@ -487,8 +486,7 @@ export default function DesignWorkspace({ embedded = false, initialWorkspaceId, 
         />
       </aside>
 
-      {/* Direction-lock + plan-review questions surface here */}
-      <QuestionModal visible={isRunning} />
+      {/* Direction-lock + plan-review questions are rendered globally by AppShell. */}
 
 
       {/* Subagent drill-in */}

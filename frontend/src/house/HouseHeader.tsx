@@ -25,7 +25,7 @@ export default function HouseHeader({
 
   return (
     <header
-      className={`relative z-20 flex items-center gap-2 px-3 sm:px-4 ${isDesktopShell ? 'pr-36' : ''} h-[52px] border-b house-hairline shrink-0`}
+      className={`relative z-20 flex items-center gap-2 px-2 sm:px-4 ${isDesktopShell ? 'pr-36' : ''} h-11 md:h-[52px] border-b house-hairline shrink-0`}
       style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
     >
       {/* ── Session tab strip (the top bar IS the chat switcher) ── */}

@@ -1,13 +1,11 @@
 import { lazy, Suspense, useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X, FolderGit2, Palette } from 'lucide-react';
-import { checkForAppUpdate } from './utils/appUpdate';
 import TitleBar from './components/Layout/TitleBar';
 import Sidebar from './components/Layout/Sidebar';
 import AgentCanvas from './components/Canvas/AgentCanvas';
 import TokenStatsModal from './components/Layout/TokenStatsModal';
 import AgentConfigModal from './components/Layout/AgentConfigModal';
 import SettingsModal from './components/Layout/SettingsModal';
-import QuestionModal from './components/Workspace/QuestionModal';
 import FileExplorer from './components/Workspace/FileExplorer';
 const DesignWorkspace = lazy(() => import('./modules/design-workspace/DesignWorkspace'));
 import { usePipeline } from './hooks/usePipeline';
@@ -16,6 +14,7 @@ import type { ChatMessage, WorkspaceInfo, ChatData, ModelOption, AppState, ChatA
 import { parseLogToSteps, filterOrchestratorSteps } from './utils/logParser';
 import { flushOutbox, queueMessage } from './services/outbox';
 import { ensureNotificationPermission, notifyRunFinished } from './services/notifications';
+import { setBusy } from './utils/runtimeBusy';
 
 const isProjectWorkspace = (w: WorkspaceInfo): boolean =>
   !w.isGeneral && !w.isHouse && !w.isPersonal && !(w as { isDfd?: boolean }).isDfd;
@@ -122,9 +121,22 @@ export default function App() {
 
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
-  // Live mirror of the pipeline state for the background auto-updater.
-  const runningRef = useRef(false);
-  runningRef.current = isRunning;
+  // Publish busy state so the updater only restarts when nothing is running.
+  useEffect(() => {
+    setBusy('coding', isRunning || isPersisting || !!voiceLiveRun?.active);
+    return () => setBusy('coding', false);
+  }, [isRunning, isPersisting, voiceLiveRun?.active]);
+
+  // Plan-review answers flip the chat mode server-side; the global question
+  // modal reports it back so the badge/composer update immediately.
+  useEffect(() => {
+    const onMode = (event: Event) => {
+      const mode = (event as CustomEvent<'plan' | 'build'>).detail;
+      if (mode === 'plan' || mode === 'build') setChatModeState(mode);
+    };
+    window.addEventListener('stark:mode-changed', onMode);
+    return () => window.removeEventListener('stark:mode-changed', onMode);
+  }, []);
   // Stop bookkeeping: the persist effect below runs after cancel() already
   // cleared the stream, so capture "was this a Stop" + partial thinking here.
   const cancelledRef = useRef(false);
@@ -161,9 +173,6 @@ export default function App() {
     }
 
     fetchModels().then((m) => { if (m.length) setModels(m); }).catch(() => {});
-    // Signed auto-update (Tauri only, silent when offline). Downloads and
-    // installs in the background; relaunch is deferred while a run is live.
-    checkForAppUpdate(setNotification, { isBusy: () => runningRef.current }).catch(() => {});
     fetchWorkspaces().then(async (ws) => {
       if (ws.length === 0) return;
       let initialWs = ws.find(isProjectWorkspace) || ws.find((w) => w.isGeneral) || ws[0];
@@ -1051,8 +1060,6 @@ export default function App() {
           </div>
         </div>
       )}
-      <QuestionModal visible={isRunning || isPersisting || !!voiceLiveRun?.active} onModeChange={setChatModeState} />
-
       {/* OpenDesign module launcher — opens the design room bound to this workspace/chat */}
       <button
         type="button"

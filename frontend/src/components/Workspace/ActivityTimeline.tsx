@@ -4,6 +4,7 @@ import { delegationTarget, isDelegationToolName, type TraceStep } from '../../ut
 import { buildEntries, resolveDelegations, type ToolGroupEntry } from '../../utils/delegationMatch';
 import { TOOL_SUMMARIES, TOOL_VERBS } from '../../utils/toolLabels.generated';
 import type { LiveToolEvent, StreamSegment } from '../../utils/streamAccum';
+import Markdown from './Markdown';
 
 interface Props {
   segments: StreamSegment[];
@@ -301,14 +302,14 @@ export default function ActivityTimeline({ segments, isActive = false, delegatio
         if (entry.kind === 'reasoning') {
     return (
       <div className="activity-inline-note activity-inline-note--reasoning" role="listitem" aria-label="Reasoning update" key={`reasoning-${index}`}>
-        {entry.segment.text}
+        <Markdown content={entry.segment.text} compact />
       </div>
     );
         }
 
         return (
           <div className="activity-inline-note activity-inline-note--status" role="listitem" aria-label="Agent update" key={`message-${index}`}>
-            {entry.segment.text}
+            <Markdown content={entry.segment.text} compact />
           </div>
         );
       })}

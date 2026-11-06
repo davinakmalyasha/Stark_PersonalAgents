@@ -3,6 +3,7 @@ import { Code2 } from 'lucide-react';
 import iconUrl from '../assets/stark-icon.png';
 import HouseHeader from './HouseHeader';
 import HouseRail, { type SideView } from './HouseRail';
+import HouseMobileNav from './HouseMobileNav';
 import HouseProjectsPanel from './HouseProjectsPanel';
 import HouseChat from './HouseChat';
 import HouseSidebar from './HouseSidebar';
@@ -24,13 +25,16 @@ import { useCanvasAgentState } from '../hooks/useCanvasAgentState';
 import type { TraceStep } from '../utils/logParser';
 import { kindForWorkspace, sendCanvasChat } from '../canvas/canvasSend';
 import { addWorkspace, createChat, updateChatTitle, deleteChat, addChatMessage, createGroupProject, createSchedule, cancelSchedule } from '../services/api';
+import { setBusy } from '../utils/runtimeBusy';
 import '../house/house.css';
 
 const CanvasStage = lazy(() => import('../canvas/CanvasStage'));
 
 export default function House() {
   const [transitioning, setTransitioning] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() =>
+    typeof window === 'undefined' ? true : window.matchMedia('(min-width: 768px)').matches,
+  );
   const [sideView, setSideView] = useState<SideView>('chats');
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -44,6 +48,12 @@ export default function House() {
   // Main workspace → General chats only (orchestrator agent). House workspace
   // is a separate route (#/house) that binds _house; never leak house here.
   const chat = useHouseChat({ workspaceKind: 'general' });
+
+  // Publish busy state for the auto-updater (never restart mid-run).
+  useEffect(() => {
+    setBusy('home', chat.isRunning || sessions.isGlobalRunning);
+    return () => setBusy('home', false);
+  }, [chat.isRunning, sessions.isGlobalRunning]);
   const { refreshSessions, newSession, newChatIn, openChat, closeTab } = sessions;
   const {
     activeChatId: generalActiveChatId,
@@ -131,16 +141,13 @@ export default function House() {
     }
   }, [sessions.booted, openChat]);
 
-  // Rail view click: switching views opens the panel; clicking the
-  // active view collapses it.
+  // Rail/nav view click: always open (or switch) the panel. Collapsing is the
+  // backdrop on mobile and the rail staying open on desktop — no tiny close
+  // button that strands the user.
   const handleSideView = useCallback((view: SideView) => {
-    if (view === sideView && sidebarOpen) {
-      setSidebarOpen(false);
-    } else {
-      setSideView(view);
-      setSidebarOpen(true);
-    }
-  }, [sideView, sidebarOpen]);
+    setSideView(view);
+    setSidebarOpen(true);
+  }, []);
 
   // Escape collapses the side panel (it stays docked, never slides away)
   useEffect(() => {
@@ -431,7 +438,7 @@ export default function House() {
   }
 
   return (
-    <div className="house-root fixed inset-0 flex flex-col overflow-hidden select-none">
+    <div className="house-root fixed inset-0 h-[100dvh] flex flex-col overflow-hidden select-none">
       <HouseHeader
         tabs={sessions.tabs}
         activeTabId={sessions.activeTabId}
@@ -442,19 +449,29 @@ export default function House() {
       />
 
       <div className="relative z-10 flex flex-1 min-h-0 overflow-hidden">
-      <HouseRail
-        view={sideView}
-        onView={handleSideView}
-        onNewChat={handleNewSession}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
-      />
-      {sidebarOpen && sideView === 'chats' && (
+      <div className="hidden md:flex shrink-0">
+        <HouseRail
+          view={sideView}
+          onView={handleSideView}
+          onNewChat={handleNewSession}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+          waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
+        />
+      </div>
+      {sidebarOpen && (
+        <div
+          className="md:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-sm"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+      {sidebarOpen && (
+        <div className="max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 max-md:w-[84vw] max-md:max-w-[320px] max-md:shadow-2xl flex min-h-0">
+      {sideView === 'chats' ? (
         <HouseSidebar
           persistent
           open
           onClose={() => setSidebarOpen(false)}
-          onCollapse={() => setSidebarOpen(false)}
           workspaces={sessions.workspaces}
           chatsByWs={sessions.chatsByWs}
           activeTabId={sessions.activeTabId}
@@ -474,9 +491,8 @@ export default function House() {
           onLaunchCoding={launchCoding}
           onLaunchHouse={launchHouse}
         />
-      )}
-      {sidebarOpen && sideView === 'projects' && (
-        <div className="w-[292px] shrink-0 bg-[#0f0f13] border-r house-hairline min-h-0">
+      ) : (
+        <div className="w-[248px] max-md:w-full shrink-0 bg-[#0f0f13] border-r house-hairline min-h-0">
           <HouseProjectsPanel
             projects={projects}
             projectsScoped={projectsScoped}
@@ -486,8 +502,9 @@ export default function House() {
             onNewTask={() => setTaskDialogOpen(true)}
             onCancelSchedule={handleCancelSchedule}
             onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
-            onCollapse={() => setSidebarOpen(false)}
           />
+        </div>
+      )}
         </div>
       )}
       <main className="relative flex-1 min-h-0 flex overflow-hidden">
@@ -533,6 +550,14 @@ export default function House() {
         )}
       </main>
       </div>
+
+      <HouseMobileNav
+        view={sideView}
+        onView={handleSideView}
+        onNewChat={handleNewSession}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
+      />
 
       {projectDialogOpen && (
         <NewProjectDialog

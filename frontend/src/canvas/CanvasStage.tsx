@@ -344,23 +344,17 @@ export default function CanvasStage({
 
       {items.length === 0 && (
         <div className="pointer-events-none absolute left-6 top-5 w-[300px]">
-          <div className="flex flex-col items-start gap-2 text-left">
-            <p className="text-[13px] font-medium text-zinc-400">Your canvas is empty</p>
-            <p className="text-[10.5px] leading-4 text-zinc-600">
-              Add a chat, project, or addon, then drag the cards anywhere. Nothing appears here automatically.
-            </p>
-            <button
-              type="button"
-              data-canvas-ui
-              onClick={() => setAddOpen(true)}
-              className="pointer-events-auto mt-1 flex items-center gap-2 text-[12.5px] font-medium text-zinc-300 hover:text-white transition-colors"
-            >
-              <span className="grid place-items-center w-7 h-7 rounded-full bg-white text-[#0a0a0d] hover:bg-zinc-200 transition-colors">
-                <Plus size={14} />
-              </span>
-              Add to Canvas
-            </button>
-          </div>
+          <button
+            type="button"
+            data-canvas-ui
+            onClick={() => setAddOpen(true)}
+            className="pointer-events-auto flex items-center gap-2 text-[12.5px] font-medium text-zinc-300 hover:text-white transition-colors"
+          >
+            <span className="grid place-items-center w-7 h-7 rounded-full bg-white text-[#0a0a0d] hover:bg-zinc-200 transition-colors">
+              <Plus size={14} />
+            </span>
+            Add to Canvas
+          </button>
         </div>
       )}
     </div>

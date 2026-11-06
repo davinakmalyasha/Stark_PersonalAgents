@@ -1,31 +1,25 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Download, FolderOpen, HardDrive, RefreshCw, Settings as SettingsIcon, Upload, X } from 'lucide-react';
 import {
-  cloneWorkspace,
   exportStarkData,
-  fetchDesktopHarness,
-  fetchHarness,
   fetchMigrationStatus,
-  fetchPairedDevices,
   importMigration,
   importStarkData,
   pickFolder,
-  revokePairedDevice,
-  setDesktopHarnessRoot,
-  type HarnessInfo,
   type MigrationCandidate,
-  type PairedDevice,
 } from '../../services/api';
 import { checkForAppUpdate } from '../../utils/appUpdate';
+import { subscribeUpdate, type UpdateState } from '../../utils/updateStore';
+import { STARK_VERSION } from '../../version';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
 }
 
+const isDesktop = () => typeof window !== 'undefined' && Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
+
 export default function SettingsModal({ isOpen, onClose }: Props) {
-  const [harness, setHarness] = useState<HarnessInfo | null>(null);
-  const [desktop, setDesktop] = useState<{ harness_root: string; install_path: string; default_root: string; dev: boolean; error?: string | null } | null>(null);
   const [candidates, setCandidates] = useState<MigrationCandidate[]>([]);
   const [active, setActive] = useState('');
   const [status, setStatus] = useState('');
@@ -34,27 +28,18 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupRoot, setBackupRoot] = useState('');
   const [backupFile, setBackupFile] = useState<File | null>(null);
-  const [devices, setDevices] = useState<PairedDevice[]>([]);
-  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateState, setUpdateState] = useState<UpdateState | null>(null);
+
+  useEffect(() => subscribeUpdate(setUpdateState), []);
 
   const load = useCallback(async () => {
     setError('');
     try {
-      const [server, migration] = await Promise.all([
-        fetchHarness().catch(() => null),
-        fetchMigrationStatus().catch(() => null),
-      ]);
-      if (server) setHarness(server);
+      const migration = await fetchMigrationStatus().catch(() => null);
       if (migration) {
         setCandidates(migration.candidates || []);
         setActive(migration.active || '');
       }
-      try {
-        setDesktop(await fetchDesktopHarness());
-      } catch {
-        setDesktop(null);
-      }
-      setDevices(await fetchPairedDevices().catch(() => []));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Could not load settings.');
     }
@@ -63,23 +48,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   useEffect(() => {
     if (isOpen) void load();
   }, [isOpen, load]);
-
-  const changeRoot = async () => {
-    setBusy(true);
-    setError('');
-    setStatus('');
-    try {
-      const folder = await pickFolder();
-      if (!folder) return;
-      await setDesktopHarnessRoot(folder);
-      setStatus('Harness root saved. Restart the app to use it.');
-      await load();
-    } catch (changeError) {
-      setError(changeError instanceof Error ? changeError.message : 'Could not save harness root.');
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const runImport = async (source: string) => {
     setBusy(true);
@@ -145,40 +113,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
-  const cloneMissingWorkspace = async (workspace: { id: string; name: string; repo?: string | null }) => {
-    setError('');
-    setStatus('');
-    try {
-      const result = await cloneWorkspace(workspace.id);
-      setStatus(result.already ? `${workspace.name} already exists.` : `Cloned ${workspace.name} into ${result.path}.`);
-      await load();
-    } catch (cloneError) {
-      setError(cloneError instanceof Error ? cloneError.message : 'Clone failed.');
-    }
-  };
-
-  const revokeDevice = async (device: PairedDevice) => {
-    setError('');
-    try {
-      await revokePairedDevice(device.id);
-      setDevices((current) => current.filter((item) => item.id !== device.id));
-      setStatus(`Revoked "${device.name}". That device must pair again.`);
-    } catch (revokeError) {
-      setError(revokeError instanceof Error ? revokeError.message : 'Could not revoke device.');
-    }
-  };
-
   const checkUpdates = async () => {
-    setUpdateBusy(true);
     setError('');
-    setStatus('');
-    try {
-      await checkForAppUpdate(setStatus, { manual: true });
-    } catch (updateError) {
-      setError(updateError instanceof Error ? updateError.message : 'Could not check for updates.');
-    } finally {
-      setUpdateBusy(false);
-    }
+    await checkForAppUpdate({ manual: true }).catch(() => {});
   };
 
   if (!isOpen) return null;
@@ -189,7 +126,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const sectionHeadClass = 'flex items-center gap-2';
   const actionClass = 'flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] font-medium text-zinc-300 hover:bg-white/[0.06] disabled:opacity-50 transition-colors';
   const primaryClass = 'flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-[11.5px] font-semibold text-[#0a0a0d] hover:bg-zinc-200 disabled:opacity-50 transition-colors';
-  const valueClass = 'text-[12px] text-zinc-200 font-mono break-all';
+  const desktop = isDesktop();
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 animate-fade-in">
@@ -198,14 +135,14 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
         style={{
           borderColor: 'var(--border-color)',
           borderRadius: '16px',
-          width: 'min(720px, calc(100vw - 48px))',
-          maxHeight: 'min(640px, calc(100vh - 48px))',
+          width: 'min(680px, calc(100vw - 32px))',
+          maxHeight: 'min(640px, calc(100vh - 40px))',
           boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
         }}
       >
         <div
           className="flex items-center justify-between flex-shrink-0"
-          style={{ padding: '18px 22px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}
+          style={{ padding: '16px 20px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}
         >
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-lg text-zinc-300 border" style={{ backgroundColor: 'rgba(255,255,255,0.04)', borderColor: 'rgba(255,255,255,0.09)' }}>
@@ -213,7 +150,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </div>
             <div>
               <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">Settings</h2>
-              <p className="text-[11px] text-zinc-500 mt-0.5">App, harness data, and one-time migration</p>
+              <p className="text-[11px] text-zinc-500 mt-0.5">Stark v{STARK_VERSION}</p>
             </div>
           </div>
           <button onClick={onClose} className="p-1.5 text-zinc-400 hover:text-zinc-200 hover:bg-white/5 rounded-md transition-all" aria-label="Close">
@@ -221,112 +158,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
           </button>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-y-auto space-y-4" style={{ padding: '18px 22px' }}>
-          <section className={sectionClass}>
-            <div className={sectionHeadClass}>
-              <HardDrive size={13} className="text-zinc-500" />
-              <span className={labelClass}>Install & data paths</span>
-            </div>
-            <div className={rowClass}>
-              <div className="min-w-0">
-                <div className={labelClass}>App install</div>
-                <div className={valueClass}>{desktop?.install_path || harness?.install_path || '—'}</div>
-              </div>
-            </div>
-            <div className={rowClass}>
-              <div className="min-w-0 flex-1">
-                <div className={labelClass}>Harness root (chats, sessions, config, .env)</div>
-                <div className={valueClass}>{desktop?.harness_root || harness?.harness_root || '—'}</div>
-                {desktop?.error && <div className="text-[11px] text-red-300 mt-1">{desktop.error}</div>}
-                {harness?.error && <div className="text-[11px] text-red-300 mt-1">{harness.error}</div>}
-                <div className="text-[10.5px] text-zinc-500 mt-1">
-                  Default: {desktop?.default_root || String.raw`D:\StarkData`}. Your projects stay where they are;
-                  only harness data lives here.
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => void changeRoot()}
-                disabled={busy}
-                className={actionClass}
-              >
-                <FolderOpen size={14} /> Change…
-              </button>
-            </div>
-            {!!harness?.workspaces?.length && (
-              <div className={rowClass}>
-                <div className="min-w-0">
-                  <div className={labelClass}>Workspaces ({harness.workspaces.length})</div>
-                  <div className="mt-1 space-y-1">
-                    {harness.workspaces.slice(0, 8).map((workspace) => (
-                      <div key={workspace.id} className="flex items-center gap-2">
-                        <div className="min-w-0 flex-1">
-                          <div className="text-[11px] text-zinc-400 font-mono truncate">
-                            {workspace.name} — {workspace.path}
-                          </div>
-                          {workspace.repo && (
-                            <div className="text-[10px] text-zinc-600 font-mono truncate">{workspace.repo}</div>
-                          )}
-                        </div>
-                        {workspace.exists === false && workspace.repo && (
-                          <button
-                            type="button"
-                            onClick={() => void cloneMissingWorkspace(workspace)}
-                            className="flex-shrink-0 px-2 py-0.5 rounded-md border border-white/10 text-[10.5px] text-zinc-300 hover:bg-white/[0.06]"
-                          >
-                            Clone
-                          </button>
-                        )}
-                        {workspace.exists === false && !workspace.repo && (
-                          <span className="flex-shrink-0 text-[10px] text-amber-300/80">folder missing</span>
-                        )}
-                      </div>
-                    ))}
-                    {harness.workspaces.length > 8 && (
-                      <div className="text-[10.5px] text-zinc-500">+{harness.workspaces.length - 8} more</div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-          </section>
-
-          <section className={sectionClass}>
-            <div className={sectionHeadClass}>
-              <SettingsIcon size={13} className="text-zinc-500" />
-              <span className={labelClass}>Paired devices</span>
-            </div>
-            <p className="text-[11px] text-zinc-500">
-              Each device has its own token. Revoking one signs that device out without touching the others.
-            </p>
-            {devices.length === 0 ? (
-              <div className="text-[11px] text-zinc-500">
-                No per-device tokens yet — devices paired with the legacy token won't appear here.
-              </div>
-            ) : (
-              <div className="space-y-1.5">
-                {devices.map((device) => (
-                  <div key={device.id} className={rowClass}>
-                    <div className="min-w-0">
-                      <div className="text-[12px] text-zinc-200 font-medium truncate">{device.name}</div>
-                      <div className="text-[10.5px] text-zinc-500 font-mono truncate">
-                        {device.id} · created {new Date(device.created_at).toLocaleDateString()}
-                        {device.last_seen ? ` · seen ${new Date(device.last_seen).toLocaleString()}` : ' · never seen'}
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void revokeDevice(device)}
-                      className="flex-shrink-0 px-2.5 py-1 rounded-lg border border-red-500/30 text-[11px] text-red-300 hover:bg-red-500/10"
-                    >
-                      Revoke
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-3.5" style={{ padding: '16px 20px 20px' }}>
           <section className={sectionClass}>
             <div className={sectionHeadClass}>
               <RefreshCw size={13} className="text-zinc-500" />
@@ -334,19 +166,33 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </div>
             <div className={rowClass}>
               <div className="min-w-0">
-                <div className="text-[12px] text-zinc-200 font-medium">Desktop app</div>
+                <div className="text-[12px] text-zinc-200 font-medium">Stark v{STARK_VERSION}</div>
                 <div className="text-[10.5px] text-zinc-500 mt-0.5">
-                  Checked on every launch and applied automatically. Check now to update immediately.
+                  {desktop
+                    ? 'Checked on every launch and applied automatically — no manual step.'
+                    : 'Web build — updates arrive when the server deploys.'}
                 </div>
+                {updateState && updateState.phase !== 'idle' && updateState.phase !== 'unsupported' && (
+                  <div
+                    role="status"
+                    className={`mt-1.5 text-[11px] ${
+                      updateState.phase === 'error' ? 'text-amber-300' : 'text-zinc-400'
+                    }`}
+                  >
+                    {updateState.message}
+                  </div>
+                )}
               </div>
-              <button
-                type="button"
-                onClick={() => void checkUpdates()}
-                disabled={updateBusy}
-                className={actionClass}
-              >
-                <RefreshCw size={14} className={updateBusy ? 'animate-spin' : ''} /> Check
-              </button>
+              {desktop && (
+                <button
+                  type="button"
+                  onClick={() => void checkUpdates()}
+                  disabled={updateState?.phase === 'checking' || updateState?.phase === 'downloading'}
+                  className={actionClass}
+                >
+                  <RefreshCw size={14} className={updateState?.phase === 'checking' ? 'animate-spin' : ''} /> Check
+                </button>
+              )}
             </div>
           </section>
 
@@ -357,7 +203,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </div>
             <p className="text-[11px] text-zinc-500">
               One portable zip: chats, sessions, config, memory, workspaces (relative paths) and a
-              consistent database snapshot. API keys, voice models, logs and WAL files are excluded.
+              consistent database snapshot. API keys are excluded.
             </p>
             <div className={rowClass}>
               <div className="min-w-0">
@@ -379,8 +225,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
               <div className="min-w-0 flex-1 space-y-1.5">
                 <div className="text-[12px] text-zinc-200 font-medium">Import a backup</div>
                 <div className="text-[10.5px] text-zinc-500">
-                  Applied on the next start, after backing up the current data. Workspace paths are
-                  rebased onto the projects root below.
+                  Applied on the next start, after backing up the current data.
                 </div>
                 <input
                   type="file"
@@ -391,7 +236,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 <input
                   value={backupRoot}
                   onChange={(event) => setBackupRoot(event.target.value)}
-                  placeholder={`Projects root here (default: ${desktop?.harness_root ? 'STARK_PROJECTS_ROOT' : 'D:\\\\MyProject'})`}
+                  placeholder="Projects root here (optional)"
                   className="block w-full rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-indigo-500/60 focus:outline-none"
                 />
               </div>
@@ -422,8 +267,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </div>
             <p className="text-[11px] text-zinc-500">
               Import chats, sessions, and config from an old harness root into the active one
-              ({active || '—'}). Existing files are backed up to <span className="font-mono">.bak</span> first;
-              nothing is merged automatically.
+              ({active || '—'}). Existing files are backed up to <span className="font-mono">.bak</span> first.
             </p>
             {candidates.filter((candidate) => !candidate.active).map((candidate) => (
               <div key={candidate.id} className={rowClass}>
@@ -455,7 +299,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
               type="button"
               onClick={() => void importFromFolder()}
               disabled={busy}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+              className={actionClass}
             >
               <FolderOpen size={14} /> Import from a folder…
             </button>

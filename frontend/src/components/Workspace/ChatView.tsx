@@ -106,11 +106,11 @@ export default function ChatView({
     <div 
       className={`${
         variant === 'docked'
-          ? 'relative w-full max-w-[780px] mx-auto flex flex-col pointer-events-auto'
-          : 'absolute bottom-4 left-2 right-2 z-40 w-auto max-w-none flex flex-col pointer-events-auto transition-all duration-300'
+          ? 'relative w-full md:max-w-[780px] mx-auto flex flex-col pointer-events-auto'
+          : 'absolute bottom-1 md:bottom-4 left-0 right-0 md:left-2 md:right-2 z-40 w-auto max-w-none flex flex-col pointer-events-auto transition-all duration-300'
       }`}
       style={{
-        maxHeight: variant === 'docked' ? '78vh' : '88vh',
+        maxHeight: variant === 'docked' ? '78vh' : undefined,
       }}
     >
       {/* Floating minimize/expand button (icon only, proper bg color, bigger icon) */}

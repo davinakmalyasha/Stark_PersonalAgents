@@ -1,4 +1,4 @@
-import { CalendarClock, FolderKanban, PanelLeftClose, Plus, X } from 'lucide-react';
+import { CalendarClock, FolderKanban, Plus, X } from 'lucide-react';
 import type { GroupProjectRow, ScheduledTask } from '../types';
 import { displayActor } from './group/groupProjectUi';
 
@@ -11,7 +11,6 @@ interface Props {
   onNewTask: () => void;
   onCancelSchedule: (scheduleId: string) => void;
   onOpenScheduledChat: (workspaceId: string, chatId: string) => void;
-  onCollapse?: () => void;
 }
 
 function dot(status: string, awaiting: number): string {
@@ -27,7 +26,7 @@ function dot(status: string, awaiting: number): string {
 }
 
 export default function HouseProjectsPanel({
-  projects, projectsScoped, schedules, onOpenProject, onNewProject, onNewTask, onCancelSchedule, onOpenScheduledChat, onCollapse,
+  projects, projectsScoped, schedules, onOpenProject, onNewProject, onNewTask, onCancelSchedule, onOpenScheduledChat,
 }: Props) {
   return (
     <div className="flex flex-col min-h-0 h-full">
@@ -42,16 +41,6 @@ export default function HouseProjectsPanel({
         >
           <Plus size={13} />
         </button>
-        {onCollapse && (
-          <button
-            onClick={onCollapse}
-            title="Collapse sidebar"
-            aria-label="Collapse sidebar"
-            className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
-          >
-            <PanelLeftClose size={13} />
-          </button>
-        )}
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto house-thread px-2.5 pb-3.5">
         {projectsScoped && (

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Brain, Code2, House as HouseIcon, User } from 'lucide-react';
 import App from './App';
 import House from './house/House';
@@ -8,7 +9,10 @@ import HouseWorkspace from './house-workspace/HouseWorkspace';
 import PersonalWorkspace from './personal-workspace/PersonalWorkspace';
 import MemoryWorkspace from './memory/MemoryWorkspace';
 import PairingGate from './components/Layout/PairingGate';
+import UpdateToast from './components/Layout/UpdateToast';
+import QuestionModal from './components/Workspace/QuestionModal';
 import { onAuthRejected } from './services/remoteAuth';
+import { startAutoUpdate } from './utils/appUpdate';
 
 type Route = 'home' | 'coding' | 'house' | 'personal' | 'memory'
 
@@ -33,6 +37,9 @@ function getRoute(): Route {
  * entered via `#/personal` (reserved shell). The Design module
  * OpenDesign is an addon inside the coding workspace, not a room.
  * Entering shows the white portal ring transition while the workspace boots.
+ *
+ * Desktop auto-update lives here (not in the coding App) so every route
+ * checks on launch and shows the same status toast.
  */
 export default function AppShell() {
   const [route, setRoute] = useState<Route>(getRoute)
@@ -43,6 +50,9 @@ export default function AppShell() {
 
   // Remote access: when the server rejects us (401) show the pairing gate.
   useEffect(() => onAuthRejected(() => setNeedsPairing(true)), [])
+
+  // Signed desktop auto-update: applies on every route, restarts when idle.
+  useEffect(() => startAutoUpdate(), [])
 
   useEffect(() => {
     const onHash = () => setRoute(getRoute())
@@ -67,11 +77,11 @@ export default function AppShell() {
     return undefined
   }, [route])
 
+  let content: ReactNode
   if (needsPairing) {
-    return <PairingGate />
-  }
-  if (route === 'coding') {
-    return (
+    content = <PairingGate />
+  } else if (route === 'coding') {
+    content = (
       <>
         <App />
         <HomeOrb />
@@ -84,9 +94,8 @@ export default function AppShell() {
         )}
       </>
     )
-  }
-  if (route === 'house') {
-    return (
+  } else if (route === 'house') {
+    content = (
       <>
         <HouseWorkspace />
         {portalVisible && (
@@ -98,9 +107,8 @@ export default function AppShell() {
         )}
       </>
     )
-  }
-  if (route === 'personal') {
-    return (
+  } else if (route === 'personal') {
+    content = (
       <>
         <PersonalWorkspace />
         {portalVisible && (
@@ -112,9 +120,8 @@ export default function AppShell() {
         )}
       </>
     )
-  }
-  if (route === 'memory') {
-    return (
+  } else if (route === 'memory') {
+    content = (
       <>
         <MemoryWorkspace />
         {portalVisible && (
@@ -126,6 +133,16 @@ export default function AppShell() {
         )}
       </>
     )
+  } else {
+    content = <House />
   }
-  return <House />
+
+  return (
+    <>
+      {content}
+      <UpdateToast />
+      {/* Ask-user overlay is global: an agent can block from any route. */}
+      <QuestionModal />
+    </>
+  )
 }

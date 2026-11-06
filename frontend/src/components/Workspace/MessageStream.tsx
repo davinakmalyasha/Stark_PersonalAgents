@@ -151,8 +151,7 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="h-full overflow-y-auto"
-        style={{ paddingLeft: '16px', paddingRight: '16px', paddingTop: '12px', paddingBottom: '12px' }}
+        className="h-full overflow-y-auto px-3 md:px-4 py-3"
       >
         {isEmpty ? (
           <div className="flex items-center justify-center min-h-[60vh] h-full">

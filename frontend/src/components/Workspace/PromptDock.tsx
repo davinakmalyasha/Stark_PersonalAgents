@@ -147,7 +147,10 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   };
 
   return (
-    <div className="w-full flex-shrink-0 px-2 pt-1.5 pb-2">
+    <div
+      className="w-full flex-shrink-0 px-1.5 md:px-2 pt-1.5 pb-1.5 md:pb-2"
+      style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 6px)' }}
+    >
       <div
         className={`prompt-dock premium-surface premium-surface--dark relative overflow-visible ${dragActive ? 'is-dragging' : ''} ${isVoiceMode ? 'is-listening' : ''}`}
         onDragEnter={(event) => { event.preventDefault(); dragDepth.current += 1; setDragActive(true); }}

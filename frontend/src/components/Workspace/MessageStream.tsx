@@ -25,72 +25,70 @@ interface Props {
 export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const isAtBottomRef = useRef(true);
-  const lastScrollHeightRef = useRef(0);
-
-  useEffect(() => {
-    if (scrollRef.current) {
-      lastScrollHeightRef.current = scrollRef.current.scrollHeight;
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!scrollRef.current || !isAtBottomRef.current) return;
-    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages]);
-
-  useEffect(() => {
-    if (!contentRef.current) return;
-    const observer = new ResizeObserver(() => {
-      if (isAtBottomRef.current && scrollRef.current) {
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      }
-    });
-    observer.observe(contentRef.current);
-    return () => observer.disconnect();
-  }, [messages, hasActiveChat]);
-
-  const handleScroll = () => {
-    if (!scrollRef.current) return;
-    const el = scrollRef.current;
-    const wasAtBottom = isAtBottomRef.current;
-    const heightChanged = el.scrollHeight !== lastScrollHeightRef.current;
-    let bottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 60;
-    if (heightChanged && wasAtBottom) bottom = true;
-    lastScrollHeightRef.current = el.scrollHeight;
-    isAtBottomRef.current = bottom;
-    // Track how far above the bottom we are (for the jump-to-bottom pill).
-    const dist = el.scrollHeight - el.clientHeight - el.scrollTop;
-    setScrollDist(Math.max(0, dist));
-  };
-
-  // Tier D: jump-to-bottom pill — shown when the user scrolls up; counts new
-  // messages that arrived while away from the bottom.
+  /** Follow streaming/updates until the user scrolls away from the bottom.
+   *  Scrolling back down (or clicking the pill) resumes following. */
+  const followRef = useRef(true);
   const [scrollDist, setScrollDist] = useState(0);
   const [unread, setUnread] = useState(0);
-  const wasAtBottomOnUpdate = useRef(true);
   const shownPill = scrollDist > 120;
 
+  function stickToBottom() {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // Follow content growth: streaming text, reasoning, tool expansion,
+  // images loading — anything that increases the scroll height.
   useEffect(() => {
-    if (isAtBottomRef.current) {
-      wasAtBottomOnUpdate.current = true;
+    const el = scrollRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => {
+      if (followRef.current) el.scrollTop = el.scrollHeight;
+    });
+    if (contentRef.current) observer.observe(contentRef.current);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasActiveChat]);
+
+  useEffect(() => {
+    if (followRef.current) stickToBottom();
+  }, [messages]);
+
+  // Switching chats resets follow mode and starts pinned to the newest turn.
+  useEffect(() => {
+    followRef.current = true;
+    setUnread(0);
+    setScrollDist(0);
+    stickToBottom();
+  }, [chatId]);
+
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.clientHeight - el.scrollTop;
+    // At the bottom → follow again (scroll-back resumes following, matching
+    // a terminal/opencode style), slightly above → stop forcing.
+    followRef.current = dist <= 40;
+    setScrollDist(Math.max(0, dist));
+    if (dist <= 40) setUnread(0);
+  };
+
+  useEffect(() => {
+    if (followRef.current) {
       setUnread(0);
     } else {
-      wasAtBottomOnUpdate.current = false;
       setUnread((u) => u + 1);
     }
   }, [messages]);
 
-  useEffect(() => {
-    if (!shownPill && wasAtBottomOnUpdate.current) setUnread(0);
-  }, [shownPill]);
-
   const jumpToBottom = () => {
-    if (!scrollRef.current) return;
-    scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+    const el = scrollRef.current;
+    if (!el) return;
+    followRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
     setUnread(0);
     setScrollDist(0);
-    isAtBottomRef.current = true;
   };
 
   const visibleMessages = messages.filter((message) => !(

@@ -106,7 +106,7 @@ export default function ChatView({
     <div 
       className={`${
         variant === 'docked'
-          ? 'relative w-full max-w-[920px] mx-auto flex flex-col pointer-events-auto'
+          ? 'relative w-full max-w-[780px] mx-auto flex flex-col pointer-events-auto'
           : 'absolute bottom-4 left-2 right-2 z-40 w-auto max-w-none flex flex-col pointer-events-auto transition-all duration-300'
       }`}
       style={{

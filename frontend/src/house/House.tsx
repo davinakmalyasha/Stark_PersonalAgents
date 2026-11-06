@@ -439,17 +439,12 @@ export default function House() {
         onActivateTab={sessions.activateTab}
         onCloseTab={sessions.closeTab}
         onNewSession={handleNewSession}
-        onToggleSidebar={() => setSidebarOpen((v) => !v)}
       />
 
       <div className="relative z-10 flex flex-1 min-h-0 overflow-hidden">
       <HouseRail
         view={sideView}
         onView={handleSideView}
-        onHome={() => {
-          const chatTab = [...sessions.tabs].reverse().find((t) => t.type === 'chat');
-          if (chatTab) sessions.activateTab(chatTab.id);
-        }}
         onNewChat={handleNewSession}
         onOpenSettings={() => setIsSettingsOpen(true)}
         waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
@@ -459,6 +454,7 @@ export default function House() {
           persistent
           open
           onClose={() => setSidebarOpen(false)}
+          onCollapse={() => setSidebarOpen(false)}
           workspaces={sessions.workspaces}
           chatsByWs={sessions.chatsByWs}
           activeTabId={sessions.activeTabId}
@@ -490,6 +486,7 @@ export default function House() {
             onNewTask={() => setTaskDialogOpen(true)}
             onCancelSchedule={handleCancelSchedule}
             onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
+            onCollapse={() => setSidebarOpen(false)}
           />
         </div>
       )}

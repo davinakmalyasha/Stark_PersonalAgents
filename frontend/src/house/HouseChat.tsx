@@ -194,7 +194,7 @@ export default function HouseChat({
   // before (no header row, narrow padding). Collapse lives in a floating
   // hover chevron, top-right of the card.
   return (
-    <div className="flex flex-col justify-end w-full max-w-[880px] mx-auto px-2 pt-2 pb-2">
+    <div className="flex flex-col justify-end w-full max-w-[740px] mx-auto px-2 pt-2 pb-2">
       <div className="house-chat-card pointer-events-auto relative flex flex-col min-h-0 max-h-[74vh] rounded-2xl border house-hairline px-2 pt-1.5 pb-1 overflow-hidden">
         <button
           onClick={() => setMinimized((m) => !m)}

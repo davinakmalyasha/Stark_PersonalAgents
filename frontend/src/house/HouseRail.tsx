@@ -1,4 +1,4 @@
-import { FolderKanban, Home, MessageSquare, Settings, SquarePen } from 'lucide-react';
+import { FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
 export type SideView = 'chats' | 'projects';
@@ -7,13 +7,12 @@ interface Props {
   view: SideView;
   /** Rail icon click: switch the side panel view (clicking active collapses). */
   onView: (view: SideView) => void;
-  onHome: () => void;
   onNewChat: () => void;
   onOpenSettings: () => void;
   waiting: number;
 }
 
-export default function HouseRail({ view, onView, onHome, onNewChat, onOpenSettings, waiting }: Props) {
+export default function HouseRail({ view, onView, onNewChat, onOpenSettings, waiting }: Props) {
   const btn = (active: boolean) =>
     `grid place-items-center w-9 h-9 rounded-xl transition-colors cursor-pointer shrink-0 ${
       active ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
@@ -25,9 +24,6 @@ export default function HouseRail({ view, onView, onHome, onNewChat, onOpenSetti
       style={{ WebkitAppRegion: 'drag' } as CSSProperties}
     >
       <div style={{ WebkitAppRegion: 'no-drag' } as CSSProperties} className="flex flex-col items-center gap-1">
-        <button onClick={onHome} title="Home" aria-label="Home" className={btn(false)}>
-          <Home size={17} />
-        </button>
         <button onClick={onNewChat} title="New chat" aria-label="New chat" className={btn(false)}>
           <SquarePen size={17} />
         </button>
@@ -41,7 +37,7 @@ export default function HouseRail({ view, onView, onHome, onNewChat, onOpenSetti
           aria-pressed={view === 'chats'}
           className={btn(view === 'chats')}
         >
-          <MessageSquare size={17} />
+          <Home size={17} />
         </button>
         <button
           onClick={() => onView('projects')}
@@ -63,12 +59,6 @@ export default function HouseRail({ view, onView, onHome, onNewChat, onOpenSetti
         <button onClick={onOpenSettings} title="Settings" aria-label="Open settings" className={btn(false)}>
           <Settings size={17} />
         </button>
-        <span
-          title="Local workspace"
-          className="grid place-items-center w-9 h-9 rounded-full bg-[#1d4ed8] text-white text-[12px] font-bold shrink-0"
-        >
-          S
-        </span>
       </div>
     </nav>
   );

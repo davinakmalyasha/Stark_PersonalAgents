@@ -17,7 +17,7 @@ interface Props {
  */
 export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings, onOpenMap, mapOpen, waiting }: Props) {
   const item = (active: boolean) =>
-    `relative flex flex-1 flex-col items-center justify-center gap-0.5 py-1.5 rounded-lg transition-colors cursor-pointer ${
+    `house-mobile-nav-btn relative flex flex-1 flex-col items-center justify-center gap-0.5 py-1.5 rounded-lg cursor-pointer ${
       active ? 'text-white' : 'text-zinc-500 active:text-zinc-200'
     }`;
   return (

@@ -68,9 +68,9 @@ export default function PairingModal({ open, onClose }: Props) {
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 modal-backdrop-enter" onClick={onClose}>
       <div
-        className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#111114] shadow-2xl overflow-hidden"
+        className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#111114] shadow-2xl overflow-hidden modal-panel-enter"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800/70">

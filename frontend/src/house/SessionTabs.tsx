@@ -40,7 +40,7 @@ export default function SessionTabs({
             title={tooltip}
             onClick={() => onActivateTab(tab.id)}
             onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); onCloseTab(tab.id); } }}
-            className={`group flex items-center gap-2 h-[30px] px-2.5 rounded-lg border shrink-0 max-w-[210px] cursor-pointer transition-all duration-150 select-none ${
+            className={`group flex items-center gap-2 h-[30px] px-2.5 rounded-lg border shrink-0 max-w-[210px] cursor-pointer transition-[background-color,border-color,color,box-shadow,opacity] duration-150 select-none ${
               isActive
                 ? 'bg-white/[0.10] border-white/[0.14] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]'
                 : 'bg-transparent border-transparent text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-200'
@@ -69,7 +69,7 @@ export default function SessionTabs({
         onClick={onNewSession}
         title="New session"
         aria-label="New session"
-        className="flex items-center gap-1.5 h-[30px] px-2.5 rounded-lg border border-dashed border-white/[0.12] shrink-0 text-zinc-500 hover:text-zinc-200 hover:border-white/[0.28] hover:bg-white/[0.04] transition-all duration-150 cursor-pointer"
+        className="flex items-center gap-1.5 h-[30px] px-2.5 rounded-lg border border-dashed border-white/[0.12] shrink-0 text-zinc-500 hover:text-zinc-200 hover:border-white/[0.28] hover:bg-white/[0.04] transition-colors duration-150 cursor-pointer"
       >
         <Plus size={13} />
         <span className="text-[12px] leading-none hidden md:inline">New session</span>

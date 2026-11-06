@@ -10,12 +10,10 @@ import HouseSidebar from './HouseSidebar';
 import HousePortal from './HousePortal';
 import CodingIDE from './CodingIDE';
 import NewProjectDialog from './NewProjectDialog';
-import NewTaskDialog, { type NewTaskRequest } from './NewTaskDialog';
 import SubagentTabsPane from './SubagentTabsPane';
 import { useSubagentTabs } from './useSubagentTabs';
 import GroupProjectModal from './GroupProjectModal';
 import { useGroupProjects } from './useGroupProjects';
-import { useScheduledTasks } from './useScheduledTasks';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import SettingsModal from '../components/Layout/SettingsModal';
 import { useHouseChat } from './useHouseChat';
@@ -24,7 +22,7 @@ import { useSessionRunner } from './useSessionRunner';
 import { useCanvasAgentState } from '../hooks/useCanvasAgentState';
 import type { TraceStep } from '../utils/logParser';
 import { kindForWorkspace, sendCanvasChat } from '../canvas/canvasSend';
-import { addWorkspace, createChat, updateChatTitle, deleteChat, addChatMessage, createGroupProject, createSchedule } from '../services/api';
+import { addWorkspace, createChat, updateChatTitle, deleteChat, createGroupProject } from '../services/api';
 import { setBusy } from '../utils/runtimeBusy';
 import '../house/house.css';
 
@@ -42,7 +40,6 @@ export default function House() {
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [projectDialogMode, setProjectDialogMode] = useState<'group' | 'solo'>('group');
-  const [taskDialogOpen, setTaskDialogOpen] = useState(false);
   const subagents = useSubagentTabs();
   const [exitingIdeTab, setExitingIdeTab] = useState<import('../types').SessionTab | null>(null);
 
@@ -74,7 +71,6 @@ export default function House() {
   const [openProjectId, setOpenProjectId] = useState<string | null>(null);
   const groupScopeId = activeTab?.workspaceId || chat.workspaceId || '';
   const { projects, scoped: projectsScoped, refresh: refreshProjects } = useGroupProjects(groupScopeId);
-  const { refresh: refreshSchedules } = useScheduledTasks('');
 
   // IDE open/close transition: keep the exiting IDE mounted for the exit
   // animation so it feels like staying on the same page (only the IDE shows/
@@ -218,46 +214,6 @@ export default function House() {
     setProjectDialogMode('solo');
     setProjectDialogOpen(true);
   }, []);
-
-  const handleCreateTask = useCallback(async (request: NewTaskRequest) => {
-    const titleSource = request.instructions.split(/[\n.!?]/, 1)[0].trim();
-    const title = (titleSource.slice(0, 48) || 'New Conversation') + (titleSource.length > 48 ? '…' : '');
-    if (request.kind === 'single') {
-      const tab = await newSession(title);
-      if (!tab) throw new Error('Could not create a General chat.');
-      chat.seedDraft(request.instructions);
-      setTaskDialogOpen(false);
-      return;
-    }
-
-    if (request.kind === 'group') {
-      const project = await createGroupProject({ goal: request.instructions, workspaceId: groupScopeId });
-      if (!project.id) throw new Error('The backend did not return a project id.');
-      await refreshProjects();
-      setOpenProjectId(project.id);
-      setTaskDialogOpen(false);
-      return;
-    }
-
-    const tab = await newSession(title);
-    if (!tab) throw new Error('Could not create a General chat.');
-    const localDate = request.runAt ? new Date(request.runAt) : null;
-    if (!localDate || Number.isNaN(localDate.getTime())) throw new Error('Choose a valid local date and time.');
-    const schedule = await createSchedule({
-      workspaceId: tab.workspaceId,
-      chatId: tab.chatId,
-      name: title,
-      prompt: request.instructions,
-      at: localDate.toISOString(),
-      recurrence: request.repeat === 'once' ? 'none' : (request.repeat || 'none'),
-    });
-    const repeatLabel = request.repeat === 'once' ? 'once' : request.repeat;
-    await addChatMessage(tab.workspaceId, tab.chatId, 'system', `Scheduled task: ${title}. Next run: ${new Date(schedule.nextRunAt).toLocaleString()}. Repeat: ${repeatLabel}.`);
-    await Promise.all([sessions.forceRefresh(), refreshSchedules()]);
-    sessions.activateTab(tab.id);
-    await chat.handleSelectChat(tab.chatId, { silent: true });
-    setTaskDialogOpen(false);
-  }, [newSession, chat, groupScopeId, refreshProjects, sessions, refreshSchedules]);
 
   const handleNewChatIn = useCallback((workspaceId: string) => {
     newChatIn(workspaceId);
@@ -566,7 +522,7 @@ export default function House() {
         />
       )}
       {sidebarOpen && (
-        <div className="max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 max-md:w-[84vw] max-md:max-w-[320px] max-md:shadow-2xl flex min-h-0">
+        <div className="house-drawer-enter max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 max-md:w-[84vw] max-md:max-w-[320px] max-md:shadow-2xl flex min-h-0">
       {sideView === 'chats' ? (
         <HouseSidebar
           persistent
@@ -665,13 +621,6 @@ export default function House() {
           onCreateProject={handleCreateProject}
           onCreateGroup={handleCreateGroupFromDialog}
           defaultMode={projectDialogMode}
-        />
-      )}
-
-      {taskDialogOpen && (
-        <NewTaskDialog
-          onClose={() => setTaskDialogOpen(false)}
-          onCreate={handleCreateTask}
         />
       )}
 

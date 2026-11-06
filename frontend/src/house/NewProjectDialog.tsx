@@ -84,7 +84,7 @@ export default function NewProjectDialog({ onClose, onCreateProject, onCreateGro
   };
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => { if (!busy) onClose(); }}>
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 modal-backdrop-enter" onClick={() => { if (!busy) onClose(); }}>
       <div
         className="w-[390px] max-w-full rounded-2xl border house-hairline bg-[#141419]/95 backdrop-blur-xl shadow-2xl overflow-hidden session-flow-enter"
         onClick={(e) => e.stopPropagation()}
@@ -110,7 +110,7 @@ export default function NewProjectDialog({ onClose, onCreateProject, onCreateGro
         </div>
 
         {step === 1 ? (
-          <div className="px-4 pb-4 flex flex-col gap-2.5">
+          <div className="px-4 pb-4 flex flex-col gap-2.5 project-step-enter">
             <input
               ref={nameRef}
               value={name}
@@ -152,7 +152,7 @@ export default function NewProjectDialog({ onClose, onCreateProject, onCreateGro
             </div>
           </div>
         ) : (
-          <div className="px-4 pb-4 flex flex-col gap-2.5">
+          <div className="px-4 pb-4 flex flex-col gap-2.5 project-step-enter">
             <div className="rounded-lg border border-white/[0.07] bg-white/[0.025] px-3 py-2">
               <div className="truncate text-[12px] font-medium text-zinc-200">{name.trim() || 'Untitled project'}</div>
               <div className="truncate text-[9.5px] font-mono text-zinc-600">{path}</div>

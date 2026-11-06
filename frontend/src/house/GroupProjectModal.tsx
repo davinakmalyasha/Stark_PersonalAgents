@@ -152,7 +152,7 @@ export default function GroupProjectModal({ projectId, onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/65 backdrop-blur-sm p-3 md:p-6"
+      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/65 backdrop-blur-sm p-3 md:p-6 modal-backdrop-enter"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div

@@ -129,7 +129,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const desktop = isDesktop();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 animate-fade-in">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 modal-backdrop-enter">
       <div
         className="modal-panel-enter border bg-zinc-950 flex flex-col overflow-hidden"
         style={{

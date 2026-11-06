@@ -13,7 +13,7 @@ interface Props {
 export default function HousePortal({ label, icon, leaving }: Props) {
   return (
     <div className={`house-portal ${leaving ? 'is-leaving' : 'is-entering'}`}>
-      <div className="flex flex-col items-center gap-5">
+      <div className="house-portal-core flex flex-col items-center gap-5">
         <div className="relative grid place-items-center">
           <div className="house-portal-ring absolute" />
           <div className="house-portal-ring absolute" style={{ animationDelay: '0.35s' }} />

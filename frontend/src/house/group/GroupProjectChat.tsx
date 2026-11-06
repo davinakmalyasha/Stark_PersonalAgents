@@ -354,7 +354,7 @@ export default function GroupProjectChat({
             <div className="gp-chat-empty-copy">{emptyCopy}</div>
           </div>
         ) : (
-          <div className="gp-chat-list">
+          <div className="gp-chat-list" key={filter}>
             {filteredEntries.map((entry, index) => {
               if (entry.kind === 'activity') {
                 return (

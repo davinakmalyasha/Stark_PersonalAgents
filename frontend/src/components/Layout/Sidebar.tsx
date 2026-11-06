@@ -265,7 +265,7 @@ export default function Sidebar({
 
   return (
     <aside
-      className="sidebar-shell flex flex-col flex-shrink-0 select-none overflow-hidden transition-all duration-300 ease-in-out"
+      className="sidebar-shell flex flex-col flex-shrink-0 select-none overflow-hidden"
       style={{
         width: collapsed ? 56 : 248,
         backgroundColor: '#151518',

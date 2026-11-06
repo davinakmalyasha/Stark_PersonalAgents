@@ -56,13 +56,13 @@ export default function NewTaskDialog({ onClose, onCreate }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-[120] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <div className="fixed inset-0 z-[120] grid place-items-center bg-black/65 p-4 backdrop-blur-sm modal-backdrop-enter" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
       <form
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-task-title"
         onSubmit={submit}
-        className="w-full max-w-[560px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#131317] shadow-[0_28px_100px_rgba(0,0,0,.7)]"
+        className="w-full max-w-[560px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#131317] shadow-[0_28px_100px_rgba(0,0,0,.7)] modal-panel-enter"
       >
         <header className="flex items-center justify-between border-b border-white/[0.07] px-5 py-4">
           <div>

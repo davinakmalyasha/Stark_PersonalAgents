@@ -652,3 +652,117 @@ html {
     font-size: 16px !important;
   }
 }
+
+/* ── Motion polish ────────────────────────────────────────────────────────
+   One timing scale for the harness. Movement stays on transform/opacity (or
+   grid rows for true height changes), so expanding a chat or opening a modal
+   never animates layout properties frame by frame. */
+
+:root {
+  --stark-dur-1: 140ms;
+  --stark-dur-2: 200ms;
+  --stark-dur-3: 280ms;
+  --stark-dur-4: 360ms;
+  --stark-ease-out: cubic-bezier(.16, 1, .3, 1);
+  --stark-ease-standard: cubic-bezier(.2, .8, .2, 1);
+  --stark-ease-in-out: cubic-bezier(.65, 0, .35, 1);
+}
+
+/* Chat bodies: a real 0fr → 1fr reveal instead of animating max-height from
+   0 to 2000px (which visually jumps in the first few frames). */
+.chat-collapse,
+.house-chat-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  min-height: 0;
+  opacity: 0;
+  transition:
+    grid-template-rows var(--stark-dur-3) var(--stark-ease-out),
+    opacity var(--stark-dur-1) ease;
+}
+.chat-collapse.is-open,
+.house-chat-collapse.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.chat-collapse-inner,
+.house-chat-collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.chat-collapse-inner > *,
+.house-chat-collapse-inner > * {
+  min-height: 0;
+}
+.chat-collapse.is-floating { max-height: 480px; }
+.chat-collapse.is-docked { flex: 1; }
+.chat-collapse.is-docked .chat-collapse-inner { flex: 1; }
+
+/* Message entrances: short, directional, never bounce. */
+.msg-user-enter { animation: msg-user-enter var(--stark-dur-2) var(--stark-ease-out) both; }
+.msg-agent-enter { animation: msg-agent-enter 240ms var(--stark-ease-out) both; }
+.animate-fade-in { animation: fadeIn var(--stark-dur-1) ease-out both; }
+
+/* Modal panels settle rather than pop. */
+.modal-panel-enter { animation: modal-panel-in 240ms var(--stark-ease-out) both; }
+
+/* House chat card reveal when returning from the Agent Map / a route. */
+@keyframes house-chat-reveal {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.house-chat-card { animation: house-chat-reveal var(--stark-dur-3) var(--stark-ease-out) both; }
+
+/* Agent Map arrives as a surface, not a hard cut. */
+@keyframes canvas-map-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes canvas-map-head-in {
+  from { opacity: 0; transform: translateY(-5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.canvas-stage.is-map { animation: canvas-map-in var(--stark-dur-3) var(--stark-ease-out) both; }
+.canvas-stage.is-map .canvas-map-head { animation: canvas-map-head-in var(--stark-dur-4) var(--stark-ease-out) both; }
+.canvas-stage.is-panning .canvas-world { will-change: transform; }
+
+/* Two-step project flow slides the next step in. */
+@keyframes project-step-in {
+  from { opacity: 0; transform: translateX(5px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.project-step-enter { animation: project-step-in var(--stark-dur-2) var(--stark-ease-out) both; }
+
+/* Group participant filter swap. */
+@keyframes gp-thread-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.gp-chat-list { animation: gp-thread-in var(--stark-dur-2) var(--stark-ease-out) both; }
+
+/* Press feedback: tiny, only where it reads as a physical control. */
+.pressable { transition: transform var(--stark-dur-1) var(--stark-ease-standard), background-color var(--stark-dur-1) ease, color var(--stark-dur-1) ease, opacity var(--stark-dur-1) ease; }
+.pressable:active { transform: scale(.96); }
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-collapse,
+  .house-chat-collapse {
+    transition: none !important;
+  }
+  .house-chat-card,
+  .project-step-enter,
+  .gp-chat-list,
+  .canvas-stage.is-map,
+  .canvas-stage.is-map .canvas-map-head,
+  .modal-backdrop-enter {
+    animation: none !important;
+  }
+}
+
+@keyframes modal-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
+.modal-backdrop-enter { animation: modal-backdrop-in var(--stark-dur-2) ease-out both; }
+
+.sidebar-shell { transition: width var(--stark-dur-3) var(--stark-ease-out); }
+@media (prefers-reduced-motion: reduce) { .sidebar-shell { transition: none; } }

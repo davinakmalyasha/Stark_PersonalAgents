@@ -96,6 +96,8 @@ export default function CanvasStage({
   const [addAnchor, setAddAnchor] = useState<{ left: number; top: number } | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
   const [sizes, setSizes] = useState<Record<string, CardSize>>({});
+  const [viewSmooth, setViewSmooth] = useState(false);
+  const smoothTimer = useRef<number | null>(null);
   const itemsRef = useRef(items);
   const viewRef = useRef(view);
   const autoSigRef = useRef('');
@@ -108,11 +110,22 @@ export default function CanvasStage({
     saveItems(scope, next);
   }, [scope]);
 
-  const commitView = useCallback((next: CanvasView) => {
+  const commitView = useCallback((next: CanvasView, smooth = false) => {
+    if (smoothTimer.current) window.clearTimeout(smoothTimer.current);
+    if (smooth) {
+      setViewSmooth(true);
+      smoothTimer.current = window.setTimeout(() => setViewSmooth(false), 340);
+    } else {
+      setViewSmooth(false);
+    }
     viewRef.current = next;
     setView(next);
     saveView(scope, next);
   }, [scope]);
+
+  useEffect(() => () => {
+    if (smoothTimer.current) window.clearTimeout(smoothTimer.current);
+  }, []);
 
   const openAddMenu = useCallback(() => {
     if (addOpen) {
@@ -360,6 +373,7 @@ export default function CanvasStage({
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest('[data-canvas-ui]')) return;
+    setViewSmooth(false);
     const card = target.closest('[data-canvas-card]') as HTMLElement | null;
     if (card && !target.closest('button, input, a, [data-no-drag]')) {
       const id = card.dataset.itemId || '';
@@ -485,7 +499,7 @@ export default function CanvasStage({
       scale,
       x: rect.width / 2 - centerX * scale,
       y: paddingTop + (rect.height - paddingTop - paddingBottom) / 2 - centerY * scale,
-    });
+    }, true);
   }, [sizes, expanded, variant, commitView]);
 
   const relayout = useCallback(() => {
@@ -525,7 +539,7 @@ export default function CanvasStage({
       {variant === 'map' && <div className="canvas-vignette" />}
 
       <div
-        className="canvas-world"
+        className={`canvas-world ${viewSmooth ? 'is-smooth' : ''}`}
         style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}
       >
         <svg className="canvas-edges" aria-hidden="true">

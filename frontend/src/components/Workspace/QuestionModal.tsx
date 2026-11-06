@@ -115,7 +115,7 @@ export default function QuestionModal({ enabled = true }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-end md:items-center justify-center bg-black/60 backdrop-blur-sm p-0 md:p-4">
+    <div className="fixed inset-0 z-[200] flex items-end md:items-center justify-center bg-black/60 backdrop-blur-sm p-0 md:p-4 modal-backdrop-enter">
       <div
         className="modal-panel-enter w-full md:max-w-[620px] max-h-[92dvh] md:max-h-[85dvh] flex flex-col overflow-hidden rounded-t-2xl md:rounded-2xl border border-zinc-800 bg-[#141417] shadow-2xl"
         style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}

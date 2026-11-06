@@ -44,6 +44,9 @@
   transform-origin: top left;
   pointer-events: none;
 }
+.canvas-world.is-smooth {
+  transition: transform var(--stark-dur-3) var(--stark-ease-out);
+}
 .canvas-node {
   position: absolute;
   pointer-events: auto;
@@ -90,10 +93,10 @@
   box-shadow:
     0 1px 0 rgba(255,255,255,.04) inset,
     0 18px 48px rgba(0,0,0,.38);
-  transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
+  transition: border-color .18s ease, box-shadow .18s ease, background .18s ease, transform .18s var(--stark-ease-standard);
 }
 .canvas-card.is-compact { width: 282px; border-radius: 13px; }
-.canvas-card:hover { border-color: rgba(255,255,255,.15); }
+.canvas-card:hover { border-color: rgba(255,255,255,.15); transform: translateY(-1px); }
 .canvas-card.is-active {
   border-color: rgba(255,255,255,.30);
   box-shadow:
@@ -526,6 +529,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .canvas-world { transition: none !important; }
+  .canvas-card:hover { transform: none; }
   .canvas-node, .canvas-card.is-running::before, .canvas-edge.is-active .canvas-edge-line,
   .canvas-card-live-dot, .canvas-card-chip.is-running .canvas-card-chip-dot, .canvas-card-details {
     animation: none !important;

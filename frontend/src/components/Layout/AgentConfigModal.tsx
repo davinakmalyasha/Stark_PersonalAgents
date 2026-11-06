@@ -172,7 +172,7 @@ export default function AgentConfigModal({ isOpen, onClose }: Props) {
   const labelClass = 'block text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500 mb-1.5';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 animate-fade-in">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 modal-backdrop-enter">
       <div
         className="modal-panel-enter border bg-zinc-950 flex flex-col overflow-hidden"
         style={{

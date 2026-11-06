@@ -13,7 +13,7 @@ export default function TokenStatsModal({ isOpen, onClose, tokenUsage, lastModel
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 animate-fade-in">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4 modal-backdrop-enter">
       {/* Modal Card */}
       <div 
         className="modal-panel-enter w-[calc(100vw-220px)] max-w-[1280px] h-[min(620px,calc(100vh-48px))] border bg-zinc-950 flex flex-col overflow-hidden"

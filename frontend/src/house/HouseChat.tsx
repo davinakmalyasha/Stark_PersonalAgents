@@ -111,36 +111,30 @@ export default function HouseChat({
   );
 
   const messagesArea = (
-    <div
-      className="min-h-0 flex flex-col overflow-hidden"
-      style={{
-        maxHeight: minimized ? 0 : 2000,
-        opacity: minimized ? 0 : 1,
-        transition: 'max-height 300ms ease-in-out, opacity 250ms ease-in-out',
-      }}
-      aria-hidden={minimized}
-    >
-      <div ref={threadRef} className="flex-1 min-h-[80px] overflow-y-auto">
-        {isLoading ? (
-          <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-500 py-6">
-            <div className="flex gap-1.5">
-              <span className="house-typing-dot" />
-              <span className="house-typing-dot" />
-              <span className="house-typing-dot" />
+    <div className={`house-chat-collapse ${minimized ? '' : 'is-open'}`} aria-hidden={minimized}>
+      <div className="house-chat-collapse-inner">
+        <div ref={threadRef} className="flex-1 min-h-[80px] overflow-y-auto">
+          {isLoading ? (
+            <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-500 py-6">
+              <div className="flex gap-1.5">
+                <span className="house-typing-dot" />
+                <span className="house-typing-dot" />
+                <span className="house-typing-dot" />
+              </div>
+              <span className="text-[12px]">Connecting...</span>
             </div>
-            <span className="text-[12px]">Connecting...</span>
-          </div>
-        ) : (
-          <MessageStream
-            messages={messages}
-            hasActiveChat={messages.length > 0}
-            onOpenSubagent={() => {}}
-            onOpenSubagentSession={onOpenSubagent}
-            workspaceId={workspaceId}
-            chatId={chatId}
-            onRewind={onRewind}
-          />
-        )}
+          ) : (
+            <MessageStream
+              messages={messages}
+              hasActiveChat={messages.length > 0}
+              onOpenSubagent={() => {}}
+              onOpenSubagentSession={onOpenSubagent}
+              workspaceId={workspaceId}
+              chatId={chatId}
+              onRewind={onRewind}
+            />
+          )}
+        </div>
       </div>
     </div>
   );

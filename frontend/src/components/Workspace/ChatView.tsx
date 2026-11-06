@@ -20,7 +20,7 @@ interface Props {
   hasActiveChat: boolean;
   notification: string | null;
   chatMode?: 'plan' | 'build';
-  onSend: (message: string) => void;
+  onSend: (message: string, files?: File[], restored?: ChatAttachment[]) => void;
   onCancel: () => void;
   onModelChange: (model: string) => void;
   onClearNotification: () => void;
@@ -109,7 +109,7 @@ export default function ChatView({
       className={`${
         variant === 'docked'
           ? 'relative w-full md:max-w-[780px] mx-auto flex flex-col pointer-events-auto'
-          : 'absolute bottom-1 md:bottom-4 left-0 right-0 md:left-2 md:right-2 z-40 w-auto max-w-none flex flex-col pointer-events-auto transition-all duration-300'
+          : 'absolute bottom-1 md:bottom-4 left-0 right-0 md:left-2 md:right-2 z-40 w-auto max-w-none flex flex-col pointer-events-auto'
       }`}
       style={{
         maxHeight: variant === 'docked' ? '78vh' : undefined,
@@ -201,28 +201,27 @@ export default function ChatView({
       )}
 
       {/* Collapsible Area */}
-      <div 
-        className="flex-1 flex flex-col overflow-y-auto transition-all duration-300 ease-in-out"
-        style={{
-          maxHeight: minimized ? '0px' : variant === 'docked' ? 'none' : '480px',
-          opacity: minimized ? 0 : 1,
-        }}
+      <div
+        className={`chat-collapse ${minimized ? '' : 'is-open'} ${variant === 'docked' ? 'is-docked' : 'is-floating'}`}
+        aria-hidden={minimized}
       >
-        {/* Message stream */}
-        <MessageStream
-          messages={visibleMessages}
-          hasActiveChat={hasActiveChat}
-          onOpenSubagent={(name) => setActiveSubagent(name)}
-          onOpenSubagentSession={onOpenSubagentSession}
-          activeSubagent={activeSubagent}
-          traceSteps={traceSteps}
-          workspaceId={workspaceId}
-          chatId={chatId}
-          onCloseSubagent={() => setActiveSubagent(null)}
-          onOpenProject={onOpenProject}
-          onRetry={onRetry}
-          onRewind={onRewind}
-        />
+        <div className="chat-collapse-inner">
+          {/* Message stream */}
+          <MessageStream
+            messages={visibleMessages}
+            hasActiveChat={hasActiveChat}
+            onOpenSubagent={(name) => setActiveSubagent(name)}
+            onOpenSubagentSession={onOpenSubagentSession}
+            activeSubagent={activeSubagent}
+            traceSteps={traceSteps}
+            workspaceId={workspaceId}
+            chatId={chatId}
+            onCloseSubagent={() => setActiveSubagent(null)}
+            onOpenProject={onOpenProject}
+            onRetry={onRetry}
+            onRewind={onRewind}
+          />
+        </div>
       </div>
 
       {/* Always visible Bottom Prompt Dock */}

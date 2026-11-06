@@ -16,7 +16,7 @@ interface Props {
 
 export default function HouseRail({ view, onView, onNewChat, onOpenSettings, onOpenMap, mapOpen, waiting }: Props) {
   const btn = (active: boolean) =>
-    `grid place-items-center w-9 h-9 rounded-xl transition-colors cursor-pointer shrink-0 ${
+    `house-rail-btn grid place-items-center w-9 h-9 rounded-xl cursor-pointer shrink-0 ${
       active ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
     }`;
   return (

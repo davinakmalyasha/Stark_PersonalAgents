@@ -33,12 +33,21 @@ export type StreamSegment =
   | { type: 'text'; text: string; agent?: string }
   | { type: 'tool'; ev: LiveToolEvent };
 
+export interface RetryNotice {
+  attempt: number;
+  max: number;
+  /** When the notice arrived — lets the UI keep it visible until real output. */
+  at: number;
+}
+
 export interface StreamAccum {
   text: string;
   reasoning: string;
   agent: string;
   segments: StreamSegment[];
   toolEvents: LiveToolEvent[];
+  /** Ephemeral transport state; never persisted into the answer. */
+  retry: RetryNotice | null;
 }
 
 export interface RateAccum {
@@ -48,7 +57,7 @@ export interface RateAccum {
 }
 
 export function emptyStreamAccum(): StreamAccum {
-  return { text: '', reasoning: '', agent: '', segments: [], toolEvents: [] };
+  return { text: '', reasoning: '', agent: '', segments: [], toolEvents: [], retry: null };
 }
 
 export function emptyRateAccum(): RateAccum {
@@ -71,6 +80,24 @@ function legacyChildRefs(text: string): ChildReference[] {
 
 let toolSeq = 0;
 
+/**
+ * The backend currently emits reconnect notices as assistant text:
+ * `_Reconnecting (2/5)…_`. They are transport state, not an answer. Strip
+ * them out of the content stream and surface the latest attempt separately so
+ * retries update one status row instead of stacking five italic sentences.
+ */
+const RETRY_NOTICE_RE = /_{0,2}\s*Reconnecting\s*\(\s*(\d+)\s*\/\s*(\d+)\s*\)\s*[.…]*\s*_{0,2}/gi;
+
+export function extractRetryNotices(text: string, now: number): { retry: RetryNotice | null; rest: string } {
+  if (!text || !/Reconnecting/i.test(text)) return { retry: null, rest: text };
+  let retry: RetryNotice | null = null;
+  const rest = text.replace(RETRY_NOTICE_RE, (_match, attempt: string, max: string) => {
+    retry = { attempt: Number(attempt), max: Number(max), at: now };
+    return '';
+  });
+  return { retry, rest };
+}
+
 function appendSegment(acc: StreamAccum, type: 'reasoning' | 'text', text: string, agent?: string) {
   if (!text) return;
   const last = acc.segments[acc.segments.length - 1];
@@ -91,10 +118,20 @@ export function applyDeltaToAccum(
 ): number {
   if (!delta) return Math.round(rate.ema);
   if (delta.kind === 'reasoning') {
+    acc.retry = null;
     acc.reasoning += delta.text || '';
     appendSegment(acc, 'reasoning', delta.text || '', delta.agent);
   } else if (delta.kind === 'text') {
-    const chars = (delta.text || '').length;
+    const parsed = extractRetryNotices(delta.text || '', now);
+    if (parsed.retry) acc.retry = parsed.retry;
+    const text = parsed.rest;
+    if (!text.trim()) {
+      if (delta.agent) acc.agent = delta.agent;
+      return Math.round(rate.ema);
+    }
+    // Real output means the stream reconnected; drop the retry row.
+    acc.retry = null;
+    const chars = text.length;
     if (rate.lastTs > 0) {
       const dt = Math.max(16, now - rate.lastTs) / 1000;
       const r = chars / 4 / dt; // ~4 chars per token
@@ -102,11 +139,13 @@ export function applyDeltaToAccum(
     }
     rate.lastTs = now;
     rate.lastChars = chars;
-    acc.text += delta.text || '';
-    appendSegment(acc, 'text', delta.text || '', delta.agent);
+    acc.text += text;
+    appendSegment(acc, 'text', text, delta.agent);
   } else if (delta.kind === 'end') {
+    acc.retry = null;
     rate.ema = 0;
   } else if (delta.kind === 'tool_started') {
+    acc.retry = null;
     toolSeq += 1;
     const ev: LiveToolEvent = {
       id: `${Date.now()}-${toolSeq}`,
@@ -120,6 +159,7 @@ export function applyDeltaToAccum(
     acc.segments.push({ type: 'tool', ev });
     if (acc.segments.length > 300) acc.segments.splice(0, acc.segments.length - 300);
   } else if (delta.kind === 'tool_finished') {
+    acc.retry = null;
     const name = delta.tool || 'tool';
     let open = -1;
     for (let i = acc.toolEvents.length - 1; i >= 0; i--) {

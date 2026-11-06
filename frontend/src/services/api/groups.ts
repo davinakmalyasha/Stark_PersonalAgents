@@ -132,3 +132,32 @@ export async function groupProjectOp(
   if (!res.ok) throw new Error(data.error || `Failed to ${op}`);
   return data;
 }
+
+/**
+ * Owner → group message. The REST endpoint is preferred; the update-op
+ * fallback keeps the composer working for backends that queue messages
+ * through the existing group op switch instead of adding a route.
+ */
+export async function sendGroupMessage(
+  projectId: string,
+  body: string,
+  to: string,
+): Promise<void> {
+  const payload = { body, content: body, to, target: to, from: 'owner', kind: 'note' };
+  let res = await fetch(`${API_BASE}/groups/${encodeURIComponent(projectId)}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 404) {
+    res = await fetch(`${API_BASE}/groups/${encodeURIComponent(projectId)}/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ op: 'message', params: payload }),
+    });
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || 'The group messaging backend is not available yet.');
+  }
+}

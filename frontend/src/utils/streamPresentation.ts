@@ -26,6 +26,35 @@ function containsText(segments: StreamSegment[], text: string): boolean {
 }
 
 /**
+ * Old runs persisted the reconnect notice as answer text. It was transport
+ * noise, not content, and stacked for every attempt. Strip it from history so
+ * the transcript reads clean without rewriting stored messages.
+ */
+const RETRY_NOTICE_RE = /_{0,2}\s*Reconnecting\s*\(\s*\d+\s*\/\s*\d+\s*\)\s*[.…]*\s*_{0,2}/gi;
+
+export function stripRetryNotices(text: string): string {
+  if (!text || !/Reconnecting/i.test(text)) return text;
+  return text
+    .replace(RETRY_NOTICE_RE, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function cleanStreamSegments(segments: StreamSegment[]): StreamSegment[] {
+  if (!segments.some((segment) => segment.type === 'text' && /Reconnecting/i.test(segment.text))) {
+    return segments;
+  }
+  return segments
+    .map((segment) =>
+      segment.type === 'text'
+        ? { ...segment, text: stripRetryNotices(segment.text) }
+        : segment,
+    )
+    .filter((segment) => segment.type !== 'text' || segment.text.trim().length > 0);
+}
+
+/**
  * Some older runs persisted a single assistant string containing both the
  * handoff and the completion, for example:
  *
@@ -106,7 +135,7 @@ function splitLeadingHandoffStatus(text: string): { status: string; answer: stri
  * once below it) and hide a copy of the answer when the block is closed.
  */
 export function presentStream(segments: StreamSegment[], fallbackText: string, streaming = false): StreamPresentation {
-  const safeSegments = Array.isArray(segments) ? segments : [];
+  const safeSegments = cleanStreamSegments(Array.isArray(segments) ? segments : []);
 
   // While a run is live, render everything in strict chronological order:
   // reasoning, text, tools, text… Hoisting the last text into a separate
@@ -117,7 +146,7 @@ export function presentStream(segments: StreamSegment[], fallbackText: string, s
 
   // Messages without a timeline (legacy persisted runs) only have the
   // flattened assistant string.
-  let finalText = safeSegments.length === 0 ? (fallbackText || '').trim() : '';
+  let finalText = safeSegments.length === 0 ? stripRetryNotices((fallbackText || '').trim()) : '';
   let activitySegments = safeSegments;
 
   // The final answer is the *last contiguous text run*, and only when it is
@@ -160,12 +189,12 @@ export function presentStream(segments: StreamSegment[], fallbackText: string, s
   }
   }
 
-  finalText = formatFinalSequence(stripMailboxEnvelope(finalText));
+  finalText = formatFinalSequence(stripRetryNotices(stripMailboxEnvelope(finalText)));
   const cleanedActivity = activitySegments.map((segment) =>
     segment.type === 'text'
-      ? { ...segment, text: stripMailboxEnvelope(segment.text) }
+      ? { ...segment, text: stripRetryNotices(stripMailboxEnvelope(segment.text)) }
       : segment,
-  );
+  ).filter((segment) => segment.type !== 'text' || segment.text.trim().length > 0);
   return { finalText, activitySegments: stripFinalAnswerDupes(cleanedActivity, finalText) };
 }
 

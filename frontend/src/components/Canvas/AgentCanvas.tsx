@@ -6,7 +6,7 @@ import type { CanvasAddonId } from '../../canvas/canvasTypes';
 import { kindForWorkspace, sendCanvasChat } from '../../canvas/canvasSend';
 import SubagentSessionView from '../../house/SubagentSessionView';
 import ChatView from '../Workspace/ChatView';
-import type { AppState, ChatMessage, ChatSummary, ModelOption, WorkspaceInfo } from '../../types';
+import type { AppState, ChatAttachment, ChatMessage, ChatSummary, ModelOption, WorkspaceInfo } from '../../types';
 import { fetchChats } from '../../services/api';
 
 const CanvasStage = lazy(() => import('../../canvas/CanvasStage'));
@@ -23,7 +23,7 @@ interface Props {
   notification: string | null;
   chatMode?: 'plan' | 'build';
   onModeChange?: (mode: 'plan' | 'build') => void;
-  onSend: (message: string, files?: File[]) => void;
+  onSend: (message: string, files?: File[], restored?: ChatAttachment[]) => void;
   onCancel: () => void;
   onModelChange: (model: string) => void;
   onClearNotification: () => void;
@@ -40,7 +40,9 @@ interface Props {
   onOpenAddon?: (addonId: CanvasAddonId) => void;
   onRewind?: (message: ChatMessage) => void;
   draft?: string;
+  draftAttachments?: ChatAttachment[];
   onDraftConsumed?: () => void;
+  onDraftAttachmentsConsumed?: () => void;
   totalCost: number;
   totalInput: number;
   totalOutput: number;

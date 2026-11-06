@@ -11,6 +11,15 @@ export interface CanvasChatItem extends CanvasItemBase {
   kind: 'chat';
   workspaceId: string;
   chatId: string;
+  /** Derived from a live tab/spawned agent rather than manually pinned. */
+  auto?: boolean;
+  /** True when this auto node is itself an open top-bar tab. */
+  isTab?: boolean;
+  /** 0 = tab root, 1 = spawned agent, 2 = nested child. */
+  depth?: number;
+  parentItemId?: string;
+  /** Spawned children hidden by the per-parent map cap. */
+  hiddenChildren?: number;
 }
 
 export interface CanvasProjectItem extends CanvasItemBase {

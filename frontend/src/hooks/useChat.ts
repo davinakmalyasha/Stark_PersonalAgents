@@ -10,7 +10,7 @@ import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateC
 import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from '../house/houseChatService';
 import { getAssistantName } from '../house/assistant';
 import { parseLogToSteps } from '../utils/logParser';
-import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
+import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type RetryNotice, type StreamSegment } from '../utils/streamAccum';
 
 export interface UseChatProps {
   onActive?: (payload: { wsId: string; chatId: string }) => void;
@@ -30,6 +30,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   const [isLoading, setIsLoading] = useState(true);
   const [notification, setNotification] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
+  const [draftAttachments, setDraftAttachments] = useState<ChatAttachment[]>([]);
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   // Phase 8-V2 fix: voice runs execute in the overlay — track their live
   // activity here so the house chat streams the reply in real time.
@@ -44,7 +45,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   // Owning run target for Stop: persist the partial into the same chat.
   const runWsRef = useRef<WorkspaceInfo | null>(null);
   const runChatIdRef = useRef<string | null>(null);
-  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number; retry: RetryNotice | null }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
   const streamRef = useRef(emptyStreamAccum());
   const rateRef = useRef(emptyRateAccum());
 
@@ -57,13 +58,14 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       segments: [...streamRef.current.segments],
       active: true,
       rate,
+      retry: streamRef.current.retry,
     });
   }, []);
 
   const resetStream = useCallback(() => {
     streamRef.current = emptyStreamAccum();
     rateRef.current = emptyRateAccum();
-    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
+    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
   }, []);
 
   const refreshMessages = useCallback(async () => {
@@ -124,14 +126,14 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         setIsVoiceMode(false);
         setVoiceActive(false);
         streamRef.current = emptyStreamAccum();
-        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '', segments: [] }));        refreshMessages();
+        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '', segments: [], retry: null }));        refreshMessages();
       }
       // Phase 8-V2 fix: a voice run started — begin the live bubble.
       if (ev?.type === 'pipeline-start') {
         setVoiceActive(true);
         streamRef.current = emptyStreamAccum();
         rateRef.current = emptyRateAccum();
-        setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 });
+        setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
       }
       // Phase 8-V2: live tokens from a voice run stream into the house chat —
       // merge them into the same streaming bubble as local runs.
@@ -147,6 +149,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           segments: [...streamRef.current.segments],
           active: true,
           rate: s.rate,
+          retry: streamRef.current.retry,
         }));
       }
       // Live input streaming: words appear in chat as you speak (ChatGPT live)
@@ -265,26 +268,30 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
 
   const handleRewind = useCallback(async (message: ChatMessage) => {
     if (!generalWs || !activeChatId || isRunning) return;
+    const restoredAttachments = Array.isArray(message.metadata?.attachments)
+      ? message.metadata.attachments as ChatAttachment[]
+      : [];
     try {
       const result = await rewindChat(generalWs.id, activeChatId, message.id);
       const chat = await fetchChat(generalWs.id, activeChatId);
-      setMessages(chat.messages || []);
+      const next = chat.messages || [];
+      // The server truncates from the message onward. Guard the projection
+      // too: a stale cache must never leave the rewound message in the thread.
+      const index = next.findIndex((candidate) => candidate.id === message.id);
+      setMessages(index >= 0 ? next.slice(0, index) : next);
       setTokenUsage(chat.token_usage ?? null);
       setDraft(result.prompt || '');
-      if (result.restore?.conflicts?.length) {
-        setNotification(`Rewound, but ${result.restore.conflicts.length} file(s) could not be restored.`);
-      } else {
-        setNotification('Rewound. The message is back in the prompt.');
-      }
+      setDraftAttachments(restoredAttachments);
+      setNotification(null);
       await refreshList(generalWs);
     } catch (e) {
       setNotification(e instanceof Error ? e.message : 'Rewind failed.');
     }
   }, [generalWs, activeChatId, isRunning, refreshList]);
 
-  const handleSend = useCallback(async (prompt: string, files: File[]) => {
+  const handleSend = useCallback(async (prompt: string, files: File[], restoredAttachments: ChatAttachment[] = []) => {
     if (isRunning || sendInFlightRef.current) return;
-    if (!prompt.trim() && !files.length) return;
+    if (!prompt.trim() && !files.length && !restoredAttachments.length) return;
     sendInFlightRef.current = true;
     setNotification(null);
 
@@ -334,10 +341,11 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       }
     }
 
-    let attachments: ChatAttachment[] = [];
+    let attachments: ChatAttachment[] = [...restoredAttachments];
     if (files.length) {
       try {
-        attachments = await uploadChatAttachments(ws.id, chatId, files);
+        const uploaded = await uploadChatAttachments(ws.id, chatId, files);
+        attachments = [...attachments, ...uploaded];
       } catch {
         setNotification('Your files could not be uploaded.');
         sendInFlightRef.current = false;
@@ -436,6 +444,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         isStreaming: streaming.active,
         streamingReasoning: streaming.reasoning,
         streamRate: streaming.rate,
+        retry: streaming.retry,
         liveTimeline: streaming.segments,
       },
     });
@@ -486,7 +495,9 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     combinedTokenUsage, lastModelName,
     handleNewChat, handleSelectChat, handleRenameChat, handleDeleteChat,
     handleSend, handleCancel, handleRewind,
-    draft, seedDraft, clearDraft: () => setDraft(''),
+    draft, draftAttachments, seedDraft,
+    clearDraft: () => setDraft(''),
+    clearDraftAttachments: () => setDraftAttachments([]),
   };
 }
 

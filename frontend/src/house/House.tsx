@@ -24,7 +24,7 @@ import { useSessionRunner } from './useSessionRunner';
 import { useCanvasAgentState } from '../hooks/useCanvasAgentState';
 import type { TraceStep } from '../utils/logParser';
 import { kindForWorkspace, sendCanvasChat } from '../canvas/canvasSend';
-import { addWorkspace, createChat, updateChatTitle, deleteChat, addChatMessage, createGroupProject, createSchedule, cancelSchedule } from '../services/api';
+import { addWorkspace, createChat, updateChatTitle, deleteChat, addChatMessage, createGroupProject, createSchedule } from '../services/api';
 import { setBusy } from '../utils/runtimeBusy';
 import '../house/house.css';
 
@@ -36,10 +36,12 @@ export default function House() {
     typeof window === 'undefined' ? true : window.matchMedia('(min-width: 768px)').matches,
   );
   const [sideView, setSideView] = useState<SideView>('chats');
+  const [mapOpen, setMapOpen] = useState(false);
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [projectDialogMode, setProjectDialogMode] = useState<'group' | 'solo'>('group');
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
   const subagents = useSubagentTabs();
   const [exitingIdeTab, setExitingIdeTab] = useState<import('../types').SessionTab | null>(null);
@@ -72,7 +74,7 @@ export default function House() {
   const [openProjectId, setOpenProjectId] = useState<string | null>(null);
   const groupScopeId = activeTab?.workspaceId || chat.workspaceId || '';
   const { projects, scoped: projectsScoped, refresh: refreshProjects } = useGroupProjects(groupScopeId);
-  const { schedules, refresh: refreshSchedules } = useScheduledTasks('');
+  const { refresh: refreshSchedules } = useScheduledTasks('');
 
   // IDE open/close transition: keep the exiting IDE mounted for the exit
   // animation so it feels like staying on the same page (only the IDE shows/
@@ -125,6 +127,21 @@ export default function House() {
     traceSteps: lastTraceSteps,
   }).agents;
 
+  const activeToolCalls = useMemo(
+    () => lastTraceSteps.filter((step) => step.type === 'tool' || step.type === 'command').length,
+    [lastTraceSteps],
+  );
+  const activeErrors = useMemo(
+    () => chat.displayMessages.slice(-40).filter((message) => message.role === 'error').length,
+    [chat.displayMessages],
+  );
+  const mapUsage = useMemo(() => ({
+    input: chat.totalInput,
+    output: chat.totalOutput,
+    cost: chat.totalCost,
+    context: chat.activeContextTokens,
+  }), [chat.totalInput, chat.totalOutput, chat.totalCost, chat.activeContextTokens]);
+
   // Room-workspace sidebars navigate home via #/?ws=<id>&chat=<id> — once the
   // session layer has booted, open that chat and clean the hash.
   useEffect(() => {
@@ -145,8 +162,14 @@ export default function House() {
   // backdrop on mobile and the rail staying open on desktop — no tiny close
   // button that strands the user.
   const handleSideView = useCallback((view: SideView) => {
+    setMapOpen(false);
     setSideView(view);
     setSidebarOpen(true);
+  }, []);
+
+  const handleOpenMap = useCallback(() => {
+    setMapOpen((open) => !open);
+    setSidebarOpen(false);
   }, []);
 
   // Escape collapses the side panel (it stays docked, never slides away)
@@ -182,8 +205,19 @@ export default function House() {
 
   // ── Session creation ──
   const handleNewSession = useCallback(() => {
+    setMapOpen(false);
     newSession();
   }, [newSession]);
+
+  const openNewGroupProject = useCallback(() => {
+    setProjectDialogMode('group');
+    setProjectDialogOpen(true);
+  }, []);
+
+  const openNewWorkspace = useCallback(() => {
+    setProjectDialogMode('solo');
+    setProjectDialogOpen(true);
+  }, []);
 
   const handleCreateTask = useCallback(async (request: NewTaskRequest) => {
     const titleSource = request.instructions.split(/[\n.!?]/, 1)[0].trim();
@@ -225,34 +259,37 @@ export default function House() {
     setTaskDialogOpen(false);
   }, [newSession, chat, groupScopeId, refreshProjects, sessions, refreshSchedules]);
 
-  const handleCancelSchedule = useCallback(async (scheduleId: string) => {
-    try {
-      await cancelSchedule(scheduleId);
-      await refreshSchedules();
-    } catch (error) {
-      setBlockedNote(error instanceof Error ? error.message : 'Could not cancel scheduled task.');
-      window.setTimeout(() => setBlockedNote(null), 3500);
-    }
-  }, [refreshSchedules]);
   const handleNewChatIn = useCallback((workspaceId: string) => {
     newChatIn(workspaceId);
   }, [newChatIn]);
   const handleOpenSession = useCallback((workspaceId: string, chatId: string) => {
+    setMapOpen(false);
     openChat(workspaceId, chatId);
   }, [openChat]);
 
   /** New Project dialog → register workspace + create its first chat + open it. */
-  const handleCreateProject = useCallback(async (folderPath: string, name: string) => {
+  const handleCreateProject = useCallback(async (folderPath: string, name: string, initialPrompt?: string) => {
     try {
       const ws = await addWorkspace(folderPath, name);
       const chatData = await createChat(ws.id, 'New Chat').catch(() => null);
       await refreshSessions();
-      if (chatData) openChat(ws.id, chatData.id);
+      if (chatData) {
+        openChat(ws.id, chatData.id);
+        if (initialPrompt?.trim()) chat.seedDraft(initialPrompt.trim());
+      }
       return ws;
     } catch {
       return null;
     }
-  }, [refreshSessions, openChat]);
+  }, [refreshSessions, openChat, chat.seedDraft]);
+
+  /** Step 2 of the new-project flow: durable team board inside the workspace. */
+  const handleCreateGroupFromDialog = useCallback(async (workspace: import('../types').WorkspaceInfo, task: string) => {
+    const project = await createGroupProject({ goal: task, workspaceId: workspace.id });
+    if (!project.id) throw new Error('The backend did not return a project id.');
+    await refreshProjects();
+    setOpenProjectId(project.id);
+  }, [refreshProjects]);
 
   const handleRenameChat = useCallback((workspaceId: string, chatId: string, title: string) => {
     // Optimistic so the sidebar shows the new title instantly.
@@ -345,7 +382,14 @@ export default function House() {
             agents={generalCanvasAgents}
             isRunning={chat.isRunning}
             projects={projects}
+            tabs={sessions.tabs}
+            runningTabId={sessions.runningTabId}
+            usage={mapUsage}
+            toolCalls={activeToolCalls}
+            errors={activeErrors}
+            onCloseTab={sessions.closeTab}
             onOpenChat={(wsId, chatId) => {
+              setMapOpen(false);
               const ws = sessions.workspaces.find((w) => w.id === wsId);
               if (ws && !ws.isGeneral && !ws.isHouse && !ws.isPersonal && !(ws as { isDfd?: boolean }).isDfd) {
                 window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(chatId)}`;
@@ -353,7 +397,7 @@ export default function House() {
                 sessions.openChat(wsId, chatId);
               }
             }}
-            onOpenGroup={setOpenProjectId}
+            onOpenGroup={(projectId) => { setMapOpen(false); setOpenProjectId(projectId); }}
             onOpenAddon={(wsId, addonId, chatId) => {
               const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
               window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
@@ -394,9 +438,63 @@ export default function House() {
         chatId={activeTabChatId}
         onRewind={chat.handleRewind}
         draft={chat.draft}
+        draftAttachments={chat.draftAttachments}
         onDraftConsumed={chat.clearDraft}
+        onDraftAttachmentsConsumed={chat.clearDraftAttachments}
       />
       </div>
+    </div>
+  );
+
+  const mapView = (
+    <div className="relative flex-1 min-h-0">
+      <Suspense fallback={null}>
+        <CanvasStage
+          key="map"
+          scope="main"
+          variant="map"
+          workspaces={sessions.workspaces}
+          chatsByWs={sessions.chatsByWs}
+          activeWorkspaceId={mainWorkspace?.id ?? null}
+          activeChatId={chat.activeChatId}
+          agents={generalCanvasAgents}
+          isRunning={chat.isRunning}
+          elapsed={undefined}
+          projects={projects}
+          tabs={sessions.tabs}
+          runningTabId={sessions.runningTabId}
+          usage={mapUsage}
+          toolCalls={activeToolCalls}
+          errors={activeErrors}
+          onCloseTab={sessions.closeTab}
+          onCloseMap={() => setMapOpen(false)}
+          onOpenChat={(wsId, chatId) => {
+            setMapOpen(false);
+            const ws = sessions.workspaces.find((w) => w.id === wsId);
+            if (ws && !ws.isGeneral && !ws.isHouse && !ws.isPersonal && !(ws as { isDfd?: boolean }).isDfd) {
+              window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(chatId)}`;
+            } else {
+              sessions.openChat(wsId, chatId);
+            }
+          }}
+          onOpenGroup={(projectId) => { setMapOpen(false); setOpenProjectId(projectId); }}
+          onOpenAddon={(wsId, addonId, chatId) => {
+            setMapOpen(false);
+            const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
+            window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
+          }}
+          onSendToChat={async (wsId, chatId, text) => {
+            const ws = sessions.workspaces.find((w) => w.id === wsId);
+            if (!ws) throw new Error('Workspace not found.');
+            if (wsId === mainWorkspace?.id && chatId === chat.activeChatId) {
+              handleGeneralSend(text, []);
+              return;
+            }
+            await sendCanvasChat(ws, chatId, text, kindForWorkspace(ws));
+            await sessions.forceRefresh();
+          }}
+        />
+      </Suspense>
     </div>
   );
 
@@ -455,6 +553,8 @@ export default function House() {
           onView={handleSideView}
           onNewChat={handleNewSession}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          onOpenMap={handleOpenMap}
+          mapOpen={mapOpen}
           waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
         />
       </div>
@@ -482,7 +582,7 @@ export default function House() {
           onTogglePin={sessions.togglePin}
           onOpenSession={handleOpenSession}
           onNewChat={handleNewSession}
-          onNewProject={() => setProjectDialogOpen(true)}
+          onNewProject={openNewWorkspace}
           onNewChatInProject={handleNewChatIn}
           onOpenRoom={handleLaunchRoom}
           onRenameChat={handleRenameChat}
@@ -496,12 +596,8 @@ export default function House() {
           <HouseProjectsPanel
             projects={projects}
             projectsScoped={projectsScoped}
-            schedules={schedules}
             onOpenProject={setOpenProjectId}
-            onNewProject={() => setProjectDialogOpen(true)}
-            onNewTask={() => setTaskDialogOpen(true)}
-            onCancelSchedule={handleCancelSchedule}
-            onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
+            onNewProject={openNewGroupProject}
           />
         </div>
       )}
@@ -509,7 +605,9 @@ export default function House() {
       )}
       <main className="relative flex-1 min-h-0 flex overflow-hidden">
         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
-        {exitingIdeTab ? (
+        {mapOpen ? (
+          mapView
+        ) : exitingIdeTab ? (
           <>
             {/* Chat is visible immediately under the exiting IDE — feels like the IDE slides away */}
             {generalChatView}
@@ -537,7 +635,7 @@ export default function House() {
           generalChatView
         )}
         </div>
-        {!isCodingTab && !exitingIdeTab && subagents.tabs.length > 0 && (
+        {!mapOpen && !isCodingTab && !exitingIdeTab && subagents.tabs.length > 0 && (
           <SubagentTabsPane
             tabs={subagents.tabs}
             activeChildId={subagents.activeChildId}
@@ -556,6 +654,8 @@ export default function House() {
         onView={handleSideView}
         onNewChat={handleNewSession}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenMap={handleOpenMap}
+        mapOpen={mapOpen}
         waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
       />
 
@@ -563,6 +663,8 @@ export default function House() {
         <NewProjectDialog
           onClose={() => setProjectDialogOpen(false)}
           onCreateProject={handleCreateProject}
+          onCreateGroup={handleCreateGroupFromDialog}
+          defaultMode={projectDialogMode}
         />
       )}
 

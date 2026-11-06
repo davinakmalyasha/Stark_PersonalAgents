@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
-import type { ModelOption } from '../../types';
+import type { ChatAttachment, ModelOption } from '../../types';
 import { fetchProvider, type ProviderInfo } from '../../services/api';
 
 interface Props {
-  onSend: (message: string, files: File[]) => void;
+  onSend: (message: string, files: File[], restored?: ChatAttachment[]) => void;
   onCancel?: () => void;
   isRunning: boolean;
   isVoiceMode?: boolean;
@@ -22,7 +22,10 @@ interface Props {
   onModelChange?: (model: string) => void;
   /** Restored text from a rewind; non-empty values populate the input once. */
   draft?: string;
+  /** Attachments restored with a rewound message — sent without re-uploading. */
+  draftAttachments?: ChatAttachment[];
   onDraftConsumed?: () => void;
+  onDraftAttachmentsConsumed?: () => void;
 }
 
 const MAX_FILES = 8;
@@ -30,9 +33,10 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 const isImage = (file: File) => file.type.startsWith('image/');
 
-export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, onDraftConsumed }: Props) {
+export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, draftAttachments, onDraftConsumed, onDraftAttachmentsConsumed }: Props) {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<File[]>([]);
+  const [restored, setRestored] = useState<ChatAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -94,10 +98,12 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
 
   useEffect(() => { if (isVoiceMode && voiceInputText !== undefined) setValue(voiceInputText); }, [voiceInputText, isVoiceMode]);
   useEffect(() => {
+    setRestored(draftAttachments ?? []);
     if (!draft) return;
     setValue(draft);
     onDraftConsumed?.();
-  }, [draft, onDraftConsumed]);
+  }, [draft, draftAttachments, onDraftConsumed]);
+  const totalAttachments = files.length + restored.length;
   const addFiles = (incoming: FileList | File[]) => {
     const selected = Array.from(incoming);
     const valid = selected.filter((file) => file.size <= MAX_FILE_SIZE);
@@ -111,16 +117,18 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
     });
   };
   useEffect(() => {
-    if (files.length < MAX_FILES) {
+    if (totalAttachments < MAX_FILES) {
       setError((prev) => (prev === `You can attach up to ${MAX_FILES} files at once.` ? null : prev));
     }
-  }, [files.length]);
+  }, [totalAttachments]);
 
   const send = () => {
     const text = value.trim();
-    if (!text && !files.length) return;
-    onSend(text, files);
-    setValue(''); setFiles([]); setError(null);
+    if ((!text && !files.length && !restored.length) || isRunning) return;
+    onSend(text, files, restored);
+    setValue(''); setFiles([]); setRestored([]); setError(null);
+    onDraftConsumed?.();
+    onDraftAttachmentsConsumed?.();
   };
   const cacheRate = totalInput ? (totalCacheHitTokens / totalInput) * 100 : 0;
   const contextPercent = Math.min(100, (activeContextTokens / 1_000_000) * 100);
@@ -162,18 +170,26 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
         <input ref={inputRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.js,.ts,.tsx,.py,.html,.css" className="hidden" onChange={(event) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} />
         {dragActive && <div className="drop-capture" aria-hidden="true"><div className="drop-orbit"><Plus size={24} /></div><strong>Drop to add to your message</strong><span>Images, documents, and code files up to 20 MB</span></div>}
 
-        {files.length > 0 && <div className="attachment-deck" aria-label="Files ready to send">
+        {totalAttachments > 0 && <div className="attachment-deck" aria-label="Files ready to send">
           {files.map((file) => <div className="attachment-card" key={`${file.name}-${file.size}`}>
             {isImage(file) ? <div className="image-chip"><Image size={16} /></div> : <div className="file-chip"><FileText size={16} /></div>}
             <div className="min-w-0 flex-1"><div className="truncate text-[12px] font-medium text-zinc-200">{file.name}</div><div className="text-[10px] text-zinc-500">{isImage(file) ? 'Image' : file.type.split('/').pop() || 'File'} · {formatSize(file.size)}</div></div>
             <button type="button" onClick={() => setFiles((all) => all.filter((item) => item !== file))} className="remove-file" title={`Remove ${file.name}`}><X size={13} /></button>
+          </div>)}
+          {restored.map((attachment) => <div className="attachment-card" key={`restored-${attachment.id}`}>
+            {attachment.isImage ? <div className="image-chip"><Image size={16} /></div> : <div className="file-chip"><FileText size={16} /></div>}
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[12px] font-medium text-zinc-200">{attachment.name}</div>
+              <div className="text-[10px] text-zinc-500">{attachment.isImage ? 'Image' : attachment.type?.split('/').pop() || 'File'} · {formatSize(attachment.size)}</div>
+            </div>
+            <button type="button" onClick={() => setRestored((all) => all.filter((item) => item.id !== attachment.id))} className="remove-file" title={`Remove ${attachment.name}`}><X size={13} /></button>
           </div>)}
           <button type="button" className="attachment-add" onClick={() => inputRef.current?.click()} title="Add files"><Plus size={17} /></button>
         </div>}
 
         <div style={{ padding: '10px 12px 4px' }}>
           <textarea ref={textareaRef} value={value} onChange={(event) => setValue(event.target.value)} onPaste={handlePaste} onKeyDown={(event) => { if (event.key === 'Enter' && (event.shiftKey === false || (event.ctrlKey || event.metaKey))) { event.preventDefault(); send(); } }} rows={1}
-            placeholder={isVoiceMode ? 'Listening…' : files.length ? 'Add a note about these files…' : 'Ask anything'}
+            placeholder={isVoiceMode ? 'Listening…' : totalAttachments ? 'Add a note about these files…' : 'Ask anything'}
             className="prompt-input" />
         </div>
         {error && <div className="mx-4 mb-2 text-[11px] text-amber-300/90">{error}</div>}
@@ -182,7 +198,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
             <button type="button" onClick={() => inputRef.current?.click()} className="tool-button" title="Attach files"><Plus size={18} /></button>
           </div>
           <div className="flex items-center gap-2">
-            <span className="hidden sm:block text-[10px] text-zinc-600">{files.length ? `${files.length} attachment${files.length > 1 ? 's' : ''}` : ''}</span>
+            <span className="hidden sm:block text-[10px] text-zinc-600">{totalAttachments ? `${totalAttachments} attachment${totalAttachments > 1 ? 's' : ''}` : ''}</span>
             <div className="usage-control"><button type="button" className="usage-orb" title={`Context ${contextPercent.toFixed(0)}% of 1M`} aria-label={`Context ${contextPercent.toFixed(0)} percent`}><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100`, stroke: contextPercent >= 95 ? '#f87171' : contextPercent >= 85 ? '#fbbf24' : undefined }}/></svg><span style={contextPercent >= 95 ? { color: '#f87171' } : contextPercent >= 85 ? { color: '#fbbf24' } : undefined}>{Math.round(contextPercent)}</span></button><div className="usage-popover"><div className="usage-popover-title">Usage</div><div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div><div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div><div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div><div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div><button type="button" onClick={onOpenStats} className="usage-details">View details</button></div></div>
             <button
               type="button"
@@ -240,7 +256,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
               </div>
             )}
             <button type="button" onClick={onToggleVoice} className={`prompt-voice-button ${isVoiceMode ? 'is-live' : ''}`} title={isVoiceMode ? 'Stop voice mode (Ctrl+G)' : 'Start voice mode (Ctrl+G)'}><AudioLines size={16}/><span className="voice-live-dot" /></button>
-            <button type="button" onClick={() => isRunning && !value.trim() && !files.length ? onCancel?.() : send()} disabled={!isRunning && !value.trim() && !files.length} className={`pressable send-button ${isRunning && !value.trim() && !files.length ? 'stop' : ''}`} title={isRunning ? 'Stop execution' : 'Send message'}>{isRunning && !value.trim() && !files.length ? <Square size={14} fill="currentColor" /> : <ArrowUp size={16} strokeWidth={2.4} />}</button>
+            <button type="button" onClick={() => isRunning && !value.trim() && !totalAttachments ? onCancel?.() : send()} disabled={!isRunning && !value.trim() && !totalAttachments} className={`pressable send-button ${isRunning && !value.trim() && !totalAttachments ? 'stop' : ''}`} title={isRunning ? 'Stop execution' : 'Send message'}>{isRunning && !value.trim() && !totalAttachments ? <Square size={14} fill="currentColor" /> : <ArrowUp size={16} strokeWidth={2.4} />}</button>
           </div>
         </div>
       </div>

@@ -1,8 +1,8 @@
-import { useState } from 'react';
-import { Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink, Loader2 } from 'lucide-react';
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
-import type { StreamSegment } from '../../utils/streamAccum';
+import type { RetryNotice, StreamSegment } from '../../utils/streamAccum';
 import { presentStream, stripDelegationNarration, stripMailboxEnvelope } from '../../utils/streamPresentation';
 import { undoRun } from '../../services/api';
 import TraceAccordion from './TraceAccordion';
@@ -229,8 +229,41 @@ function ThinkingPlaceholder() {
   );
 }
 
+/**
+ * Transport status, never content. One row updates in place as attempts
+ * increment; the next real delta removes it. Previously every attempt was
+ * persisted as italic assistant text, so failed runs kept five stacked lines.
+ */
+function RetryStatus({ retry }: { retry: RetryNotice }) {
+  const total = Math.max(1, retry.max || 1);
+  const attempt = Math.min(Math.max(1, retry.attempt || 1), total);
+  return (
+    <div className="retry-status" role="status" aria-live="polite">
+      <span className="retry-status-orb"><Loader2 size={12} className="animate-spin" /></span>
+      <div className="retry-status-copy">
+        <div className="retry-status-line">
+          <span className="retry-status-title">Reconnecting</span>
+          <span className="retry-status-count">{attempt}/{total}</span>
+          <span className="retry-status-wait">provider hiccup — retrying</span>
+        </div>
+        <div className="retry-status-track" aria-hidden="true">
+          {Array.from({ length: total }).map((_, index) => (
+            <span key={index} className={index < attempt ? 'is-filled' : ''} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const [copied, setCopied] = useState(false);
+  const [rewindArmed, setRewindArmed] = useState(false);
+  useEffect(() => {
+    if (!rewindArmed) return;
+    const timer = window.setTimeout(() => setRewindArmed(false), 3200);
+    return () => window.clearTimeout(timer);
+  }, [rewindArmed]);
   const copyMessage = async () => {
     try {
       await navigator.clipboard.writeText(message.content);
@@ -268,6 +301,7 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
   );
   const showTrace = !!message.metadata?.isTrace && (activitySegments.length > 0 || hasRenderableTraceSteps);
   const wasStopped = !!message.metadata?.stopped;
+  const retry = (message.metadata?.retry as RetryNotice | undefined) || null;
   const usageMeta = message.metadata?.usage as { total_input_tokens?: number; total_output_tokens?: number; total_cost?: number } | undefined;
   const isScheduledWake = !!message.metadata?.scheduledWake;
   const isCanvasEvent = !!message.metadata?.canvasEvent;
@@ -312,15 +346,27 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
           </button>
           {onRewind && (
-            <button
-              type="button"
-              onClick={() => onRewind(message)}
-              title="Revert to before this message"
-              aria-label="Revert message"
-              className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-red-300 hover:bg-red-500/10 transition-colors cursor-pointer"
-            >
-              <RotateCcw size={12} />
-            </button>
+            rewindArmed ? (
+              <button
+                type="button"
+                onClick={() => { setRewindArmed(false); onRewind(message); }}
+                title="Click again to confirm — this removes this message and everything after it"
+                aria-label="Confirm rewind"
+                className="flex items-center gap-1 h-6 px-2 rounded-md bg-red-500/15 text-red-300 text-[10px] font-semibold transition-colors cursor-pointer"
+              >
+                <RotateCcw size={11} /> Rewind?
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setRewindArmed(true)}
+                title="Rewind to before this message"
+                aria-label="Rewind to this message"
+                className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-red-300 hover:bg-red-500/10 transition-colors cursor-pointer"
+              >
+                <RotateCcw size={12} />
+              </button>
+            )
           )}
         </div>
       )}
@@ -361,16 +407,19 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
 
           {/* Timeline — live shown inline; history timeline is inside "Worked for" dropdown */}
           {message.duration === 'active' && (
-            activitySegments.length ? (
-              <ActivityTimeline
-                segments={activitySegments.slice(-18)}
-                isActive
-                delegationSteps={delegationSteps}
-                onOpenSubagentSession={onOpenSubagentSession}
-              />
-            ) : !responseContent ? (
-              <ThinkingPlaceholder />
-            ) : null
+            <>
+              {retry && <RetryStatus retry={retry} />}
+              {activitySegments.length ? (
+                <ActivityTimeline
+                  segments={activitySegments.slice(-18)}
+                  isActive
+                  delegationSteps={delegationSteps}
+                  onOpenSubagentSession={onOpenSubagentSession}
+                />
+              ) : !responseContent && !retry ? (
+                <ThinkingPlaceholder />
+              ) : null}
+            </>
           )}
 
           {/* Trace status owns the complete chronological activity history.

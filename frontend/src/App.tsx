@@ -54,6 +54,7 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
+  const [draftAttachments, setDraftAttachments] = useState<ChatAttachment[]>([]);
   const [chatModeState, setChatModeState] = useState<'plan' | 'build'>('build');
   const [sidebarRefreshTick, setSidebarRefreshTick] = useState(0);
 
@@ -359,7 +360,7 @@ export default function App() {
 
   // ── Handlers ──
 
-  const handleSend = useCallback(async (prompt: string, files: File[] = []) => {
+  const handleSend = useCallback(async (prompt: string, files: File[] = [], restoredAttachments: ChatAttachment[] = []) => {
     console.log('[App.handleSend] called with prompt=%o activeWorkspace=%o activeChat=%o', prompt, activeWorkspace, activeChat);
     setNotification(null);
 
@@ -503,10 +504,11 @@ export default function App() {
 
     // ── Send the message ──
     console.log('[App.handleSend] sending message, ws=%o chat=%o', ws, chat);
-    let attachments: ChatAttachment[] = [];
+    let attachments: ChatAttachment[] = [...restoredAttachments];
     if (files.length) {
       try {
-        attachments = await uploadChatAttachments(ws.id, chat.id, files);
+        const uploaded = await uploadChatAttachments(ws.id, chat.id, files);
+        attachments = [...attachments, ...uploaded];
       } catch (err) {
         console.error('[App] attachment upload failed:', err);
         setNotification('Your files could not be uploaded. Please try again.');
@@ -861,16 +863,18 @@ export default function App() {
 
   const handleRewind = useCallback(async (message: ChatMessage) => {
     if (!activeWorkspace || !activeChat || isRunning) return;
+    const restoredAttachments = Array.isArray(message.metadata?.attachments)
+      ? message.metadata.attachments as ChatAttachment[]
+      : [];
     try {
       const result = await rewindChat(activeWorkspace.id, activeChat.id, message.id);
       const chat = await fetchChat(activeWorkspace.id, activeChat.id);
-      setMessages(chat.messages || []);
+      const next = chat.messages || [];
+      const index = next.findIndex((candidate) => candidate.id === message.id);
+      setMessages(index >= 0 ? next.slice(0, index) : next);
       setDraft(result.prompt || '');
-      setNotification(
-        result.restore?.conflicts?.length
-          ? `Rewound, but ${result.restore.conflicts.length} file(s) could not be restored.`
-          : 'Rewound. The message is back in the prompt.',
-      );
+      setDraftAttachments(restoredAttachments);
+      setNotification(null);
       setSidebarRefreshTick((t) => t + 1);
     } catch (e) {
       setNotification(e instanceof Error ? e.message : 'Rewind failed.');
@@ -1014,7 +1018,9 @@ export default function App() {
           onRetry={handleSend}
           onRewind={handleRewind}
           draft={draft}
+          draftAttachments={draftAttachments}
           onDraftConsumed={() => setDraft('')}
+          onDraftAttachmentsConsumed={() => setDraftAttachments([])}
           totalCost={combinedTokenUsage.total_cost}
           totalInput={combinedTokenUsage.total_input_tokens}
           totalOutput={combinedTokenUsage.total_output_tokens}

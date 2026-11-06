@@ -1,4 +1,4 @@
-import { FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
+import { FolderKanban, Home, Settings, SquarePen, Waypoints } from 'lucide-react';
 import type { SideView } from './HouseRail';
 
 interface Props {
@@ -6,14 +6,16 @@ interface Props {
   onView: (view: SideView) => void;
   onNewChat: () => void;
   onOpenSettings: () => void;
+  onOpenMap: () => void;
+  mapOpen: boolean;
   waiting: number;
 }
 
 /**
  * Phone/tablet navigation. The vertical rail is hidden below `md`; this bar
- * gives the same four destinations without stealing chat width.
+ * gives the same destinations without stealing chat width.
  */
-export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings, waiting }: Props) {
+export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings, onOpenMap, mapOpen, waiting }: Props) {
   const item = (active: boolean) =>
     `relative flex flex-1 flex-col items-center justify-center gap-0.5 py-1.5 rounded-lg transition-colors cursor-pointer ${
       active ? 'text-white' : 'text-zinc-500 active:text-zinc-200'
@@ -28,6 +30,14 @@ export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings
         <Home size={18} />
         <span className="text-[9px]">Chats</span>
       </button>
+      <button onClick={onOpenMap} className={item(mapOpen)} aria-label="Agent map" aria-pressed={mapOpen}>
+        <Waypoints size={18} />
+        <span className="text-[9px]">Map</span>
+      </button>
+      <button onClick={onNewChat} className={item(false)} aria-label="New chat">
+        <SquarePen size={18} />
+        <span className="text-[9px]">New</span>
+      </button>
       <button onClick={() => onView('projects')} className={item(view === 'projects')} aria-label="Projects" aria-pressed={view === 'projects'}>
         <span className="relative">
           <FolderKanban size={18} />
@@ -38,10 +48,6 @@ export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings
           )}
         </span>
         <span className="text-[9px]">Projects</span>
-      </button>
-      <button onClick={onNewChat} className={item(false)} aria-label="New chat">
-        <SquarePen size={18} />
-        <span className="text-[9px]">New</span>
       </button>
       <button onClick={onOpenSettings} className={item(false)} aria-label="Settings">
         <Settings size={18} />

@@ -5,7 +5,7 @@ import PromptDock from '../components/Workspace/PromptDock';
 import MessageStream from '../components/Workspace/MessageStream';
 import NotesButton from '../components/Notes/NotesButton';
 import CanvasModeBadge from '../components/Canvas/CanvasModeBadge';
-import type { ChatMessage } from '../types';
+import type { ChatAttachment, ChatMessage } from '../types';
 import '../house/house.css';
 
 interface Props {
@@ -14,7 +14,7 @@ interface Props {
   messages: ChatMessage[];
   isRunning: boolean;
   isLoading: boolean;
-  notification: string | null;
+  notification?: string | null;
   threadRef: MutableRefObject<HTMLDivElement | null>;
   isVoiceMode: boolean;
   totalCost: number;
@@ -22,7 +22,7 @@ interface Props {
   totalOutput: number;
   totalCacheHitTokens: number;
   activeContextTokens: number;
-  onSend: (prompt: string, files: File[]) => void;
+  onSend: (prompt: string, files: File[], restored?: ChatAttachment[]) => void;
   onCancel: () => void;
   onToggleVoice: () => void;
   onOpenStats: () => void;
@@ -40,7 +40,9 @@ interface Props {
   chatId?: string | null;
   onRewind?: (message: ChatMessage) => void;
   draft?: string;
+  draftAttachments?: ChatAttachment[];
   onDraftConsumed?: () => void;
+  onDraftAttachmentsConsumed?: () => void;
 }
 
 /**
@@ -50,7 +52,7 @@ interface Props {
  */
 export default function HouseChat({
   title, subtitle,
-  messages, isRunning, isLoading, notification, threadRef,
+  messages, isRunning, isLoading, threadRef,
   isVoiceMode,
   totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens,
   onSend, onCancel, onToggleVoice, onOpenStats,
@@ -63,7 +65,9 @@ export default function HouseChat({
   chatId,
   onRewind,
   draft,
+  draftAttachments,
   onDraftConsumed,
+  onDraftAttachmentsConsumed,
 }: Props) {
   const [minimized, setMinimized] = useState(defaultMinimized);
 
@@ -141,12 +145,6 @@ export default function HouseChat({
     </div>
   );
 
-  const notificationBar = notification ? (
-    <div className="py-1.5 px-3 mb-1 text-[11px] text-zinc-400 bg-white/[0.05] border border-white/10 rounded shrink-0 flex items-center gap-2">
-      <span className="flex-1 truncate">{notification}</span>
-    </div>
-  ) : null;
-
   const dock = (
     <div className="shrink-0 pt-1">
       <PromptDock
@@ -163,7 +161,9 @@ export default function HouseChat({
         totalCacheHitTokens={totalCacheHitTokens}
         activeContextTokens={activeContextTokens}
         draft={draft}
+        draftAttachments={draftAttachments}
         onDraftConsumed={onDraftConsumed}
+        onDraftAttachmentsConsumed={onDraftAttachmentsConsumed}
       />
     </div>
   );
@@ -173,7 +173,6 @@ export default function HouseChat({
       <div className="absolute bottom-3 right-3 z-30 w-[min(600px,calc(100vw-360px))] flex flex-col rounded-2xl border house-hairline premium-surface backdrop-blur-md shadow-2xl px-3 pt-2.5 pb-1 ide-panel-enter">
         {header}
         {messagesArea}
-        {notificationBar}
         {dock}
       </div>
     );
@@ -184,7 +183,6 @@ export default function HouseChat({
       <div className="flex flex-col min-h-0 h-full px-3 pt-2.5 pb-2 overflow-hidden">
         {header}
         {messagesArea}
-        {notificationBar}
         {dock}
       </div>
     );
@@ -205,7 +203,6 @@ export default function HouseChat({
           {minimized ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
         </button>
         {messagesArea}
-        {notificationBar}
         {dock}
       </div>
     </div>

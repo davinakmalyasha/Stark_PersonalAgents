@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { X, Minimize2, Maximize2, Search, Download, RotateCcw, CircleAlert, GitBranch } from 'lucide-react';
-import type { ChatMessage, AppState, ModelOption } from '../../types';
+import { Minimize2, Maximize2, Search, Download, RotateCcw, GitBranch } from 'lucide-react';
+import type { ChatMessage, AppState, ChatAttachment, ModelOption } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
 import PlanDock from './PlanDock';
@@ -41,7 +41,9 @@ interface Props {
   onRetry?: (prompt: string) => void;
   onRewind?: (message: ChatMessage) => void;
   draft?: string;
+  draftAttachments?: ChatAttachment[];
   onDraftConsumed?: () => void;
+  onDraftAttachmentsConsumed?: () => void;
   /** Session-keyed subagent drill-in (delegation rows carrying childId). */
   onOpenSubagentSession?: (childId: string, label: string, childWorkspace?: string) => void;
   /** Reflect server-side mode flips (plan approval) in the App badge/bar. */
@@ -52,10 +54,10 @@ interface Props {
 
 export default function ChatView({
   messages, isRunning,
-  hasActiveChat, notification, chatMode = 'build',
-  onSend, onCancel, onClearNotification,
+  hasActiveChat, chatMode = 'build',
+  onSend, onCancel,
   isVoiceMode, onToggleVoice, voiceInputText,   onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, traceSteps = [], workspaceId, chatId, onOpenProject,
-  selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession, onRewind, draft, onDraftConsumed,
+  selectedModel, models, onModelChange, onRetry, state, onOpenSubagentSession, onRewind, draft, draftAttachments, onDraftConsumed, onDraftAttachmentsConsumed,
   onModeChange,
   variant = 'floating',
 }: Props) {
@@ -206,17 +208,6 @@ export default function ChatView({
           opacity: minimized ? 0 : 1,
         }}
       >
-        {/* Notifications — inline line, no banner box */}
-        {notification && (
-          <div className={`mx-4 mt-2 flex items-start gap-2 text-[12px] leading-relaxed flex-shrink-0 ${/error|fail|blocked|stopped|expired|denied/i.test(notification) ? 'text-red-300/90' : 'text-zinc-400'}`}>
-            <CircleAlert size={13} className={`mt-[2px] flex-shrink-0 ${/error|fail|blocked|stopped|expired|denied/i.test(notification) ? 'text-red-400/80' : 'text-zinc-500'}`} />
-            <span className="flex-1">{notification}</span>
-            <button onClick={onClearNotification} className="mt-[1px] p-0.5 text-zinc-500 hover:text-zinc-300">
-              <X size={12} />
-            </button>
-          </div>
-        )}
-
         {/* Message stream */}
         <MessageStream
           messages={visibleMessages}
@@ -266,7 +257,7 @@ export default function ChatView({
             </div>
           </div>
         )}
-        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} onOpenAgentConfig={onOpenAgentConfig} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} onDraftConsumed={onDraftConsumed} />
+        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} onOpenAgentConfig={onOpenAgentConfig} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} draftAttachments={draftAttachments} onDraftConsumed={onDraftConsumed} onDraftAttachmentsConsumed={onDraftAttachmentsConsumed} />
       </div>
     </div>
   );

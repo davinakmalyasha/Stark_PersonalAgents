@@ -4,7 +4,7 @@ import {
   PanelRightOpen, Pause, Play, Terminal, X,
 } from 'lucide-react';
 import type { GroupOp, GroupProjectDetail } from '../types';
-import { fetchGroupProject, groupProjectOp, resolveGroupApproval } from '../services/api';
+import { fetchGroupProject, groupProjectOp, resolveGroupApproval, sendGroupMessage } from '../services/api';
 import NotesButton from '../components/Notes/NotesButton';
 import GroupProjectChat from './group/GroupProjectChat';
 import GroupProjectRail from './group/GroupProjectRail';
@@ -126,6 +126,12 @@ export default function GroupProjectModal({ projectId, onClose }: Props) {
     } finally {
       setOpBusy(null);
     }
+  };
+
+  const onSendMessage = async (body: string, to: string) => {
+    setActionError(null);
+    await sendGroupMessage(projectId, body, to);
+    await reload();
   };
 
   const onOpenFolder = async () => {
@@ -251,6 +257,9 @@ export default function GroupProjectModal({ projectId, onClose }: Props) {
                 onResolve={onResolve}
                 loading={loading}
                 error={error}
+                projectStatus={status}
+                members={detail?.members}
+                onSend={onSendMessage}
               />
               <GroupProjectRail
                 project={project}

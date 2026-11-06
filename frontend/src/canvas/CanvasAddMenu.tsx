@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import type { CSSProperties } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Check, FolderKanban, MessageSquare, Palette, Plus, Search, X } from 'lucide-react';
 import type { ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
@@ -29,6 +31,8 @@ interface Props {
   added: Set<string>;
   onAdd: (draft: CanvasDraft) => void;
   onClose: () => void;
+  /** Viewport anchor; the menu portals above the chat/canvas stack. */
+  anchor?: { left: number; top: number } | null;
 }
 
 const ADDON_LABEL: Record<CanvasAddonId, string> = {
@@ -56,25 +60,39 @@ function Row({
       }}
       onClick={() => { if (!added) onAdd(draft); }}
       onKeyDown={(e) => { if (!added && e.key === 'Enter') onAdd(draft); }}
-      className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+      className={`flex items-center gap-2 rounded-md px-2 py-1 text-left transition-colors ${
         added ? 'cursor-default opacity-45' : 'cursor-pointer hover:bg-white/[0.05]'
       }`}
       title={added ? 'Already on the canvas' : `${title} — click or drag to canvas`}
     >
       <span className="flex-none text-zinc-600">{icon}</span>
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-[11.5px] text-zinc-300">{title}</span>
-        <span className="block truncate text-[9.5px] text-zinc-600">{subtitle}</span>
+        <span className="block truncate text-[11px] text-zinc-300">{title}</span>
+        <span className="block truncate text-[9px] text-zinc-600">{subtitle}</span>
       </span>
       {added ? <Check size={11} className="flex-none text-emerald-400" /> : <Plus size={11} className="flex-none text-zinc-600" />}
     </div>
   );
 }
 
-export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, onClose }: Props) {
+export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, onClose, anchor }: Props) {
   const [query, setQuery] = useState('');
   const [tab, setTab] = useState<'chats' | 'projects' | 'addons'>('chats');
   const q = query.trim().toLowerCase();
+
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      if ((event.target as HTMLElement | null)?.closest('.canvas-add-menu')) return;
+      onClose();
+    };
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    window.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
 
   const filteredChats = useMemo(
     () => chats.filter(({ chat, workspace }) =>
@@ -92,22 +110,28 @@ export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, o
     [addons, q],
   );
 
-  return (
-    <div className="absolute left-3 top-12 z-30 w-[360px] max-h-[min(480px,calc(100vh-120px))] overflow-hidden rounded-xl border border-white/[0.09] bg-[#121317]/98 shadow-2xl backdrop-blur-xl">
-      <div className="flex items-center gap-2 border-b border-white/[0.06] px-2.5 py-2">
-        <Search size={11} className="flex-none text-zinc-600" />
+  return createPortal(
+    <div
+      className="canvas-add-menu"
+      style={{
+        '--canvas-menu-left': `${anchor?.left ?? 14}px`,
+        '--canvas-menu-top': `${anchor?.top ?? 58}px`,
+      } as CSSProperties}
+    >
+      <div className="flex items-center gap-2 border-b border-white/[0.06] px-2 py-1.5">
+        <Search size={10} className="flex-none text-zinc-600" />
         <input
           autoFocus
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Add chat, project, or addon…"
-          className="min-w-0 flex-1 bg-transparent text-[11.5px] text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
+          className="min-w-0 flex-1 bg-transparent text-[10.5px] text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
         />
         <button type="button" onClick={onClose} className="grid h-5 w-5 place-items-center rounded text-zinc-600 hover:bg-white/[0.06] hover:text-white" aria-label="Close add menu">
-          <X size={11} />
+          <X size={10} />
         </button>
       </div>
-      <div className="flex items-center gap-1 border-b border-white/[0.06] px-2 py-1.5">
+      <div className="flex items-center gap-0.5 border-b border-white/[0.06] px-1.5 py-1">
         {([
           ['chats', 'Chats', filteredChats.length],
           ['projects', 'Projects', filteredProjects.length],
@@ -117,18 +141,18 @@ export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, o
             key={key}
             type="button"
             onClick={() => setTab(key)}
-            className={`rounded-md px-2 py-1 text-[10px] font-medium transition-colors ${
+            className={`rounded px-1.5 py-0.5 text-[9px] font-medium transition-colors ${
               tab === key ? 'bg-white/[0.09] text-white' : 'text-zinc-500 hover:bg-white/[0.04] hover:text-zinc-300'
             }`}
           >
-            {label} <span className="text-[9px] text-zinc-600">{count}</span>
+            {label} <span className="text-[8px] text-zinc-600">{count}</span>
           </button>
         ))}
       </div>
-      <div className="max-h-[380px] overflow-y-auto p-1.5">
+      <div className="max-h-[250px] overflow-y-auto p-1">
         {tab === 'chats' && filteredChats.length > 0 && (
           <>
-            <div className="px-2 pb-1 pt-2 text-[8.5px] font-bold uppercase tracking-widest text-zinc-600">Chats</div>
+            <div className="px-1.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-widest text-zinc-600">Chats</div>
             {filteredChats.map(({ workspace, chat }) => {
               const draft: CanvasDraft = { kind: 'chat', workspaceId: workspace.id, chatId: chat.id };
               return (
@@ -148,7 +172,7 @@ export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, o
 
         {tab === 'projects' && filteredProjects.length > 0 && (
           <>
-            <div className="px-2 pb-1 pt-2 text-[8.5px] font-bold uppercase tracking-widest text-zinc-600">Projects</div>
+            <div className="px-1.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-widest text-zinc-600">Projects</div>
             {filteredProjects.map(({ workspace, project }) => {
               const draft: CanvasDraft = { kind: 'project', workspaceId: workspace.id, projectId: project.id };
               return (
@@ -168,7 +192,7 @@ export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, o
 
         {tab === 'addons' && filteredAddons.length > 0 && (
           <>
-            <div className="px-2 pb-1 pt-2 text-[8.5px] font-bold uppercase tracking-widest text-zinc-600">Addons</div>
+            <div className="px-1.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-widest text-zinc-600">Addons</div>
             {filteredAddons.map(({ workspace, addonId, chatId }) => {
               const draft: CanvasDraft = { kind: 'addon', workspaceId: workspace.id, addonId, chatId };
               return (
@@ -192,6 +216,7 @@ export default function CanvasAddMenu({ chats, projects, addons, added, onAdd, o
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

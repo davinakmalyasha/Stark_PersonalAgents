@@ -1,4 +1,4 @@
-import { FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
+import { FolderKanban, Home, Settings, SquarePen, Waypoints } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
 export type SideView = 'chats' | 'projects';
@@ -9,10 +9,12 @@ interface Props {
   onView: (view: SideView) => void;
   onNewChat: () => void;
   onOpenSettings: () => void;
+  onOpenMap: () => void;
+  mapOpen: boolean;
   waiting: number;
 }
 
-export default function HouseRail({ view, onView, onNewChat, onOpenSettings, waiting }: Props) {
+export default function HouseRail({ view, onView, onNewChat, onOpenSettings, onOpenMap, mapOpen, waiting }: Props) {
   const btn = (active: boolean) =>
     `grid place-items-center w-9 h-9 rounded-xl transition-colors cursor-pointer shrink-0 ${
       active ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
@@ -38,6 +40,15 @@ export default function HouseRail({ view, onView, onNewChat, onOpenSettings, wai
           className={btn(view === 'chats')}
         >
           <Home size={17} />
+        </button>
+        <button
+          onClick={onOpenMap}
+          title="Agent map"
+          aria-label="Agent map"
+          aria-pressed={mapOpen}
+          className={btn(mapOpen)}
+        >
+          <Waypoints size={17} />
         </button>
         <button
           onClick={() => onView('projects')}

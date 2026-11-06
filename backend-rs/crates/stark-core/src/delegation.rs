@@ -1,13 +1,11 @@
 //! Orchestrator → workspace delegation, backed by durable agents.
 //!
-//! The legacy job registry is gone. `delegate` creates/reuses a durable
-//! workspace agent and queues the task; the server supervisor runs it.
+//! Each fan-out item gets its own workspace agent + chat (Codex parity).
+//! The durable singleton is only for sequential follow-ups.
 
 use serde_json::{Value, json};
 use stark_store::{AgentRecord, AgentStore, WorkspaceRegistry};
 use stark_tools::ToolOutcome;
-
-use std::time::{Duration, Instant};
 
 use crate::{RunContext, agent_for_scope, agents_tools};
 
@@ -53,6 +51,7 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 "workspace_id": workspace_id,
                 "workspace_path": workspace_path,
                 "isolate": item.isolate,
+                "fresh": true,
                 "wait_seconds": 0
             }),
         )
@@ -60,12 +59,24 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
         if result.is_error {
             return result;
         }
-        let Some(agent) = store
-            .workspace_agent(&workspace_id, item.agent.key)
-            .await
-            .ok()
-            .flatten()
-        else {
+        // Fresh parallel spawns have unique ids; parse the spawn receipt
+        // instead of the singleton lookup (which returns the first agent).
+        let spawned_id = result
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("id="))
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let agent = match spawned_id {
+            Some(id) => store.get(&id).await.ok().flatten(),
+            None => store
+                .workspace_agent(&workspace_id, item.agent.key)
+                .await
+                .ok()
+                .flatten(),
+        };
+        let Some(agent) = agent else {
             return ToolOutcome::err("Error: delegated agent was not persisted");
         };
         rows.push(format!(
@@ -81,7 +92,7 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
         }));
     }
     ToolOutcome::ok(format!(
-        "[DELEGATION STARTED]\n{}\nUse delegation_status with wait_seconds to collect results; job_message/job_cancel manage the agent.",
+        "[DELEGATION STARTED]\n{}\nEach item runs in its own agent/chat. Use delegation_status(id, wait_seconds) per agent to collect results; delegation_status lists the board; job_message/job_cancel manage an agent.",
         rows.join("\n")
     ))
     .with_children(children)
@@ -169,17 +180,12 @@ fn resolve_target(ctx: &RunContext, item: &JobItem) -> Result<(String, String), 
             harness.join("_dfd").to_string_lossy().to_string(),
         )),
         "developer" | "ui" | "devops" => {
-            // Never silently write a project agent into the harness root.
-            let in_project = ctx.workspace != *harness && !ctx.workspace_id.starts_with('_');
-            if in_project {
-                return Ok((
-                    ctx.workspace_id.clone(),
-                    ctx.workspace.to_string_lossy().to_string(),
-                ));
-            }
-            Err(format!(
-                "Error: {} delegation requires a workspace or project target; current chat is not in a project",
-                item.agent.display
+            // Codex parity: inherit the parent workspace. An orchestrator
+            // outside a project still fans out; the child runs in the
+            // current workspace (scratch/ephemeral) instead of erroring.
+            Ok((
+                ctx.workspace_id.clone(),
+                ctx.workspace.to_string_lossy().to_string(),
             ))
         }
         _ => Ok((
@@ -248,41 +254,32 @@ pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOut
         Ok(agent) => agent,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
-    // Long-poll instead of tight polling: wait until the children settle, the
-    // user sends another message, or the deadline (default 300s) passes. This
-    // is one tool call, so repeated identical calls (and the repeat guard)
-    // never fire.
-    let wait = args
-        .get("wait_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(300)
-        .min(300);
-    let deadline = Instant::now() + Duration::from_secs(wait);
-    let agents = loop {
-        let agents = store.list(Some(&current.id)).await.unwrap_or_default();
-        let busy = agents
-            .iter()
-            .any(|agent| matches!(agent.status.as_str(), "running" | "queued"));
-        let steered = ctx
-            .steering
-            .lock()
-            .map(|queue| !queue.is_empty())
-            .unwrap_or(false);
-        if !busy || steered || ctx.cancel.is_cancelled() || Instant::now() >= deadline {
-            break agents;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
+    // Codex parity: the board query is instant. Waiting belongs to the
+    // per-id call (`delegation_status(id, wait_seconds)` / `wait_agent`),
+    // not to the list. Long-polling here blocked the orchestrator tool
+    // for up to 300s and made settled jobs look "vanished".
+    let agents = store.list(Some(&current.id)).await.unwrap_or_default();
     if agents.is_empty() {
         return ToolOutcome::ok("[DELEGATIONS]\nNo active delegations.".to_string());
     }
     let rows = agents
         .iter()
         .map(|agent| {
-            format!(
+            let mut row = format!(
                 "- {} · {} · {} — {} (chat: {})",
                 agent.id, agent.role, agent.nickname, agent.status, agent.chat_id
-            )
+            );
+            // Surface short results inline so completed fan-out (e.g. 5x
+            // 1+3) reads without a second round-trip per agent.
+            if matches!(
+                agent.status.as_str(),
+                "completed" | "failed" | "cancelled" | "interrupted"
+            ) && !agent.result.trim().is_empty()
+            {
+                let preview: String = agent.result.chars().take(200).collect();
+                row.push_str(&format!(" → {}", preview.replace('\n', " ")));
+            }
+            row
         })
         .collect::<Vec<_>>();
     ToolOutcome::ok(format!("[DELEGATIONS]\n{}", rows.join("\n")))

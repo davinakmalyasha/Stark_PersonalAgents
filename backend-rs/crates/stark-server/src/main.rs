@@ -1870,14 +1870,7 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
     }
     let prompt = messages
         .iter()
-        .map(|message| {
-            format!(
-                "[{} from {}]\n{}",
-                message["kind"].as_str().unwrap_or("message"),
-                message["senderId"].as_str().unwrap_or("user"),
-                message["body"].as_str().unwrap_or("")
-            )
-        })
+        .map(|message| message["body"].as_str().unwrap_or("").to_string())
         .collect::<Vec<_>>()
         .join("\n\n");
     let checkpoint = Checkpoint::begin(&target.chat_id, &target.workspace);

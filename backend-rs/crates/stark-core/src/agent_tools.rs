@@ -233,22 +233,37 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
         .await
         .map_err(|error| error.to_string())?;
     let chat_id = chat["id"].as_str().unwrap_or("").to_string();
-    if fork_turns == "all" {
+    // Codex parity: the child transcript starts clean. A full-history fork
+    // is inline context inside the single spawn message, never 40 persisted
+    // parent rows that make every chat look mixed.
+    let body = if fork_turns == "all" {
         let history = ctx
             .store
-            .history(&ctx.chat_id, 40)
+            .history(&ctx.chat_id, 20)
             .await
             .map_err(|error| error.to_string())?;
+        let mut context = String::new();
         for message in history {
             if message.role != "user" && message.role != "assistant" {
                 continue;
             }
-            let _ = ctx
-                .store
-                .append_message(&chat_id, &message.role, &message.content, false)
-                .await;
+            if context.len() > 6_000 {
+                break;
+            }
+            context.push_str(&format!("{}: {}\n", message.role, message.content));
         }
-    }
+        if context.trim().is_empty() {
+            message.to_string()
+        } else {
+            format!(
+                "Parent context (fork_turns=all, not a new task):\n{}\n---\nTask:\n{}",
+                context.trim(),
+                message
+            )
+        }
+    } else {
+        message.to_string()
+    };
     let spec = agent_for_scope("developer").ok_or_else(|| "developer agent missing".to_string())?;
     let agent = store
         .create_agent(
@@ -271,7 +286,7 @@ async fn spawn_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
             Some(&current.id),
             &agent.id,
             "spawn",
-            &format!("[TASK] {path}\n\n{message}"),
+            &body,
             "trigger",
             json!({
                 "task_name": task_name,

@@ -160,8 +160,13 @@ export function presentStream(segments: StreamSegment[], fallbackText: string, s
   }
   }
 
-  finalText = formatFinalSequence(finalText);
-  return { finalText, activitySegments: stripFinalAnswerDupes(activitySegments, finalText) };
+  finalText = formatFinalSequence(stripMailboxEnvelope(finalText));
+  const cleanedActivity = activitySegments.map((segment) =>
+    segment.type === 'text'
+      ? { ...segment, text: stripMailboxEnvelope(segment.text) }
+      : segment,
+  );
+  return { finalText, activitySegments: stripFinalAnswerDupes(cleanedActivity, finalText) };
 }
 
 /** Collapse whitespace so stream/persisted copies of one answer compare equal. */
@@ -192,10 +197,19 @@ function stripFinalAnswerDupes(segments: StreamSegment[], finalText: string): St
  * announcements as clickable delegation cards instead of leaving sentences
  * such as "Created Confucius with the instructions…" in the parent answer.
  */
-export function stripDelegationNarration(text: string, steps: TraceStep[]): string {
-  if (!text || !steps.some((step) => !!step.childId)) return text;
-
+export function stripMailboxEnvelope(text: string): string {
+  if (!text) return text;
   let cleaned = text;
+  cleaned = cleaned.replace(/^\s*\[[^\]\n]*\sfrom\s+[^\]\n]+\]\s*$/gim, '');
+  cleaned = cleaned.replace(/^\s*\[TASK\][^\n]*$/gim, '');
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return cleaned;
+}
+
+export function stripDelegationNarration(text: string, steps: TraceStep[]): string {
+  if (!text) return text;
+  let cleaned = stripMailboxEnvelope(text);
+  if (!steps.some((step) => !!step.childId)) return cleaned;
   const linePatterns = [
     /(^|\n)\s*Created\s+an\s+agent[^\n]*(?:\n|$)/gi,
     /(^|\n)\s*Created\s+[^.\n]+?\s+with\s+(?:the\s+)?instructions?:[^\n]*(?:\n|$)/gi,

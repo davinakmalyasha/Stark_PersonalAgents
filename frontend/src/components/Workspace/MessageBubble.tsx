@@ -3,7 +3,7 @@ import { Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDo
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import type { StreamSegment } from '../../utils/streamAccum';
-import { presentStream, stripDelegationNarration } from '../../utils/streamPresentation';
+import { presentStream, stripDelegationNarration, stripMailboxEnvelope } from '../../utils/streamPresentation';
 import { undoRun } from '../../services/api';
 import TraceAccordion from './TraceAccordion';
 import ActivityTimeline from './ActivityTimeline';
@@ -260,7 +260,7 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
                 {isScheduledWake ? 'Scheduled wake' : 'Canvas event'}
               </div>
             )}
-            {message.content && <Markdown content={message.content} />}
+            {message.content && <Markdown content={stripMailboxEnvelope(message.content)} />}
             {Array.isArray(message.metadata?.attachments) && <div className="message-attachments">
               {(message.metadata.attachments as ChatAttachment[]).map((file) => <div className="message-attachment" key={file.id}>
                 {file.isImage ? <Image size={14} /> : <FileText size={14} />}<span className="truncate">{file.name}</span>

@@ -135,10 +135,16 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
             if current.kind != "orchestrator" {
                 return Err("only the orchestrator can spawn workspace agents".to_string());
             }
-            if let Some(existing) = store
-                .workspace_agent(&workspace_id, spec.key)
-                .await
-                .map_err(|error| error.to_string())?
+            // Codex parity: parallel fan-out needs one independent agent per
+            // job. The durable singleton is only for sequential follow-ups to
+            // the same workspace, so `fresh` bypasses reuse entirely.
+            let fresh_requested = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+            let mut reused: Option<stark_store::AgentRecord> = None;
+            if !fresh_requested
+                && let Some(existing) = store
+                    .workspace_agent(&workspace_id, spec.key)
+                    .await
+                    .map_err(|error| error.to_string())?
             {
                 // Reuse the durable workspace agent. If its previous worktree
                 // is terminal or missing, isolate a fresh one.
@@ -152,6 +158,9 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                 {
                     let _ = attach_worktree(ctx, store, &existing, &workspace_path).await;
                 }
+                reused = Some(existing);
+            }
+            if let Some(existing) = reused {
                 (existing, false)
             } else {
                 let chat = ctx
@@ -166,7 +175,14 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
                     .await
                     .map_err(|error| error.to_string())?;
                 let chat_id = chat["id"].as_str().unwrap_or("").to_string();
-                let path = format!("workspace:{}:{}", workspace_id, spec.key);
+                // Fresh parallel jobs need unique paths; the singleton lookup
+                // is (workspace_id, scope), so suffix parallel spawns.
+                let path = if fresh_requested {
+                    let short = &uuid::Uuid::new_v4().simple().to_string()[..8];
+                    format!("workspace:{}:{}:{}", workspace_id, spec.key, short)
+                } else {
+                    format!("workspace:{}:{}", workspace_id, spec.key)
+                };
                 let agent = store
                     .create_agent(
                         "workspace",

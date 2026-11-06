@@ -106,11 +106,11 @@ export default function ChatView({
     <div 
       className={`${
         variant === 'docked'
-          ? 'relative w-full max-w-[780px] mx-auto flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/60 bg-[#0c0c0f] shadow-2xl'
-          : 'absolute bottom-6 left-3 right-3 z-40 w-auto max-w-none flex flex-col pointer-events-auto rounded-2xl border border-zinc-800/50 backdrop-blur-md shadow-2xl transition-all duration-300 premium-surface'
+          ? 'relative w-full max-w-[920px] mx-auto flex flex-col pointer-events-auto'
+          : 'absolute bottom-4 left-2 right-2 z-40 w-auto max-w-none flex flex-col pointer-events-auto transition-all duration-300'
       }`}
       style={{
-        maxHeight: variant === 'docked' ? '70vh' : '80vh',
+        maxHeight: variant === 'docked' ? '78vh' : '88vh',
       }}
     >
       {/* Floating minimize/expand button (icon only, proper bg color, bigger icon) */}
@@ -198,12 +198,6 @@ export default function ChatView({
         </div>
       )}
 
-      {variant === 'docked' && (
-        <div className="flex h-10 shrink-0 items-center px-3">
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Conversation</span>
-        </div>
-      )}
-
       {/* Collapsible Area */}
       <div 
         className="flex-1 flex flex-col overflow-y-auto transition-all duration-300 ease-in-out"
@@ -241,7 +235,7 @@ export default function ChatView({
       </div>
 
       {/* Always visible Bottom Prompt Dock */}
-      <div className="border-t border-zinc-800/50 flex-shrink-0">
+      <div className="flex-shrink-0">
         <PlanDock plan={state?.plan} />
         {chatMode === 'plan' && (
           <div className="mx-4 mt-2.5 mb-1 rounded-xl border border-amber-700/50 bg-amber-950/40 px-3.5 py-2.5">

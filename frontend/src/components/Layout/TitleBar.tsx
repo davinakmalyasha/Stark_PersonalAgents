@@ -3,6 +3,7 @@ import { Smartphone, Settings, X } from 'lucide-react';
 import PairingModal from './PairingModal';
 import WindowControls from './WindowControls';
 import { apiUrl } from '../../services/api';
+import { STARK_VERSION } from '../../version';
 
 type AppRegionStyle = React.CSSProperties & { WebkitAppRegion?: 'drag' | 'no-drag' };
 
@@ -143,6 +144,13 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
           <Settings size={14} />
         </button>
       )}
+      <span
+        title={`Stark ${STARK_VERSION}`}
+        className="select-none shrink-0 text-[9px] leading-none font-mono text-zinc-700 opacity-60 px-1"
+        aria-label={`Stark version ${STARK_VERSION}`}
+      >
+        v{STARK_VERSION}
+      </span>
       <WindowControls />
       <PairingModal open={pairingOpen} onClose={() => setPairingOpen(false)} />
     </header>

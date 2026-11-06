@@ -14,6 +14,7 @@ import GroupProjectModal from './GroupProjectModal';
 import { useGroupProjects } from './useGroupProjects';
 import { useScheduledTasks } from './useScheduledTasks';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
+import SettingsModal from '../components/Layout/SettingsModal';
 import { useHouseChat } from './useHouseChat';
 import { useSessions, tabId } from './useSessions';
 import { useSessionRunner } from './useSessionRunner';
@@ -29,6 +30,7 @@ export default function House() {
   const [transitioning, setTransitioning] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isStatsOpen, setIsStatsOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
@@ -431,6 +433,7 @@ export default function House() {
         onNewTask={() => setTaskDialogOpen(true)}
         onCancelSchedule={handleCancelSchedule}
         onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
+        onOpenSettings={() => setIsSettingsOpen(true)}
       />
 
       <main className="relative z-10 flex-1 min-h-0 flex overflow-hidden">
@@ -518,6 +521,11 @@ export default function House() {
         onClose={() => setIsStatsOpen(false)}
         tokenUsage={chat.combinedTokenUsage}
         lastModelName={chat.lastModelName}
+      />
+
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
       />
 
       {openProjectId && (

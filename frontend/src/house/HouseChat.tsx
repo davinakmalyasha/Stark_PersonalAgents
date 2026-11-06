@@ -190,14 +190,11 @@ export default function HouseChat({
     );
   }
 
-  // Home: a solid dark-grey card that follows the chat — auto height hugging
-  // header + messages + dock exactly like the ide floating panel (single
-  // max-height animation, so the dock never gets displaced mid-transition),
-  // bottom-anchored, capped at the workspace height.
+  // Home: no card chrome — messages sit on the canvas, only the prompt dock
+  // floats. Header removed (title lives in the tab strip); width up.
   return (
-    <div className="flex flex-col justify-end w-full max-w-[680px] mx-auto px-3 pt-2 pb-3">
-      <div className="house-chat-card pointer-events-auto flex flex-col min-h-0 max-h-[70vh] rounded-2xl border house-hairline px-3 pt-2.5 pb-1 overflow-hidden">
-        {header}
+    <div className="flex flex-col justify-end w-full max-w-[920px] mx-auto px-2 pt-2 pb-2">
+      <div className="pointer-events-auto flex flex-col min-h-0 max-h-[78vh] overflow-hidden">
         {messagesArea}
         {notificationBar}
         {dock}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Menu, FolderKanban, CircleAlert, Terminal, Plus, CalendarClock, X } from 'lucide-react';
+import { Menu, FolderKanban, CircleAlert, Terminal, Plus, CalendarClock, X, Settings } from 'lucide-react';
 import type { SessionTab, GroupProjectRow, ScheduledTask } from '../types';
 import SessionTabs from './SessionTabs';
 import WindowControls from '../components/Layout/WindowControls';
@@ -23,6 +23,7 @@ interface HouseHeaderProps {
   onNewTask: () => void;
   onCancelSchedule: (scheduleId: string) => void;
   onOpenScheduledChat: (workspaceId: string, chatId: string) => void;
+  onOpenSettings?: () => void;
 }
 
 /** Close a dropdown on outside-click or Escape. */
@@ -66,7 +67,7 @@ export default function HouseHeader({
   tabs, activeTabId, runningTabId,
   onActivateTab, onCloseTab, onNewSession,
   onOpenSidebar, projects, projectsScoped, onOpenProject, schedules,
-  onNewTask, onCancelSchedule, onOpenScheduledChat,
+  onNewTask, onCancelSchedule, onOpenScheduledChat, onOpenSettings,
 }: HouseHeaderProps) {
   const hasDesktopBridge = typeof window !== 'undefined' && !!window.antigravity;
   const isDesktopShell = hasDesktopBridge || Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
@@ -248,6 +249,18 @@ export default function HouseHeader({
           )}
         </div>
       </div>
+
+      {onOpenSettings && (
+        <button
+          onClick={onOpenSettings}
+          title="Settings — app, harness data, migration"
+          aria-label="Open settings"
+          className="grid place-items-center w-8 h-8 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07] transition-colors cursor-pointer shrink-0"
+          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+        >
+          <Settings size={15} />
+        </button>
+      )}
 
       {/* ── Session tab strip (the top bar IS the workspace switcher) ── */}
       <div className="flex-1 min-w-0 flex items-center" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>

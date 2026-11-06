@@ -147,7 +147,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   };
 
   return (
-    <div className="w-full flex-shrink-0 px-4 pt-3 pb-4">
+    <div className="w-full flex-shrink-0 px-2 pt-1.5 pb-2">
       <div
         className={`prompt-dock premium-surface premium-surface--dark relative overflow-visible ${dragActive ? 'is-dragging' : ''} ${isVoiceMode ? 'is-listening' : ''}`}
         onDragEnter={(event) => { event.preventDefault(); dragDepth.current += 1; setDragActive(true); }}
@@ -168,7 +168,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
           <button type="button" className="attachment-add" onClick={() => inputRef.current?.click()} title="Add files"><Plus size={17} /></button>
         </div>}
 
-        <div style={{ padding: '14px 18px 5px' }}>
+        <div style={{ padding: '10px 12px 4px' }}>
           <textarea ref={textareaRef} value={value} onChange={(event) => setValue(event.target.value)} onPaste={handlePaste} onKeyDown={(event) => { if (event.key === 'Enter' && (event.shiftKey === false || (event.ctrlKey || event.metaKey))) { event.preventDefault(); send(); } }} rows={1}
             placeholder={isVoiceMode ? 'Listening…' : files.length ? 'Add a note about these files…' : 'Ask anything'}
             className="prompt-input" />

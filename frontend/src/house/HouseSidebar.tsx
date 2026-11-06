@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, MessageSquare, Pencil, Trash2, Check, Code2, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, LayoutGrid, Bot, CornerDownRight, Home,
+  ChevronDown, Search, Pin, PinOff, Bot, CornerDownRight, Home,
 } from 'lucide-react';
 import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
 import { cleanChatTitle } from '../utils/chatTitle';
-import WorkspaceSwitcher from './WorkspaceSwitcher';
 import {
   buildGlobalLookup,
   collectSpawnedChildrenOf,
@@ -109,7 +108,6 @@ export default function HouseSidebar({
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
   onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
-  onLaunchPersonal, onLaunchCoding, onLaunchHouse,
 }: Props) {
   const [modeOpen, setModeOpen] = useState(false);
   const modeRef = useRef<HTMLDivElement | null>(null);
@@ -134,8 +132,6 @@ export default function HouseSidebar({
   const [filter, setFilter] = useState('');
   const [collapsedWs, setCollapsedWs] = useState<Set<string>>(new Set());
   const deleteTimer = useRef<number | null>(null);
-  const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
-  const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
   const [generalLimit, setGeneralLimit] = useState(GENERAL_PAGE);
   const [roomLimit, setRoomLimit] = useState(ROOM_PAGE);
   const [projectLimits, setProjectLimits] = useState<Record<string, number>>({});
@@ -810,35 +806,6 @@ export default function HouseSidebar({
         <div className="flex-1 min-h-0 overflow-y-auto house-thread px-2.5 pb-3.5">
           {renderBody()}
         </div>
-
-        {/* ── Workspaces trigger (bottom) ── */}
-        <div className="border-t house-hairline mt-2 px-3 py-3 shrink-0">
-          <button
-            ref={workspaceTriggerRef}
-            onClick={() => setWorkspaceModalOpen((v) => !v)}
-            aria-expanded={workspaceModalOpen}
-            aria-haspopup="dialog"
-            className={`w-full flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 border transition-colors cursor-pointer ${
-              workspaceModalOpen
-                ? 'bg-white/[0.06] border-white/[0.08] text-white'
-                : 'bg-white/[0.02] border-white/[0.05] text-zinc-400 hover:bg-white/[0.05] hover:border-white/[0.08] hover:text-zinc-200'
-            }`}
-          >
-            <span className="grid place-items-center w-7 h-7 rounded-lg bg-white/[0.04] border border-white/[0.06] shrink-0">
-              <LayoutGrid size={13} />
-            </span>
-            <span className="flex-1 text-left text-[11px] font-semibold tracking-widest uppercase">Workspaces</span>
-            <ChevronRight size={12} className={`text-zinc-500 transition-transform ${workspaceModalOpen ? 'rotate-90' : ''}`} />
-          </button>
-        </div>
-        <WorkspaceSwitcher
-          open={workspaceModalOpen && open}
-          onClose={() => setWorkspaceModalOpen(false)}
-          anchorRef={workspaceTriggerRef}
-          onLaunchPersonal={onLaunchPersonal}
-          onLaunchCoding={onLaunchCoding}
-          onLaunchHouse={onLaunchHouse}
-        />
       </aside>
     </>
   );

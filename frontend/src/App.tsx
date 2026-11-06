@@ -122,6 +122,9 @@ export default function App() {
 
   const wasRunning = useRef(false);
   const runStartTime = useRef<number | null>(null);
+  // Live mirror of the pipeline state for the background auto-updater.
+  const runningRef = useRef(false);
+  runningRef.current = isRunning;
   // Stop bookkeeping: the persist effect below runs after cancel() already
   // cleared the stream, so capture "was this a Stop" + partial thinking here.
   const cancelledRef = useRef(false);
@@ -158,8 +161,9 @@ export default function App() {
     }
 
     fetchModels().then((m) => { if (m.length) setModels(m); }).catch(() => {});
-    // Signed auto-update (Tauri only, once per day, silent when offline).
-    checkForAppUpdate(setNotification).catch(() => {});
+    // Signed auto-update (Tauri only, silent when offline). Downloads and
+    // installs in the background; relaunch is deferred while a run is live.
+    checkForAppUpdate(setNotification, { isBusy: () => runningRef.current }).catch(() => {});
     fetchWorkspaces().then(async (ws) => {
       if (ws.length === 0) return;
       let initialWs = ws.find(isProjectWorkspace) || ws.find((w) => w.isGeneral) || ws[0];

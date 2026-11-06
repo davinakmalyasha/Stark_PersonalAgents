@@ -18,6 +18,8 @@ interface Props {
    *  hamburger: search + all chats + workspaces. */
   variant?: 'full' | 'room';
   open: boolean;
+  /** Home shell: docked flex column, always laid out (no slide-over). */
+  persistent?: boolean;
   onClose: () => void;
   workspaces: WorkspaceInfo[];
   chatsByWs: Record<string, ChatSummary[]>;
@@ -105,6 +107,7 @@ function modeOf(filter: ChatsFilter): 'general' | 'coding' | 'house' {
 export default function HouseSidebar({
   variant = 'full',
   open, onClose, workspaces, chatsByWs,
+  persistent = false,
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
   onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
   onRenameChat, onDeleteChat,
@@ -701,17 +704,23 @@ export default function HouseSidebar({
 
   return (
     <>
-      {/* Backdrop */}
-      <div
-        onClick={onClose}
-        className={`fixed inset-0 z-40 bg-black/50 backdrop-blur-[2px] transition-opacity duration-300 ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
-        aria-hidden="true"
-      />
+      {/* Backdrop (slide-over only) */}
+      {!persistent && (
+        <div
+          onClick={onClose}
+          className={`fixed inset-0 z-40 bg-black/50 backdrop-blur-[2px] transition-opacity duration-300 ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+          aria-hidden="true"
+        />
+      )}
 
       {/* Panel */}
       <aside
-        className={`house-sidebar-panel fixed inset-y-0 left-0 z-50 w-[292px] bg-[#0f0f13] border-r house-hairline flex flex-col transition-transform duration-300 ease-out select-none ${
-          open ? 'translate-x-0' : '-translate-x-full'
+        className={`house-sidebar-panel flex flex-col select-none ${
+          persistent
+            ? 'relative inset-auto z-10 w-[292px] shrink-0 bg-[#0f0f13] border-r house-hairline'
+            : `fixed inset-y-0 left-0 z-50 w-[292px] bg-[#0f0f13] border-r house-hairline transition-transform duration-300 ease-out ${
+              open ? 'translate-x-0' : '-translate-x-full'
+            }`
         }`}
         aria-label="Chat management"
       >

@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { LayoutGrid, Plus } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import type { ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import CanvasAddMenu from './CanvasAddMenu';
@@ -345,7 +345,6 @@ export default function CanvasStage({
       {items.length === 0 && (
         <div className="pointer-events-none absolute left-6 top-5 w-[300px]">
           <div className="flex flex-col items-start gap-2 text-left">
-            <LayoutGrid size={22} className="text-zinc-700" />
             <p className="text-[13px] font-medium text-zinc-400">Your canvas is empty</p>
             <p className="text-[10.5px] leading-4 text-zinc-600">
               Add a chat, project, or addon, then drag the cards anywhere. Nothing appears here automatically.
@@ -354,9 +353,12 @@ export default function CanvasStage({
               type="button"
               data-canvas-ui
               onClick={() => setAddOpen(true)}
-              className="pointer-events-auto mt-1 flex h-8 items-center gap-1.5 rounded-lg bg-white px-3 text-[10.5px] font-semibold text-[#0a0a0d] hover:bg-zinc-200"
+              className="pointer-events-auto mt-1 flex items-center gap-2 text-[12.5px] font-medium text-zinc-300 hover:text-white transition-colors"
             >
-              <Plus size={12} /> Add to canvas
+              <span className="grid place-items-center w-7 h-7 rounded-full bg-white text-[#0a0a0d] hover:bg-zinc-200 transition-colors">
+                <Plus size={14} />
+              </span>
+              Add to Canvas
             </button>
           </div>
         </div>

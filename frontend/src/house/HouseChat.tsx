@@ -190,11 +190,20 @@ export default function HouseChat({
     );
   }
 
-  // Home: no card chrome — messages sit on the canvas, only the prompt dock
-  // floats. Header removed (title lives in the tab strip); width up.
+  // Home: slim card that hugs the chat — background back, but tighter than
+  // before (no header row, narrow padding). Collapse lives in a floating
+  // hover chevron, top-right of the card.
   return (
-    <div className="flex flex-col justify-end w-full max-w-[920px] mx-auto px-2 pt-2 pb-2">
-      <div className="pointer-events-auto flex flex-col min-h-0 max-h-[78vh] overflow-hidden">
+    <div className="flex flex-col justify-end w-full max-w-[880px] mx-auto px-2 pt-2 pb-2">
+      <div className="house-chat-card pointer-events-auto relative flex flex-col min-h-0 max-h-[74vh] rounded-2xl border house-hairline px-2 pt-1.5 pb-1 overflow-hidden">
+        <button
+          onClick={() => setMinimized((m) => !m)}
+          title={minimized ? 'Expand conversation' : 'Collapse conversation'}
+          aria-label={minimized ? 'Expand conversation' : 'Collapse conversation'}
+          className="absolute top-1.5 right-1.5 z-10 grid place-items-center w-7 h-7 rounded-lg text-zinc-600 opacity-0 hover:opacity-100 hover:text-white hover:bg-white/[0.08] focus-visible:opacity-100 transition-all cursor-pointer [.house-chat-card:hover_&]:opacity-100"
+        >
+          {minimized ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+        </button>
         {messagesArea}
         {notificationBar}
         {dock}

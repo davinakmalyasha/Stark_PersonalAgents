@@ -60,7 +60,7 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
 
   return (
     <header
-      className={`relative flex items-center select-none flex-shrink-0 h-[38px] bg-[#0c0c0e] border-b border-zinc-800/60 px-2 z-50 gap-2 ${dragOver ? 'bg-white/[0.04]' : ''}`}
+      className={`relative flex items-center select-none flex-shrink-0 h-[38px] bg-[#0c0c0e] border-b border-zinc-800/60 pl-2 pr-0 gap-2 z-50 ${dragOver ? 'bg-white/[0.04]' : ''}`}
       style={{ WebkitAppRegion: 'drag' } as AppRegionStyle}
       data-tauri-drag-region="deep"
       onDragOver={(e) => {

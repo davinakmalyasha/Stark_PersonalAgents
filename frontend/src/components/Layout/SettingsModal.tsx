@@ -183,8 +183,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
   if (!isOpen) return null;
 
-  const rowClass = 'flex items-start justify-between gap-3 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2';
+  const rowClass = 'flex items-start justify-between gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3.5 py-2.5';
   const labelClass = 'text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500';
+  const sectionClass = 'rounded-2xl border border-white/[0.06] bg-white/[0.015] p-3.5 space-y-2.5';
+  const sectionHeadClass = 'flex items-center gap-2';
+  const actionClass = 'flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] font-medium text-zinc-300 hover:bg-white/[0.06] disabled:opacity-50 transition-colors';
+  const primaryClass = 'flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-[11.5px] font-semibold text-[#0a0a0d] hover:bg-zinc-200 disabled:opacity-50 transition-colors';
   const valueClass = 'text-[12px] text-zinc-200 font-mono break-all';
 
   return (
@@ -218,8 +222,11 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
         </div>
 
         <div className="flex-1 min-h-0 overflow-y-auto space-y-4" style={{ padding: '18px 22px' }}>
-          <section className="space-y-2">
-            <div className={labelClass}>Install & data paths</div>
+          <section className={sectionClass}>
+            <div className={sectionHeadClass}>
+              <HardDrive size={13} className="text-zinc-500" />
+              <span className={labelClass}>Install & data paths</span>
+            </div>
             <div className={rowClass}>
               <div className="min-w-0">
                 <div className={labelClass}>App install</div>
@@ -241,7 +248,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 type="button"
                 onClick={() => void changeRoot()}
                 disabled={busy}
-                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+                className={actionClass}
               >
                 <FolderOpen size={14} /> Change…
               </button>
@@ -284,8 +291,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
           </section>
 
-          <section className="space-y-2">
-            <div className="flex items-center gap-2">
+          <section className={sectionClass}>
+            <div className={sectionHeadClass}>
               <SettingsIcon size={13} className="text-zinc-500" />
               <span className={labelClass}>Paired devices</span>
             </div>
@@ -320,8 +327,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
           </section>
 
-          <section className="space-y-2">
-            <div className="flex items-center gap-2">
+          <section className={sectionClass}>
+            <div className={sectionHeadClass}>
               <RefreshCw size={13} className="text-zinc-500" />
               <span className={labelClass}>App updates</span>
             </div>
@@ -329,22 +336,22 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
               <div className="min-w-0">
                 <div className="text-[12px] text-zinc-200 font-medium">Desktop app</div>
                 <div className="text-[10.5px] text-zinc-500 mt-0.5">
-                  Checks the signed release feed on every launch. Check now to update immediately.
+                  Checked on every launch and applied automatically. Check now to update immediately.
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => void checkUpdates()}
                 disabled={updateBusy}
-                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+                className={actionClass}
               >
                 <RefreshCw size={14} className={updateBusy ? 'animate-spin' : ''} /> Check
               </button>
             </div>
           </section>
 
-          <section className="space-y-2">
-            <div className="flex items-center gap-2">
+          <section className={sectionClass}>
+            <div className={sectionHeadClass}>
               <Download size={13} className="text-zinc-500" />
               <span className={labelClass}>Backup &amp; move</span>
             </div>
@@ -363,7 +370,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 type="button"
                 onClick={() => void runExport()}
                 disabled={backupBusy || busy}
-                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-500/90 text-[11.5px] font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
+                className={primaryClass}
               >
                 <Download size={14} /> Export
               </button>
@@ -392,15 +399,15 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 type="button"
                 onClick={() => void runBackupImport()}
                 disabled={backupBusy || busy || !backupFile}
-                className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 text-[11.5px] text-zinc-300 hover:bg-white/[0.05] disabled:opacity-50"
+                className={actionClass}
               >
                 <Upload size={14} /> Import
               </button>
             </div>
           </section>
 
-          <section className="space-y-2">
-            <div className="flex items-center gap-2">
+          <section className={sectionClass}>
+            <div className={sectionHeadClass}>
               <HardDrive size={13} className="text-zinc-500" />
               <span className={labelClass}>One-time migration</span>
               <button
@@ -435,7 +442,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   type="button"
                   onClick={() => void runImport(candidate.id)}
                   disabled={busy || (!candidate.has_chats_db && !candidate.has_sessions && !candidate.has_config)}
-                  className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-indigo-500/90 text-[11.5px] font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
+                  className={primaryClass}
                 >
                   Import
                 </button>
@@ -454,8 +461,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </button>
           </section>
 
-          {error && <div className="text-[11px] text-red-300">{error}</div>}
-          {status && <div className="text-[11px] text-emerald-300/90">{status}</div>}
+          {error && <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/[0.07] px-3 py-2 text-[11.5px] text-red-300">{error}</div>}
+          {status && <div role="status" className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-[11.5px] text-zinc-300">{status}</div>}
         </div>
       </div>
     </div>

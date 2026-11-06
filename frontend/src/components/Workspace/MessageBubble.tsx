@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, MoreHorizontal, RotateCcw, X, FolderGit2, ExternalLink } from 'lucide-react';
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import type { StreamSegment } from '../../utils/streamAccum';
@@ -211,7 +211,33 @@ function ThinkingPlaceholder() {
 }
 
 export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
-  const [rewindConfirmOpen, setRewindConfirmOpen] = useState(false);
+  const [revertMenuOpen, setRevertMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const revertMenuRef = useRef<HTMLDivElement | null>(null);
+  const copyMessage = async () => {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+  useEffect(() => {
+    if (!revertMenuOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (revertMenuRef.current && !revertMenuRef.current.contains(e.target as Node)) setRevertMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setRevertMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [revertMenuOpen]);
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
@@ -270,23 +296,48 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
         </div>
       )}
       {isUser && onRewind && (
-        <div className="message-revert-row">
-          {!rewindConfirmOpen ? (
+        <div className="flex justify-end">
+          <div className="relative" ref={revertMenuRef}>
             <button
               type="button"
-              onClick={() => setRewindConfirmOpen(true)}
-              title="Revert to before this message"
-              className="message-revert-pill"
+              onClick={() => setRevertMenuOpen((v) => !v)}
+              title="Message actions"
+              aria-label="Message actions"
+              aria-expanded={revertMenuOpen}
+              className="mt-1 grid place-items-center w-6 h-6 rounded-md text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-zinc-200 hover:bg-white/[0.07] focus-visible:opacity-100 transition-all cursor-pointer"
             >
-              <RotateCcw size={11} /> Revert message
+              <MoreHorizontal size={13} />
             </button>
-          ) : (
-            <div className="message-revert-confirm" role="group" aria-label="Confirm message revert">
-              <span>Files changed after this message will be restored and the prompt will return to the composer.</span>
-              <button type="button" onClick={() => setRewindConfirmOpen(false)}>Cancel</button>
-              <button type="button" className="is-primary" onClick={() => { setRewindConfirmOpen(false); onRewind(message); }}>Revert</button>
-            </div>
-          )}
+            {revertMenuOpen && (
+              <div
+                role="menu"
+                aria-label="Message actions"
+                className="absolute right-0 top-[calc(100%+4px)] z-30 w-56 rounded-xl border border-white/[0.09] bg-[#15151a] shadow-2xl overflow-hidden py-1"
+              >
+                <div className="px-3 py-1.5 text-[10.5px] text-zinc-500">
+                  {new Date(message.timestamp).toLocaleString()}
+                </div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { void copyMessage(); }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-zinc-300 hover:bg-white/[0.05] transition-colors cursor-pointer"
+                >
+                  {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} className="text-zinc-500" />}
+                  {copied ? 'Copied' : 'Copy message'}
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { setRevertMenuOpen(false); onRewind(message); }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-red-300 hover:bg-red-500/10 transition-colors cursor-pointer"
+                >
+                  <RotateCcw size={13} />
+                  Revert message
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

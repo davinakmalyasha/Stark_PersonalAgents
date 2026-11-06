@@ -2,6 +2,8 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Code2 } from 'lucide-react';
 import iconUrl from '../assets/stark-icon.png';
 import HouseHeader from './HouseHeader';
+import HouseRail, { type SideView } from './HouseRail';
+import HouseProjectsPanel from './HouseProjectsPanel';
 import HouseChat from './HouseChat';
 import HouseSidebar from './HouseSidebar';
 import HousePortal from './HousePortal';
@@ -28,7 +30,8 @@ const CanvasStage = lazy(() => import('../canvas/CanvasStage'));
 
 export default function House() {
   const [transitioning, setTransitioning] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sideView, setSideView] = useState<SideView>('chats');
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
@@ -128,7 +131,18 @@ export default function House() {
     }
   }, [sessions.booted, openChat]);
 
-  // Escape closes the sidebar
+  // Rail view click: switching views opens the panel; clicking the
+  // active view collapses it.
+  const handleSideView = useCallback((view: SideView) => {
+    if (view === sideView && sidebarOpen) {
+      setSidebarOpen(false);
+    } else {
+      setSideView(view);
+      setSidebarOpen(true);
+    }
+  }, [sideView, sidebarOpen]);
+
+  // Escape collapses the side panel (it stays docked, never slides away)
   useEffect(() => {
     if (!sidebarOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -425,18 +439,61 @@ export default function House() {
         onActivateTab={sessions.activateTab}
         onCloseTab={sessions.closeTab}
         onNewSession={handleNewSession}
-        onOpenSidebar={() => setSidebarOpen(true)}
-        projects={projects}
-        projectsScoped={projectsScoped}
-        onOpenProject={setOpenProjectId}
-        schedules={schedules}
-        onNewTask={() => setTaskDialogOpen(true)}
-        onCancelSchedule={handleCancelSchedule}
-        onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
       />
 
-      <main className="relative z-10 flex-1 min-h-0 flex overflow-hidden">
+      <div className="relative z-10 flex flex-1 min-h-0 overflow-hidden">
+      <HouseRail
+        view={sideView}
+        onView={handleSideView}
+        onHome={() => {
+          const chatTab = [...sessions.tabs].reverse().find((t) => t.type === 'chat');
+          if (chatTab) sessions.activateTab(chatTab.id);
+        }}
+        onNewChat={handleNewSession}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
+      />
+      {sidebarOpen && sideView === 'chats' && (
+        <HouseSidebar
+          persistent
+          open
+          onClose={() => setSidebarOpen(false)}
+          workspaces={sessions.workspaces}
+          chatsByWs={sessions.chatsByWs}
+          activeTabId={sessions.activeTabId}
+          runningTabId={sessions.runningTabId}
+          pinnedChats={sessions.pinnedChats}
+          chatsFilter={sessions.chatsFilter}
+          onFilterChange={sessions.setChatsFilter}
+          onTogglePin={sessions.togglePin}
+          onOpenSession={handleOpenSession}
+          onNewChat={handleNewSession}
+          onNewProject={() => setProjectDialogOpen(true)}
+          onNewChatInProject={handleNewChatIn}
+          onOpenRoom={handleLaunchRoom}
+          onRenameChat={handleRenameChat}
+          onDeleteChat={handleDeleteChat}
+          onLaunchPersonal={launchPersonal}
+          onLaunchCoding={launchCoding}
+          onLaunchHouse={launchHouse}
+        />
+      )}
+      {sidebarOpen && sideView === 'projects' && (
+        <div className="w-[292px] shrink-0 bg-[#0f0f13] border-r house-hairline min-h-0">
+          <HouseProjectsPanel
+            projects={projects}
+            projectsScoped={projectsScoped}
+            schedules={schedules}
+            onOpenProject={setOpenProjectId}
+            onNewProject={() => setProjectDialogOpen(true)}
+            onNewTask={() => setTaskDialogOpen(true)}
+            onCancelSchedule={handleCancelSchedule}
+            onOpenScheduledChat={(workspaceId, chatId) => sessions.openChat(workspaceId, chatId)}
+          />
+        </div>
+      )}
+      <main className="relative flex-1 min-h-0 flex overflow-hidden">
         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
         {exitingIdeTab ? (
           <>
@@ -478,29 +535,7 @@ export default function House() {
           />
         )}
       </main>
-
-      <HouseSidebar
-        open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
-        workspaces={sessions.workspaces}
-        chatsByWs={sessions.chatsByWs}
-        activeTabId={sessions.activeTabId}
-        runningTabId={sessions.runningTabId}
-        pinnedChats={sessions.pinnedChats}
-        chatsFilter={sessions.chatsFilter}
-        onFilterChange={sessions.setChatsFilter}
-        onTogglePin={sessions.togglePin}
-        onOpenSession={handleOpenSession}
-        onNewChat={handleNewSession}
-        onNewProject={() => setProjectDialogOpen(true)}
-        onNewChatInProject={handleNewChatIn}
-        onOpenRoom={handleLaunchRoom}
-        onRenameChat={handleRenameChat}
-        onDeleteChat={handleDeleteChat}
-        onLaunchPersonal={launchPersonal}
-        onLaunchCoding={launchCoding}
-        onLaunchHouse={launchHouse}
-      />
+      </div>
 
       {projectDialogOpen && (
         <NewProjectDialog

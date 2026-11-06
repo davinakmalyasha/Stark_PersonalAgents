@@ -45,14 +45,14 @@ export default function WindowControls({ className = '' }: { className?: string 
   return (
     <div
       data-tauri-window-control
-      className={`flex items-center gap-0.5 shrink-0 ${className}`}
+      className={`flex items-stretch self-stretch shrink-0 ${className}`}
       style={{ WebkitAppRegion: 'no-drag' } as AppRegionStyle}
     >
       <button
         onClick={() => run('minimize')}
         title="Minimize"
         aria-label="Minimize"
-        className="grid place-items-center w-8 h-7 rounded text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+        className="grid place-items-center w-11 self-stretch text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
       >
         <Minus size={13} />
       </button>
@@ -60,7 +60,7 @@ export default function WindowControls({ className = '' }: { className?: string 
         onClick={() => run('toggleMaximize')}
         title="Maximize"
         aria-label="Maximize"
-        className="grid place-items-center w-8 h-7 rounded text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+        className="grid place-items-center w-11 self-stretch text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
       >
         <Square size={11} />
       </button>
@@ -68,7 +68,7 @@ export default function WindowControls({ className = '' }: { className?: string 
         onClick={() => run('close')}
         title="Close"
         aria-label="Close"
-        className="grid place-items-center w-8 h-7 rounded text-zinc-500 hover:text-white hover:bg-red-500/80 transition-colors"
+        className="grid place-items-center w-11 self-stretch text-zinc-500 hover:text-white hover:bg-[#e81123] transition-colors"
       >
         <X size={13} />
       </button>

@@ -244,20 +244,58 @@ fn remove(repo_root: &Path, path: &Path, branch: &str) -> Result<(), String> {
 }
 
 pub fn reconcile(harness_root: &Path, agents: &[stark_store::AgentRecord]) -> Vec<String> {
+    gc(harness_root, agents)
+}
+
+/// Remove settled worktrees and orphan directories left behind by older
+/// runs. Active worktrees are never deleted; orphan directories must be at
+/// least seven days old, so an in-flight spawn is never swept.
+pub fn gc(harness_root: &Path, agents: &[stark_store::AgentRecord]) -> Vec<String> {
     let mut notes = Vec::new();
+    let mut keep = std::collections::HashSet::new();
     for agent in agents {
-        if agent.worktree_path.trim().is_empty()
-            || agent.worktree_state == "merged"
-            || agent.worktree_state == "discarded"
-        {
+        if agent.worktree_path.trim().is_empty() {
             continue;
         }
         let path = PathBuf::from(&agent.worktree_path);
-        if !path.exists() && agent.worktree_state == "active" {
-            notes.push(format!("{}: worktree missing", agent.id));
+        if matches!(agent.worktree_state.as_str(), "merged" | "discarded") {
+            if path.exists() {
+                let repo = PathBuf::from(&agent.repo_root);
+                if remove(&repo, &path, &agent.worktree_branch).is_ok() {
+                    notes.push(format!("{}: removed settled worktree", agent.id));
+                }
+            }
+            continue;
+        }
+        if agent.worktree_state == "active" {
+            if path.exists() {
+                keep.insert(path);
+            } else {
+                notes.push(format!("{}: worktree missing", agent.id));
+            }
         }
     }
-    let _ = harness_root;
+
+    let root = harness_root.join(".deep_agents").join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return notes;
+    };
+    let max_age = Duration::from_secs(7 * 24 * 3600);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.contains(&path) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if old && std::fs::remove_dir_all(&path).is_ok() {
+            notes.push(format!("{}: removed orphan worktree", path.display()));
+        }
+    }
     notes
 }
 
@@ -294,6 +332,57 @@ mod tests {
         merge(&info).unwrap();
         assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "two");
         assert!(!info.path.exists());
+    }
+
+    #[test]
+    fn gc_removes_settled_worktrees() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git(&repo, &["init", "-q"]).is_ok());
+        assert!(git(&repo, &["config", "user.name", "Test"]).is_ok());
+        assert!(git(&repo, &["config", "user.email", "test@test"]).is_ok());
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        assert!(git(&repo, &["add", "-A"]).is_ok());
+        assert!(git(&repo, &["commit", "-qm", "init"]).is_ok());
+
+        let harness = dir.path().join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        let info = create(&harness, &repo, "agent-gc123456").expect("create worktree");
+        let agent = stark_store::AgentRecord {
+            id: "agent-gc".to_string(),
+            kind: "workspace".to_string(),
+            path: "workspace:test".to_string(),
+            parent_id: None,
+            chat_id: "chat".to_string(),
+            workspace_id: "ws".to_string(),
+            scope: "developer".to_string(),
+            role: "Developer".to_string(),
+            nickname: "gc".to_string(),
+            status: "done".to_string(),
+            model: "model".to_string(),
+            depth: 1,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_active: None,
+            result: String::new(),
+            usage: json!({}),
+            access: "worktree".to_string(),
+            repo_root: info.repo_root.to_string_lossy().to_string(),
+            workspace_subdir: String::new(),
+            worktree_path: info.path.to_string_lossy().to_string(),
+            worktree_branch: info.branch.clone(),
+            worktree_base: info.base.clone(),
+            worktree_state: "discarded".to_string(),
+            worktree_diff: json!({}),
+            worktree_error: String::new(),
+        };
+        let notes = gc(&harness, &[agent]);
+        assert!(!info.path.exists(), "{notes:?}");
+        assert!(!notes.is_empty());
     }
 
     #[test]

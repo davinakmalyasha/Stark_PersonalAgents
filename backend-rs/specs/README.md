@@ -1,18 +1,22 @@
-# Tool contract v3 (Developer Pi-simplified)
+# Tool contract v4 (Codex-aligned agent surfaces)
 
 `tool-specs.json` is the single model-facing tool contract for the Rust server.
 It now contains two surfaces:
 
-- **v1 tools** — legacy Stark tools still used by General, House, DFD, UI,
-  DevOps, Explore, and Orchestrator.
-- **Developer tools** — the 18-tool Pi-simplified surface derived from DeepSeek
-  Harness `standard` and Codex multi-agent v2.
+- **Workspace tools** — the v2 surface used by Developer, Coder, General, House,
+  DFD, UI, DevOps, and Explore.
+- **Orchestrator tools** — read-only `bash` plus `memory`, delegation, and coordination.
+
+Legacy names (`read_file`, `edit_file`, `search_code`, `run_command`,
+`call_subagent`, `ask_user`, `todo_write`) and the removed `write` tool are
+not in the contract or any `scope_map`. A dispatch denylist remains for old
+transcripts.
 
 ## Developer sources
 
 | Source | Pin | Used for |
 |---|---|---|
-| `deepseek-ai/deepseek-harness` | `f3803c9` (0.2.2-alpha.2, 2026-10-27) | `bash`, `job`, `read`, `write`, `edit`, `glob`, `grep`, `todo_write`, `ask_user_question`, `skill`, `web_search`, `web_fetch` |
+| `deepseek-ai/deepseek-harness` | `f3803c9` (0.2.2-alpha.2, 2026-10-27) | `bash`, `job`, `read`, `apply_patch`, `edit`, `glob`, `grep`, `update_plan`, `ask_user_question`, `skill`, `web_search`, `web_fetch` |
 | `openai/codex` | `79be2e2` (2026-10-29) | `spawn_agent`, `message_agent`, `wait_agent`, `list_agents`, `interrupt_agent`, `close_agent` |
 
 Pi simplifications on top of the sources (documented, not byte-identical):
@@ -34,18 +38,18 @@ Other deviations (unchanged):
 - Stark's `memory` tool, worktree isolation, and merge/discard tools are
   removed from the Developer surface.
 
-## Developer manifest (18)
+## Developer manifest (17)
 
 ```
 bash, job,
-read, write, edit, glob, grep,
-todo_write, ask_user_question,
+read, apply_patch, edit, glob, grep,
+update_plan, ask_user_question,
 skill, web_search, web_fetch,
 spawn_agent, message_agent, wait_agent,
-list_agents, interrupt_agent, close_agent
+interrupt_agent, close_agent
 ```
 
-`run_code` is not part of the default Developer surface. DeepSeek Harness keeps
+``run_code` is not part of the default Developer surface; `tool_search` is General-only and Developer delegates MCP work. DeepSeek Harness keeps
 PTC/code mode in a separate preset.
 
 ## Editing

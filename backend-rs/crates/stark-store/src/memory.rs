@@ -523,6 +523,8 @@ impl MemoryStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        // Bounded long-term memory: keep the newest/pinned 2,000 entries.
+        let _ = self.prune(workspace_id, 2_000).await;
         self.rebuild_files(workspace_id).await?;
         Ok(())
     }
@@ -627,6 +629,8 @@ impl MemoryStore {
         .fetch_one(&self.pool)
         .await?;
         self.rebuild_files(workspace_id).await?;
+        // Every tier (user/project/session) is bounded, not just consolidation.
+        let _ = self.prune(workspace_id, 2_000).await;
         Ok(id)
     }
 
@@ -637,7 +641,7 @@ impl MemoryStore {
     ) -> Result<Vec<MemoryEntry>, StoreError> {
         let rows = if let Some(topic) = topic {
             sqlx::query(
-                "SELECT * FROM memory_entries WHERE workspace_id = ? AND topic = ? ORDER BY pinned DESC, created_at DESC",
+                "SELECT * FROM memory_entries WHERE workspace_id = ? AND topic = ? ORDER BY pinned DESC, created_at DESC LIMIT 5000",
             )
             .bind(workspace_id)
             .bind(normalize_topic(topic))
@@ -645,7 +649,7 @@ impl MemoryStore {
             .await?
         } else {
             sqlx::query(
-                "SELECT * FROM memory_entries WHERE workspace_id = ? ORDER BY pinned DESC, created_at DESC",
+                "SELECT * FROM memory_entries WHERE workspace_id = ? ORDER BY pinned DESC, created_at DESC LIMIT 5000",
             )
             .bind(workspace_id)
             .fetch_all(&self.pool)
@@ -677,6 +681,30 @@ impl MemoryStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(row_entry).collect())
+    }
+
+    /// Bounded memory: keep the newest/pinned `keep` entries and delete older
+    /// unpinned rows. Called after consolidation so a long-lived workspace
+    /// does not grow forever.
+    pub async fn prune(&self, workspace_id: &str, keep: usize) -> Result<u64, StoreError> {
+        let keep = keep.clamp(50, 10_000) as i64;
+        let result = sqlx::query(
+            r#"
+            DELETE FROM memory_entries
+            WHERE workspace_id = ? AND pinned = 0 AND id NOT IN (
+                SELECT id FROM memory_entries
+                WHERE workspace_id = ?
+                ORDER BY pinned DESC, created_at DESC
+                LIMIT ?
+            )
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(workspace_id)
+        .bind(keep)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn forget_entry(
@@ -1033,10 +1061,11 @@ fn render_index(workspace_id: &str, entries: &[MemoryEntry], max_chars: usize) -
         .map(|(topic, count)| format!("{topic} ({count})"))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut text = format!(
-        "# Workspace Memory\n\nWorkspace: {workspace_id}\nUpdated: {}\n",
-        now()
-    );
+    // Date precision only: a millisecond timestamp here changes every rebuild
+    // and defeats provider prefix caching for the whole system prompt.
+    let updated = now();
+    let updated = updated.get(..10).unwrap_or(&updated);
+    let mut text = format!("# Workspace Memory\n\nWorkspace: {workspace_id}\nUpdated: {updated}\n");
     if !topic_line.is_empty() {
         text.push_str(&format!("Topics: {topic_line}\n"));
     }

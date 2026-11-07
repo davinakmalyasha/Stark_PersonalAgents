@@ -18,15 +18,9 @@ impl ApprovalCache {
         if tokens.is_empty() {
             return false;
         }
-        let approved = self.approved.lock().unwrap();
-        approved.iter().any(|prefix| {
-            !prefix.is_empty()
-                && prefix.len() <= tokens.len()
-                && prefix
-                    .iter()
-                    .zip(tokens.iter())
-                    .all(|(left, right)| left == right)
-        })
+        // Exact token sequence only. A short prefix like `git` must never
+        // authorize `git status; rm -rf /` or a different subcommand.
+        self.approved.lock().unwrap().contains(&tokens)
     }
 
     pub fn approve(&self, prefix: &[String]) {
@@ -51,11 +45,13 @@ impl ApprovalCache {
 }
 
 fn tokens(command: &str) -> Vec<String> {
-    command
-        .split_whitespace()
-        .map(|token| token.trim_matches(['"', '\'']).to_string())
-        .filter(|token| !token.is_empty())
-        .collect()
+    shlex::split(command).unwrap_or_else(|| {
+        command
+            .split_whitespace()
+            .map(|token| token.trim_matches(['"', '\'']).to_string())
+            .filter(|token| !token.is_empty())
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -63,11 +59,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caches_prefixes() {
+    fn caches_exact_commands_only() {
         let cache = ApprovalCache::new();
         assert!(!cache.is_approved("git push origin main"));
-        cache.approve(&["git".into(), "push".into()]);
+        cache.approve(&["git".into(), "push".into(), "origin".into(), "main".into()]);
         assert!(cache.is_approved("git push origin main"));
         assert!(!cache.is_approved("git status"));
+        // A short prefix must never authorize a chained command.
+        cache.approve(&["git".into()]);
+        assert!(!cache.is_approved("git status; rm -rf /"));
     }
 }

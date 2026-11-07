@@ -31,6 +31,7 @@ mod notes;
 mod prompt;
 mod rollout_trace;
 mod schedules;
+mod status_budget;
 mod workspace_state;
 mod workspaces;
 pub mod worktree;
@@ -43,7 +44,8 @@ pub type JobDoneHook = Arc<dyn Fn(String) + Send + Sync>;
 const HISTORY_LIMIT: usize = 200;
 const REPEAT_READ_LIMIT: usize = 4;
 const REPEAT_WRITE_LIMIT: usize = 5;
-const MAX_CONSECUTIVE_ERRORS: usize = 12;
+const MAX_CONSECUTIVE_ERRORS: usize = 24;
+const ERROR_NUDGE_INTERVAL: usize = 6;
 
 static AGENT_CANCELS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
 
@@ -286,6 +288,7 @@ fn is_internal_delegation_result(prompt: &str) -> bool {
 }
 
 async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError> {
+    crate::status_budget::begin_turn(&ctx.chat_id);
     let history = ctx
         .store
         .history(&ctx.chat_id, HISTORY_LIMIT)
@@ -437,6 +440,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             mode: &mode,
             depth: ctx.depth,
             code_mode: ctx.scope == "coder",
+            access: ctx.file_access.as_str(),
             skills: ctx
                 .config
                 .as_ref()
@@ -463,7 +467,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             });
         let mut prompt = format!(
             "{preamble} Use the provided tools to inspect and change files. Read before editing. \
-             Never invent tool results. Keep the final answer concise.\n\n{}",
+             Never invent tool results. Persist until the task is resolved: if a tool fails, read \
+             the error, fix the arguments or try an alternative tool, and continue. Keep the final answer concise.\n\n{}",
             workspace_state::render(ctx.store.harness_root(), &ctx.workspace_id, &ctx.workspace)
         );
         prompt.push('\n');
@@ -471,7 +476,8 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         if ctx.file_access.is_read_only() {
             prompt.push_str(
                 " You are READ-ONLY in this task. Do not edit files, run mutating commands, or call write tools. \
-                 Inspect with read_file/search_code/memory and report findings or a proposed patch.",
+                 Inspect with the read-only tools available to your scope (read/grep/glob, read-only bash, files_changed) and memory. \
+                 If the task needs writes, delegate it to a workspace agent instead of doing it yourself.",
             );
         }
         if let Some(instructions) = instructions::load(ctx.store.harness_root(), &ctx.workspace) {
@@ -517,9 +523,10 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
     } else {
         messages.extend(session_messages(&session_entries));
     }
-    if ctx.scope != "developer"
-        && ctx.scope != "coder"
-        && let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
+    // Codex parity: every executing scope, including Developer/Coder, sees the
+    // current plan progress. Excluding them let the two main coding agents
+    // drift from the plan they were asked to maintain.
+    if let Ok(block) = plan_store.progress_block(&ctx.chat_id, &ctx.scope).await
         && !block.is_empty()
     {
         messages.push(ChatMessage::user(block));
@@ -1073,12 +1080,17 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 .await;
             }
             if ctx.depth <= 1
-                && ctx.scope != "developer"
                 && stark_store::memory_enabled()
                 && let Ok(memory) = stark_store::MemoryStore::open(ctx.store.harness_root()).await
             {
                 let _ = memory
-                    .record(&ctx.workspace_id, &ctx.chat_id, None, &prompt, &final_text)
+                    .record(
+                        &ctx.workspace_id,
+                        &ctx.chat_id,
+                        Some(&ctx.scope),
+                        &prompt,
+                        &final_text,
+                    )
                     .await;
                 // Distillation/consolidation is background work. The
                 // deterministic stage-1 record above is the durable capture;
@@ -1130,28 +1142,36 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         {
             rollout_trace::record_reasoning(&ctx.store, writer, &ctx.chat_id, &reasoning).await;
         }
-        if !assistant_text.is_empty() {
-            messages.push(ChatMessage::assistant(&assistant_text));
-            if let Some(writer) = rollout.as_mut() {
-                rollout_trace::record_assistant(
-                    &ctx.store,
-                    writer,
-                    &ctx.chat_id,
-                    &assistant_text,
-                    &ctx.model,
-                    finish_reason.clone(),
-                )
-                .await;
-            }
+        if !assistant_text.is_empty()
+            && let Some(writer) = rollout.as_mut()
+        {
+            rollout_trace::record_assistant(
+                &ctx.store,
+                writer,
+                &ctx.chat_id,
+                &assistant_text,
+                &ctx.model,
+                finish_reason.clone(),
+            )
+            .await;
         }
-        messages.push(ChatMessage::assistant_tool_calls(
-            if assistant_text.is_empty() {
-                None
-            } else {
-                Some(assistant_text.clone())
-            },
-            tool_calls.clone(),
-        ));
+        if tool_calls.is_empty() {
+            if !assistant_text.is_empty() {
+                messages.push(ChatMessage::assistant(&assistant_text));
+            }
+        } else {
+            // One assistant message carries both the text and the calls.
+            // Pushing a separate text message here duplicated every
+            // tool-using turn in the live and replayed history.
+            messages.push(ChatMessage::assistant_tool_calls(
+                if assistant_text.is_empty() {
+                    None
+                } else {
+                    Some(assistant_text.clone())
+                },
+                tool_calls.clone(),
+            ));
+        }
         for call in &tool_calls {
             if let Some(writer) = rollout.as_mut() {
                 rollout_trace::record_function_call(
@@ -1239,9 +1259,11 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         // order, so parallel edits cannot race. Shell, subagents, groups and
         // long-running work stay sequential.
         let parallel_batch = tool_calls.len() > 1
-            && tool_calls
-                .iter()
-                .all(|call| parallel_safe(&call.function.name));
+            && tool_calls.iter().all(|call| {
+                let args: Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
+                call_supports_parallel(&call.function.name, &args)
+            });
         let mut precomputed: Vec<Option<ToolOutcome>> =
             (0..tool_calls.len()).map(|_| None).collect();
         if parallel_batch {
@@ -1503,6 +1525,13 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             } else {
                 consecutive_errors = 0;
             }
+            if consecutive_errors > 0 && consecutive_errors % ERROR_NUDGE_INTERVAL == 0 {
+                messages.push(ChatMessage::user(format!(
+                    "[RETRY GUIDANCE] {consecutive_errors} consecutive tool errors. Do not repeat the same call. \
+                     Read the exact error, fix the arguments, or switch to an alternative tool (read/grep/glob, \
+                     bash vs job, tool_search for MCP). If the blocker is user-owned, ask once; otherwise continue."
+                )));
+            }
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                 let message =
                     format!("Run stopped: {MAX_CONSECUTIVE_ERRORS} consecutive tool errors.");
@@ -1579,8 +1608,6 @@ fn parallel_safe(name: &str) -> bool {
         name,
         "read"
             | "read_file"
-            | "write"
-            | "write_file"
             | "edit"
             | "edit_file"
             | "glob"
@@ -1595,12 +1622,31 @@ fn parallel_safe(name: &str) -> bool {
     )
 }
 
+/// Codex parity: shell calls participate in a parallel batch only when the
+/// command is on the strict safe-command allowlist. A mutating command keeps
+/// the whole batch sequential.
+fn call_supports_parallel(name: &str, args: &Value) -> bool {
+    if name == "bash" {
+        let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+        let background = args
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let process_action = args
+            .get("process_action")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        return !background && !process_action && stark_policy::is_read_only_command(command);
+    }
+    parallel_safe(name)
+}
+
 /// Serialization key for the parallel batch: file tools share a key per path,
 /// everything else is independent.
 fn resource_key(name: &str, args: &Value, index: usize) -> String {
     if matches!(
         name,
-        "read" | "read_file" | "write" | "write_file" | "edit" | "edit_file" | "read_pdf"
+        "read" | "read_file" | "edit" | "edit_file" | "read_pdf"
     ) && let Some(path) = args
         .get("file_path")
         .or_else(|| args.get("path"))
@@ -2493,7 +2539,7 @@ mod tests {
         let turn = counter.fetch_add(1, Ordering::SeqCst);
         let payload = if turn == 0 {
             vec![
-                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":"{\"file_path\":\"big.txt\",\"content\":\"partial"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\n*** Add File: big.txt\n+partial"}}]},"finish_reason":null}]}),
                 json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
             ]
         } else {
@@ -2681,6 +2727,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_safe_bash_is_parallel_but_mutating_bash_is_not() {
+        assert!(call_supports_parallel(
+            "bash",
+            &json!({"command": "ls -la", "description": "list"})
+        ));
+        assert!(call_supports_parallel(
+            "bash",
+            &json!({"command": "git status --short", "description": "status"})
+        ));
+        assert!(!call_supports_parallel(
+            "bash",
+            &json!({"command": "rm -rf build", "description": "remove"})
+        ));
+        assert!(!call_supports_parallel(
+            "bash",
+            &json!({
+                "command": "ls",
+                "description": "background",
+                "run_in_background": true
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn parallel_reads_preserve_call_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2758,12 +2828,29 @@ mod tests {
         Json(_body): Json<Value>,
     ) -> Response {
         let turn = counter.fetch_add(1, Ordering::SeqCst);
+        let p1 = json!({"input": "*** Begin Patch
+*** Add File: a.txt
++one
+*** End Patch"})
+        .to_string();
+        let p2 = json!({"input": "*** Begin Patch
+*** Add File: b.txt
++two
+*** End Patch"})
+        .to_string();
+        let p3 = json!({"input": "*** Begin Patch
+*** Update File: a.txt
+@@
+-one
++three
+*** End Patch"})
+        .to_string();
         let payload = if turn == 0 {
             vec![
                 json!({"choices":[{"delta":{"tool_calls":[
-                    {"index":0,"id":"w1","function":{"name":"write","arguments":"{\"file_path\":\"a.txt\",\"content\":\"one\"}"}},
-                    {"index":1,"id":"w2","function":{"name":"write","arguments":"{\"file_path\":\"b.txt\",\"content\":\"two\"}"}},
-                    {"index":2,"id":"w3","function":{"name":"write","arguments":"{\"file_path\":\"a.txt\",\"content\":\"three\"}"}}
+                    {"index":0,"id":"w1","function":{"name":"apply_patch","arguments":p1}},
+                    {"index":1,"id":"w2","function":{"name":"apply_patch","arguments":p2}},
+                    {"index":2,"id":"w3","function":{"name":"apply_patch","arguments":p3}}
                 ]},"finish_reason":null}]}),
                 json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
             ]
@@ -2785,7 +2872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_writes_serialize_same_path() {
+    async fn patch_writes_serialize_same_path() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -2836,11 +2923,13 @@ mod tests {
         // so the last one wins instead of racing.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "three"
+            "three
+"
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
-            "two"
+            "two
+"
         );
     }
 

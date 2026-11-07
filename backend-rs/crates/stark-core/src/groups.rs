@@ -9,18 +9,25 @@ fn store() -> GroupStore {
 }
 
 pub(crate) async fn create_group(ctx: &RunContext, args: &Value) -> ToolOutcome {
-    match store().create(args, &ctx.workspace_id).await {
+    match store()
+        .create_with_origin(args, &ctx.workspace_id, &ctx.chat_id)
+        .await
+    {
         Ok(detail) => ToolOutcome::ok(format!(
-            "[OK] Group project '{}' created at {}.\nUse group_board(project_id=\"{}\") to follow progress.",
+            "[OK] Group project '{}' created at {}.\nGroup progress is event-driven; call group_board once when the user asks for status.",
             detail["id"].as_str().unwrap_or(""),
-            detail["path"].as_str().unwrap_or(""),
-            detail["id"].as_str().unwrap_or("")
+            detail["path"].as_str().unwrap_or("")
         )),
         Err(error) => ToolOutcome::err(format!("[ERR] create_group failed: {error}")),
     }
 }
 
 pub(crate) async fn group_board(_ctx: &RunContext, args: &Value) -> ToolOutcome {
+    if !crate::status_budget::allow(&_ctx.chat_id, crate::status_budget::StatusKind::Group) {
+        return ToolOutcome::err(
+            "[STATUS ALREADY CHECKED] Group progress is event-driven. Wait for the next [GROUP RESULT] or answer with the last known state. Do not poll.",
+        );
+    }
     let Some(project_id) = args.get("project_id").and_then(Value::as_str) else {
         return ToolOutcome::err("[ERR] group_board requires project_id");
     };
@@ -31,6 +38,11 @@ pub(crate) async fn group_board(_ctx: &RunContext, args: &Value) -> ToolOutcome 
 }
 
 pub(crate) async fn group_item_detail(_ctx: &RunContext, args: &Value) -> ToolOutcome {
+    if !crate::status_budget::allow(&_ctx.chat_id, crate::status_budget::StatusKind::Group) {
+        return ToolOutcome::err(
+            "[STATUS ALREADY CHECKED] Group progress is event-driven. Wait for the next [GROUP RESULT] or answer with the last known state. Do not poll.",
+        );
+    }
     let Some(project_id) = args.get("project_id").and_then(Value::as_str) else {
         return ToolOutcome::err("[ERR] group_item_detail requires project_id");
     };
@@ -46,6 +58,11 @@ pub(crate) async fn group_item_detail(_ctx: &RunContext, args: &Value) -> ToolOu
 }
 
 pub(crate) async fn group_events(_ctx: &RunContext, args: &Value) -> ToolOutcome {
+    if !crate::status_budget::allow(&_ctx.chat_id, crate::status_budget::StatusKind::Group) {
+        return ToolOutcome::err(
+            "[STATUS ALREADY CHECKED] Group progress is event-driven. Wait for the next [GROUP RESULT] or answer with the last known state. Do not poll.",
+        );
+    }
     let Some(project_id) = args.get("project_id").and_then(Value::as_str) else {
         return ToolOutcome::err("[ERR] group_events requires project_id");
     };

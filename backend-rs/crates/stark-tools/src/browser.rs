@@ -9,7 +9,7 @@ use crate::{ToolContext, ToolOutcome};
 const MAX_SNAPSHOT_CHARS: usize = 24_000;
 const DEFAULT_WAIT_MS: u64 = 5_000;
 
-pub async fn browser_act(_ctx: &ToolContext, args: &Value) -> ToolOutcome {
+pub async fn browser_act(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let action = args
         .get("action")
         .and_then(Value::as_str)
@@ -41,7 +41,7 @@ pub async fn browser_act(_ctx: &ToolContext, args: &Value) -> ToolOutcome {
         }
         "press" => command(&["press", required(args, "key")], Duration::from_secs(15)).await,
         "extract" => extract(args).await,
-        "screenshot" => screenshot(args).await,
+        "screenshot" => screenshot(ctx, args).await,
         "close" => {
             let _ = raw_command(&["close", "--all"], Duration::from_secs(10)).await;
             ToolOutcome::ok("Browser closed.")
@@ -54,11 +54,17 @@ pub async fn browser_act(_ctx: &ToolContext, args: &Value) -> ToolOutcome {
 
 async fn navigate(args: &Value) -> ToolOutcome {
     let url = required(args, "url");
+    if url.trim().is_empty() {
+        return ToolOutcome::err("Error: browser_act navigate requires url");
+    }
     let url = if url.starts_with("http://") || url.starts_with("https://") {
         url.to_string()
     } else {
         format!("https://{url}")
     };
+    if let Err(error) = crate::ds_web::validate_public_url(&url).await {
+        return ToolOutcome::err(format!("Error: {error}"));
+    }
     let open = raw_command(&["open", &url], Duration::from_secs(30)).await;
     if open.starts_with('(') {
         return ToolOutcome::ok(open);
@@ -114,21 +120,26 @@ async fn extract(args: &Value) -> ToolOutcome {
     command(&["get", &what, selector], Duration::from_secs(15)).await
 }
 
-async fn screenshot(args: &Value) -> ToolOutcome {
-    let path = args
+async fn screenshot(ctx: &ToolContext, args: &Value) -> ToolOutcome {
+    let requested = args
         .get("path")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let directory = std::env::temp_dir().join("agent-screenshots");
-            let _ = std::fs::create_dir_all(&directory);
-            directory.join(format!(
-                "screenshot_{}.png",
-                &uuid::Uuid::new_v4().simple().to_string()[..8]
-            ))
-        });
+        .filter(|path| !path.is_empty());
+    let path = if let Some(raw) = requested {
+        if ctx.access == "read" {
+            // Screenshots are harness artifacts, never workspace writes, for
+            // a read-only agent. Ignore a model-supplied path and use scratch.
+            scratch_screenshot(ctx)
+        } else {
+            match crate::paths::resolve_workspace_path(&ctx.workspace, raw) {
+                Ok(path) => path,
+                Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+            }
+        }
+    } else {
+        scratch_screenshot(ctx)
+    };
     let path_text = path.to_string_lossy().to_string();
     let result = raw_command(
         &["screenshot", "--full", &path_text],
@@ -141,6 +152,15 @@ async fn screenshot(args: &Value) -> ToolOutcome {
     } else {
         ToolOutcome::ok(format!("(screenshot result: {result})"))
     }
+}
+
+fn scratch_screenshot(ctx: &ToolContext) -> PathBuf {
+    let directory = ctx.harness_root.join(".deep_agents").join("scratch");
+    let _ = std::fs::create_dir_all(&directory);
+    directory.join(format!(
+        "screenshot_{}.png",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ))
 }
 
 async fn command(args: &[&str], timeout: Duration) -> ToolOutcome {
@@ -201,6 +221,24 @@ mod tests {
         let outcome = browser_act(&ctx, &serde_json::json!({"action": "dance"})).await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("unknown browser_act action"));
+    }
+
+    #[tokio::test]
+    async fn navigate_rejects_private_destinations_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path(), "chat", Arc::new(QuestionBroker::new()));
+        let outcome = browser_act(
+            &ctx,
+            &serde_json::json!({"action": "navigate", "url": "http://127.0.0.1:8080"}),
+        )
+        .await;
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("blocked private destination")
+                || outcome.content.contains("localhost"),
+            "{}",
+            outcome.content
+        );
     }
 
     #[test]

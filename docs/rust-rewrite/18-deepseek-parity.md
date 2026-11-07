@@ -25,7 +25,7 @@ prompt cache.
 | Group | Tools |
 |---|---|
 | Shell + jobs | `bash`, `job` |
-| Files | `read` (text + images), `write`, `edit` |
+| Files | `read` (text + images), `apply_patch`, `edit` |
 | Discovery | `glob`, `grep` |
 | Session | `todo_write`, `ask_user_question` |
 | Knowledge | `skill`, `web_search`, `web_fetch` |
@@ -78,7 +78,7 @@ prefix. The date is day-precision so it does not break the cache every turn.
 
 - `read` is 1-based, line-numbered, marks the file observed, and returns inline
   image parts for PNG/JPEG/WebP/GIF.
-- `write`/`edit` require a prior `read` for an existing file.
+- `apply_patch`/`edit` mutate files; `edit` requires a prior `read` for an existing file.
 - `edit` supports literal unique replacement and `replace_all`.
 - `glob` returns up to 100 files in mtime order; `grep` returns up to 250
   matches. Larger results are written to `.deep_agents/scratch/`.

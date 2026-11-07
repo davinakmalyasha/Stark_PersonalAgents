@@ -31,6 +31,13 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
             "<conversation-checkpoint>\n{}\n</conversation-checkpoint>",
             payload.summary
         )));
+        // Keep the verbatim tail that compaction captured. Without this the
+        // model loses the most recent tool results after a restart.
+        for entry in &payload.retained_tail {
+            if let Some(message) = entry_message(entry) {
+                messages.push(message);
+            }
+        }
         start = index + 1;
     } else if let Some(index) = lines
         .iter()
@@ -82,18 +89,80 @@ pub fn messages_from_rollout(lines: &[RolloutLine]) -> Vec<ChatMessage> {
             | RolloutItem::Compacted { .. } => {}
         }
     }
-    // Drop trailing tool calls with no matching output (crash mid-tool).
-    // Sending an unanswered call would make the provider reject the history;
-    // the next turn re-issues the work instead. The file itself is unchanged.
-    while messages.last().is_some_and(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty())
-    }) {
-        messages.pop();
+    // A crash can leave tool calls without outputs. Do not silently delete
+    // the turn: synthesize an explicit retry result for each missing call so
+    // the provider accepts the history and the model knows to re-issue the
+    // work. This is the Codex-style resumable turn.
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect();
+    let mut missing = Vec::new();
+    for message in &messages {
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if !answered.contains(&call.id) && !missing.contains(&call.id) {
+                    missing.push(call.id.clone());
+                }
+            }
+        }
+    }
+    for call_id in missing {
+        messages.push(ChatMessage::tool(
+            &call_id,
+            "[harness] This tool call was interrupted before it produced output. Re-issue it if it is still needed.",
+        ));
     }
     messages
+}
+
+fn entry_message(entry: &Value) -> Option<ChatMessage> {
+    let role = entry.get("role")?.as_str()?;
+    match role {
+        "toolResult" | "tool" => {
+            let call_id = entry.get("tool_call_id")?.as_str()?;
+            let content = entry
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(ChatMessage::tool(call_id, content))
+        }
+        "assistant" => {
+            let content = content_text(entry.get("content").unwrap_or(&Value::Null));
+            let mut calls = Vec::new();
+            if let Some(blocks) = entry.get("content").and_then(Value::as_array) {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("toolCall")
+                        && let (Some(id), Some(name)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("name").and_then(Value::as_str),
+                        )
+                    {
+                        calls.push(stark_providers::ToolCall::function(
+                            id,
+                            name,
+                            block
+                                .get("arguments")
+                                .map(Value::to_string)
+                                .unwrap_or_else(|| "{}".to_string()),
+                        ));
+                    }
+                }
+            }
+            if calls.is_empty() {
+                (!content.trim().is_empty()).then(|| ChatMessage::assistant(content))
+            } else {
+                Some(ChatMessage::assistant_tool_calls(
+                    (!content.trim().is_empty()).then_some(content),
+                    calls,
+                ))
+            }
+        }
+        "user" => Some(ChatMessage::user(content_text(
+            entry.get("content").unwrap_or(&Value::Null),
+        ))),
+        _ => None,
+    }
 }
 
 fn content_text(content: &Value) -> String {
@@ -453,18 +522,6 @@ pub async fn record_turn_aborted(
     .await;
 }
 
-/// Legacy wrapper removed: call `record_turn_started`, `record_turn_complete`,
-/// or `record_turn_aborted` directly so the turn lifecycle is explicit.
-/// Resume helper: the rollout file is never mutated here. Dangling tool
-/// calls are dropped on read by `messages_from_rollout`, so the next turn
-/// simply re-issues the work. Kept for call-site compatibility.
-pub async fn ensure_resumable(
-    _store: &stark_store::ChatStore,
-    _harness_root: &std::path::Path,
-    _chat_id: &str,
-) {
-}
-
 /// Metadata stored on the `chats.db` projection so reloads show the trace.
 pub fn projection_metadata(thinking: &str, segments: &[Value], stopped: bool) -> Value {
     let mut metadata = json!({});
@@ -595,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn dangling_tool_call_is_dropped_on_resume() {
+    fn dangling_tool_call_is_resumable() {
         let call = RolloutLine {
             timestamp: "t0".to_string(),
             ordinal: Some(0),
@@ -646,10 +703,18 @@ mod tests {
             },
         };
         let messages = messages_from_rollout(&[call.clone(), output.clone(), dangling]);
-        assert!(!messages.iter().any(|m| {
+        // The call is preserved and a synthetic result is attached so the
+        // provider accepts the history and the model can re-issue the work.
+        assert!(messages.iter().any(|m| {
             m.tool_calls
                 .as_ref()
                 .is_some_and(|calls| calls.iter().any(|c| c.id == "call-2"))
+        }));
+        assert!(messages.iter().any(|m| {
+            m.tool_call_id.as_deref() == Some("call-2")
+                && m.content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("interrupted"))
         }));
     }
 }

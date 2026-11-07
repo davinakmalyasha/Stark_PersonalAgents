@@ -575,6 +575,66 @@ pub struct Completion {
 pub struct Provider {
     client: reqwest::Client,
     config: ProviderConfig,
+    /// Optional second provider used when the primary handshake fails or its
+    /// circuit is open. The fallback keeps its own base URL, key, and model.
+    fallback: Option<ProviderConfig>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CircuitState {
+    failures: u32,
+    opened_at: Option<std::time::Instant>,
+}
+
+static CIRCUITS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, CircuitState>>,
+> = std::sync::OnceLock::new();
+const CIRCUIT_THRESHOLD: u32 = 3;
+const CIRCUIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn circuits() -> &'static std::sync::Mutex<std::collections::HashMap<String, CircuitState>> {
+    CIRCUITS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn circuit_key(config: &ProviderConfig) -> String {
+    format!("{}|{}|{}", config.mode, config.base_url, config.model)
+}
+
+fn circuit_open(key: &str) -> bool {
+    let Ok(mut circuits) = circuits().lock() else {
+        return false;
+    };
+    let Some(state) = circuits.get_mut(key) else {
+        return false;
+    };
+    if let Some(opened) = state.opened_at {
+        if opened.elapsed() < CIRCUIT_COOLDOWN {
+            return true;
+        }
+        // Half-open: allow one probe after the cooldown.
+        state.opened_at = None;
+        state.failures = 0;
+    }
+    false
+}
+
+fn record_failure(key: &str) {
+    if let Ok(mut circuits) = circuits().lock() {
+        let state = circuits.entry(key.to_string()).or_insert(CircuitState {
+            failures: 0,
+            opened_at: None,
+        });
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= CIRCUIT_THRESHOLD {
+            state.opened_at = Some(std::time::Instant::now());
+        }
+    }
+}
+
+fn record_success(key: &str) {
+    if let Ok(mut circuits) = circuits().lock() {
+        circuits.remove(key);
+    }
 }
 
 /// Context windows reported by the provider's `/models` endpoint. Populated at
@@ -684,7 +744,22 @@ impl Provider {
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(1_800))
             .build()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            fallback: None,
+        })
+    }
+
+    /// Attach a second provider used when the primary handshake fails or its
+    /// circuit breaker is open.
+    pub fn with_fallback(mut self, fallback: ProviderConfig) -> Self {
+        self.fallback = Some(fallback);
+        self
+    }
+
+    pub fn fallback(&self) -> Option<&ProviderConfig> {
+        self.fallback.as_ref()
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -701,7 +776,9 @@ impl Provider {
         }
         let mut config = self.config.clone();
         config.model = self.config.resolve_model(model);
-        Self::new(config)
+        let mut provider = Self::new(config)?;
+        provider.fallback = self.fallback.clone();
+        Ok(provider)
     }
 
     /// Collect a non-tool stream into one text result. Memory extraction and
@@ -762,12 +839,76 @@ impl Provider {
         temperature: f64,
         session: Option<ProviderSession<'_>>,
     ) -> Result<EventStream, ProviderError> {
-        if !self.config.has_key() {
+        let primary_key = circuit_key(&self.config);
+        if circuit_open(&primary_key) {
+            if let Some(fallback) = &self.fallback {
+                return self
+                    .stream_with_config(fallback, messages, tools, temperature, session)
+                    .await;
+            }
+            return Err(ProviderError::Transport(
+                "provider circuit is open after repeated failures; retry after 60s or configure a fallback provider"
+                    .to_string(),
+            ));
+        }
+        match self
+            .stream_with_config(&self.config, messages, tools, temperature, session)
+            .await
+        {
+            Ok(stream) => {
+                record_success(&primary_key);
+                Ok(stream)
+            }
+            Err(error) => {
+                record_failure(&primary_key);
+                let Some(fallback) = &self.fallback else {
+                    return Err(error);
+                };
+                if matches!(
+                    &error,
+                    ProviderError::MissingApiKey | ProviderError::Json(_)
+                ) {
+                    return Err(error);
+                }
+                let fallback_key = circuit_key(fallback);
+                if circuit_open(&fallback_key) {
+                    return Err(ProviderError::Transport(format!(
+                        "primary provider failed: {error}; fallback circuit is open"
+                    )));
+                }
+                match self
+                    .stream_with_config(fallback, messages, tools, temperature, session)
+                    .await
+                {
+                    Ok(stream) => {
+                        record_success(&fallback_key);
+                        Ok(stream)
+                    }
+                    Err(fallback_error) => {
+                        record_failure(&fallback_key);
+                        Err(ProviderError::Transport(format!(
+                            "primary provider failed: {error}; fallback provider failed: {fallback_error}"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn stream_with_config(
+        &self,
+        config: &ProviderConfig,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        temperature: f64,
+        session: Option<ProviderSession<'_>>,
+    ) -> Result<EventStream, ProviderError> {
+        if !config.has_key() {
             return Err(ProviderError::MissingApiKey);
         }
 
         let mut body = json!({
-            "model": self.config.model,
+            "model": config.model,
             "messages": messages,
             "stream": true,
             "temperature": temperature,
@@ -784,7 +925,7 @@ impl Provider {
             .and_then(|session| session.reasoning_effort)
             .and_then(normalize_reasoning_effort)
         {
-            if self.config.mode == "openrouter" {
+            if config.mode == "openrouter" {
                 body["reasoning"] = json!({ "effort": effort });
             } else {
                 body["reasoning_effort"] = json!(effort);
@@ -795,14 +936,14 @@ impl Provider {
             body["tool_choice"] = Value::String("auto".to_string());
         }
 
-        let headers = session_headers(&self.config, session);
+        let headers = session_headers(&config, session);
         let max_attempts = request_max_retries();
         let mut attempt = 0u64;
         let response = loop {
             let mut request = self
                 .client
-                .post(self.config.endpoint())
-                .bearer_auth(&self.config.api_key);
+                .post(config.endpoint())
+                .bearer_auth(&config.api_key);
             for (name, value) in &headers {
                 request = request.header(*name, value);
             }
@@ -812,18 +953,18 @@ impl Provider {
                     let failure = if error.is_timeout() {
                         ProviderError::Transport(format!(
                             "Timed out connecting to {} after {}s. Check your network or the provider status.",
-                            self.config.endpoint(),
+                            config.endpoint(),
                             15
                         ))
                     } else if error.is_connect() {
                         ProviderError::Transport(format!(
                             "Cannot reach {} (connection failed). Check your network, proxy, or VPN.",
-                            self.config.endpoint()
+                            config.endpoint()
                         ))
                     } else {
                         ProviderError::Transport(format!(
                             "Connection to {} failed: {error}",
-                            self.config.endpoint()
+                            config.endpoint()
                         ))
                     };
                     if failure.is_retryable() && attempt < max_attempts {
@@ -1372,5 +1513,40 @@ mod tests {
         let third = backoff_delay(3);
         assert!(third > first);
         assert!(first.as_millis() >= 180 && first.as_millis() <= 220);
+    }
+
+    #[test]
+    fn circuit_opens_after_repeated_failures_and_resets_on_success() {
+        let key = "test-circuit|http://primary|model";
+        record_success(key);
+        assert!(!circuit_open(key));
+        for _ in 0..CIRCUIT_THRESHOLD {
+            record_failure(key);
+        }
+        assert!(circuit_open(key));
+        record_success(key);
+        assert!(!circuit_open(key));
+    }
+
+    #[test]
+    fn provider_keeps_a_fallback_config() {
+        let primary = Provider::new(ProviderConfig {
+            mode: "opencode".to_string(),
+            base_url: "https://primary.example/v1".to_string(),
+            api_key: "primary".to_string(),
+            model: "primary-model".to_string(),
+        })
+        .unwrap()
+        .with_fallback(ProviderConfig {
+            mode: "openrouter".to_string(),
+            base_url: "https://fallback.example/v1".to_string(),
+            api_key: "fallback".to_string(),
+            model: "fallback-model".to_string(),
+        });
+        assert_eq!(primary.config().model, "primary-model");
+        assert_eq!(
+            primary.fallback().map(|config| config.model.as_str()),
+            Some("fallback-model")
+        );
     }
 }

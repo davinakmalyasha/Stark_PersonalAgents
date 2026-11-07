@@ -28,18 +28,55 @@ pub fn resolve_workspace_path(workspace: &Path, raw: &str) -> Result<PathBuf, St
         }
     }
 
-    let workspace_normalized = normalize(workspace);
-    if !path_starts_with(&normalized, &workspace_normalized) {
+    let workspace_normalized = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| normalize(workspace));
+    // Resolve symlinks when the target exists; for new files resolve the
+    // nearest existing parent so a symlinked directory cannot escape.
+    let resolved = canonicalize_best_effort(&normalized);
+    if !path_starts_with(&resolved, &workspace_normalized) {
         return Err(format!("path escapes the workspace: {raw}"));
     }
+    // Keep the lexical path for callers (checkpoints and relative displays
+    // expect the original drive form); the canonical path above is the
+    // symlink-escape check.
     Ok(normalized)
 }
 
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut suffix = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Some(name) = current.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if let Ok(mut canonical) = parent.canonicalize() {
+            for part in suffix.iter().rev() {
+                canonical.push(part);
+            }
+            return canonical;
+        }
+        current = parent.to_path_buf();
+    }
+    normalize(path)
+}
+
 pub fn relative_display(workspace: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    if let Ok(relative) = path.strip_prefix(workspace) {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    if let Ok(canonical_workspace) = workspace.canonicalize()
+        && let Ok(relative) = path.strip_prefix(&canonical_workspace)
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn normalize(path: &Path) -> PathBuf {

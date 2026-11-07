@@ -34,12 +34,16 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
     let _ = agents_tools::current_agent(ctx, &store).await;
     let mut rows = Vec::new();
     let mut children = Vec::new();
+    let mut failures = Vec::new();
     for item in items {
         let (workspace_id, workspace_path) = match resolve_target(ctx, &item) {
             Ok(target) => target,
-            Err(error) => return ToolOutcome::err(error),
+            Err(error) => {
+                failures.push(format!("- {} — {error}", item.title));
+                continue;
+            }
         };
-        let task = job_prompt(&item);
+        let task = job_prompt(&item, &workspace_id, &workspace_path);
         let result = agents_tools::handle(
             ctx,
             &json!({
@@ -57,7 +61,10 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
         )
         .await;
         if result.is_error {
-            return result;
+            // Codex parity: one bad item must not cancel the rest of the
+            // fan-out. Report it and keep launching the remaining items.
+            failures.push(format!("- {} — {}", item.title, result.content));
+            continue;
         }
         // Fresh parallel spawns have unique ids; parse the spawn receipt
         // instead of the singleton lookup (which returns the first agent).
@@ -77,7 +84,11 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
                 .flatten(),
         };
         let Some(agent) = agent else {
-            return ToolOutcome::err("Error: delegated agent was not persisted");
+            failures.push(format!(
+                "- {} — delegated agent was not persisted",
+                item.title
+            ));
+            continue;
         };
         rows.push(format!(
             "- {} · {} · {} — {} (chat: {})",
@@ -91,11 +102,21 @@ pub(crate) async fn delegate(ctx: &RunContext, args: &Value) -> ToolOutcome {
             "workspaceId": workspace_id,
         }));
     }
-    ToolOutcome::ok(format!(
+    if rows.is_empty() {
+        return ToolOutcome::err(format!(
+            "[DELEGATION FAILED]\n{}\nNo agents were started. Fix the item and retry.",
+            failures.join("\n")
+        ));
+    }
+    let mut report = format!(
         "[DELEGATION STARTED]\n{}\nEach item runs in its own agent/chat. Use delegation_status(id, wait_seconds) per agent to collect results; delegation_status lists the board; job_message/job_cancel manage an agent.",
         rows.join("\n")
-    ))
-    .with_children(children)
+    );
+    if !failures.is_empty() {
+        report.push_str("\n\n[DELEGATION ITEMS THAT FAILED TO START]\n");
+        report.push_str(&failures.join("\n"));
+    }
+    ToolOutcome::ok(report).with_children(children)
 }
 
 const VIRTUAL_WORKSPACE_IDS: [&str; 4] = ["_general", "_house", "_personal", "_dfd"];
@@ -225,6 +246,11 @@ pub(crate) async fn job_cancel(ctx: &RunContext, args: &Value) -> ToolOutcome {
 }
 
 pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOutcome {
+    if !crate::status_budget::allow(&ctx.chat_id, crate::status_budget::StatusKind::Delegation) {
+        return ToolOutcome::err(
+            "[STATUS ALREADY CHECKED] Progress is event-driven. Wait for the next [DELEGATION RESULT] or answer with the last known state. Do not poll.",
+        );
+    }
     let store = match AgentStore::open(ctx.store.harness_root()).await {
         Ok(store) => store,
         Err(error) => return ToolOutcome::err(format!("Error: agent store unavailable: {error}")),
@@ -234,7 +260,7 @@ pub(crate) async fn delegation_status(ctx: &RunContext, args: &Value) -> ToolOut
         let wait = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(300)
+            .unwrap_or(0)
             .min(300);
         let detail = if wait == 0 {
             match store.get(id).await {
@@ -381,8 +407,15 @@ fn parse_items(args: &Value) -> Result<Vec<JobItem>, String> {
     Ok(parsed)
 }
 
-fn job_prompt(item: &JobItem) -> String {
-    let mut prompt = item.task.clone();
+fn job_prompt(item: &JobItem, workspace_id: &str, workspace_path: &str) -> String {
+    let mut prompt = format!(
+        "You are {} in workspace {workspace_id} ({workspace_path}).\n\
+         Work only in this workspace. Read before editing. Verify before reporting.\n\
+         Your final message is the report to the Orchestrator: changed files, verification evidence, and unresolved risks.",
+        item.agent.display
+    );
+    prompt.push_str("\n\n");
+    prompt.push_str(&item.task);
     if !item.outcome.is_empty() {
         prompt.push_str("\n\nExpected outcome:\n");
         prompt.push_str(&item.outcome);
@@ -426,7 +459,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        let prompt = job_prompt(&parsed[0]);
+        let prompt = job_prompt(&parsed[0], "ws-1", "C:/projects/ws-1");
+        assert!(prompt.contains("You are Developer in workspace ws-1"));
         assert!(prompt.contains("Expected outcome:\nA working build"));
         assert!(prompt.contains("Acceptance criteria:\nTests pass"));
     }

@@ -12,7 +12,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_CHARS: usize = 100_000;
 
-fn resolve_workdir(ctx: &ToolContext, raw: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_workdir(
+    ctx: &ToolContext,
+    raw: Option<&str>,
+    allow_outside: bool,
+) -> Result<PathBuf, String> {
     match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
         Some(raw) => {
             let candidate = PathBuf::from(raw);
@@ -21,6 +25,9 @@ fn resolve_workdir(ctx: &ToolContext, raw: Option<&str>) -> Result<PathBuf, Stri
             } else {
                 ctx.current_dir().join(candidate)
             };
+            if allow_outside {
+                return Ok(joined.canonicalize().unwrap_or(joined));
+            }
             resolve_workspace_path(&ctx.workspace, &joined.to_string_lossy())
         }
         None => Ok(ctx.current_dir()),
@@ -28,12 +35,20 @@ fn resolve_workdir(ctx: &ToolContext, raw: Option<&str>) -> Result<PathBuf, Stri
 }
 
 fn truncate(text: String) -> String {
-    if text.chars().count() <= MAX_OUTPUT_CHARS {
+    let count = text.chars().count();
+    if count <= MAX_OUTPUT_CHARS {
         return text;
     }
-    let mut out: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
-    out.push_str("\n[output truncated at 100000 chars]");
-    out
+    // Keep both ends: failures usually live at the tail, while the command
+    // header lives at the head. Head-only truncation hid test failures.
+    let head_budget = MAX_OUTPUT_CHARS / 2;
+    let tail_budget = MAX_OUTPUT_CHARS - head_budget;
+    let head: String = text.chars().take(head_budget).collect();
+    let tail: String = text.chars().skip(count - tail_budget).collect();
+    format!(
+        "{head}\n[... {} chars omitted ...]\n{tail}",
+        count.saturating_sub(MAX_OUTPUT_CHARS)
+    )
 }
 
 async fn approve_command(ctx: &ToolContext, command: &str, reason: &str) -> bool {
@@ -93,9 +108,12 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         ));
     }
     let auto = stark_policy::auto_approve(&ctx.harness_root);
-    // Paths outside the workspace fall under external_directory.
+    // Codex policy: reads may cross workspace boundaries; writes may not.
+    // A verifiably read-only command (ls, cat, rg, git status, ...) is allowed
+    // outside the workspace. Mutating commands still hit external_directory.
+    let read_only_command = stark_policy::check_read_only(command).is_ok();
     let outside = crate::permissions::external_paths(command, &ctx.workspace);
-    if !outside.is_empty() && !auto {
+    if !outside.is_empty() && !auto && !read_only_command {
         match crate::permissions::effect(ctx, "external_directory", &outside).await {
             stark_policy::Effect::Deny => {
                 return ToolOutcome::err(format!(
@@ -104,6 +122,14 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
                 ));
             }
             stark_policy::Effect::Ask => {
+                if stark_sandbox::SandboxProfile::from_env(&ctx.workspace).approval
+                    == stark_sandbox::ApprovalPolicy::Never
+                {
+                    return ToolOutcome::err(format!(
+                        "[BLOCKED] external_directory requires approval, but approval policy is 'never': {}",
+                        outside.join(", ")
+                    ));
+                }
                 if ctx.depth > 0
                     || !approve_command(
                         ctx,
@@ -126,6 +152,14 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         && !ctx.approvals.is_approved(command)
         && !auto
     {
+        if stark_sandbox::SandboxProfile::from_env(&ctx.workspace).approval
+            == stark_sandbox::ApprovalPolicy::Never
+        {
+            return ToolOutcome::err(format!(
+                "[BLOCKED] Command requires approval, but approval policy is 'never': {}",
+                policy.reason.unwrap_or_else(|| "prompt".to_string())
+            ));
+        }
         if ctx.depth > 0 {
             return ToolOutcome::err(format!(
                 "[BLOCKED] Subagents run non-interactively; command requires approval: {}",
@@ -148,10 +182,20 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             ));
         }
     }
-    let workdir = match resolve_workdir(ctx, args.get("workdir").and_then(Value::as_str)) {
+    let workdir = match resolve_workdir(
+        ctx,
+        args.get("workdir").and_then(Value::as_str),
+        read_only_command,
+    ) {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
+    if !workdir.is_dir() {
+        return ToolOutcome::err(format!(
+            "Error: workdir does not exist or is not a directory: {}. Create it first or omit workdir.",
+            workdir.display()
+        ));
+    }
     if args
         .get("run_in_background")
         .and_then(Value::as_bool)
@@ -312,6 +356,23 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("hello"), "{}", out.content);
         assert!(out.content.contains("[exit code: 0]"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn missing_workdir_is_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let out = bash(
+            &ctx,
+            &json!({"description": "list", "command": "ls", "workdir": "missing-folder"}),
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("workdir does not exist"),
+            "{}",
+            out.content
+        );
     }
 
     #[tokio::test]

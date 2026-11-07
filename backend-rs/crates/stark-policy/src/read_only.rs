@@ -2,100 +2,37 @@ use std::collections::BTreeSet;
 
 const MAX_PARSE_CHARS: usize = 20_000;
 
-const READ_ONLY_PROGRAMS: &[&str] = &[
-    "ls",
-    "dir",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "find",
-    "grep",
-    "rg",
-    "which",
-    "where",
-    "echo",
-    "printf",
-    "pwd",
-    "env",
-    "printenv",
-    "date",
-    "whoami",
-    "id",
-    "hostname",
-    "uname",
-    "stat",
-    "file",
-    "tree",
-    "du",
-    "df",
-    "sort",
-    "uniq",
-    "cut",
-    "diff",
-    "cmp",
-    "md5sum",
-    "sha256sum",
-    "true",
-    "false",
+/// Codex's known-safe command set. These are the commands that may run in a
+/// read-only sandbox and therefore may be parallelized with other reads.
+const SAFE_PROGRAMS: &[&str] = &[
+    "cat", "cd", "cut", "echo", "expr", "false", "grep", "head", "id", "ls", "nl", "paste", "pwd",
+    "rev", "seq", "stat", "tail", "tr", "true", "uname", "uniq", "wc", "which", "whoami",
 ];
 
-const GIT_READ_SUBCOMMANDS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "branch",
-    "remote",
-    "ls-files",
-    "rev-parse",
-    "describe",
-    "blame",
-    "shortlog",
-    "reflog",
-    "config",
+const FIND_UNSAFE_OPTIONS: &[&str] = &[
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf",
 ];
 
-const GIT_VALUE_FLAGS: &[&str] = &[
+const RG_UNSAFE_OPTIONS_WITH_ARGS: &[&str] = &["--pre", "--hostname-bin"];
+const RG_UNSAFE_OPTIONS_WITHOUT_ARGS: &[&str] = &["--search-zip", "-z"];
+const BASE64_UNSAFE_OPTIONS: &[&str] = &["-o", "--output"];
+
+const GIT_SAFE_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "show", "branch"];
+const GIT_UNSAFE_GLOBAL_OPTIONS: &[&str] = &[
     "-C",
     "-c",
-    "--git-dir",
-    "--work-tree",
-    "--namespace",
-    "--exec-path",
+    "-p",
     "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--paginate",
+    "--super-prefix",
+    "--work-tree",
 ];
+const GIT_UNSAFE_SUBCOMMAND_OPTIONS: &[&str] = &["--output", "--ext-diff", "--textconv", "--exec"];
 
-const WRAPPER_PROGRAMS: &[&str] = &[
-    "env", "nohup", "time", "command", "exec", "sudo", "builtin", "nice",
-];
-
-const SUBSHELL_PROGRAMS: &[&str] = &["bash", "sh", "zsh", "dash", "powershell", "pwsh", "cmd"];
-
-const PYTHON_WRITE_HINTS: &[&str] = &[
-    "open(",
-    ".write(",
-    ".writelines(",
-    "os.remove",
-    "os.unlink",
-    "os.rmdir",
-    "os.mkdir",
-    "os.makedirs",
-    "os.rename",
-    "os.replace",
-    "shutil.",
-    "rmtree",
-    "subprocess",
-    "os.system",
-    "os.popen",
-    "savefig",
-    "to_csv",
-    "to_excel",
-    ".unlink(",
-    ".rename(",
-    "chmod",
-    "chown",
-];
+const WRAPPER_PROGRAMS: &[&str] = &["nohup", "time", "command", "builtin", "nice"];
 
 pub fn check_read_only(command: &str) -> Result<(), String> {
     if command.trim().is_empty() {
@@ -118,63 +55,19 @@ pub fn check_read_only(command: &str) -> Result<(), String> {
         if core.is_empty() {
             continue;
         }
-        let program = basename(&core[0]);
-        let args = &core[1..];
-        if SUBSHELL_PROGRAMS.contains(&program.as_str()) {
-            return Err(format!("nested shell '{program}' is not read-only"));
-        }
-        if matches!(program.as_str(), "python" | "python3" | "py") {
-            if args.first().is_some_and(|arg| arg == "-c") && args.len() > 1 {
-                if python_has_write_hint(&args[1..]) {
-                    return Err("python -c contains write operations".to_string());
-                }
-                continue;
-            }
-            return Err("python execution is not verifiably read-only".to_string());
-        }
-        if program == "git" {
-            let (subcommand, index) = first_positional(args, GIT_VALUE_FLAGS);
-            if !GIT_READ_SUBCOMMANDS.contains(&subcommand.as_str()) {
-                return Err(format!("git {subcommand} may write"));
-            }
-            let tail: Vec<&str> = args[index + 1..]
-                .iter()
-                .map(String::as_str)
-                .filter(|arg| !arg.starts_with('-'))
-                .collect();
-            match subcommand.as_str() {
-                "branch" if !tail.is_empty() => {
-                    return Err("git branch with arguments may write".to_string());
-                }
-                "remote"
-                    if !tail.is_empty()
-                        && !matches!(tail.first().copied(), Some("show" | "get-url")) =>
-                {
-                    return Err(format!("git remote {} may write", tail[0]));
-                }
-                "config"
-                    if !args.iter().any(|arg| {
-                        matches!(
-                            arg.as_str(),
-                            "--get" | "--get-all" | "--get-regexp" | "--list" | "-l"
-                        )
-                    }) =>
-                {
-                    return Err("git config without a read flag may write".to_string());
-                }
-                _ => {}
-            }
-            continue;
-        }
-        if program == "find"
-            && args
-                .iter()
-                .any(|arg| matches!(arg.as_str(), "-delete" | "-exec" | "-execdir" | "-ok"))
+        // Variable expansion can smuggle an arbitrary value into an otherwise
+        // safe command; Codex's safe-command path is conservative here too.
+        if core
+            .iter()
+            .any(|arg| arg.contains('$') || arg.contains('%') && arg.ends_with('%'))
         {
-            return Err("find with -delete/-exec is not read-only".to_string());
+            return Err("variable expansion is not verifiably read-only".to_string());
         }
-        if !READ_ONLY_PROGRAMS.contains(&program.as_str()) {
-            return Err(format!("'{program}' is not on the read-only allowlist"));
+        if !is_known_safe_command(&core) {
+            let program = basename(&core[0]);
+            return Err(format!(
+                "'{program}' is not on the Codex safe-command allowlist"
+            ));
         }
     }
     Ok(())
@@ -184,9 +77,128 @@ pub fn is_read_only_command(command: &str) -> bool {
     check_read_only(command).is_ok()
 }
 
-fn python_has_write_hint(args: &[String]) -> bool {
-    let joined = args.join(" ").to_lowercase();
-    PYTHON_WRITE_HINTS.iter().any(|hint| joined.contains(hint))
+/// Codex `is_known_safe_command`: the command will not write, delete, execute
+/// another arbitrary program, or redirect output. Path-qualified program names
+/// are deliberately rejected so `./sed` cannot impersonate `sed`.
+pub fn is_known_safe_command(command: &[String]) -> bool {
+    let Some(cmd0) = command.first() else {
+        return false;
+    };
+    if cmd0.contains('/') || cmd0.contains('\\') {
+        return false;
+    }
+
+    let program = basename(cmd0);
+    let args = &command[1..];
+
+    // `bash -lc "ls && pwd"` is safe only when every nested plain command is
+    // safe. The outer shell itself is the harness's execution shell.
+    if matches!(program.as_str(), "bash" | "sh" | "zsh") {
+        let script = args
+            .iter()
+            .position(|arg| matches!(arg.as_str(), "-c" | "-lc"))
+            .and_then(|index| args.get(index + 1));
+        return script.is_some_and(|script| check_read_only(script).is_ok());
+    }
+    if matches!(program.as_str(), "powershell" | "pwsh" | "cmd") {
+        return false;
+    }
+
+    if SAFE_PROGRAMS.contains(&program.as_str()) {
+        return true;
+    }
+
+    match program.as_str() {
+        "base64" => !args.iter().any(|arg| {
+            BASE64_UNSAFE_OPTIONS.contains(&arg.as_str())
+                || arg.starts_with("--output=")
+                || (arg.starts_with("-o") && arg != "-o")
+        }),
+        "find" => !args
+            .iter()
+            .any(|arg| FIND_UNSAFE_OPTIONS.contains(&arg.as_str())),
+        "rg" => !args.iter().any(|arg| {
+            RG_UNSAFE_OPTIONS_WITHOUT_ARGS.contains(&arg.as_str())
+                || RG_UNSAFE_OPTIONS_WITH_ARGS
+                    .iter()
+                    .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+        }),
+        "git" => is_safe_git_command(args),
+        "sed" => {
+            command.len() <= 4
+                && command.get(1).map(String::as_str) == Some("-n")
+                && is_valid_sed_n_arg(command.get(2).map(String::as_str))
+        }
+        _ => false,
+    }
+}
+
+fn is_safe_git_command(args: &[String]) -> bool {
+    let subcommand_index = args.iter().position(|arg| !arg.starts_with('-'));
+    let Some(subcommand_index) = subcommand_index else {
+        return false;
+    };
+    let global_args = &args[..subcommand_index];
+    if global_args.iter().any(|arg| {
+        GIT_UNSAFE_GLOBAL_OPTIONS
+            .iter()
+            .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+    }) {
+        return false;
+    }
+    let subcommand = args[subcommand_index].as_str();
+    if !GIT_SAFE_SUBCOMMANDS.contains(&subcommand) {
+        return false;
+    }
+    let subcommand_args = &args[subcommand_index + 1..];
+    if subcommand_args.iter().any(|arg| {
+        GIT_UNSAFE_SUBCOMMAND_OPTIONS
+            .iter()
+            .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
+    }) {
+        return false;
+    }
+    match subcommand {
+        "branch" => git_branch_is_read_only(subcommand_args),
+        _ => true,
+    }
+}
+
+fn git_branch_is_read_only(args: &[String]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+    let mut saw_read_only_flag = false;
+    for arg in args {
+        match arg.as_str() {
+            "--list" | "-l" | "--show-current" | "-a" | "--all" | "-r" | "--remotes" | "-v"
+            | "-vv" | "--verbose" => saw_read_only_flag = true,
+            _ if arg.starts_with("--format=") => saw_read_only_flag = true,
+            _ => return false,
+        }
+    }
+    saw_read_only_flag
+}
+
+fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
+    let Some(arg) = arg else {
+        return false;
+    };
+    let Some(body) = arg.strip_suffix('p') else {
+        return false;
+    };
+    let mut seen_comma = false;
+    let mut digits = 0usize;
+    for character in body.chars() {
+        if character.is_ascii_digit() {
+            digits += 1;
+        } else if character == ',' && !seen_comma {
+            seen_comma = true;
+        } else {
+            return false;
+        }
+    }
+    digits > 0
 }
 
 fn split_segments(command: &str) -> (Vec<String>, bool, bool) {
@@ -303,23 +315,6 @@ fn is_assignment(token: &str) -> bool {
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-fn first_positional(args: &[String], value_flags: &[&str]) -> (String, usize) {
-    let mut index = 0;
-    while index < args.len() {
-        let token = &args[index];
-        if value_flags.contains(&token.as_str()) {
-            index += 2;
-            continue;
-        }
-        if token.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        return (token.clone(), index);
-    }
-    (String::new(), args.len())
-}
-
 fn basename(program: &str) -> String {
     let program = program.replace('\\', "/");
     let program = program.trim_end_matches('/');
@@ -335,37 +330,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_read_only_commands() {
+    fn allows_codex_safe_commands() {
         assert!(is_read_only_command("ls -la"));
         assert!(is_read_only_command("git status --short"));
         assert!(is_read_only_command("git diff -- src/main.rs"));
-        assert!(is_read_only_command("git config --get user.name"));
+        assert!(is_read_only_command("git branch --show-current"));
         assert!(is_read_only_command("rg update_plan backend-rs"));
-        assert!(is_read_only_command("python -c \"print(1)\""));
+        assert!(is_read_only_command("find . -name file.txt"));
+        assert!(is_read_only_command("sed -n '1,5p' file.txt"));
+        assert!(is_read_only_command("base64 file.txt"));
+        assert!(is_read_only_command("bash -lc \"ls && pwd\""));
     }
 
     #[test]
-    fn rejects_write_redirects_and_shells() {
-        assert!(check_read_only("echo hi > out.txt").is_err());
-        assert!(check_read_only("bash -c \"ls\"").is_err());
+    fn rejects_unknown_and_mutating_programs() {
+        assert!(check_read_only("python -c \"print(1)\"").is_err());
         assert!(check_read_only("python script.py").is_err());
-        assert!(check_read_only("python -c \"open('x','w')\"").is_err());
+        assert!(check_read_only("rm -rf build").is_err());
+        assert!(check_read_only("cargo test").is_err());
+        assert!(check_read_only("echo hi > out.txt").is_err());
+        assert!(check_read_only("bash -c \"ls && rm -rf /\"").is_err());
     }
 
     #[test]
-    fn rejects_write_git_forms() {
+    fn rejects_codex_unsafe_git_forms() {
         assert!(check_read_only("git push origin main").is_err());
+        assert!(check_read_only("git -C . status").is_err());
+        assert!(check_read_only("git --git-dir=.evil diff").is_err());
         assert!(check_read_only("git branch feature").is_err());
         assert!(check_read_only("git remote add origin url").is_err());
         assert!(check_read_only("git config user.name x").is_err());
     }
 
     #[test]
-    fn rejects_write_programs_and_find_flags() {
-        assert!(check_read_only("rm -rf build").is_err());
+    fn rejects_codex_unsafe_command_options() {
         assert!(check_read_only("find . -delete").is_err());
         assert!(check_read_only("find . -exec rm {} +").is_err());
-        assert!(check_read_only("cargo test").is_err());
+        assert!(check_read_only("rg --pre cmd pattern").is_err());
+        assert!(check_read_only("rg -z pattern").is_err());
+        assert!(check_read_only("base64 -o out.txt file").is_err());
+        assert!(check_read_only("./sed -n '1p' file").is_err());
     }
 
     #[test]
@@ -373,5 +377,13 @@ mod tests {
         assert!(check_read_only("echo 'unterminated").is_err());
         assert!(check_read_only("echo $(cat secret)").is_err());
         assert!(check_read_only("echo `date`").is_err());
+    }
+
+    #[test]
+    fn rejects_environment_dumps_and_variable_expansion() {
+        assert!(check_read_only("env").is_err());
+        assert!(check_read_only("printenv").is_err());
+        assert!(check_read_only("echo $OPENAI_API_KEY").is_err());
+        assert!(check_read_only("echo %PATH%").is_err());
     }
 }

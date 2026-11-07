@@ -1,17 +1,14 @@
 mod approvals;
-mod ask;
 mod browser;
 mod changes;
 mod checkpoint;
 mod codemode;
-mod command;
 mod dfd;
 mod docs;
 mod ds_fs;
 mod ds_session;
 mod ds_shell;
 mod ds_web;
-mod edit;
 mod head_tail;
 mod house;
 mod images;
@@ -26,7 +23,6 @@ mod processes;
 mod questions;
 mod read;
 mod screen;
-mod search;
 mod skills;
 mod verify;
 
@@ -49,6 +45,17 @@ pub use stark_sandbox::{ApprovalPolicy, SandboxMode, SandboxProfile};
 /// Prompt line stating the requested sandbox mode and the real backend.
 pub fn sandbox_prompt_line(workspace: &Path) -> String {
     SandboxProfile::from_env(workspace).prompt_line()
+}
+
+/// Like [`sandbox_prompt_line`], but the agent's file-access mode wins over
+/// the process default. A read-only Orchestrator must not be told it has
+/// workspace-write access.
+pub fn sandbox_prompt_line_for(workspace: &Path, access: &str) -> String {
+    let mut profile = SandboxProfile::from_env(workspace);
+    if access == "read" {
+        profile.mode = SandboxMode::ReadOnly;
+    }
+    profile.prompt_line()
 }
 
 /// Startup log line for the server.
@@ -400,9 +407,7 @@ pub fn tool_specs_for_run(
                             "edit_file"
                                 | "run_code"
                                 | "call_subagent"
-                                | "write"
                                 | "edit"
-                                | "todo_write"
                                 | "spawn_agent"
                                 | "message_agent"
                                 | "interrupt_agent"
@@ -574,6 +579,25 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
     }
     match name {
         "run_command" | "bash" => {
+            let background = args
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || args
+                    .get("run_in_background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            let process_action = args
+                .get("process_action")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if background || !process_action.is_empty() {
+                return Some(
+                    "[BLOCKED] Read-only agents may not start background jobs or manage processes. Use a foreground read-only command."
+                        .to_string(),
+                );
+            }
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             if let Err(reason) = stark_policy::check_read_only(command) {
                 Some(format!(
@@ -628,10 +652,35 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
     }
 }
 
+fn argument_matches(value: &Value, kind: &str) -> bool {
+    match kind {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    }
+}
+
 pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     if !ctx.tool_allowed(name) {
         return ToolOutcome::err(format!(
             "[BLOCKED] Tool '{name}' is not enabled for this agent. Change the agent's tools config or continue without it."
+        ));
+    }
+    // Enforce the frozen scope contract at dispatch, not only when
+    // advertising. Without this a hallucinated legacy name (read_file,
+    // run_command, ...) skipped the v2 permission gates.
+    if !name.starts_with("mcp__")
+        && let Some(allowed) = contract().scope_map.get(&ctx.scope)
+        && !allowed.iter().any(|tool| tool == name)
+    {
+        return ToolOutcome::err(format!(
+            "[BLOCKED] Tool '{name}' is not in the '{}' scope contract. Use one of: {}",
+            ctx.scope,
+            allowed.join(", ")
         ));
     }
     if ctx.depth > 0 && matches!(name, "ask_user_question" | "ask_user") {
@@ -639,13 +688,65 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
             "[BLOCKED] Subagents run non-interactively: the user cannot answer here. Do not ask questions. Decide with the information you have, or report the decision/blocker to your parent in your final message.",
         );
     }
-    if let Some(tool) = contract().tool(name)
-        && let Some(required) = tool
-            .required
-            .iter()
-            .find(|required| args.get(required.as_str()).is_none())
+    const LEGACY_REPLACEMENTS: &[(&str, &str)] = &[
+        ("read_file", "read"),
+        ("edit_file", "edit"),
+        ("search_code", "grep"),
+        ("run_command", "bash"),
+        ("ask_user", "ask_user_question"),
+        ("call_subagent", "spawn_agent"),
+        ("todo_write", "update_plan"),
+    ];
+    if let Some((legacy, replacement)) = LEGACY_REPLACEMENTS
+        .iter()
+        .find(|(legacy, _)| *legacy == name)
     {
-        return ToolOutcome::err(format!("Error: {name} requires {required}"));
+        return ToolOutcome::err(format!(
+            "[BLOCKED] Tool '{legacy}' was removed. Use '{replacement}' instead."
+        ));
+    }
+    if let Some(tool) = contract().tool(name)
+        && let Some(required) = tool.required.iter().find(|required| {
+            args.get(required.as_str())
+                .is_none_or(serde_json::Value::is_null)
+        })
+    {
+        let schema = tool.parameters.pointer(&format!("/properties/{required}"));
+        let kind = schema
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("value");
+        let hint = schema
+            .and_then(|value| value.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let received = args
+            .get(required.as_str())
+            .map(Value::to_string)
+            .unwrap_or_else(|| "nothing".to_string());
+        return ToolOutcome::err(format!(
+            "Error: {name} requires '{required}' ({kind}). Got: {received}. {hint} Retry with corrected arguments."
+        ));
+    }
+    if let Some(tool) = contract().tool(name) {
+        for required in &tool.required {
+            let Some(value) = args.get(required.as_str()) else {
+                continue;
+            };
+            let Some(kind) = tool
+                .parameters
+                .pointer(&format!("/properties/{required}/type"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if !argument_matches(value, kind) {
+                return ToolOutcome::err(format!(
+                    "Error: {name}.{required} must be {kind}, got {}. Retry with corrected arguments.",
+                    value
+                ));
+            }
+        }
     }
     if let Some(reason) = plan_mode_denial(&ctx.mode, name, args) {
         return ToolOutcome::err(reason);
@@ -667,24 +768,25 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         return codemode::handle(ctx, args).await;
     }
     match name {
-        "read_file" => read::read_file(ctx, args).await,
-        "edit_file" => edit::edit_file(ctx, args).await,
-        "search_code" => search::search_code(ctx, args).await,
-        "run_command" => command::run_command(ctx, args).await,
         "bash" => ds_shell::bash(ctx, args).await,
         "job" => ds_shell::job(ctx, args).await,
         "read" => ds_fs::read(ctx, args).await,
-        "write" => ds_fs::write(ctx, args).await,
+        "apply_patch" => match args
+            .get("input")
+            .or_else(|| args.get("patch"))
+            .and_then(Value::as_str)
+        {
+            Some(patch) if !patch.trim().is_empty() => crate::patch::apply_patch(ctx, patch).await,
+            _ => ToolOutcome::err("Error: apply_patch requires a non-empty 'patch' string"),
+        },
         "edit" => ds_fs::edit(ctx, args).await,
         "glob" => ds_fs::glob(ctx, args).await,
         "grep" => ds_fs::grep(ctx, args).await,
-        "todo_write" => ds_session::todo_write(ctx, args).await,
         "ask_user_question" => ds_session::ask_user_question(ctx, args).await,
         "skill" => skills::skill(ctx, args).await,
         "tool_search" => mcp::search_tools(ctx, args).await,
         "web_search" => ds_web::web_search(ctx, args).await,
         "web_fetch" => ds_web::web_fetch(ctx, args).await,
-        "ask_user" => ask::ask_user(ctx, args).await,
         "update_plan" => update_plan(ctx, args).await,
         "browser_act" => browser::browser_act(ctx, args).await,
         "house_get_state" => house::house_get_state(ctx, args).await,
@@ -751,17 +853,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_exposes_unified_exec_fields() {
+    fn tool_specs_exposes_shell_fields() {
         let specs = tool_specs();
-        let run = specs
+        let shell = specs
             .iter()
-            .find(|spec| spec["function"]["name"] == "run_command")
-            .expect("run_command spec");
-        let properties = run
+            .find(|spec| spec["function"]["name"] == "bash")
+            .expect("bash spec");
+        let properties = shell
             .pointer("/function/parameters/properties")
-            .expect("run_command properties");
-        assert!(properties.get("tty").is_some());
-        assert!(properties.get("yield_time_ms").is_some());
+            .expect("bash properties");
+        assert!(properties.get("workdir").is_some());
+        assert!(properties.get("timeoutMs").is_some());
         assert!(tool_names(&specs).contains(&"update_plan"));
     }
 
@@ -769,33 +871,28 @@ mod tests {
     fn plan_mode_hides_write_tools_and_guards_shell() {
         let build = tool_specs_for("build");
         let plan = tool_specs_for("plan");
-        assert!(tool_names(&build).contains(&"edit_file"));
-        assert!(tool_names(&build).contains(&"call_subagent"));
-        assert!(!tool_names(&plan).contains(&"edit_file"));
-        assert!(!tool_names(&plan).contains(&"call_subagent"));
+        assert!(tool_names(&build).contains(&"edit"));
+        assert!(tool_names(&build).contains(&"spawn_agent"));
+        assert!(!tool_names(&plan).contains(&"edit"));
+        assert!(!tool_names(&plan).contains(&"spawn_agent"));
         assert!(!tool_names(&plan).contains(&"run_code"));
         assert!(!tool_names(&plan).contains(&"agent"));
         assert!(tool_names(&plan).contains(&"update_plan"));
-        assert!(tool_names(&plan).contains(&"run_command"));
+        assert!(tool_names(&plan).contains(&"bash"));
 
         assert!(
             plan_mode_denial(
                 "plan",
-                "edit_file",
+                "edit",
                 &json!({"file_path": "a.txt", "new_string": "x"})
             )
             .is_some()
         );
-        assert!(plan_mode_denial("plan", "run_command", &json!({"command": "ls"})).is_none());
+        assert!(plan_mode_denial("plan", "bash", &json!({"command": "ls"})).is_none());
         assert!(
-            plan_mode_denial(
-                "plan",
-                "run_command",
-                &json!({"command": "echo x > out.txt"})
-            )
-            .is_some()
+            plan_mode_denial("plan", "bash", &json!({"command": "echo x > out.txt"})).is_some()
         );
-        assert!(plan_mode_denial("build", "edit_file", &json!({})).is_none());
+        assert!(plan_mode_denial("build", "edit", &json!({})).is_none());
         assert!(plan_mode_denial("plan", "run_code", &json!({"code": "return 1"})).is_some());
         assert!(plan_mode_denial("plan", "agent", &json!({"action": "spawn"})).is_some());
     }
@@ -805,18 +902,21 @@ mod tests {
         let developer = tool_specs_for_scope("build", "developer");
         let names = tool_names(&developer);
         assert!(names.contains(&"read"));
-        assert!(names.contains(&"write"));
+        assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"spawn_agent"));
-        assert!(names.contains(&"todo_write"));
+        assert!(names.contains(&"update_plan"));
         assert!(names.contains(&"web_fetch"));
         assert!(!names.contains(&"read_file"));
         assert!(!names.contains(&"read_pdf"));
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
-        assert_eq!(names.len(), 12);
-        assert!(names.contains(&"run_command"));
+        assert_eq!(names.len(), 19);
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"glob"));
+        assert!(names.contains(&"grep"));
         assert!(names.contains(&"update_plan"));
         assert!(names.contains(&"read_pdf"));
         assert!(names.contains(&"create_docx"));
@@ -824,6 +924,7 @@ mod tests {
         assert!(names.contains(&"set_screen_share"));
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
+        assert!(!names.contains(&"run_command"));
 
         let dfd = tool_specs_for_scope("build", "dfd");
         let names = tool_names(&dfd);
@@ -832,12 +933,16 @@ mod tests {
         assert!(names.contains(&"dfd_bridge"));
         assert!(names.contains(&"create_client"));
         assert!(names.contains(&"files_changed"));
+        assert!(names.contains(&"bash"));
+        assert!(!names.contains(&"run_command"));
 
         let house = tool_specs_for_scope("build", "house");
         let names = tool_names(&house);
         assert_eq!(names.len(), 11);
         assert!(names.contains(&"house_set_device"));
         assert!(names.contains(&"house_run_scene"));
+        assert!(names.contains(&"bash"));
+        assert!(!names.contains(&"run_command"));
 
         let orchestrator = tool_specs_for_scope("build", "orchestrator");
         let names = tool_names(&orchestrator);
@@ -850,15 +955,20 @@ mod tests {
         assert!(names.contains(&"group_events"));
         assert!(names.contains(&"group_update"));
         assert!(names.contains(&"workspace"));
-        assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"delegate"));
         assert!(names.contains(&"delegation_status"));
         assert!(names.contains(&"job_message"));
         assert!(names.contains(&"job_cancel"));
         assert!(names.contains(&"give_note"));
+        // The manager inspects only through read-only bash and coordinates.
+        for tool in ["bash", "memory", "ask_user_question"] {
+            assert!(names.contains(&tool), "orchestrator missing {tool}");
+        }
+        assert!(!names.contains(&"ask_user"));
+        assert!(!names.contains(&"agent"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            57
+            48
         );
     }
 
@@ -870,8 +980,8 @@ mod tests {
         let coder_specs = tool_specs_for_scope("build", "coder");
         let coder: std::collections::BTreeSet<&str> =
             tool_names(&coder_specs).into_iter().collect();
-        assert_eq!(developer.len(), 20);
-        assert_eq!(coder.len(), 21);
+        assert_eq!(developer.len(), 17);
+        assert_eq!(coder.len(), 18);
         assert!(coder.contains("run_code"));
         assert!(!developer.contains("run_code"));
         let extra: Vec<&&str> = coder.difference(&developer).collect();
@@ -907,10 +1017,11 @@ mod tests {
     fn read_only_access_hides_write_tools_and_blocks_dispatch() {
         let read = tool_specs_for_scope_with_access("build", "explore", "read");
         let names = tool_names(&read);
-        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"edit"));
         assert!(!names.contains(&"run_code"));
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"search_code"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"bash"));
 
         // Orchestrator keeps its orchestration tools with read-only file
         // access: they act through server-owned state, not direct writes.
@@ -923,6 +1034,9 @@ mod tests {
             "schedule",
             "give_note",
             "canvas_mode",
+            "bash",
+            "memory",
+            "ask_user_question",
         ] {
             assert!(
                 orch_names.contains(&tool),
@@ -930,7 +1044,7 @@ mod tests {
             );
         }
         // ...but still loses direct filesystem writes.
-        for tool in ["edit_file", "write", "edit", "create_docx"] {
+        for tool in ["edit", "create_docx"] {
             assert!(
                 !orch_names.contains(&tool),
                 "orchestrator kept filesystem write {tool} with read access"
@@ -946,12 +1060,25 @@ mod tests {
             Arc::new(QuestionBroker::new()),
         )
         .with_access("read");
-        assert!(read_only_denial("edit_file", &json!({"file_path": "a"}), &ctx).is_some());
+        assert!(read_only_denial("edit", &json!({"file_path": "a"}), &ctx).is_some());
+        assert!(read_only_denial("bash", &json!({"command": "echo x > out.txt"}), &ctx).is_some());
+        assert!(read_only_denial("bash", &json!({"command": "ls"}), &ctx).is_none());
         assert!(
-            read_only_denial("run_command", &json!({"command": "echo x > out.txt"}), &ctx)
-                .is_some()
+            read_only_denial(
+                "bash",
+                &json!({"command": "ls", "run_in_background": true}),
+                &ctx
+            )
+            .is_some()
         );
-        assert!(read_only_denial("run_command", &json!({"command": "ls"}), &ctx).is_none());
+        assert!(
+            read_only_denial(
+                "bash",
+                &json!({"command": "ls", "process_action": "kill"}),
+                &ctx
+            )
+            .is_some()
+        );
         assert!(
             read_only_denial(
                 "browser_act",
@@ -984,7 +1111,7 @@ mod tests {
         let ctx = context(dir.path()).with_mode("plan");
 
         let edit = dispatch(
-            "edit_file",
+            "edit",
             &json!({"file_path": "a.txt", "old_string": "hello", "new_string": "bye"}),
             &ctx,
         )
@@ -992,7 +1119,7 @@ mod tests {
         assert!(edit.is_error);
         assert!(edit.content.contains("[BLOCKED]"));
 
-        let read = dispatch("read_file", &json!({"file_path": "a.txt"}), &ctx).await;
+        let read = dispatch("read", &json!({"file_path": "a.txt"}), &ctx).await;
         assert!(!read.is_error, "{}", read.content);
     }
 
@@ -1001,7 +1128,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         std::fs::write(dir.path().join("shot.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
-        let read = dispatch("read_file", &json!({"file_path": "shot.png"}), &ctx).await;
+        let read = dispatch("read", &json!({"file_path": "shot.png"}), &ctx).await;
         assert!(!read.is_error, "{}", read.content);
         assert!(read.content.contains("[IMAGE]"));
         let queued = crate::screen::drain_images("test-chat");
@@ -1015,20 +1142,20 @@ mod tests {
         let ctx = context(dir.path());
 
         let write = dispatch(
-            "edit_file",
-            &json!({"file_path": "src/demo.txt", "new_string": "alpha\nbeta\n"}),
+            "apply_patch",
+            &json!({"input": "*** Begin Patch\n*** Add File: src/demo.txt\n+alpha\n+beta\n*** End Patch"}),
             &ctx,
         )
         .await;
         assert!(!write.is_error, "{}", write.content);
 
-        let read = dispatch("read_file", &json!({"file_path": "src/demo.txt"}), &ctx).await;
+        let read = dispatch("read", &json!({"file_path": "src/demo.txt"}), &ctx).await;
         assert!(!read.is_error, "{}", read.content);
         assert!(read.content.contains("[FILE] src/demo.txt"));
         assert!(read.content.contains("alpha"));
 
         let edit = dispatch(
-            "edit_file",
+            "edit",
             &json!({
                 "file_path": "src/demo.txt",
                 "old_string": "beta",
@@ -1040,12 +1167,7 @@ mod tests {
         assert!(!edit.is_error, "{}", edit.content);
         assert!(edit.content.contains("[OK] Edited"));
 
-        let search = dispatch(
-            "search_code",
-            &json!({"pattern": "gamma", "path": "src"}),
-            &ctx,
-        )
-        .await;
+        let search = dispatch("grep", &json!({"pattern": "gamma", "path": "src"}), &ctx).await;
         assert!(!search.is_error, "{}", search.content);
         assert!(search.content.contains("src/demo.txt:2: gamma"));
     }
@@ -1054,65 +1176,84 @@ mod tests {
     async fn read_rejects_path_escape() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let read = dispatch(
-            "read_file",
-            &json!({"file_path": "../../outside.txt"}),
-            &ctx,
-        )
-        .await;
+        let read = dispatch("read", &json!({"file_path": "../../outside.txt"}), &ctx).await;
         assert!(read.is_error);
         assert!(read.content.contains("escapes the workspace"));
     }
 
     #[tokio::test]
-    async fn run_command_returns_exit_and_output() {
+    async fn dispatch_enforces_the_scope_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let scoped = context(dir.path()).with_scope("developer");
+        let out_of_scope = dispatch("read_file", &json!({"file_path": "a.txt"}), &scoped).await;
+        assert!(out_of_scope.is_error, "{}", out_of_scope.content);
+        assert!(
+            out_of_scope.content.contains("scope contract"),
+            "{}",
+            out_of_scope.content
+        );
+        let legacy = dispatch(
+            "read_file",
+            &json!({"file_path": "a.txt"}),
+            &context(dir.path()),
+        )
+        .await;
+        assert!(legacy.is_error, "{}", legacy.content);
+        assert!(legacy.content.contains("was removed"), "{}", legacy.content);
+        let current = dispatch("read", &json!({"file_path": "a.txt"}), &scoped).await;
+        assert!(!current.is_error, "{}", current.content);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_wrong_argument_types() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let result = dispatch("run_command", &json!({"command": "printf 'hello'"}), &ctx).await;
+        let out = dispatch("read", &json!({"file_path": 7}), &ctx).await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("must be string"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn bash_returns_exit_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let result = dispatch(
+            "bash",
+            &json!({"description": "Print a value", "command": "printf 'hello'"}),
+            &ctx,
+        )
+        .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("[OK] Exit 0"));
+        assert!(result.content.contains("[exit code: 0]"));
         assert!(result.content.contains("hello"));
     }
 
     #[tokio::test]
-    async fn run_command_supports_pty_and_resumable_sessions() {
+    async fn bash_supports_resumable_background_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-
-        let pty = dispatch(
-            "run_command",
-            &json!({"command": "printf 'pty-hello\\n'", "tty": true, "timeout": 15000}),
-            &ctx,
-        )
-        .await;
-        assert!(!pty.is_error, "{}", pty.content);
-        assert!(pty.content.contains("pty-hello"), "{}", pty.content);
-
         let started = dispatch(
-            "run_command",
+            "bash",
             &json!({
-                "command": "sleep 0.8; printf 'session-done\\n'",
-                "yield_time_ms": 100
+                "description": "Print a value after a short delay",
+                "command": "sleep 0.5; printf 'session-done\\n'",
+                "run_in_background": true
             }),
             &ctx,
         )
         .await;
         assert!(!started.is_error, "{}", started.content);
-        assert!(started.content.contains("[RUNNING]"), "{}", started.content);
-        let id = started
+        let job_id = started
             .content
-            .split("session #")
+            .split("\"jobId\":")
             .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .expect("session id")
-            .to_string();
+            .and_then(|rest| rest.split(',').next())
+            .map(|value| value.trim().trim_matches('"').to_string())
+            .expect("job id");
         let polled = dispatch(
-            "run_command",
-            &json!({
-                "command": id,
-                "process_action": "send",
-                "yield_time_ms": 15000
-            }),
+            "job",
+            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 5000}),
             &ctx,
         )
         .await;
@@ -1125,46 +1266,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_process_ready_logs_and_kill() {
+    async fn background_job_logs_and_kill() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let command = "printf 'bg-ready\\n'; sleep 2";
         let started = dispatch(
-            "run_command",
+            "bash",
             &json!({
+                "description": "Print a ready marker and wait",
                 "command": command,
-                "background": true,
-                "expect": "bg-ready",
-                "ready_timeout": 20000
+                "run_in_background": true
             }),
             &ctx,
         )
         .await;
         assert!(!started.is_error, "{}", started.content);
-        assert!(started.content.contains("[READY]"));
+        let job_id = started
+            .content
+            .split("\"jobId\":")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .map(|value| value.trim().trim_matches('"').to_string())
+            .expect("job id");
 
         let logs = dispatch(
-            "run_command",
-            &json!({"command": command, "process_action": "logs"}),
+            "job",
+            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 5000}),
             &ctx,
         )
         .await;
-        assert!(logs.content.contains("bg-ready"));
+        assert!(logs.content.contains("bg-ready"), "{}", logs.content);
 
-        let killed = dispatch(
-            "run_command",
-            &json!({"command": command, "process_action": "kill"}),
-            &ctx,
-        )
-        .await;
+        let killed = dispatch("job", &json!({"action": "kill", "job_id": job_id}), &ctx).await;
         assert!(!killed.is_error, "{}", killed.content);
     }
 
     #[tokio::test]
-    async fn run_command_blocks_destructive_policy_hits() {
+    async fn bash_blocks_destructive_policy_hits() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let result = dispatch("run_command", &json!({"command": "rm -rf /"}), &ctx).await;
+        let result = dispatch(
+            "bash",
+            &json!({"description": "Dangerous command", "command": "rm -rf /"}),
+            &ctx,
+        )
+        .await;
         assert!(result.is_error);
         assert!(result.content.contains("[BLOCKED]"));
     }
@@ -1179,10 +1325,9 @@ mod tests {
             let ctx = ctx.clone();
             async move {
                 dispatch(
-                    "ask_user",
+                    "ask_user_question",
                     &json!({
-                        "questions": [{"id": "q1", "question": "Continue?"}],
-                        "timeout": 10
+                        "questions": [{"id": "q1", "question": "Continue?"}]
                     }),
                     &ctx,
                 )
@@ -1214,6 +1359,13 @@ mod tests {
 mod v2_surface_tests {
     use super::*;
 
+    fn names_for(scope: &str) -> Vec<String> {
+        tool_specs_for_scope("build", scope)
+            .iter()
+            .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
     #[test]
     fn developer_v2_surface_matches_the_frozen_manifest() {
         let names: Vec<String> = tool_specs_for_scope("build", "developer")
@@ -1224,11 +1376,10 @@ mod v2_surface_tests {
             "bash",
             "job",
             "read",
-            "write",
+            "apply_patch",
             "edit",
             "glob",
             "grep",
-            "todo_write",
             "ask_user_question",
             "skill",
             "web_search",
@@ -1236,11 +1387,9 @@ mod v2_surface_tests {
             "spawn_agent",
             "message_agent",
             "wait_agent",
-            "list_agents",
             "interrupt_agent",
             "close_agent",
-            "resume_agent",
-            "tool_search",
+            "update_plan",
         ];
         assert_eq!(
             names,
@@ -1255,7 +1404,7 @@ mod v2_surface_tests {
             "run_command",
             "search_code",
             "ask_user",
-            "update_plan",
+            "todo_write",
             "call_subagent",
             "run_code",
             "agent",
@@ -1273,6 +1422,39 @@ mod v2_surface_tests {
                 !names.iter().any(|name| name == legacy),
                 "legacy Developer tool {legacy}"
             );
+        }
+    }
+
+    #[test]
+    fn no_scope_advertises_legacy_tool_names() {
+        let legacy = [
+            "read_file",
+            "edit_file",
+            "search_code",
+            "run_command",
+            "ask_user",
+            "call_subagent",
+            "todo_write",
+        ];
+        for scope in [
+            "developer",
+            "coder",
+            "general",
+            "house",
+            "dfd",
+            "orchestrator",
+            "devops",
+            "explore",
+            "ui",
+            "agent",
+        ] {
+            let names = names_for(scope);
+            for name in legacy {
+                assert!(
+                    !names.iter().any(|candidate| candidate == name),
+                    "{scope} still advertises legacy tool {name}"
+                );
+            }
         }
     }
 

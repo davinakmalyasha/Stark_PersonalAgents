@@ -1,44 +1,12 @@
-//! Session tools: todo_write and ask_user_question.
+//! Session tools: ask_user_question.
 //!
 //! The working directory is runtime context (Zone 1), not a tool: it is
 //! injected into the system prompt every turn and relative paths resolve
 //! server-side. Navigation uses `bash` with a per-call `workdir`.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{ToolContext, ToolOutcome};
-
-pub async fn todo_write(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    let Some(todos) = args.get("todos").and_then(Value::as_array) else {
-        return ToolOutcome::err("Error: todo_write requires todos");
-    };
-    let mut plan = Vec::new();
-    for todo in todos {
-        let Some(content) = todo.get("content").and_then(Value::as_str) else {
-            return ToolOutcome::err("Error: every todo requires content");
-        };
-        let Some(status) = todo.get("status").and_then(Value::as_str) else {
-            return ToolOutcome::err("Error: every todo requires status");
-        };
-        if !matches!(status, "pending" | "in_progress" | "completed") {
-            return ToolOutcome::err(format!(
-                "Error: invalid todo status '{status}' (must be pending|in_progress|completed)"
-            ));
-        }
-        plan.push(json!({"step": content, "status": status}));
-    }
-    let outcome = crate::plan::update_plan(ctx, &json!({"plan": plan})).await;
-    if outcome.is_error {
-        return outcome;
-    }
-    ToolOutcome {
-        content: outcome.content,
-        is_error: false,
-        exit_code: None,
-        plan: outcome.plan,
-        children: Vec::new(),
-    }
-}
 
 fn selected_text(value: &Value) -> String {
     match value {
@@ -154,34 +122,13 @@ pub async fn ask_user_question(ctx: &ToolContext, args: &Value) -> ToolOutcome {
 mod tests {
     use std::sync::Arc;
 
+    use serde_json::json;
+
     use super::*;
     use crate::QuestionBroker;
 
     fn context(dir: &std::path::Path) -> ToolContext {
         ToolContext::new(dir, "v2-session", Arc::new(QuestionBroker::new()))
-    }
-
-    #[tokio::test]
-    async fn todo_write_updates_the_plan_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let out = todo_write(
-            &ctx,
-            &json!({"todos": [
-                {"content": "inspect", "status": "completed"},
-                {"content": "implement", "status": "in_progress"}
-            ]}),
-        )
-        .await;
-        assert!(!out.is_error, "{}", out.content);
-        assert!(out.plan.is_some());
-        let saved = ctx
-            .plan_store
-            .load_plan("v2-session", "agent")
-            .await
-            .unwrap();
-        assert_eq!(saved.len(), 2);
-        assert_eq!(saved[1].status, "in_progress");
     }
 
     #[tokio::test]

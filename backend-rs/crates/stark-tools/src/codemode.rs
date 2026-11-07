@@ -111,8 +111,10 @@ impl Bridge {
             state.calls += 1;
         }
         let args: Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
-        if name == "run_command" {
-            if args.get("background").and_then(Value::as_bool) == Some(true) {
+        if name == "run_command" || name == "bash" {
+            if args.get("background").and_then(Value::as_bool) == Some(true)
+                || args.get("run_in_background").and_then(Value::as_bool) == Some(true)
+            {
                 return error_envelope(
                     "background commands are not allowed in code mode".to_string(),
                 );
@@ -124,6 +126,27 @@ impl Bridge {
             {
                 return error_envelope("process actions are not allowed in code mode".to_string());
             }
+        }
+        // Capability ban, not just a name ban: job control and durable
+        // subagents must stay outside a program so the parent can observe
+        // and approve them.
+        if matches!(
+            name,
+            "job"
+                | "agent"
+                | "spawn_agent"
+                | "message_agent"
+                | "wait_agent"
+                | "list_agents"
+                | "interrupt_agent"
+                | "close_agent"
+                | "resume_agent"
+                | "delegate"
+                | "call_subagent"
+        ) {
+            return error_envelope(format!(
+                "tool '{name}' cannot be called from inside run_code; call it directly"
+            ));
         }
         self.emit(stark_contract::Delta::tool_started(name, args_json));
         let started = Instant::now();

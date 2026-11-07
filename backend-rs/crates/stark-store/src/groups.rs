@@ -51,6 +51,16 @@ impl GroupStore {
         manifest: &Value,
         origin_workspace_id: &str,
     ) -> Result<Value, String> {
+        self.create_with_origin(manifest, origin_workspace_id, "")
+            .await
+    }
+
+    pub async fn create_with_origin(
+        &self,
+        manifest: &Value,
+        origin_workspace_id: &str,
+        origin_chat_id: &str,
+    ) -> Result<Value, String> {
         let goal = manifest
             .get("goal")
             .and_then(Value::as_str)
@@ -80,8 +90,11 @@ impl GroupStore {
         tokio::fs::create_dir_all(&path.join(".gp"))
             .await
             .map_err(|error| error.to_string())?;
-        if !origin_workspace_id.trim().is_empty() {
-            let origin = json!({"workspace_id": origin_workspace_id.trim()});
+        if !origin_workspace_id.trim().is_empty() || !origin_chat_id.trim().is_empty() {
+            let origin = json!({
+                "workspace_id": origin_workspace_id.trim(),
+                "chat_id": origin_chat_id.trim()
+            });
             tokio::fs::write(path.join(".gp").join("origin.json"), format!("{origin}\n"))
                 .await
                 .map_err(|error| error.to_string())?;
@@ -597,6 +610,10 @@ impl GroupStore {
         Ok(())
     }
 
+    pub async fn origin_chat(&self, project_id: &str) -> Option<String> {
+        read_origin_chat(&self.root.join(project_id)).await
+    }
+
     pub async fn detail(&self, project_id: &str, event_limit: usize) -> Result<Value, String> {
         validate_id(project_id)?;
         let path = self.root.join(project_id);
@@ -824,6 +841,47 @@ impl GroupStore {
                 )
                 .await?;
                 format!("Added milestone {id}.")
+            }
+            "message" => {
+                let body = params
+                    .get("body")
+                    .or_else(|| params.get("content"))
+                    .or_else(|| params.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "message needs a non-empty body".to_string())?;
+                let body: String = body.chars().take(8_000).collect();
+                let to = params
+                    .get("to")
+                    .or_else(|| params.get("target"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("all");
+                let kind = params
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("note");
+                append_event(
+                    &pool,
+                    project_id,
+                    "message.sent",
+                    "owner",
+                    None,
+                    None,
+                    json!({
+                        "from": "owner",
+                        "to": to,
+                        "body": body,
+                        "kind": kind,
+                        "deliver": true,
+                    }),
+                )
+                .await?;
+                format!("Message sent to {to}.")
             }
             "cancel_item" | "invalidate_item" => {
                 let item_id = params
@@ -1164,6 +1222,18 @@ async fn read_origin(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+async fn read_origin_chat(path: &Path) -> Option<String> {
+    let text = tokio::fs::read_to_string(path.join(".gp").join("origin.json"))
+        .await
+        .ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn parse_json(raw: String) -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::Null)
 }
@@ -1259,6 +1329,68 @@ mod tests {
         assert_eq!(store.events("demo", 0, 10).await.unwrap().len(), 3);
         let item = store.item("demo", "i1").await.unwrap();
         assert_eq!(item["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn owner_message_is_projected_into_the_group_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        store
+            .create(
+                &json!({
+                    "id": "chat-demo",
+                    "goal": "Talk to the team",
+                    "milestones": [{
+                        "id": "m1",
+                        "title": "Build",
+                        "items": [{"id": "i1", "title": "Do it"}]
+                    }]
+                }),
+                "ws-1",
+            )
+            .await
+            .unwrap();
+        store
+            .update(
+                "chat-demo",
+                "message",
+                &json!({"body": "Please compare pricing first", "to": "all"}),
+            )
+            .await
+            .unwrap();
+        let detail = store.detail("chat-demo", 60).await.unwrap();
+        let messages = detail["messages"].as_array().cloned().unwrap_or_default();
+        assert!(messages.iter().any(|message| {
+            message["body"] == "Please compare pricing first"
+                && message["from"] == "owner"
+                && message["to"] == "all"
+        }));
+    }
+
+    #[tokio::test]
+    async fn stores_origin_chat_for_group_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        store
+            .create_with_origin(
+                &json!({
+                    "id": "origin-test",
+                    "goal": "Notify the manager",
+                    "milestones": [{
+                        "id": "m1",
+                        "title": "Build",
+                        "items": [{"id": "i1", "title": "Do it"}]
+                    }]
+                }),
+                "ws-1",
+                "chat-origin",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.origin_chat("origin-test").await.as_deref(),
+            Some("chat-origin")
+        );
     }
 
     #[tokio::test]

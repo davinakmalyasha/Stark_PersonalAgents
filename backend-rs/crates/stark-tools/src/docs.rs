@@ -20,7 +20,10 @@ pub async fn read_pdf(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if file_path.is_empty() {
         return ToolOutcome::err("Error: file_path is required");
     }
-    let path = input_path(ctx, file_path);
+    let path = match input_path(ctx, file_path) {
+        Ok(path) => path,
+        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+    };
     if !path.is_file() {
         return ToolOutcome::err(format!("Error: File not found: {file_path}"));
     }
@@ -216,13 +219,8 @@ pub async fn create_xlsx(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     ))
 }
 
-fn input_path(ctx: &ToolContext, raw: &str) -> PathBuf {
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        ctx.workspace.join(path)
-    }
+fn input_path(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
+    crate::paths::resolve_workspace_path(&ctx.workspace, raw)
 }
 
 fn parse_pages(value: &str) -> Result<Vec<usize>, String> {

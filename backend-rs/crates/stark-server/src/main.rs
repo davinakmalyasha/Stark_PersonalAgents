@@ -225,6 +225,57 @@ struct RunTarget {
 }
 
 impl ServerState {
+    /// Pick a different configured provider with a usable key and model. The
+    /// explicit `STARK_FALLBACK_PROVIDER` wins; otherwise the first healthy
+    /// other provider in `providers.json` order is used.
+    fn fallback_config(&self, effective: &EffectiveAgent) -> Option<ProviderConfig> {
+        let preferred = std::env::var("STARK_FALLBACK_PROVIDER")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let candidates = self.config.provider_summaries();
+        let chosen = candidates
+            .iter()
+            .find(|provider| {
+                preferred
+                    .as_deref()
+                    .is_some_and(|wanted| provider.id.eq_ignore_ascii_case(wanted))
+                    && !provider.id.eq_ignore_ascii_case(&effective.provider)
+                    && provider.has_key
+                    && !provider.models.is_empty()
+            })
+            .or_else(|| {
+                candidates.iter().find(|provider| {
+                    !provider.id.eq_ignore_ascii_case(&effective.provider)
+                        && provider.has_key
+                        && !provider.models.is_empty()
+                })
+            })?;
+        let requested = if chosen.default_model.trim().is_empty() {
+            chosen.models.first()?.id.clone()
+        } else {
+            chosen.default_model.clone()
+        };
+        let model = self
+            .config
+            .resolve_model(&chosen.id, &requested)
+            .map(|(_, model)| model)
+            .unwrap_or(requested);
+        Some(ProviderConfig {
+            mode: chosen.id.clone(),
+            base_url: chosen.base_url.clone(),
+            api_key: self.config.resolve_key(&chosen.id),
+            model,
+        })
+    }
+
+    fn attach_fallback(&self, provider: Provider, effective: &EffectiveAgent) -> Provider {
+        match self.fallback_config(effective) {
+            Some(config) => provider.with_fallback(config),
+            None => provider,
+        }
+    }
+
     /// Client for the provider an agent resolved to. Falls back to the active
     /// provider only if the registry entry is missing.
     fn provider_for(&self, effective: &EffectiveAgent) -> Provider {
@@ -242,7 +293,7 @@ impl ServerState {
                 || current.api_key != key
                 || !current.mode.eq_ignore_ascii_case(&effective.provider);
             if !stale && current.model.eq_ignore_ascii_case(&effective.model) {
-                return provider.clone();
+                return self.attach_fallback(provider.clone(), effective);
             }
             // Hot reload: rebuild the client with the edited base/key/model.
             let mut config = current.clone();
@@ -250,18 +301,19 @@ impl ServerState {
             config.base_url = effective.base_url.clone();
             config.api_key = key;
             config.model = effective.model.clone();
-            return Provider::new(config).unwrap_or_else(|error| {
+            let rebuilt = Provider::new(config).unwrap_or_else(|error| {
                 tracing::warn!(
                     "provider '{}' could not apply the edited config: {error}",
                     effective.provider
                 );
                 provider.clone()
             });
+            return self.attach_fallback(rebuilt, effective);
         }
         // A provider added to providers.json after startup is not in the
         // prebuilt map yet. Build it on demand so hot-reload covers new
         // gateways, not just edits to existing ones.
-        Provider::new(ProviderConfig {
+        let built = Provider::new(ProviderConfig {
             mode: effective.provider.clone(),
             base_url: effective.base_url.clone(),
             api_key: self.config.resolve_key(&effective.provider),
@@ -273,7 +325,8 @@ impl ServerState {
                 effective.provider
             );
             self.provider.clone()
-        })
+        });
+        self.attach_fallback(built, effective)
     }
 }
 
@@ -1323,6 +1376,43 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     {
         tracing::warn!("group {project_id} item finish failed: {error}");
     }
+    notify_group_origin(
+        &state,
+        &groups,
+        &project_id,
+        item["id"].as_str().unwrap_or(""),
+        item["title"].as_str().unwrap_or("item"),
+        success,
+        &output,
+    )
+    .await;
+}
+
+async fn notify_group_origin(
+    state: &ServerState,
+    groups: &GroupStore,
+    project_id: &str,
+    item_id: &str,
+    title: &str,
+    success: bool,
+    report: &str,
+) {
+    let Some(chat_id) = groups.origin_chat(project_id).await else {
+        return;
+    };
+    let status = if success { "completed" } else { "failed" };
+    let report: String = report.chars().take(4_000).collect();
+    let message = format!(
+        "[GROUP RESULT] project={project_id} item={item_id} ({title}) status={status}\n\n{report}"
+    );
+    if state.runs.follow_up(&chat_id, &message) {
+        return;
+    }
+    let Ok(Some(chat)) = state.store.get_chat(&chat_id).await else {
+        return;
+    };
+    let target = canvas_target(state, &chat);
+    spawn_follow_up_run(state.clone(), target, message);
 }
 
 async fn run_handler(
@@ -1765,6 +1855,11 @@ async fn agent_loop(state: ServerState) {
         // The rollout file is never mutated here. An unfinished TurnStarted
         // without a matching TurnComplete/TurnAborted is the interruption
         // signal; resume derives it on read.
+    }
+    if let Ok(agents) = store.list(None).await {
+        for note in stark_core::worktree::gc(&state.harness_root, &agents) {
+            tracing::info!("worktree gc: {note}");
+        }
     }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

@@ -154,7 +154,7 @@ async fn git_clone(repo: &str, branch: Option<&str>, path: &Path) -> Result<(), 
 }
 
 async fn clone_workspace(ctx: &RunContext, args: &Value) -> ToolOutcome {
-    if ctx.file_access.is_read_only() && ctx.scope != "orchestrator" {
+    if ctx.file_access.is_read_only() {
         return ToolOutcome::err(
             "[BLOCKED] Read-only agent cannot clone workspaces. Report findings instead.",
         );
@@ -203,7 +203,7 @@ async fn create(ctx: &RunContext, args: &Value) -> ToolOutcome {
     // Registry writes are orchestration, not filesystem edits — but only the
     // orchestrator may do them with read-only file access. Spawned children
     // with read access (explore, deep subagents) may only list/inspect.
-    if ctx.file_access.is_read_only() && ctx.scope != "orchestrator" {
+    if ctx.file_access.is_read_only() {
         return ToolOutcome::err(
             "[BLOCKED] Read-only agent cannot create workspaces. Report findings instead.",
         );
@@ -465,7 +465,7 @@ async fn info(ctx: &RunContext, args: &Value) -> ToolOutcome {
 }
 
 async fn remove(ctx: &RunContext, args: &Value) -> ToolOutcome {
-    if ctx.file_access.is_read_only() && ctx.scope != "orchestrator" {
+    if ctx.file_access.is_read_only() {
         return ToolOutcome::err(
             "[BLOCKED] Read-only agent cannot remove workspaces. Report findings instead.",
         );
@@ -674,10 +674,10 @@ mod tests {
         // passes without touching the real D:\MyProject.
         let _lock = ENV_LOCK.lock().await;
         let _guard = EnvGuard::set("STARK_PROJECTS_ROOT", dir.path());
-        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Read).await;
+        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Write).await;
 
-        // create by name under an explicit root (orchestrator may write the
-        // registry with read-only file access).
+        // create by name under an explicit root (a write-capable orchestrator
+        // may write the registry; read-only managers may only list/info).
         let created = workspace(
             &ctx,
             &json!({"action": "create", "name": "Coffee Shop", "root": root.to_string_lossy()}),
@@ -748,12 +748,23 @@ mod tests {
         // ...but listing and info stay available.
         let listed = workspace(&ctx, &json!({"action": "list"})).await;
         assert!(!listed.is_error, "{}", listed.content);
+
+        // The Orchestrator is read-only too: it may list/info but not register
+        // or remove workspaces. Registration is a filesystem write.
+        let orch = test_context(dir.path(), "orchestrator", crate::FileAccess::Read).await;
+        let denied_orch = workspace(
+            &orch,
+            &json!({"action": "create", "name": "nope", "root": dir.path().join("p").to_string_lossy()}),
+        )
+        .await;
+        assert!(denied_orch.is_error);
+        assert!(denied_orch.content.contains("[BLOCKED]"));
     }
 
     #[tokio::test]
     async fn virtual_workspaces_cannot_be_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Read).await;
+        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Write).await;
         let denied = workspace(
             &ctx,
             &json!({"action": "remove", "workspace_id": "_general"}),
@@ -821,7 +832,7 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
 
-        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Read).await;
+        let ctx = test_context(dir.path(), "orchestrator", crate::FileAccess::Write).await;
         let outcome = workspace(
             &ctx,
             &json!({

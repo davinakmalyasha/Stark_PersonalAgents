@@ -14,7 +14,7 @@ pub use error::{Error, ErrorLocation, Result, TextPosition, TextRange};
 pub use parser::PolicyParser;
 pub use permissions::{Effect, PermissionSet, Rule as PermissionRule, auto_approve};
 pub use policy::{Evaluation, MatchOptions, Policy, RequirementsExecPolicy};
-pub use read_only::{check_read_only, is_read_only_command};
+pub use read_only::{check_read_only, is_known_safe_command, is_read_only_command};
 pub use rule::{PatternToken, PrefixPattern, PrefixRule, Rule, RuleMatch, RuleRef};
 
 const DEFAULT_RULES: &str = r#"
@@ -85,6 +85,11 @@ fn heuristics_decision(tokens: &[String]) -> Decision {
     // at the policy layer, not just in the read tool. `.env.example` stays
     // allowed (it is a template, not a secret).
     if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("set") {
+        return Decision::Forbidden;
+    }
+    if tokens.first().is_some_and(|program| {
+        program.eq_ignore_ascii_case("env") || program.eq_ignore_ascii_case("printenv")
+    }) {
         return Decision::Forbidden;
     }
     if normalized == "export -p" || normalized.starts_with("export -p ") {

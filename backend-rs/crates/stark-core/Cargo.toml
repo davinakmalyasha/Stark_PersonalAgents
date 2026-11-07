@@ -11,6 +11,7 @@ futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 stark-contract = { path = "../stark-contract" }
+stark-policy = { path = "../stark-policy" }
 stark-config = { path = "../stark-config" }
 stark-sandbox = { path = "../stark-sandbox" }
 stark-providers = { path = "../stark-providers" }

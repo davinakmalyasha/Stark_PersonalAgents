@@ -238,10 +238,19 @@ impl Transport {
         )
         .await
         .map_err(|_| format!("MCP tool {tool} timed out"))??;
+        let multiline = |value: &Value| {
+            let text = content_text(value);
+            if text.is_empty()
+                && let Some(structured) = value.get("structuredContent")
+            {
+                return structured.to_string();
+            }
+            text
+        };
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(content_text(&result));
+            return Err(multiline(&result));
         }
-        let text = content_text(&result);
+        let text = multiline(&result);
         if text.is_empty() {
             Ok(result.to_string())
         } else {
@@ -598,6 +607,18 @@ impl McpManager {
             })
             .unwrap_or_else(|| tool_name.clone());
         if server.config.approval == "prompt" {
+            if stark_sandbox::SandboxProfile::from_env(&ctx.workspace).approval
+                == stark_sandbox::ApprovalPolicy::Never
+            {
+                return Err(format!(
+                    "MCP tool call {server_name}/{actual_tool} requires approval, but approval policy is 'never'"
+                ));
+            }
+            if ctx.depth > 0 {
+                return Err(format!(
+                    "MCP tool call {server_name}/{actual_tool} requires approval; subagents run non-interactively"
+                ));
+            }
             let question = json!({
                 "id": "mcp-approval",
                 "question": format!("Approve MCP tool call {server_name}/{actual_tool} with {}?", truncate(&args.to_string(), 400)),
@@ -626,10 +647,35 @@ impl McpManager {
             }
         }
         let timeout = Duration::from_secs_f64(server.config.tool_timeout_sec.max(1.0));
+        let first = {
+            let mut transport = server.transport.lock().await;
+            let transport = transport
+                .as_mut()
+                .ok_or_else(|| format!("MCP server '{server_name}' has no transport"))?;
+            transport
+                .call_tool(&actual_tool, args.clone(), timeout)
+                .await
+        };
+        let error = match first {
+            Ok(text) => return Ok(text),
+            Err(error) => error,
+        };
+        // A dead stdio pipe or a hung HTTP transport is recovered by one
+        // restart + retry; a normal tool error is returned unchanged.
+        if !transport_failure(&error) {
+            return Err(error);
+        }
+        self.restart_server(&server_name).await?;
+        let server = self
+            .servers
+            .read()
+            .ok()
+            .and_then(|servers| servers.get(&server_name).cloned())
+            .ok_or_else(|| format!("MCP server '{server_name}' disappeared during restart"))?;
         let mut transport = server.transport.lock().await;
         let transport = transport
             .as_mut()
-            .ok_or_else(|| format!("MCP server '{server_name}' has no transport"))?;
+            .ok_or_else(|| format!("MCP server '{server_name}' has no transport after restart"))?;
         transport.call_tool(&actual_tool, args, timeout).await
     }
 
@@ -812,9 +858,33 @@ pub async fn call(fq_name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome
         return ToolOutcome::err("Error: MCP is not initialized");
     };
     match manager.call(fq_name, args.clone(), ctx).await {
-        Ok(text) => ToolOutcome::ok(truncate(&text, 20_000)),
-        Err(error) => ToolOutcome::err(format!("Error: MCP call failed: {error}")),
+        Ok(text) => ToolOutcome::ok(truncate_output(&text, 20_000)),
+        Err(error) => ToolOutcome::err(format!(
+            "Error: MCP call failed: {error}. Check the server status; restart or reconnect the MCP server, then retry."
+        )),
     }
+}
+
+fn transport_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("closed stdout")
+        || error.contains("broken pipe")
+        || error.contains("connection")
+        || error.contains("failed to write")
+        || error.contains("eof")
+        || error.contains("timed out")
+}
+
+fn truncate_output(value: &str, cap: usize) -> String {
+    let count = value.chars().count();
+    if count <= cap {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(cap).collect();
+    out.push_str(&format!(
+        "\n[MCP output truncated at {cap} chars; {count} chars total. Request a narrower query or page the result.]"
+    ));
+    out
 }
 
 fn tool_spec(server: &str, tool: &str, definition: &Value) -> Value {
@@ -914,6 +984,14 @@ fn truncate(value: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_failures_are_distinguished_from_tool_errors() {
+        assert!(transport_failure("MCP server closed stdout"));
+        assert!(transport_failure("MCP tool x timed out"));
+        assert!(transport_failure("failed to write stdin: broken pipe"));
+        assert!(!transport_failure("tool returned an error: invalid input"));
+    }
 
     #[test]
     fn tool_search_ranks_name_matches_first() {

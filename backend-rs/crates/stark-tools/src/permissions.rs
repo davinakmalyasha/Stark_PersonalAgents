@@ -71,6 +71,13 @@ pub async fn gate(
             if stark_policy::auto_approve(&ctx.harness_root) {
                 return None;
             }
+            if stark_sandbox::SandboxProfile::from_env(&ctx.workspace).approval
+                == stark_sandbox::ApprovalPolicy::Never
+            {
+                return Some(ToolOutcome::err(format!(
+                    "[BLOCKED] {action} on {label} requires approval, but approval policy is 'never'. Change the request or update STARK_APPROVAL."
+                )));
+            }
             if ctx.depth > 0 {
                 return Some(ToolOutcome::err(format!(
                     "[BLOCKED] Subagents run non-interactively; {action} on {label} requires user approval."

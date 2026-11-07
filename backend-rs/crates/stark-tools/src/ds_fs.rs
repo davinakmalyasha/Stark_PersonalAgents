@@ -20,18 +20,63 @@ const MAX_LINE_CHARS: usize = 2000;
 const GLOB_LIMIT: usize = 300;
 const GREP_LIMIT: usize = 500;
 
-fn resolve(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
+fn resolve_in(ctx: &ToolContext, base: &Path, raw: &str) -> Result<PathBuf, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("path is empty".to_string());
     }
     let candidate = Path::new(raw);
+    let root = if base == ctx.workspace {
+        ctx.current_dir()
+    } else {
+        base.to_path_buf()
+    };
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        ctx.current_dir().join(candidate)
+        root.join(candidate)
     };
-    resolve_workspace_path(&ctx.workspace, &joined.to_string_lossy())
+    resolve_workspace_path(base, &joined.to_string_lossy())
+}
+
+/// Resolve an optional `workspace`/`workspace_id` argument for read-only
+/// cross-workspace inspection. Writable agents stay inside their own
+/// workspace; the Orchestrator (and other read-only scopes) may read any
+/// registered workspace by id or exact name.
+fn read_base(ctx: &ToolContext, args: &Value) -> Result<PathBuf, String> {
+    let raw = args
+        .get("workspace")
+        .or_else(|| args.get("workspace_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(raw) = raw else {
+        return Ok(ctx.workspace.clone());
+    };
+    if ctx.access != "read" {
+        return Err(
+            "workspace override is only available to read-only agents; use your current workspace"
+                .to_string(),
+        );
+    }
+    let registry = stark_store::WorkspaceRegistry::new(&ctx.harness_root);
+    if let Some(record) = registry.get(raw) {
+        return Ok(PathBuf::from(record.path));
+    }
+    let records = registry.list();
+    let matches: Vec<_> = records
+        .iter()
+        .filter(|record| record.name.eq_ignore_ascii_case(raw))
+        .collect();
+    match matches.as_slice() {
+        [record] => Ok(PathBuf::from(&record.path)),
+        [] => Err(format!(
+            "unknown workspace '{raw}'. Use workspace action=\"list\" to see registered ids and names."
+        )),
+        _ => Err(format!(
+            "workspace name '{raw}' is ambiguous. Retry with an exact id."
+        )),
+    }
 }
 
 fn trim_line(line: &str) -> String {
@@ -48,11 +93,15 @@ pub async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(raw) = args.get("file_path").and_then(Value::as_str) else {
         return ToolOutcome::err("Error: read requires file_path");
     };
-    let path = match resolve(ctx, raw) {
+    let base = match read_base(ctx, args) {
+        Ok(base) => base,
+        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+    };
+    let path = match resolve_in(ctx, &base, raw) {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
-    let resource = crate::paths::relative_display(&ctx.workspace, &path);
+    let resource = crate::paths::relative_display(&base, &path);
     if let Some(blocked) = crate::permissions::gate(ctx, "read", &[resource], raw).await {
         return blocked;
     }
@@ -62,7 +111,20 @@ pub async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .is_some_and(|ext| crate::images::mime_for_ext(ext).is_some())
     {
         let forwarded = serde_json::json!({"file_path": path.to_string_lossy()});
-        return crate::read::read_file(ctx, &forwarded).await;
+        // `read_file` resolves against ctx.workspace; for a cross-workspace
+        // read, give it a context rooted at the selected workspace.
+        let mut image_ctx = ctx.clone();
+        image_ctx.workspace = base.clone();
+        image_ctx.cwd = std::sync::Arc::new(std::sync::Mutex::new(base.clone()));
+        return crate::read::read_file(&image_ctx, &forwarded).await;
+    }
+    if let Ok(metadata) = tokio::fs::metadata(&path).await
+        && metadata.len() > 10 * 1024 * 1024
+    {
+        return ToolOutcome::err(format!(
+            "Error: {raw} is too large to read ({:.1} MB). Use grep/glob to find the relevant section, or read it with offset/limit.",
+            metadata.len() as f64 / (1024.0 * 1024.0)
+        ));
     }
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(content) => content,
@@ -107,40 +169,6 @@ pub async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     ToolOutcome::ok(output)
 }
 
-pub async fn write(ctx: &ToolContext, args: &Value) -> ToolOutcome {
-    let Some(raw) = args.get("file_path").and_then(Value::as_str) else {
-        return ToolOutcome::err("Error: write requires file_path");
-    };
-    let Some(content) = args.get("content").and_then(Value::as_str) else {
-        return ToolOutcome::err("Error: write requires content");
-    };
-    let path = match resolve(ctx, raw) {
-        Ok(path) => path,
-        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
-    };
-    let resource = crate::paths::relative_display(&ctx.workspace, &path);
-    if let Some(blocked) = crate::permissions::gate(ctx, "edit", &[resource], raw).await {
-        return blocked;
-    }
-    if path.exists() && !ctx.was_read(&path) {
-        return ToolOutcome::err(format!("Error: read {raw} before overwriting it"));
-    }
-    if let Some(parent) = path.parent()
-        && let Err(error) = tokio::fs::create_dir_all(parent).await
-    {
-        return ToolOutcome::err(format!("Error: {raw}: {error}"));
-    }
-    if let Err(error) = tokio::fs::write(&path, content).await {
-        return ToolOutcome::err(format!("Error: {raw}: {error}"));
-    }
-    ctx.mark_read(path);
-    ToolOutcome::ok(format!(
-        "[OK] Wrote {raw} ({} lines, {} chars)",
-        content.lines().count(),
-        content.chars().count()
-    ))
-}
-
 pub async fn edit(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let Some(raw) = args.get("file_path").and_then(Value::as_str) else {
         return ToolOutcome::err("Error: edit requires file_path");
@@ -154,7 +182,7 @@ pub async fn edit(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if old_string.is_empty() {
         return ToolOutcome::err("Error: old_string must not be empty");
     }
-    let path = match resolve(ctx, raw) {
+    let path = match resolve_in(ctx, &ctx.workspace, raw) {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
@@ -248,6 +276,10 @@ fn scratch_path(ctx: &ToolContext, prefix: &str) -> PathBuf {
 }
 
 async fn write_scratch(ctx: &ToolContext, prefix: &str, content: &str) -> Option<String> {
+    // Read-only agents must not write, even scratch files.
+    if ctx.access == "read" {
+        return None;
+    }
     let path = scratch_path(ctx, prefix);
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -265,8 +297,12 @@ pub async fn glob(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     {
         return blocked;
     }
+    let base = match read_base(ctx, args) {
+        Ok(base) => base,
+        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+    };
     let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let root = match resolve(ctx, raw_root) {
+    let root = match resolve_in(ctx, &base, raw_root) {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
@@ -280,7 +316,7 @@ pub async fn glob(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let rel = relative_display(&ctx.workspace, entry.path());
+        let rel = relative_display(&base, entry.path());
         let matched = if anchored {
             matcher.is_match(&rel)
         } else {
@@ -303,7 +339,7 @@ pub async fn glob(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let shown: Vec<String> = files
         .iter()
         .take(GLOB_LIMIT)
-        .map(|(path, _)| relative_display(&ctx.workspace, path))
+        .map(|(path, _)| relative_display(&base, path))
         .collect();
     if total == 0 {
         return ToolOutcome::ok(format!("No files found matching: {pattern}"));
@@ -312,7 +348,7 @@ pub async fn glob(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if total > GLOB_LIMIT {
         let all: Vec<String> = files
             .iter()
-            .map(|(path, _)| relative_display(&ctx.workspace, path))
+            .map(|(path, _)| relative_display(&base, path))
             .collect();
         if let Some(path) = write_scratch(ctx, "glob", &all.join("\n")).await {
             output.push_str(&format!(
@@ -334,8 +370,12 @@ pub async fn grep(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     {
         return blocked;
     }
+    let base = match read_base(ctx, args) {
+        Ok(base) => base,
+        Err(error) => return ToolOutcome::err(format!("Error: {error}")),
+    };
     let raw_root = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let root = match resolve(ctx, raw_root) {
+    let root = match resolve_in(ctx, &base, raw_root) {
         Ok(path) => path,
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
@@ -354,10 +394,17 @@ pub async fn grep(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let rel = relative_display(&ctx.workspace, entry.path());
+        let rel = relative_display(&base, entry.path());
         if let Some(include) = &include
             && !include.is_match(&rel)
             && !include.is_match(entry.file_name().to_string_lossy().as_ref())
+        {
+            continue;
+        }
+        if entry
+            .metadata()
+            .ok()
+            .is_some_and(|metadata| metadata.len() > 4 * 1024 * 1024)
         {
             continue;
         }
@@ -432,31 +479,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_requires_read_for_existing_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "before").unwrap();
-        let ctx = context(dir.path());
-        let denied = write(
-            &ctx,
-            &serde_json::json!({"file_path": "a.txt", "content": "after"}),
-        )
-        .await;
-        assert!(denied.is_error);
-        assert!(denied.content.contains("read a.txt before overwriting"));
-        let _ = read(&ctx, &serde_json::json!({"file_path": "a.txt"})).await;
-        let ok = write(
-            &ctx,
-            &serde_json::json!({"file_path": "a.txt", "content": "after"}),
-        )
-        .await;
-        assert!(!ok.is_error, "{}", ok.content);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "after"
-        );
-    }
-
-    #[tokio::test]
     async fn edit_supports_unique_and_replace_all() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "x x x").unwrap();
@@ -477,6 +499,53 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "y y y"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_agent_can_inspect_a_registered_workspace() {
+        let harness = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("notes.txt"), "project note\n").unwrap();
+        std::fs::create_dir_all(harness.path().join(".deep_agents")).unwrap();
+        let registry = serde_json::json!({
+            "workspaces": [{
+                "id": "ws-4ceria",
+                "name": "4Ceria",
+                "path": project.path().to_string_lossy(),
+                "addedAt": "2026-01-01"
+            }]
+        });
+        std::fs::write(
+            harness.path().join(".deep_agents/workspaces.json"),
+            serde_json::to_string(&registry).unwrap(),
+        )
+        .unwrap();
+        let ctx = ToolContext::new(harness.path(), "orch", Arc::new(QuestionBroker::new()))
+            .with_harness_root(harness.path())
+            .with_access("read");
+        let out = read(
+            &ctx,
+            &serde_json::json!({"workspace": "4Ceria", "file_path": "notes.txt"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("project note"), "{}", out.content);
+
+        // A writable agent cannot use the selector to escape its workspace.
+        let writable = ToolContext::new(harness.path(), "dev", Arc::new(QuestionBroker::new()))
+            .with_harness_root(harness.path())
+            .with_access("write");
+        let denied = read(
+            &writable,
+            &serde_json::json!({"workspace": "4Ceria", "file_path": "notes.txt"}),
+        )
+        .await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied
+                .content
+                .contains("only available to read-only agents")
         );
     }
 

@@ -199,10 +199,14 @@ impl ProcessManager {
         owner: &str,
         tty: bool,
     ) -> Result<SpawnedProcess, String> {
-        if self.processes.contains_key(command) {
-            return Err(format!(
-                "background process already exists for this command: {command}"
-            ));
+        if let Some(existing) = self.processes.get(command) {
+            // Idempotent retry: return the existing handle instead of making
+            // the model guess a new command string.
+            return Ok(SpawnedProcess {
+                id: existing.id,
+                name: existing.name.clone(),
+                pid: existing.pid,
+            });
         }
         self.spawn_inner(command, workdir, owner, Some(command.to_string()), tty)
     }
@@ -231,7 +235,7 @@ impl ProcessManager {
     ) -> Result<SpawnedProcess, String> {
         if self.by_id.len() >= MAX_PROCESSES {
             return Err(format!(
-                "unified exec process limit reached ({MAX_PROCESSES})"
+                "unified exec process limit reached ({MAX_PROCESSES}). List jobs, read their logs, then kill finished ones before starting another."
             ));
         }
 
@@ -285,7 +289,11 @@ impl ProcessManager {
 
         let mut child = process
             .spawn()
-            .map_err(|error| format!("failed to start process: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "failed to start process: {error}. If bash is missing, install Git Bash or set STARK_BASH to a bash executable."
+                )
+            })?;
         let pid = child.id().unwrap_or(0);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -335,7 +343,11 @@ impl ProcessManager {
         let child = pair
             .slave
             .spawn_command(builder)
-            .map_err(|error| format!("failed to start PTY process: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "failed to start PTY process: {error}. If bash is missing, install Git Bash or set STARK_BASH to a bash executable."
+                )
+            })?;
         let pid = child.process_id().unwrap_or(0);
         let reader = pair
             .master

@@ -1,5 +1,5 @@
 //! Durable multi-agent tools: spawn_agent, message_agent, wait_agent,
-//! list_agents, interrupt_agent, close_agent.
+//! interrupt_agent, close_agent.
 //!
 //! `message_agent` merges queue-only messaging with follow-up turns:
 //! `wake=true` triggers an idle agent, `wake=false` (default) only queues.
@@ -397,36 +397,6 @@ async fn wait_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
     }
 }
 
-async fn list_agents(ctx: &RunContext, args: &Value) -> Result<String, String> {
-    let store = store(ctx).await?;
-    let current = current(ctx, &store).await?;
-    let prefix = args
-        .get("path_prefix")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|prefix| !prefix.is_empty());
-    let all = store.list(None).await.map_err(|error| error.to_string())?;
-    let mut rows = Vec::new();
-    for agent in all {
-        if agent.id == current.id || agent.status == "closed" {
-            continue;
-        }
-        if !same_tree(&current, &agent) {
-            continue;
-        }
-        if let Some(prefix) = prefix
-            && !agent.path.starts_with(prefix)
-        {
-            continue;
-        }
-        rows.push(json!({
-            "agent_name": if agent.path.is_empty() { agent.id.clone() } else { agent.path.clone() },
-            "agent_status": agent.status,
-        }));
-    }
-    Ok(json!({"agents": rows}).to_string())
-}
-
 async fn interrupt_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
     let store = store(ctx).await?;
     let current = current(ctx, &store).await?;
@@ -442,57 +412,6 @@ async fn interrupt_agent(ctx: &RunContext, args: &Value) -> Result<String, Strin
     crate::cancel_agent_run(&target.id);
     let _ = store.set_status(&target.id, "interrupted", false).await;
     Ok(json!({"previous_status": previous}).to_string())
-}
-
-async fn resume_agent(ctx: &RunContext, args: &Value) -> Result<String, String> {
-    let store = store(ctx).await?;
-    let current = current(ctx, &store).await?;
-    let target = args
-        .get("target")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "resume_agent requires target".to_string())?;
-    let message = args
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .ok_or_else(|| "resume_agent requires message".to_string())?;
-    let target = resolve_target(&store, &current, target).await?;
-    if !is_descendant_of(&store, &target, &current).await? {
-        return Err(format!(
-            "agent {} is not in your delegation tree",
-            target.path
-        ));
-    }
-    if matches!(target.status.as_str(), "running" | "queued") {
-        return Err(format!(
-            "agent {} is already active; use message_agent",
-            target.path
-        ));
-    }
-    let id = store
-        .enqueue(
-            Some(&current.id),
-            &target.id,
-            "resume",
-            message,
-            "trigger",
-            json!({"task_path": target.path}),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if !store
-        .reopen(&target.id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        return Err(format!("agent {} could not be resumed", target.path));
-    }
-    // Resume continues from the rollout: unmatched tool calls get a synthetic
-    // output so the model does not see an unanswered call.
-    crate::rollout_trace::ensure_resumable(&ctx.store, ctx.store.harness_root(), &target.chat_id)
-        .await;
-    Ok(json!({"resumed": target.id, "submission_id": id}).to_string())
 }
 
 async fn close_tree(store: &AgentStore, agent: &AgentRecord) -> Result<(), String> {
@@ -532,10 +451,8 @@ pub async fn handle(ctx: &RunContext, name: &str, args: &Value) -> ToolOutcome {
         "spawn_agent" => spawn_agent(ctx, args).await,
         "message_agent" => message_agent(ctx, args).await,
         "wait_agent" => wait_agent(ctx, args).await,
-        "list_agents" => list_agents(ctx, args).await,
         "interrupt_agent" => interrupt_agent(ctx, args).await,
         "close_agent" => close_agent(ctx, args).await,
-        "resume_agent" => resume_agent(ctx, args).await,
         other => Err(format!("unknown multi-agent tool '{other}'")),
     };
     match result {
@@ -610,10 +527,6 @@ mod tests {
         assert_eq!(child.access, "write");
         assert_eq!(child.status, "queued");
         assert_eq!(child.depth, 1);
-
-        let listed = handle(&ctx, "list_agents", &json!({})).await;
-        assert!(!listed.is_error, "{}", listed.content);
-        assert!(listed.content.contains("task_1"), "{}", listed.content);
 
         let message = handle(
             &ctx,

@@ -9,6 +9,14 @@ use stark_store::{MemoryStore, NewEntry};
 
 use crate::{ToolContext, ToolOutcome};
 
+fn memory_key(ctx: &crate::ToolContext, scope: &str) -> String {
+    match scope {
+        "user" => "_user".to_string(),
+        "session" => format!("_session:{}:{}", ctx.workspace_id, ctx.chat_id),
+        _ => ctx.workspace_id.clone(),
+    }
+}
+
 pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let store = match MemoryStore::open(&ctx.harness_root).await {
         Ok(store) => store,
@@ -20,6 +28,18 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .unwrap_or("index")
         .trim()
         .to_lowercase();
+    let scope = args
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("project")
+        .trim()
+        .to_lowercase();
+    if !matches!(scope.as_str(), "user" | "project" | "session") {
+        return ToolOutcome::err(format!(
+            "Error: unknown memory scope '{scope}'. Use user, project, or session."
+        ));
+    }
+    let memory_key = memory_key(ctx, &scope);
     if matches!(action.as_str(), "remember" | "forget" | "pin") && ctx.mode == "plan" {
         return ToolOutcome::err(
             "[BLOCKED] Plan mode is read-only. Memory writes are disabled until /build.",
@@ -27,7 +47,7 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     }
     match action.as_str() {
         "index" => match store
-            .index(&ctx.workspace_id, stark_store::memory_max_chars())
+            .index(&memory_key, stark_store::memory_max_chars())
             .await
         {
             Some(index) => ToolOutcome::ok(index),
@@ -37,13 +57,13 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             ),
         },
         "summary" => match store
-            .summary(&ctx.workspace_id, stark_store::memory_max_chars())
+            .summary(&memory_key, stark_store::memory_max_chars())
             .await
         {
             Some(summary) => ToolOutcome::ok(summary),
             None => ToolOutcome::ok("[MEMORY] No long-form summary yet.".to_string()),
         },
-        "list" => match store.topics(&ctx.workspace_id).await {
+        "list" => match store.topics(&memory_key).await {
             Ok(topics) => {
                 if topics.is_empty() {
                     return ToolOutcome::ok("[MEMORY] No topics yet.".to_string());
@@ -66,9 +86,9 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             let Some(topic) = args.get("topic").and_then(Value::as_str) else {
                 return ToolOutcome::err("Error: memory action='read' requires topic");
             };
-            match store.read_topic(&ctx.workspace_id, topic).await {
+            match store.read_topic(&memory_key, topic).await {
                 Ok(Some(text)) => {
-                    let _ = store.mark_topic_used(&ctx.workspace_id, topic).await;
+                    let _ = store.mark_topic_used(&memory_key, topic).await;
                     ToolOutcome::ok(text.chars().take(32_000).collect::<String>())
                 }
                 Ok(None) => ToolOutcome::err(format!(
@@ -81,7 +101,7 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             let Some(query) = args.get("query").and_then(Value::as_str) else {
                 return ToolOutcome::err("Error: memory action='search' requires query");
             };
-            match store.search(&ctx.workspace_id, query, 20).await {
+            match store.search(&memory_key, query, 20).await {
                 Ok(entries) if entries.is_empty() => {
                     ToolOutcome::ok(format!("[MEMORY] No entries matching '{query}'."))
                 }
@@ -119,9 +139,13 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             let pinned = args.get("pinned").and_then(Value::as_bool).unwrap_or(true);
             match store
                 .add_entry(
-                    &ctx.workspace_id,
+                    &memory_key,
                     NewEntry {
-                        chat_id: ctx.chat_id.clone(),
+                        chat_id: if scope == "session" {
+                            ctx.chat_id.clone()
+                        } else {
+                            String::new()
+                        },
                         agent_id: None,
                         kind: kind.to_string(),
                         topic: topic.to_string(),
@@ -147,7 +171,7 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             else {
                 return ToolOutcome::err("Error: memory action='forget' requires entry_id");
             };
-            match store.forget_entry(&ctx.workspace_id, entry_id).await {
+            match store.forget_entry(&memory_key, entry_id).await {
                 Ok(true) => ToolOutcome::ok(format!("[MEMORY] Forgot entry {entry_id}.")),
                 Ok(false) => ToolOutcome::err(format!("Error: unknown memory entry {entry_id}")),
                 Err(error) => ToolOutcome::err(format!("Error: {error}")),
@@ -163,7 +187,7 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             };
             let pinned = args.get("pinned").and_then(Value::as_bool).unwrap_or(true);
             match store
-                .pin_entry(&ctx.workspace_id, entry_id, pinned)
+                .pin_entry(&memory_key, entry_id, pinned)
                 .await
             {
                 Ok(true) => ToolOutcome::ok(format!(
@@ -174,7 +198,7 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
                 Err(error) => ToolOutcome::err(format!("Error: {error}")),
             }
         }
-        "status" => match store.status(&ctx.workspace_id).await {
+        "status" => match store.status(&memory_key).await {
             Ok(status) => ToolOutcome::ok(serde_json::to_string_pretty(&status).unwrap_or_default()),
             Err(error) => ToolOutcome::err(format!("Error: {error}")),
         },
@@ -213,6 +237,46 @@ mod tests {
         assert!(list.content.contains("preferences"), "{}", list.content);
         let search = handle(&ctx, &json!({"action":"search","query":"pnpm"})).await;
         assert!(search.content.contains("pnpm"), "{}", search.content);
+    }
+
+    #[tokio::test]
+    async fn memory_tiers_are_separated() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path(), "chat-tier", Arc::new(QuestionBroker::new()))
+            .with_workspace_id("ws-tier");
+        let global = handle(
+            &ctx,
+            &json!({"action":"remember","scope":"user","text":"global preference","topic":"preferences"}),
+        )
+        .await;
+        assert!(!global.is_error, "{}", global.content);
+        let project_index = handle(&ctx, &json!({"action":"index"})).await;
+        assert!(!project_index.content.contains("global preference"));
+        let user_index = handle(&ctx, &json!({"action":"index","scope":"user"})).await;
+        assert!(
+            user_index.content.contains("global preference"),
+            "{}",
+            user_index.content
+        );
+
+        let session = handle(
+            &ctx,
+            &json!({"action":"remember","scope":"session","text":"ephemeral note","topic":"tasks"}),
+        )
+        .await;
+        assert!(!session.is_error, "{}", session.content);
+        let project_index = handle(&ctx, &json!({"action":"index"})).await;
+        assert!(!project_index.content.contains("ephemeral note"));
+        let session_search = handle(
+            &ctx,
+            &json!({"action":"search","scope":"session","query":"ephemeral"}),
+        )
+        .await;
+        assert!(
+            session_search.content.contains("ephemeral"),
+            "{}",
+            session_search.content
+        );
     }
 
     #[tokio::test]

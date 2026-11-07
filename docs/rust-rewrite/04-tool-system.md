@@ -15,7 +15,7 @@ Developer catalog:
 
 ```
 bash, job,
-read, write, edit, glob, grep,
+read, apply_patch, edit, glob, grep,
 todo_write, ask_user_question,
 skill, web_search, web_fetch,
 spawn_agent, message_agent, wait_agent,
@@ -136,7 +136,7 @@ isolation or read-only subagent default.
 
 | Area | Module | Tools |
 |---|---|---|
-| Files | `ds_fs` | `read` (text + images), `write`, `edit`, `glob`, `grep` |
+| Files | `ds_fs` | `read` (text + images), `apply_patch`, `edit`, `glob`, `grep` |
 | Shell | `ds_shell` | `bash`, `job` (list/output/kill) |
 | Session | `ds_session` | `todo_write`, `ask_user_question` (plan-review approval flips plan to build) |
 | Web | `ds_web` | `web_search`, `web_fetch` |

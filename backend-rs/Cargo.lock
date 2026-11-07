@@ -4127,6 +4127,7 @@ dependencies = [
  "serde_json",
  "stark-config",
  "stark-contract",
+ "stark-policy",
  "stark-providers",
  "stark-sandbox",
  "stark-store",

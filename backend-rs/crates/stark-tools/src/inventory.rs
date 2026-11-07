@@ -31,54 +31,6 @@ pub struct ToolMeta {
 
 pub const INVENTORY: &[ToolMeta] = &[
     ToolMeta {
-        name: "read_file",
-        plan_write: false,
-        read_blocked: false,
-        program: true,
-        verb: "Read",
-        summary: "read files",
-    },
-    ToolMeta {
-        name: "edit_file",
-        plan_write: true,
-        read_blocked: true,
-        program: true,
-        verb: "Edited",
-        summary: "edited files",
-    },
-    ToolMeta {
-        name: "run_command",
-        plan_write: false,
-        read_blocked: false,
-        program: true,
-        verb: "Ran command",
-        summary: "ran commands",
-    },
-    ToolMeta {
-        name: "search_code",
-        plan_write: false,
-        read_blocked: false,
-        program: true,
-        verb: "Searched",
-        summary: "searched code",
-    },
-    ToolMeta {
-        name: "ask_user",
-        plan_write: false,
-        read_blocked: false,
-        program: false,
-        verb: "Asked",
-        summary: "asked a question",
-    },
-    ToolMeta {
-        name: "call_subagent",
-        plan_write: true,
-        read_blocked: true,
-        program: false,
-        verb: "Delegated",
-        summary: "created an agent",
-    },
-    ToolMeta {
         name: "update_plan",
         plan_write: false,
         read_blocked: false,
@@ -343,12 +295,12 @@ pub const INVENTORY: &[ToolMeta] = &[
         summary: "read files",
     },
     ToolMeta {
-        name: "write",
+        name: "apply_patch",
         plan_write: true,
         read_blocked: true,
         program: true,
-        verb: "Wrote",
-        summary: "wrote files",
+        verb: "Patched",
+        summary: "patched files",
     },
     ToolMeta {
         name: "edit",
@@ -373,14 +325,6 @@ pub const INVENTORY: &[ToolMeta] = &[
         program: true,
         verb: "Searched",
         summary: "searched code",
-    },
-    ToolMeta {
-        name: "todo_write",
-        plan_write: true,
-        read_blocked: true,
-        program: true,
-        verb: "Updated todo list",
-        summary: "updated the todo list",
     },
     ToolMeta {
         name: "ask_user_question",
@@ -439,14 +383,6 @@ pub const INVENTORY: &[ToolMeta] = &[
         summary: "waited for an agent",
     },
     ToolMeta {
-        name: "list_agents",
-        plan_write: false,
-        read_blocked: false,
-        program: false,
-        verb: "Listed agents",
-        summary: "listed agents",
-    },
-    ToolMeta {
         name: "interrupt_agent",
         plan_write: true,
         read_blocked: true,
@@ -461,14 +397,6 @@ pub const INVENTORY: &[ToolMeta] = &[
         program: false,
         verb: "Closed agent",
         summary: "closed an agent",
-    },
-    ToolMeta {
-        name: "resume_agent",
-        plan_write: true,
-        read_blocked: true,
-        program: false,
-        verb: "Resumed agent",
-        summary: "resumed an agent",
     },
     ToolMeta {
         name: "tool_search",
@@ -570,8 +498,8 @@ mod tests {
         assert!(is_implemented("workspace"));
         // Defensive plan blocks for names with no handler.
         assert!(is_plan_write("github_apply_gate") && !is_implemented("github_apply_gate"));
-        // Standard write tool and read tool.
-        assert!(is_plan_write("write") && is_read_blocked("write"));
+        // Apply-patch is the mutating tool; read is non-mutating.
+        assert!(is_plan_write("apply_patch") && is_read_blocked("apply_patch"));
         assert!(!is_plan_write("read") && !is_read_blocked("read"));
     }
 
@@ -587,14 +515,12 @@ mod tests {
             "spawn_agent",
             "message_agent",
             "wait_agent",
-            "list_agents",
             "interrupt_agent",
             "close_agent",
             "job_message",
             "job_cancel",
             "schedule",
             "canvas_mode",
-            "resume_agent",
             "tool_search",
         ];
         for tool in INVENTORY {

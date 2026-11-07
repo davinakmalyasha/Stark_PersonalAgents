@@ -36,6 +36,35 @@ pub(crate) async fn apply_patch(ctx: &ToolContext, patch: &str) -> ToolOutcome {
         return ToolOutcome::err("Error: invalid patch: no hunks");
     }
 
+    // Codex parity: every affected path must be unique and pass the edit gate.
+    let mut targets = std::collections::HashSet::new();
+    for hunk in &hunks {
+        for path in hunk_paths(hunk) {
+            let normalized = path.trim().replace('\\', "/").to_ascii_lowercase();
+            if !targets.insert(normalized) {
+                return ToolOutcome::err(format!(
+                    "Error: invalid patch: multiple operations target {path}"
+                ));
+            }
+            let resolved = match resolve_patch_path(ctx, path) {
+                Ok(path) => path,
+                Err(error) => return ToolOutcome::err(error),
+            };
+            let resource = crate::paths::relative_display(&ctx.workspace, &resolved);
+            if let Some(blocked) = crate::permissions::gate(ctx, "edit", &[resource], path).await {
+                return blocked;
+            }
+        }
+    }
+
+    // Codex parity: validate every hunk before mutating anything. A patch
+    // that fails in the middle must not leave earlier files changed.
+    for hunk in &hunks {
+        if let Err(error) = validate_hunk(ctx, hunk).await {
+            return ToolOutcome::err(error);
+        }
+    }
+
     let mut first_path = String::new();
     let mut changed_lines = 0usize;
     for hunk in hunks {
@@ -64,12 +93,69 @@ pub(crate) async fn apply_patch(ctx: &ToolContext, patch: &str) -> ToolOutcome {
     ))
 }
 
+async fn validate_hunk(ctx: &ToolContext, hunk: &Hunk) -> Result<(), String> {
+    match hunk {
+        Hunk::AddFile { path, .. } => {
+            let path = resolve_patch_path(ctx, path)?;
+            if path.exists() {
+                return Err(format!(
+                    "Error: Add File failed: {} already exists. Use Update File instead.",
+                    path.display()
+                ));
+            }
+        }
+        Hunk::DeleteFile { path } => {
+            let path = resolve_patch_path(ctx, path)?;
+            if !path.exists() {
+                return Err(format!(
+                    "Error: Delete File failed: {} does not exist",
+                    path.display()
+                ));
+            }
+        }
+        Hunk::UpdateFile { path, chunks, .. } => {
+            let path = resolve_patch_path(ctx, path)?;
+            let original = tokio::fs::read_to_string(&path).await.map_err(|error| {
+                format!("Error: Update File failed for {}: {error}", path.display())
+            })?;
+            let source = SourceFile::parse(&original);
+            let _ = compute_replacements(&source.line_texts(), &path.to_string_lossy(), chunks)?;
+        }
+    }
+    Ok(())
+}
+
+fn hunk_paths(hunk: &Hunk) -> Vec<&str> {
+    match hunk {
+        Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => vec![path.as_str()],
+        Hunk::UpdateFile { path, move_to, .. } => {
+            let mut paths = vec![path.as_str()];
+            if let Some(destination) = move_to {
+                paths.push(destination.as_str());
+            }
+            paths
+        }
+    }
+}
+
+fn resolve_patch_path(ctx: &ToolContext, raw: &str) -> Result<std::path::PathBuf, String> {
+    if std::path::Path::new(raw).is_absolute() {
+        return Err(format!("apply_patch paths must be relative: {raw}"));
+    }
+    resolve_workspace_path(&ctx.workspace, raw)
+}
+
 async fn add_file(
     ctx: &ToolContext,
     raw_path: &str,
     contents: &str,
 ) -> Result<(String, usize), String> {
-    let path = resolve_workspace_path(&ctx.workspace, raw_path)?;
+    let path = resolve_patch_path(ctx, raw_path)?;
+    if path.exists() {
+        return Err(format!(
+            "Error: Add File failed: {raw_path} already exists. Use Update File instead."
+        ));
+    }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -82,7 +168,7 @@ async fn add_file(
 }
 
 async fn delete_file(ctx: &ToolContext, raw_path: &str) -> Result<(String, usize), String> {
-    let path = resolve_workspace_path(&ctx.workspace, raw_path)?;
+    let path = resolve_patch_path(ctx, raw_path)?;
     if !path.exists() {
         return Err(format!(
             "Error: Delete File failed: {raw_path} does not exist"
@@ -100,7 +186,7 @@ async fn update_file(
     chunks: &[UpdateChunk],
     move_to: Option<&str>,
 ) -> Result<(String, usize), String> {
-    let path = resolve_workspace_path(&ctx.workspace, raw_path)?;
+    let path = resolve_patch_path(ctx, raw_path)?;
     let original = tokio::fs::read_to_string(&path)
         .await
         .map_err(|error| format!("Error: Update File failed for {raw_path}: {error}"))?;
@@ -110,7 +196,7 @@ async fn update_file(
     let updated = source.into_contents();
 
     if let Some(destination) = move_to {
-        let destination = resolve_workspace_path(&ctx.workspace, destination)?;
+        let destination = resolve_patch_path(ctx, destination)?;
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -135,13 +221,29 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
     let normalized = strip_heredoc(patch);
     let trimmed = normalized.trim();
     let lines: Vec<&str> = trimmed.lines().collect();
-    let lines = strip_boundaries(&lines);
+    let Some(first) = lines.first() else {
+        return Err("empty patch".to_string());
+    };
+    let Some(last) = lines.last() else {
+        return Err("empty patch".to_string());
+    };
+    if first.trim() != "*** Begin Patch" {
+        return Err("The first line of the patch must be '*** Begin Patch'".to_string());
+    }
+    if last.trim() != "*** End Patch" {
+        return Err("The last line of the patch must be '*** End Patch'".to_string());
+    }
+    let lines = &lines[1..lines.len() - 1];
     let mut index = 0;
     let mut hunks = Vec::new();
 
     while index < lines.len() {
         let line = lines[index].trim();
         if line.is_empty() || line == "*** Begin Patch" || line == "*** End Patch" {
+            index += 1;
+            continue;
+        }
+        if line.starts_with("*** Environment ID:") {
             index += 1;
             continue;
         }
@@ -152,7 +254,10 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
             let mut body = Vec::new();
             while index < lines.len() && !lines[index].trim_start().starts_with("*** ") {
                 let raw = lines[index];
-                body.push(raw.strip_prefix('+').unwrap_or(raw).to_string());
+                let Some(text) = raw.strip_prefix('+') else {
+                    return Err(format!("Add File lines must start with '+': {raw}"));
+                };
+                body.push(text.to_string());
                 index += 1;
             }
             let mut contents = body.join("\n");
@@ -268,21 +373,6 @@ fn strip_heredoc(patch: &str) -> String {
     }
     let body = lines.collect::<Vec<_>>().join("\n");
     body.trim_end_matches("EOF").trim().to_string()
-}
-
-fn strip_boundaries<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
-    let mut start = 0;
-    let mut end = lines.len();
-    if lines
-        .first()
-        .is_some_and(|line| line.trim() == "*** Begin Patch")
-    {
-        start = 1;
-    }
-    if end > start && lines[end - 1].trim() == "*** End Patch" {
-        end -= 1;
-    }
-    &lines[start..end]
 }
 
 fn compute_replacements(
@@ -525,7 +615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_overwrites_existing_file() {
+    async fn add_rejects_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         tokio::fs::write(dir.path().join("duplicate.txt"), "old content\n")
@@ -536,12 +626,74 @@ mod tests {
             "*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch",
         )
         .await;
-        assert!(!result.is_error, "{}", result.content);
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("already exists"),
+            "{}",
+            result.content
+        );
         assert_eq!(
             tokio::fs::read_to_string(dir.path().join("duplicate.txt"))
                 .await
                 .unwrap(),
-            "new content\n"
+            "old content\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforces_codex_patch_boundaries_and_add_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let missing = apply_patch(&ctx, "*** Add File: a.txt\n+hello\n*** End Patch").await;
+        assert!(missing.is_error, "{}", missing.content);
+        assert!(missing.content.contains("first line"));
+        let no_plus = apply_patch(
+            &ctx,
+            "*** Begin Patch\n*** Add File: a.txt\nhello\n*** End Patch",
+        )
+        .await;
+        assert!(no_plus.is_error, "{}", no_plus.content);
+        assert!(no_plus.content.contains("must start with '+'"));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_targets_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let duplicate = apply_patch(
+            &ctx,
+            "*** Begin Patch\n*** Add File: a.txt\n+one\n*** Update File: a.txt\n@@\n-one\n+two\n*** End Patch",
+        )
+        .await;
+        assert!(duplicate.is_error, "{}", duplicate.content);
+        assert!(duplicate.content.contains("multiple operations"));
+        let absolute = if cfg!(windows) {
+            "C:/absolute.txt"
+        } else {
+            "/absolute.txt"
+        };
+        let out = apply_patch(
+            &ctx,
+            &format!("*** Begin Patch\n*** Add File: {absolute}\n+x\n*** End Patch"),
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("must be relative"));
+    }
+
+    #[tokio::test]
+    async fn accepts_environment_id_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let out = apply_patch(
+            &ctx,
+            "*** Begin Patch\n*** Environment ID: local\n*** Add File: env.txt\n+ok\n*** End Patch",
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.txt")).unwrap(),
+            "ok\n"
         );
     }
 
@@ -628,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failure_after_partial_success_leaves_changes() {
+    async fn failed_patch_leaves_no_changes() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let result = apply_patch(
@@ -637,11 +789,9 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
-        assert_eq!(
-            tokio::fs::read_to_string(dir.path().join("created.txt"))
-                .await
-                .unwrap(),
-            "hello\n"
+        assert!(
+            !dir.path().join("created.txt").exists(),
+            "a failed patch must not leave earlier files behind"
         );
     }
 

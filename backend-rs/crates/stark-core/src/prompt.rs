@@ -27,6 +27,8 @@ const WORKING_IN_CODEBASES: &str = r#"# Working in codebases
 - Read a file before editing or overwriting it. Use exact literal matches for edits.
 - Verify changes with the project's tests or build when available.
 - Persist until the task is fully resolved: implement, verify, then report. Do not stop at analysis.
+- On a tool error, timeout, or disconnect: read the exact error, fix the arguments, retry with up to three variations, then try the next-best tool. Never stop at the first failure.
+- Timeouts are resumable. Use the returned job/session id with logs/wait/send instead of re-running a long command.
 - Never run destructive commands (git reset --hard, git checkout --, rm -rf) unless explicitly requested."#;
 
 const SUBAGENT_NOTE: &str = "You are a subagent. Your final message is your report to the parent: state what changed, the files you touched, verification evidence, and unresolved risks. Do not ask the user questions; report blockers to the parent.";
@@ -35,7 +37,7 @@ const PLAN_SECTION: &str = r#"You are in plan mode. Stay in plan mode until the 
 
 Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
 
-The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed only to keep the request shape stable. Writes are blocked at dispatch with [BLOCKED]. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in the approval request.
+The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed only to keep the request shape stable. Writes are blocked at dispatch with [BLOCKED]. Do not use update_plan to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in the approval request.
 
 Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
 
@@ -68,15 +70,22 @@ pub async fn memory_block(harness_root: &std::path::Path, workspace_id: &str) ->
         return None;
     }
     let memory = stark_store::MemoryStore::open(harness_root).await.ok()?;
-    let index = memory
-        .index(workspace_id, stark_store::memory_max_chars())
-        .await?;
-    let mut block = String::from("[WORKSPACE MEMORY]\n");
-    block.push_str(&index);
-    block.push_str(
-        "\nMemory is a hint, not the source of truth. Verify current code. Use the memory tool (action=\"read\") for topic details.",
+    let mut sections = Vec::new();
+    for (label, key) in [("USER", "_user"), ("WORKSPACE", workspace_id)] {
+        if let Some(index) = memory.index(key, stark_store::memory_max_chars()).await {
+            sections.push(format!("[{label} MEMORY]\n{index}"));
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    sections.push(
+        "Memory is historical context, not current policy. It has user/project/session tiers; \
+         it may be stale. The runtime context below (workspace, sandbox, approvals) is authoritative; \
+         verify current files before acting. Use memory action=\"read\" with scope=\"user|project|session\" for details."
+            .to_string(),
     );
-    Some(block)
+    Some(sections.join("\n\n"))
 }
 
 /// Inputs for one agent's system prompt.
@@ -88,6 +97,7 @@ pub struct AgentPrompt<'a> {
     pub mode: &'a str,
     pub depth: u32,
     pub code_mode: bool,
+    pub access: &'a str,
     pub skills: Option<&'a [String]>,
 }
 
@@ -108,6 +118,7 @@ pub async fn system_prompt(
         mode,
         depth,
         code_mode,
+        access: "write",
         skills: None,
     })
     .await
@@ -123,6 +134,7 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
         mode,
         depth,
         code_mode,
+        access,
         skills,
     } = context;
     // Stable first: identity, persona, project instructions, skills, workspace.
@@ -175,7 +187,7 @@ pub async fn system_prompt_for_agent(context: AgentPrompt<'_>) -> String {
          Approvals: destructive shell commands may pause for user approval.\n\
          Relative paths resolve from the workspace folder; use bash workdir for per-command directories.",
         platform_label(),
-        sandbox = stark_tools::sandbox_prompt_line(workspace)
+        sandbox = stark_tools::sandbox_prompt_line_for(workspace, access)
     ));
     prompt
 }
@@ -239,13 +251,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_prompt_reports_read_only_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = system_prompt_for_agent(AgentPrompt {
+            workspace: dir.path(),
+            workspace_id: "_general",
+            harness_root: dir.path(),
+            model: "model",
+            mode: "build",
+            depth: 0,
+            code_mode: false,
+            access: "read",
+            skills: None,
+        })
+        .await;
+        assert!(
+            prompt.contains("Sandbox: read-only"),
+            "read-only access must not be advertised as workspace-write: {prompt}"
+        );
+    }
+
+    #[tokio::test]
     async fn plan_prompt_uses_ask_user_question_for_approval() {
         let dir = tempfile::tempdir().unwrap();
         let prompt = system_prompt(dir.path(), dir.path(), "model", "plan", 0, false).await;
         assert!(prompt.contains("ask_user_question"));
         assert!(prompt.contains("plan-review"));
         assert!(!prompt.contains("exit_plan_mode"));
-        assert!(prompt.contains("Do not use todo_write"));
+        assert!(prompt.contains("Do not use update_plan"));
         // Plan section sits after stable content, before the runtime tail.
         let plan = prompt.find("You are in plan mode.").unwrap();
         let runtime = prompt.find("Current runtime context.").unwrap();

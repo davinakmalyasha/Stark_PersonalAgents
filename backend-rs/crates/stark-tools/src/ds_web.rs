@@ -41,7 +41,7 @@ fn private_ip(ip: IpAddr) -> bool {
     }
 }
 
-async fn validate_public_url(raw: &str) -> Result<Url, String> {
+pub(crate) async fn validate_public_url(raw: &str) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|error| format!("invalid URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("only http and https URLs are allowed".to_string());

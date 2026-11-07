@@ -5,7 +5,7 @@
  * Legacy: `house/useHouseChat.ts` re-exports this.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, StreamDelta } from '../types';
+import type { ChatMessage, WorkspaceInfo, AppState, ChatSummary, ChatAttachment, TokenUsage, StreamDelta, RunStatusNotice } from '../types';
 import { fetchWorkspaces, createChat, fetchChats, fetchChat, deleteChat, updateChatTitle, uploadChatAttachments, abortRun, rewindChat, addChatMessage } from '../services/api';
 import { initHouseWorkspace, startHousePipeline, finishHouseMessage, resolvePinnedChat } from '../house/houseChatService';
 import { getAssistantName } from '../house/assistant';
@@ -45,7 +45,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   // Owning run target for Stop: persist the partial into the same chat.
   const runWsRef = useRef<WorkspaceInfo | null>(null);
   const runChatIdRef = useRef<string | null>(null);
-  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number; retry: RetryNotice | null }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number; retry: RetryNotice | null; status: RunStatusNotice | null }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null, status: null });
   const streamRef = useRef(emptyStreamAccum());
   const rateRef = useRef(emptyRateAccum());
 
@@ -59,13 +59,14 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
       active: true,
       rate,
       retry: streamRef.current.retry,
+      status: streamRef.current.status,
     });
   }, []);
 
   const resetStream = useCallback(() => {
     streamRef.current = emptyStreamAccum();
     rateRef.current = emptyRateAccum();
-    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
+    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null, status: null });
   }, []);
 
   const refreshMessages = useCallback(async () => {
@@ -126,14 +127,14 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         setIsVoiceMode(false);
         setVoiceActive(false);
         streamRef.current = emptyStreamAccum();
-        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '', segments: [], retry: null }));        refreshMessages();
+        setStreaming((s) => ({ ...s, active: false, text: '', reasoning: '', segments: [], retry: null, status: null }));        refreshMessages();
       }
       // Phase 8-V2 fix: a voice run started — begin the live bubble.
       if (ev?.type === 'pipeline-start') {
         setVoiceActive(true);
         streamRef.current = emptyStreamAccum();
         rateRef.current = emptyRateAccum();
-        setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
+        setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null, status: null });
       }
       // Phase 8-V2: live tokens from a voice run stream into the house chat —
       // merge them into the same streaming bubble as local runs.
@@ -150,6 +151,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
           active: true,
           rate: s.rate,
           retry: streamRef.current.retry,
+          status: streamRef.current.status,
         }));
       }
       // Live input streaming: words appear in chat as you speak (ChatGPT live)
@@ -445,6 +447,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
         streamingReasoning: streaming.reasoning,
         streamRate: streaming.rate,
         retry: streaming.retry,
+        liveStatus: streaming.status,
         liveTimeline: streaming.segments,
       },
     });

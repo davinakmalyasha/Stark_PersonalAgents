@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import type { ChatAttachment, ModelOption } from '../../types';
-import { fetchProvider, type ProviderInfo } from '../../services/api';
+import { chatAttachmentUrl, fetchProvider, type ProviderInfo } from '../../services/api';
+import { DropOverlay, useOptionalAttachmentDrop } from './AttachmentDrop';
 
 interface Props {
   onSend: (message: string, files: File[], restored?: ChatAttachment[]) => void;
@@ -26,14 +27,48 @@ interface Props {
   draftAttachments?: ChatAttachment[];
   onDraftConsumed?: () => void;
   onDraftAttachmentsConsumed?: () => void;
+  /** Used to preview persisted image/audio attachments. */
+  workspaceId?: string | null;
+  chatId?: string | null;
 }
 
 const MAX_FILES = 8;
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const ACCEPTED_TYPES = 'image/*,audio/*,.pdf,.txt,.md,.json,.js,.ts,.tsx,.py,.html,.css,.csv,.doc,.docx,.zip';
 const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 const isImage = (file: File) => file.type.startsWith('image/');
+const isAudio = (file: File) => file.type.startsWith('audio/');
 
-export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, draftAttachments, onDraftConsumed, onDraftAttachmentsConsumed }: Props) {
+function LocalFileThumb({ file }: { file: File }) {
+  const preview = useMemo(() => (isImage(file) ? URL.createObjectURL(file) : ''), [file]);
+  useEffect(() => {
+    if (!preview) return undefined;
+    return () => URL.revokeObjectURL(preview);
+  }, [preview]);
+  if (isImage(file) && preview) {
+    return <div className="image-chip image-chip--preview"><img src={preview} alt="" /></div>;
+  }
+  if (isAudio(file)) return <div className="audio-chip"><AudioLines size={16} /></div>;
+  return <div className="file-chip"><FileText size={16} /></div>;
+}
+
+function RestoredFileThumb({ attachment, workspaceId, chatId }: {
+  attachment: ChatAttachment;
+  workspaceId?: string | null;
+  chatId?: string | null;
+}) {
+  const src = attachment.isImage && workspaceId && chatId
+    ? chatAttachmentUrl(workspaceId, chatId, attachment.id)
+    : '';
+  if (src) {
+    return <div className="image-chip image-chip--preview"><img src={src} alt="" /></div>;
+  }
+  if (attachment.type?.startsWith('audio/')) return <div className="audio-chip"><AudioLines size={16} /></div>;
+  if (attachment.isImage) return <div className="image-chip"><Image size={16} /></div>;
+  return <div className="file-chip"><FileText size={16} /></div>;
+}
+
+export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, draftAttachments, onDraftConsumed, onDraftAttachmentsConsumed, workspaceId, chatId }: Props) {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [restored, setRestored] = useState<ChatAttachment[]>([]);
@@ -104,7 +139,8 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
     onDraftConsumed?.();
   }, [draft, draftAttachments, onDraftConsumed]);
   const totalAttachments = files.length + restored.length;
-  const addFiles = (incoming: FileList | File[]) => {
+  const attachContext = useOptionalAttachmentDrop();
+  const addFiles = useCallback((incoming: FileList | File[]) => {
     const selected = Array.from(incoming);
     const valid = selected.filter((file) => file.size <= MAX_FILE_SIZE);
     if (valid.length !== selected.length) setError('Files must be 20 MB or smaller.');
@@ -115,7 +151,8 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
       else if (next.length < MAX_FILES) setError((prev) => (prev && prev.includes('up to 8') ? null : prev) as any);
       return next;
     });
-  };
+  }, []);
+  useEffect(() => attachContext?.register(addFiles), [attachContext, addFiles]);
   useEffect(() => {
     if (totalAttachments < MAX_FILES) {
       setError((prev) => (prev === `You can attach up to ${MAX_FILES} files at once.` ? null : prev));
@@ -160,6 +197,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
       style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 6px)' }}
     >
       <div
+        data-prompt-dock
         className={`prompt-dock premium-surface premium-surface--dark relative overflow-visible ${dragActive ? 'is-dragging' : ''} ${isVoiceMode ? 'is-listening' : ''}`}
         onDragEnter={(event) => { event.preventDefault(); dragDepth.current += 1; setDragActive(true); }}
         onDragLeave={(event) => { event.preventDefault(); dragDepth.current -= 1; if (dragDepth.current <= 0) { dragDepth.current = 0; setDragActive(false); } }}
@@ -167,20 +205,20 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
         onDrop={(event) => { event.preventDefault(); dragDepth.current = 0; setDragActive(false); addFiles(event.dataTransfer.files); }}
         onPaste={handlePaste}
       >
-        <input ref={inputRef} type="file" multiple accept="image/*,.pdf,.txt,.md,.json,.js,.ts,.tsx,.py,.html,.css" className="hidden" onChange={(event) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} />
-        {dragActive && <div className="drop-capture" aria-hidden="true"><div className="drop-orbit"><Plus size={24} /></div><strong>Drop to add to your message</strong><span>Images, documents, and code files up to 20 MB</span></div>}
+        <input ref={inputRef} type="file" multiple accept={ACCEPTED_TYPES} className="hidden" onChange={(event) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} />
+        {dragActive && <DropOverlay compact title="Drop to attach" />}
 
         {totalAttachments > 0 && <div className="attachment-deck" aria-label="Files ready to send">
           {files.map((file) => <div className="attachment-card" key={`${file.name}-${file.size}`}>
-            {isImage(file) ? <div className="image-chip"><Image size={16} /></div> : <div className="file-chip"><FileText size={16} /></div>}
-            <div className="min-w-0 flex-1"><div className="truncate text-[12px] font-medium text-zinc-200">{file.name}</div><div className="text-[10px] text-zinc-500">{isImage(file) ? 'Image' : file.type.split('/').pop() || 'File'} · {formatSize(file.size)}</div></div>
+            <LocalFileThumb file={file} />
+            <div className="min-w-0 flex-1"><div className="truncate text-[12px] font-medium text-zinc-200">{file.name}</div><div className="text-[10px] text-zinc-500">{isImage(file) ? 'Image' : isAudio(file) ? 'Audio' : file.type.split('/').pop() || 'File'} · {formatSize(file.size)}</div></div>
             <button type="button" onClick={() => setFiles((all) => all.filter((item) => item !== file))} className="remove-file" title={`Remove ${file.name}`}><X size={13} /></button>
           </div>)}
           {restored.map((attachment) => <div className="attachment-card" key={`restored-${attachment.id}`}>
-            {attachment.isImage ? <div className="image-chip"><Image size={16} /></div> : <div className="file-chip"><FileText size={16} /></div>}
+            <RestoredFileThumb attachment={attachment} workspaceId={workspaceId} chatId={chatId} />
             <div className="min-w-0 flex-1">
               <div className="truncate text-[12px] font-medium text-zinc-200">{attachment.name}</div>
-              <div className="text-[10px] text-zinc-500">{attachment.isImage ? 'Image' : attachment.type?.split('/').pop() || 'File'} · {formatSize(attachment.size)}</div>
+              <div className="text-[10px] text-zinc-500">{attachment.isImage ? 'Image' : attachment.type?.startsWith('audio/') ? 'Audio' : attachment.type?.split('/').pop() || 'File'} · {formatSize(attachment.size)}</div>
             </div>
             <button type="button" onClick={() => setRestored((all) => all.filter((item) => item.id !== attachment.id))} className="remove-file" title={`Remove ${attachment.name}`}><X size={13} /></button>
           </div>)}

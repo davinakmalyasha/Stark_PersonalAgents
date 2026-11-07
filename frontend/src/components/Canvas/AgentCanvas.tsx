@@ -126,7 +126,7 @@ export default function AgentCanvas(props: Props) {
                 props.onSend(text);
                 return;
               }
-              await sendCanvasChat(workspace, chatId, text, kindForWorkspace(workspace));
+              await sendCanvasChat(workspace, chatId, text, [], kindForWorkspace(workspace));
               fetchChats(props.workspaceId!).then(setWorkspaceChats).catch(() => {});
             }}
           />

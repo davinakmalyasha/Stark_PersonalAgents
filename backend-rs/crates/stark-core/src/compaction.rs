@@ -17,7 +17,7 @@ use std::env;
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use stark_providers::{ChatMessage, Provider, ProviderEvent, ProviderSession};
+use stark_providers::{ChatMessage, Provider, ProviderEvent, ProviderSession, Usage};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
@@ -168,6 +168,9 @@ pub struct CompactionOutcome {
     pub summary: String,
     pub retained_tail: Vec<Value>,
     pub tokens_before: usize,
+    pub tokens_after: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
@@ -238,17 +241,21 @@ pub async fn compact_history(
         affinity,
         reasoning_effort: None,
     };
-    let summary = summarize(provider, cancel, &messages[1..cut], policy, session).await?;
+    let (summary, usage) = summarize(provider, cancel, &messages[1..cut], policy, session).await?;
     let tail = &messages[cut..];
     let tail_text = tail_transcript(tail);
     let checkpoint = format_checkpoint(&summary, &tail_text);
     let compacted = vec![messages[0].clone(), ChatMessage::user(checkpoint)];
     let retained_tail = tail.iter().map(message_to_entry).collect::<Vec<_>>();
+    let tokens_after = estimate_tokens(&compacted);
     Some(CompactionOutcome {
         messages: compacted,
         summary,
         retained_tail,
         tokens_before,
+        tokens_after,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
     })
 }
 
@@ -319,7 +326,7 @@ async fn summarize(
     messages: &[ChatMessage],
     policy: &CompactionPolicy,
     session: ProviderSession<'_>,
-) -> Option<String> {
+) -> Option<(String, Usage)> {
     let update = messages.first().is_some_and(is_checkpoint);
     let budget = policy
         .trigger_tokens
@@ -339,17 +346,22 @@ async fn summarize(
         ChatMessage::user(input),
         ChatMessage::user(prompt),
     ];
-    let mut text = stream_summary(provider, cancel, &request, session).await?;
+    let (mut text, mut usage) = stream_summary(provider, cancel, &request, session).await?;
     if !has_summary_heading(&text) {
         let mut retry = request;
         retry.push(ChatMessage::user(NUDGE));
-        text = stream_summary(provider, cancel, &retry, session).await?;
+        let (retry_text, retry_usage) = stream_summary(provider, cancel, &retry, session).await?;
+        text = retry_text;
+        usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(retry_usage.output_tokens);
     }
     if !has_summary_heading(&text) {
         return None;
     }
     let limit = (policy.summary_output_tokens * 4).min(MAX_SUMMARY_OUTPUT_CHARS);
-    Some(text.chars().take(limit).collect())
+    Some((text.chars().take(limit).collect(), usage))
 }
 
 fn has_summary_heading(text: &str) -> bool {
@@ -363,12 +375,13 @@ async fn stream_summary(
     cancel: &CancellationToken,
     request: &[ChatMessage],
     session: ProviderSession<'_>,
-) -> Option<String> {
+) -> Option<(String, Usage)> {
     let mut stream = provider
         .stream_chat_for_session(request, &[], 0.0, session)
         .await
         .ok()?;
     let mut text = String::new();
+    let mut usage = Usage::default();
     loop {
         let event = tokio::select! {
             _ = cancel.cancelled() => return None,
@@ -381,13 +394,18 @@ async fn stream_summary(
                     break;
                 }
             }
+            Some(Ok(ProviderEvent::Usage(value))) => usage = value,
             Some(Ok(ProviderEvent::Done { .. })) | None => break,
             Some(Ok(_)) => {}
             Some(Err(_)) => return None,
         }
     }
     let text = text.trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some((text, usage))
+    }
 }
 
 fn build_prompt(update: bool) -> String {

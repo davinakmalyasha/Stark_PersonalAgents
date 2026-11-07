@@ -349,14 +349,14 @@ export default function House() {
               const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
               window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
             }}
-            onSendToChat={async (wsId, chatId, text) => {
+            onSendToChat={async (wsId, chatId, text, files = []) => {
               const ws = sessions.workspaces.find((w) => w.id === wsId);
               if (!ws) throw new Error('Workspace not found.');
               if (wsId === mainWorkspace?.id && chatId === chat.activeChatId) {
-                handleGeneralSend(text, []);
+                handleGeneralSend(text, files);
                 return;
               }
-              await sendCanvasChat(ws, chatId, text, kindForWorkspace(ws));
+              await sendCanvasChat(ws, chatId, text, files, kindForWorkspace(ws));
               await sessions.forceRefresh();
             }}
           />
@@ -384,6 +384,7 @@ export default function House() {
         workspaceId={chat.workspaceId}
         chatId={activeTabChatId}
         onRewind={chat.handleRewind}
+        onRetry={(prompt) => handleGeneralSend(prompt, [])}
         draft={chat.draft}
         draftAttachments={chat.draftAttachments}
         onDraftConsumed={chat.clearDraft}

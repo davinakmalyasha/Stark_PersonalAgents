@@ -5,6 +5,7 @@ import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
 import PlanDock from './PlanDock';
 import MessageStream from './MessageStream';
+import { AttachmentDropProvider, FileDropSurface } from './AttachmentDrop';
 import NotesButton from '../Notes/NotesButton';
 import CanvasModeBadge from '../Canvas/CanvasModeBadge';
 import { getChatSnapshots, restoreRun, setChatMode, forkChat, type SnapshotGroup } from '../../services/api';
@@ -105,6 +106,7 @@ export default function ChatView({
   };
 
   return (
+    <AttachmentDropProvider>
     <div 
       className={`${
         variant === 'docked'
@@ -206,21 +208,23 @@ export default function ChatView({
         aria-hidden={minimized}
       >
         <div className="chat-collapse-inner">
-          {/* Message stream */}
-          <MessageStream
-            messages={visibleMessages}
-            hasActiveChat={hasActiveChat}
-            onOpenSubagent={(name) => setActiveSubagent(name)}
-            onOpenSubagentSession={onOpenSubagentSession}
-            activeSubagent={activeSubagent}
-            traceSteps={traceSteps}
-            workspaceId={workspaceId}
-            chatId={chatId}
-            onCloseSubagent={() => setActiveSubagent(null)}
-            onOpenProject={onOpenProject}
-            onRetry={onRetry}
-            onRewind={onRewind}
-          />
+          <FileDropSurface className="flex-1 min-h-0 flex flex-col">
+            {/* Message stream */}
+            <MessageStream
+              messages={visibleMessages}
+              hasActiveChat={hasActiveChat}
+              onOpenSubagent={(name) => setActiveSubagent(name)}
+              onOpenSubagentSession={onOpenSubagentSession}
+              activeSubagent={activeSubagent}
+              traceSteps={traceSteps}
+              workspaceId={workspaceId}
+              chatId={chatId}
+              onCloseSubagent={() => setActiveSubagent(null)}
+              onOpenProject={onOpenProject}
+              onRetry={onRetry}
+              onRewind={onRewind}
+            />
+          </FileDropSurface>
         </div>
       </div>
 
@@ -256,9 +260,10 @@ export default function ChatView({
             </div>
           </div>
         )}
-        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} onOpenAgentConfig={onOpenAgentConfig} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} draftAttachments={draftAttachments} onDraftConsumed={onDraftConsumed} onDraftAttachmentsConsumed={onDraftAttachmentsConsumed} />
+        <PromptDock onSend={onSend} onCancel={onCancel} isRunning={isRunning} isVoiceMode={isVoiceMode} onToggleVoice={onToggleVoice} voiceInputText={voiceInputText} onOpenStats={onOpenStats} onOpenAgentConfig={onOpenAgentConfig} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} totalCacheHitTokens={totalCacheHitTokens} activeContextTokens={activeContextTokens} selectedModel={selectedModel} models={models} onModelChange={onModelChange} draft={draft} draftAttachments={draftAttachments} onDraftConsumed={onDraftConsumed} onDraftAttachmentsConsumed={onDraftAttachmentsConsumed} workspaceId={workspaceId} chatId={chatId} />
       </div>
     </div>
+    </AttachmentDropProvider>
   );
 }
 

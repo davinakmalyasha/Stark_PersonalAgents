@@ -62,8 +62,17 @@ export interface ProjectRef {
 }
 
 /** P10: live token delta frame from the backend SSE stream. */
+export interface RunStatusNotice {
+  kind: 'compaction_started' | 'compaction_completed' | 'compaction_failed' | string;
+  reason?: string;
+  tokens_before?: number;
+  tokens_after?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
 export interface StreamDelta {
-  kind: 'text' | 'reasoning' | 'usage' | 'end' | 'tool_started' | 'tool_finished';
+  kind: 'text' | 'reasoning' | 'usage' | 'end' | 'tool_started' | 'tool_finished' | 'status';
   text: string;
   agent?: string;
   model?: string;
@@ -76,6 +85,8 @@ export interface StreamDelta {
   ms?: number;
   /** Structured child session reference for live delegation cards. */
   children?: ChildReference[];
+  /** Out-of-band run state (compaction/context notices). */
+  status?: RunStatusNotice;
 }
 
 export interface ChildReference {
@@ -249,6 +260,10 @@ export interface ChatSummary {
   /** Short preview of the newest message (server-side, display only). */
   lastMessage?: string;
   lastRole?: string;
+  /** Latest message metadata kind (aborted, compaction, …). */
+  lastKind?: string;
+  /** Server-derived run status for cards and lists. */
+  status?: 'running' | 'queued' | 'done' | 'failed' | 'aborted' | 'idle';
 }
 
 export interface ChatData {

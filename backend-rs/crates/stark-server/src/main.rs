@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -676,6 +677,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/attachments",
             post(upload_attachments_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/attachments/{attachment_id}",
+            get(attachment_handler),
         )
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/rewind",
@@ -3607,6 +3612,20 @@ async fn remove_workspace_handler(
     Json(json!({"status": status}))
 }
 
+fn chat_run_status(chat: &Value, running: bool) -> &'static str {
+    if running {
+        return "running";
+    }
+    if chat["lastKind"].as_str() == Some("aborted") {
+        return "aborted";
+    }
+    match chat["lastRole"].as_str().unwrap_or("") {
+        "error" => "failed",
+        "agent" | "assistant" => "done",
+        _ => "idle",
+    }
+}
+
 async fn chats_handler(
     State(state): State<ServerState>,
     Path(workspace_id): Path<String>,
@@ -3614,7 +3633,12 @@ async fn chats_handler(
     if workspace_path(&state, &workspace_id).is_none() {
         return Err(not_found("workspace not found"));
     }
-    let chats = state.store.list_chats(&workspace_id).await;
+    let mut chats = state.store.list_chats(&workspace_id).await;
+    for chat in &mut chats {
+        let chat_id = chat["id"].as_str().unwrap_or_default();
+        let status = chat_run_status(chat, state.runs.is_running(chat_id));
+        chat["status"] = Value::String(status.to_string());
+    }
     Ok(Json(json!({"chats": chats})))
 }
 
@@ -4857,6 +4881,122 @@ async fn upload_attachments_handler(
         return Err(bad_request("no files uploaded"));
     }
     Ok(Json(json!({"attachments": attachments})))
+}
+
+fn attachment_mime(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "csv" => "text/csv; charset=utf-8",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+fn safe_attachment_component(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains(['/', '\\'])
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+async fn attachment_handler(
+    State(state): State<ServerState>,
+    Path((workspace_id, chat_id, attachment_id)): Path<(String, String, String)>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    if workspace_path(&state, &workspace_id).is_none() {
+        return Err(not_found("workspace not found"));
+    }
+    if state
+        .store
+        .get_chat(&chat_id)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Err(not_found("chat not found"));
+    }
+    let Some(workspace_component) = safe_component(&workspace_id) else {
+        return Err(bad_request("invalid workspace id"));
+    };
+    let Some(chat_component) = safe_component(&chat_id) else {
+        return Err(bad_request("invalid chat id"));
+    };
+    let Some(name) = safe_attachment_component(&attachment_id) else {
+        return Err(bad_request("invalid attachment id"));
+    };
+    let upload_dir = state
+        .harness_root
+        .join(".deep_agents")
+        .join("uploads")
+        .join(workspace_component)
+        .join(chat_component);
+    let Ok(canonical_dir) = tokio::fs::canonicalize(&upload_dir).await else {
+        return Err(not_found("attachment not found"));
+    };
+    let path = upload_dir.join(name);
+    let Ok(canonical_path) = tokio::fs::canonicalize(&path).await else {
+        return Err(not_found("attachment not found"));
+    };
+    if !canonical_path.starts_with(&canonical_dir) {
+        return Err(not_found("attachment not found"));
+    }
+    let bytes = tokio::fs::read(&canonical_path)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    let mime = attachment_mime(&canonical_path);
+    let inline = mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime == "application/pdf";
+    let fallback_name: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() && !matches!(character, '"' | '\\') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let disposition = format!(
+        "{}; filename=\"{}\"",
+        if inline { "inline" } else { "attachment" },
+        fallback_name
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(bytes))
+        .map_err(|error| bad_request(error.to_string()))
 }
 
 fn safe_component(value: &str) -> Option<&str> {

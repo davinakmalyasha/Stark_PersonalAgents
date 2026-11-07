@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <rect width="1024" height="1024" rx="224" fill="#0A0A0C"/>
+  <rect x="17" y="17" width="990" height="990" rx="208" stroke="#FFFFFF" stroke-opacity=".07" stroke-width="2"/>
+  <text x="512" y="592" text-anchor="middle" fill="#FFFFFF"
+        font-family="Inter, 'Segoe UI', Arial, Helvetica, sans-serif"
+        font-size="252" font-weight="700" letter-spacing="-14"
+        textLength="690" lengthAdjust="spacingAndGlyphs">Stark</text>
+</svg>

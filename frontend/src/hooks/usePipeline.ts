@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import type { AppState, ChatAttachment, StreamDelta } from '../types';
+import type { AppState, ChatAttachment, StreamDelta, RunStatusNotice } from '../types';
 import { apiUrl, streamPipeline } from '../services/api';
 import { applyDeltaToAccum, emptyRateAccum, emptyStreamAccum, type StreamSegment } from '../utils/streamAccum';
 
@@ -10,6 +10,7 @@ export interface LiveStream {
   segments: StreamSegment[];
   active: boolean;
   rate: number; // tokens/sec estimate
+  status: RunStatusNotice | null;
 }
 
 interface UsePipelineReturn {
@@ -25,7 +26,7 @@ interface UsePipelineReturn {
   attachMirror: (chatId: string) => void;
 }
 
-const EMPTY_STREAM: LiveStream = { text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0 };
+const EMPTY_STREAM: LiveStream = { text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, status: null };
 
 export function usePipeline(): UsePipelineReturn {
   const [state, setState] = useState<AppState | null>(null);
@@ -59,6 +60,7 @@ export function usePipeline(): UsePipelineReturn {
         segments: [...streamRef.current.segments],
         active: true,
         rate: rateValueRef.current,
+        status: streamRef.current.status,
       });
     });
   }, []);

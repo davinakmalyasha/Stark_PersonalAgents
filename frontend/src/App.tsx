@@ -918,6 +918,7 @@ export default function App() {
         isStreaming: isRunning && streaming.active,
         streamingReasoning: streaming.active ? streaming.reasoning : '',
         streamRate: isRunning ? streaming.rate : 0,
+        liveStatus: streaming.status,
         liveTimeline: streaming.segments,
       },
     });

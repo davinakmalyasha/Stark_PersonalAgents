@@ -1,6 +1,10 @@
 import type { ChatSummary, ChatData, ChatMessage, ChatAttachment, SubagentInfo, SubagentSession } from '../../types';
 import { API_BASE, fetchWithRetry } from './base';
 
+export function chatAttachmentUrl(workspaceId: string, chatId: string, attachmentId: string): string {
+  return `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/attachments/${encodeURIComponent(attachmentId)}`;
+}
+
 export async function fetchChats(workspaceId: string): Promise<ChatSummary[]> {
   const res = await fetchWithRetry(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/chats`);
   if (!res.ok) return [];

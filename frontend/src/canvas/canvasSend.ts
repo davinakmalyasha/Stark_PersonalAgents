@@ -1,5 +1,6 @@
-import type { AppState, WorkspaceInfo } from '../types';
+import type { AppState, ChatAttachment, WorkspaceInfo } from '../types';
 import { finishHouseMessage, startHousePipeline } from '../house/houseChatService';
+import { uploadChatAttachments } from '../services/api';
 
 export type CanvasRunKind = 'general' | 'house' | 'personal' | 'design';
 
@@ -10,12 +11,17 @@ export type CanvasRunKind = 'general' | 'house' | 'personal' | 'design';
  * stream here only to persist the assistant's final trace when it finishes —
  * the same single-writer path the normal chat uses.
  */
-export function sendCanvasChat(
+export async function sendCanvasChat(
   ws: WorkspaceInfo,
   chatId: string,
   text: string,
+  files: File[] = [],
   kind: CanvasRunKind = 'general',
 ): Promise<void> {
+  let attachments: ChatAttachment[] = [];
+  if (files.length) {
+    attachments = await uploadChatAttachments(ws.id, chatId, files);
+  }
   return new Promise((resolve, reject) => {
     let liveState: AppState | null = null;
     const startedAt = Date.now();
@@ -23,7 +29,7 @@ export function sendCanvasChat(
       text,
       ws,
       chatId,
-      [],
+      attachments,
       (state) => { liveState = state; },
       async () => {
         try {

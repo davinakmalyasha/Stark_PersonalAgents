@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react';
 import { ChevronDown, ChevronUp, ExternalLink, X } from 'lucide-react';
 import PromptDock from '../components/Workspace/PromptDock';
 import MessageStream from '../components/Workspace/MessageStream';
+import { AttachmentDropProvider, FileDropSurface } from '../components/Workspace/AttachmentDrop';
 import NotesButton from '../components/Notes/NotesButton';
 import CanvasModeBadge from '../components/Canvas/CanvasModeBadge';
 import type { ChatAttachment, ChatMessage } from '../types';
@@ -39,6 +40,7 @@ interface Props {
   workspaceId?: string | null;
   chatId?: string | null;
   onRewind?: (message: ChatMessage) => void;
+  onRetry?: (prompt: string) => void;
   draft?: string;
   draftAttachments?: ChatAttachment[];
   onDraftConsumed?: () => void;
@@ -64,6 +66,7 @@ export default function HouseChat({
   workspaceId,
   chatId,
   onRewind,
+  onRetry,
   draft,
   draftAttachments,
   onDraftConsumed,
@@ -113,7 +116,7 @@ export default function HouseChat({
   const messagesArea = (
     <div className={`house-chat-collapse ${minimized ? '' : 'is-open'}`} aria-hidden={minimized}>
       <div className="house-chat-collapse-inner">
-        <div ref={threadRef} className="flex-1 min-h-[80px] overflow-y-auto">
+        <FileDropSurface ref={threadRef} className="flex-1 min-h-[80px] flex flex-col">
           {isLoading ? (
             <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-500 py-6">
               <div className="flex gap-1.5">
@@ -132,9 +135,10 @@ export default function HouseChat({
               workspaceId={workspaceId}
               chatId={chatId}
               onRewind={onRewind}
+              onRetry={onRetry}
             />
           )}
-        </div>
+        </FileDropSurface>
       </div>
     </div>
   );
@@ -158,27 +162,33 @@ export default function HouseChat({
         draftAttachments={draftAttachments}
         onDraftConsumed={onDraftConsumed}
         onDraftAttachmentsConsumed={onDraftAttachmentsConsumed}
+        workspaceId={workspaceId}
+        chatId={chatId}
       />
     </div>
   );
 
   if (variant === 'ide') {
     return (
-      <div className="absolute bottom-3 right-3 z-30 w-[min(600px,calc(100vw-360px))] flex flex-col rounded-2xl border house-hairline premium-surface backdrop-blur-md shadow-2xl px-3 pt-2.5 pb-1 ide-panel-enter">
-        {header}
-        {messagesArea}
-        {dock}
-      </div>
+      <AttachmentDropProvider>
+        <div className="absolute bottom-3 right-3 z-30 w-[min(600px,calc(100vw-360px))] flex flex-col rounded-2xl border house-hairline premium-surface backdrop-blur-md shadow-2xl px-3 pt-2.5 pb-1 ide-panel-enter">
+          {header}
+          {messagesArea}
+          {dock}
+        </div>
+      </AttachmentDropProvider>
     );
   }
 
   if (variant === 'ide-panel') {
     return (
-      <div className="flex flex-col min-h-0 h-full px-3 pt-2.5 pb-2 overflow-hidden">
-        {header}
-        {messagesArea}
-        {dock}
-      </div>
+      <AttachmentDropProvider>
+        <div className="flex flex-col min-h-0 h-full px-3 pt-2.5 pb-2 overflow-hidden">
+          {header}
+          {messagesArea}
+          {dock}
+        </div>
+      </AttachmentDropProvider>
     );
   }
 
@@ -186,19 +196,21 @@ export default function HouseChat({
   // before (no header row, narrow padding). Collapse lives in a floating
   // hover chevron, top-right of the card. Full-bleed on phones.
   return (
-    <div className="flex flex-col justify-end w-full md:max-w-[740px] mx-auto px-1.5 md:px-2 pt-2 pb-1.5 md:pb-2">
-      <div className={`house-chat-card pointer-events-auto relative flex flex-col min-h-0 max-h-[calc(100dvh-186px)] md:max-h-[74vh] rounded-xl md:rounded-2xl border house-hairline px-1.5 md:px-2 pt-1.5 pb-1 overflow-hidden ${minimized ? 'is-minimized' : ''}`}>
-        <button
-          onClick={() => setMinimized((m) => !m)}
-          title={minimized ? 'Expand conversation' : 'Collapse conversation'}
-          aria-label={minimized ? 'Expand conversation' : 'Collapse conversation'}
-          className="absolute top-1.5 right-1.5 z-10 grid place-items-center w-7 h-7 rounded-lg text-zinc-500 md:text-zinc-600 opacity-100 md:opacity-0 hover:opacity-100 hover:text-white hover:bg-white/[0.08] focus-visible:opacity-100 transition-all cursor-pointer [.house-chat-card:hover_&]:opacity-100"
-        >
-          {minimized ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-        </button>
-        {messagesArea}
-        {dock}
+    <AttachmentDropProvider>
+      <div className="flex flex-col justify-end w-full md:max-w-[740px] mx-auto px-1.5 md:px-2 pt-2 pb-1.5 md:pb-2">
+        <div className={`house-chat-card pointer-events-auto relative flex flex-col min-h-0 max-h-[calc(100dvh-186px)] md:max-h-[74vh] rounded-xl md:rounded-2xl border house-hairline px-1.5 md:px-2 pt-1.5 pb-1 overflow-hidden ${minimized ? 'is-minimized' : ''}`}>
+          <button
+            onClick={() => setMinimized((m) => !m)}
+            title={minimized ? 'Expand conversation' : 'Collapse conversation'}
+            aria-label={minimized ? 'Expand conversation' : 'Collapse conversation'}
+            className="absolute top-1.5 right-1.5 z-10 grid place-items-center w-7 h-7 rounded-lg text-zinc-500 md:text-zinc-600 opacity-100 md:opacity-0 hover:opacity-100 hover:text-white hover:bg-white/[0.08] focus-visible:opacity-100 transition-all cursor-pointer [.house-chat-card:hover_&]:opacity-100"
+          >
+            {minimized ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+          </button>
+          {messagesArea}
+          {dock}
+        </div>
       </div>
-    </div>
+    </AttachmentDropProvider>
   );
 }

@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink, Loader2 } from 'lucide-react';
-import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts } from '../../types';
+import { Archive, Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, Image, ChevronDown, Plus, Pencil, Minus, CheckCircle2, RotateCcw, X, FolderGit2, ExternalLink, Loader2, AudioLines, Download, Square } from 'lucide-react';
+import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts, RunStatusNotice } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import type { RetryNotice, StreamSegment } from '../../utils/streamAccum';
 import { presentStream, stripDelegationNarration, stripMailboxEnvelope } from '../../utils/streamPresentation';
-import { undoRun } from '../../services/api';
+import { chatAttachmentUrl, undoRun } from '../../services/api';
 import TraceAccordion from './TraceAccordion';
 import ActivityTimeline from './ActivityTimeline';
 import Markdown from './Markdown';
@@ -256,9 +256,81 @@ function RetryStatus({ retry }: { retry: RetryNotice }) {
   );
 }
 
+function compactTokens(value?: number): string {
+  if (!value || value < 1) return '';
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
+  return String(Math.round(value));
+}
+
+function SessionEventDivider({ kind, metadata, onRetry }: {
+  kind: 'compaction' | 'aborted';
+  metadata?: Record<string, unknown>;
+  onRetry?: () => void;
+}) {
+  const tokensBefore = Number(metadata?.tokens_before || 0);
+  const input = Number(metadata?.input_tokens || 0);
+  const output = Number(metadata?.output_tokens || 0);
+  const aborted = kind === 'aborted';
+  return (
+    <div className={`session-event ${aborted ? 'is-aborted' : 'is-compaction'}`} role="status">
+      <span className="session-event-line" />
+      <span className="session-event-main">
+        <span className="session-event-icon">
+          {aborted ? <Square size={10} /> : <Archive size={11} />}
+        </span>
+        <span className="session-event-label">{aborted ? 'Session aborted' : 'Session compacted'}</span>
+        {aborted ? (
+          <span className="session-event-meta">partial response kept</span>
+        ) : (
+          <span className="session-event-meta">
+            {!!input && <>{compactTokens(input)} in</>}
+            {!!input && !!output && <span>·</span>}
+            {!!output && <>{compactTokens(output)} out</>}
+            {!input && !!tokensBefore && <>{compactTokens(tokensBefore)} context</>}
+          </span>
+        )}
+        {aborted && onRetry && (
+          <button type="button" className="session-event-action" onClick={onRetry}>
+            <RotateCcw size={10} /> Retry
+          </button>
+        )}
+      </span>
+      <span className="session-event-line" />
+    </div>
+  );
+}
+
+function LiveCompactionStatus({ status }: { status: RunStatusNotice }) {
+  const failed = status.kind === 'compaction_failed';
+  const completed = status.kind === 'compaction_completed';
+  return (
+    <div className={`session-event is-live ${failed ? 'is-failed' : ''}`} role="status" aria-live="polite">
+      <span className="session-event-line" />
+      <span className="session-event-main">
+        <span className="session-event-icon">
+          {completed ? <Check size={11} /> : failed ? <CircleAlert size={11} /> : <Loader2 size={11} className="animate-spin" />}
+        </span>
+        <span className="session-event-label">
+          {failed ? 'Session compaction failed' : completed ? 'Session compacted' : 'Session compaction started'}
+        </span>
+        {completed && (!!status.input_tokens || !!status.output_tokens) && (
+          <span className="session-event-meta">
+            {compactTokens(status.input_tokens)} in · {compactTokens(status.output_tokens)} out
+          </span>
+        )}
+        {!completed && !failed && <span className="session-event-meta">summarizing older context…</span>}
+        {failed && <span className="session-event-meta">{status.reason === 'no-reduction' ? 'context unchanged' : 'continuing with current context'}</span>}
+      </span>
+      <span className="session-event-line" />
+    </div>
+  );
+}
+
 export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
   const [copied, setCopied] = useState(false);
   const [rewindArmed, setRewindArmed] = useState(false);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
   useEffect(() => {
     if (!rewindArmed) return;
     const timer = window.setTimeout(() => setRewindArmed(false), 3200);
@@ -277,6 +349,9 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
   const isSystem = message.role === 'system';
+  const eventKind = message.metadata?.kind as string | undefined;
+  const isSessionEvent = eventKind === 'compaction' || eventKind === 'aborted';
+  const liveStatus = message.metadata?.liveStatus as RunStatusNotice | undefined;
   const isTool = isAgent && isToolCall(message.content);
   const showAgentName = !!message.agentName;
   const streamingActive = !!message.metadata?.isStreaming;
@@ -324,9 +399,44 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             )}
             {message.content && <Markdown content={stripMailboxEnvelope(message.content)} />}
             {Array.isArray(message.metadata?.attachments) && <div className="message-attachments">
-              {(message.metadata.attachments as ChatAttachment[]).map((file) => <div className="message-attachment" key={file.id}>
-                {file.isImage ? <Image size={14} /> : <FileText size={14} />}<span className="truncate">{file.name}</span>
-              </div>)}
+              {(message.metadata.attachments as ChatAttachment[]).map((file) => {
+                const src = file.url || (workspaceId && chatId ? chatAttachmentUrl(workspaceId, chatId, file.id) : '');
+                if (file.isImage && src) {
+                  return (
+                    <button
+                      type="button"
+                      className="message-image"
+                      key={file.id}
+                      onClick={() => setPreviewImage(src)}
+                      title={`Open ${file.name}`}
+                    >
+                      <img src={src} alt={file.name} loading="lazy" />
+                    </button>
+                  );
+                }
+                if (file.type?.startsWith('audio/') && src) {
+                  return (
+                    <div className="message-audio" key={file.id} title={file.name}>
+                      <AudioLines size={14} />
+                      <audio controls preload="metadata" src={src} />
+                    </div>
+                  );
+                }
+                return (
+                  <a
+                    className="message-attachment"
+                    key={file.id}
+                    href={src || undefined}
+                    download={file.name}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {file.isImage ? <Image size={14} /> : <FileText size={14} />}
+                    <span className="truncate">{file.name}</span>
+                    {src && <Download size={12} className="ml-auto shrink-0 opacity-60" />}
+                  </a>
+                );
+              })}
             </div>}
           </div>
         </div>
@@ -394,9 +504,23 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
       )}
 
       {/* ────────────────────────────────────
+          SESSION EVENT — compaction / aborted markers
+          ──────────────────────────────────── */}
+      {(eventKind === 'compaction' || eventKind === 'aborted') && (
+        <SessionEventDivider
+          kind={eventKind}
+          metadata={message.metadata}
+          onRetry={eventKind === 'aborted' ? onRetry : undefined}
+        />
+      )}
+      {liveStatus && message.duration === 'active' && (
+        <LiveCompactionStatus status={liveStatus} />
+      )}
+
+      {/* ────────────────────────────────────
           AGENT MESSAGE — with status + actions
           ──────────────────────────────────── */}
-      {isAgent && !isTool && (
+      {isAgent && !isTool && !isSessionEvent && (
         <div className="agent-message-content">
           {/* Agent name label */}
           {showAgentName && (
@@ -525,19 +649,48 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
       {isError && (
         <div className="flex items-start gap-2.5 py-1">
           <CircleAlert size={15} className="text-red-400/90 flex-shrink-0 mt-[3px]" />
-          <p className="min-w-0 text-[13px] text-red-300/90 leading-relaxed whitespace-pre-wrap break-words">
-            {message.content}
-          </p>
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] text-red-300/90 leading-relaxed whitespace-pre-wrap break-words">
+              {message.content}
+            </p>
+            <div className="mt-1.5 flex items-center gap-1">
+              {onRetry && (
+                <button
+                  type="button"
+                  onClick={onRetry}
+                  className="inline-flex items-center gap-1 rounded-md border border-red-400/15 bg-red-400/[0.06] px-2 py-1 text-[10px] font-medium text-red-200/90 hover:bg-red-400/[0.12] hover:text-red-100 transition-colors"
+                >
+                  <RotateCcw size={10} /> Retry
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => { void copyMessage(); }}
+                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors"
+              >
+                {copied ? <Check size={10} className="text-emerald-400" /> : <Copy size={10} />} {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
       {/* ────────────────────────────────────
           SYSTEM MESSAGE — low-contrast italic
           ──────────────────────────────────── */}
-      {isSystem && (
+      {isSystem && !isSessionEvent && (
         <div className="system-message-note">
           <span className="system-message-dot" />
           <span>{message.content}</span>
+        </div>
+      )}
+
+      {previewImage && (
+        <div className="message-lightbox" onClick={() => setPreviewImage(null)} role="dialog" aria-label="Image preview">
+          <img src={previewImage} alt="Attachment preview" />
+          <button type="button" className="message-lightbox-close" onClick={() => setPreviewImage(null)} aria-label="Close image preview">
+            <X size={16} />
+          </button>
         </div>
       )}
     </div>

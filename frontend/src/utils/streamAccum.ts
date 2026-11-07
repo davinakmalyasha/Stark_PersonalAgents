@@ -1,4 +1,4 @@
-import type { ChildReference, StreamDelta } from '../types';
+import type { ChildReference, RunStatusNotice, StreamDelta } from '../types';
 
 /**
  * Shared stream accumulator — single implementation of the SSE delta fold
@@ -48,6 +48,8 @@ export interface StreamAccum {
   toolEvents: LiveToolEvent[];
   /** Ephemeral transport state; never persisted into the answer. */
   retry: RetryNotice | null;
+  /** Compaction/context notices are transient; the completed marker persists. */
+  status: RunStatusNotice | null;
 }
 
 export interface RateAccum {
@@ -57,7 +59,7 @@ export interface RateAccum {
 }
 
 export function emptyStreamAccum(): StreamAccum {
-  return { text: '', reasoning: '', agent: '', segments: [], toolEvents: [], retry: null };
+  return { text: '', reasoning: '', agent: '', segments: [], toolEvents: [], retry: null, status: null };
 }
 
 export function emptyRateAccum(): RateAccum {
@@ -117,6 +119,15 @@ export function applyDeltaToAccum(
   now: number,
 ): number {
   if (!delta) return Math.round(rate.ema);
+  // A finished compaction notice is a one-shot event; let it clear as soon as
+  // the run produces its next output instead of pinning it for the whole turn.
+  if (
+    acc.status
+    && acc.status.kind !== 'compaction_started'
+    && (delta.kind === 'text' || delta.kind === 'reasoning' || delta.kind === 'tool_started' || delta.kind === 'tool_finished')
+  ) {
+    acc.status = null;
+  }
   if (delta.kind === 'reasoning') {
     acc.retry = null;
     acc.reasoning += delta.text || '';
@@ -141,6 +152,8 @@ export function applyDeltaToAccum(
     rate.lastChars = chars;
     acc.text += text;
     appendSegment(acc, 'text', text, delta.agent);
+  } else if (delta.kind === 'status' && delta.status) {
+    acc.status = delta.status;
   } else if (delta.kind === 'end') {
     acc.retry = null;
     rate.ema = 0;

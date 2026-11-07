@@ -138,7 +138,11 @@
   min-width: 0;
   padding: 9px 9px 8px;
   border-bottom: 1px solid rgba(255,255,255,.065);
+  cursor: grab;
 }
+.canvas-card-head:active { cursor: grabbing; }
+.canvas-card-head button,
+.canvas-card-head input { cursor: pointer; }
 .canvas-card-grip { flex: none; color: rgba(255,255,255,.18); cursor: grab; }
 .canvas-card-grip:active { cursor: grabbing; }
 .canvas-card-icon {
@@ -190,6 +194,17 @@
 }
 .canvas-card-icon-button:hover { background: rgba(255,255,255,.07); color: #ededf0; }
 .canvas-card-icon-button.is-close:hover { background: rgba(244, 63, 94, .10); color: #fda4af; }
+.canvas-card-icon-button.is-details {
+  width: auto;
+  gap: 3px;
+  padding: 0 5px;
+  color: #777b84;
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+.canvas-card-icon-button.is-details span { line-height: 1; }
 .canvas-card-icon-button:focus-visible { outline: 1px solid rgba(255,255,255,.5); outline-offset: 1px; }
 
 .canvas-card-chip {
@@ -208,12 +223,19 @@
   white-space: nowrap;
 }
 .canvas-card-chip-dot { width: 4px; height: 4px; border-radius: 999px; background: currentColor; }
-.canvas-card-chip.is-running { border-color: rgba(255,255,255,.18); color: #e9e9ec; }
-.canvas-card-chip.is-running .canvas-card-chip-dot { background: #fff; box-shadow: 0 0 8px rgba(255,255,255,.7); animation: canvas-dot-pulse 1.4s ease-in-out infinite; }
-.canvas-card-chip.is-waiting { border-color: rgba(252,211,77,.22); color: #fcd34d; }
-.canvas-card-chip.is-done { border-color: rgba(110,231,183,.16); color: #86efac; }
-.canvas-card-chip.is-error { border-color: rgba(251,113,133,.2); color: #fda4af; }
+.canvas-card-chip svg { flex: none; }
+.canvas-card-chip-spinner { animation: canvas-spin 1s linear infinite; }
+@keyframes canvas-spin { to { transform: rotate(360deg); } }
+.canvas-card-chip.is-running { border-color: rgba(255,255,255,.18); color: #e9e9ec; background: rgba(255,255,255,.035); }
+.canvas-card-chip.is-queued { border-color: rgba(252,211,77,.22); color: #fcd34d; background: rgba(252,211,77,.035); }
+.canvas-card-chip.is-queued svg { animation: canvas-dot-pulse 1.4s ease-in-out infinite; }
+.canvas-card-chip.is-done { border-color: rgba(110,231,183,.16); color: #86efac; background: rgba(110,231,183,.025); }
+.canvas-card-chip.is-failed { border-color: rgba(251,113,133,.2); color: #fda4af; background: rgba(251,113,133,.035); }
+.canvas-card-chip.is-aborted { border-color: rgba(251,191,36,.18); color: #fcd34d; background: rgba(251,191,36,.03); }
+.canvas-card-chip.is-idle { color: #898c95; }
 .canvas-card.is-compact .canvas-card-chip { padding: 1px 4px; font-size: 7px; }
+.canvas-card.is-compact .canvas-card-icon-button.is-details { padding: 0 3px; }
+.canvas-card.is-compact .canvas-card-icon-button.is-details span { display: none; }
 
 .canvas-card-body { padding: 9px 10px 0; }
 .canvas-card-live { display: flex; align-items: center; gap: 6px; min-width: 0; color: #e7e7ea; font-size: 10.5px; line-height: 1.4; }
@@ -307,7 +329,39 @@
 .canvas-card-open:hover { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.075); }
 
 /* ── Prompt dock ── */
-.canvas-card-dock { padding: 8px 10px 9px; }
+.canvas-card-dock { position: relative; padding: 8px 10px 9px; }
+.canvas-card-dock.is-drag-active .canvas-card-input-wrap { border-color: rgba(255,255,255,.3); }
+.canvas-card-files { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.canvas-card-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 6px;
+  padding: 3px 5px;
+  background: rgba(255,255,255,.035);
+  color: #b9b9c1;
+  font-size: 8.5px;
+}
+.canvas-card-file > span { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.canvas-card-file button { display: grid; place-items: center; flex: none; width: 13px; height: 13px; border: 0; border-radius: 4px; background: transparent; color: #74747d; cursor: pointer; }
+.canvas-card-file button:hover { background: rgba(255,255,255,.1); color: #fff; }
+.canvas-card-attach {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #676b74;
+  cursor: pointer;
+  transition: color .15s ease, background .15s ease;
+}
+.canvas-card-attach:hover { color: #ededf0; background: rgba(255,255,255,.07); }
 .canvas-card-input-wrap {
   display: flex;
   align-items: center;
@@ -315,7 +369,7 @@
   border: 1px solid rgba(255,255,255,.075);
   border-radius: 8px;
   background: rgba(0,0,0,.18);
-  padding: 3px 4px 3px 8px;
+  padding: 3px 4px;
   transition: border-color .15s ease, background .15s ease;
 }
 .canvas-card-input-wrap:focus-within { border-color: rgba(255,255,255,.19); background: rgba(0,0,0,.28); }
@@ -359,56 +413,33 @@
 /* ── Map header ── */
 .canvas-map-head {
   position: absolute;
-  left: 14px;
-  right: 14px;
-  top: 14px;
+  right: 12px;
+  top: 10px;
   z-index: 60;
   display: flex;
   align-items: center;
-  gap: 14px;
   min-width: 0;
-  padding: 8px 9px 8px 11px;
-  border: 1px solid rgba(255,255,255,.085);
-  border-radius: 12px;
-  background: rgba(13,13,16,.80);
-  box-shadow: 0 12px 36px rgba(0,0,0,.32);
-  backdrop-filter: blur(18px);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
   pointer-events: auto;
 }
-.canvas-map-title-wrap { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.canvas-map-mark {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: 27px;
-  height: 27px;
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 8px;
-  background: rgba(255,255,255,.045);
-  color: #dedee2;
-}
-.canvas-map-title-copy { min-width: 0; }
-.canvas-map-title { color: #f1f1f3; font-size: 12px; font-weight: 650; letter-spacing: -.01em; }
-.canvas-map-subtitle { display: flex; align-items: center; gap: 5px; margin-top: 1px; color: #777b85; font-size: 9px; white-space: nowrap; }
-.canvas-map-subtitle span { color: #4f525a; }
-.canvas-map-subtitle b { color: #fda4af; font-weight: 600; }
-.canvas-map-stats { display: flex; align-items: center; gap: 12px; min-width: 0; margin-left: 6px; color: #757983; font-size: 9px; white-space: nowrap; }
-.canvas-map-stats span { display: inline-flex; align-items: baseline; gap: 4px; }
-.canvas-map-stats b { color: #dedee2; font: 600 10px/1 ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; }
-.canvas-map-controls { display: flex; align-items: center; gap: 2px; margin-left: auto; flex: none; }
+.canvas-map-controls { display: flex; align-items: center; gap: 1px; margin-left: auto; flex: none; }
 .canvas-map-controls button {
   display: grid;
   place-items: center;
-  width: 27px;
-  height: 27px;
-  border: 1px solid transparent;
-  border-radius: 7px;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
   background: transparent;
-  color: #8a8d96;
+  color: #81848d;
   cursor: pointer;
-  transition: background .15s ease, color .15s ease, border-color .15s ease;
+  opacity: .82;
+  transition: background .15s ease, color .15s ease, opacity .15s ease;
 }
-.canvas-map-controls button:hover { border-color: rgba(255,255,255,.08); background: rgba(255,255,255,.06); color: #fff; }
+.canvas-map-controls button:hover { background: rgba(255,255,255,.07); color: #fff; opacity: 1; }
 .canvas-map-controls button:focus-visible { outline: 1px solid rgba(255,255,255,.5); outline-offset: 1px; }
 .canvas-map-controls button.is-close { margin-left: 3px; border-color: rgba(255,255,255,.08); }
 .canvas-map-hint {
@@ -517,10 +548,8 @@
 @keyframes canvas-border-sweep { from { background-position: 140% 0; } to { background-position: -80% 0; } }
 
 @media (max-width: 720px) {
-  .canvas-map-head { left: 8px; right: 8px; top: 8px; flex-wrap: wrap; gap: 8px; padding: 7px 8px; }
-  .canvas-map-stats { order: 3; width: 100%; margin-left: 0; padding: 2px 2px 0; gap: 10px; overflow-x: auto; }
+  .canvas-map-head { right: 8px; top: 8px; }
   .canvas-map-controls { margin-left: auto; }
-  .canvas-map-title { font-size: 11.5px; }
   .canvas-map-hint { display: none; }
   .canvas-card { width: 300px; }
   .canvas-card.is-compact { width: 262px; }

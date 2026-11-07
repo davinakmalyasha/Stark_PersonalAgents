@@ -709,10 +709,12 @@ impl ChatStore {
             r#"
             SELECT c.id, c.title, c.model, c.created_at, c.updated_at, c.message_count,
                    c.parent_chat_id, c.parent_workspace_id,
-                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,
-                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id
-                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role,
+                   (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata
             FROM chats c
             WHERE c.workspace_id = ?
             ORDER BY c.updated_at DESC
@@ -758,6 +760,15 @@ impl ChatStore {
                 if let Some(role) = row.try_get::<Option<String>, _>("last_role").ok().flatten() {
                     item["lastRole"] = Value::String(display_role(&role));
                 }
+                if let Some(raw) = row
+                    .try_get::<Option<String>, _>("last_metadata")
+                    .ok()
+                    .flatten()
+                    && let Ok(metadata) = serde_json::from_str::<Value>(&raw)
+                    && let Some(kind) = metadata.get("kind").and_then(Value::as_str)
+                {
+                    item["lastKind"] = Value::String(kind.to_string());
+                }
                 item
             })
             .collect()
@@ -770,10 +781,12 @@ impl ChatStore {
             r#"
             SELECT c.id, c.workspace_id, c.workspace_path, c.title, c.model,
                    c.created_at, c.updated_at, c.message_count, c.parent_chat_id,
-                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,
-                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id
-                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role,
+                   (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata
             FROM chats c
             ORDER BY c.updated_at DESC
             "#,
@@ -789,6 +802,12 @@ impl ChatStore {
                     .flatten()
                     .unwrap_or_default();
                 let snippet: String = last.split_whitespace().collect::<Vec<_>>().join(" ");
+                let last_kind = row
+                    .try_get::<Option<String>, _>("last_metadata")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|metadata| metadata.get("kind").and_then(Value::as_str).map(str::to_string));
                 json!({
                     "id": row.get::<String, _>("id"),
                     "workspaceId": row.get::<String, _>("workspace_id"),
@@ -805,6 +824,7 @@ impl ChatStore {
                         .flatten()
                         .map(|role| display_role(&role))
                         .unwrap_or_default(),
+                    "lastKind": last_kind,
                     "lastMessage": snippet.chars().take(1200).collect::<String>(),
                 })
             })

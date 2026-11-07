@@ -1702,6 +1702,10 @@ async fn force_compact(
     writer: Option<&mut stark_store::rollout::RolloutWriter>,
 ) -> bool {
     let policy = compaction::CompactionPolicy::from_env(&ctx.scope, &ctx.model);
+    ctx.emit_delta(Delta::status(json!({
+        "kind": "compaction_started",
+        "reason": "context-overflow",
+    })));
     let Some(outcome) = compaction::compact_history(
         &ctx.provider,
         &ctx.cancel,
@@ -1712,12 +1716,36 @@ async fn force_compact(
     )
     .await
     else {
+        ctx.emit_delta(Delta::status(json!({
+            "kind": "compaction_failed",
+            "reason": "context-overflow",
+        })));
         return false;
     };
     if compaction::estimate_tokens(&outcome.messages) >= compaction::estimate_tokens(messages) {
+        ctx.emit_delta(Delta::status(json!({
+            "kind": "compaction_failed",
+            "reason": "no-reduction",
+        })));
         return false;
     }
     *messages = outcome.messages;
+    let _ = ctx
+        .store
+        .append_message_with_metadata(
+            &ctx.chat_id,
+            "system",
+            "Session compacted",
+            false,
+            Some(&json!({
+                "kind": "compaction",
+                "tokens_before": outcome.tokens_before,
+                "tokens_after": outcome.tokens_after,
+                "input_tokens": outcome.input_tokens,
+                "output_tokens": outcome.output_tokens,
+            })),
+        )
+        .await;
     let _ = ctx
         .store
         .append_session_entry_for(
@@ -1744,6 +1772,14 @@ async fn force_compact(
         )
         .await;
     }
+    ctx.emit_delta(Delta::status(json!({
+        "kind": "compaction_completed",
+        "reason": "context-overflow",
+        "tokens_before": outcome.tokens_before,
+        "tokens_after": outcome.tokens_after,
+        "input_tokens": outcome.input_tokens,
+        "output_tokens": outcome.output_tokens,
+    })));
     true
 }
 
@@ -1769,6 +1805,11 @@ async fn maybe_compact(
     if !compaction::should_compact_with(messages, &policy, tokens) {
         return;
     }
+    ctx.emit_delta(Delta::status(json!({
+        "kind": "compaction_started",
+        "reason": "context-limit",
+        "tokens_before": tokens,
+    })));
     let Some(outcome) = compaction::compact_history(
         &ctx.provider,
         &ctx.cancel,
@@ -1779,6 +1820,10 @@ async fn maybe_compact(
     )
     .await
     else {
+        ctx.emit_delta(Delta::status(json!({
+            "kind": "compaction_failed",
+            "reason": "summarize-failed",
+        })));
         return;
     };
     if compaction::estimate_tokens(&outcome.messages) >= policy.trigger_tokens {
@@ -1786,9 +1831,36 @@ async fn maybe_compact(
             "chat {} compaction did not reduce the context below the trigger; keeping the previous history",
             ctx.chat_id
         );
+        ctx.emit_delta(Delta::status(json!({
+            "kind": "compaction_failed",
+            "reason": "no-reduction",
+            "tokens_before": tokens,
+        })));
         return;
     }
     *messages = outcome.messages;
+    if let Err(error) = ctx
+        .store
+        .append_message_with_metadata(
+            &ctx.chat_id,
+            "system",
+            "Session compacted",
+            false,
+            Some(&json!({
+                "kind": "compaction",
+                "tokens_before": outcome.tokens_before,
+                "tokens_after": outcome.tokens_after,
+                "input_tokens": outcome.input_tokens,
+                "output_tokens": outcome.output_tokens,
+            })),
+        )
+        .await
+    {
+        tracing::warn!(
+            "failed to persist compacted marker for {}: {error}",
+            ctx.chat_id
+        );
+    }
     if let Err(error) = ctx
         .store
         .append_session_entry_for(
@@ -1818,6 +1890,14 @@ async fn maybe_compact(
         )
         .await;
     }
+    ctx.emit_delta(Delta::status(json!({
+        "kind": "compaction_completed",
+        "reason": "context-limit",
+        "tokens_before": outcome.tokens_before,
+        "tokens_after": outcome.tokens_after,
+        "input_tokens": outcome.input_tokens,
+        "output_tokens": outcome.output_tokens,
+    })));
 }
 
 #[derive(Default)]
@@ -1863,9 +1943,35 @@ async fn finish_aborted(
         )
         .await;
     }
+    // Keep the partial response as an assistant projection, then a durable
+    // aborted marker. The UI renders the marker as a session divider and the
+    // latest-message metadata drives the card's "Aborted" status.
+    if !partial_text.trim().is_empty() || !partial_reasoning.trim().is_empty() {
+        let metadata = rollout_trace::projection_metadata(partial_reasoning, &[], true);
+        let _ = ctx
+            .store
+            .append_message_with_metadata(
+                &ctx.chat_id,
+                "assistant",
+                partial_text,
+                false,
+                Some(&metadata),
+            )
+            .await;
+    }
     let _ = ctx
         .store
-        .append_message(&ctx.chat_id, "assistant", message, false)
+        .append_message_with_metadata(
+            &ctx.chat_id,
+            "assistant",
+            "Session aborted",
+            false,
+            Some(&json!({
+                "kind": "aborted",
+                "stopped": true,
+                "reason": "cancelled",
+            })),
+        )
         .await;
     let _ = ctx
         .store

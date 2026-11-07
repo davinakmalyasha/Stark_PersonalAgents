@@ -468,12 +468,24 @@ export function streamPipeline(
                 } else {
                   finish();
                 }
-              } else if (parsed.error) {
-                console.error('[streamPipeline] Backend pipeline error:', parsed.error);
-                onState(parsed as AppState);
-                fail(parsed.error);
-              } else {
-                onState(parsed as AppState);
+              } else if (currentEvent === 'error') {
+                fail(parsed.message || parsed.error || 'The agent pipeline failed.');
+              } else if (currentEvent === 'warning') {
+                // Warnings are durable in the rollout; surface them in the
+                // console without replacing live AppState with a message.
+                console.warn('[streamPipeline] warning:', parsed.message || parsed);
+              } else if (currentEvent === 'turn_aborted') {
+                // The backend persists the aborted marker; the next chat
+                // refresh (on done) shows it.
+                console.warn('[streamPipeline] turn aborted:', parsed.reason || parsed);
+              } else if (currentEvent === 'state' || parsed.active_node || typeof parsed.state_version === 'number') {
+                if (parsed.error) {
+                  console.error('[streamPipeline] Backend pipeline error:', parsed.error);
+                  onState(parsed as AppState);
+                  fail(parsed.error);
+                } else {
+                  onState(parsed as AppState);
+                }
               }
               currentEvent = '';
             } catch {

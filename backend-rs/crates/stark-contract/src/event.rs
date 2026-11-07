@@ -21,6 +21,10 @@ pub struct Delta {
     pub ms: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<Value>,
+    /// Out-of-band run state (compaction, context warnings, …). Kept in the
+    /// delta stream so every client folds it through the same path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Value>,
 }
 
 impl Delta {
@@ -52,6 +56,7 @@ impl Delta {
             ok: None,
             ms: None,
             children: Vec::new(),
+            status: None,
         }
     }
 
@@ -73,7 +78,14 @@ impl Delta {
             ok: Some(ok),
             ms: Some(ms),
             children: Vec::new(),
+            status: None,
         }
+    }
+
+    pub fn status(status: Value) -> Self {
+        let mut delta = Self::new("status", "");
+        delta.status = Some(status);
+        delta
     }
 
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
@@ -98,6 +110,7 @@ impl Delta {
             ok: None,
             ms: None,
             children: Vec::new(),
+            status: None,
         }
     }
 }

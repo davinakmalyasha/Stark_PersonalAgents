@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { FolderPlus, Minus, Plus, RotateCcw, Scan, Waypoints } from 'lucide-react';
+import { FolderPlus, Minus, Plus, RotateCcw, Scan } from 'lucide-react';
 import type { ChatSummary, GroupProjectRow, SessionTab, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import CanvasAddMenu from './CanvasAddMenu';
@@ -32,7 +32,7 @@ interface Props {
   onOpenChat?: (workspaceId: string, chatId: string) => void;
   onOpenGroup?: (projectId: string) => void;
   onOpenAddon?: (workspaceId: string, addonId: CanvasAddonId, chatId?: string) => void;
-  onSendToChat?: (workspaceId: string, chatId: string, text: string) => Promise<void> | void;
+  onSendToChat?: (workspaceId: string, chatId: string, text: string, files?: File[]) => Promise<void> | void;
   /** Open top-bar tabs; when present they are auto-added as map roots. */
   tabs?: SessionTab[];
   runningTabId?: string | null;
@@ -61,13 +61,6 @@ function isProjectWorkspace(ws: WorkspaceInfo): boolean {
     && !(ws as { isDfd?: boolean }).isDfd;
 }
 
-function compactNumber(value?: number): string {
-  if (!value || value < 1) return '0';
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
-  return String(Math.round(value));
-}
-
 function sizesEqual(left: Record<string, CardSize>, right: Record<string, CardSize>): boolean {
   const leftKeys = Object.keys(left);
   const rightKeys = Object.keys(right);
@@ -84,7 +77,7 @@ export default function CanvasStage({
   scope, workspaces, chatsByWs, activeWorkspaceId, activeChatId,
   agents, isRunning, elapsed, projects = [],
   onOpenChat, onOpenGroup, onOpenAddon, onSendToChat,
-  tabs, runningTabId, variant = 'background', usage, toolCalls, errors,
+  tabs, runningTabId, variant = 'background', usage, toolCalls,
   onCloseTab,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -372,9 +365,19 @@ export default function CanvasStage({
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest('[data-canvas-ui]')) return;
-    setViewSmooth(false);
+
+    // Never steal a click from a real control. The old handler called
+    // preventDefault + setPointerCapture for every non-button target, which
+    // made the card input unfocusable and swallowed the header actions.
+    if (target.closest('button, input, textarea, select, a, label, [contenteditable="true"], [data-no-drag]')) {
+      return;
+    }
+
     const card = target.closest('[data-canvas-card]') as HTMLElement | null;
-    if (card && !target.closest('button, input, a, [data-no-drag]')) {
+    if (card) {
+      // Cards only move from their explicit grip/header handle. Clicking the
+      // card body must remain a normal click, not a tiny accidental drag.
+      if (!target.closest('[data-canvas-drag-handle]')) return;
       const id = card.dataset.itemId || '';
       const item = itemsRef.current.find((candidate) => candidate.id === id);
       if (!item) return;
@@ -386,6 +389,8 @@ export default function CanvasStage({
       });
       return;
     }
+
+    setViewSmooth(false);
     e.preventDefault();
     containerRef.current?.setPointerCapture(e.pointerId);
     setInteraction({
@@ -518,8 +523,6 @@ export default function CanvasStage({
     fitView();
   }, [variant, items.length, fitView]);
 
-  const autoRoots = items.filter((item) => item.kind === 'chat' && item.auto && (item.depth || 0) === 0).length;
-  const autoAgents = items.filter((item) => item.kind === 'chat' && item.auto && (item.depth || 0) > 0).length;
   const totalTokens = (usage?.input || 0) + (usage?.output || 0);
 
   return (
@@ -599,7 +602,7 @@ export default function CanvasStage({
                 onOpen={() => openItem(item)}
                 onRemove={() => removeItem(item.id)}
                 onSend={item.kind === 'chat' && onSendToChat
-                  ? (text) => onSendToChat(item.workspaceId, item.chatId, text)
+                  ? (text, files) => onSendToChat(item.workspaceId, item.chatId, text, files)
                   : undefined}
                 compact={item.kind === 'chat' && (item.depth || 0) > 0}
                 isActive={activeChat}
@@ -620,24 +623,6 @@ export default function CanvasStage({
 
       {variant === 'map' && (
         <div data-canvas-ui className="canvas-map-head">
-          <div className="canvas-map-title-wrap">
-            <span className="canvas-map-mark"><Waypoints size={15} /></span>
-            <div className="canvas-map-title-copy">
-              <div className="canvas-map-title">Canvas</div>
-              <div className="canvas-map-subtitle">
-                {autoRoots} {autoRoots === 1 ? 'chat' : 'chats'}
-                <span>·</span>
-                {autoAgents} {autoAgents === 1 ? 'agent' : 'agents'}
-                {errors ? <><span>·</span><b className="is-error">{errors} errors</b></> : null}
-              </div>
-            </div>
-          </div>
-          <div className="canvas-map-stats">
-            <span><b>{tabs?.length ?? autoRoots}</b> open</span>
-            {!!totalTokens && <span><b>{compactNumber(totalTokens)}</b> tokens</span>}
-            {!!usage?.cost && <span><b>${usage.cost < 0.01 ? usage.cost.toFixed(4) : usage.cost.toFixed(2)}</b></span>}
-            {!!toolCalls && <span><b>{toolCalls}</b> tools</span>}
-          </div>
           <div className="canvas-map-controls">
             <button type="button" onClick={openAddMenu} title="Add to canvas" aria-label="Add to canvas"><FolderPlus size={13} /></button>
             <button type="button" onClick={() => zoomBy(0.86)} title="Zoom out" aria-label="Zoom out"><Minus size={13} /></button>

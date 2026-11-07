@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { AppState, ChatMessage, ChatAttachment, SessionTab, TokenUsage, StreamDelta } from '../types';
+import type { AppState, ChatMessage, ChatAttachment, SessionTab, TokenUsage, StreamDelta, RunStatusNotice } from '../types';
 import { addChatMessage, fetchChat, uploadChatAttachments, abortRun } from '../services/api';
 import { startHousePipeline } from './houseChatService';
 import { parseLogToSteps } from '../utils/logParser';
@@ -34,7 +34,7 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
   const currentKeyRef = useRef('');
   // Owning run target for Stop: persist the partial into the same session.
   const runTargetRef = useRef<SessionTab | null>(null);
-  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number; retry: RetryNotice | null }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
+  const [streaming, setStreaming] = useState<{ text: string; reasoning: string; agent: string; segments: StreamSegment[]; active: boolean; rate: number; retry: RetryNotice | null; status: RunStatusNotice | null }>({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null, status: null });
   const streamRef = useRef(emptyStreamAccum());
   const rateRef = useRef(emptyRateAccum());
 
@@ -48,13 +48,14 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
       active: true,
       rate,
       retry: streamRef.current.retry,
+      status: streamRef.current.status,
     });
   }, []);
 
   const resetStream = useCallback(() => {
     streamRef.current = emptyStreamAccum();
     rateRef.current = emptyRateAccum();
-    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null });
+    setStreaming({ text: '', reasoning: '', agent: '', segments: [], active: false, rate: 0, retry: null, status: null });
   }, []);
 
   const finishedRef = useRef(onFinished);
@@ -98,6 +99,7 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
           streamingReasoning: streaming.reasoning,
           streamRate: streaming.rate,
           retry: streaming.retry,
+          liveStatus: streaming.status,
           liveTimeline: streaming.segments,
         },
       },

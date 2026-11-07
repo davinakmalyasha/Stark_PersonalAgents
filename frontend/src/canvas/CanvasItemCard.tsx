@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
-  ArrowUp, Bot, ChevronDown, ChevronUp, Clock3, FolderKanban, GripVertical,
-  MessageSquare, Palette, Plus, X,
+  ArrowUp, AudioLines, Bot, Check, ChevronDown, ChevronUp, CircleAlert, Clock3,
+  FileText, FolderKanban, GripVertical, Image as ImageIcon, Loader2, MessageSquare,
+  Palette, Paperclip, Plus, Square, X,
 } from 'lucide-react';
+import { DropOverlay } from '../components/Workspace/AttachmentDrop';
 import type { ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import { cleanChatTitle } from '../utils/chatTitle';
@@ -22,7 +24,7 @@ interface Props {
   onToggleExpanded: () => void;
   onOpen: () => void;
   onRemove: () => void;
-  onSend?: (text: string) => Promise<void> | void;
+  onSend?: (text: string, files: File[]) => Promise<void> | void;
   /** Live map context. */
   compact?: boolean;
   isActive?: boolean;
@@ -35,13 +37,14 @@ interface Props {
   toolCalls?: number;
 }
 
-type CardStatus = 'running' | 'waiting' | 'done' | 'error' | 'idle';
+type CardStatus = 'running' | 'queued' | 'done' | 'failed' | 'aborted' | 'idle';
 
 const STATUS_LABEL: Record<CardStatus, string> = {
-  running: 'Working',
-  waiting: 'Queued',
+  running: 'Running',
+  queued: 'Queued',
   done: 'Done',
-  error: 'Failed',
+  failed: 'Failed',
+  aborted: 'Aborted',
   idle: 'Idle',
 };
 
@@ -55,9 +58,9 @@ const AGENT_DOT: Record<string, string> = {
 const GROUP_STATUS: Record<string, CardStatus> = {
   running: 'running',
   done: 'done',
-  paused: 'waiting',
-  stalled: 'waiting',
-  failed: 'error',
+  paused: 'queued',
+  stalled: 'queued',
+  failed: 'failed',
 };
 
 function timeAgo(iso?: string): string {
@@ -81,15 +84,27 @@ function compactNumber(value?: number): string {
 
 function chatStatus(chat: ChatSummary, running: boolean): CardStatus {
   if (running) return 'running';
-  if (chat.lastRole === 'error') return 'error';
-  if (chat.lastRole === 'user') return 'waiting';
-  return 'done';
+  if (chat.status) return chat.status;
+  if (chat.lastKind === 'aborted') return 'aborted';
+  if (chat.lastRole === 'error') return 'failed';
+  if (chat.lastRole === 'user') return 'idle';
+  if (chat.lastRole === 'agent') return 'done';
+  return 'idle';
+}
+
+function StatusIcon({ status }: { status: CardStatus }) {
+  if (status === 'running') return <Loader2 size={9} className="canvas-card-chip-spinner" />;
+  if (status === 'queued') return <Clock3 size={9} />;
+  if (status === 'done') return <Check size={9} />;
+  if (status === 'failed') return <CircleAlert size={9} />;
+  if (status === 'aborted') return <Square size={8} />;
+  return <span className="canvas-card-chip-dot" />;
 }
 
 function StatusChip({ status }: { status: CardStatus }) {
   return (
-    <span className={`canvas-card-chip is-${status}`}>
-      <span className="canvas-card-chip-dot" />
+    <span className={`canvas-card-chip is-${status}`} data-status={status}>
+      <StatusIcon status={status} />
       {STATUS_LABEL[status]}
     </span>
   );
@@ -102,18 +117,29 @@ export default function CanvasItemCard({
   onOpenChild, onCloseTab, tokens, cost, toolCalls,
 }: Props) {
   const [draft, setDraft] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const dragDepth = useRef(0);
+  const fileRef = useRef<HTMLInputElement | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState('');
+
+  const addFiles = (incoming: FileList | File[]) => {
+    const valid = Array.from(incoming).filter((file) => file.size <= 20 * 1024 * 1024);
+    setFiles((current) => [...current, ...valid.filter((file) => !current.some((item) => item.name === file.name && item.size === file.size))].slice(0, 8));
+    if (valid.length !== Array.from(incoming).length) setSendError('Files must be 20 MB or smaller.');
+  };
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     const text = draft.trim();
-    if (!text || sending || running || !onSend) return;
+    if ((!text && !files.length) || sending || running || !onSend) return;
     setSending(true);
     setSendError('');
     try {
-      await onSend(text);
+      await onSend(text || `Attached ${files.length} file${files.length === 1 ? '' : 's'}`, files);
       setDraft('');
+      setFiles([]);
     } catch (err) {
       setSendError(err instanceof Error ? err.message : 'Could not send.');
     } finally {
@@ -129,7 +155,7 @@ export default function CanvasItemCard({
     : onRemove;
 
   const header = (icon: ReactNode, title: string, subtitle: string, status: CardStatus) => (
-    <div className="canvas-card-head">
+    <div className="canvas-card-head" data-canvas-drag-handle>
       <GripVertical size={12} className="canvas-card-grip" />
       <span className="canvas-card-icon">{icon}</span>
       <div className="canvas-card-title-wrap">
@@ -141,11 +167,13 @@ export default function CanvasItemCard({
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
-          className="canvas-card-icon-button"
-          title={expanded ? 'Collapse details' : 'Show details'}
-          aria-label={expanded ? 'Collapse details' : 'Show details'}
+          className="canvas-card-icon-button is-details"
+          title={expanded ? 'Hide agents and details' : 'Show agents and details'}
+          aria-label={expanded ? 'Hide agents and details' : 'Show agents and details'}
+          aria-expanded={expanded}
         >
           {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+          {!compact && <span>Details</span>}
         </button>
       )}
       <button
@@ -265,22 +293,93 @@ export default function CanvasItemCard({
           </div>
         )}
 
-        <form data-no-drag onSubmit={submit} className="canvas-card-dock">
+        <form
+          data-no-drag
+          onSubmit={submit}
+          className={`canvas-card-dock ${dragActive ? 'is-drag-active' : ''}`}
+          onDragEnter={(event) => {
+            if (!Array.from(event.dataTransfer.types || []).includes('Files')) return;
+            event.preventDefault();
+            event.stopPropagation();
+            dragDepth.current += 1;
+            setDragActive(true);
+          }}
+          onDragLeave={(event) => {
+            if (!Array.from(event.dataTransfer.types || []).includes('Files')) return;
+            event.preventDefault();
+            event.stopPropagation();
+            dragDepth.current -= 1;
+            if (dragDepth.current <= 0) {
+              dragDepth.current = 0;
+              setDragActive(false);
+            }
+          }}
+          onDragOver={(event) => {
+            if (!Array.from(event.dataTransfer.types || []).includes('Files')) return;
+            event.preventDefault();
+            event.stopPropagation();
+            event.dataTransfer.dropEffect = 'copy';
+          }}
+          onDrop={(event) => {
+            if (!event.dataTransfer.files?.length) return;
+            event.preventDefault();
+            event.stopPropagation();
+            dragDepth.current = 0;
+            setDragActive(false);
+            addFiles(event.dataTransfer.files);
+          }}
+        >
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            accept="image/*,audio/*,.pdf,.txt,.md,.json,.js,.ts,.tsx,.py,.html,.css,.csv,.doc,.docx,.zip"
+            className="hidden"
+            onChange={(event) => {
+              if (event.target.files) addFiles(event.target.files);
+              event.currentTarget.value = '';
+            }}
+          />
+          {dragActive && <DropOverlay compact />}
+          {files.length > 0 && (
+            <div className="canvas-card-files">
+              {files.map((file) => (
+                <span className="canvas-card-file" key={`${file.name}-${file.size}`}>
+                  {file.type.startsWith('image/') ? <ImageIcon size={9} /> : file.type.startsWith('audio/') ? <AudioLines size={9} /> : <FileText size={9} />}
+                  <span>{file.name}</span>
+                  <button type="button" onClick={() => setFiles((all) => all.filter((item) => item !== file))} aria-label={`Remove ${file.name}`}>
+                    <X size={8} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="canvas-card-input-wrap">
+            <button
+              type="button"
+              className="canvas-card-attach"
+              onClick={() => fileRef.current?.click()}
+              title="Attach files"
+              aria-label="Attach files"
+            >
+              <Paperclip size={11} />
+            </button>
             <input
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              disabled={sending || running}
-              placeholder={sending ? 'Sending…' : running ? 'Agent working…' : 'Message this chat…'}
+              disabled={sending}
+              placeholder={sending ? 'Sending…' : running ? 'Agent is running — you can type ahead…' : 'Message this chat…'}
               className="canvas-card-input"
+              aria-label="Message this chat"
             />
             <button
               type="submit"
-              disabled={sending || running || !draft.trim()}
+              disabled={sending || running || (!draft.trim() && !files.length)}
               className="canvas-card-send"
               aria-label="Send message"
+              title={running ? 'Wait for this run to finish' : 'Send message'}
             >
-              <ArrowUp size={11} />
+              {sending ? <Loader2 size={11} className="canvas-card-chip-spinner" /> : <ArrowUp size={11} />}
             </button>
           </div>
           {sendError && <div className="canvas-card-error">{sendError}</div>}

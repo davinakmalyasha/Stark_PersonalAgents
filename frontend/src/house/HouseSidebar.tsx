@@ -320,7 +320,13 @@ export default function HouseSidebar({
     return (
       <div
         key={row.sid}
-        onClick={() => { if (!isEditing && !isDeleting) { onOpenSession(row.ws.id, row.id); onClose(); } }}
+        onClick={() => {
+          if (isEditing || isDeleting) return;
+          onOpenSession(row.ws.id, row.id);
+          // Keep the dock open on desktop so checking several chats is one
+          // click each. On phones the drawer must close to reveal the chat.
+          if (window.matchMedia('(max-width: 767px)').matches) onClose();
+        }}
         className={`house-sidebar-row group relative flex items-center gap-2 rounded-lg mb-1 pr-2 py-2 cursor-pointer ${
           isActive ? 'is-active' : ''
         } ${isDeleting ? 'is-deleting' : ''} ${spawned ? 'is-spawned' : ''}`}
@@ -411,7 +417,10 @@ export default function HouseSidebar({
   const renderKidLeaves = (kid: RowChat, depth: number) => (
     <div
       key={kid.sid}
-      onClick={() => { onOpenSession(kid.ws.id, kid.id); onClose(); }}
+      onClick={() => {
+        onOpenSession(kid.ws.id, kid.id);
+        if (window.matchMedia('(max-width: 767px)').matches) onClose();
+      }}
       className="group/sub relative flex items-center gap-1.5 rounded-lg pr-2 py-1.5 cursor-pointer hover:bg-white/[0.04]"
       style={{ paddingLeft: 12 + (depth + 1) * 14 }}
       title={`${kid.title || 'Untitled'} — opens child chat`}

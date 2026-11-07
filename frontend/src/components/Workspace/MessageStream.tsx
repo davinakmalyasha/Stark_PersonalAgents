@@ -1,8 +1,9 @@
-import { useRef, useEffect, useMemo, useState } from 'react';
+import { Fragment, useRef, useEffect, useMemo, useState } from 'react';
 import { ArrowDown } from 'lucide-react';
 import type { ChatMessage } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import MessageBubble from './MessageBubble';
+import ConversationRail from './ConversationRail';
 
 interface Props {
   messages: ChatMessage[];
@@ -20,6 +21,22 @@ interface Props {
   /** Kept for compat — empty state is now fixed to "What to do Boss?" */
   emptyTitle?: string;
   emptyHint?: string;
+}
+
+function dayKey(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toDateString();
+}
+
+function dayLabel(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return 'Today';
+  if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: date.getFullYear() === today.getFullYear() ? undefined : 'numeric' });
 }
 
 export default function MessageStream({ messages, hasActiveChat, onOpenSubagent, onOpenSubagentSession, activeSubagent, traceSteps = [], workspaceId, chatId, onCloseSubagent, onOpenProject, onRetry, onRewind }: Props) {
@@ -151,7 +168,7 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="h-full overflow-y-auto px-3 md:px-4 py-3"
+        className="h-full overflow-y-auto pl-7 pr-3 md:pl-8 md:pr-4 py-3"
       >
         {isEmpty ? (
           <div className="flex items-center justify-center min-h-[60vh] h-full">
@@ -159,12 +176,29 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
           </div>
         ) : (
           <div ref={contentRef} className="max-w-[1100px] mx-auto flex flex-col justify-start" style={{ width: '100%' }}>
-            {dedupedMessages.map((msg) => (
-              <MessageBubble key={msg.id} message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} onRewind={onRewind} />
-            ))}
+            {dedupedMessages.map((msg, index) => {
+              const currentDay = dayKey(msg.timestamp);
+              const previousDay = index > 0 ? dayKey(dedupedMessages[index - 1].timestamp) : '';
+              return (
+                <Fragment key={msg.id}>
+                  {currentDay && currentDay !== previousDay && (
+                    <div className="chat-date-divider">
+                      <span className="chat-date-line" />
+                      <span className="chat-date-label">{dayLabel(msg.timestamp)}</span>
+                      <span className="chat-date-line" />
+                    </div>
+                  )}
+                  <div data-message-anchor={msg.id}>
+                    <MessageBubble message={msg} onOpenSubagent={onOpenSubagent} onOpenSubagentSession={onOpenSubagentSession} activeSubagent={activeSubagent} traceSteps={traceSteps} workspaceId={workspaceId} chatId={chatId} onCloseSubagent={onCloseSubagent} onOpenProject={onOpenProject} onRetry={onRetry ? () => onRetry(retryMap[msg.id] || '') : undefined} onRewind={onRewind} />
+                  </div>
+                </Fragment>
+              );
+            })}
           </div>
         )}
       </div>
+
+      {!isEmpty && <ConversationRail messages={dedupedMessages} scrollRef={scrollRef} contentRef={contentRef} />}
 
       {/* Tier D: jump-to-bottom pill (unread count while scrolled up) */}
       <button

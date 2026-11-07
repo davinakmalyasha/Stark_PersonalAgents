@@ -936,7 +936,7 @@ impl Provider {
             body["tool_choice"] = Value::String("auto".to_string());
         }
 
-        let headers = session_headers(&config, session);
+        let headers = session_headers(config, session);
         let max_attempts = request_max_retries();
         let mut attempt = 0u64;
         let response = loop {

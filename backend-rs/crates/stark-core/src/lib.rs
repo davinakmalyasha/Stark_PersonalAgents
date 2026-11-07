@@ -1525,7 +1525,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
             } else {
                 consecutive_errors = 0;
             }
-            if consecutive_errors > 0 && consecutive_errors % ERROR_NUDGE_INTERVAL == 0 {
+            if consecutive_errors > 0 && consecutive_errors.is_multiple_of(ERROR_NUDGE_INTERVAL) {
                 messages.push(ChatMessage::user(format!(
                     "[RETRY GUIDANCE] {consecutive_errors} consecutive tool errors. Do not repeat the same call. \
                      Read the exact error, fix the arguments, or switch to an alternative tool (read/grep/glob, \

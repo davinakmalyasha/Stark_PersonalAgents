@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { FolderPlus, Minus, Plus, RotateCcw, Scan, Waypoints, X } from 'lucide-react';
+import { FolderPlus, Minus, Plus, RotateCcw, Scan, Waypoints } from 'lucide-react';
 import type { ChatSummary, GroupProjectRow, SessionTab, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import CanvasAddMenu from './CanvasAddMenu';
@@ -41,7 +41,6 @@ interface Props {
   toolCalls?: number;
   errors?: number;
   onCloseTab?: (tabId: string) => void;
-  onCloseMap?: () => void;
 }
 
 type Interaction =
@@ -86,7 +85,7 @@ export default function CanvasStage({
   agents, isRunning, elapsed, projects = [],
   onOpenChat, onOpenGroup, onOpenAddon, onSendToChat,
   tabs, runningTabId, variant = 'background', usage, toolCalls, errors,
-  onCloseTab, onCloseMap,
+  onCloseTab,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [items, setItems] = useState<CanvasItem[]>(() => loadItems(scope));
@@ -624,7 +623,7 @@ export default function CanvasStage({
           <div className="canvas-map-title-wrap">
             <span className="canvas-map-mark"><Waypoints size={15} /></span>
             <div className="canvas-map-title-copy">
-              <div className="canvas-map-title">Agent map</div>
+              <div className="canvas-map-title">Canvas</div>
               <div className="canvas-map-subtitle">
                 {autoRoots} {autoRoots === 1 ? 'chat' : 'chats'}
                 <span>·</span>
@@ -645,9 +644,6 @@ export default function CanvasStage({
             <button type="button" onClick={() => zoomBy(1.16)} title="Zoom in" aria-label="Zoom in"><Plus size={13} /></button>
             <button type="button" onClick={fitView} title="Fit to view" aria-label="Fit to view"><Scan size={13} /></button>
             <button type="button" onClick={relayout} title="Reset layout" aria-label="Reset layout"><RotateCcw size={13} /></button>
-            {onCloseMap && (
-              <button type="button" className="is-close" onClick={onCloseMap} title="Back to chat" aria-label="Back to chat"><X size={14} /></button>
-            )}
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-import { FolderKanban, Home, Settings, SquarePen, Waypoints } from 'lucide-react';
+import { FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
 import type { SideView } from './HouseRail';
 
 interface Props {
@@ -6,8 +6,6 @@ interface Props {
   onView: (view: SideView) => void;
   onNewChat: () => void;
   onOpenSettings: () => void;
-  onOpenMap: () => void;
-  mapOpen: boolean;
   waiting: number;
 }
 
@@ -15,7 +13,7 @@ interface Props {
  * Phone/tablet navigation. The vertical rail is hidden below `md`; this bar
  * gives the same destinations without stealing chat width.
  */
-export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings, onOpenMap, mapOpen, waiting }: Props) {
+export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings, waiting }: Props) {
   const item = (active: boolean) =>
     `house-mobile-nav-btn relative flex flex-1 flex-col items-center justify-center gap-0.5 py-1.5 rounded-lg cursor-pointer ${
       active ? 'text-white' : 'text-zinc-500 active:text-zinc-200'
@@ -29,10 +27,6 @@ export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings
       <button onClick={() => onView('chats')} className={item(view === 'chats')} aria-label="Chats" aria-pressed={view === 'chats'}>
         <Home size={18} />
         <span className="text-[9px]">Chats</span>
-      </button>
-      <button onClick={onOpenMap} className={item(mapOpen)} aria-label="Agent map" aria-pressed={mapOpen}>
-        <Waypoints size={18} />
-        <span className="text-[9px]">Map</span>
       </button>
       <button onClick={onNewChat} className={item(false)} aria-label="New chat">
         <SquarePen size={18} />

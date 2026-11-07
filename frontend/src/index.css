@@ -708,14 +708,14 @@ html {
 /* Modal panels settle rather than pop. */
 .modal-panel-enter { animation: modal-panel-in 240ms var(--stark-ease-out) both; }
 
-/* House chat card reveal when returning from the Agent Map / a route. */
+/* House chat card reveal when returning from the canvas / a route. */
 @keyframes house-chat-reveal {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
 .house-chat-card { animation: house-chat-reveal var(--stark-dur-3) var(--stark-ease-out) both; }
 
-/* Agent Map arrives as a surface, not a hard cut. */
+/* The canvas arrives as a surface, not a hard cut. */
 @keyframes canvas-map-in {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }

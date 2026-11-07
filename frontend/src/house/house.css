@@ -2207,3 +2207,10 @@
 @media (prefers-reduced-motion: reduce) {
   .house-drawer-enter { animation: none !important; }
 }
+
+/* Keep phones chat-first: the canvas toolbar appears only after the chat is
+   collapsed to its prompt dock. Desktop keeps it visible above the canvas. */
+@media (max-width: 767px) {
+  .canvas-stage.is-map .canvas-map-head { display: none; }
+  .relative:has(.house-chat-card.is-minimized) .canvas-stage .canvas-map-head { display: flex; }
+}

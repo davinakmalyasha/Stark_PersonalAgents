@@ -34,7 +34,6 @@ export default function House() {
     typeof window === 'undefined' ? true : window.matchMedia('(min-width: 768px)').matches,
   );
   const [sideView, setSideView] = useState<SideView>('chats');
-  const [mapOpen, setMapOpen] = useState(false);
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [blockedNote, setBlockedNote] = useState<string | null>(null);
@@ -158,14 +157,8 @@ export default function House() {
   // backdrop on mobile and the rail staying open on desktop — no tiny close
   // button that strands the user.
   const handleSideView = useCallback((view: SideView) => {
-    setMapOpen(false);
     setSideView(view);
     setSidebarOpen(true);
-  }, []);
-
-  const handleOpenMap = useCallback(() => {
-    setMapOpen((open) => !open);
-    setSidebarOpen(false);
   }, []);
 
   // Escape collapses the side panel (it stays docked, never slides away)
@@ -201,7 +194,6 @@ export default function House() {
 
   // ── Session creation ──
   const handleNewSession = useCallback(() => {
-    setMapOpen(false);
     newSession();
   }, [newSession]);
 
@@ -219,7 +211,6 @@ export default function House() {
     newChatIn(workspaceId);
   }, [newChatIn]);
   const handleOpenSession = useCallback((workspaceId: string, chatId: string) => {
-    setMapOpen(false);
     openChat(workspaceId, chatId);
   }, [openChat]);
 
@@ -331,6 +322,7 @@ export default function House() {
           <CanvasStage
             key="main"
             scope="main"
+            variant="map"
             workspaces={sessions.workspaces}
             chatsByWs={sessions.chatsByWs}
             activeWorkspaceId={mainWorkspace?.id ?? null}
@@ -345,7 +337,6 @@ export default function House() {
             errors={activeErrors}
             onCloseTab={sessions.closeTab}
             onOpenChat={(wsId, chatId) => {
-              setMapOpen(false);
               const ws = sessions.workspaces.find((w) => w.id === wsId);
               if (ws && !ws.isGeneral && !ws.isHouse && !ws.isPersonal && !(ws as { isDfd?: boolean }).isDfd) {
                 window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(chatId)}`;
@@ -353,7 +344,7 @@ export default function House() {
                 sessions.openChat(wsId, chatId);
               }
             }}
-            onOpenGroup={(projectId) => { setMapOpen(false); setOpenProjectId(projectId); }}
+            onOpenGroup={(projectId) => { setOpenProjectId(projectId); }}
             onOpenAddon={(wsId, addonId, chatId) => {
               const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
               window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
@@ -399,58 +390,6 @@ export default function House() {
         onDraftAttachmentsConsumed={chat.clearDraftAttachments}
       />
       </div>
-    </div>
-  );
-
-  const mapView = (
-    <div className="relative flex-1 min-h-0">
-      <Suspense fallback={null}>
-        <CanvasStage
-          key="map"
-          scope="main"
-          variant="map"
-          workspaces={sessions.workspaces}
-          chatsByWs={sessions.chatsByWs}
-          activeWorkspaceId={mainWorkspace?.id ?? null}
-          activeChatId={chat.activeChatId}
-          agents={generalCanvasAgents}
-          isRunning={chat.isRunning}
-          elapsed={undefined}
-          projects={projects}
-          tabs={sessions.tabs}
-          runningTabId={sessions.runningTabId}
-          usage={mapUsage}
-          toolCalls={activeToolCalls}
-          errors={activeErrors}
-          onCloseTab={sessions.closeTab}
-          onCloseMap={() => setMapOpen(false)}
-          onOpenChat={(wsId, chatId) => {
-            setMapOpen(false);
-            const ws = sessions.workspaces.find((w) => w.id === wsId);
-            if (ws && !ws.isGeneral && !ws.isHouse && !ws.isPersonal && !(ws as { isDfd?: boolean }).isDfd) {
-              window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(chatId)}`;
-            } else {
-              sessions.openChat(wsId, chatId);
-            }
-          }}
-          onOpenGroup={(projectId) => { setMapOpen(false); setOpenProjectId(projectId); }}
-          onOpenAddon={(wsId, addonId, chatId) => {
-            setMapOpen(false);
-            const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
-            window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
-          }}
-          onSendToChat={async (wsId, chatId, text) => {
-            const ws = sessions.workspaces.find((w) => w.id === wsId);
-            if (!ws) throw new Error('Workspace not found.');
-            if (wsId === mainWorkspace?.id && chatId === chat.activeChatId) {
-              handleGeneralSend(text, []);
-              return;
-            }
-            await sendCanvasChat(ws, chatId, text, kindForWorkspace(ws));
-            await sessions.forceRefresh();
-          }}
-        />
-      </Suspense>
     </div>
   );
 
@@ -509,8 +448,6 @@ export default function House() {
           onView={handleSideView}
           onNewChat={handleNewSession}
           onOpenSettings={() => setIsSettingsOpen(true)}
-          onOpenMap={handleOpenMap}
-          mapOpen={mapOpen}
           waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
         />
       </div>
@@ -561,9 +498,7 @@ export default function House() {
       )}
       <main className="relative flex-1 min-h-0 flex overflow-hidden">
         <div className="relative flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
-        {mapOpen ? (
-          mapView
-        ) : exitingIdeTab ? (
+        {exitingIdeTab ? (
           <>
             {/* Chat is visible immediately under the exiting IDE — feels like the IDE slides away */}
             {generalChatView}
@@ -591,7 +526,7 @@ export default function House() {
           generalChatView
         )}
         </div>
-        {!mapOpen && !isCodingTab && !exitingIdeTab && subagents.tabs.length > 0 && (
+        {!isCodingTab && !exitingIdeTab && subagents.tabs.length > 0 && (
           <SubagentTabsPane
             tabs={subagents.tabs}
             activeChildId={subagents.activeChildId}
@@ -610,8 +545,6 @@ export default function House() {
         onView={handleSideView}
         onNewChat={handleNewSession}
         onOpenSettings={() => setIsSettingsOpen(true)}
-        onOpenMap={handleOpenMap}
-        mapOpen={mapOpen}
         waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
       />
 

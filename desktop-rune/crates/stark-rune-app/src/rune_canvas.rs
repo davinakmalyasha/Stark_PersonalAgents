@@ -53,6 +53,8 @@ pub struct CanvasState {
     pub edit: rune::TextEdit,
     /// Selected chat id; sidebar rows and cards key off the same ids.
     pub active_id: String,
+    /// Voice dictation affordance (mic capture binds later).
+    pub voice_live: bool,
     /// Prompts staged from the map dock, awaiting run dispatch.
     pub outbox: Vec<String>,
 }
@@ -65,6 +67,7 @@ impl std::fmt::Debug for CanvasState {
             .field("model", &self.model)
             .field("edit", &self.edit.text)
             .field("active_id", &self.active_id)
+            .field("voice_live", &self.voice_live)
             .field("outbox", &self.outbox)
             .finish()
     }
@@ -79,6 +82,7 @@ impl Clone for CanvasState {
             model: self.model.clone(),
             edit: self.edit.clone(),
             active_id: self.active_id.clone(),
+            voice_live: self.voice_live,
             outbox: self.outbox.clone(),
         }
     }
@@ -144,6 +148,7 @@ impl CanvasState {
             model: "Automatic Fallback".to_string(),
             edit: rune::TextEdit::new(""),
             active_id: "chat:ws-general:chat-1".to_string(),
+            voice_live: false,
             outbox: Vec::new(),
         }
     }
@@ -355,6 +360,10 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
                 &s.model,
                 &s.edit,
                 |s: &mut CanvasState| &mut s.edit,
+                s.voice_live,
+                |s: &mut CanvasState| {
+                    s.voice_live = !s.voice_live;
+                },
                 |s: &mut CanvasState| {
                     let prompt = s.edit.text.trim().to_string();
                     if prompt.is_empty() {

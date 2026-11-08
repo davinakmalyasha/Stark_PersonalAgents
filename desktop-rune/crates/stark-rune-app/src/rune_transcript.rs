@@ -38,6 +38,8 @@ pub struct RuneTranscriptState {
     pub api_port: u16,
     /// Settings sheet visibility.
     pub settings_open: bool,
+    /// Voice dictation affordance (mic capture binds later).
+    pub voice_live: bool,
     /// Frames streamed from the run thread, drained by the `poll` hook.
     /// `None` on clone: a copied state never inherits a live socket.
     pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
@@ -54,6 +56,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
             .field("settings_open", &self.settings_open)
+            .field("voice_live", &self.voice_live)
             .field("inbox", &self.inbox.is_some())
             .finish()
     }
@@ -70,6 +73,7 @@ impl Clone for RuneTranscriptState {
             api_host: self.api_host.clone(),
             api_port: self.api_port,
             settings_open: self.settings_open,
+            voice_live: self.voice_live,
             inbox: None,
         }
     }
@@ -101,6 +105,7 @@ impl RuneTranscriptState {
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
             settings_open: false,
+            voice_live: false,
             inbox: None,
         }
     }
@@ -135,6 +140,7 @@ impl RuneTranscriptState {
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
             settings_open: false,
+            voice_live: false,
             inbox: None,
         }
     }
@@ -340,6 +346,10 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         &s.model,
         &s.edit,
         |s: &mut RuneTranscriptState| &mut s.edit,
+        s.voice_live,
+        |s: &mut RuneTranscriptState| {
+            s.voice_live = !s.voice_live;
+        },
         stage_send,
     );
     root = root.child(
@@ -684,6 +694,30 @@ mod tests {
         });
         rt.frame(0.0);
         assert!(!rt.state.settings_open, "Escape dismisses");
+    }
+
+    #[test]
+    fn voice_toggle_flips_live_dot() {
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(
+            RuneTranscriptState::screenshot(),
+            transcript_view,
+            (468.0, 720.0),
+            env,
+        );
+        rt.frame(0.0);
+        assert!(!rt.state.voice_live);
+        let (x, y) = rt.find("composer-voice").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(rt.state.voice_live);
+        assert!(rt.find("composer-voice-dot").is_some());
+        let (x, y) = rt.find("composer-voice").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(!rt.state.voice_live);
     }
 
     #[test]

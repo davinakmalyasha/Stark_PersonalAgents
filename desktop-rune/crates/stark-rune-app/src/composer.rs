@@ -10,14 +10,57 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+/// Voice toggle button. `S` is the owning view's state type.
+fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> El {
+    let mut button = rune::el()
+        .key("composer-voice")
+        .role("button")
+        .label(if live {
+            "Stop voice input"
+        } else {
+            "Start voice input"
+        })
+        .size(32.0, 32.0)
+        .radius(11.0)
+        .center()
+        .on_press(on_voice);
+    if live {
+        button = button
+            .linear_gradient(
+                135.0 * std::f32::consts::PI / 180.0,
+                [(0.0, ink("#7860d9")), (1.0, ink("#aa8dff"))],
+            )
+            .child(
+                rune::el()
+                    .key("composer-voice-dot")
+                    .size(8.0, 8.0)
+                    .radius(4.0)
+                    .fill(ink("#ffffff"))
+                    .looping(rune::LoopSpec::opacity(1.2, 0.0, 0.4, 1.0)),
+            );
+    } else {
+        button = button.fill(ink("#303035")).child(
+            rune::el()
+                .key("composer-voice-dot")
+                .size(8.0, 8.0)
+                .radius(4.0)
+                .fill(ink("#b6b6be")),
+        );
+    }
+    button
+}
+
 /// Premium-surface composer: gradient card, live 15px input, toolbar with
-/// model pill, spacer, and white send circle. `w_full` — callers set the
-/// width. `on_send` runs on send-button press and field submit; each view
-/// wires its own state type through `edit_of`.
+/// model pill, spacer, voice toggle, and white send circle. `w_full` —
+/// callers set the width. `on_send` runs on send-button press and field
+/// submit; `on_voice` toggles dictation; each view wires its own state type
+/// through `edit_of`.
 pub fn composer_card<S: 'static>(
     model: &str,
     edit: &TextEdit,
     edit_of: impl for<'a> Fn(&'a mut S) -> &'a mut TextEdit + 'static,
+    voice_live: bool,
+    on_voice: impl Fn(&mut S) + 'static,
     on_send: impl Fn(&mut S) + 'static,
 ) -> El {
     let on_send = std::rc::Rc::new(on_send);
@@ -61,7 +104,14 @@ pub fn composer_card<S: 'static>(
             text_input(edit, rune::tok::TextStyle::new(15.0, 400.0))
                 .key("composer-input")
                 .w_full()
-                .placeholder("Ask anything", ink("#74747d"))
+                .placeholder(
+                    if voice_live {
+                        "Listening…"
+                    } else {
+                        "Ask anything"
+                    },
+                    ink("#74747d"),
+                )
                 .caret(ink("#f2f2f4"), ink("#3b82f6"))
                 .on_edit(edit_of)
                 .on_submit(submit),
@@ -101,6 +151,12 @@ pub fn composer_card<S: 'static>(
                         ),
                 )
                 .child(spacer())
+                .child(
+                    // Voice toggle (`.prompt-voice-button`): idle graphite mic
+                    // dot; live gradient + pulsing dot. Real mic capture binds
+                    // later — the toggle owns the affordance and state today.
+                    voice_button(voice_live, on_voice),
+                )
                 .child(
                     rune::el()
                         .key("composer-send")

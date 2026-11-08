@@ -225,7 +225,23 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         );
     }
     // Composer card: shared `.premium-surface` dock (see `composer.rs`).
-    let composer_card = super::composer::composer_card(&s.model, &s.composer);
+    // Send stages the draft as a user row and marks the run live; the
+    // `stream.rs` transport replays the backend SSE into the same rows.
+    let composer_card =
+        super::composer::composer_card(&s.model, &s.composer, |s: &mut RuneTranscriptState| {
+            let prompt = s.composer.trim().to_string();
+            if prompt.is_empty() {
+                return;
+            }
+            let n = s.rows.len();
+            s.rows.push(RowData {
+                key: format!("user-{n}"),
+                role: "user",
+                body: prompt,
+            });
+            s.live = true;
+            s.composer.clear();
+        });
     root.child(
         rune::el()
             .key("composer-dock")
@@ -305,6 +321,27 @@ mod tests {
         assert!(rt.find("composer-input").is_some());
         assert!(rt.find("composer-send").is_some());
         assert!(rt.find("model-pill").is_some());
+    }
+
+    #[test]
+    fn send_tap_stages_prompt_and_marks_live() {
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.composer = "hello agent".to_string();
+        init.live = false;
+        let n = init.rows.len();
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("composer-send").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.rows.len(), n + 1);
+        assert_eq!(rt.state.rows[n].role, "user");
+        assert_eq!(rt.state.rows[n].body, "hello agent");
+        assert!(rt.state.live);
+        assert!(rt.state.composer.is_empty());
+        assert!(rt.find(&rt.state.rows[n].key).is_some());
     }
 
     #[test]

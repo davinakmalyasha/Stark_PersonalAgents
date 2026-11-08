@@ -52,6 +52,8 @@ pub struct CanvasState {
     pub press_home: Option<(f32, f32)>,
     pub model: String,
     pub composer: String,
+    /// Prompts staged from the map dock, awaiting run dispatch.
+    pub outbox: Vec<String>,
 }
 
 impl CanvasState {
@@ -107,6 +109,7 @@ impl CanvasState {
             press_home: None,
             model: "Automatic Fallback".to_string(),
             composer: String::new(),
+            outbox: Vec::new(),
         }
     }
 
@@ -306,13 +309,25 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
         canvas = canvas.child(card_view(card));
     }
     // Floating composer, centred over the canvas like `HouseChat`'s dock:
-    // 640pt wide, bottom-anchored. Same card as the transcript dock.
+    // 640pt wide, bottom-anchored. Same card as the transcript dock; send
+    // stages into the outbox for run dispatch.
     canvas = canvas.child(
         rune::el()
             .key("map-composer-float")
             .absolute((MAP_W - MAP_SIDEBAR_W - 640.0) / 2.0, MAP_H - 128.0)
             .w(640.0)
-            .child(super::composer::composer_card(&s.model, &s.composer)),
+            .child(super::composer::composer_card(
+                &s.model,
+                &s.composer,
+                |s: &mut CanvasState| {
+                    let prompt = s.composer.trim().to_string();
+                    if prompt.is_empty() {
+                        return;
+                    }
+                    s.outbox.push(prompt);
+                    s.composer.clear();
+                },
+            )),
     );
 
     row()

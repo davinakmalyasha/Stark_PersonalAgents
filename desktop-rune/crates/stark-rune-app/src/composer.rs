@@ -12,7 +12,12 @@ fn ink(hex: &'static str) -> rune::Color {
 
 /// Premium-surface composer: gradient card, 15px input, toolbar with model
 /// pill, spacer, and white send circle. `w_full` — callers set the width.
-pub fn composer_card(model: &str, draft: &str) -> El {
+/// `on_send` runs on send-button press (each view wires its own state type).
+pub fn composer_card<S: 'static>(
+    model: &str,
+    draft: &str,
+    on_send: impl Fn(&mut S) + 'static,
+) -> El {
     let input = if draft.is_empty() {
         "Ask anything".to_string()
     } else {
@@ -101,6 +106,7 @@ pub fn composer_card(model: &str, draft: &str) -> El {
                         .radius(17.0)
                         .fill(ink("#ffffff"))
                         .center()
+                        .on_press(on_send)
                         .child(
                             text("↑".to_string())
                                 .font(rune::tok::TextStyle::new(16.0, 650.0))

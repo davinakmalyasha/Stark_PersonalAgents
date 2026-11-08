@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 stark-theme = { path = "../stark-theme" }
 stark-kit = { path = "../stark-kit" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [features]
 # Real Rune rendering. Off by default so headless goldens + unit tests stay

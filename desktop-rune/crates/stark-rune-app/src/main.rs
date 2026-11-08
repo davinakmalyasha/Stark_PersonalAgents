@@ -22,6 +22,8 @@ mod composer;
 mod rune_canvas;
 #[cfg(feature = "rune-real")]
 mod rune_transcript;
+#[cfg(feature = "rune-real")]
+mod stream;
 
 // ---------------------------------------------------------------------------
 // Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)
@@ -409,11 +411,60 @@ fn xml_escape(s: &str) -> String {
 fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
     eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
-    eprintln!("stark-rune --rune-canvas-snap <png>  (1280x720 canvas map PNG)");
+    eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
+    eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--replay-sse") {
+        #[cfg(not(feature = "rune-real"))]
+        {
+            let _ = pos;
+            eprintln!("--replay-sse needs --features rune-real.");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "rune-real")]
+        {
+            let file = args.get(pos + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--replay-sse <file> is required");
+                std::process::exit(2);
+            });
+            let mut prompt = String::from("hello");
+            let mut k = 0;
+            while k < args.len() {
+                if args[k] == "--prompt" && k + 1 < args.len() {
+                    prompt = args[k + 1].clone();
+                    k += 2;
+                    continue;
+                }
+                k += 1;
+            }
+            let bytes = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                eprintln!("cannot read {file}: {e}");
+                std::process::exit(1);
+            });
+            // Show the exact POST body a live run would send, then replay the
+            // recorded stream into transcript rows for agent inspection.
+            let req = stream::RunRequest {
+                prompt,
+                model: "Automatic Fallback".to_string(),
+                temperature: 0.7,
+                workspace_path: String::new(),
+                chat_id: String::new(),
+                workspace_kind: "general".to_string(),
+            };
+            println!("request: {}", req.to_json());
+            let mut state = rune_transcript::RuneTranscriptState::screenshot();
+            let statuses = stream::replay(&mut state, &bytes);
+            println!("frames: {}", statuses.len());
+            println!("live: {}", state.live);
+            for row in &state.rows {
+                println!("{} [{}] {}", row.key, row.role, row.body);
+            }
+            return;
+        }
+    }
     if let Some(pos) = args.iter().position(|a| a == "--rune-canvas-snap") {
         #[cfg(not(feature = "rune-real"))]
         {

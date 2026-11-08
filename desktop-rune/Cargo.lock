@@ -2298,6 +2298,8 @@ name = "stark-rune-app"
 version = "0.1.0"
 dependencies = [
  "rune",
+ "serde",
+ "serde_json",
  "stark-kit",
  "stark-theme",
 ]

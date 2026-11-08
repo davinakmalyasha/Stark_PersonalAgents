@@ -365,6 +365,7 @@ pub fn refresh_cloud(s: &mut ShellState) {
 pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = drain_run_inbox(&mut s.transcript, clock, tx);
     changed |= drain_run_inbox(&mut s.personal, clock, tx);
+    changed |= s.canvas.voice.drain(1.0 / 60.0);
     changed |= poll_house(s, clock);
     changed |= poll_memory(s, clock);
     // Cloud inbox first (a refresh may have landed), then auto-refresh.

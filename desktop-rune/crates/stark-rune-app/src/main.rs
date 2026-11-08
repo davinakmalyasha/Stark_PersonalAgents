@@ -35,6 +35,8 @@ mod shell;
 mod stream;
 #[cfg(feature = "rune-real")]
 mod transport;
+#[cfg(feature = "rune-real")]
+mod voice;
 
 // ---------------------------------------------------------------------------
 // Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)

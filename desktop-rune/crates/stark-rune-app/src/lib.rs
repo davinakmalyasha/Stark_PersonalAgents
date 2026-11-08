@@ -23,3 +23,6 @@ pub mod stream;
 #[cfg(feature = "rune-real")]
 #[path = "transport.rs"]
 pub mod transport;
+#[cfg(feature = "rune-real")]
+#[path = "voice.rs"]
+pub mod voice;

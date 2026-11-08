@@ -10,6 +10,43 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+/// Level meter: five bars lit by bucket, plus the capture note (no-device
+/// reason) when present. Mounted beside the voice toggle while live.
+fn voice_meter(live: bool, level: f32, note: Option<&str>) -> El {
+    let lit = if live {
+        crate::voice::lit_bars(level)
+    } else {
+        0
+    };
+    let mut bars = row().key("voice-meter").items_center().gap(3.0);
+    for i in 0..5 {
+        let h = 4.0 + i as f32 * 3.0;
+        bars = bars.child(
+            rune::el()
+                .key(format!("voice-bar-{i}"))
+                .size(3.0, h)
+                .radius(1.5)
+                .fill(ink(if live && i < lit {
+                    "#ededf0"
+                } else {
+                    "#3a3a40"
+                })),
+        );
+    }
+    let mut meter = col().key("voice-meter-wrap").gap(2.0).child(bars);
+    if live {
+        if let Some(note) = note {
+            meter = meter.child(
+                text(note.to_string())
+                    .key("voice-note")
+                    .font(rune::tok::TextStyle::new(10.0, 400.0))
+                    .color(ink("#8a8a93")),
+            );
+        }
+    }
+    meter
+}
+
 /// Voice toggle button. `S` is the owning view's state type.
 fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> El {
     let mut button = rune::el()
@@ -51,18 +88,19 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
 }
 
 /// Premium-surface composer: gradient card, live 15px input, toolbar with
-/// model pill, spacer, voice toggle, and white send circle. `w_full` —
-/// callers set the width. `on_send` runs on send-button press and field
-/// submit; `on_voice` toggles dictation; each view wires its own state type
+/// model pill, spacer, voice toggle + meter, and white send circle. `w_full`
+/// — callers set the width. `on_send` runs on send-button press and field
+/// submit; `on_voice` toggles capture; each view wires its own state type
 /// through `edit_of`.
 pub fn composer_card<S: 'static>(
     model: &str,
     edit: &TextEdit,
     edit_of: impl for<'a> Fn(&'a mut S) -> &'a mut TextEdit + 'static,
-    voice_live: bool,
+    voice: (bool, f32, Option<&str>),
     on_voice: impl Fn(&mut S) + 'static,
     on_send: impl Fn(&mut S) + 'static,
 ) -> El {
+    let (voice_live, voice_level, voice_note) = voice;
     let on_send = std::rc::Rc::new(on_send);
     let submit = {
         let on_send = on_send.clone();
@@ -152,11 +190,12 @@ pub fn composer_card<S: 'static>(
                 )
                 .child(spacer())
                 .child(
-                    // Voice toggle (`.prompt-voice-button`): idle graphite mic
-                    // dot; live gradient + pulsing dot. Real mic capture binds
-                    // later — the toggle owns the affordance and state today.
-                    voice_button(voice_live, on_voice),
+                    // Voice toggle (`.prompt-voice-button`) with a 5-bar level
+                    // meter beside it while live. Levels come from the capture
+                    // thread via the voice bus; without a mic the note says so.
+                    voice_meter(voice_live, voice_level, voice_note),
                 )
+                .child(voice_button(voice_live, on_voice))
                 .child(
                     rune::el()
                         .key("composer-send")

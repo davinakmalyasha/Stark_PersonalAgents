@@ -249,8 +249,8 @@ async fn post_run_stream_inner(
         if done {
             break;
         }
-        let value = js_sys::Reflect::get(&chunk, &"value".into())
-            .map_err(|e| format!("value: {e:?}"))?;
+        let value =
+            js_sys::Reflect::get(&chunk, &"value".into()).map_err(|e| format!("value: {e:?}"))?;
         let bytes = js_sys::Uint8Array::from(value).to_vec();
         decoder.push(&bytes, &mut frames);
         for frame in frames.drain(..) {

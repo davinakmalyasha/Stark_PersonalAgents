@@ -1,0 +1,312 @@
+//! Mic capture + level metering behind the voice toggle.
+//!
+//! Native: cpal default input streams RMS blocks into an `mpsc` channel the
+//! poll hook drains into `voice_level`. Web: `getUserMedia` binds later —
+//! the toggle owns the affordance, and capture reports honestly when there
+//! is no device. Pure math (`rms_f32`, `decay_level`, `lit_bars`) is tested;
+//! hardware paths degrade to notes, never panics.
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+/// Messages from the capture thread to the UI thread.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VoiceMsg {
+    Level(f32),
+    Error(String),
+}
+
+/// All voice runtime state in one bus so every view (transcript, canvas,
+/// personal) shares toggle/drain logic. `stop`/`rx` reset on clone: a copied
+/// state never inherits a live microphone.
+pub struct VoiceBus {
+    pub live: bool,
+    pub level: f32,
+    pub note: Option<String>,
+    pub stop: Option<Arc<AtomicBool>>,
+    pub rx: Option<std::sync::mpsc::Receiver<VoiceMsg>>,
+}
+
+impl std::fmt::Debug for VoiceBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceBus")
+            .field("live", &self.live)
+            .field("level", &self.level)
+            .field("note", &self.note)
+            .field("capturing", &self.stop.is_some())
+            .finish()
+    }
+}
+
+impl Clone for VoiceBus {
+    fn clone(&self) -> Self {
+        Self {
+            live: self.live,
+            level: self.level,
+            note: self.note.clone(),
+            stop: None,
+            rx: None,
+        }
+    }
+}
+
+impl Default for VoiceBus {
+    fn default() -> Self {
+        Self {
+            live: false,
+            level: 0.0,
+            note: None,
+            stop: None,
+            rx: None,
+        }
+    }
+}
+
+impl VoiceBus {
+    /// Toggle capture. Returns true when a capture attempt started.
+    /// Stopping always succeeds. Hardware failures (no device, OS error)
+    /// arrive asynchronously as [`VoiceMsg::Error`] notes via [`VoiceBus::drain`].
+    pub fn set_live(&mut self, on: bool) -> bool {
+        if !on {
+            if let Some(stop) = self.stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            self.rx = None;
+            self.live = false;
+            self.level = 0.0;
+            return false;
+        }
+        self.note = None;
+        self.level = 0.0;
+        #[cfg(target_arch = "wasm32")]
+        {
+            // getUserMedia binds here next; the affordance is live today.
+            self.note = Some("mic capture binds next on web".to_string());
+            self.live = false;
+            return false;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Fail fast without spawning: a doomed thread only adds latency.
+            if probe_input().is_none() {
+                self.note = Some("no microphone found".to_string());
+                self.live = false;
+                return false;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            self.stop = Some(stop);
+            self.rx = Some(rx);
+            self.live = true;
+            std::thread::spawn(move || capture_loop(flag, tx));
+            true
+        }
+    }
+    pub fn drain(&mut self, dt: f32) -> bool {
+        let mut changed = false;
+        while let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            match msg {
+                VoiceMsg::Level(peak) => {
+                    self.level = decay_level(self.level, peak, dt);
+                    changed = true;
+                }
+                VoiceMsg::Error(note) => {
+                    self.note = Some(note);
+                    self.live = false;
+                    self.level = 0.0;
+                    changed = true;
+                }
+            }
+        }
+        // Idle decay keeps the meter falling between blocks.
+        if self.live && self.level > 0.0 {
+            let next = decay_level(self.level, 0.0, dt);
+            if (next - self.level).abs() > f32::EPSILON {
+                self.level = next;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Meter snapshot for the composer bars: (live, level, note).
+    pub fn meter(&self) -> (bool, f32, Option<&str>) {
+        (self.live, self.level, self.note.as_deref())
+    }
+}
+
+/// RMS loudness in 0..1 of an f32 sample block.
+pub fn rms_f32(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = samples.iter().map(|s| s * s).sum();
+    (sum / samples.len() as f32).sqrt().clamp(0.0, 1.0)
+}
+
+/// Meter dynamics: instant attack to a new peak, linear release otherwise.
+pub fn decay_level(current: f32, peak: f32, dt: f32) -> f32 {
+    if peak >= current {
+        peak.clamp(0.0, 1.0)
+    } else {
+        (current - dt * 1.5).max(peak).max(0.0)
+    }
+}
+
+/// How many of the 5 meter bars a level lights.
+pub fn lit_bars(level: f32) -> usize {
+    if level <= 0.0 {
+        return 0;
+    }
+    ((level.clamp(0.0, 1.0) * 5.0).ceil() as usize).min(5)
+}
+
+/// Default input device name, if the OS reports one.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn probe_input() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|d| d.description().ok())
+        .map(|d| d.name().to_string())
+        .filter(|n| !n.trim().is_empty())
+}
+
+/// Capture loop: streams [`VoiceMsg::Level`] until `stop` flips, then exits.
+/// Owns the cpal `Stream` (dropping it stops the device). Never panics: all
+/// failures arrive as [`VoiceMsg::Error`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn capture_loop(stop: Arc<AtomicBool>, tx: std::sync::mpsc::Sender<VoiceMsg>) {
+    // Each callback owns a cloned sender: everything handed to cpal must be
+    // `'static` (the stream outlives this frame).
+    let emit = |tx: &std::sync::mpsc::Sender<VoiceMsg>| tx.clone();
+    let fail = |tx: &std::sync::mpsc::Sender<VoiceMsg>, msg: String| {
+        let _ = tx.send(VoiceMsg::Error(msg));
+    };
+    let host = cpal::default_host();
+    let Some(device) = host.default_input_device() else {
+        fail(&tx, "no microphone found".to_string());
+        return;
+    };
+    let config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => {
+            fail(&tx, format!("mic config: {e}"));
+            return;
+        }
+    };
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let (dtx, etx) = (emit(&tx), emit(&tx));
+            device.build_input_stream(
+                config.into(),
+                move |data: &[f32], _| {
+                    let _ = dtx.send(VoiceMsg::Level(rms_f32(data)));
+                },
+                move |e| {
+                    let _ = etx.send(VoiceMsg::Error(format!("mic: {e}")));
+                },
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let (dtx, etx) = (emit(&tx), emit(&tx));
+            device.build_input_stream(
+                config.into(),
+                move |data: &[i16], _| {
+                    let _ = dtx.send(VoiceMsg::Level(rms_f32(
+                        &data
+                            .iter()
+                            .map(|s| *s as f32 / i16::MAX as f32)
+                            .collect::<Vec<_>>(),
+                    )));
+                },
+                move |e| {
+                    let _ = etx.send(VoiceMsg::Error(format!("mic: {e}")));
+                },
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let (dtx, etx) = (emit(&tx), emit(&tx));
+            device.build_input_stream(
+                config.into(),
+                move |data: &[u16], _| {
+                    let _ = dtx.send(VoiceMsg::Level(rms_f32(
+                        &data
+                            .iter()
+                            .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                            .collect::<Vec<_>>(),
+                    )));
+                },
+                move |e| {
+                    let _ = etx.send(VoiceMsg::Error(format!("mic: {e}")));
+                },
+                None,
+            )
+        }
+        fmt => {
+            fail(&tx, format!("unsupported mic format: {fmt:?}"));
+            return;
+        }
+    };
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&tx, format!("mic open: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = stream.play() {
+        fail(&tx, format!("mic play: {e}"));
+        return;
+    }
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rms_measures_loudness() {
+        assert_eq!(rms_f32(&[]), 0.0);
+        assert_eq!(rms_f32(&[0.0, 0.0]), 0.0);
+        assert!((rms_f32(&[1.0, -1.0]) - 1.0).abs() < 1e-6);
+        assert!((rms_f32(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn decay_attacks_instantly_releases_linearly() {
+        assert_eq!(decay_level(0.2, 0.8, 0.016), 0.8);
+        let next = decay_level(0.8, 0.1, 0.1);
+        assert!((next - 0.65).abs() < 1e-6, "{next}");
+        assert_eq!(decay_level(0.0, 0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn bars_light_by_threshold() {
+        assert_eq!(lit_bars(0.0), 0);
+        assert_eq!(lit_bars(0.01), 1);
+        assert_eq!(lit_bars(0.5), 3);
+        assert_eq!(lit_bars(1.0), 5);
+        assert_eq!(lit_bars(2.0), 5);
+    }
+
+    /// Hardware-dependent by nature: asserts only that probing never panics
+    /// and, when a device exists, names something non-empty.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn probe_never_panics() {
+        if let Some(name) = probe_input() {
+            assert!(!name.trim().is_empty());
+        }
+    }
+}

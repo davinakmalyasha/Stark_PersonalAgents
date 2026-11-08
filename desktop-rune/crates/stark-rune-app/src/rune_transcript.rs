@@ -38,8 +38,8 @@ pub struct RuneTranscriptState {
     pub api_port: u16,
     /// Settings sheet visibility.
     pub settings_open: bool,
-    /// Voice dictation affordance (mic capture binds later).
-    pub voice_live: bool,
+    /// Mic capture bus (levels, notes, stop flag, inbox).
+    pub voice: crate::voice::VoiceBus,
     /// Frames streamed from the run thread, drained by the `poll` hook.
     /// `None` on clone: a copied state never inherits a live socket.
     pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
@@ -56,7 +56,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
             .field("settings_open", &self.settings_open)
-            .field("voice_live", &self.voice_live)
+            .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
             .finish()
     }
@@ -73,7 +73,7 @@ impl Clone for RuneTranscriptState {
             api_host: self.api_host.clone(),
             api_port: self.api_port,
             settings_open: self.settings_open,
-            voice_live: self.voice_live,
+            voice: self.voice.clone(),
             inbox: None,
         }
     }
@@ -105,7 +105,7 @@ impl RuneTranscriptState {
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
             settings_open: false,
-            voice_live: false,
+            voice: crate::voice::VoiceBus::default(),
             inbox: None,
         }
     }
@@ -140,7 +140,7 @@ impl RuneTranscriptState {
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
             settings_open: false,
-            voice_live: false,
+            voice: crate::voice::VoiceBus::default(),
             inbox: None,
         }
     }
@@ -509,10 +509,10 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
         &s.model,
         &s.edit,
         move |s: &mut S| &mut s.thread_mut(which).edit,
-        s.voice_live,
+        s.voice.meter(),
         move |s: &mut S| {
-            let t = s.thread_mut(which);
-            t.voice_live = !t.voice_live;
+            let on = !s.thread_mut(which).voice.live;
+            s.thread_mut(which).voice.set_live(on);
         },
         move |s: &mut S| stage_send(s.thread_mut(which)),
     );
@@ -634,6 +634,14 @@ fn apply_settings(s: &mut RuneTranscriptState) {
     s.settings_open = true;
 }
 
+fn apply_voice(s: &mut RuneTranscriptState) {
+    *s = RuneTranscriptState::screenshot();
+    // Deterministic meter proof: preset levels directly (no mic thread in a
+    // headless snap; live capture is exercised by the toggle/drain tests).
+    s.voice.live = true;
+    s.voice.level = 0.6;
+}
+
 /// `poll` hook: drain run frames queued by the transport thread into rows.
 /// Returns true when state changed (requests another frame).
 pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune::Tx) -> bool {
@@ -655,6 +663,8 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune:
             s.inbox = None;
         }
     }
+    // Voice levels ride the same poll at 60fps steps.
+    changed |= s.voice.drain(1.0 / 60.0);
     changed
 }
 
@@ -674,6 +684,7 @@ pub fn spec() -> AppSpec<RuneTranscriptState> {
             ("screenshot", apply_screenshot),
             ("stress", apply_stress),
             ("settings", apply_settings),
+            ("voice", apply_voice),
         ],
         poll: Some(drain_run_inbox),
         ..AppSpec::new(
@@ -870,18 +881,48 @@ mod tests {
             env,
         );
         rt.frame(0.0);
-        assert!(!rt.state.voice_live);
+        assert!(!rt.state.voice.live);
         let (x, y) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert!(rt.state.voice_live);
+        // Outcome depends on hardware (mic vs none), so assert the invariant:
+        // either live capture staged, or an honest note explains why not.
+        // (No poll in `Runtime::new`, so nothing races the assertion.)
+        assert!(
+            rt.state.voice.live || rt.state.voice.note.is_some(),
+            "voice state: {:?}",
+            rt.state.voice
+        );
         assert!(rt.find("composer-voice-dot").is_some());
+        assert!(rt.find("voice-meter").is_some());
         let (x, y) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert!(!rt.state.voice_live);
+        assert!(!rt.state.voice.live);
+        assert!(rt.state.voice.stop.is_none());
+    }
+
+    #[test]
+    fn voice_drain_applies_levels_and_errors() {
+        use crate::voice::{VoiceBus, VoiceMsg};
+        let mut bus = VoiceBus::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        bus.rx = Some(rx);
+        bus.live = true;
+        tx.send(VoiceMsg::Level(0.6)).unwrap();
+        assert!(bus.drain(0.016));
+        // Fresh peak attacked to 0.6, then one idle-decay step (0.016s × 1.5).
+        assert!((bus.level - 0.576).abs() < 1e-4, "{}", bus.level);
+        assert_eq!(crate::voice::lit_bars(bus.level), 3);
+        tx.send(VoiceMsg::Error("no microphone found".to_string()))
+            .unwrap();
+        drop(tx);
+        assert!(bus.drain(0.016));
+        assert!(!bus.live);
+        assert_eq!(bus.note.as_deref(), Some("no microphone found"));
+        assert_eq!(bus.level, 0.0);
     }
 
     #[test]

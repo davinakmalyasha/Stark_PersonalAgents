@@ -53,8 +53,8 @@ pub struct CanvasState {
     pub edit: rune::TextEdit,
     /// Selected chat id; sidebar rows and cards key off the same ids.
     pub active_id: String,
-    /// Voice dictation affordance (mic capture binds later).
-    pub voice_live: bool,
+    /// Mic capture bus (levels, notes, stop flag, inbox).
+    pub voice: crate::voice::VoiceBus,
     /// Prompts staged from the map dock, awaiting run dispatch.
     pub outbox: Vec<String>,
 }
@@ -67,7 +67,7 @@ impl std::fmt::Debug for CanvasState {
             .field("model", &self.model)
             .field("edit", &self.edit.text)
             .field("active_id", &self.active_id)
-            .field("voice_live", &self.voice_live)
+            .field("voice", &self.voice)
             .field("outbox", &self.outbox)
             .finish()
     }
@@ -82,7 +82,7 @@ impl Clone for CanvasState {
             model: self.model.clone(),
             edit: self.edit.clone(),
             active_id: self.active_id.clone(),
-            voice_live: self.voice_live,
+            voice: self.voice.clone(),
             outbox: self.outbox.clone(),
         }
     }
@@ -148,7 +148,7 @@ impl CanvasState {
             model: "Automatic Fallback".to_string(),
             edit: rune::TextEdit::new(""),
             active_id: "chat:ws-general:chat-1".to_string(),
-            voice_live: false,
+            voice: crate::voice::VoiceBus::default(),
             outbox: Vec::new(),
         }
     }
@@ -375,10 +375,10 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 &s.model,
                 &s.edit,
                 move |s: &mut S| &mut s.canvas_mut().edit,
-                s.voice_live,
+                s.voice.meter(),
                 move |s: &mut S| {
                     let c = s.canvas_mut();
-                    c.voice_live = !c.voice_live;
+                    c.voice.set_live(!c.voice.live);
                 },
                 move |s: &mut S| {
                     let c = s.canvas_mut();

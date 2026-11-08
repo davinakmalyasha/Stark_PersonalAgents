@@ -165,7 +165,10 @@ export default function CloudBadge({ chatId, workspaceId, live, title }: Props) 
                     {sending ? 'Sending…' : 'Send to Cloud'}
                   </button>
                   <button
-                    onClick={() => { window.location.hash = '#/cloud'; setOpen(false); }}
+                    onClick={() => {
+                      setOpen(false);
+                      window.dispatchEvent(new CustomEvent('stark:open-cloud'));
+                    }}
                     className="px-2 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 text-[11px] font-medium hover:bg-white/[0.05] transition-colors cursor-pointer"
                   >
                     View runs

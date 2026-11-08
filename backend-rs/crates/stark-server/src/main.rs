@@ -1553,6 +1553,14 @@ Attached files:
         request.workspace_id.trim().to_string()
     } else if let Ok(Some(existing)) = state.store.chat_workspace_id(&chat_id).await {
         existing
+    } else if request
+        .workspace_kind
+        .trim()
+        .eq_ignore_ascii_case("personal")
+    {
+        // Direct General-agent chats live in the Personal virtual workspace so
+        // the sidebar's "General" mode lists them, separate from Main.
+        "_personal".to_string()
     } else if request.workspace_path.trim().is_empty() {
         "_general".to_string()
     } else {

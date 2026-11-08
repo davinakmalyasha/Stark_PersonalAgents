@@ -13,6 +13,7 @@ import NewProjectDialog from './NewProjectDialog';
 import SubagentTabsPane from './SubagentTabsPane';
 import { useSubagentTabs } from './useSubagentTabs';
 import GroupProjectModal from './GroupProjectModal';
+import CloudPanel from '../cloud/CloudPanel';
 import { useGroupProjects } from './useGroupProjects';
 import TokenStatsModal from '../components/Layout/TokenStatsModal';
 import SettingsModal from '../components/Layout/SettingsModal';
@@ -47,20 +48,19 @@ export default function House() {
   // Main workspace → General chats only (orchestrator agent). House workspace
   // is a separate route (#/house) that binds _house; never leak house here.
   const chat = useHouseChat({ workspaceKind: 'general' });
+  // Dedicated General-agent chats (sidebar mode "General"): binds _personal and
+  // routes kind='personal' → GENERAL directly, no orchestrator hop.
+  const personalChat = useHouseChat({ workspaceKind: 'personal' });
+  const personalWs = sessions.workspaces.find((w) => (w as { isPersonal?: boolean }).isPersonal) ?? null;
+  const personalMode = sessions.chatsFilter === 'personal';
+  const home = personalMode ? personalChat : chat;
 
   // Publish busy state for the auto-updater (never restart mid-run).
   useEffect(() => {
-    setBusy('home', chat.isRunning || sessions.isGlobalRunning);
+    setBusy('home', home.isRunning || sessions.isGlobalRunning);
     return () => setBusy('home', false);
-  }, [chat.isRunning, sessions.isGlobalRunning]);
+  }, [home.isRunning, sessions.isGlobalRunning]);
   const { refreshSessions, newSession, newChatIn, openChat, closeTab } = sessions;
-  const {
-    activeChatId: generalActiveChatId,
-    isRunning: chatRunning,
-    isLoading: chatLoading,
-    handleSelectChat,
-    handleSend: handleGeneralChatSend,
-  } = chat;
 
   const activeTab = sessions.activeTab;
   const isCodingTab = activeTab?.type === 'coding';
@@ -69,7 +69,7 @@ export default function House() {
   // projects started from its own folder, while General sees them all. The
   // rule itself lives on the server — this only carries the id.
   const [openProjectId, setOpenProjectId] = useState<string | null>(null);
-  const groupScopeId = activeTab?.workspaceId || chat.workspaceId || '';
+  const groupScopeId = activeTab?.workspaceId || home.workspaceId || '';
   const { projects, scoped: projectsScoped, refresh: refreshProjects } = useGroupProjects(groupScopeId);
 
   // IDE open/close transition: keep the exiting IDE mounted for the exit
@@ -110,16 +110,16 @@ export default function House() {
   }, [refreshSessions]);
   const runner = useSessionRunner(isCodingTab && activeTab ? activeTab : null, handleRunFinished);
   const lastTraceSteps = useMemo<TraceStep[]>(() => {
-    for (let i = chat.displayMessages.length - 1; i >= 0; i--) {
-      const steps = chat.displayMessages[i]?.metadata?.steps;
+    for (let i = home.displayMessages.length - 1; i >= 0; i--) {
+      const steps = home.displayMessages[i]?.metadata?.steps;
       if (Array.isArray(steps) && steps.length > 0) return steps as TraceStep[];
     }
     return [];
-  }, [chat.displayMessages]);
+  }, [home.displayMessages]);
   const generalCanvasAgents = useCanvasAgentState({
-    isRunning: chat.isRunning,
-    liveLog: chat.liveState?.live_terminal_log,
-    tokenUsage: chat.liveState?.token_usage,
+    isRunning: home.isRunning,
+    liveLog: home.liveState?.live_terminal_log,
+    tokenUsage: home.liveState?.token_usage,
     traceSteps: lastTraceSteps,
   }).agents;
 
@@ -128,29 +128,29 @@ export default function House() {
     [lastTraceSteps],
   );
   const activeErrors = useMemo(
-    () => chat.displayMessages.slice(-40).filter((message) => message.role === 'error').length,
-    [chat.displayMessages],
+    () => home.displayMessages.slice(-40).filter((message) => message.role === 'error').length,
+    [home.displayMessages],
   );
   const mapUsage = useMemo(() => ({
-    input: chat.totalInput,
-    output: chat.totalOutput,
-    cost: chat.totalCost,
-    context: chat.activeContextTokens,
-  }), [chat.totalInput, chat.totalOutput, chat.totalCost, chat.activeContextTokens]);
+    input: home.totalInput,
+    output: home.totalOutput,
+    cost: home.totalCost,
+    context: home.activeContextTokens,
+  }), [home.totalInput, home.totalOutput, home.totalCost, home.activeContextTokens]);
 
   // Mini-chat cards reuse the exact live thread the full chat renders, so
   // streaming text, tool steps, and thinking all stay in sync.
   const liveMessagesByChat = useMemo<Record<string, ChatMessage[]>>(() => {
     const map: Record<string, ChatMessage[]> = {};
-    if (chat.isRunning && chat.workspaceId && chat.activeChatId) {
-      map[`${chat.workspaceId}:${chat.activeChatId}`] = chat.displayMessages;
+    if (home.isRunning && home.workspaceId && home.activeChatId) {
+      map[`${home.workspaceId}:${home.activeChatId}`] = home.displayMessages;
     }
     if (runner.isRunning && activeTab) {
       map[`${activeTab.workspaceId}:${activeTab.chatId}`] = runner.messages;
     }
     return map;
   }, [
-    chat.isRunning, chat.workspaceId, chat.activeChatId, chat.displayMessages,
+    home.isRunning, home.workspaceId, home.activeChatId, home.displayMessages,
     runner.isRunning, runner.messages, activeTab,
   ]);
 
@@ -178,6 +178,16 @@ export default function House() {
     setSidebarOpen(true);
   }, []);
 
+  // Badge / chat toolbar "View runs" opens the cloud side panel in place.
+  useEffect(() => {
+    const openCloud = () => {
+      setSideView('cloud');
+      setSidebarOpen(true);
+    };
+    window.addEventListener('stark:open-cloud', openCloud);
+    return () => window.removeEventListener('stark:open-cloud', openCloud);
+  }, []);
+
   // Escape collapses the side panel (it stays docked, never slides away)
   useEffect(() => {
     if (!sidebarOpen) return;
@@ -201,18 +211,24 @@ export default function House() {
     prevTabRef.current = activeTabId;
   }, [activeTabId, clearSubagents]);
 
+  const activeIsPersonal = !!activeTab?.workspaceId && activeTab.workspaceId === personalWs?.id;
   useEffect(() => {
     if (activeTabType !== 'chat' || !activeTabChatId) return;
-    if (chatRunning || chatLoading) return;
-    if (generalActiveChatId !== activeTabChatId) {
-      handleSelectChat(activeTabChatId, { silent: true });
+    const target = activeIsPersonal ? personalChat : chat;
+    if (target.isRunning || target.isLoading) return;
+    if (target.activeChatId !== activeTabChatId) {
+      target.handleSelectChat(activeTabChatId, { silent: true });
     }
-  }, [activeTabId, activeTabType, activeTabChatId, generalActiveChatId, chatRunning, chatLoading, handleSelectChat]);
+  }, [activeTabId, activeTabType, activeTabChatId, activeIsPersonal, personalChat, chat]);
 
   // ── Session creation ──
   const handleNewSession = useCallback(() => {
+    if (personalMode && personalWs) {
+      newChatIn(personalWs.id);
+      return;
+    }
     newSession();
-  }, [newSession]);
+  }, [personalMode, personalWs, newChatIn, newSession]);
 
   const openNewGroupProject = useCallback(() => {
     setProjectDialogMode('group');
@@ -239,13 +255,13 @@ export default function House() {
       await refreshSessions();
       if (chatData) {
         openChat(ws.id, chatData.id);
-        if (initialPrompt?.trim()) chat.seedDraft(initialPrompt.trim());
+        if (initialPrompt?.trim()) home.seedDraft(initialPrompt.trim());
       }
       return ws;
     } catch {
       return null;
     }
-  }, [refreshSessions, openChat, chat.seedDraft]);
+  }, [refreshSessions, openChat, home.seedDraft]);
 
   /** Step 2 of the new-project flow: durable team board inside the workspace. */
   const handleCreateGroupFromDialog = useCallback(async (workspace: import('../types').WorkspaceInfo, task: string) => {
@@ -291,13 +307,13 @@ export default function House() {
   }, []);
 
   const handleGeneralSend = useCallback((prompt: string, files: File[]) => {
-    if (chatRunning) return;
+    if (home.isRunning) return;
     if (runner.isRunning || foreignRunActive) {
       notifyBlocked();
       return;
     }
-    handleGeneralChatSend(prompt, files);
-  }, [chatRunning, handleGeneralChatSend, runner.isRunning, foreignRunActive, notifyBlocked]);
+    home.handleSend(prompt, files);
+  }, [home, runner.isRunning, foreignRunActive, notifyBlocked]);
 
   const launchCoding = useCallback(() => {
     if (transitioning) return;
@@ -327,11 +343,12 @@ export default function House() {
   }, [transitioning]);
 
   const activeGeneralTitle = useMemo(
-    () => chat.chats.find((c) => c.id === chat.activeChatId)?.title ?? 'New conversation',
-    [chat.chats, chat.activeChatId],
+    () => home.chats.find((c) => c.id === home.activeChatId)?.title ?? 'New conversation',
+    [home.chats, home.activeChatId],
   );
 
   const mainWorkspace = sessions.workspaces.find((w) => w.isGeneral) || sessions.workspaces[0] || null;
+  const homeWorkspace = personalMode ? (personalWs ?? mainWorkspace) : mainWorkspace;
   const generalChatView = (
     <div className="relative flex-1 min-h-0">
       <div className="absolute inset-0 overflow-y-auto house-thread px-3 pt-3 sm:px-5">
@@ -342,10 +359,10 @@ export default function House() {
             variant="map"
             workspaces={sessions.workspaces}
             chatsByWs={sessions.chatsByWs}
-            activeWorkspaceId={mainWorkspace?.id ?? null}
-            activeChatId={chat.activeChatId}
+            activeWorkspaceId={homeWorkspace?.id ?? null}
+            activeChatId={home.activeChatId}
             agents={generalCanvasAgents}
-            isRunning={chat.isRunning}
+            isRunning={home.isRunning}
             projects={projects}
             tabs={sessions.tabs}
             runningTabId={sessions.runningTabId}
@@ -370,7 +387,7 @@ export default function House() {
             onSendToChat={async (wsId, chatId, text, files = []) => {
               const ws = sessions.workspaces.find((w) => w.id === wsId);
               if (!ws) throw new Error('Workspace not found.');
-              if (wsId === mainWorkspace?.id && chatId === chat.activeChatId) {
+              if (wsId === homeWorkspace?.id && chatId === home.activeChatId) {
                 handleGeneralSend(text, files);
                 return;
               }
@@ -378,7 +395,7 @@ export default function House() {
               await sessions.forceRefresh();
             }}
             onRewindMessage={async (wsId, chatId, message) => {
-              const isActive = wsId === mainWorkspace?.id && chatId === chat.activeChatId;
+              const isActive = wsId === homeWorkspace?.id && chatId === home.activeChatId;
               if (isActive) {
                 try {
                   // The summary carries only the fields a card needs; the
@@ -386,7 +403,7 @@ export default function House() {
                   const full = await fetchChat(wsId, chatId);
                   const target = full.messages.find((candidate) => candidate.id === message.id);
                   if (target) {
-                    await chat.handleRewind(target);
+                    await home.handleRewind(target);
                     await sessions.forceRefresh();
                     return;
                   }
@@ -403,30 +420,30 @@ export default function House() {
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[60]">
       <HouseChat
         title={activeGeneralTitle}
-        messages={chat.displayMessages}
-        isRunning={chat.isRunning}
-        isLoading={chat.isLoading}
-        notification={chat.notification ?? blockedNote}
-        threadRef={chat.threadRef}
-        isVoiceMode={chat.isVoiceMode}
-        totalCost={chat.totalCost}
-        totalInput={chat.totalInput}
-        totalOutput={chat.totalOutput}
-        totalCacheHitTokens={chat.totalCacheHitTokens}
-        activeContextTokens={chat.activeContextTokens}
+        messages={home.displayMessages}
+        isRunning={home.isRunning}
+        isLoading={home.isLoading}
+        notification={home.notification ?? blockedNote}
+        threadRef={home.threadRef}
+        isVoiceMode={home.isVoiceMode}
+        totalCost={home.totalCost}
+        totalInput={home.totalInput}
+        totalOutput={home.totalOutput}
+        totalCacheHitTokens={home.totalCacheHitTokens}
+        activeContextTokens={home.activeContextTokens}
         onSend={handleGeneralSend}
-        onCancel={chat.handleCancel}
-        onToggleVoice={chat.toggleVoice}
+        onCancel={home.handleCancel}
+        onToggleVoice={home.toggleVoice}
         onOpenStats={() => setIsStatsOpen(true)}
         onOpenSubagent={subagents.open}
-        workspaceId={chat.workspaceId}
+        workspaceId={home.workspaceId}
         chatId={activeTabChatId}
-        onRewind={chat.handleRewind}
+        onRewind={home.handleRewind}
         onRetry={(prompt) => handleGeneralSend(prompt, [])}
-        draft={chat.draft}
-        draftAttachments={chat.draftAttachments}
-        onDraftConsumed={chat.clearDraft}
-        onDraftAttachmentsConsumed={chat.clearDraftAttachments}
+        draft={home.draft}
+        draftAttachments={home.draftAttachments}
+        onDraftConsumed={home.clearDraft}
+        onDraftAttachmentsConsumed={home.clearDraftAttachments}
       />
       </div>
     </div>
@@ -487,7 +504,6 @@ export default function House() {
           onView={handleSideView}
           onNewChat={handleNewSession}
           onOpenSettings={() => setIsSettingsOpen(true)}
-          onOpenCloud={() => { window.location.hash = '#/cloud'; }}
           waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
         />
       </div>
@@ -524,6 +540,10 @@ export default function House() {
           onLaunchCoding={launchCoding}
           onLaunchHouse={launchHouse}
         />
+      ) : sideView === 'cloud' ? (
+        <div className="w-[248px] max-md:w-full shrink-0 bg-[#0f0f0f] border-r house-hairline min-h-0">
+          <CloudPanel />
+        </div>
       ) : (
         <div className="w-[248px] max-md:w-full shrink-0 bg-[#0f0f0f] border-r house-hairline min-h-0">
           <HouseProjectsPanel
@@ -571,7 +591,7 @@ export default function House() {
             tabs={subagents.tabs}
             activeChildId={subagents.activeChildId}
             parentTitle={activeGeneralTitle}
-            fallbackWorkspaceId={chat.workspaceId || sessions.workspaces.find((w) => w.isGeneral)?.id || ''}
+            fallbackWorkspaceId={home.workspaceId || sessions.workspaces.find((w) => w.isGeneral)?.id || ''}
             onActivate={subagents.activate}
             onClose={subagents.close}
             onOpenSubagent={subagents.open}
@@ -600,8 +620,8 @@ export default function House() {
       <TokenStatsModal
         isOpen={isStatsOpen}
         onClose={() => setIsStatsOpen(false)}
-        tokenUsage={chat.combinedTokenUsage}
-        lastModelName={chat.lastModelName}
+        tokenUsage={home.combinedTokenUsage}
+        lastModelName={home.lastModelName}
       />
 
       <SettingsModal

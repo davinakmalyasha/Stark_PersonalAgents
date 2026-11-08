@@ -1,7 +1,7 @@
 import { Cloud, FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
-export type SideView = 'chats' | 'projects';
+export type SideView = 'chats' | 'projects' | 'cloud';
 
 interface Props {
   view: SideView;
@@ -9,11 +9,10 @@ interface Props {
   onView: (view: SideView) => void;
   onNewChat: () => void;
   onOpenSettings: () => void;
-  onOpenCloud: () => void;
   waiting: number;
 }
 
-export default function HouseRail({ view, onView, onNewChat, onOpenSettings, onOpenCloud, waiting }: Props) {
+export default function HouseRail({ view, onView, onNewChat, onOpenSettings, waiting }: Props) {
   const btn = (active: boolean) =>
     `house-rail-btn grid place-items-center w-9 h-9 rounded-xl cursor-pointer shrink-0 ${
       active ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
@@ -55,10 +54,11 @@ export default function HouseRail({ view, onView, onNewChat, onOpenSettings, onO
           )}
         </button>
         <button
-          onClick={onOpenCloud}
+          onClick={() => onView('cloud')}
           title="Cloud runs"
           aria-label="Cloud runs"
-          className={btn(false)}
+          aria-pressed={view === 'cloud'}
+          className={btn(view === 'cloud')}
         >
           <Cloud size={17} />
         </button>

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, MessageSquare, Pencil, Trash2, Check, Code2, ChevronRight,
-  ChevronDown, Search, Pin, PinOff, Bot, CornerDownRight, Home,
+  ChevronDown, Search, Pin, PinOff, Bot, CornerDownRight, Home, User,
 } from 'lucide-react';
 import type { ChatSummary, ChatsFilter, WorkspaceInfo } from '../types';
 import { tabId } from './useSessions';
+import CloudBadge from '../components/Layout/CloudBadge';
 import { cleanChatTitle } from '../utils/chatTitle';
 import {
   buildGlobalLookup,
@@ -92,15 +93,17 @@ function LoadMoreButton({ remaining, onClick }: { remaining: number; onClick: ()
  * dropdown — search + every chat in one list + the workspace launchers.
  * Rows support open, pin, rename and delete.
  */
-const MODE_META: Record<'general' | 'coding' | 'house', { label: string; desc: string }> = {
+const MODE_META: Record<'general' | 'coding' | 'house' | 'personal', { label: string; desc: string }> = {
   general: { label: 'Main', desc: 'Create, learn, and explore' },
   coding: { label: 'Coding', desc: 'Build, debug, and ship' },
   house: { label: 'House', desc: 'Manage home, tasks, and routines' },
+  personal: { label: 'General', desc: 'Life admin, research, and records' },
 };
 
-function modeOf(filter: ChatsFilter): 'general' | 'coding' | 'house' {
+function modeOf(filter: ChatsFilter): 'general' | 'coding' | 'house' | 'personal' {
   if (filter === 'coding') return 'coding';
-  if (filter === 'house' || filter === 'personal') return 'house';
+  if (filter === 'house') return 'house';
+  if (filter === 'personal') return 'personal';
   return 'general';
 }
 
@@ -143,6 +146,7 @@ export default function HouseSidebar({
   const isPinned = (sid: string) => pinnedChats.includes(sid);
   const general = workspaces.find((w) => w.isGeneral);
   const houseWs = workspaces.find((w) => (w as { isHouse?: boolean }).isHouse);
+  const personalWs = workspaces.find((w) => (w as { isPersonal?: boolean }).isPersonal);
   // Coding folders are real project workspaces only — house/personal rooms
   // never appear as folders (they live under the House mode).
   const projects = workspaces.filter(
@@ -254,9 +258,10 @@ export default function HouseSidebar({
     let pool: RowChat[] = [];
     if (chatsFilter === 'general' && general) pool = (chatsByWs[general.id] ?? []).map((c) => withWs(general, c));
     else if (chatsFilter === 'coding') pool = projects.flatMap((ws) => (chatsByWs[ws.id] ?? []).map((c) => withWs(ws, c)));
-    else if ((chatsFilter === 'house' || chatsFilter === 'personal') && houseWs) pool = (chatsByWs[houseWs.id] ?? []).map((c) => withWs(houseWs, c));
+    else if (chatsFilter === 'house' && houseWs) pool = (chatsByWs[houseWs.id] ?? []).map((c) => withWs(houseWs, c));
+    else if (chatsFilter === 'personal' && personalWs) pool = (chatsByWs[personalWs.id] ?? []).map((c) => withWs(personalWs, c));
     return pinnedSort(pool.filter((r) => (r.title || 'untitled').toLowerCase().includes(q)));
-  }, [searching, chatsFilter, general, projects, houseWs, chatsByWs, q, pinnedSort]);
+  }, [searching, chatsFilter, general, projects, houseWs, personalWs, chatsByWs, q, pinnedSort]);
 
   const startRename = (row: RowChat) => {
     setConfirmDeleteSid(null);
@@ -379,6 +384,7 @@ export default function HouseSidebar({
             {showWs && !spawned && <span className="text-[9.5px] text-zinc-600 shrink-0 truncate max-w-[64px]">{row.ws.name}</span>}
             <span className="text-[10px] text-zinc-600 flex-shrink-0 tabular-nums">{relativeTime(row.updatedAt)}</span>
             <div className="absolute right-1 hidden group-hover:flex items-center gap-0.5 bg-[#181818] rounded-md border border-white/[0.06] px-0.5 py-0.5">
+              <CloudBadge chatId={row.id} workspaceId={row.ws.id} live={isRunning} />
               <button
                 title={pinned ? 'Unpin' : 'Pin'}
                 onClick={(e) => { e.stopPropagation(); onTogglePin(row.sid); }}
@@ -503,24 +509,31 @@ export default function HouseSidebar({
     }
 
     if (chatsFilter === 'house' || chatsFilter === 'personal') {
-      const roomLabel = chatsFilter === 'house' ? 'House' : 'Personal';
-      const roomWs = houseWs ?? workspaces.find((w) => (w as { isPersonal?: boolean }).isPersonal);
+      const isPersonalMode = chatsFilter === 'personal';
+      const roomLabel = isPersonalMode ? 'General' : 'House';
+      const roomWs = isPersonalMode
+        ? personalWs
+        : (houseWs ?? workspaces.find((w) => (w as { isHouse?: boolean }).isHouse));
       const roomChats = roomWs ? pinnedSort((chatsByWs[roomWs.id] ?? []).map((c) => withWs(roomWs, c))) : [];
       return (
         <div className="flex flex-col gap-1">
           {roomChats.map((row) => renderRow(withParentInfo(row), false, { depth: isSpawnedChat(row) ? 1 : 0 }))}
           {roomChats.length === 0 && (
             <div className="flex flex-col items-center gap-2.5 text-center px-6 py-8">
-              <p className="text-[11.5px] text-zinc-600 leading-5">No house chats yet.</p>
+              <p className="text-[11.5px] text-zinc-600 leading-5">
+                {isPersonalMode ? 'No General chats yet.' : 'No house chats yet.'}
+              </p>
             </div>
           )}
-          <button
-            onClick={() => { onOpenRoom?.('house'); onClose(); }}
-            className="mx-3 mt-2 flex items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11.5px] text-zinc-300 hover:bg-white/[0.09] transition-colors cursor-pointer"
-          >
-            <ChevronRight size={12} />
-            Open {roomLabel} Workspace
-          </button>
+          {!isPersonalMode && (
+            <button
+              onClick={() => { onOpenRoom?.('house'); onClose(); }}
+              className="mx-3 mt-2 flex items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11.5px] text-zinc-300 hover:bg-white/[0.09] transition-colors cursor-pointer"
+            >
+              <ChevronRight size={12} />
+              Open {roomLabel} Workspace
+            </button>
+          )}
         </div>
       );
     }
@@ -758,9 +771,9 @@ export default function HouseSidebar({
                   aria-label="Chat mode"
                   className="absolute left-0 top-[calc(100%+6px)] z-50 w-[248px] rounded-xl border border-white/[0.09] bg-[#151515] shadow-2xl overflow-hidden"
                 >
-                  {(['general', 'coding', 'house'] as const).map((key) => {
+                  {(['general', 'coding', 'house', 'personal'] as const).map((key) => {
                     const active = modeOf(chatsFilter) === key;
-                    const Icon = key === 'coding' ? Code2 : key === 'house' ? Home : MessageSquare;
+                    const Icon = key === 'coding' ? Code2 : key === 'house' ? Home : key === 'personal' ? User : MessageSquare;
                     return (
                       <button
                         key={key}
@@ -790,14 +803,17 @@ export default function HouseSidebar({
             </div>
             <button
               onClick={() => {
-                if (modeOf(chatsFilter) === 'coding' && projects.length > 0) {
+                const mode = modeOf(chatsFilter);
+                if (mode === 'coding' && projects.length > 0) {
                   const first = [...projects].sort((a, b) => a.name.localeCompare(b.name))[0];
                   onNewChatInProject?.(first.id);
+                } else if (mode === 'personal' && personalWs) {
+                  onNewChatInProject?.(personalWs.id);
                 } else {
                   onNewChat?.();
                 }
               }}
-              title={modeOf(chatsFilter) === 'coding' ? 'New coding chat' : modeOf(chatsFilter) === 'house' ? 'New house chat' : 'New chat'}
+              title={modeOf(chatsFilter) === 'coding' ? 'New coding chat' : modeOf(chatsFilter) === 'house' ? 'New house chat' : modeOf(chatsFilter) === 'personal' ? 'New General chat' : 'New chat'}
               aria-label="New chat"
               className="grid place-items-center w-6 h-6 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer shrink-0"
             >

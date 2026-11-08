@@ -251,8 +251,8 @@ untouched), and records the handoff in `.deep_agents/cloud/handoffs.json`.
   job queues, checkpoints, logs, and WAL files never travel.
 - UI: per-chat `☁` badge (glow = live run) with Send + run details, dock
   `Local | Cloud` toggle saved per chat, `Send to Cloud` in the chat toolbar,
-  and the `#/cloud` room (left-rail Cloud icon) with status, send form, and
-  the handoff queue.
+  and the Home rail's Cloud icon, which opens the send form and handoff queue
+  as an in-place side panel (the `#/cloud` room remains for deep links/phones).
 - `GET /api/cloud/status` reports `{origin, cap, configured, cloud_host,
   runs[]}` and drives the badge glow plus the room header.
 

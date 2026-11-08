@@ -36,6 +36,11 @@ General handles everyday life: research, writing, admin, personal records,
 signed-in browser tasks, and desktop actions. It does not build software
 (Developer) and does not control devices (House).
 
+The Home sidebar exposes it as the **General** chat mode (next to Main, Coding,
+and House): those chats bind the `_personal` workspace and send
+`workspace_kind="personal"`, which routes straight to the General agent with no
+orchestrator hop. **Main** stays the orchestrator (coordinate + delegate).
+
 Routing:
 
 - Public web → `web_search`, `web_fetch`, `browser_act` (isolated browser, no

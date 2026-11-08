@@ -60,6 +60,14 @@ export default function App() {
 
   // Components outside App (ChatView fork, subagent views) can request a
   // sidebar refresh without prop-drilling the tick setter.
+  // Cloud badge "View runs": the coding shell has no side panel, so it opens
+  // the standalone cloud room. Home handles the same event in-place.
+  useEffect(() => {
+    const openCloud = () => { window.location.hash = '#/cloud'; };
+    window.addEventListener('stark:open-cloud', openCloud);
+    return () => window.removeEventListener('stark:open-cloud', openCloud);
+  }, []);
+
   useEffect(() => {
     const refresh = () => setSidebarRefreshTick((tick) => tick + 1);
     window.addEventListener('stark:refresh-sidebar', refresh);

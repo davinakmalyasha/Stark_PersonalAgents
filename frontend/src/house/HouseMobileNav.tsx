@@ -1,4 +1,4 @@
-import { FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
+import { Cloud, FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
 import type { SideView } from './HouseRail';
 
 interface Props {
@@ -42,6 +42,10 @@ export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings
           )}
         </span>
         <span className="text-[9px]">Projects</span>
+      </button>
+      <button onClick={() => onView('cloud')} className={item(view === 'cloud')} aria-label="Cloud" aria-pressed={view === 'cloud'}>
+        <Cloud size={18} />
+        <span className="text-[9px]">Cloud</span>
       </button>
       <button onClick={onOpenSettings} className={item(false)} aria-label="Settings">
         <Settings size={18} />

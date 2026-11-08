@@ -96,7 +96,7 @@ impl RuneTranscriptState {
                 RowData {
                     key: "msg-1".to_string(),
                     role: "agent",
-                    body: "Playing now in your YouTube tab: massive green day — Cinnamon Girl (8yr-old). A 20s pre-roll ad played first — I skipped it, and the actual track is running (04:48).".to_string(),
+                    body: "Playing now in your YouTube tab: **massive green day** — `Cinnamon Girl` (8yr-old).\n\n```text\ntrack is running (04:48)\n```".to_string(),
                 },
             ],
             edit: TextEdit::new(""),
@@ -164,6 +164,124 @@ impl RuneTranscriptState {
 
 fn bg() -> rune::Color {
     rune::color::hex("#0a0a0a").unwrap_or(rune::Color::BLACK)
+}
+
+/// Render a message body as markdown blocks: paras/headings/lists become
+/// `rich` runs (bold weight, inline-code mono + merged backgrounds), fenced
+/// code becomes a mono block on a dark well. Mirrors `Markdown.tsx`.
+fn render_body(key: &str, body: &str) -> El {
+    use stark_kit::markdown::{Block, Inline};
+    let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
+    let body_style = rune::tok::TextStyle::new(12.5, 400.0);
+    /// Flatten inlines to (text, spans) with byte offsets.
+    fn runs(inlines: &[Inline]) -> (String, Vec<rune::Span>) {
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        for inline in inlines {
+            let (chunk, span) = match inline {
+                Inline::Text(t) => (t.clone(), None),
+                Inline::Bold(t) => {
+                    let s = rune::Span::new(text.len(), text.len() + t.len()).weight(650.0);
+                    (t.clone(), Some(s))
+                }
+                Inline::Code(t) => {
+                    let s = rune::Span::new(text.len(), text.len() + t.len()).mono().bg(
+                        rune::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 0.07,
+                        },
+                        2.0,
+                    );
+                    (t.clone(), Some(s))
+                }
+            };
+            text.push_str(&chunk);
+            if let Some(s) = span {
+                spans.push(s);
+            }
+        }
+        (text, spans)
+    }
+    let mut stack = col().key(format!("{key}-md")).w_full().gap(6.0);
+    for (i, block) in stark_kit::markdown::parse(body).iter().enumerate() {
+        match block {
+            Block::Para(inlines) => {
+                let (content, spans) = runs(inlines);
+                stack = stack.child(
+                    rune::rich(content, spans)
+                        .key(format!("{key}-p-{i}"))
+                        .font(body_style)
+                        .color(ink("#d2d2da")),
+                );
+            }
+            Block::Heading {
+                level,
+                text: inlines,
+            } => {
+                let (content, mut spans) = runs(inlines);
+                spans.push(
+                    rune::Span::new(0, content.len())
+                        .weight(650.0)
+                        .size(17.0 - *level as f32),
+                );
+                stack = stack.child(
+                    rune::rich(content, spans)
+                        .key(format!("{key}-h-{i}"))
+                        .font(body_style)
+                        .color(ink("#f0f0f3")),
+                );
+            }
+            Block::List(items) => {
+                let mut list = col().key(format!("{key}-ul-{i}")).w_full().gap(2.0);
+                for (j, item) in items.iter().enumerate() {
+                    let (content, spans) = runs(item);
+                    list = list.child(
+                        row()
+                            .key(format!("{key}-li-{i}-{j}"))
+                            .w_full()
+                            .gap(8.0)
+                            .child(text("•".to_string()).font(body_style).color(ink("#8a8a93")))
+                            .child(
+                                rune::rich(content, spans)
+                                    .font(body_style)
+                                    .color(ink("#d2d2da")),
+                            ),
+                    );
+                }
+                stack = stack.child(list);
+            }
+            Block::Code { lang, text: code } => {
+                let mut block = col()
+                    .key(format!("{key}-code-{i}"))
+                    .w_full()
+                    .radius(8.0)
+                    .fill(ink("#0b0b0e"))
+                    .border(1.0, ink("#ffffff14"))
+                    .px(10.0)
+                    .py(8.0)
+                    .gap(6.0);
+                if !lang.is_empty() {
+                    block = block.child(
+                        text(lang.clone())
+                            .key(format!("{key}-code-{i}-lang"))
+                            .font(rune::tok::TextStyle::new(10.0, 600.0))
+                            .color(ink("#71717a")),
+                    );
+                }
+                stack = stack.child(
+                    block.child(
+                        rune::rich(code.clone(), vec![])
+                            .key(format!("{key}-code-{i}-body"))
+                            .font(rune::tok::TextStyle::new(12.0, 400.0).mono())
+                            .color(ink("#dfe0e4")),
+                    ),
+                );
+            }
+        }
+    }
+    stack
 }
 
 /// Shared send path (button + Enter): stage the field as a user row, mark the
@@ -266,7 +384,6 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> 
                     a: 0.06,
                 };
                 let name_style = rune::tok::TextStyle::new(11.0, 650.0);
-                let body_style = rune::tok::TextStyle::new(12.5, 400.0);
                 let initial_style = rune::tok::TextStyle::new(9.5, 700.0);
                 let bubble = col()
                     .key(format!("{}-bubble", r.key))
@@ -280,7 +397,7 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> 
                             .key(format!("{}-name", r.key))
                             .font(name_style),
                     )
-                    .child(text(r.body.clone()).font(body_style).wrap());
+                    .child(render_body(&r.key, &r.body));
                 let bubble = if r.role == "user" {
                     // Content-sized (no `grow`) + `justify_end` row hugs right
                     // like `.canvas-bubble-row.is-user`. `max_w` bounds the
@@ -747,6 +864,21 @@ mod tests {
         rt.pointer_up(x, y);
         rt.frame(0.0);
         assert!(!rt.state.voice_live);
+    }
+
+    #[test]
+    fn markdown_code_block_mounts_in_row() {
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(
+            RuneTranscriptState::screenshot(),
+            transcript_view,
+            (468.0, 720.0),
+            env,
+        );
+        rt.frame(0.0);
+        for key in ["msg-1-md", "msg-1-code-1", "msg-1-code-1-body"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
     }
 
     #[test]

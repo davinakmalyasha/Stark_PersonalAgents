@@ -10,6 +10,7 @@
 //!
 //! No raw style literals here — sizes come from `stark-theme`.
 
+pub mod markdown;
 pub mod transcript;
 
 use stark_theme::layout;

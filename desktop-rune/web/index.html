@@ -33,6 +33,15 @@
   <div id="boot">Loading Stark…</div>
   <script type="module">
     import init from './pkg/stark_rune_web.js';
+    // App-shell offline: register the service worker (no-op where
+    // unsupported); updates take over on next load via skipWaiting.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch((err) => {
+          console.warn('sw register failed', err);
+        });
+      });
+    }
     try {
       await init();
       document.getElementById('boot')?.remove();

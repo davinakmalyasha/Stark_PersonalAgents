@@ -17,7 +17,7 @@
 
 use std::borrow::Cow;
 
-use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec};
+use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
 use stark_kit::transcript::{TranscriptRow, ESTIMATED_ROW_H};
 
 /// Row content fed to both the pure window math and the Rune view.
@@ -31,7 +31,7 @@ pub struct RowData {
 pub struct RuneTranscriptState {
     pub title: String,
     pub rows: Vec<RowData>,
-    pub composer: String,
+    pub edit: TextEdit,
     pub model: String,
     pub live: bool,
     pub api_host: String,
@@ -46,7 +46,7 @@ impl std::fmt::Debug for RuneTranscriptState {
         f.debug_struct("RuneTranscriptState")
             .field("title", &self.title)
             .field("rows", &self.rows)
-            .field("composer", &self.composer)
+            .field("edit", &self.edit.text)
             .field("model", &self.model)
             .field("live", &self.live)
             .field("api_host", &self.api_host)
@@ -61,7 +61,7 @@ impl Clone for RuneTranscriptState {
         Self {
             title: self.title.clone(),
             rows: self.rows.clone(),
-            composer: self.composer.clone(),
+            edit: self.edit.clone(),
             model: self.model.clone(),
             live: self.live,
             api_host: self.api_host.clone(),
@@ -91,7 +91,7 @@ impl RuneTranscriptState {
                     body: "Playing now in your YouTube tab: massive green day — Cinnamon Girl (8yr-old). A 20s pre-roll ad played first — I skipped it, and the actual track is running (04:48).".to_string(),
                 },
             ],
-            composer: String::new(),
+            edit: TextEdit::new(""),
             model: "Automatic Fallback".to_string(),
             live: true,
             api_host: DEFAULT_API_HOST.to_string(),
@@ -124,7 +124,7 @@ impl RuneTranscriptState {
         Self {
             title: "Stress — 10k rows".to_string(),
             rows,
-            composer: String::new(),
+            edit: TextEdit::new(""),
             model: "Automatic Fallback".to_string(),
             live: false,
             api_host: DEFAULT_API_HOST.to_string(),
@@ -152,6 +152,47 @@ impl RuneTranscriptState {
 
 fn bg() -> rune::Color {
     rune::color::hex("#0a0a0a").unwrap_or(rune::Color::BLACK)
+}
+
+/// Shared send path (button + Enter): stage the field as a user row, mark the
+/// run live, and spawn the blocking `POST /api/run` thread into `inbox`.
+pub fn stage_send(s: &mut RuneTranscriptState) {
+    let prompt = s.edit.text.trim().to_string();
+    if prompt.is_empty() {
+        return;
+    }
+    let n = s.rows.len();
+    s.rows.push(RowData {
+        key: format!("user-{n}"),
+        role: "user",
+        body: prompt.clone(),
+    });
+    s.live = true;
+    s.edit.text.clear();
+    s.edit.anchor = 0;
+    s.edit.focus = 0;
+    let req = crate::stream::RunRequest {
+        prompt,
+        model: s.model.clone(),
+        temperature: 0.7,
+        workspace_path: String::new(),
+        chat_id: String::new(),
+        workspace_kind: "general".to_string(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.inbox = Some(rx);
+    let (host, port) = (s.api_host.clone(), s.api_port);
+    std::thread::spawn(move || {
+        let mut emit = |frame: crate::stream::SseFrame| {
+            let _ = tx.send(frame);
+        };
+        if let Err(message) = crate::transport::post_run(&host, port, &req, &mut emit) {
+            let _ = tx.send(crate::stream::SseFrame {
+                event: "error".to_string(),
+                data: serde_json::json!({"message": message}),
+            });
+        }
+    });
 }
 
 pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>) -> El {
@@ -268,46 +309,15 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         );
     }
     // Composer card: shared `.premium-surface` dock (see `composer.rs`).
-    // Send stages the draft as a user row, marks the run live, and spawns the
-    // blocking `POST /api/run` thread; frames land in `inbox`, drained by the
-    // `poll` hook before every frame. The UI thread never blocks.
-    let composer_card =
-        super::composer::composer_card(&s.model, &s.composer, |s: &mut RuneTranscriptState| {
-            let prompt = s.composer.trim().to_string();
-            if prompt.is_empty() {
-                return;
-            }
-            let n = s.rows.len();
-            s.rows.push(RowData {
-                key: format!("user-{n}"),
-                role: "user",
-                body: prompt.clone(),
-            });
-            s.live = true;
-            s.composer.clear();
-            let req = crate::stream::RunRequest {
-                prompt,
-                model: s.model.clone(),
-                temperature: 0.7,
-                workspace_path: String::new(),
-                chat_id: String::new(),
-                workspace_kind: "general".to_string(),
-            };
-            let (tx, rx) = std::sync::mpsc::channel();
-            s.inbox = Some(rx);
-            let (host, port) = (s.api_host.clone(), s.api_port);
-            std::thread::spawn(move || {
-                let mut emit = |frame: crate::stream::SseFrame| {
-                    let _ = tx.send(frame);
-                };
-                if let Err(message) = crate::transport::post_run(&host, port, &req, &mut emit) {
-                    let _ = tx.send(crate::stream::SseFrame {
-                        event: "error".to_string(),
-                        data: serde_json::json!({"message": message}),
-                    });
-                }
-            });
-        });
+    // Send (button or Enter) stages the field as a user row, marks the run
+    // live, and spawns the blocking `POST /api/run` thread; frames land in
+    // `inbox`, drained by the `poll` hook before every frame.
+    let composer_card = super::composer::composer_card(
+        &s.model,
+        &s.edit,
+        |s: &mut RuneTranscriptState| &mut s.edit,
+        stage_send,
+    );
     root.child(
         rune::el()
             .key("composer-dock")
@@ -415,10 +425,52 @@ mod tests {
     }
 
     #[test]
+    fn typing_in_composer_edits_live_field() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.edit = TextEdit::new("");
+        init.edit.focused = true;
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        for ch in ["h", "i"] {
+            rt.key(KeyEvent {
+                key: Key::Text(ch.to_string()),
+                mods: Mods::default(),
+            });
+            rt.frame(0.0);
+        }
+        assert_eq!(rt.state.edit.text, "hi");
+    }
+
+    #[test]
+    fn enter_submits_staged_prompt() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.edit = TextEdit::new("hello agent");
+        init.edit.focused = true;
+        init.live = false;
+        init.api_port = 1;
+        let n = init.rows.len();
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.rows.len(), n + 1);
+        assert_eq!(rt.state.rows[n].body, "hello agent");
+        assert!(rt.state.live);
+        assert!(rt.state.edit.text.is_empty());
+    }
+
+    #[test]
     fn send_tap_stages_prompt_and_marks_live() {
         let env = Env::new(true, 2.0);
         let mut init = RuneTranscriptState::screenshot();
-        init.composer = "hello agent".to_string();
+        init.edit = TextEdit::new("hello agent");
         init.live = false;
         // Closed port: the spawned run thread fails into the undrained channel
         // (Runtime::new wires no poll), so staging assertions stay exact and no
@@ -435,7 +487,7 @@ mod tests {
         assert_eq!(rt.state.rows[n].role, "user");
         assert_eq!(rt.state.rows[n].body, "hello agent");
         assert!(rt.state.live);
-        assert!(rt.state.composer.is_empty());
+        assert!(rt.state.edit.text.is_empty());
         assert!(rt.find(&rt.state.rows[n].key).is_some());
         assert!(rt.state.inbox.is_some(), "run thread owns the inbox");
     }

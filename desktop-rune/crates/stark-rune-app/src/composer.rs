@@ -4,24 +4,26 @@
 //! Voice button and live `text_input` binding arrive next; the input is static
 //! text for now.
 
-use rune::{col, row, spacer, text, El};
+use rune::{col, row, spacer, text, text_input, El, TextEdit, Tx};
 
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
-/// Premium-surface composer: gradient card, 15px input, toolbar with model
-/// pill, spacer, and white send circle. `w_full` — callers set the width.
-/// `on_send` runs on send-button press (each view wires its own state type).
+/// Premium-surface composer: gradient card, live 15px input, toolbar with
+/// model pill, spacer, and white send circle. `w_full` — callers set the
+/// width. `on_send` runs on send-button press and field submit; each view
+/// wires its own state type through `edit_of`.
 pub fn composer_card<S: 'static>(
     model: &str,
-    draft: &str,
+    edit: &TextEdit,
+    edit_of: impl for<'a> Fn(&'a mut S) -> &'a mut TextEdit + 'static,
     on_send: impl Fn(&mut S) + 'static,
 ) -> El {
-    let input = if draft.is_empty() {
-        "Ask anything".to_string()
-    } else {
-        draft.to_string()
+    let on_send = std::rc::Rc::new(on_send);
+    let submit = {
+        let on_send = on_send.clone();
+        move |s: &mut S, _tx: &mut Tx| on_send(s)
     };
     col()
         .key("composer-card")
@@ -56,11 +58,13 @@ pub fn composer_card<S: 'static>(
         .pb(10.0)
         .gap(8.0)
         .child(
-            text(input)
+            text_input(edit, rune::tok::TextStyle::new(15.0, 400.0))
                 .key("composer-input")
-                .font(rune::tok::TextStyle::new(15.0, 400.0))
-                .wrap()
-                .color(ink("#74747d")),
+                .w_full()
+                .placeholder("Ask anything", ink("#74747d"))
+                .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                .on_edit(edit_of)
+                .on_submit(submit),
         )
         .child(
             row()
@@ -106,7 +110,10 @@ pub fn composer_card<S: 'static>(
                         .radius(17.0)
                         .fill(ink("#ffffff"))
                         .center()
-                        .on_press(on_send)
+                        .on_press({
+                            let on_send = on_send.clone();
+                            move |s: &mut S| on_send(s)
+                        })
                         .child(
                             text("↑".to_string())
                                 .font(rune::tok::TextStyle::new(16.0, 650.0))

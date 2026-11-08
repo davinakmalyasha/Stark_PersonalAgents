@@ -45,15 +45,45 @@ impl MapCard {
     }
 }
 
-#[derive(Debug, Clone, Default)]
 pub struct CanvasState {
     pub cards: Vec<MapCard>,
     pub edges: Vec<(String, String)>,
     pub press_home: Option<(f32, f32)>,
     pub model: String,
-    pub composer: String,
+    pub edit: rune::TextEdit,
     /// Prompts staged from the map dock, awaiting run dispatch.
     pub outbox: Vec<String>,
+}
+
+impl std::fmt::Debug for CanvasState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanvasState")
+            .field("cards", &self.cards)
+            .field("edges", &self.edges)
+            .field("model", &self.model)
+            .field("edit", &self.edit.text)
+            .field("outbox", &self.outbox)
+            .finish()
+    }
+}
+
+impl Clone for CanvasState {
+    fn clone(&self) -> Self {
+        Self {
+            cards: self.cards.clone(),
+            edges: self.edges.clone(),
+            press_home: self.press_home,
+            model: self.model.clone(),
+            edit: self.edit.clone(),
+            outbox: self.outbox.clone(),
+        }
+    }
+}
+
+impl Default for CanvasState {
+    fn default() -> Self {
+        Self::map()
+    }
 }
 
 impl CanvasState {
@@ -108,7 +138,7 @@ impl CanvasState {
             )],
             press_home: None,
             model: "Automatic Fallback".to_string(),
-            composer: String::new(),
+            edit: rune::TextEdit::new(""),
             outbox: Vec::new(),
         }
     }
@@ -318,14 +348,17 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
             .w(640.0)
             .child(super::composer::composer_card(
                 &s.model,
-                &s.composer,
+                &s.edit,
+                |s: &mut CanvasState| &mut s.edit,
                 |s: &mut CanvasState| {
-                    let prompt = s.composer.trim().to_string();
+                    let prompt = s.edit.text.trim().to_string();
                     if prompt.is_empty() {
                         return;
                     }
                     s.outbox.push(prompt);
-                    s.composer.clear();
+                    s.edit.text.clear();
+                    s.edit.anchor = 0;
+                    s.edit.focus = 0;
                 },
             )),
     );

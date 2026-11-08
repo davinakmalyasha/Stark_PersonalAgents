@@ -1,0 +1,17 @@
+[package]
+name = "stark-rune-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stark-rune"
+path = "src/main.rs"
+
+[dependencies]
+stark-theme = { path = "../stark-theme" }
+stark-kit = { path = "../stark-kit" }
+
+# Real Rune integration (requires network). Pinned `dev` rev; `dev` is never
+# rewritten upstream. Uncomment when online:
+# rune = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }

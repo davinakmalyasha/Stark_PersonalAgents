@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stark-theme",
+    "crates/stark-kit",
+    "crates/stark-rune-app",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { FolderPlus, Minus, Plus, RotateCcw, Scan } from 'lucide-react';
-import type { ChatSummary, GroupProjectRow, SessionTab, WorkspaceInfo } from '../types';
+import { Minus, Plus, RotateCcw, Scan } from 'lucide-react';
+import type { ChatMessage, ChatPreviewMessage, ChatSummary, GroupProjectRow, SessionTab, WorkspaceInfo } from '../types';
 import type { BoardAgent } from '../types/board.types';
 import CanvasAddMenu from './CanvasAddMenu';
 import type { AddAddonEntry, AddChatEntry } from './CanvasAddMenu';
@@ -33,6 +33,9 @@ interface Props {
   onOpenGroup?: (projectId: string) => void;
   onOpenAddon?: (workspaceId: string, addonId: CanvasAddonId, chatId?: string) => void;
   onSendToChat?: (workspaceId: string, chatId: string, text: string, files?: File[]) => Promise<void> | void;
+  onRewindMessage?: (workspaceId: string, chatId: string, message: ChatPreviewMessage) => Promise<void> | void;
+  /** Live thread messages keyed by `workspaceId:chatId` for mini-chat cards. */
+  liveMessages?: Record<string, ChatMessage[]>;
   /** Open top-bar tabs; when present they are auto-added as map roots. */
   tabs?: SessionTab[];
   runningTabId?: string | null;
@@ -76,14 +79,13 @@ function sizesEqual(left: Record<string, CardSize>, right: Record<string, CardSi
 export default function CanvasStage({
   scope, workspaces, chatsByWs, activeWorkspaceId, activeChatId,
   agents, isRunning, elapsed, projects = [],
-  onOpenChat, onOpenGroup, onOpenAddon, onSendToChat,
-  tabs, runningTabId, variant = 'background', usage, toolCalls,
+  onOpenChat, onOpenGroup, onOpenAddon, onSendToChat, onRewindMessage, liveMessages,
+  tabs, runningTabId, variant = 'background',
   onCloseTab,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [items, setItems] = useState<CanvasItem[]>(() => loadItems(scope));
   const [view, setView] = useState<CanvasView>(() => loadView(scope));
-  const [expanded, setExpanded] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [addAnchor, setAddAnchor] = useState<{ left: number; top: number } | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
@@ -221,7 +223,7 @@ export default function CanvasStage({
   }, [graph, tabs, commitItems]);
 
   // Measure real card boxes so connectors always meet the border, including
-  // when a card is expanded or a streaming task wraps to a second line.
+  // when a streaming task wraps to a second line.
   useEffect(() => {
     const root = containerRef.current;
     if (!root) return;
@@ -240,13 +242,14 @@ export default function CanvasStage({
       frame = window.requestAnimationFrame(measure);
     };
     const observer = new ResizeObserver(schedule);
+
     root.querySelectorAll<HTMLElement>('[data-canvas-card]').forEach((el) => observer.observe(el));
     schedule();
     return () => {
       window.cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [items, expanded, variant]);
+  }, [items, variant]);
 
   const addonEntries = useMemo<AddAddonEntry[]>(() => {
     // Workspace scope always offers its addon. In the main canvas, addons are
@@ -281,7 +284,7 @@ export default function CanvasStage({
     let x: number;
     let y: number;
     if (at) {
-      x = at.x - 140;
+      x = at.x - 234;
       y = at.y - 60;
     } else {
       // New cards land in the visible top-left area, never under the floating
@@ -289,7 +292,7 @@ export default function CanvasStage({
       const current = viewRef.current;
       const n = itemsRef.current.length;
       const screenX = 10;
-      const screenY = 76 + n * 190;
+      const screenY = 78 + n * 430;
       x = (screenX - current.x) / current.scale;
       y = (screenY - current.y) / current.scale;
     }
@@ -300,8 +303,7 @@ export default function CanvasStage({
 
   const removeItem = useCallback((id: string) => {
     commitItems(itemsRef.current.filter((item) => item.id !== id));
-    if (expanded === id) setExpanded(null);
-  }, [commitItems, expanded]);
+  }, [commitItems]);
 
   const openItem = useCallback((item: CanvasItem) => {
     if (item.kind === 'chat') {
@@ -431,11 +433,7 @@ export default function CanvasStage({
         saveItems(scope, itemsRef.current);
       } else {
         const item = itemsRef.current.find((candidate) => candidate.id === interaction.id);
-        if (item?.kind === 'chat') {
-          setExpanded((cur) => (cur === item.id ? null : item.id));
-        } else if (item) {
-          openItem(item);
-        }
+        if (item && item.kind !== 'chat') openItem(item);
       }
     }
     containerRef.current?.releasePointerCapture(e.pointerId);
@@ -481,7 +479,10 @@ export default function CanvasStage({
     let maxX = -Infinity;
     let maxY = -Infinity;
     for (const item of itemsRef.current) {
-      const size = sizes[item.id] || { w: item.kind === 'chat' && (item.depth || 0) > 0 ? 282 : 326, h: expanded === item.id ? 420 : 210 };
+      const size = sizes[item.id] || {
+        w: item.kind === 'chat' && (item.depth || 0) > 0 ? 384 : 468,
+        h: item.kind === 'chat' && (item.depth || 0) > 0 ? 392 : 420,
+      };
       minX = Math.min(minX, item.x);
       minY = Math.min(minY, item.y);
       maxX = Math.max(maxX, item.x + size.w);
@@ -504,7 +505,28 @@ export default function CanvasStage({
       x: rect.width / 2 - centerX * scale,
       y: paddingTop + (rect.height - paddingTop - paddingBottom) / 2 - centerY * scale,
     }, true);
-  }, [sizes, expanded, variant, commitView]);
+  }, [sizes, variant, commitView]);
+
+  const focusChat = useCallback((workspaceId: string, chatId: string) => {
+    const target = itemsRef.current.find(
+      (item) => item.kind === 'chat' && item.workspaceId === workspaceId && item.chatId === chatId,
+    );
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (target && rect) {
+      const child = target.kind === 'chat' && (target.depth || 0) > 0;
+      const size = sizes[target.id] || {
+        w: child ? 384 : 468,
+        h: child ? 392 : 420,
+      };
+      const scale = clamp(viewRef.current.scale, 0.65, 1.15);
+      commitView({
+        scale,
+        x: rect.width / 2 - (target.x + size.w / 2) * scale,
+        y: rect.height / 2 - (target.y + size.h / 2) * scale,
+      }, true);
+    }
+    onOpenChat?.(workspaceId, chatId);
+  }, [sizes, commitView, onOpenChat]);
 
   const relayout = useCallback(() => {
     const layout = new Map(graph.items.map((item) => [item.id, item]));
@@ -522,8 +544,6 @@ export default function CanvasStage({
     fittedRef.current = true;
     fitView();
   }, [variant, items.length, fitView]);
-
-  const totalTokens = (usage?.input || 0) + (usage?.output || 0);
 
   return (
     <div
@@ -546,8 +566,8 @@ export default function CanvasStage({
       >
         <svg className="canvas-edges" aria-hidden="true">
           {edges.map(({ parent, child }) => {
-            const parentSize = sizes[parent.id] || { w: (parent.kind === 'chat' && (parent.depth || 0) > 0) ? 282 : 326, h: 210 };
-            const childSize = sizes[child.id] || { w: (child.kind === 'chat' && (child.depth || 0) > 0) ? 282 : 326, h: 210 };
+            const parentSize = sizes[parent.id] || { w: (parent.kind === 'chat' && (parent.depth || 0) > 0) ? 384 : 468, h: 400 };
+            const childSize = sizes[child.id] || { w: (child.kind === 'chat' && (child.depth || 0) > 0) ? 384 : 468, h: 400 };
             const sx = parent.x + parentSize.w / 2;
             const sy = parent.y + parentSize.h;
             const tx = child.x + childSize.w / 2;
@@ -585,7 +605,7 @@ export default function CanvasStage({
               style={{
                 left: item.x,
                 top: item.y,
-                zIndex: interaction?.type === 'item' && interaction.id === item.id ? 50 : expanded === item.id ? 40 : index + 1,
+                zIndex: interaction?.type === 'item' && interaction.id === item.id ? 50 : index + 1,
                 animationDelay: `${Math.min(index, 10) * 34}ms`,
               }}
             >
@@ -597,24 +617,23 @@ export default function CanvasStage({
                 agents={activeChat ? agents : []}
                 running={running}
                 elapsed={activeChat && running ? elapsed : undefined}
-                expanded={expanded === item.id}
-                onToggleExpanded={() => setExpanded((cur) => (cur === item.id ? null : item.id))}
                 onOpen={() => openItem(item)}
                 onRemove={() => removeItem(item.id)}
                 onSend={item.kind === 'chat' && onSendToChat
                   ? (text, files) => onSendToChat(item.workspaceId, item.chatId, text, files)
                   : undefined}
+                onRewind={item.kind === 'chat' && onRewindMessage
+                  ? (message) => onRewindMessage(item.workspaceId, item.chatId, message)
+                  : undefined}
+                liveMessages={item.kind === 'chat' ? liveMessages?.[`${item.workspaceId}:${item.chatId}`] : undefined}
                 compact={item.kind === 'chat' && (item.depth || 0) > 0}
                 isActive={activeChat}
                 childChats={childChats}
                 hiddenChildren={item.kind === 'chat' ? item.hiddenChildren : 0}
-                onOpenChild={(wsId, chatId) => onOpenChat?.(wsId, chatId)}
+                onOpenChild={(wsId, chatId) => focusChat(wsId, chatId)}
                 onCloseTab={item.kind === 'chat' && item.auto && item.isTab && onCloseTab
                   ? () => onCloseTab(`${item.workspaceId}:${item.chatId}`)
                   : undefined}
-                tokens={activeChat ? totalTokens : undefined}
-                cost={activeChat ? usage?.cost : undefined}
-                toolCalls={activeChat ? toolCalls : undefined}
               />
             </div>
           );
@@ -624,7 +643,6 @@ export default function CanvasStage({
       {variant === 'map' && (
         <div data-canvas-ui className="canvas-map-head">
           <div className="canvas-map-controls">
-            <button type="button" onClick={openAddMenu} title="Add to canvas" aria-label="Add to canvas"><FolderPlus size={13} /></button>
             <button type="button" onClick={() => zoomBy(0.86)} title="Zoom out" aria-label="Zoom out"><Minus size={13} /></button>
             <button type="button" onClick={() => zoomBy(1.16)} title="Zoom in" aria-label="Zoom in"><Plus size={13} /></button>
             <button type="button" onClick={fitView} title="Fit to view" aria-label="Fit to view"><Scan size={13} /></button>
@@ -633,7 +651,7 @@ export default function CanvasStage({
         </div>
       )}
 
-      {variant !== 'map' && items.length > 0 && (
+      {items.length > 0 && (
         <button
           type="button"
           data-canvas-ui

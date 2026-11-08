@@ -269,7 +269,12 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
   }, []);
 
   const handleRewind = useCallback(async (message: ChatMessage) => {
-    if (!generalWs || !activeChatId || isRunning) return;
+    if (!generalWs || !activeChatId) return;
+    // If the run is still live, detach this client first so its completion
+    // handler cannot re-persist a partial reply after the server truncates.
+    abortRef.current?.abort();
+    resetStream();
+    setIsRunning(false);
     const restoredAttachments = Array.isArray(message.metadata?.attachments)
       ? message.metadata.attachments as ChatAttachment[]
       : [];
@@ -289,7 +294,7 @@ export function useChat({ onActive, pinnedChatTitle, workspaceKind: _workspaceKi
     } catch (e) {
       setNotification(e instanceof Error ? e.message : 'Rewind failed.');
     }
-  }, [generalWs, activeChatId, isRunning, refreshList]);
+  }, [generalWs, activeChatId, refreshList, resetStream]);
 
   const handleSend = useCallback(async (prompt: string, files: File[], restoredAttachments: ChatAttachment[] = []) => {
     if (isRunning || sendInFlightRef.current) return;

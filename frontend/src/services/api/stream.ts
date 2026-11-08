@@ -39,8 +39,10 @@ export async function submitAskAnswers(batchId: string, answers: AskAnswer[]): P
   }
 }
 
-export async function fetchActiveRun(): Promise<ActiveRun> {  try {
-    const res = await fetch(`${API_BASE}/runs/active`);
+export async function fetchActiveRun(chatId?: string): Promise<ActiveRun> {
+  try {
+    const suffix = chatId ? `?chat_id=${encodeURIComponent(chatId)}` : '';
+    const res = await fetch(`${API_BASE}/runs/active${suffix}`);
     if (!res.ok) return { running: false, workspace_path: '', chat_id: '', started_at: '' };
     return await res.json();
   } catch {

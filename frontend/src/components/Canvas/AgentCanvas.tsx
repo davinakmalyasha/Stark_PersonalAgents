@@ -7,7 +7,7 @@ import { kindForWorkspace, sendCanvasChat } from '../../canvas/canvasSend';
 import SubagentSessionView from '../../house/SubagentSessionView';
 import ChatView from '../Workspace/ChatView';
 import type { AppState, ChatAttachment, ChatMessage, ChatSummary, ModelOption, WorkspaceInfo } from '../../types';
-import { fetchChats } from '../../services/api';
+import { fetchChat, fetchChats, rewindChat } from '../../services/api';
 
 const CanvasStage = lazy(() => import('../../canvas/CanvasStage'));
 
@@ -117,6 +117,9 @@ export default function AgentCanvas(props: Props) {
             agents={agents}
             isRunning={props.isRunning}
             projects={projects}
+            liveMessages={props.isRunning && props.workspaceId && props.chatId
+              ? { [`${props.workspaceId}:${props.chatId}`]: props.messages }
+              : undefined}
             onOpenChat={(wsId, chatId) => props.onOpenChat?.(wsId, chatId)}
             onOpenGroup={setOpenGroupId}
             onOpenAddon={(_wsId, addonId) => props.onOpenAddon?.(addonId)}
@@ -128,6 +131,24 @@ export default function AgentCanvas(props: Props) {
               }
               await sendCanvasChat(workspace, chatId, text, [], kindForWorkspace(workspace));
               fetchChats(props.workspaceId!).then(setWorkspaceChats).catch(() => {});
+            }}
+            onRewindMessage={async (wsId, chatId, message) => {
+              if (chatId === props.chatId && props.onRewind) {
+                try {
+                  const full = await fetchChat(wsId, chatId);
+                  const target = full.messages.find((candidate) => candidate.id === message.id);
+                  if (target) {
+                    props.onRewind(target);
+                    return;
+                  }
+                } catch {
+                  /* fall through to the direct rewind */
+                }
+              }
+              await rewindChat(wsId, chatId, message.id);
+              if (props.workspaceId) {
+                fetchChats(props.workspaceId).then(setWorkspaceChats).catch(() => {});
+              }
             }}
           />
         </Suspense>

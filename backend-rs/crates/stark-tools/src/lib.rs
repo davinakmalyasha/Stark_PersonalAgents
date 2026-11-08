@@ -25,6 +25,7 @@ mod questions;
 mod read;
 mod screen;
 mod skills;
+mod truncate;
 mod verify;
 
 use std::collections::BTreeMap;

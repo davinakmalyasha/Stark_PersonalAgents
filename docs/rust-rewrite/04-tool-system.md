@@ -112,8 +112,15 @@ isolation or read-only subagent default.
 
 ## 6. Output handling
 
-- Large outputs are truncated with a `[PARTIAL ...]` note and a resume hint
-  (`read_file(offset=…)`, narrower `search_code`).
+- Tool results follow Pi-class budgets (50KB / 2000 lines, lines never split)
+  with Codex-class markers: head + tail plus exact omitted counts. Truncation
+  fires only when output is genuinely large, so the agent never loses the log
+  lines or guardrails it needs.
+- Truncated browser/MCP/shell output is spilled to
+  `.deep_agents/scratch/` and the marker points at the file with an
+  offset/limit resume hint.
+- Shell takes Codex's per-call `max_output_tokens` (~4 chars/token) over a
+  generous ~25k-token default; failures live at the tail, which is always kept.
 - Secrets are redacted before stage-1 memory capture.
 - Line endings tolerated (CRLF/LF) in patches.
 

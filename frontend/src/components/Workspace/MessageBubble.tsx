@@ -608,12 +608,14 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
             </div>
           )}
 
-          {/* P10: per-message usage chip (tokens + cost for this run) */}
+          {/* Per-message usage chip (tokens + local time; cost stays in stats). */}
           {!!usageMeta && !streamingActive && (
             <div className="agent-message-footer flex items-center gap-3 mt-2 text-[10.5px] font-mono text-zinc-600">
               <span title="Input tokens">↑{((usageMeta.total_input_tokens) || 0).toLocaleString()}</span>
               <span title="Output tokens">↓{((usageMeta.total_output_tokens) || 0).toLocaleString()}</span>
-              <span title="Cost">${((usageMeta.total_cost) || 0).toFixed(5)}</span>
+              <span title="Time">
+                {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </span>
               {message.duration && <span title="Duration">{message.duration}</span>}
             </div>
           )}

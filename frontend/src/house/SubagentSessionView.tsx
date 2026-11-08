@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, ChevronDown, ChevronRight, LoaderCircle, Wrench } from 'lucide-react';
-import type { ChatData, SessionTab, SubagentSession, SubagentSessionEntry, WorkspaceInfo } from '../types';
-import { fetchChat, fetchSubagentSession, fetchWorkspaces } from '../services/api';
+import type { ChatAttachment, ChatData, ChatMessage, SessionTab, SubagentSession, SubagentSessionEntry, WorkspaceInfo } from '../types';
+import { abortRun, fetchActiveRun, fetchChat, fetchSubagentSession, fetchWorkspaces, rewindChat } from '../services/api';
 import MessageStream from '../components/Workspace/MessageStream';
 import Markdown from '../components/Workspace/Markdown';
 import PromptDock from '../components/Workspace/PromptDock';
+import { AttachmentDropProvider, FileDropSurface } from '../components/Workspace/AttachmentDrop';
 import { useSessionRunner } from './useSessionRunner';
+import { usePipeline } from '../hooks/usePipeline';
+import { parseLogToSteps } from '../utils/logParser';
 import './house.css';
 
 const POLL_MS = 2500;
@@ -38,11 +41,11 @@ function ToolRow({ entry }: { entry: SubagentSessionEntry }) {
         <span className={`grid place-items-center w-4 h-4 rounded ${entry.isError ? 'text-red-400' : 'text-zinc-500'}`}>
           <Wrench size={10} />
         </span>
-        <span className="text-[11.5px] font-medium text-zinc-400 shrink-0">{entry.toolName || 'tool'}</span>
-        <span className="text-[11px] text-zinc-600 truncate flex-1">{firstLine}</span>
+        <span className="text-[13px] font-medium text-zinc-400 shrink-0">{entry.toolName || 'tool'}</span>
+        <span className="text-[12.5px] text-zinc-600 truncate flex-1">{firstLine}</span>
       </button>
       {open && (
-        <pre className="px-3 py-2 text-[11px] leading-5 text-zinc-400 whitespace-pre-wrap max-h-56 overflow-y-auto border-t border-white/[0.05] font-mono">
+        <pre className="px-3 py-2 text-[12.5px] leading-5 text-zinc-400 whitespace-pre-wrap max-h-56 overflow-y-auto border-t border-white/[0.05] font-mono">
           {entry.content}
         </pre>
       )}
@@ -101,6 +104,8 @@ export default function SubagentSessionView({
   const [legacySession, setLegacySession] = useState<SubagentSession | null>(null);
   const [loadedKey, setLoadedKey] = useState('');
   const [errorKey, setErrorKey] = useState('');
+  const [childDraft, setChildDraft] = useState('');
+  const [childDraftAttachments, setChildDraftAttachments] = useState<ChatAttachment[]>([]);
   const requestKey = `${workspaceId}:${childId}`;
 
   const resolvedWorkspace = useMemo(() => {
@@ -179,24 +184,76 @@ export default function SubagentSessionView({
   }, [childChat, loadedKey, requestKey, resolvedWorkspace, childId, label]);
 
   const runner = useSessionRunner(childTab, undefined, childTab ? pipelineKindFor(resolvedWorkspace!) : 'general');
+  // A delegated child run starts on the backend (parent agent), not through
+  // this drawer's runner. Mirror its live SSE stream so reasoning and tool
+  // calls render while it works instead of waiting for the persisted reply.
+  const mirror = usePipeline();
+  const {
+    attachMirror, cancel: cancelMirror, isRunning: mirrorRunning,
+    state: mirrorState, streaming: mirrorStreaming,
+  } = mirror;
+  useEffect(() => () => cancelMirror(), [childTab?.chatId, cancelMirror]);
+  useEffect(() => {
+    if (!childTab || runner.isRunning || mirrorRunning) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled || document.hidden) return;
+      const active = await fetchActiveRun(childTab.chatId).catch(() => null);
+      if (!cancelled && active?.running && active.chat_id === childTab.chatId) {
+        attachMirror(childTab.chatId);
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 2200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [childTab, runner.isRunning, mirrorRunning, attachMirror]);
+
   const activeChildChat = loadedKey === requestKey ? childChat : null;
   const activeLegacySession = loadedKey === requestKey ? legacySession : null;
+  const mirrorLive = useMemo<ChatMessage | null>(() => {
+    if (!mirrorRunning) return null;
+    const { steps } = parseLogToSteps(mirrorState?.live_terminal_log || '');
+    return {
+      id: 'subagent-mirror-live',
+      role: 'agent',
+      agentName: mirrorStreaming.agent || undefined,
+      content: mirrorStreaming.text || mirrorState?.outputs?.agent_report || '',
+      timestamp: new Date().toISOString(),
+      duration: 'active',
+      metadata: {
+        isTrace: true,
+        duration: 'active',
+        steps,
+        isStreaming: mirrorStreaming.active,
+        streamingReasoning: mirrorStreaming.reasoning,
+        streamRate: mirrorStreaming.rate,
+        liveStatus: mirrorStreaming.status,
+        liveTimeline: mirrorStreaming.segments,
+      },
+    };
+  }, [mirrorRunning, mirrorState, mirrorStreaming]);
+
   // Full parity: merge persisted + runner messages (dedup by id) instead of
   // XOR-switching, so previous replies never vanish mid-run and rapid sends
   // never collapse into one bubble.
   const childMessages = (() => {
     const persisted = activeChildChat?.messages || [];
     const live = runner.messages;
-    if (!live.length && !runner.isRunning) return persisted;
-    if (!persisted.length) return live;
-    const seen = new Set(persisted.map((m) => m.id));
-    // Runner's first items may duplicate persisted when seeded after key switch.
-    const fresh = live.filter((m) => !seen.has(m.id));
-    // If runner already contains full history (post-fetch), prefer it.
-    if (!fresh.length && live.length >= persisted.length) return live;
-    return [...persisted, ...fresh];
+    const merged = (() => {
+      if (!live.length && !runner.isRunning) return persisted;
+      if (!persisted.length) return live;
+      const seen = new Set(persisted.map((m) => m.id));
+      const fresh = live.filter((m) => !seen.has(m.id));
+      if (!fresh.length && live.length >= persisted.length) return live;
+      return [...persisted, ...fresh];
+    })();
+    if (!mirrorLive) return merged;
+    return [...merged.filter((message) => message.id !== 'subagent-mirror-live'), mirrorLive];
   })();
-  const running = runner.isRunning || activeLegacySession?.info.status === 'running';
+  const running = runner.isRunning || mirrorRunning || activeLegacySession?.info.status === 'running';
   const childName = activeChildChat?.title || activeLegacySession?.info.name || label || 'Subagent';
   const displayLabel = childName && childName !== label ? childName : (label || childName);
   const isLoading = loadedKey !== requestKey && !errorKey;
@@ -206,8 +263,29 @@ export default function SubagentSessionView({
     if (childTab) runner.send(childTab, prompt, files);
   }, [childTab, runner]);
 
+  const handleCancel = useCallback(() => {
+    if (runner.isRunning) {
+      runner.cancel();
+      return;
+    }
+    if (mirrorRunning && childTab) void abortRun(childTab.chatId);
+  }, [runner, mirrorRunning, childTab]);
+
+  const handleRewind = useCallback(async (message: ChatMessage) => {
+    if (!childTab) return;
+    const restored = Array.isArray(message.metadata?.attachments)
+      ? message.metadata.attachments as ChatAttachment[]
+      : [];
+    const result = await rewindChat(childTab.workspaceId, childTab.chatId, message.id);
+    setChildDraft(result.prompt || '');
+    setChildDraftAttachments(restored);
+    await loadChild();
+    await runner.refresh();
+  }, [childTab, loadChild, runner]);
+
   return (
-    <div className="subagent-session-view">
+    <AttachmentDropProvider>
+    <FileDropSurface className="subagent-session-view">
       {!hideHeader && <header className="subagent-session-view-header">
         <button
           type="button"
@@ -246,6 +324,7 @@ export default function SubagentSessionView({
             onOpenSubagentSession={onOpenSubagentSession}
             workspaceId={childTab.workspaceId}
             chatId={childTab.chatId}
+            onRewind={handleRewind}
             onRetry={(prompt) => { if (prompt) runner.send(childTab, prompt, []); }}
           />
         ) : activeLegacySession ? (
@@ -284,8 +363,8 @@ export default function SubagentSessionView({
         {childTab ? (
           <PromptDock
             onSend={handleSend}
-            onCancel={runner.cancel}
-            isRunning={runner.isRunning}
+            onCancel={handleCancel}
+            isRunning={running}
             isVoiceMode={false}
             onToggleVoice={() => {}}
             voiceInputText=""
@@ -295,11 +374,18 @@ export default function SubagentSessionView({
             totalOutput={runner.usage.total_output_tokens}
             totalCacheHitTokens={runner.usage.total_cache_hit_tokens || 0}
             activeContextTokens={runner.activeContextTokens}
+            workspaceId={childTab.workspaceId}
+            chatId={childTab.chatId}
+            draft={childDraft}
+            draftAttachments={childDraftAttachments}
+            onDraftConsumed={() => setChildDraft('')}
+            onDraftAttachmentsConsumed={() => setChildDraftAttachments([])}
           />
         ) : activeLegacySession ? (
           <div className="subagent-session-legacy-dock">This older child session is read-only.</div>
         ) : null}
       </div>
-    </div>
+    </FileDropSurface>
+    </AttachmentDropProvider>
   );
 }

@@ -2157,7 +2157,11 @@ async fn stream_handler(
     let replay_events: Vec<Result<Event, Infallible>> = replay_after(&state, &chat_id, &headers)
         .await
         .unwrap_or_default();
-    if let Some(receiver) = state.runs.subscribe(&chat_id) {
+    if let Some(receiver) = state
+        .runs
+        .subscribe(&chat_id)
+        .or_else(|| stark_core::subscribe_child_run(&chat_id))
+    {
         let head = stream::iter(
             std::iter::once(Ok(hello))
                 .chain(replay_events)
@@ -2200,10 +2204,67 @@ async fn replay_after(
         .filter(|line| line.ordinal.unwrap_or(0) > last)
     {
         let ordinal = line.ordinal.unwrap_or(0).to_string();
-        let (event, data) = rollout_event(&line);
-        out.push(Ok(Event::default().event(event).id(ordinal).data(data)));
+        for (event, data) in rollout_events(&line) {
+            out.push(Ok(Event::default()
+                .event(event)
+                .id(ordinal.clone())
+                .data(data)));
+        }
     }
     Ok(out)
+}
+
+/// Codex App Server lifecycle: response items replay as `item_started` /
+/// `item_completed` in addition to the legacy `delta` frames, so a
+/// reconnecting client can rebuild streaming items without the full log.
+fn rollout_events(line: &stark_store::rollout::RolloutLine) -> Vec<(&'static str, String)> {
+    let (event, data) = rollout_event(line);
+    let mut events = vec![(event, data)];
+    use stark_store::rollout::{ResponseItemPayload, RolloutItem};
+    if let RolloutItem::ResponseItem { payload, .. } = &line.item {
+        match payload {
+            ResponseItemPayload::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                events.push((
+                    "item_started",
+                    json!({"kind": "tool_started", "tool": name, "id": call_id, "args": arguments})
+                        .to_string(),
+                ));
+            }
+            ResponseItemPayload::FunctionCallOutput {
+                call_id,
+                name,
+                output,
+                is_error,
+            } => {
+                events.push((
+                    "item_completed",
+                    json!({"kind": "tool_finished", "tool": name, "id": call_id, "ok": !is_error, "preview": output.chars().take(300).collect::<String>()}).to_string(),
+                ));
+            }
+            ResponseItemPayload::Message { role, content, .. } => {
+                let text = match content {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                events.push((
+                    "item_completed",
+                    json!({"kind": "text", "role": role, "text": text}).to_string(),
+                ));
+            }
+            ResponseItemPayload::Reasoning { summary, .. } => {
+                events.push((
+                    "item_completed",
+                    json!({"kind": "reasoning", "text": summary.first().map(|entry| entry.text.clone()).unwrap_or_default()}).to_string(),
+                ));
+            }
+        }
+    }
+    events
 }
 
 fn rollout_event(line: &stark_store::rollout::RolloutLine) -> (&'static str, String) {
@@ -2275,7 +2336,9 @@ async fn abort_handler(
     State(state): State<ServerState>,
     Json(request): Json<ChatRequest>,
 ) -> Json<Value> {
-    Json(json!({"ok": state.runs.cancel(&request.chat_id)}))
+    let top = state.runs.cancel(&request.chat_id);
+    let child = stark_core::cancel_child_run(&request.chat_id);
+    Json(json!({"ok": top || child}))
 }
 
 async fn health_handler() -> Json<Value> {
@@ -2294,6 +2357,13 @@ async fn state_handler(
     let mut value = state
         .runs
         .state(query.chat_id.as_deref())
+        .or_else(|| {
+            query
+                .chat_id
+                .as_deref()
+                .and_then(stark_core::child_run_state)
+                .and_then(|state| serde_json::to_value(state).ok())
+        })
         .unwrap_or_else(|| serde_json::to_value(AppState::default()).unwrap_or(Value::Null));
     hydrate_plan(&state.harness_root, &mut value, query.chat_id.as_deref()).await;
     Json(value)
@@ -2338,7 +2408,19 @@ async fn active_handler(
     Query(query): Query<ActiveQuery>,
 ) -> Json<Value> {
     let _ = query.workspace_path;
-    Json(state.runs.active(query.chat_id.as_deref()))
+    let mut active = state.runs.active(query.chat_id.as_deref());
+    if !active["running"].as_bool().unwrap_or(false)
+        && let Some(chat_id) = query.chat_id.as_deref()
+        && let Some(started_at) = stark_core::child_run_started_at(chat_id)
+    {
+        active = json!({
+            "running": true,
+            "workspace_path": "",
+            "chat_id": chat_id,
+            "started_at": started_at,
+        });
+    }
+    Json(active)
 }
 
 async fn agents_handler(State(state): State<ServerState>) -> Json<Value> {
@@ -3636,7 +3718,10 @@ async fn chats_handler(
     let mut chats = state.store.list_chats(&workspace_id).await;
     for chat in &mut chats {
         let chat_id = chat["id"].as_str().unwrap_or_default();
-        let status = chat_run_status(chat, state.runs.is_running(chat_id));
+        let status = chat_run_status(
+            chat,
+            state.runs.is_running(chat_id) || stark_core::child_run_active(chat_id),
+        );
         chat["status"] = Value::String(status.to_string());
     }
     Ok(Json(json!({"chats": chats})))
@@ -3681,6 +3766,7 @@ async fn chat_handler(
             // not settle. New chats have no turns, running chats are skipped
             // by checking the live run registry first.
             if state.runs.subscribe(&chat_id).is_none()
+                && !stark_core::child_run_active(&chat_id)
                 && let Some(path) =
                     stark_store::rollout::find_rollout(&state.harness_root, &chat_id)
             {
@@ -5084,11 +5170,25 @@ async fn rewind_chat_handler(
     if request.message_id.is_empty() {
         return Err(bad_request("message_id is required"));
     }
-    if state.runs.is_running(&chat_id) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": "This chat is still running. Stop it before rewinding."})),
-        ));
+    // Rewinding is allowed while a run is active: stop it first, give the
+    // run task a moment to persist its aborted tail, then truncate. The wait
+    // prevents the aborted marker from landing after the rewind and making
+    // the message reappear.
+    if state.runs.is_running(&chat_id) || stark_core::child_run_active(&chat_id) {
+        state.runs.cancel(&chat_id);
+        stark_core::cancel_child_run(&chat_id);
+        for _ in 0..40 {
+            if !state.runs.is_running(&chat_id) && !stark_core::child_run_active(&chat_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if state.runs.is_running(&chat_id) || stark_core::child_run_active(&chat_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "This chat is still stopping. Try again in a moment."})),
+            ));
+        }
     }
     let Some(removed_messages) = state
         .store

@@ -1,8 +1,10 @@
 import type { CanvasItem, CanvasScope, CanvasView } from './canvasTypes';
 import { DEFAULT_VIEW } from './canvasTypes';
 
-const ITEMS_PREFIX = 'stark.canvas.items.v2:';
-const VIEW_PREFIX = 'stark.canvas.view.v2:';
+// v3: the conversation card grew from 326/282 to 468/384, so persisted
+// positions from v2 would overlap. Start from a clean tidy layout once.
+const ITEMS_PREFIX = 'stark.canvas.items.v3:';
+const VIEW_PREFIX = 'stark.canvas.view.v3:';
 
 function safeParse<T>(raw: string | null): T | null {
   if (!raw) return null;

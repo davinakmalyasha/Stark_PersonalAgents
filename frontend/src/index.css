@@ -360,10 +360,10 @@ html, body, #root {
 .activity-event-kind { flex:none; color:#e0e1e5; font-size:10px; font-weight:700; letter-spacing:.055em; text-transform:uppercase; }
 .activity-event-title { flex:none; color:#c8cad0; font-weight:600; }
 .activity-event-agent { overflow:hidden; color:#888b95; font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
-.activity-event-subject { min-width:0; overflow:hidden; color:#969aa4; font:500 10.5px/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+.activity-event-subject { min-width:0; overflow:hidden; color:#969aa4; font:500 13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
 .activity-event-status { display:grid; place-items:center; flex:none; margin-left:auto; color:#b8bdc4; }
 .activity-event-status.is-error { color:#d39ba4; }
-.activity-event-duration { flex:none; color:#747781; font:10px ui-monospace,SFMono-Regular,Consolas,monospace; }
+.activity-event-duration { flex:none; color:#747781; font:11px ui-monospace,SFMono-Regular,Consolas,monospace; }
 .activity-event-copy { margin:4px 0 0 19px; max-height:150px; overflow:auto; color:#aeb1b8; font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; }
 .activity-agent-link { display:block; max-width:100%; margin:5px 0 0 19px; padding:4px 7px; overflow:hidden; border:1px solid rgba(255,255,255,.08); border-radius:6px; background:rgba(255,255,255,.035); color:#c7c9d0; font-size:10.5px; text-align:left; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
 .activity-agent-link:hover { border-color:rgba(255,255,255,.18); background:rgba(255,255,255,.07); color:#f2f2f4; }
@@ -411,15 +411,15 @@ html, body, #root {
 .retry-status-track span.is-filled { background:rgba(255,255,255,.72); box-shadow:0 0 7px rgba(255,255,255,.28); animation:retry-glow 1.4s ease-in-out infinite; }
 
 .activity-tool-group { min-width:0; }
-.activity-tool-group-header { display:flex; align-items:center; gap:7px; width:100%; min-width:0; padding:6px 7px; border:0; border-radius:7px; background:transparent; color:#b9bbc2; font:inherit; font-size:12px; text-align:left; cursor:pointer; transition:background .18s ease,color .18s ease; }
+.activity-tool-group-header { display:flex; align-items:center; gap:7px; width:100%; min-width:0; padding:7px 7px; border:0; border-radius:7px; background:transparent; color:#b9bbc2; font:inherit; font-size:15px; line-height:1.45; text-align:left; cursor:pointer; transition:background .18s ease,color .18s ease; }
 .activity-tool-group-header:hover { background:rgba(255,255,255,.045); color:#ededf0; }
 .activity-tool-group-header:focus-visible { outline:1px solid rgba(210,211,218,.7); outline-offset:2px; }
 .activity-tool-group-icon { display:grid; place-items:center; flex:none; color:#aeb1b9; }
-.activity-tool-group-title { min-width:0; overflow:hidden; color:#d3d4d9; font-size:12px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
-.activity-tool-group-count { flex:none; color:#777b85; font-size:10px; }
+.activity-tool-group-title { min-width:0; overflow:hidden; color:#d3d4d9; font-size:15px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.activity-tool-group-count { flex:none; color:#777b85; font-size:11px; }
 .activity-tool-group-chevron { flex:none; margin-left:auto; color:#747781; }
 .activity-tool-group-body { display:flex; flex-direction:column; gap:2px; margin:1px 0 5px 13px; padding:2px 0 2px 14px; border-left:1px solid rgba(255,255,255,.11); }
-.activity-tool-detail { display:flex; align-items:center; flex-wrap:wrap; gap:6px; min-width:0; min-height:23px; padding:2px 5px; color:#aeb1b8; font-size:12px; line-height:1.35; }
+.activity-tool-detail { display:flex; align-items:center; flex-wrap:wrap; gap:6px; min-width:0; min-height:27px; padding:2px 5px; color:#aeb1b8; font-size:15px; line-height:1.4; }
 .activity-tool-detail-icon { display:grid; place-items:center; flex:none; color:#8f949e; }
 .activity-tool-detail-title { flex:none; color:#bfc1c8; font-weight:500; }
 .activity-tool-detail .activity-agent-link { flex-basis:100%; margin:1px 0 2px 19px; }
@@ -429,29 +429,29 @@ html, body, #root {
 @keyframes tool-panel-in { from { opacity:0; transform:translateY(-2px); } to { opacity:1; transform:translateY(0); } }
 .activity-tool-call { min-width:0; border-radius:8px; }
 .activity-tool-call.is-open { background:rgba(255,255,255,.017); }
-.activity-tool-call-row { display:flex; align-items:center; gap:6px; width:100%; min-width:0; min-height:25px; padding:3px 5px; border:0; border-radius:7px; background:transparent; color:#aeb1b8; font:inherit; font-size:12px; line-height:1.35; text-align:left; cursor:pointer; transition:background .16s ease,color .16s ease; }
+.activity-tool-call-row { display:flex; align-items:center; gap:7px; width:100%; min-width:0; min-height:31px; padding:4px 5px; border:0; border-radius:7px; background:transparent; color:#aeb1b8; font:inherit; font-size:15px; line-height:1.4; text-align:left; cursor:pointer; transition:background .16s ease,color .16s ease; }
 .activity-tool-call-row:hover { background:rgba(255,255,255,.045); color:#ededf0; }
 .activity-tool-call-row:focus-visible { outline:1px solid rgba(210,211,218,.65); outline-offset:1px; }
 .activity-tool-chevron { flex:none; color:#6f727b; transition:transform .16s ease,color .16s ease; }
 .activity-tool-call-row:hover .activity-tool-chevron { color:#c9cbd2; }
 .activity-tool-panel { margin:2px 0 7px 19px; overflow:hidden; border:1px solid rgba(255,255,255,.09); border-radius:9px; background:#0b0b0e; box-shadow:0 10px 30px rgba(0,0,0,.22); animation:tool-panel-in .18s cubic-bezier(.16,1,.3,1) both; }
 .activity-tool-panel-head { display:flex; align-items:center; gap:7px; min-height:29px; padding:5px 9px; border-bottom:1px solid rgba(255,255,255,.07); background:rgba(255,255,255,.025); }
-.activity-tool-panel-name { min-width:0; overflow:hidden; color:#c9cbd2; font:500 10.5px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
-.activity-tool-panel-status { flex:none; color:#898d96; font-size:9.5px; font-weight:650; letter-spacing:.04em; text-transform:uppercase; }
+.activity-tool-panel-name { min-width:0; overflow:hidden; color:#c9cbd2; font:500 13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+.activity-tool-panel-status { flex:none; color:#898d96; font-size:10.5px; font-weight:650; letter-spacing:.04em; text-transform:uppercase; }
 .activity-tool-panel-status.is-error { color:#d39ba4; }
 .activity-tool-copy { display:grid; place-items:center; flex:none; width:22px; height:22px; margin-left:auto; border:0; border-radius:5px; background:transparent; color:#777b85; cursor:pointer; }
 .activity-tool-copy:hover { background:rgba(255,255,255,.07); color:#e4e5e8; }
 .activity-tool-command { display:flex; align-items:flex-start; gap:7px; padding:8px 10px; border-bottom:1px solid rgba(255,255,255,.06); background:rgba(255,255,255,.018); }
 .activity-tool-prompt { flex:none; color:#6f727b; font:500 11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
-.activity-tool-command code { min-width:0; color:#dfe0e4; font:500 11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-.activity-tool-output { max-height:300px; margin:0; padding:9px 10px; overflow:auto; color:#b9bcc4; font:400 11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-.activity-tool-empty { display:flex; align-items:center; gap:6px; padding:9px 10px; color:#747781; font-size:10.5px; }
+.activity-tool-command code { min-width:0; color:#dfe0e4; font:500 13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.activity-tool-output { max-height:300px; margin:0; padding:9px 10px; overflow:auto; color:#b9bcc4; font:400 13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.activity-tool-empty { display:flex; align-items:center; gap:6px; padding:9px 10px; color:#747781; font-size:11.5px; }
 .activity-tool-section { border-top:1px solid rgba(255,255,255,.055); }
 .activity-tool-section:first-of-type { border-top:0; }
 .activity-tool-section-label { display:block; padding:7px 10px 0; color:#777b85; font-size:9px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
-.activity-tool-input { max-height:220px; margin:0; padding:7px 10px 9px; overflow:auto; color:#aeb1b8; font:400 10.5px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.activity-tool-input { max-height:220px; margin:0; padding:7px 10px 9px; overflow:auto; color:#aeb1b8; font:400 13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
 .activity-tool-diff { padding:8px; }
-.activity-tool-diff-note { margin-top:6px; padding:7px 9px; border:1px solid rgba(255,255,255,.06); border-radius:7px; background:rgba(255,255,255,.018); color:#9b9ea7; font:400 10.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.activity-tool-diff-note { margin-top:6px; padding:7px 9px; border:1px solid rgba(255,255,255,.06); border-radius:7px; background:rgba(255,255,255,.018); color:#9b9ea7; font:400 13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
 @media (max-width: 640px) {
   .activity-tool-panel { margin-left:0; }
   .activity-tool-output { max-height:240px; }

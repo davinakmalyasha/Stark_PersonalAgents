@@ -139,6 +139,11 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
   const send = useCallback(async (target: SessionTab, prompt: string, files: File[]) => {
     if (runningRef.current) return;
     if (!prompt.trim() && !files.length) return;
+    // Claim the run before any await (uploads, seeding). A second click or
+    // Enter while the first send is still in flight used to start a second
+    // pipeline against the same chat.
+    runningRef.current = true;
+    setIsRunning(true);
     const s = target;
     const runKey = `${s.workspaceId}:${s.chatId}`;
     runTargetRef.current = s;
@@ -155,6 +160,8 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
         attachments = await uploadChatAttachments(s.workspaceId, s.chatId, files);
       } catch {
         setNotification('Your files could not be uploaded.');
+        runningRef.current = false;
+        setIsRunning(false);
         return;
       }
     }
@@ -179,17 +186,18 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
         setThread((prev) => {
           if (prev.key !== runKey) return prev;
           const seen = new Set(prev.messages.map((m) => m.id));
-          const seeded = (chat.messages || []).filter((m) => !seen.has(m.id));
-          // Insert seeded history before the optimistic userMsg(s).
-          const optimistic = prev.messages.filter((m) => m.id === userMsg.id || m.role === 'user' && !seen.has(m.id));
-          void optimistic;
-          return { key: runKey, messages: [...seeded.filter((m) => m.id !== userMsg.id), ...prev.messages] };
+          const optimisticPrompts = new Set(
+            prev.messages.filter((m) => m.role === 'user').map((m) => m.content.trim()),
+          );
+          // The persisted prompt can land while the optimistic row is still
+          // present; keep one copy of it.
+          const seeded = (chat.messages || []).filter((m) => !seen.has(m.id)
+            && !(m.role === 'user' && optimisticPrompts.has(m.content.trim())));
+          return { key: runKey, messages: [...seeded, ...prev.messages] };
         });
       }).catch(() => {});
     }
-    runningRef.current = true;
     startedAtRef.current = Date.now();
-    setIsRunning(true);
     setLiveState(null);
     resetStream();
 
@@ -312,8 +320,20 @@ export function useSessionRunner(session: SessionTab | null, onFinished?: () => 
   const lastCall = usage.calls[usage.calls.length - 1];
   const activeContextTokens = lastCall?.input || 0;
 
+  const refresh = useCallback(async () => {
+    if (!sessionKey) return;
+    try {
+      const chat = await fetchChat(ws, chatId);
+      if (currentKeyRef.current !== sessionKey) return;
+      setThread({ key: sessionKey, messages: chat.messages || [] });
+      setUsageState({ key: sessionKey, value: chat.token_usage ?? null });
+    } catch {
+      /* keep the current thread on a transient fetch failure */
+    }
+  }, [sessionKey, ws, chatId]);
+
   return {
     messages: displayMessages, isRunning, liveState, notification, usage, activeContextTokens,
-    send, cancel, clearNotification: () => setNotification(null),
+    send, cancel, refresh, clearNotification: () => setNotification(null),
   };
 }

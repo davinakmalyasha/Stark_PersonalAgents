@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+use crate::truncate::truncate_tool_output;
 use crate::{ToolContext, ToolOutcome};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -552,6 +553,23 @@ impl McpManager {
                 specs.push(tool_spec(&server.name, name, &tool));
             }
         }
+        // Codex parity (PR #2611 class): MCP tools must surface in a stable
+        // order. Discovery order can shift mid-conversation via
+        // notifications/tools/list_changed, and any order change busts the
+        // provider prompt cache for the rest of a long turn sequence.
+        specs.sort_by(|left, right| {
+            let left_name = left
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let right_name = right
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            left_name.cmp(right_name)
+        });
         specs
     }
 
@@ -870,7 +888,10 @@ pub async fn call(fq_name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome
         return ToolOutcome::err("Error: MCP is not initialized");
     };
     match manager.call(fq_name, args.clone(), ctx).await {
-        Ok(text) => ToolOutcome::ok(truncate_output(&text, 20_000)),
+        // Pi-class budget (50KB / 2000 lines, line-aware head + tail with
+        // omitted counts) instead of the old 20k head-only cut: truncation
+        // must never hide what the agent needs.
+        Ok(text) => ToolOutcome::ok(truncate_tool_output(&text).text),
         Err(error) => ToolOutcome::err(format!(
             "Error: MCP call failed: {error}. Check the server status; restart or reconnect the MCP server, then retry."
         )),
@@ -887,6 +908,7 @@ fn transport_failure(error: &str) -> bool {
         || error.contains("timed out")
 }
 
+#[allow(dead_code)]
 fn truncate_output(value: &str, cap: usize) -> String {
     let count = value.chars().count();
     if count <= cap {

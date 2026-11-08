@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 
 /// Group projects are folders, not a separate database.
@@ -1051,11 +1050,7 @@ async fn open_pool(path: &Path, create: bool) -> Result<SqlitePool, String> {
             .await
             .map_err(|error| error.to_string())?;
     }
-    let options = SqliteConnectOptions::new()
-        .filename(&db)
-        .create_if_missing(create)
-        .journal_mode(SqliteJournalMode::Wal)
-        .busy_timeout(Duration::from_secs(5));
+    let options = crate::sqlite_options(&db, create);
     let pool = SqlitePoolOptions::new()
         .max_connections(3)
         .connect_with(options)

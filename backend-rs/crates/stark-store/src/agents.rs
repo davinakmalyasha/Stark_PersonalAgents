@@ -6,11 +6,10 @@
 //! run is started, so a restart can recover queued work and notify parents.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -152,11 +151,7 @@ impl AgentStore {
         if let Some(parent) = db_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let options = SqliteConnectOptions::new()
-            .filename(&db_path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
+        let options = crate::sqlite_options(&db_path, true);
         let pool = SqlitePoolOptions::new()
             .max_connections(3)
             .connect_with(options)

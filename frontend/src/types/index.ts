@@ -248,6 +248,15 @@ export function getWorkspaceKind(ws: WorkspaceInfo): WorkspaceKind {
   return 'project';
 }
 
+export interface ChatPreviewMessage {
+  id: string;
+  role: string;
+  content: string;
+  timestamp: string;
+  /** Latest message metadata kind (aborted, compaction, …). */
+  kind?: string;
+}
+
 export interface ChatSummary {
   id: string;
   title: string;
@@ -262,6 +271,10 @@ export interface ChatSummary {
   lastRole?: string;
   /** Latest message metadata kind (aborted, compaction, …). */
   lastKind?: string;
+  /** Latest visible user prompt, for canvas card bubbles. */
+  lastUser?: ChatPreviewMessage;
+  /** Latest visible agent/error reply, for canvas card bubbles. */
+  lastAgent?: ChatPreviewMessage;
   /** Server-derived run status for cards and lists. */
   status?: 'running' | 'queued' | 'done' | 'failed' | 'aborted' | 'idle';
 }

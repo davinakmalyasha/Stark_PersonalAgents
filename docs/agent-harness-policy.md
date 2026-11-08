@@ -168,6 +168,12 @@ checked against the same public-URL guard as `web_fetch`.
 - A crash-interrupted tool call is preserved with a synthetic retry result on
   replay; compaction keeps its retained tail.
 - Assistant text is stored once per turn, never duplicated in live history.
+- Streaming follows the Codex item lifecycle: every tool delta also emits
+  `item_started` / `item_completed`, and rollout replay re-emits them keyed by
+  `Last-Event-ID` ordinal — reconnecting clients rebuild items without the
+  full log. Legacy `delta` frames are unchanged.
+- Tool lists are order-stable across turns (MCP specs sorted by name), so
+  provider prompt caches stay hot for long sessions.
 
 ## Trust checks
 

@@ -76,6 +76,22 @@ pub struct StoredMessage {
 /// Consistent snapshot of a standalone SQLite database (schedules, group
 /// state, or any other store without an exposed pool). Uses `VACUUM INTO` so
 /// the copy is valid even while the source is live.
+/// Shared SQLite tuning for every harness database: WAL + busy timeout for
+/// concurrency, NORMAL synchronous (all WAL mode needs), mmap disabled so a
+/// large DB file is never mapped into the process address space, a 64MB
+/// page-cache cap, and in-memory temp tables. Applied per connection via
+/// `pragma()`, so every pooled connection inherits it.
+pub fn sqlite_options(db_path: &Path, create: bool) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(create)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .pragma("mmap_size", "0")
+        .pragma("cache_size", "-64000")
+        .pragma("temp_store", "MEMORY")
+}
 pub async fn vacuum_sqlite(src: &Path, dest: &Path) -> Result<(), StoreError> {
     if !src.is_file() {
         return Err(StoreError::Invalid(format!(
@@ -87,9 +103,7 @@ pub async fn vacuum_sqlite(src: &Path, dest: &Path) -> Result<(), StoreError> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let _ = tokio::fs::remove_file(dest).await;
-    let options = SqliteConnectOptions::new()
-        .filename(src)
-        .busy_timeout(Duration::from_secs(5));
+    let options = crate::sqlite_options(src, false);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -119,11 +133,7 @@ impl ChatStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
+        let options = crate::sqlite_options(&db_path, true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -734,7 +744,37 @@ impl ChatStore {
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role,
                    (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
                     AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
-                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata,
+                   (SELECT m.id FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_id,
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_content,
+                   (SELECT m.timestamp FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_timestamp,
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_role,
+                   (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_metadata,
+                   (SELECT m.id FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_id,
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_content,
+                   (SELECT m.timestamp FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_timestamp,
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_role,
+                   (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_metadata
             FROM chats c
             WHERE c.workspace_id = ?
             ORDER BY c.updated_at DESC
@@ -789,6 +829,26 @@ impl ChatStore {
                 {
                     item["lastKind"] = Value::String(kind.to_string());
                 }
+                if let Some(message) = preview_from_row(
+                    &row,
+                    "last_user_id",
+                    "last_user_content",
+                    "last_user_timestamp",
+                    "last_user_role",
+                    "last_user_metadata",
+                ) {
+                    item["lastUser"] = message;
+                }
+                if let Some(message) = preview_from_row(
+                    &row,
+                    "last_agent_id",
+                    "last_agent_content",
+                    "last_agent_timestamp",
+                    "last_agent_role",
+                    "last_agent_metadata",
+                ) {
+                    item["lastAgent"] = message;
+                }
                 item
             })
             .collect()
@@ -809,7 +869,37 @@ impl ChatStore {
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role,
                    (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
                     AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
-                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata,
+                   (SELECT m.id FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_id,
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_content,
+                   (SELECT m.timestamp FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_timestamp,
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_role,
+                   (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role = 'user' AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_user_metadata,
+                   (SELECT m.id FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_id,
+                   (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_content,
+                   (SELECT m.timestamp FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_timestamp,
+                   (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_role,
+                   (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role IN ('assistant', 'error') AND m.is_trace = 0
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
+                    ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_agent_metadata
             FROM chats c
             ORDER BY c.updated_at DESC
             "#,
@@ -831,7 +921,7 @@ impl ChatStore {
                     .flatten()
                     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                     .and_then(|metadata| metadata.get("kind").and_then(Value::as_str).map(str::to_string));
-                json!({
+                let mut item = json!({
                     "id": row.get::<String, _>("id"),
                     "workspaceId": row.get::<String, _>("workspace_id"),
                     "workspacePath": row.get::<String, _>("workspace_path"),
@@ -849,7 +939,28 @@ impl ChatStore {
                         .unwrap_or_default(),
                     "lastKind": last_kind,
                     "lastMessage": snippet.chars().take(1200).collect::<String>(),
-                })
+                });
+                if let Some(message) = preview_from_row(
+                    &row,
+                    "last_user_id",
+                    "last_user_content",
+                    "last_user_timestamp",
+                    "last_user_role",
+                    "last_user_metadata",
+                ) {
+                    item["lastUser"] = message;
+                }
+                if let Some(message) = preview_from_row(
+                    &row,
+                    "last_agent_id",
+                    "last_agent_content",
+                    "last_agent_timestamp",
+                    "last_agent_role",
+                    "last_agent_metadata",
+                ) {
+                    item["lastAgent"] = message;
+                }
+                item
             })
             .collect()
     }
@@ -1516,6 +1627,50 @@ fn display_role(role: &str) -> String {
     }
 }
 
+/// One card-sized message preview: the latest visible user/agent row with the
+/// id needed by copy/rewind, without loading the full conversation.
+fn preview_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    id_col: &str,
+    content_col: &str,
+    timestamp_col: &str,
+    role_col: &str,
+    metadata_col: &str,
+) -> Option<Value> {
+    let id = row.try_get::<Option<String>, _>(id_col).ok().flatten()?;
+    let content = row
+        .try_get::<Option<String>, _>(content_col)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let timestamp = row
+        .try_get::<Option<String>, _>(timestamp_col)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let role = row
+        .try_get::<Option<String>, _>(role_col)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "user".to_string());
+    let mut value = json!({
+        "id": id,
+        "role": display_role(&role),
+        "content": content.chars().take(1200).collect::<String>(),
+        "timestamp": timestamp,
+    });
+    if let Some(raw) = row
+        .try_get::<Option<String>, _>(metadata_col)
+        .ok()
+        .flatten()
+        && let Ok(metadata) = serde_json::from_str::<Value>(&raw)
+        && let Some(kind) = metadata.get("kind").and_then(Value::as_str)
+    {
+        value["kind"] = Value::String(kind.to_string());
+    }
+    Some(value)
+}
+
 fn validate_chat_id(chat_id: &str) -> Result<(), StoreError> {
     if chat_id.is_empty()
         || !chat_id.chars().all(|character| {
@@ -2001,6 +2156,56 @@ mod tests {
         assert_eq!(history[0].content, "Hello");
         let prompts = store.recent_user_prompts(10).await.unwrap();
         assert_eq!(prompts, vec!["Hello"]);
+    }
+
+    #[tokio::test]
+    async fn chat_summaries_carry_the_latest_exchange_for_canvas_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        store
+            .ensure_chat(
+                "chat-preview",
+                "_general",
+                dir.path().to_string_lossy().as_ref(),
+                "mock",
+                "Hello",
+            )
+            .await
+            .unwrap();
+        store
+            .append_message("chat-preview", "user", "first prompt", false)
+            .await
+            .unwrap();
+        store
+            .append_message("chat-preview", "assistant", "first answer", false)
+            .await
+            .unwrap();
+        store
+            .append_message("chat-preview", "user", "second prompt", false)
+            .await
+            .unwrap();
+        store
+            .append_message("chat-preview", "assistant", "second answer", false)
+            .await
+            .unwrap();
+        let chats = store.list_chats("_general").await;
+        let summary = chats
+            .iter()
+            .find(|chat| chat["id"] == "chat-preview")
+            .expect("summary");
+        assert_eq!(summary["lastUser"]["content"], "second prompt");
+        assert_eq!(summary["lastUser"]["role"], "user");
+        assert!(summary["lastUser"]["id"].as_str().is_some());
+        assert_eq!(summary["lastAgent"]["content"], "second answer");
+        assert_eq!(summary["lastAgent"]["role"], "agent");
+
+        let all = store.all_chats().await;
+        let summary = all
+            .iter()
+            .find(|chat| chat["id"] == "chat-preview")
+            .expect("global summary");
+        assert_eq!(summary["lastUser"]["content"], "second prompt");
+        assert_eq!(summary["lastAgent"]["content"], "second answer");
     }
 
     #[tokio::test]

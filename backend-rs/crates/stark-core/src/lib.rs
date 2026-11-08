@@ -53,6 +53,88 @@ fn agent_cancels() -> &'static Mutex<HashMap<String, CancellationToken>> {
     AGENT_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Live handles for delegated child runs. The top-level run manager only knows
+/// about runs started from HTTP; child agents run inside an already-running
+/// parent. Registering them here lets the streaming/status endpoints mirror a
+/// child's live reasoning and tools when it is opened in the sidebar.
+#[derive(Clone)]
+pub struct ChildRunHandle {
+    pub tx: broadcast::Sender<ServerEvent>,
+    pub latest: Arc<Mutex<Option<AppState>>>,
+    pub cancel: CancellationToken,
+    pub started_at: String,
+}
+
+static CHILD_RUNS: OnceLock<Mutex<HashMap<String, ChildRunHandle>>> = OnceLock::new();
+
+fn child_runs() -> &'static Mutex<HashMap<String, ChildRunHandle>> {
+    CHILD_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_child_run(ctx: &RunContext) {
+    if let Ok(mut runs) = child_runs().lock() {
+        runs.insert(
+            ctx.chat_id.clone(),
+            ChildRunHandle {
+                tx: ctx.tx.clone(),
+                latest: ctx.latest.clone(),
+                cancel: ctx.cancel.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+}
+
+fn unregister_child_run(chat_id: &str) {
+    if let Ok(mut runs) = child_runs().lock() {
+        runs.remove(chat_id);
+    }
+}
+
+pub fn child_run_handle(chat_id: &str) -> Option<ChildRunHandle> {
+    child_runs()
+        .lock()
+        .ok()
+        .and_then(|runs| runs.get(chat_id).cloned())
+}
+
+pub fn subscribe_child_run(chat_id: &str) -> Option<broadcast::Receiver<ServerEvent>> {
+    child_run_handle(chat_id).map(|handle| handle.tx.subscribe())
+}
+
+pub fn child_run_active(chat_id: &str) -> bool {
+    child_runs()
+        .lock()
+        .map(|runs| runs.contains_key(chat_id))
+        .unwrap_or(false)
+}
+
+pub fn child_run_state(chat_id: &str) -> Option<AppState> {
+    child_run_handle(chat_id)
+        .and_then(|handle| handle.latest.lock().ok().and_then(|state| state.clone()))
+}
+
+pub fn child_run_started_at(chat_id: &str) -> Option<String> {
+    child_run_handle(chat_id).map(|handle| handle.started_at)
+}
+
+pub fn cancel_child_run(chat_id: &str) -> bool {
+    child_run_handle(chat_id)
+        .map(|handle| {
+            handle.cancel.cancel();
+            true
+        })
+        .unwrap_or(false)
+}
+
+struct ChildRunGuard(String);
+
+impl Drop for ChildRunGuard {
+    fn drop(&mut self) {
+        unregister_child_run(&self.0);
+    }
+}
+
 pub fn register_agent_cancel(agent_id: &str, token: CancellationToken) {
     if let Ok(mut cancels) = agent_cancels().lock() {
         cancels.insert(agent_id.to_string(), token);
@@ -121,6 +203,15 @@ impl RunContext {
     }
 
     fn emit_delta(&self, delta: Delta) {
+        // Codex App Server lifecycle: every tool delta also carries an
+        // item_started/item_completed event so clients can render streaming
+        // items without replaying the full log. The `delta` event is kept
+        // byte-identical for existing clients.
+        match delta.kind.as_str() {
+            "tool_started" => self.emit("item_started", &delta),
+            "tool_finished" => self.emit("item_completed", &delta),
+            _ => {}
+        }
         self.emit("delta", delta);
     }
 
@@ -1613,7 +1704,15 @@ pub fn run_agent(
     ctx: RunContext,
     prompt: String,
 ) -> Pin<Box<dyn Future<Output = Result<(), RunError>> + Send>> {
-    Box::pin(run_agent_inner(ctx, prompt))
+    if ctx.depth == 0 {
+        return Box::pin(run_agent_inner(ctx, prompt));
+    }
+    register_child_run(&ctx);
+    let chat_id = ctx.chat_id.clone();
+    Box::pin(async move {
+        let _live = ChildRunGuard(chat_id);
+        run_agent_inner(ctx, prompt).await
+    })
 }
 
 /// Tools that may run inside a parallel batch. Same-path calls are grouped and
@@ -3272,6 +3371,31 @@ mod tests {
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(messages[3].content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn child_run_registry_exposes_live_handle_and_cancels() {
+        let (tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        child_runs().lock().unwrap().insert(
+            "child-live-registry".to_string(),
+            ChildRunHandle {
+                tx,
+                latest: Arc::new(Mutex::new(None)),
+                cancel: cancel.clone(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        );
+        assert!(child_run_active("child-live-registry"));
+        assert!(subscribe_child_run("child-live-registry").is_some());
+        assert_eq!(
+            child_run_started_at("child-live-registry").as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert!(cancel_child_run("child-live-registry"));
+        assert!(cancel.is_cancelled());
+        unregister_child_run("child-live-registry");
+        assert!(!child_run_active("child-live-registry"));
     }
 
     #[test]

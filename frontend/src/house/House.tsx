@@ -20,9 +20,10 @@ import { useHouseChat } from './useHouseChat';
 import { useSessions, tabId } from './useSessions';
 import { useSessionRunner } from './useSessionRunner';
 import { useCanvasAgentState } from '../hooks/useCanvasAgentState';
+import type { ChatMessage } from '../types';
 import type { TraceStep } from '../utils/logParser';
 import { kindForWorkspace, sendCanvasChat } from '../canvas/canvasSend';
-import { addWorkspace, createChat, updateChatTitle, deleteChat, createGroupProject } from '../services/api';
+import { addWorkspace, createChat, fetchChat, rewindChat, updateChatTitle, deleteChat, createGroupProject } from '../services/api';
 import { setBusy } from '../utils/runtimeBusy';
 import '../house/house.css';
 
@@ -136,6 +137,22 @@ export default function House() {
     cost: chat.totalCost,
     context: chat.activeContextTokens,
   }), [chat.totalInput, chat.totalOutput, chat.totalCost, chat.activeContextTokens]);
+
+  // Mini-chat cards reuse the exact live thread the full chat renders, so
+  // streaming text, tool steps, and thinking all stay in sync.
+  const liveMessagesByChat = useMemo<Record<string, ChatMessage[]>>(() => {
+    const map: Record<string, ChatMessage[]> = {};
+    if (chat.isRunning && chat.workspaceId && chat.activeChatId) {
+      map[`${chat.workspaceId}:${chat.activeChatId}`] = chat.displayMessages;
+    }
+    if (runner.isRunning && activeTab) {
+      map[`${activeTab.workspaceId}:${activeTab.chatId}`] = runner.messages;
+    }
+    return map;
+  }, [
+    chat.isRunning, chat.workspaceId, chat.activeChatId, chat.displayMessages,
+    runner.isRunning, runner.messages, activeTab,
+  ]);
 
   // Room-workspace sidebars navigate home via #/?ws=<id>&chat=<id> — once the
   // session layer has booted, open that chat and clean the hash.
@@ -335,6 +352,7 @@ export default function House() {
             usage={mapUsage}
             toolCalls={activeToolCalls}
             errors={activeErrors}
+            liveMessages={liveMessagesByChat}
             onCloseTab={sessions.closeTab}
             onOpenChat={(wsId, chatId) => {
               const ws = sessions.workspaces.find((w) => w.id === wsId);
@@ -357,6 +375,26 @@ export default function House() {
                 return;
               }
               await sendCanvasChat(ws, chatId, text, files, kindForWorkspace(ws));
+              await sessions.forceRefresh();
+            }}
+            onRewindMessage={async (wsId, chatId, message) => {
+              const isActive = wsId === mainWorkspace?.id && chatId === chat.activeChatId;
+              if (isActive) {
+                try {
+                  // The summary carries only the fields a card needs; the
+                  // active chat's rewind needs the full row (attachments).
+                  const full = await fetchChat(wsId, chatId);
+                  const target = full.messages.find((candidate) => candidate.id === message.id);
+                  if (target) {
+                    await chat.handleRewind(target);
+                    await sessions.forceRefresh();
+                    return;
+                  }
+                } catch {
+                  /* fall through to the direct rewind */
+                }
+              }
+              await rewindChat(wsId, chatId, message.id);
               await sessions.forceRefresh();
             }}
           />

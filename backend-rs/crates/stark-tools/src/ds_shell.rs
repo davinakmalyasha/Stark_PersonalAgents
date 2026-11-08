@@ -10,7 +10,11 @@ use crate::{ToolContext, ToolOutcome};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Default model-facing output budget (~25k tokens at ~4 chars/token,
+/// Claude-class). Overridable per call with Codex's `max_output_tokens`.
 const MAX_OUTPUT_CHARS: usize = 100_000;
+const MIN_OUTPUT_CHARS: usize = 1_000;
+const MAX_OUTPUT_CHARS_CAP: usize = 200_000;
 
 fn resolve_workdir(
     ctx: &ToolContext,
@@ -34,21 +38,37 @@ fn resolve_workdir(
     }
 }
 
-fn truncate(text: String) -> String {
+fn truncate_with_limit(text: &str, limit: usize) -> String {
     let count = text.chars().count();
-    if count <= MAX_OUTPUT_CHARS {
-        return text;
+    if count <= limit {
+        return text.to_string();
     }
     // Keep both ends: failures usually live at the tail, while the command
     // header lives at the head. Head-only truncation hid test failures.
-    let head_budget = MAX_OUTPUT_CHARS / 2;
-    let tail_budget = MAX_OUTPUT_CHARS - head_budget;
+    let head_budget = limit / 2;
+    let tail_budget = limit - head_budget;
     let head: String = text.chars().take(head_budget).collect();
     let tail: String = text.chars().skip(count - tail_budget).collect();
     format!(
-        "{head}\n[... {} chars omitted ...]\n{tail}",
-        count.saturating_sub(MAX_OUTPUT_CHARS)
+        "{head}\n[... {} chars omitted (showing {} head + {} tail of {} chars total). Request a narrower command or read the job log with job output.]\n{tail}",
+        count.saturating_sub(limit),
+        head_budget,
+        tail_budget,
+        count
     )
+}
+
+/// Codex shell contract: per-call `max_output_tokens` overrides the default
+/// budget. Tokens convert at ~4 chars/token (same approximation Codex and the
+/// OpenAI Agents SDK use). The default stays generous so routine logs are
+/// never hidden from the model.
+fn output_limit(args: &Value) -> usize {
+    args.get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .map(|tokens| {
+            (tokens.saturating_mul(4) as usize).clamp(MIN_OUTPUT_CHARS, MAX_OUTPUT_CHARS_CAP)
+        })
+        .unwrap_or(MAX_OUTPUT_CHARS)
 }
 
 async fn approve_command(ctx: &ToolContext, command: &str, reason: &str) -> bool {
@@ -224,6 +244,7 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .clamp(1_000, MAX_TIMEOUT_MS);
+    let output_limit = output_limit(args);
     let spawned = match ctx
         .processes
         .spawn_session(command, &workdir, &ctx.chat_id, false)
@@ -243,7 +264,7 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         ProcessStatus::Exited(code) => {
             ctx.processes.remove(&job);
             let code = code.unwrap_or(-1);
-            let text = truncate(output);
+            let text = with_spill(ctx, &output, output_limit);
             if code == 0 {
                 ToolOutcome::ok(format!("{text}\n[exit code: 0]"))
             } else {
@@ -252,7 +273,10 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         }
         ProcessStatus::Killed => {
             ctx.processes.remove(&job);
-            ToolOutcome::err(format!("[killed]\n{}", truncate(output)))
+            ToolOutcome::err(format!(
+                "[killed]\n{}",
+                with_spill(ctx, &output, output_limit)
+            ))
         }
         ProcessStatus::Running => ToolOutcome::ok(
             json!({
@@ -260,11 +284,27 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
                 "jobId": job,
                 "cwd": workdir.to_string_lossy(),
                 "timeoutMs": timeout_ms,
-                "output": truncate(output),
+                "output": with_spill(ctx, &output, output_limit),
             })
             .to_string(),
         ),
     }
+}
+
+/// Truncates to the call budget and, when truncation fires, spills the full
+/// output to scratch so the marker can point the agent at the complete log
+/// (what the bash contract already promises) instead of hiding data.
+fn with_spill(ctx: &ToolContext, output: &str, limit: usize) -> String {
+    let mut text = truncate_with_limit(output, limit);
+    if output.chars().count() > limit
+        && let Some(path) = crate::truncate::spill_full_output(&ctx.harness_root, "bash", output)
+    {
+        text.push_str(&format!(
+            "\n[full output saved to {} — read it with an offset/limit]",
+            path.to_string_lossy()
+        ));
+    }
+    text
 }
 
 pub async fn job(ctx: &ToolContext, args: &Value) -> ToolOutcome {

@@ -10,7 +10,6 @@ import PersonalWorkspace from './personal-workspace/PersonalWorkspace';
 import MemoryWorkspace from './memory/MemoryWorkspace';
 import PairingGate from './components/Layout/PairingGate';
 import UpdateToast from './components/Layout/UpdateToast';
-import QuestionModal from './components/Workspace/QuestionModal';
 import { onAuthRejected } from './services/remoteAuth';
 import { startAutoUpdate } from './utils/appUpdate';
 
@@ -141,8 +140,6 @@ export default function AppShell() {
     <>
       {content}
       <UpdateToast />
-      {/* Ask-user overlay is global: an agent can block from any route. */}
-      <QuestionModal />
     </>
   )
 }

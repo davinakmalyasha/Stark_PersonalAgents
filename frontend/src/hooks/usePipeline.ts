@@ -179,6 +179,16 @@ export function usePipeline(): UsePipelineReturn {
                 resetStream();
                 setIsRunning(false);
                 return;
+              } else if (
+                currentEvent === 'item_started'
+                || currentEvent === 'item_completed'
+                || currentEvent === 'warning'
+                || currentEvent === 'turn_started'
+                || currentEvent === 'turn_complete'
+                || currentEvent === 'turn_aborted'
+              ) {
+                // Canonical rollout lifecycle frames; deltas already carry
+                // the renderable content and state carries AppState.
               } else if (parsed.error) {
                 // Render the failure state but leave persistence to the initiator.
                 setState(parsed as AppState);

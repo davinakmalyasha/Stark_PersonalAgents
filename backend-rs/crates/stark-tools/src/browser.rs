@@ -4,10 +4,10 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::process::Command;
 
+use crate::truncate::{MAX_TOOL_BYTES, spill_full_output, truncate_with_spill};
 use crate::{ToolContext, ToolOutcome};
 
-const MAX_SNAPSHOT_CHARS: usize = 24_000;
-const MAX_MCP_CHARS: usize = 24_000;
+const MAX_SNAPSHOT_CHARS: usize = MAX_TOOL_BYTES;
 const DEFAULT_WAIT_MS: u64 = 5_000;
 
 pub async fn browser_act(ctx: &ToolContext, args: &Value) -> ToolOutcome {
@@ -42,8 +42,8 @@ pub async fn browser_act(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         }
         "press" => command(&["press", required(args, "key")], Duration::from_secs(15)).await,
         "extract" => extract(args).await,
-        "read" => read(args).await,
-        "a11y" => a11y(args).await,
+        "read" => read(ctx, args).await,
+        "a11y" => a11y(ctx, args).await,
         "record" => record(ctx, args).await,
         "network" => network(ctx, args).await,
         "screenshot" => screenshot(ctx, args).await,
@@ -81,7 +81,7 @@ async fn navigate(args: &Value) -> ToolOutcome {
         .min(3_000);
     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
     let snapshot = raw_command(
-        &["snapshot", "-i", "--max-output", "24000"],
+        &["snapshot", "-i", "--max-output", "51200"],
         Duration::from_secs(20),
     )
     .await;
@@ -125,7 +125,7 @@ async fn extract(args: &Value) -> ToolOutcome {
     command(&["get", &what, selector], Duration::from_secs(15)).await
 }
 
-async fn read(args: &Value) -> ToolOutcome {
+async fn read(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if let Some(url) = arg_str(args, "url")
         && let Err(error) = crate::ds_web::validate_public_url(url).await
     {
@@ -138,6 +138,7 @@ async fn read(args: &Value) -> ToolOutcome {
     copy_bool(args, &mut payload, "outline");
     copy_bool(args, &mut payload, "raw");
     mcp_call(
+        ctx,
         "agent_browser_read",
         Value::Object(payload),
         Duration::from_secs(90),
@@ -145,7 +146,7 @@ async fn read(args: &Value) -> ToolOutcome {
     .await
 }
 
-async fn a11y(args: &Value) -> ToolOutcome {
+async fn a11y(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     if let Some(url) = arg_str(args, "url")
         && let Err(error) = crate::ds_web::validate_public_url(url).await
     {
@@ -156,6 +157,7 @@ async fn a11y(args: &Value) -> ToolOutcome {
     copy_str(args, &mut payload, "selector");
     copy_str(args, &mut payload, "tags");
     mcp_call(
+        ctx,
         "agent_browser_a11y",
         Value::Object(payload),
         Duration::from_secs(90),
@@ -169,6 +171,7 @@ async fn record(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         .to_ascii_lowercase();
     if action == "stop" {
         return mcp_call(
+            ctx,
             "agent_browser_record_stop",
             Value::Object(serde_json::Map::new()),
             Duration::from_secs(30),
@@ -207,7 +210,7 @@ async fn record(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     } else {
         "agent_browser_record_start"
     };
-    mcp_call(tool, Value::Object(payload), Duration::from_secs(30)).await
+    mcp_call(ctx, tool, Value::Object(payload), Duration::from_secs(30)).await
 }
 
 async fn network(ctx: &ToolContext, args: &Value) -> ToolOutcome {
@@ -271,7 +274,7 @@ async fn network(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             ));
         }
     };
-    mcp_call(tool, Value::Object(payload), Duration::from_secs(60)).await
+    mcp_call(ctx, tool, Value::Object(payload), Duration::from_secs(60)).await
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -306,16 +309,19 @@ fn copy_u64(args: &Value, payload: &mut serde_json::Map<String, Value>, key: &st
 /// Run one MCP tool without a persistent stdio session and render its text
 /// content. This is what makes 0.41's `mcp call` useful here: `browser_act`
 /// already spawns one short process per action, so no daemon lifecycle changes.
-async fn mcp_call(tool: &str, args: Value, timeout: Duration) -> ToolOutcome {
+/// Large outputs use Pi-class truncation (50KB / 2000 lines, head + tail with
+/// counts) and the full output is spilled to scratch so the marker can point
+/// the agent at it instead of hiding data.
+async fn mcp_call(ctx: &ToolContext, tool: &str, args: Value, timeout: Duration) -> ToolOutcome {
     let json = args.to_string();
     let raw = raw_command(&["mcp", "call", tool, json.as_str()], timeout).await;
-    render_mcp_result(&raw)
+    render_mcp_result(&ctx.harness_root, tool, &raw)
 }
 
-fn render_mcp_result(raw: &str) -> ToolOutcome {
+fn render_mcp_result(harness_root: &Path, tool: &str, raw: &str) -> ToolOutcome {
     let trimmed = raw.trim();
     let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return truncated_ok(trimmed);
+        return truncated_ok(harness_root, tool, trimmed);
     };
     if let Some(error) = value.get("error") {
         let message = error
@@ -333,21 +339,23 @@ fn render_mcp_result(raw: &str) -> ToolOutcome {
         }
         if !parts.is_empty() {
             let joined = parts.join("\n");
-            return truncated_ok(joined.trim());
+            return truncated_ok(harness_root, tool, joined.trim());
         }
     }
-    truncated_ok(trimmed)
+    truncated_ok(harness_root, tool, trimmed)
 }
 
-fn truncated_ok(text: &str) -> ToolOutcome {
+fn truncated_ok(harness_root: &Path, tool: &str, text: &str) -> ToolOutcome {
     if text.is_empty() {
         return ToolOutcome::ok("(empty)");
     }
-    if text.chars().count() > MAX_MCP_CHARS {
-        let head: String = text.chars().take(MAX_MCP_CHARS).collect();
-        return ToolOutcome::ok(format!("{head}\n[PARTIAL: output truncated]"));
-    }
-    ToolOutcome::ok(text.to_string())
+    let spilled = if text.len() > MAX_TOOL_BYTES {
+        spill_full_output(harness_root, tool, text)
+    } else {
+        None
+    };
+    let out = truncate_with_spill(text, spilled.as_deref());
+    ToolOutcome::ok(out.text)
 }
 
 async fn screenshot(ctx: &ToolContext, args: &Value) -> ToolOutcome {
@@ -498,18 +506,30 @@ mod tests {
 
     #[test]
     fn renders_mcp_content_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let ok = render_mcp_result(
+            root,
+            "agent_browser_read",
             r#"{"_meta":{"agentBrowserVersion":"0.41.2"},"content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}"#,
         );
         assert!(!ok.is_error);
         assert_eq!(ok.content, "hello\nworld");
         let err = render_mcp_result(
+            root,
+            "agent_browser_read",
             r#"{"_meta":{"agentBrowserVersion":"0.41.2"},"error":{"code":-32602,"message":"Unknown tool: read"}}"#,
         );
         assert!(err.is_error);
         assert!(err.content.contains("Unknown tool"));
-        let partial = render_mcp_result(&"x".repeat(MAX_MCP_CHARS + 10));
-        assert!(partial.content.contains("[PARTIAL"));
+        let big = "x".repeat(MAX_TOOL_BYTES + 10);
+        let partial = render_mcp_result(root, "agent_browser_read", &big);
+        assert!(partial.content.contains("omitted"), "{}", partial.content);
+        assert!(
+            partial.content.contains(".deep_agents"),
+            "{}",
+            partial.content
+        );
     }
 
     #[tokio::test]

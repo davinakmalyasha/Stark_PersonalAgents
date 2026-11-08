@@ -3,7 +3,9 @@ import { createPortal } from 'react-dom';
 import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import type { ChatAttachment, ModelOption } from '../../types';
 import { chatAttachmentUrl, fetchProvider, type ProviderInfo } from '../../services/api';
-import { DropOverlay, useOptionalAttachmentDrop } from './AttachmentDrop';
+import { useOptionalAttachmentDrop } from './AttachmentDrop';
+import AskQuestionPanel from './AskQuestionPanel';
+import { dismissAskBatch, useAskBatchForChat } from '../../hooks/usePendingAsk';
 
 interface Props {
   onSend: (message: string, files: File[], restored?: ChatAttachment[]) => void;
@@ -159,6 +161,7 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   const [providerInfo, setProviderInfo] = useState<ProviderInfo | null>(null);
   const [usageOpen, setUsageOpen] = useState(false);
   const usageOrbRef = useRef<HTMLButtonElement | null>(null);
+  const askBatch = useAskBatchForChat(chatId);
 
   // The old label was hardcoded to "OpenCode Go" even when the server was on
   // another gateway. Read the live provider from the backend instead.
@@ -269,6 +272,21 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
     }
   };
 
+  if (askBatch) {
+    return (
+      <div
+        className="ask-prompt-slot w-full flex-shrink-0 px-1.5 md:px-2 pt-1.5 pb-1.5 md:pb-2"
+        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 6px)' }}
+      >
+        <AskQuestionPanel
+          key={askBatch.batch_id}
+          batch={askBatch}
+          onClose={() => dismissAskBatch(askBatch.batch_id)}
+        />
+      </div>
+    );
+  }
+
   return (
     <div
       className="w-full flex-shrink-0 px-1.5 md:px-2 pt-1.5 pb-1.5 md:pb-2"
@@ -284,7 +302,6 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
         onPaste={handlePaste}
       >
         <input ref={inputRef} type="file" multiple accept={ACCEPTED_TYPES} className="hidden" onChange={(event) => { if (event.target.files) addFiles(event.target.files); event.currentTarget.value = ''; }} />
-        {dragActive && <DropOverlay compact title="Drop to attach" />}
 
         {totalAttachments > 0 && <div className="attachment-deck" aria-label="Files ready to send">
           {files.map((file) => <div className="attachment-card" key={`${file.name}-${file.size}`}>

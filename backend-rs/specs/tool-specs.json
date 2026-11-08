@@ -28,6 +28,10 @@
           "run_in_background": {
             "type": "boolean",
             "description": "Run in the background and return a job id immediately (collect with job_output, stop with job_kill). No timeout applies."
+          },
+          "max_output_tokens": {
+            "type": "number",
+            "description": "Per-call model-facing output budget in tokens (~4 chars/token). Omit to use the generous default; set lower only to bound context on known-verbose commands."
           }
         },
         "required": [

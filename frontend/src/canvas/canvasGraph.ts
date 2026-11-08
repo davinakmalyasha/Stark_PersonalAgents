@@ -7,11 +7,11 @@ import type { CanvasChatItem } from './canvasTypes';
  * derived — the only persisted canvas state is a card's position.
  */
 
-const ROOT_WIDTH = 326;
-const CHILD_WIDTH = 282;
-const ROOT_GAP = 92;
-const CHILD_GAP = 44;
-const LEVEL_GAP = 244;
+const ROOT_WIDTH = 468;
+const CHILD_WIDTH = 384;
+const ROOT_GAP = 120;
+const CHILD_GAP = 64;
+const LEVEL_GAP = 470;
 const MAX_DEPTH = 3;
 const MAX_NODES = 60;
 const MAX_CHILDREN = 12;

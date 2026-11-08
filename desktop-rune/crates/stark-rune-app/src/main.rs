@@ -418,10 +418,44 @@ fn print_usage() {
     eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
     eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <map|chat>]  (unified shell PNG)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
+    eprintln!("stark-rune --api-get <path> [--api-port <n>]  (live GET against stark-server)");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--api-get") {
+        #[cfg(not(feature = "rune-real"))]
+        {
+            let _ = pos;
+            eprintln!("--api-get needs --features rune-real.");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "rune-real")]
+        {
+            let path = args.get(pos + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--api-get <path> is required");
+                std::process::exit(2);
+            });
+            let mut port = 8124u16;
+            let mut k = 0;
+            while k < args.len() {
+                if args[k] == "--api-port" && k + 1 < args.len() {
+                    port = args[k + 1].parse().unwrap_or(port);
+                    k += 2;
+                    continue;
+                }
+                k += 1;
+            }
+            match transport::get_json("127.0.0.1", port, &path) {
+                Ok(v) => println!("{v}"),
+                Err(e) => {
+                    eprintln!("GET {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+    }
     if let Some(pos) = args.iter().position(|a| a == "--replay-sse") {
         #[cfg(not(feature = "rune-real"))]
         {

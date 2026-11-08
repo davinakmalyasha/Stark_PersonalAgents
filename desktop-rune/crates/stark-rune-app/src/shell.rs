@@ -33,6 +33,7 @@ pub struct CloudActive {
 }
 
 impl CloudActive {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_json(v: &serde_json::Value) -> Self {
         let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         Self {
@@ -43,6 +44,7 @@ impl CloudActive {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn fetch(host: &str, port: u16) -> Result<Self, String> {
         let v = crate::transport::get_json(host, port, "/api/runs/active")?;
         Ok(Self::from_json(&v))
@@ -304,7 +306,8 @@ fn cloud_view(s: &CloudState) -> El {
 }
 
 /// Spawn a worker-thread refresh of `/api/runs/active`. No-op while one is in
-/// flight; failures surface as an error row, never a stuck spinner.
+/// flight; failures surface as an error row, never a stuck spinner. On wasm
+/// (no sockets yet) the refresh records a pending note instead of hanging.
 pub fn refresh_cloud(s: &mut ShellState) {
     if s.cloud.loading {
         return;
@@ -314,6 +317,15 @@ pub fn refresh_cloud(s: &mut ShellState) {
     let (tx, rx) = std::sync::mpsc::channel();
     s.cloud.inbox = Some(rx);
     let (host, port) = (s.cloud.host.clone(), s.cloud.port);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tx.send(Err(
+            "Cloud refresh is native-only for now — fetch transport binds next.".to_string(),
+        ));
+        let _ = (host, port);
+        s.cloud.loading = false;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let _ = tx.send(CloudActive::fetch(&host, port));
     });

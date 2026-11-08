@@ -8,11 +8,17 @@
 //! lines, blank-line dispatch, trailing-buffer flush. Bodies may be
 //! `Transfer-Encoding: chunked` (axum SSE) or close-delimited.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufRead, BufReader, Read, Write};
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::TcpStream;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use crate::stream::{infer_event, RunRequest, SseFrame};
+use crate::stream::{infer_event, SseFrame};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::stream::RunRequest;
 
 /// Incremental SSE decoder over raw bytes. Handles UTF-8 split across chunks
 /// (only complete lines up to the last valid `\n` are processed) and keeps
@@ -95,6 +101,7 @@ impl SseDecoder {
 }
 
 /// Outcome of [`post_run`]: the terminal `done` status, if the server sent one.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunOutcome {
     pub status: String,
@@ -103,6 +110,10 @@ pub struct RunOutcome {
 /// Blocking `POST /api/run`, streaming frames to `on_frame` as they arrive.
 /// Chunked and close-delimited bodies both supported. Errors are strings so
 /// the UI thread can surface them as an `error` frame.
+///
+/// Native only: browsers have no TCP sockets — the web build uses `fetch`
+/// (not yet wired; sends stage locally, see `stage_send`).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn post_run(
     host: &str,
     port: u16,
@@ -130,9 +141,9 @@ pub fn post_run(
 }
 
 /// Blocking `GET` returning a JSON body. Used for status endpoints
-/// (`/api/runs/active`, `/api/cloud/status`).
-pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, String> {
-    let (mut reader, chunked) =
+/// (`/api/runs/active`, `/api/cloud/status`). Native only (see `post_run`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, String> {    let (mut reader, chunked) =
         request(host, port, "GET", path, "Accept: application/json\r\n", &[])?;
     let mut raw = Vec::new();
     for bytes in read_body(&mut reader, chunked)? {
@@ -143,6 +154,7 @@ pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, 
 
 /// Open a connection, send the request, and return a reader past the
 /// response headers plus whether the body is chunked.
+#[cfg(not(target_arch = "wasm32"))]
 fn request(
     host: &str,
     port: u16,
@@ -189,6 +201,7 @@ fn request(
 
 /// Read one body as pieces (streaming-friendly): chunk frames when chunked,
 /// 8KB reads until close otherwise.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_body(reader: &mut BufReader<TcpStream>, chunked: bool) -> Result<Vec<Vec<u8>>, String> {
     let mut pieces = Vec::new();
     if chunked {
@@ -225,6 +238,7 @@ fn read_body(reader: &mut BufReader<TcpStream>, chunked: bool) -> Result<Vec<Vec
     Ok(pieces)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn drain(frames: &mut Vec<SseFrame>, outcome: &mut RunOutcome, on_frame: &mut dyn FnMut(SseFrame)) {
     for frame in frames.drain(..) {
         if frame.event == "done" {

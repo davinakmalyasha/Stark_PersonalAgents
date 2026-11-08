@@ -13,6 +13,11 @@
 //!   Here PNG is an SVG golden (no GPU needed in CI); element-tree dump and
 //!   scripted input are byte-stable and agent-checkable.
 
+// The wasm entry (`main` → shell) exercises a subset of this binary: CLI
+// flags, headless specs, and test-only helpers are intentionally unused there.
+// Host builds keep full `-D warnings` teeth; see CI.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 use stark_kit::{draft_id, Role};
 use stark_theme::{color, layout};
 
@@ -422,6 +427,20 @@ fn print_usage() {
 }
 
 fn main() {
+    // Web entry: no CLI in the browser — open the unified shell directly.
+    // The shell adapts via `Cx::system_dark` / `Cx::safe_area` on device.
+    #[cfg(all(target_arch = "wasm32", feature = "rune-real"))]
+    {
+        shell::run_shell_headless(vec![]);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        run_cli();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_cli() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--api-get") {
         #[cfg(not(feature = "rune-real"))]

@@ -312,6 +312,18 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
     let (host, port) = (s.api_host.clone(), s.api_port);
+    // Browsers have no TCP sockets: stage locally and note the pending run.
+    // The `fetch` transport binds here next.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (host, port, req, tx);
+        s.rows.push(RowData {
+            key: format!("sys-{n}"),
+            role: "system",
+            body: "Run transport is native-only for now — your prompt is staged above.".to_string(),
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let mut emit = |frame: crate::stream::SseFrame| {
             let _ = tx.send(frame);

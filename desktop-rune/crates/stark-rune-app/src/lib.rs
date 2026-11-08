@@ -6,6 +6,9 @@
 #[path = "composer.rs"]
 pub mod composer;
 #[cfg(feature = "rune-real")]
+#[path = "rooms.rs"]
+pub mod rooms;
+#[cfg(feature = "rune-real")]
 #[path = "rune_canvas.rs"]
 pub mod rune_canvas;
 #[cfg(feature = "rune-real")]

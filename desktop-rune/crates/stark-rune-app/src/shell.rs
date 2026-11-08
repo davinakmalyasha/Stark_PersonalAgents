@@ -7,13 +7,18 @@
 
 use rune::{col, row, text, AppSpec, Cx, El};
 
+use crate::rooms::{
+    drain_results, house_view, memory_view, refresh_house, refresh_memory, HouseHost, HouseState,
+    MemoryHost, MemoryState,
+};
 use crate::rune_canvas::{canvas_body, CanvasHost, CanvasState};
 use crate::rune_transcript::{
     drain_run_inbox, transcript_body, RuneTranscriptState, Thread, TranscriptHost,
 };
 
 /// Shell routes. `Map` is the home canvas; `Chat` the main transcript;
-/// `Personal` the personal room; `Cloud` the runs status board.
+/// `Personal` the personal room; `Cloud` the runs board; `House` the smart
+/// home; `Memory` the memory index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Route {
     #[default]
@@ -21,6 +26,8 @@ pub enum Route {
     Chat,
     Personal,
     Cloud,
+    House,
+    Memory,
 }
 
 /// One active run, mirroring `ActiveRun` (`GET /api/runs/active`).
@@ -114,6 +121,8 @@ pub struct ShellState {
     pub personal: RuneTranscriptState,
     pub canvas: CanvasState,
     pub cloud: CloudState,
+    pub house: HouseState,
+    pub memory: MemoryState,
 }
 
 impl Default for ShellState {
@@ -128,6 +137,8 @@ impl Default for ShellState {
             personal,
             canvas: CanvasState::map(),
             cloud: CloudState::default(),
+            house: HouseState::default(),
+            memory: MemoryState::default(),
         }
     }
 }
@@ -150,6 +161,18 @@ impl TranscriptHost for ShellState {
 impl CanvasHost for ShellState {
     fn canvas_mut(&mut self) -> &mut CanvasState {
         &mut self.canvas
+    }
+}
+
+impl HouseHost for ShellState {
+    fn house_mut(&mut self) -> &mut HouseState {
+        &mut self.house
+    }
+}
+
+impl MemoryHost for ShellState {
+    fn memory_mut(&mut self) -> &mut MemoryState {
+        &mut self.memory
     }
 }
 
@@ -187,6 +210,8 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
         Route::Chat => transcript_body::<ShellState>(&s.transcript, Thread::Main),
         Route::Personal => transcript_body::<ShellState>(&s.personal, Thread::Personal),
         Route::Cloud => cloud_view(&s.cloud),
+        Route::House => house_view::<ShellState>(&s.house),
+        Route::Memory => memory_view::<ShellState>(&s.memory),
     };
     col()
         .key("stark-shell")
@@ -205,7 +230,9 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
                 .child(tab(s, Route::Map, "Map", "tab-map"))
                 .child(tab(s, Route::Chat, "Chat", "tab-chat"))
                 .child(tab(s, Route::Personal, "Personal", "tab-personal"))
-                .child(tab(s, Route::Cloud, "Cloud", "tab-cloud")),
+                .child(tab(s, Route::Cloud, "Cloud", "tab-cloud"))
+                .child(tab(s, Route::House, "House", "tab-house"))
+                .child(tab(s, Route::Memory, "Memory", "tab-memory")),
         )
         .child(body)
 }
@@ -331,11 +358,14 @@ pub fn refresh_cloud(s: &mut ShellState) {
     });
 }
 
-/// `poll` drains transcript inboxes whatever route is up and refreshes Cloud
-/// at most every 10s, so runs started in Chat keep streaming on the Map.
+/// `poll` drains transcript inboxes whatever route is up and refreshes
+/// status rooms at most every 10–15s, so runs started in Chat keep streaming
+/// on the Map.
 pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = drain_run_inbox(&mut s.transcript, clock, tx);
     changed |= drain_run_inbox(&mut s.personal, clock, tx);
+    changed |= poll_house(s, clock);
+    changed |= poll_memory(s, clock);
     // Cloud inbox first (a refresh may have landed), then auto-refresh.
     let mut seen = false;
     while let Some(msg) = s.cloud.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -371,6 +401,57 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed
 }
 
+/// Drain the house inbox; auto-refresh at most every 15s.
+fn poll_house(s: &mut ShellState, clock: f64) -> bool {
+    let (msgs, _) = drain_results(&mut s.house.inbox);
+    let mut changed = false;
+    for msg in msgs {
+        match msg {
+            Ok(snap) => {
+                s.house.rooms = snap.rooms;
+                s.house.devices = snap.devices;
+                s.house.error = None;
+                s.house.last_ok = clock;
+            }
+            Err(message) => {
+                s.house.error = Some(message);
+            }
+        }
+        s.house.loading = false;
+        changed = true;
+    }
+    if s.house.auto && !s.house.loading && clock - s.house.last_ok > 15.0 {
+        refresh_house(&mut s.house);
+        changed = true;
+    }
+    changed
+}
+
+/// Drain the memory inbox; auto-refresh at most every 15s.
+fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
+    let (msgs, _) = drain_results(&mut s.memory.inbox);
+    let mut changed = false;
+    for msg in msgs {
+        match msg {
+            Ok(workspaces) => {
+                s.memory.workspaces = workspaces;
+                s.memory.error = None;
+                s.memory.last_ok = clock;
+            }
+            Err(message) => {
+                s.memory.error = Some(message);
+            }
+        }
+        s.memory.loading = false;
+        changed = true;
+    }
+    if s.memory.auto && !s.memory.loading && clock - s.memory.last_ok > 15.0 {
+        refresh_memory(&mut s.memory);
+        changed = true;
+    }
+    changed
+}
+
 fn init_shell() -> ShellState {
     ShellState::default()
 }
@@ -391,6 +472,14 @@ fn apply_cloud(s: &mut ShellState) {
     s.route = Route::Cloud;
 }
 
+fn apply_house(s: &mut ShellState) {
+    s.route = Route::House;
+}
+
+fn apply_memory(s: &mut ShellState) {
+    s.route = Route::Memory;
+}
+
 pub fn shell_spec() -> AppSpec<ShellState> {
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
@@ -398,6 +487,8 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("chat", apply_chat),
         ("personal", apply_personal),
         ("cloud", apply_cloud),
+        ("house", apply_house),
+        ("memory", apply_memory),
     ];
     spec.poll = Some(shell_poll);
     spec
@@ -514,6 +605,109 @@ mod tests {
         assert!(active.running);
         assert_eq!(active.workspace_path, "D:/proj");
         assert!(!rt.state.cloud.loading);
+    }
+
+    #[test]
+    fn house_and_memory_rooms_load_from_mock() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        fn serve_once(body: &'static str) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let mut raw = Vec::new();
+                loop {
+                    let n = sock.read(&mut buf).unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            });
+            port
+        }
+        let house_port = serve_once(
+            r#"{"rooms":[{"id":"living","name":"Living Room"}],"devices":[{"id":"blind-living","name":"Window Blinds","roomId":"living","type":"blinds","state":{"position":1},"capabilities":[],"isOnline":true}]}"#,
+        );
+        let mem_port = serve_once(
+            r#"{"workspaces":[{"id":"_general","name":"General","status":{"entryCount":7}}]}"#,
+        );
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.house.host = "127.0.0.1".to_string();
+        state.house.port = house_port;
+        state.house.auto = false;
+        state.memory.host = "127.0.0.1".to_string();
+        state.memory.port = mem_port;
+        state.memory.auto = false;
+        state.route = Route::House;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("house-board").is_some());
+        // Refresh from the House tab, then drain via shell poll through
+        // `rt.update` (the AppHandle path): external data enters the frame
+        // the same way in tests and in the window.
+        let (x, y) = rt.find("house-refresh").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        let mut waited = 0;
+        while rt.state.house.devices.is_empty() && waited < 500 {
+            rt.update(|s, tx| {
+                shell_poll(s, 0.0, tx);
+            });
+            rt.frame(0.0);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert_eq!(rt.state.house.devices.len(), 1);
+        assert_eq!(rt.state.house.devices[0].state_line, "100%");
+        rt.frame(0.0);
+        assert!(rt.find("house-dev-blind-living-name").is_some());
+        // Memory tab loads its board the same way.
+        let (x, y) = rt.find("tab-memory").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.route, Route::Memory);
+        // Settle frames after the route switch before tapping: hit-testing
+        // lags one commit in stepped headless frames (real windows run
+        // continuously, so hits are always fresh there).
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (x, y) = rt.find("memory-refresh").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        let mut waited = 0;
+        while rt.state.memory.workspaces.is_empty() && waited < 500 {
+            rt.update(|s, tx| {
+                shell_poll(s, 0.0, tx);
+            });
+            rt.frame(0.0);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert_eq!(
+            rt.state.memory.workspaces.len(),
+            1,
+            "memory error: {:?}",
+            rt.state.memory.error
+        );
+        assert_eq!(rt.state.memory.workspaces[0].entries, 7);
+        rt.frame(0.0);
+        assert!(rt.find("memory-ws-_general-name").is_some());
     }
 
     #[test]

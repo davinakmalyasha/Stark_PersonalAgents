@@ -160,10 +160,10 @@ mod tests {
         let file = ToolSpecFile::load(fixture()).expect("tool contract");
 
         assert_eq!(file.contract_version, 4);
-        assert_eq!(file.tool_count, 56);
-        assert_eq!(file.tools.len(), 56);
+        assert_eq!(file.tool_count, 57);
+        assert_eq!(file.tools.len(), 57);
         assert_eq!(file.scope_map.len(), 9);
-        assert_eq!(file.exposed_tools().count(), 48);
+        assert_eq!(file.exposed_tools().count(), 49);
 
         let hidden: BTreeSet<&str> = file
             .tools
@@ -195,8 +195,8 @@ mod tests {
         assert_eq!(file.scope_map["developer"].len(), 17);
         assert_eq!(file.scope_map["coder"].len(), 18);
         assert!(file.scope_map["coder"].contains(&"run_code".to_string()));
-        assert_eq!(file.scope_map["general"].len(), 19);
-        assert_eq!(file.scope_map["house"].len(), 11);
+        assert_eq!(file.scope_map["general"].len(), 20);
+        assert_eq!(file.scope_map["house"].len(), 12);
         assert_eq!(file.scope_map["dfd"].len(), 9);
         assert_eq!(file.scope_map["orchestrator"].len(), 16);
         assert_eq!(file.scope_map["devops"].len(), 7);

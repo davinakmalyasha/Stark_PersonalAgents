@@ -18,6 +18,7 @@ mod memory;
 mod patch;
 mod paths;
 mod permissions;
+mod personal;
 mod plan;
 mod processes;
 mod questions;
@@ -620,9 +621,21 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
         "browser_act" => {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
             match action {
-                "navigate" | "extract" | "screenshot" | "close" | "" => None,
+                "navigate" | "extract" | "screenshot" | "read" | "a11y" | "close" | "" => None,
+                "network" => {
+                    let network_action = args
+                        .get("network_action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("requests");
+                    match network_action {
+                        "requests" | "request" => None,
+                        _ => Some(format!(
+                            "[BLOCKED] Read-only agent cannot use browser_act network_action '{network_action}'. Allowed: requests, request."
+                        )),
+                    }
+                }
                 _ => Some(format!(
-                    "[BLOCKED] Read-only agent cannot use browser_act '{action}'. Allowed: navigate, extract, screenshot, close."
+                    "[BLOCKED] Read-only agent cannot use browser_act '{action}'. Allowed: navigate, extract, screenshot, read, a11y, network (requests/request), close."
                 )),
             }
         }
@@ -647,6 +660,34 @@ pub fn read_only_denial(name: &str, args: &Value, ctx: &ToolContext) -> Option<S
                 )),
                 _ => None,
             }
+        }
+        "personal_os" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let read_action = matches!(
+                action.as_str(),
+                "overview"
+                    | "money_list"
+                    | "money_summary"
+                    | "todo_list"
+                    | "food_summary"
+                    | "training_summary"
+            );
+            if !read_action {
+                return Some(format!(
+                    "[BLOCKED] Read-only agent cannot write personal data ('{action}'). Allowed reads: overview, money_list, money_summary, todo_list, food_summary, training_summary."
+                ));
+            }
+            if ctx.scope == "house" && action.starts_with("money") {
+                return Some(
+                    "[BLOCKED] House may read household context (overview, todo_list, food_summary, training_summary) but not money.".to_string(),
+                );
+            }
+            None
         }
         _ => None,
     }
@@ -803,6 +844,7 @@ pub async fn dispatch(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcom
         "create_docx" => docs::create_docx(ctx, args).await,
         "create_xlsx" => docs::create_xlsx(ctx, args).await,
         "memory" => memory::handle(ctx, args).await,
+        "personal_os" => personal::personal_os(ctx, args).await,
         other => ToolOutcome::err(format!(
             "Error: tool '{other}' is not implemented in the Rust Phase 1 backend"
         )),
@@ -912,7 +954,7 @@ mod tests {
 
         let general = tool_specs_for_scope("build", "general");
         let names = tool_names(&general);
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
@@ -922,6 +964,7 @@ mod tests {
         assert!(names.contains(&"create_docx"));
         assert!(names.contains(&"look_at_screen"));
         assert!(names.contains(&"set_screen_share"));
+        assert!(names.contains(&"personal_os"));
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"read_file"));
         assert!(!names.contains(&"run_command"));
@@ -938,9 +981,10 @@ mod tests {
 
         let house = tool_specs_for_scope("build", "house");
         let names = tool_names(&house);
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"house_set_device"));
         assert!(names.contains(&"house_run_scene"));
+        assert!(names.contains(&"personal_os"));
         assert!(names.contains(&"bash"));
         assert!(!names.contains(&"run_command"));
 
@@ -968,7 +1012,7 @@ mod tests {
         assert!(!names.contains(&"agent"));
         assert_eq!(
             tool_names(&tool_specs_for_scope("build", "agent")).len(),
-            48
+            49
         );
     }
 
@@ -990,6 +1034,50 @@ mod tests {
         let plan_specs = tool_specs_for_scope("plan", "coder");
         let plan = tool_names(&plan_specs);
         assert!(plan.contains(&"run_code"));
+    }
+
+    #[tokio::test]
+    async fn personal_os_dispatch_follows_scope_and_access() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let general = context(dir.path()).with_scope("general");
+        let added = dispatch(
+            "personal_os",
+            &json!({"action": "todo_add", "text": "Water plants"}),
+            &general,
+        )
+        .await;
+        assert!(!added.is_error, "{}", added.content);
+        let overview = dispatch("personal_os", &json!({"action": "overview"}), &general).await;
+        assert!(!overview.is_error, "{}", overview.content);
+        assert!(overview.content.contains("1 open"), "{}", overview.content);
+
+        // House is read-only and never sees money.
+        let house = context(dir.path()).with_scope("house").with_access("read");
+        let read = dispatch("personal_os", &json!({"action": "todo_list"}), &house).await;
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("Water plants"), "{}", read.content);
+        let write = dispatch(
+            "personal_os",
+            &json!({"action": "todo_add", "text": "x"}),
+            &house,
+        )
+        .await;
+        assert!(write.is_error, "{}", write.content);
+        assert!(write.content.contains("[BLOCKED]"), "{}", write.content);
+        let money = dispatch("personal_os", &json!({"action": "money_summary"}), &house).await;
+        assert!(money.is_error, "{}", money.content);
+        assert!(money.content.contains("not money"), "{}", money.content);
+
+        // A scope without personal_os is rejected by the contract.
+        let explore = context(dir.path()).with_scope("explore");
+        let denied = dispatch("personal_os", &json!({"action": "overview"}), &explore).await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied.content.contains("scope contract"),
+            "{}",
+            denied.content
+        );
     }
 
     #[tokio::test]
@@ -1095,6 +1183,31 @@ mod tests {
             )
             .is_none()
         );
+        assert!(read_only_denial("browser_act", &json!({"action": "read"}), &ctx).is_none());
+        assert!(
+            read_only_denial(
+                "browser_act",
+                &json!({"action": "network", "network_action": "requests"}),
+                &ctx
+            )
+            .is_none()
+        );
+        assert!(
+            read_only_denial(
+                "browser_act",
+                &json!({"action": "network", "network_action": "route", "url": "*"}),
+                &ctx
+            )
+            .is_some()
+        );
+        assert!(
+            read_only_denial(
+                "browser_act",
+                &json!({"action": "record", "record_action": "start", "path": "a.webm"}),
+                &ctx
+            )
+            .is_some()
+        );
         assert!(
             read_only_denial("memory", &json!({"action": "remember", "text": "x"}), &ctx).is_some()
         );
@@ -1102,6 +1215,48 @@ mod tests {
             read_only_denial("memory", &json!({"action": "read", "topic": "facts"}), &ctx)
                 .is_none()
         );
+        assert!(read_only_denial("personal_os", &json!({"action": "overview"}), &ctx).is_none());
+        assert!(read_only_denial("personal_os", &json!({"action": "todo_list"}), &ctx).is_none());
+        assert!(
+            read_only_denial("personal_os", &json!({"action": "money_summary"}), &ctx).is_none()
+        );
+        assert!(
+            read_only_denial(
+                "personal_os",
+                &json!({"action": "money_add", "amount": 5}),
+                &ctx
+            )
+            .is_some()
+        );
+        assert!(
+            read_only_denial(
+                "personal_os",
+                &json!({"action": "todo_add", "text": "x"}),
+                &ctx
+            )
+            .is_some()
+        );
+
+        // House reads household context but never money.
+        let house = ToolContext::new(
+            std::path::Path::new("."),
+            "house-chat",
+            Arc::new(QuestionBroker::new()),
+        )
+        .with_access("read")
+        .with_scope("house");
+        for action in ["overview", "todo_list", "food_summary", "training_summary"] {
+            assert!(
+                read_only_denial("personal_os", &json!({"action": action}), &house).is_none(),
+                "house should read {action}"
+            );
+        }
+        for action in ["money_summary", "money_list"] {
+            assert!(
+                read_only_denial("personal_os", &json!({"action": action}), &house).is_some(),
+                "house must not read {action}"
+            );
+        }
     }
 
     #[tokio::test]

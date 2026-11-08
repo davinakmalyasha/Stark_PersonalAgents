@@ -1,6 +1,6 @@
 # 04 — Tool System
 
-63 tools in the contract (`backend-rs/specs/tool-specs.json`), enforced by
+57 tools in the contract (`backend-rs/specs/tool-specs.json`), enforced by
 `stark-contract` tests. The model sees these strings; changing them changes
 behavior.
 
@@ -88,7 +88,8 @@ Denial is a `[BLOCKED] ...` tool result, not a crash.
 - `run_command`: allowed only if `stark_policy::check_read_only` passes —
   no redirection, no substitution, no `sed -i`, no `find -delete`, no package
   installs, git read subcommands only.
-- `browser_act`: only `navigate`, `extract`, `screenshot`, `close`.
+- `browser_act`: only `navigate`, `extract`, `screenshot`, `read`, `a11y`,
+  `close`, and `network` with `network_action=requests|request`.
 - `memory`: reads allowed; `remember`/`forget`/`pin` blocked.
 - `agent`: `spawn`/`send`/`list`/`status`/`report` allowed (orchestration is
   not a write); `merge`/`discard` blocked (they change the tree).
@@ -149,10 +150,11 @@ isolation or read-only subagent default.
 | Delegation | `stark-core::delegation` | `delegate`, `delegation_status`, `job_message`, `job_cancel` |
 | Subagents | `stark-core` run path | `call_subagent` (run/spawn/status/message/stop/list) |
 | Code mode | `codemode` | `run_code` (QuickJS, developer-only) |
-| Browser | `browser` | `browser_act` (via `agent-browser` subprocess) |
+| Browser | `browser` | `browser_act` (via `agent-browser` subprocess, including one-shot MCP calls for `read`, `a11y`, `record`, `network`) |
 | Screen | `screen` | `look_at_screen`, `set_screen_share` |
 | Docs | `docs` | `read_pdf`, `create_docx`, `create_xlsx` |
 | House | `house` | `house_get_state/device/history`, `house_set_device`, `house_run_scene` |
+| Personal OS | `personal` | `personal_os` (money/todo/food/training; General full, House read-only household context, never money) |
 | DFD | `dfd` | `dfd_bridge`, `create_client` |
 | Groups | `stark-core::groups` | `create_group`, `group_board/item_detail/events/update` |
 | Schedules | `stark-core::schedules` | `schedule` |

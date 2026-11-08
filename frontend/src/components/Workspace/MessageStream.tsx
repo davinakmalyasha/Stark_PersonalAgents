@@ -2,6 +2,7 @@ import { Fragment, useRef, useEffect, useMemo, useState } from 'react';
 import { ArrowDown } from 'lucide-react';
 import type { ChatMessage } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
+import { isInternalTransport } from '../../utils/streamPresentation';
 import MessageBubble from './MessageBubble';
 import ConversationRail from './ConversationRail';
 
@@ -108,9 +109,7 @@ export default function MessageStream({ messages, hasActiveChat, onOpenSubagent,
     setScrollDist(0);
   };
 
-  const visibleMessages = messages.filter((message) => !(
-    message.role === 'user' && message.content.trimStart().startsWith('[DELEGATION RESULT]')
-  ));
+  const visibleMessages = messages.filter((message) => !isInternalTransport(message.content));
   const isEmpty = !hasActiveChat && visibleMessages.length <= 1;
 
   // General mode persists the assistant response first and the trace record

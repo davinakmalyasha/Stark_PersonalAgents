@@ -127,6 +127,24 @@ backoff with jitter; stream idle defaults to 300s (`STARK_STREAM_IDLE_TIMEOUT_SE
 replays later items before attaching live. Rollouts are part of the portable
 export.
 
+## Agent runtimes (VPS)
+
+The harness itself needs no language runtime: CI builds `stark-server` and the
+frontend, and the VPS only runs the binary. Delegated agents still need a real
+toolchain for the stacks they build, so install the current versions once:
+
+```bash
+bash scripts/vps-runtimes.sh
+```
+
+That installs Rust stable, Go latest, Node 26 (Lithium), PostgreSQL (tuned for
+a 2GB box), and the Vercel Labs `agent-browser` CLI with Chrome for Testing.
+There is no PHP and no Java on the VPS. Voice STT/TTS stays on the desktop app.
+
+The browser is stateless from the harness's point of view: `browser_act` shells
+out to `agent-browser`, which keeps one Chrome warm between commands and exits
+after an hour idle. Keep it at the stateless budget below on small hosts.
+
 ## Deploy (push to master, drain-safe, auto-rollback)
 
 One-time key setup (public SSH is the deploy transport; the app stays
@@ -274,7 +292,7 @@ due several times during downtime collapses into one run (no burst replay).
 
 ## Limits and guardrails
 
-- `STARK_MAX_CONCURRENT_RUNS` (default 2) — overflow gets HTTP 429, never OOM.
+- `STARK_MAX_CONCURRENT_RUNS` (default 10) — overflow gets HTTP 429, never OOM.
 - `STARK_RUN_IDLE_TIMEOUT_SEC` (default 900) — a provider that stops emitting
   fails the run instead of hanging forever.
 - Drain marker refuses new runs during deploys.

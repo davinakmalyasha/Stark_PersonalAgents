@@ -6,12 +6,12 @@
  *   models/tts/english_18m_2026-10/model.safetensors
  *   models/tts/english_18m_2026-10/tokenizer.json
  *   models/tts/voices/{jarvis,alba,anna}.safetensors
- *   models/stt/tiny-streaming-en/*.ort + tokenizer.bin
+ *   models/stt/medium-streaming-en/*.ort + tokenizer.bin
  *
  * The public TTS weights/tokenizer/catalog voices are downloaded from the non-gated
  * `kyutai/pocket-tts-without-voice-cloning` repository. JARVIS must be exported once with the
- * gated model (see the Rust voice docs); pass it with --jarvis-state. The Moonshine tiny-streaming
- * files are copied from an existing moonshine_voice cache or STARK_STT_MODEL_DIR.
+ * gated model (see the Rust voice docs); pass it with --jarvis-state. The Moonshine
+ * medium-streaming files are copied from an existing moonshine_voice cache or STARK_STT_MODEL_DIR.
  *
  * Node port of the former prepare-voice-models.py: same flags, same layout.
  */
@@ -47,7 +47,6 @@ function parseArgs(argv) {
     jarvisState: null,
     skipTts: false,
     skipStt: false,
-    sttModel: 'medium',
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -57,19 +56,13 @@ function parseArgs(argv) {
     else if (arg.startsWith('--jarvis-state=')) args.jarvisState = path.resolve(arg.slice(15));
     else if (arg === '--skip-tts') args.skipTts = true;
     else if (arg === '--skip-stt') args.skipStt = true;
-    else if (arg === '--stt-model') args.sttModel = argv[++i];
-    else if (arg.startsWith('--stt-model=')) args.sttModel = arg.slice(12);
     else if (arg === '--help' || arg === '-h') {
-      console.log(`usage: prepare-voice-models.mjs [--output DIR] [--jarvis-state FILE] [--skip-tts] [--skip-stt] [--stt-model medium|small|tiny]`);
+      console.log('usage: prepare-voice-models.mjs [--output DIR] [--jarvis-state FILE] [--skip-tts] [--skip-stt]');
       process.exit(0);
     } else {
       console.error(`unknown argument: ${arg}`);
       process.exit(2);
     }
-  }
-  if (!['medium', 'small', 'tiny'].includes(args.sttModel)) {
-    console.error(`invalid --stt-model (expected medium|small|tiny): ${args.sttModel}`);
-    process.exit(2);
   }
   return args;
 }
@@ -185,7 +178,7 @@ async function main() {
     console.error('warning: no --jarvis-state; the default JARVIS voice will not be bundled');
   }
   if (!args.skipStt) {
-    copyStt(args.output, args.sttModel);
+    copyStt(args.output, 'medium');
   }
   console.log(`voice assets ready at ${args.output}`);
 }

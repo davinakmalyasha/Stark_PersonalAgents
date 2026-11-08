@@ -707,6 +707,13 @@ export default function App() {
         refreshActiveChat();
         window.setTimeout(() => setVoiceLiveRun(null), 800);
       }
+      // Dictate mode: STT only, no agent run. Append to the prompt box draft.
+      if (ev?.type === 'dictate' && ev.text) {
+        const dictated = String(ev.text).trim();
+        if (dictated) {
+          setVoiceInputText((prev) => (prev ? prev.replace(/\s+$/, '') + ' ' + dictated : dictated));
+        }
+      }
       // Live input streaming: the overlay streams STT words as they are heard —
       // append them to the chat in real time (one live user bubble).
       if (ev?.type === 'transcript' && ev.text) {

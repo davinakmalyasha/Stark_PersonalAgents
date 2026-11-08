@@ -1241,6 +1241,9 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   ];
   let voice = localStorage.getItem('voice.voice') || 'jarvis';
   let voiceId = localStorage.getItem('voice.idVoice') || 'jarvis';
+  // Dictate mode: STT only, like Hex. No TTS, no agent run; committed turns
+  // accumulate into the main window's prompt box.
+  let dictateMode = localStorage.getItem('voice.dictate') === '1';
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // Rough Indonesian vs English detection (Indonesian stopwords)
@@ -1847,6 +1850,16 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
       if (accumulated && isGarbage(accumulated)) accumulated = '';
       return;
     }
+    // Dictate mode: STT only. Send each committed turn to the prompt box; no
+    // TTS, no agent run, no question answering.
+    if (dictateMode) {
+      accumulated = accumulated ? accumulated + ' ' + text : text;
+      lastLang = detectLanguage(accumulated);
+      setStatus('listening', accumulated.slice(-160));
+      showHint();
+      send('dictate', { text, turnId });
+      return;
+    }
     // A voice-answered question batch owns the next committed turns.
     // Route them to the broker instead of starting a new agent run.
     if (answeringBatch) { collectVoiceAnswer(text); return; }
@@ -1877,6 +1890,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   // speaks each question, and routes the next committed turns to /api/ask/answer
   // instead of starting new agent runs. The main-window modal stays as fallback.
   async function pollVoiceQuestions() {
+    if (dictateMode) return;
     if (!micOn || answeringBatch || !chatId) return;
     try {
       const r = await fetch(API + '/api/ask/pending');
@@ -3368,6 +3382,7 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   }
 
   async function speak(text) {
+    if (dictateMode) return;
     const clean = cleanForTTS(text);
     if (!clean) return;
     lastReply = clean;
@@ -3579,6 +3594,29 @@ body.is-screen .voice-menu button:hover { background: rgba(255, 255, 255, 0.08);
   // ── Voice menu + preview ──
   function renderVoiceMenu() {
     voiceMenu.innerHTML = '';
+    const modeHead = document.createElement('div');
+    modeHead.className = 'voice-menu-head';
+    modeHead.textContent = 'Mode';
+    voiceMenu.appendChild(modeHead);
+    [
+      { id: 'live', label: 'Live — agent + voice' },
+      { id: 'dictate', label: 'Dictate — STT only' },
+    ].forEach((mode) => {
+      const b = document.createElement('button');
+      const active = (mode.id === 'dictate') === dictateMode;
+      b.textContent = mode.label + (active ? '  ✓' : '');
+      b.className = active ? 'active' : '';
+      b.addEventListener('click', () => {
+        dictateMode = mode.id === 'dictate';
+        localStorage.setItem('voice.dictate', dictateMode ? '1' : '0');
+        renderVoiceMenu();
+        voiceMenu.style.display = 'none';
+        if (!micOn && !thinking && !speaking) {
+          setStatus('idle', dictateMode ? 'Dictate mode' : 'Voice: live');
+        }
+      });
+      voiceMenu.appendChild(b);
+    });
     const sections = [
       { label: 'Voices', lang: 'en' },
     ];

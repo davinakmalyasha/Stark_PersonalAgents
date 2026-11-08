@@ -23,7 +23,7 @@ The release bundle contains or links the following components. Keep this file, t
 - Source: https://github.com/moonshine-ai/moonshine and
   https://github.com/ghchinoy/moonshine-rs
 - License: MIT (Moonshine models and the Rust wrapper)
-- Model: tiny-streaming English, quantized
+- Model: medium-streaming English, quantized (245M, 6.65% OpenASR avg)
 
 ## ONNX Runtime
 

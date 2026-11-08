@@ -1,7 +1,7 @@
 {
   "contract_version": 4,
   "source": "DeepSeek Harness standard core (f3803c9) + Codex multi-agent v2 (79be2e2); Developer Pi-simplified v3 surface; workspace registry v4",
-  "tool_count": 56,
+  "tool_count": 57,
   "tools": [
     {
       "name": "bash",
@@ -659,7 +659,7 @@
     },
     {
       "name": "browser_act",
-      "description": "Browser automation: navigate, click, fill, type, press, extract, screenshot, close. Selector = CSS or @ref from the navigate snapshot. Start servers with run_command(background=true) first.",
+      "description": "Browser automation: navigate, click, fill, type, press, extract, screenshot, read, a11y, record, network, close. Selector = CSS or @ref from the navigate snapshot. read returns agent-readable Markdown; a11y runs an axe-core WCAG audit; record captures WebM/MP4 with record_action=start|stop|restart; network inspects or mocks requests with network_action=requests|request|har_start|har_stop|route|unroute. Start servers with run_command(background=true) first.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -673,6 +673,10 @@
               "press",
               "extract",
               "screenshot",
+              "read",
+              "a11y",
+              "record",
+              "network",
               "close"
             ]
           },
@@ -699,7 +703,88 @@
           },
           "path": {
             "type": "string",
-            "description": "Screenshot save path."
+            "description": "Screenshot, recording, or HAR save path."
+          },
+          "record_action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "stop",
+              "restart"
+            ],
+            "description": "Recording action for action=record."
+          },
+          "network_action": {
+            "type": "string",
+            "enum": [
+              "requests",
+              "request",
+              "har_start",
+              "har_stop",
+              "route",
+              "unroute"
+            ],
+            "description": "Network action for action=network."
+          },
+          "request_id": {
+            "type": "string",
+            "description": "Request id for network_action=request."
+          },
+          "filter": {
+            "type": "string",
+            "description": "Read section filter or network request filter."
+          },
+          "method": {
+            "type": "string",
+            "description": "HTTP method filter for network_action=requests."
+          },
+          "status": {
+            "type": "string",
+            "description": "HTTP status filter for network_action=requests."
+          },
+          "resource_type": {
+            "type": "string",
+            "description": "Comma-separated resource types for network route or requests."
+          },
+          "body": {
+            "type": "string",
+            "description": "Mocked response body for network_action=route."
+          },
+          "abort": {
+            "type": "boolean",
+            "description": "Abort matching requests for network_action=route."
+          },
+          "allow_origin": {
+            "type": "string",
+            "description": "Origin allowed to read a mocked body cross-origin."
+          },
+          "tags": {
+            "type": "string",
+            "description": "WCAG tag filter for a11y, e.g. wcag2a,wcag2aa."
+          },
+          "outline": {
+            "type": "boolean",
+            "description": "Return a heading outline instead of full page text."
+          },
+          "raw": {
+            "type": "boolean",
+            "description": "Return the raw response body without extraction."
+          },
+          "llms": {
+            "type": "string",
+            "description": "Read nearest llms data: index or full."
+          },
+          "fps": {
+            "type": "integer",
+            "description": "Recording frame rate, 1-60 (default 30)."
+          },
+          "cursor": {
+            "type": "boolean",
+            "description": "Render a pointer and click ripple in the recording."
+          },
+          "contact_sheet": {
+            "type": "boolean",
+            "description": "Export a timestamped contact-sheet PNG beside the recording."
           }
         },
         "required": [
@@ -978,6 +1063,124 @@
         "action"
       ],
       "doc": "workspace(action, name?, root?, path?, repo?, branch?, workspace_id?, query?) \u2014 Registry primitive: create (mkdir, register path, or git clone via repo), clone (re-clone a missing registered workspace from its stored repo), list, info, remove (unregister only, never deletes files). Dispatch stays in delegate / agent spawn / create_group."
+    },
+    {
+      "name": "personal_os",
+      "description": "Personal OS records for everyday life: money (expenses, income, monthly budgets), todos, food/calories, and training. Local-first JSON store at .deep_agents/personal_os.json \u2014 always use this tool, never edit that file directly. Actions: overview; money_add(amount, kind=expense|income, category, note, date); money_list(month, category, limit); money_summary(month); money_budget_set(amount, category, month); todo_add(text, due, priority=low|normal|high); todo_list(status=open|done|all); todo_done(id); todo_remove(id); food_log(calories, name, date); food_summary(date); training_log(activity, minutes, date, note); training_summary(days). Dates are YYYY-MM-DD, months YYYY-MM, amounts are decimal currency units. Bookkeeping only: this tool never moves money.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "overview",
+              "money_add",
+              "money_list",
+              "money_summary",
+              "money_budget_set",
+              "todo_add",
+              "todo_list",
+              "todo_done",
+              "todo_remove",
+              "food_log",
+              "food_summary",
+              "training_log",
+              "training_summary"
+            ],
+            "description": "Personal OS action."
+          },
+          "amount": {
+            "type": "number",
+            "description": "Money amount in currency units for money_add / money_budget_set (for example 12.50)."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "expense",
+              "income"
+            ],
+            "description": "Transaction kind for money_add (default expense)."
+          },
+          "category": {
+            "type": "string",
+            "description": "Free-form category such as food, transport, rent, salary."
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional short note (max 200 chars)."
+          },
+          "date": {
+            "type": "string",
+            "description": "Date YYYY-MM-DD. Defaults to today."
+          },
+          "month": {
+            "type": "string",
+            "description": "Month YYYY-MM for money_list/money_summary/money_budget_set. Defaults to the current month."
+          },
+          "text": {
+            "type": "string",
+            "description": "Todo text for todo_add (max 500 chars)."
+          },
+          "due": {
+            "type": "string",
+            "description": "Optional due date YYYY-MM-DD for todo_add."
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "low",
+              "normal",
+              "high"
+            ],
+            "description": "Todo priority (default normal)."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "done",
+              "all"
+            ],
+            "description": "Todo filter for todo_list (default open)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Todo id for todo_done / todo_remove, for example todo-1 or 1."
+          },
+          "calories": {
+            "type": "integer",
+            "description": "Calories for food_log (0-20000)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Food name for food_log (default meal)."
+          },
+          "activity": {
+            "type": "string",
+            "description": "Training activity for training_log, for example Run or Weights."
+          },
+          "minutes": {
+            "type": "integer",
+            "description": "Training minutes for training_log (0-1440)."
+          },
+          "days": {
+            "type": "integer",
+            "description": "Lookback window in days for training_summary (default 7)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum rows for money_list / todo_list (default 20, max 200)."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "exposed": true,
+      "required": [
+        "action"
+      ],
+      "doc": "personal_os(action, amount?, kind?, category?, note?, date?, month?, text?, due?, priority?, status?, id?, calories?, name?, activity?, minutes?, days?, limit?) \u2014 local-first money/todo/food/training records; bookkeeping only, never moves money."
     },
     {
       "name": "update_plan",
@@ -2108,7 +2311,8 @@
       "web_fetch",
       "web_search",
       "skill",
-      "tool_search"
+      "tool_search",
+      "personal_os"
     ],
     "house": [
       "house_get_state",
@@ -2121,7 +2325,8 @@
       "ask_user_question",
       "update_plan",
       "agent",
-      "memory"
+      "memory",
+      "personal_os"
     ],
     "dfd": [
       "dfd_bridge",

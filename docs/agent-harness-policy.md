@@ -30,6 +30,51 @@ workspace and is not limited by the Orchestrator's read-only sandbox. The
 Orchestrator prompt says this explicitly so it does not give up when a path is
 outside its own workspace.
 
+## General: personal operator
+
+General handles everyday life: research, writing, admin, personal records,
+signed-in browser tasks, and desktop actions. It does not build software
+(Developer) and does not control devices (House).
+
+Routing:
+
+- Public web → `web_search`, `web_fetch`, `browser_act` (isolated browser, no
+  logins).
+- Signed-in web (Gmail, certificates, portals) → the `browse` MCP server,
+  exposed to `general` only. It drives the user's real browser and tabs. A
+  named session plus `allowedOrigins` limits the sites it can touch. Logins,
+  2FA, captchas, and payments are handed back to the user through browse's
+  `handoff()` and resume only after the user clicks Continue.
+- Desktop apps → the `agent-desktop` MCP server (Vercel Labs, Apache-2.0,
+  native Rust core over Windows UI Automation), exposed to `general` only.
+  `desktop_snapshot` first; act on refs (`@snapshot:ref`), then snapshot again
+  to verify. Refs are snapshot-scoped: `STALE_REF` or `AMBIGUOUS_TARGET` means
+  take a new snapshot. Only ref-based UI tools are enabled; clipboard, traces,
+  notifications, pixel mouse, and key/mouse down/up stay off. Files and
+  processes stay with `bash`.
+- Personal records → `personal_os` (see [personal-os.md](./personal-os.md)).
+  General gets the full surface; House gets read-only household context and
+  never money.
+- Confirmation: `ask_user_question` before sending email/messages, submitting
+  forms, applications, certificate exams, payments, purchases, deletions, or
+  typing into a desktop app. Show the exact recipient/subject/body or amount
+  and payee first.
+- Money is bookkeeping only. No transfers, no card or bank credentials, and no
+  claim that a payment happened.
+- Secrets: never written to memory, files, plans, notes, or tool arguments.
+  2FA and logins stay with the user.
+
+MCP scope is enforced by `stark-tools::mcp` (`scopes` on each server), not just
+by the prompt. A server marked `["general"]` is invisible to every other
+scope, and read-only agents cannot call MCP tools at all.
+
+The versioned example config is
+`backend-rs/specs/mcp-general.example.json`; the live copy is
+`.deep_agents/mcp_servers.json`. Browse is installed with
+`npx @opencode/browse install` (extension + `browse mcp`). Desktop control is
+`npm install -g agent-desktop` followed by `agent-desktop mcp`; the package
+ships its native Rust binary, and no Python or .NET runtime is involved.
+
 ## Tool surface
 
 Legacy names (`read_file`, `edit_file`, `search_code`, `run_command`,
@@ -45,6 +90,7 @@ transcripts. The v2 surface is:
   `close_agent`
 - research: `web_fetch`, `web_search`, `browser_act`
 - memory: `memory`
+- personal: `personal_os` (money/todos/food/training)
 - MCP discovery: `tool_search` (General only; Developer delegates MCP work)
 
 ## Sandbox and approvals
@@ -85,7 +131,21 @@ mutating shell commands stay sequential.
 
 ## Browser budget
 
-`browser_act` is a stateless CLI wrapper. Keep it that way on small machines:
+`browser_act` is a stateless CLI wrapper over Vercel Labs `agent-browser`
+(Apache-2.0, native Rust + CDP). The CLI is installed globally with
+`npm install -g agent-browser@latest`; its versioned skill (`agent-browser
+skills get core`) always matches the installed binary, and Chrome is refreshed
+with `agent-browser install`.
+
+Actions: `navigate`, `click`, `fill`, `type`, `press`, `extract`,
+`screenshot`, `close` use the CLI directly. `read`, `a11y`, `record`, and
+`network` go through `agent-browser mcp call <tool> '<json>'`, which runs one
+MCP tool without a persistent stdio session and returns JSON — a good fit for
+one short process per action. Read-only agents get `read`, `a11y`, and
+`network_action=requests|request`; `record`, `network` routes/HAR, and the
+interaction actions stay write-gated.
+
+Keep it at the stateless budget on small machines:
 
 - 1 GB / 1 CPU: stateless `agent-browser`, one short-lived headless Chromium per
   action; prefer `web_fetch` for static pages and `extract` over screenshots.

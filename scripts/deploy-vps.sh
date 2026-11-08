@@ -91,6 +91,7 @@ STARK_HARNESS_ROOT=/var/lib/stark-data
 STARK_FRONTEND_DIST=/opt/stark/current/frontend
 STARK_HOST=0.0.0.0
 STARK_PORT=8123
+STARK_MAX_CONCURRENT_RUNS=10
 RUST_LOG=stark_server=info,tower_http=info
 EOF
   chown stark:stark /etc/stark/stark.env

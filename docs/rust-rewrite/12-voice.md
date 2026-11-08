@@ -3,7 +3,8 @@
 The voice stack is single-process:
 
 - **TTS**: vendored official Pocket TTS Rust port, 18.2M `english_18m_2026-10` model.
-- **STT**: `moonshine-rs` / `libmoonshine` tiny-streaming.
+- **STT**: `moonshine-rs` / `libmoonshine` medium-streaming (245M, MIT). Tiny
+  and small are no longer bundled or selectable.
 - **Mic capture**: `cpal`, fed directly to Moonshine's streaming API.
 - **Screen**: `/api/voice/ws` + `/api/vision/frame` + the `look_at_screen` / `set_screen_share` tools.
 
@@ -40,7 +41,7 @@ models/
       alba.safetensors
       anna.safetensors
   stt/
-    tiny-streaming-en/
+    medium-streaming-en/
       encoder.ort
       decoder_kv.ort
       frontend.weights.ort
@@ -67,7 +68,7 @@ cargo-xwin build --release -p stark-server --features voice-stt \
 ```
 
 Copy `onnxruntime.dll` (1.26.x preferred) next to `stark-server.exe`. The old 1.17 DLL shipped
-inside the upstream prebuilt archive cannot load the current tiny-streaming models: they request
+inside the upstream prebuilt archive cannot load the current streaming models: they request
 ONNX Runtime API 23.
 
 For the Tauri installer, `prepare-sidecar.mjs` copies the selected backend binary, models, and
@@ -84,6 +85,18 @@ npm run tauri build
 `STARK_MODELS_DIR` wins. Otherwise the server looks for `models`/`resources/models` next to the
 executable or under the harness root. If no models are found, the server still starts and voice
 routes return `503` instead of crashing.
+
+## Dictate mode (STT only)
+
+The overlay has two modes, chosen from the voice menu and persisted in
+`localStorage["voice.dictate"]`:
+
+- **Live** — full duplex: STT → agent run → TTS, plus voice answers to
+  `ask_user`.
+- **Dictate** — Hex-style dictation: STT only. No TTS, no agent run, no question
+  answering. Each committed turn is emitted as a `dictate` bridge event and
+  appended to the main window's prompt draft, so the user reviews and sends it
+  when ready.
 
 ## Voice answers to ask_user
 
@@ -110,5 +123,5 @@ and is also shown during active voice runs. Verified end to end: a blocked
 
 - Rust 18M JARVIS, release, single process: warm **0.64 s**, warm RSS **237 MB**, one sentence
   **0.82 s**, first PCM stream chunk **92 ms**, RSS after streaming **279 MB**.
-- Packaged installer: **131 MB**, including the 18M model, three voice states, Moonshine tiny,
-  ONNX Runtime DLL, and the Rust sidecar.
+- Packaged installer: about 200 MB, including the 18M model, three voice states,
+  Moonshine medium-streaming, ONNX Runtime DLL, and the Rust sidecar.

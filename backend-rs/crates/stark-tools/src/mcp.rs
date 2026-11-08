@@ -157,11 +157,7 @@ impl Transport {
         if config.command.trim().is_empty() {
             return Err("stdio MCP server requires 'command'".to_string());
         }
-        let mut command = if cfg!(windows)
-            && (config.command.eq_ignore_ascii_case("npx")
-                || config.command.eq_ignore_ascii_case("uvx")
-                || config.command.to_ascii_lowercase().ends_with(".cmd"))
-        {
+        let mut command = if needs_cmd_shim(&config.command) {
             let mut command = Command::new("cmd");
             command.arg("/C").arg(&config.command);
             command
@@ -281,6 +277,22 @@ impl Transport {
             Self::Http(_) => {}
         }
     }
+}
+
+/// On Windows, bare command names may resolve to an npm `.cmd` shim rather
+/// than an `.exe`; `CreateProcess` only appends `.exe`, so run those through
+/// `cmd /C`. Absolute `.exe` paths and extension-qualified commands stay
+/// direct.
+fn needs_cmd_shim(command: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        return true;
+    }
+    let path = std::path::Path::new(command);
+    path.extension().is_none() && !path.is_absolute()
 }
 
 fn content_text(result: &Value) -> String {
@@ -1050,6 +1062,23 @@ mod tests {
         assert_eq!(config.tool_timeout_sec, 60.0);
         assert!(valid_name("my-server_1"));
         assert!(!valid_name("bad name"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bare_commands_use_cmd_shim() {
+        assert!(needs_cmd_shim("browse"));
+        assert!(needs_cmd_shim("npx"));
+        assert!(needs_cmd_shim("thing.cmd"));
+        assert!(needs_cmd_shim("thing.bat"));
+        assert!(!needs_cmd_shim(r"C:\tools\browse.exe"));
+        assert!(!needs_cmd_shim(r"C:\tools\node.exe"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_commands_run_directly() {
+        assert!(!needs_cmd_shim("browse"));
     }
 }
 

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
   ArrowUp, AudioLines, Bot, Check, ChevronDown, ChevronUp, CircleAlert, Clock3,
@@ -6,7 +6,9 @@ import {
   Palette, Paperclip, Plus, Square, X,
 } from 'lucide-react';
 import { DropOverlay } from '../components/Workspace/AttachmentDrop';
-import type { ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
+import type { ChatData, ChatSummary, GroupProjectRow, WorkspaceInfo } from '../types';
+import { fetchChat } from '../services/api';
+import { isInternalTransport } from '../utils/streamPresentation';
 import type { BoardAgent } from '../types/board.types';
 import { cleanChatTitle } from '../utils/chatTitle';
 import type { CanvasItem } from './canvasTypes';
@@ -82,6 +84,12 @@ function compactNumber(value?: number): string {
   return String(Math.round(value));
 }
 
+function previewText(chat: ChatSummary): string {
+  const text = chat.lastMessage || '';
+  if (!text || isInternalTransport(text)) return '';
+  return text;
+}
+
 function chatStatus(chat: ChatSummary, running: boolean): CardStatus {
   if (running) return 'running';
   if (chat.status) return chat.status;
@@ -123,6 +131,28 @@ export default function CanvasItemCard({
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState('');
+  const [optimistic, setOptimistic] = useState<Array<{ id: string; text: string; ts: number }>>([]);
+  const [detail, setDetail] = useState<{ key: string; chat: ChatData | null; error: string } | null>(null);
+
+  // Lazy detail fetch: the summary row stays light; expanding loads the
+  // full turn (latest user request + latest answer + counts).
+  const detailKey = item.kind === 'chat' && chat && workspace ? `${workspace.id}:${chat.id}` : '';
+  useEffect(() => {
+    if (!expanded || !detailKey) return;
+    if (detail?.key === detailKey) return;
+    let cancelled = false;
+    const key = detailKey;
+    const separator = key.indexOf(':');
+    const wsId = key.slice(0, separator);
+    const chatId = key.slice(separator + 1);
+    fetchChat(wsId, chatId)
+      .then((full) => { if (!cancelled) setDetail({ key, chat: full, error: '' }); })
+      .catch(() => { if (!cancelled) setDetail({ key, chat: null, error: 'Could not load details.' }); });
+    return () => { cancelled = true; };
+  }, [expanded, detailKey, detail?.key]);
+  const detailChat = detail?.key === detailKey ? detail.chat : null;
+  const detailLoading = expanded && !!detailKey && (!detail || detail.key !== detailKey);
+  const detailError = detail?.key === detailKey ? detail.error : '';
 
   const addFiles = (incoming: FileList | File[]) => {
     const valid = Array.from(incoming).filter((file) => file.size <= 20 * 1024 * 1024);
@@ -134,16 +164,23 @@ export default function CanvasItemCard({
     e.preventDefault();
     const text = draft.trim();
     if ((!text && !files.length) || sending || running || !onSend) return;
+    const body = text || `Attached ${files.length} file${files.length === 1 ? '' : 's'}`;
+    const pending = { id: `opt-${Date.now()}`, text: body, ts: Date.now() };
+    // Optimistic: clear the composer immediately and show our message with
+    // a sent → running transition while the agent works.
+    setDraft('');
+    setFiles([]);
+    setOptimistic((prev) => [...prev.slice(-2), pending]);
     setSending(true);
     setSendError('');
     try {
-      await onSend(text || `Attached ${files.length} file${files.length === 1 ? '' : 's'}`, files);
-      setDraft('');
-      setFiles([]);
+      await onSend(body, files);
     } catch (err) {
       setSendError(err instanceof Error ? err.message : 'Could not send.');
+      setDraft(body);
     } finally {
       setSending(false);
+      setOptimistic((prev) => prev.filter((row) => row.id !== pending.id));
     }
   };
 
@@ -154,14 +191,26 @@ export default function CanvasItemCard({
     ? onCloseTab
     : onRemove;
 
-  const header = (icon: ReactNode, title: string, subtitle: string, status: CardStatus) => (
+  const header = (icon: ReactNode, title: string, subtitle: string, status: CardStatus, titleOpen?: () => void) => (
     <div className="canvas-card-head" data-canvas-drag-handle>
       <GripVertical size={12} className="canvas-card-grip" />
       <span className="canvas-card-icon">{icon}</span>
-      <div className="canvas-card-title-wrap">
-        <div className="canvas-card-title" title={title}>{title}</div>
-        <div className="canvas-card-subtitle" title={subtitle}>{subtitle}</div>
-      </div>
+      {titleOpen ? (
+        <button
+          type="button"
+          className="canvas-card-title-wrap is-link"
+          onClick={(e) => { e.stopPropagation(); titleOpen(); }}
+          title={`Open ${title}`}
+        >
+          <span className="canvas-card-title" title={title}>{title}</span>
+          <span className="canvas-card-subtitle" title={subtitle}>{subtitle}</span>
+        </button>
+      ) : (
+        <div className="canvas-card-title-wrap">
+          <div className="canvas-card-title" title={title}>{title}</div>
+          <div className="canvas-card-subtitle" title={subtitle}>{subtitle}</div>
+        </div>
+      )}
       <StatusChip status={status} />
       {item.kind === 'chat' && (
         <button
@@ -205,7 +254,16 @@ export default function CanvasItemCard({
     const currentTask = activeAgent?.task || visibleAgents.find((agent) => agent.status !== 'idle')?.task || '';
     const status = chatStatus(chat, running);
     const directChildren = childChats.filter((child) => child.id !== chat.id);
-    const hasDetails = visibleAgents.length > 0 || directChildren.length > 0 || hiddenChildren > 0;
+    const preview = previewText(chat);
+
+    const detailMessages = (detailChat?.messages || []).filter(
+      (message) => !isInternalTransport(message.content) && message.content.trim(),
+    );
+    const lastUserTurn = [...detailMessages].reverse().find((message) => message.role === 'user');
+    const lastAnswer = [...detailMessages].reverse().find(
+      (message) => (message.role === 'agent' || message.role === 'error') && !message.metadata?.isTrace,
+    ) || [...detailMessages].reverse().find((message) => message.role === 'agent');
+    const detailMessageCount = detailChat?.messages?.length ?? chat.messageCount ?? 0;
 
     return (
       <div
@@ -224,40 +282,96 @@ export default function CanvasItemCard({
           cleanChatTitle(chat.title),
           workspace.isGeneral ? 'Main workspace' : workspace.name,
           status,
+          onOpen,
         )}
 
         <div className="canvas-card-body">
           {running ? (
             <div className="canvas-card-live">
               <span className="canvas-card-live-dot" />
-              <span className="canvas-card-live-text">{currentTask || chat.lastMessage || 'working…'}</span>
+              <span className="canvas-card-live-text">{currentTask || preview || 'working…'}</span>
               {elapsed && <span className="canvas-card-live-time">{elapsed}</span>}
             </div>
           ) : (
             <div className="canvas-card-preview">
-              {chat.lastMessage || (chat.lastRole === 'error' ? 'Run failed.' : 'No messages yet.')}
+              {preview || (chat.lastRole === 'error' ? 'Run failed.' : 'No messages yet.')}
             </div>
           )}
 
-          <div className="canvas-card-metrics">
-            <span title="Messages"><MessageSquare size={9} />{chat.messageCount || 0}</span>
-            {!!toolCalls && <span title="Tool calls">{toolCalls} tools</span>}
-            {!!tokens && <span title="Tokens">{compactNumber(tokens)} tok</span>}
-            {!!cost && <span title="Cost">${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}</span>}
-            <span className="canvas-card-time"><Clock3 size={9} />{timeAgo(chat.updatedAt)}</span>
-          </div>
+          {optimistic.length > 0 && (
+            <div className="canvas-card-pending">
+              {optimistic.map((row) => (
+                <div key={row.id} className="canvas-card-pending-row">
+                  <span className="canvas-card-pending-you">You</span>
+                  <span className="canvas-card-pending-text">{row.text}</span>
+                  <span className="canvas-card-pending-state">
+                    {sending ? 'Sending…' : running ? 'Running…' : 'Sent'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(!running || expanded) && (
+            <div className="canvas-card-metrics">
+              <span title="Messages"><MessageSquare size={9} />{detailChat?.messages?.length ?? chat.messageCount ?? 0}</span>
+              {!!toolCalls && <span title="Tool calls">{toolCalls} tools</span>}
+              {!!tokens && <span title="Tokens">{compactNumber(tokens)} tok</span>}
+              {!!cost && <span title="Cost">${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}</span>}
+              <span className="canvas-card-time"><Clock3 size={9} />{timeAgo(chat.updatedAt)}</span>
+            </div>
+          )}
         </div>
 
         {expanded && (
           <div className="canvas-card-details">
-            {hasDetails ? (
-              <div className="canvas-card-agent-list">
-                <div className="canvas-card-section-label">
-                  <span>Agents</span>
-                  {(visibleAgents.length + directChildren.length) > 0 && (
-                    <span className="canvas-card-section-count">{visibleAgents.length + directChildren.length}</span>
-                  )}
+            <div className="canvas-card-agent-list">
+              <div className="canvas-card-section-label">
+                <span>Latest request</span>
+              </div>
+              {detailLoading ? (
+                <div className="canvas-card-skeleton">Loading conversation…</div>
+              ) : detailError ? (
+                <div className="canvas-card-empty">{detailError}</div>
+              ) : lastUserTurn ? (
+                <div className="canvas-card-turn is-user">
+                  <span className="canvas-card-turn-role">You</span>
+                  <span className="canvas-card-turn-text">{lastUserTurn.content.slice(0, 500)}</span>
                 </div>
+              ) : (
+                <div className="canvas-card-empty">No user request yet.</div>
+              )}
+              <div className="canvas-card-section-label">
+                <span>Latest response</span>
+              </div>
+              {detailLoading ? (
+                <div className="canvas-card-skeleton">Loading conversation…</div>
+              ) : lastAnswer ? (
+                <div className="canvas-card-turn is-answer">
+                  <span className="canvas-card-turn-role">{lastAnswer.agentName || 'Stark'}</span>
+                  <span className="canvas-card-turn-text">{lastAnswer.content.slice(0, 600) || 'Working…'}</span>
+                </div>
+              ) : (
+                <div className="canvas-card-empty">No response yet.</div>
+              )}
+              <div className="canvas-card-section-label">
+                <span>Detail</span>
+                <span className="canvas-card-section-count">{detailMessageCount}</span>
+              </div>
+              <div className="canvas-card-meta-grid">
+                <span>Model</span><span>{detailChat?.model || chat.model || '—'}</span>
+                <span>Messages</span><span>{detailMessageCount}</span>
+                <span>Tools</span><span>{toolCalls ?? '—'}</span>
+                <span>Tokens</span><span>{tokens ? compactNumber(tokens) : '—'}</span>
+                <span>Cost</span><span>{cost ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}` : '—'}</span>
+                <span>Updated</span><span>{timeAgo(chat.updatedAt) || '—'}</span>
+              </div>
+              <div className="canvas-card-section-label">
+                <span>Agents</span>
+                {(visibleAgents.length + directChildren.length) > 0 && (
+                  <span className="canvas-card-section-count">{visibleAgents.length + directChildren.length}</span>
+                )}
+              </div>
                 {visibleAgents.map((agent) => (
                   <div key={agent.id} className="canvas-card-agent-row">
                     <span className={`canvas-card-agent-dot ${AGENT_DOT[agent.status] || 'bg-zinc-600'} ${agent.isActive ? 'is-live' : ''}`} />
@@ -283,13 +397,10 @@ export default function CanvasItemCard({
                 {hiddenChildren > 0 && (
                   <div className="canvas-card-overflow">+{hiddenChildren} more spawned agents</div>
                 )}
-              </div>
-            ) : (
-              <div className="canvas-card-empty">No child agents in this run.</div>
-            )}
-            <button type="button" onClick={(e) => { e.stopPropagation(); onOpen(); }} className="canvas-card-open">
-              Open chat
-            </button>
+              {visibleAgents.length === 0 && directChildren.length === 0 && hiddenChildren === 0 && (
+                <div className="canvas-card-empty">No child agents in this run.</div>
+              )}
+            </div>
           </div>
         )}
 

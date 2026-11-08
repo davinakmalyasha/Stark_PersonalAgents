@@ -227,7 +227,19 @@ fn session_messages(entries: &[Value]) -> Vec<ChatMessage> {
         }
         let content = entry.get("content").cloned().unwrap_or(Value::Null);
         if role == "user" {
-            messages.push(ChatMessage::user(content_text(&content)));
+            let text = content_text(&content);
+            // Legacy rows persisted internal wake prompts as user messages
+            // ([AGENT/GROUP/DELEGATION RESULT]); never feed them back to the
+            // model as if the user typed them.
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("[DELEGATION RESULT]")
+                || trimmed.starts_with("[AGENT RESULT]")
+                || trimmed.starts_with("[GROUP RESULT]")
+            {
+                seen_message = true;
+                continue;
+            }
+            messages.push(ChatMessage::user(text));
             seen_message = true;
             continue;
         }
@@ -283,8 +295,11 @@ fn content_text(value: &Value) -> String {
     }
 }
 
-fn is_internal_delegation_result(prompt: &str) -> bool {
-    prompt.trim_start().starts_with("[DELEGATION RESULT]")
+fn is_internal_followup(prompt: &str) -> bool {
+    let trimmed = prompt.trim_start();
+    trimmed.starts_with("[DELEGATION RESULT]")
+        || trimmed.starts_with("[AGENT RESULT]")
+        || trimmed.starts_with("[GROUP RESULT]")
 }
 
 async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError> {
@@ -404,7 +419,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
         .plan_state(&ctx.chat_id)
         .await
         .unwrap_or_default();
-    if !is_internal_delegation_result(&prompt) {
+    if !is_internal_followup(&prompt) {
         let user_message_id = ctx
             .store
             .append_message(&ctx.chat_id, "user", &prompt, false)
@@ -1035,7 +1050,7 @@ async fn run_agent_inner(ctx: RunContext, prompt: String) -> Result<(), RunError
                 if !final_text.is_empty() {
                     messages.push(ChatMessage::assistant(&final_text));
                 }
-                if !is_internal_delegation_result(&follow_up) {
+                if !is_internal_followup(&follow_up) {
                     let user_id = ctx
                         .store
                         .append_message(&ctx.chat_id, "user", &follow_up, false)
@@ -3257,6 +3272,33 @@ mod tests {
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(messages[3].content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn internal_followups_are_never_user_visible() {
+        assert!(is_internal_followup("[DELEGATION RESULT] job done"));
+        assert!(is_internal_followup(
+            "[AGENT RESULT] workspace:_general:dev · Developer · completed chat: del-1 4 Review the child result and continue."
+        ));
+        assert!(is_internal_followup(
+            "[GROUP RESULT] project=p item=i (t) status=completed\n\nreport"
+        ));
+        assert!(!is_internal_followup("Hello"));
+        assert!(!is_internal_followup("[TASK] something"));
+    }
+
+    #[test]
+    fn session_messages_skip_legacy_internal_wakes() {
+        let entries = vec![
+            json!({"type": "message", "role": "user", "content": "do the math"}),
+            json!({"type": "message", "role": "user", "content": "[AGENT RESULT] workspace:_general:developer · Developer · completed chat: del-1 4 Review the child result and continue."}),
+            json!({"type": "message", "role": "user", "content": "[GROUP RESULT] project=p item=i (t) status=completed\n\nreport"}),
+            json!({"type": "message", "role": "assistant", "content": "done"}),
+        ];
+        let messages = session_messages(&entries);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_deref(), Some("do the math"));
+        assert_eq!(messages[1].content.as_deref(), Some("done"));
     }
 
     #[test]

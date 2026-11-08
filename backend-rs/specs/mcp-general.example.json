@@ -1,0 +1,61 @@
+{
+  "servers": {
+    "browse": {
+      "command": "browse",
+      "args": [
+        "mcp"
+      ],
+      "scopes": [
+        "general"
+      ],
+      "enabled_tools": [],
+      "disabled_tools": [
+        "secrets_list",
+        "secrets_status",
+        "secrets_refresh",
+        "secrets_run",
+        "settings"
+      ],
+      "approval": "auto",
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120,
+      "instructions": "OpenCode Browse: the user's real signed-in browser via the paired Chromium extension. Use for Gmail, certificates, portals, and any task that needs an existing login or 2FA. Create a named session and restrict allowedOrigins to the sites the task needs. Hand logins/2FA/payments back to the user and wait for Continue. Never paste passwords or one-time codes into tool arguments."
+    },
+    "agent-desktop": {
+      "command": "agent-desktop",
+      "args": [
+        "mcp"
+      ],
+      "scopes": [
+        "general"
+      ],
+      "enabled_tools": [
+        "desktop_snapshot",
+        "desktop_screenshot",
+        "desktop_find",
+        "desktop_get",
+        "desktop_is",
+        "desktop_status",
+        "desktop_click",
+        "desktop_double_click",
+        "desktop_right_click",
+        "desktop_type",
+        "desktop_set_value",
+        "desktop_clear",
+        "desktop_press",
+        "desktop_scroll",
+        "desktop_focus",
+        "desktop_wait",
+        "desktop_launch",
+        "desktop_list_apps",
+        "desktop_list_windows",
+        "desktop_focus_window"
+      ],
+      "disabled_tools": [],
+      "approval": "auto",
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120,
+      "instructions": "Vercel Labs agent-desktop: native Windows UI Automation. Snapshot first, act on refs (@snapshot:ref), re-snapshot to verify. Refs are snapshot-scoped; STALE_REF or AMBIGUOUS_TARGET means take a new snapshot. Prefer ref actions over pixel input. Clipboard, traces, notifications, pixel mouse and key/mouse down/up are deliberately not enabled."
+    }
+  }
+}

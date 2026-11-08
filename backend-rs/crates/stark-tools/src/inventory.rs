@@ -414,6 +414,14 @@ pub const INVENTORY: &[ToolMeta] = &[
         verb: "Recalled memory",
         summary: "recalled memory",
     },
+    ToolMeta {
+        name: "personal_os",
+        plan_write: true,
+        read_blocked: false,
+        program: true,
+        verb: "Used personal OS",
+        summary: "managed personal data",
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static ToolMeta> {

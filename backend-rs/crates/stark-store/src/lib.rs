@@ -233,6 +233,20 @@ impl ChatStore {
         )
         .execute(&self.pool)
         .await?;
+        // One-time cleanup: internal wake prompts were briefly persisted as
+        // user messages ([AGENT/GROUP/DELEGATION RESULT]). They read as if
+        // the user typed them, so delete them and repair message counts.
+        // Idempotent: a no-op once the rows are gone.
+        let _ = sqlx::query(
+            "DELETE FROM messages WHERE role = 'user' AND (content LIKE '[AGENT RESULT]%' OR content LIKE '[GROUP RESULT]%' OR content LIKE '[DELEGATION RESULT]%')",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "UPDATE chats SET message_count = (SELECT COUNT(*) FROM messages WHERE messages.chat_id = chats.id) WHERE EXISTS (SELECT 1 FROM messages WHERE messages.chat_id = chats.id)",
+        )
+        .execute(&self.pool)
+        .await;
         Ok(())
     }
 
@@ -544,6 +558,9 @@ impl ChatStore {
                 SELECT role, content, timestamp, rowid
                 FROM messages
                 WHERE chat_id = ? AND is_trace = 0
+                    AND content NOT LIKE '[AGENT RESULT]%'
+                    AND content NOT LIKE '[GROUP RESULT]%'
+                    AND content NOT LIKE '[DELEGATION RESULT]%'
                 ORDER BY timestamp DESC, rowid DESC
                 LIMIT ?
             )
@@ -566,7 +583,7 @@ impl ChatStore {
 
     pub async fn recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query(
-            "SELECT content FROM messages WHERE role = 'user' AND is_trace = 0 ORDER BY rowid DESC LIMIT ?",
+            "SELECT content FROM messages WHERE role = 'user' AND is_trace = 0 AND content NOT LIKE '[AGENT RESULT]%' AND content NOT LIKE '[GROUP RESULT]%' AND content NOT LIKE '[DELEGATION RESULT]%' ORDER BY rowid DESC LIMIT ?",
         )
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -710,10 +727,13 @@ impl ChatStore {
             SELECT c.id, c.title, c.model, c.created_at, c.updated_at, c.message_count,
                    c.parent_chat_id, c.parent_workspace_id,
                    (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,
                    (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role,
                    (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata
             FROM chats c
             WHERE c.workspace_id = ?
@@ -782,10 +802,13 @@ impl ChatStore {
             SELECT c.id, c.workspace_id, c.workspace_path, c.title, c.model,
                    c.created_at, c.updated_at, c.message_count, c.parent_chat_id,
                    (SELECT m.content FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_message,
                    (SELECT m.role FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_role,
                    (SELECT m.metadata_json FROM messages m WHERE m.chat_id = c.id AND m.role != 'system'
+                    AND m.content NOT LIKE '[AGENT RESULT]%' AND m.content NOT LIKE '[GROUP RESULT]%' AND m.content NOT LIKE '[DELEGATION RESULT]%'
                     ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS last_metadata
             FROM chats c
             ORDER BY c.updated_at DESC
@@ -1937,6 +1960,47 @@ mod tests {
         let raw = tokio::fs::read_to_string(path).await.unwrap();
         assert!(raw.contains("\"type\":\"session\""));
         assert!(raw.contains("\"role\":\"user\""));
+    }
+
+    #[tokio::test]
+    async fn internal_wake_prompts_never_surface_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        store
+            .ensure_chat(
+                "chat-internal",
+                "_general",
+                dir.path().to_string_lossy().as_ref(),
+                "mock",
+                "Hello",
+            )
+            .await
+            .unwrap();
+        // Legacy rows may already exist in the wild; the open-time cleanup
+        // deletes them even when inserted directly.
+        for content in [
+            "Hello",
+            "[AGENT RESULT] workspace:_general:developer · Developer · completed chat: del-1 4 Review the child result and continue.",
+            "[GROUP RESULT] project=p item=i (t) status=completed\n\nreport",
+            "[DELEGATION RESULT] job done",
+        ] {
+            store
+                .append_message("chat-internal", "user", content, false)
+                .await
+                .unwrap();
+        }
+        // Simulate a pre-fix database by re-running the cleanup path.
+        let _ = sqlx::query(
+            "DELETE FROM messages WHERE role = 'user' AND (content LIKE '[AGENT RESULT]%' OR content LIKE '[GROUP RESULT]%' OR content LIKE '[DELEGATION RESULT]%')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let history = store.history("chat-internal", 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "Hello");
+        let prompts = store.recent_user_prompts(10).await.unwrap();
+        assert_eq!(prompts, vec!["Hello"]);
     }
 
     #[tokio::test]

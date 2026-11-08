@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import type { ChatAttachment, ModelOption } from '../../types';
 import { chatAttachmentUrl, fetchProvider, type ProviderInfo } from '../../services/api';
@@ -68,6 +69,81 @@ function RestoredFileThumb({ attachment, workspaceId, chatId }: {
   return <div className="file-chip"><FileText size={16} /></div>;
 }
 
+function UsagePopover({ orbRef, open, onClose, totalCost, totalInput, totalOutput, cacheRate, activeContextTokens, onOpenStats }: {
+  orbRef: React.RefObject<HTMLButtonElement | null>;
+  open: boolean;
+  onClose: () => void;
+  totalCost: number;
+  totalInput: number;
+  totalOutput: number;
+  cacheRate: number;
+  activeContextTokens: number;
+  onOpenStats: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState({ left: 0, top: 0, placement: 'above' as 'above' | 'below', visible: false });
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const rect = orbRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const width = 190;
+      const height = 210;
+      const margin = 8;
+      const left = Math.max(margin, Math.min(rect.right - width, window.innerWidth - width - margin));
+      const aboveTop = rect.top - height - 10;
+      const belowTop = rect.bottom + 10;
+      const placement = aboveTop >= margin ? 'above' : 'below';
+      const top = placement === 'above' ? Math.max(margin, aboveTop) : Math.min(belowTop, window.innerHeight - height - margin);
+      setPos({ left, top, placement, visible: true });
+    };
+    place();
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open, orbRef]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (panelRef.current?.contains(target)) return;
+      if (orbRef.current?.contains(target)) return;
+      onClose();
+    };
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('pointerdown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open, onClose, orbRef]);
+
+  if (!open || typeof document === 'undefined') return null;
+  return createPortal(
+    <div
+      ref={panelRef}
+      className={`usage-popover-portal is-${pos.placement} ${pos.visible ? 'is-visible' : ''}`}
+      style={{ left: pos.left, top: pos.top }}
+      role="dialog"
+      aria-label="Usage"
+    >
+      <div className="usage-popover-title">Usage</div>
+      <div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div>
+      <div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div>
+      <div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div>
+      <div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div>
+      <button type="button" onClick={() => { onClose(); onOpenStats(); }} className="usage-details">View details</button>
+    </div>,
+    document.body,
+  );
+}
+
 export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, onToggleVoice, voiceInputText, onOpenStats, onOpenAgentConfig, totalCost, totalInput, totalOutput, totalCacheHitTokens, activeContextTokens, selectedModel, models = [], onModelChange, draft, draftAttachments, onDraftConsumed, onDraftAttachmentsConsumed, workspaceId, chatId }: Props) {
   const [value, setValue] = useState('');
   const [files, setFiles] = useState<File[]>([]);
@@ -81,6 +157,8 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   const [openMenu, setOpenMenu] = useState<'model' | null>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const [providerInfo, setProviderInfo] = useState<ProviderInfo | null>(null);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const usageOrbRef = useRef<HTMLButtonElement | null>(null);
 
   // The old label was hardcoded to "OpenCode Go" even when the server was on
   // another gateway. Read the live provider from the backend instead.
@@ -237,7 +315,10 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
           </div>
           <div className="flex items-center gap-2">
             <span className="hidden sm:block text-[10px] text-zinc-600">{totalAttachments ? `${totalAttachments} attachment${totalAttachments > 1 ? 's' : ''}` : ''}</span>
-            <div className="usage-control"><button type="button" className="usage-orb" title={`Context ${contextPercent.toFixed(0)}% of 1M`} aria-label={`Context ${contextPercent.toFixed(0)} percent`}><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100`, stroke: contextPercent >= 95 ? '#f87171' : contextPercent >= 85 ? '#fbbf24' : undefined }}/></svg><span style={contextPercent >= 95 ? { color: '#f87171' } : contextPercent >= 85 ? { color: '#fbbf24' } : undefined}>{Math.round(contextPercent)}</span></button><div className="usage-popover"><div className="usage-popover-title">Usage</div><div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div><div className="usage-line"><span>Tokens</span><strong>{(totalInput + totalOutput).toLocaleString()}</strong></div><div className="usage-line"><span>Context</span><strong>{activeContextTokens.toLocaleString()}</strong></div><div className="usage-line"><span>Cache</span><strong>{cacheRate.toFixed(1)}%</strong></div><button type="button" onClick={onOpenStats} className="usage-details">View details</button></div></div>
+            <div className="usage-control" onMouseLeave={() => setUsageOpen(false)}>
+              <button ref={usageOrbRef} type="button" className="usage-orb" title={`Context ${contextPercent.toFixed(0)}% of 1M`} aria-label={`Context ${contextPercent.toFixed(0)} percent`} aria-expanded={usageOpen} aria-haspopup="dialog" onClick={() => setUsageOpen((open) => !open)} onMouseEnter={() => setUsageOpen(true)} onFocus={() => setUsageOpen(true)}><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100`, stroke: contextPercent >= 95 ? '#f87171' : contextPercent >= 85 ? '#fbbf24' : undefined }}/></svg><span style={contextPercent >= 95 ? { color: '#f87171' } : contextPercent >= 85 ? { color: '#fbbf24' } : undefined}>{Math.round(contextPercent)}</span></button>
+              <UsagePopover orbRef={usageOrbRef} open={usageOpen} onClose={() => setUsageOpen(false)} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} cacheRate={cacheRate} activeContextTokens={activeContextTokens} onOpenStats={onOpenStats} />
+            </div>
             <button
               type="button"
               className={`provider-trigger ${providerInfo && (!providerInfo.has_key || providerHealth) ? 'is-warning' : ''}`}

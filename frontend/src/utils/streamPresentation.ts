@@ -226,6 +226,20 @@ function stripFinalAnswerDupes(segments: StreamSegment[], finalText: string): St
  * announcements as clickable delegation cards instead of leaving sentences
  * such as "Created Confucius with the instructions…" in the parent answer.
  */
+/**
+ * Internal wake prompts are transport, never user content. The backend no
+ * longer persists them, but legacy rows and other surfaces can still carry
+ * them — hide them everywhere in the UI.
+ */
+export function isInternalTransport(text: string): boolean {
+  const trimmed = (text || '').trimStart();
+  return (
+    trimmed.startsWith('[DELEGATION RESULT]')
+    || trimmed.startsWith('[AGENT RESULT]')
+    || trimmed.startsWith('[GROUP RESULT]')
+  );
+}
+
 export function stripMailboxEnvelope(text: string): string {
   if (!text) return text;
   let cleaned = text;

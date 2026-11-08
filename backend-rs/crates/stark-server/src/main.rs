@@ -1458,13 +1458,13 @@ Attached files:
             })),
         ));
     }
-    // Concurrency cap: 1GB of RAM cannot host an unbounded number of runs.
-    // Overflow is a clear 429 the client can show, never an OOM kill.
+    // Concurrency cap: bounds parallel runs so a burst degrades into a clear
+    // 429 instead of an OOM kill. Raise STARK_MAX_CONCURRENT_RUNS per host.
     let cap = std::env::var("STARK_MAX_CONCURRENT_RUNS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2);
+        .unwrap_or(10);
     let running = state.runs.running_count();
     if running >= cap {
         return Err((

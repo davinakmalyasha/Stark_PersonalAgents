@@ -167,7 +167,7 @@ graph TD
 ## Features
 
 - Multi-agent orchestration with automatic task routing
-- 63-tool contract (18-tool Developer surface + legacy scopes)
+- 57-tool contract (18-tool Developer surface + legacy scopes)
 - OpenAI-compatible providers with affinity/cache routing
 - Native Rust voice input/output with real-time STT/TTS
 - Tauri desktop application
@@ -408,7 +408,7 @@ graph TD
 ## Features
 
 - Multi-agent orchestration with automatic task routing
-- 63-tool contract (18-tool Developer surface + legacy scopes)
+- 57-tool contract (18-tool Developer surface + legacy scopes)
 - OpenAI-compatible providers with affinity/cache routing
 - Native Rust voice input/output with real-time STT/TTS
 - Tauri desktop application

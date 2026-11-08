@@ -19,11 +19,8 @@ mod imp {
     use moonshine_rs::audio::load_audio_for_transcription;
     use moonshine_rs::{ModelArch, OwnedTranscriberStream, Transcriber};
 
-    const MODELS: &[(&str, &str, ModelArch)] = &[
-        ("medium", "medium-streaming-en", ModelArch::MediumStreaming),
-        ("small", "small-streaming-en", ModelArch::SmallStreaming),
-        ("tiny", "tiny-streaming-en", ModelArch::TinyStreaming),
-    ];
+    const MODEL: (&str, &str, ModelArch) =
+        ("medium", "medium-streaming-en", ModelArch::MediumStreaming);
     const REQUIRED_FILES: &[&str] = &[
         "encoder.ort",
         "decoder_kv.ort",
@@ -42,54 +39,41 @@ mod imp {
 
     impl SttService {
         pub fn load(models_dir: &Path) -> Result<Self> {
-            let requested = std::env::var("STARK_STT_MODEL")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty());
-            let candidates: Vec<&(&str, &str, ModelArch)> = requested
-                .as_deref()
-                .map(|requested| {
-                    MODELS
-                        .iter()
-                        .filter(|(name, _, _)| *name == requested)
-                        .collect()
-                })
-                .unwrap_or_else(|| MODELS.iter().collect());
-            if candidates.is_empty() {
-                anyhow::bail!("unknown STARK_STT_MODEL {requested:?}; use medium, small, or tiny");
+            let (name, dirname, arch) = MODEL;
+            let dir = models_dir.join("stt").join(dirname);
+            if !dir.is_dir() {
+                anyhow::bail!(
+                    "Moonshine medium-streaming model missing at {}; run prepare-voice-models.mjs",
+                    dir.display()
+                );
             }
-
-            let mut errors = Vec::new();
-            for (name, dirname, arch) in candidates {
-                let dir = models_dir.join("stt").join(dirname);
-                let missing: Vec<String> = REQUIRED_FILES
-                    .iter()
-                    .filter(|file| !dir.join(file).is_file())
-                    .map(|file| file.to_string())
-                    .collect();
-                if !missing.is_empty() {
-                    errors.push(format!("{} missing {}", dir.display(), missing.join(", ")));
-                    continue;
-                }
-                match Transcriber::from_files(&dir, *arch, None) {
-                    Ok(transcriber) => {
-                        let keyterms = std::env::var("STARK_STT_KEYTERMS")
-                            .unwrap_or_else(|_| "Stark".to_string());
-                        if !keyterms.trim().is_empty()
-                            && let Err(error) = transcriber.set_keyterms(keyterms.trim())
-                        {
-                            log::warn!("Moonshine keyterms unavailable: {error}");
-                        }
-                        log::info!("Moonshine {name}-streaming loaded from {}", dir.display());
-                        return Ok(Self {
-                            transcriber: Arc::new(transcriber),
-                            model: name,
-                        });
-                    }
-                    Err(error) => errors.push(format!("{name}: {error}")),
-                }
+            let missing: Vec<&str> = REQUIRED_FILES
+                .iter()
+                .copied()
+                .filter(|file| !dir.join(*file).is_file())
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "Moonshine medium-streaming model missing files in {}: {}",
+                    dir.display(),
+                    missing.join(", ")
+                );
             }
-            anyhow::bail!("failed to load Moonshine STT; tried {}", errors.join("; "))
+            let transcriber = Transcriber::from_files(&dir, arch, None).map_err(|error| {
+                anyhow::anyhow!("failed to load Moonshine medium-streaming: {error}")
+            })?;
+            let keyterms =
+                std::env::var("STARK_STT_KEYTERMS").unwrap_or_else(|_| "Stark".to_string());
+            if !keyterms.trim().is_empty()
+                && let Err(error) = transcriber.set_keyterms(keyterms.trim())
+            {
+                log::warn!("Moonshine keyterms unavailable: {error}");
+            }
+            log::info!("Moonshine {name}-streaming loaded from {}", dir.display());
+            Ok(Self {
+                transcriber: Arc::new(transcriber),
+                model: name,
+            })
         }
 
         pub fn model_name(&self) -> &'static str {

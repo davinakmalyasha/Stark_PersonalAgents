@@ -3,7 +3,7 @@ import { Archive, Check, Copy, CircleAlert, Wrench, Terminal, FileText, Search, 
 import type { ArtifactFile, ChatAttachment, ChatMessage, ProjectRef, RunArtifacts, RunStatusNotice } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import type { RetryNotice, StreamSegment } from '../../utils/streamAccum';
-import { presentStream, stripDelegationNarration, stripMailboxEnvelope } from '../../utils/streamPresentation';
+import { presentStream, stripDelegationNarration, stripMailboxEnvelope, isInternalTransport } from '../../utils/streamPresentation';
 import { chatAttachmentUrl, undoRun } from '../../services/api';
 import TraceAccordion from './TraceAccordion';
 import ActivityTimeline from './ActivityTimeline';
@@ -349,6 +349,9 @@ export default function MessageBubble({ message, onOpenSubagent, onOpenSubagentS
   const isError = message.role === 'error';
   const isAgent = message.role === 'agent';
   const isSystem = message.role === 'system';
+  // Belt and suspenders: internal wake prompts must never render as chat,
+  // even if a legacy row slips past the stream filter.
+  if (isInternalTransport(message.content)) return null;
   const eventKind = message.metadata?.kind as string | undefined;
   const isSessionEvent = eventKind === 'compaction' || eventKind === 'aborted';
   const liveStatus = message.metadata?.liveStatus as RunStatusNotice | undefined;

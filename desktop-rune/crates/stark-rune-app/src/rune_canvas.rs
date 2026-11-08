@@ -153,10 +153,6 @@ impl CanvasState {
         }
     }
 
-    pub fn card_mut(&mut self, id: &str) -> Option<&mut MapCard> {
-        self.cards.iter_mut().find(|c| c.id == id)
-    }
-
     pub fn card(&self, id: &str) -> Option<&MapCard> {
         self.cards.iter().find(|c| c.id == id)
     }
@@ -180,7 +176,18 @@ pub fn edge_cubic(parent: &MapCard, child: &MapCard) -> Path {
         .cubic_to([sx, sy + bend], [tx, ty - bend], [tx, ty])
 }
 
-fn card_view(card: &MapCard) -> El {
+/// Host access for views composed into a larger shell.
+pub trait CanvasHost {
+    fn canvas_mut(&mut self) -> &mut CanvasState;
+}
+
+impl CanvasHost for CanvasState {
+    fn canvas_mut(&mut self) -> &mut CanvasState {
+        self
+    }
+}
+
+fn card_view<S: CanvasHost + 'static>(card: &MapCard) -> El {
     let (w, h) = card.size();
     let radius = if card.compact { 16.0 } else { 18.0 };
     let id = card.id.clone();
@@ -241,22 +248,25 @@ fn card_view(card: &MapCard) -> El {
         .px(14.0)
         .pt(14.0)
         .pb(10.0)
-        .on_drag(move |s: &mut CanvasState, drag: &mut Drag, _tx| {
-            let home = s.press_home;
-            let Some(card) = s.card_mut(&drag_id) else {
-                return;
+        .on_drag(move |s: &mut S, drag: &mut Drag, _tx| {
+            // Index, never a held reference: each phase takes its own borrow.
+            let idx = match s.canvas_mut().cards.iter().position(|c| c.id == drag_id) {
+                Some(i) => i,
+                None => return,
             };
             match drag.phase {
                 Phase::Down => {
-                    s.press_home = Some((card.x, card.y));
+                    let c = s.canvas_mut();
+                    c.press_home = Some((c.cards[idx].x, c.cards[idx].y));
                 }
                 Phase::Move | Phase::Up => {
-                    if let Some((hx, hy)) = home {
-                        card.x = hx + drag.dx;
-                        card.y = hy + drag.dy;
+                    let c = s.canvas_mut();
+                    if let Some((hx, hy)) = c.press_home {
+                        c.cards[idx].x = hx + drag.dx;
+                        c.cards[idx].y = hy + drag.dy;
                     }
                     if matches!(drag.phase, Phase::Up) {
-                        s.press_home = None;
+                        c.press_home = None;
                     }
                 }
             }
@@ -300,6 +310,11 @@ fn card_view(card: &MapCard) -> El {
 }
 
 pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
+    canvas_body::<CanvasState>(s)
+}
+
+/// Canvas body shared by the standalone view and the shell.
+pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
     let dot = rune::Color {
         r: 1.0,
         g: 1.0,
@@ -346,7 +361,7 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
             .shape(shape),
     );
     for card in &s.cards {
-        canvas = canvas.child(card_view(card));
+        canvas = canvas.child(card_view::<S>(card));
     }
     // Floating composer, centred over the canvas like `HouseChat`'s dock:
     // 640pt wide, bottom-anchored. Same card as the transcript dock; send
@@ -359,20 +374,22 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
             .child(super::composer::composer_card(
                 &s.model,
                 &s.edit,
-                |s: &mut CanvasState| &mut s.edit,
+                |s: &mut S| &mut s.canvas_mut().edit,
                 s.voice_live,
-                |s: &mut CanvasState| {
-                    s.voice_live = !s.voice_live;
+                |s: &mut S| {
+                    let c = s.canvas_mut();
+                    c.voice_live = !c.voice_live;
                 },
-                |s: &mut CanvasState| {
-                    let prompt = s.edit.text.trim().to_string();
+                |s: &mut S| {
+                    let c = s.canvas_mut();
+                    let prompt = c.edit.text.trim().to_string();
                     if prompt.is_empty() {
                         return;
                     }
-                    s.outbox.push(prompt);
-                    s.edit.text.clear();
-                    s.edit.anchor = 0;
-                    s.edit.focus = 0;
+                    c.outbox.push(prompt);
+                    c.edit.text.clear();
+                    c.edit.anchor = 0;
+                    c.edit.focus = 0;
                 },
             )),
     );
@@ -382,7 +399,10 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
     // Rows key off card ids so the board and the list can never disagree.
     let mut sidebar = col()
         .key("map-sidebar")
-        .size(MAP_SIDEBAR_W, MAP_H)
+        // Fixed width, full row height (never `MAP_H`: the row shares shell
+        // space with the tab bar).
+        .w(MAP_SIDEBAR_W)
+        .h_full()
         .fill(ink("#0f0f0f"))
         .px(16.0)
         .pt(14.0)
@@ -411,8 +431,8 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
             .radius(8.0)
             .px(10.0)
             .py(8.0)
-            .on_press(move |s: &mut CanvasState| {
-                s.active_id = target.clone();
+            .on_press(move |s: &mut S| {
+                s.canvas_mut().active_id = target.clone();
             });
         if active {
             item = item.fill(rune::Color {
@@ -444,7 +464,10 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
     row()
         .key("stark-map")
         .w_full()
-        .h_full()
+        // `grow`, not `h_full`: fills a standalone window and shares a shell
+        // column with the tab bar without overflowing it.
+        .grow(1.0)
+        .min_h(0.0)
         .fill(ink("#0a0a0a"))
         .child(sidebar)
         .child(canvas)

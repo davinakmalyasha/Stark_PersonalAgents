@@ -23,6 +23,8 @@ mod rune_canvas;
 #[cfg(feature = "rune-real")]
 mod rune_transcript;
 #[cfg(feature = "rune-real")]
+mod shell;
+#[cfg(feature = "rune-real")]
 mod stream;
 #[cfg(feature = "rune-real")]
 mod transport;
@@ -414,6 +416,7 @@ fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
     eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
     eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
+    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <map|chat>]  (unified shell PNG)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
 }
 
@@ -483,6 +486,40 @@ fn main() {
             rune_canvas::run_canvas_headless(vec![
                 "--snap".to_string(),
                 png,
+                "--scale".to_string(),
+                "1".to_string(),
+            ]);
+            return;
+        }
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--rune-shell-snap") {
+        #[cfg(not(feature = "rune-real"))]
+        {
+            let _ = pos;
+            eprintln!("--rune-shell-snap needs --features rune-real.");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "rune-real")]
+        {
+            let png = args.get(pos + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--rune-shell-snap <png> is required");
+                std::process::exit(2);
+            });
+            let mut scene = String::from("map");
+            let mut k = 0;
+            while k < args.len() {
+                if args[k] == "--rune-route" && k + 1 < args.len() {
+                    scene = args[k + 1].clone();
+                    k += 2;
+                    continue;
+                }
+                k += 1;
+            }
+            shell::run_shell_headless(vec![
+                "--snap".to_string(),
+                png,
+                "--scene".to_string(),
+                scene,
                 "--scale".to_string(),
                 "1".to_string(),
             ]);

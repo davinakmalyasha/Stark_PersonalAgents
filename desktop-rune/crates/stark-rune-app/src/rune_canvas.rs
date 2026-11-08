@@ -51,6 +51,8 @@ pub struct CanvasState {
     pub press_home: Option<(f32, f32)>,
     pub model: String,
     pub edit: rune::TextEdit,
+    /// Selected chat id; sidebar rows and cards key off the same ids.
+    pub active_id: String,
     /// Prompts staged from the map dock, awaiting run dispatch.
     pub outbox: Vec<String>,
 }
@@ -62,6 +64,7 @@ impl std::fmt::Debug for CanvasState {
             .field("edges", &self.edges)
             .field("model", &self.model)
             .field("edit", &self.edit.text)
+            .field("active_id", &self.active_id)
             .field("outbox", &self.outbox)
             .finish()
     }
@@ -75,6 +78,7 @@ impl Clone for CanvasState {
             press_home: self.press_home,
             model: self.model.clone(),
             edit: self.edit.clone(),
+            active_id: self.active_id.clone(),
             outbox: self.outbox.clone(),
         }
     }
@@ -139,6 +143,7 @@ impl CanvasState {
             press_home: None,
             model: "Automatic Fallback".to_string(),
             edit: rune::TextEdit::new(""),
+            active_id: "chat:ws-general:chat-1".to_string(),
             outbox: Vec::new(),
         }
     }
@@ -363,44 +368,76 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
             )),
     );
 
+    // Sidebar rows mirror the cards: the active chat carries the white-9%
+    // wash (`.house-sidebar-row.is-active`); a press switches selection.
+    // Rows key off card ids so the board and the list can never disagree.
+    let mut sidebar = col()
+        .key("map-sidebar")
+        .size(MAP_SIDEBAR_W, MAP_H)
+        .fill(ink("#0f0f0f"))
+        .px(16.0)
+        .pt(14.0)
+        .gap(8.0)
+        .child(
+            text("General".to_string())
+                .key("map-filter")
+                .font(rune::tok::TextStyle::new(15.0, 600.0))
+                .color(ink("#fafafa")),
+        )
+        .child(
+            text("Search chats...".to_string())
+                .key("map-search")
+                .font(rune::tok::TextStyle::new(12.0, 400.0))
+                .color(ink("#8a8a8a")),
+        );
+    for card in &s.cards {
+        let row_id = format!("side-{}", card.id);
+        let active = card.id == s.active_id;
+        let target = card.id.clone();
+        let mut item = row()
+            .key(row_id)
+            .w_full()
+            .items_center()
+            .gap(8.0)
+            .radius(8.0)
+            .px(10.0)
+            .py(8.0)
+            .on_press(move |s: &mut CanvasState| {
+                s.active_id = target.clone();
+            });
+        if active {
+            item = item.fill(rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.09,
+            });
+        }
+        if card.running {
+            item = item.child(
+                rune::el()
+                    .key(format!("side-{}-dot", card.id))
+                    .size(6.0, 6.0)
+                    .radius(3.0)
+                    .fill(ink("#fafafa")),
+            );
+        }
+        sidebar = sidebar.child(
+            item.child(
+                text(card.title.clone())
+                    .key(format!("side-{}-title", card.id))
+                    .font(rune::tok::TextStyle::new(12.0, 500.0))
+                    .color(ink(if active { "#e4e4e7" } else { "#a1a1aa" })),
+            ),
+        );
+    }
+
     row()
         .key("stark-map")
         .w_full()
         .h_full()
         .fill(ink("#0a0a0a"))
-        .child(
-            col()
-                .key("map-sidebar")
-                .size(MAP_SIDEBAR_W, MAP_H)
-                .fill(ink("#0f0f0f"))
-                .px(16.0)
-                .pt(14.0)
-                .gap(8.0)
-                .child(
-                    text("General".to_string())
-                        .key("map-filter")
-                        .font(rune::tok::TextStyle::new(15.0, 600.0))
-                        .color(ink("#fafafa")),
-                )
-                .child(
-                    text("Search chats...".to_string())
-                        .key("map-search")
-                        .font(rune::tok::TextStyle::new(12.0, 400.0))
-                        .color(ink("#8a8a8a")),
-                )
-                .child(
-                    text("New Chat · 45m".to_string())
-                        .key("map-row-0")
-                        .font(rune::tok::TextStyle::new(12.0, 500.0))
-                        .color(ink("#d4d4d8")),
-                )
-                .child(
-                    text("Use personal_os action=… · 58m".to_string())
-                        .key("map-row-1")
-                        .font(rune::tok::TextStyle::new(12.0, 500.0))
-                        .color(ink("#8a8a8a")),
-                ),
-        )
+        .child(sidebar)
         .child(canvas)
 }
 
@@ -439,6 +476,22 @@ mod tests {
         for key in ["map-composer-float", "composer-card", "composer-send"] {
             assert!(rt.find(key).is_some(), "{key} mounted");
         }
+    }
+
+    #[test]
+    fn sidebar_press_switches_active_chat() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
+        rt.frame(0.0);
+        assert_eq!(rt.state.active_id, "chat:ws-general:chat-1");
+        let target = "side-chat:ws-general:chat-2-title";
+        assert!(rt.find(target).is_some(), "row title mounted");
+        let row = "side-chat:ws-general:chat-2";
+        let (x, y) = rt.find(row).unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.active_id, "chat:ws-general:chat-2");
     }
 
     #[test]

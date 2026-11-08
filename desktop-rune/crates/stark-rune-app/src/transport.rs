@@ -153,6 +153,40 @@ pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, 
     serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
 }
 
+/// Web `fetch` GET returning JSON — the browser twin of [`get_json`].
+/// Same contract; the page talks to the LAN backend over plain HTTP
+/// (default `127.0.0.1:8124`, mirroring the desktop default). CORS is open
+/// server-side (`access-control-allow-origin: *`, verified live).
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_json(path: &str) -> Result<serde_json::Value, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let url = format!("http://127.0.0.1:8124{path}");
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(web_sys::RequestMode::Cors);
+    let request = web_sys::Request::new_with_str_and_init(&url, &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch {path}: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let json = JsFuture::from(resp.json().map_err(|e| format!("json: {e:?}"))?)
+        .await
+        .map_err(|e| format!("body: {e:?}"))?;
+    let text = js_sys::JSON::stringify(&json)
+        .map_err(|e| format!("stringify: {e:?}"))?
+        .as_string()
+        .ok_or("non-string json")?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
 /// Open a connection, send the request, and return a reader past the
 /// response headers plus whether the body is chunked.
 #[cfg(not(target_arch = "wasm32"))]

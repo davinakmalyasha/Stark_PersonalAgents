@@ -2297,11 +2297,15 @@ dependencies = [
 name = "stark-rune-app"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "rune",
  "serde",
  "serde_json",
  "stark-kit",
  "stark-theme",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

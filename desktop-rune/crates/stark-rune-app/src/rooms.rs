@@ -117,6 +117,7 @@ impl HouseSnapshot {
         Self { rooms, devices }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn fetch(host: &str, port: u16) -> Result<Self, String> {
         let v = crate::transport::get_json(host, port, "/api/house/state")?;
         Ok(Self::from_json(&v))
@@ -260,6 +261,7 @@ impl Default for MemoryState {
 }
 
 impl MemoryState {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn fetch(host: &str, port: u16) -> Result<Vec<MemoryWs>, String> {
         let v = crate::transport::get_json(host, port, "/api/memory")?;
         Ok(v.get("workspaces")
@@ -298,15 +300,20 @@ pub fn refresh_house(s: &mut HouseState) {
     s.error = None;
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
-    let (host, port) = (s.host.clone(), s.port);
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::spawn(move || {
-        let _ = tx.send(HouseSnapshot::fetch(&host, port));
-    });
     #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = match crate::transport::fetch_json("/api/house/state").await {
+            Ok(v) => Ok(HouseSnapshot::from_json(&v)),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = tx.send(Err("house refresh is native-only for now".to_string()));
-        let _ = (host, port);
+        let (host, port) = (s.host.clone(), s.port);
+        std::thread::spawn(move || {
+            let _ = tx.send(HouseSnapshot::fetch(&host, port));
+        });
     }
 }
 
@@ -319,15 +326,24 @@ pub fn refresh_memory(s: &mut MemoryState) {
     s.error = None;
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
-    let (host, port) = (s.host.clone(), s.port);
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::spawn(move || {
-        let _ = tx.send(MemoryState::fetch(&host, port));
-    });
     #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = match crate::transport::fetch_json("/api/memory").await {
+            Ok(v) => Ok(v
+                .get("workspaces")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().map(MemoryWs::from_json).collect())
+                .unwrap_or_default()),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = tx.send(Err("memory refresh is native-only for now".to_string()));
-        let _ = (host, port);
+        let (host, port) = (s.host.clone(), s.port);
+        std::thread::spawn(move || {
+            let _ = tx.send(MemoryState::fetch(&host, port));
+        });
     }
 }
 

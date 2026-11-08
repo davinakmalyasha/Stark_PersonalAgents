@@ -17,7 +17,7 @@
 
 use std::borrow::Cow;
 
-use rune::{col, row, spacer, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec};
+use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec};
 use stark_kit::transcript::{TranscriptRow, ESTIMATED_ROW_H};
 
 /// Row content fed to both the pure window math and the Rune view.
@@ -224,105 +224,8 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
                 .color(rune::color::hex("#ededf0").unwrap_or(rune::Color::BLACK)),
         );
     }
-    // Composer card: `.premium-surface` — 145deg graphite gradient, 18px
-    // radius, white-8% hairline, soft drop shadow; input 15px on top, toolbar
-    // (model pill + spacer + white send circle) below. Voice button and live
-    // `text_input` binding arrive next; the placeholder is static text for now.
-    let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-    let composer_card = col()
-        .key("composer-card")
-        .w_full()
-        .radius(18.0)
-        .fill(ink("#101013"))
-        .linear_gradient(
-            145.0 * std::f32::consts::PI / 180.0,
-            [(0.0, ink("#161618fa")), (1.0, ink("#0e0e10fc"))],
-        )
-        .border(
-            1.0,
-            rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.08,
-            },
-        )
-        .shadow(
-            14.0,
-            42.0,
-            rune::Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.34,
-            },
-        )
-        .px(12.0)
-        .pt(10.0)
-        .pb(10.0)
-        .gap(8.0)
-        .child(
-            text(if s.composer.is_empty() {
-                "Ask anything".to_string()
-            } else {
-                s.composer.clone()
-            })
-            .key("composer-input")
-            .font(rune::tok::TextStyle::new(15.0, 400.0))
-            .wrap()
-            .color(ink("#74747d")),
-        )
-        .child(
-            row()
-                .key("composer-toolbar")
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .child(
-                    row()
-                        .key("model-pill")
-                        .items_center()
-                        .gap(6.0)
-                        .radius(9.0)
-                        .fill(rune::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.04,
-                        })
-                        .px(8.0)
-                        .py(6.0)
-                        .child(
-                            rune::el()
-                                .key("model-dot")
-                                .size(6.0, 6.0)
-                                .radius(3.0)
-                                .fill(ink("#aa8dff")),
-                        )
-                        .child(
-                            text(s.model.clone())
-                                .key("model-name")
-                                .font(rune::tok::TextStyle::new(11.0, 500.0))
-                                .color(ink("#c9c9d1")),
-                        ),
-                )
-                .child(spacer())
-                .child(
-                    rune::el()
-                        .key("composer-send")
-                        .role("button")
-                        .label("Send")
-                        .size(34.0, 34.0)
-                        .radius(17.0)
-                        .fill(ink("#ffffff"))
-                        .center()
-                        .child(
-                            text("↑".to_string())
-                                .font(rune::tok::TextStyle::new(16.0, 650.0))
-                                .color(ink("#111113")),
-                        ),
-                ),
-        );
+    // Composer card: shared `.premium-surface` dock (see `composer.rs`).
+    let composer_card = super::composer::composer_card(&s.model, &s.composer);
     root.child(
         rune::el()
             .key("composer-dock")

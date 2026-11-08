@@ -17,6 +17,8 @@ use stark_kit::{draft_id, Role};
 use stark_theme::{color, layout};
 
 #[cfg(feature = "rune-real")]
+mod composer;
+#[cfg(feature = "rune-real")]
 mod rune_canvas;
 #[cfg(feature = "rune-real")]
 mod rune_transcript;

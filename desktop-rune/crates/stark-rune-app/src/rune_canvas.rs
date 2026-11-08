@@ -49,6 +49,8 @@ pub struct CanvasState {
     pub cards: Vec<MapCard>,
     pub edges: Vec<(String, String)>,
     pub press_home: Option<(f32, f32)>,
+    pub model: String,
+    pub composer: String,
 }
 
 impl CanvasState {
@@ -98,6 +100,8 @@ impl CanvasState {
                 "chat:ws-general:chat-3".to_string(),
             )],
             press_home: None,
+            model: "Automatic Fallback".to_string(),
+            composer: String::new(),
         }
     }
 
@@ -247,6 +251,15 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
     for card in &s.cards {
         canvas = canvas.child(card_view(card));
     }
+    // Floating composer, centred over the canvas like `HouseChat`'s dock:
+    // 640pt wide, bottom-anchored. Same card as the transcript dock.
+    canvas = canvas.child(
+        rune::el()
+            .key("map-composer-float")
+            .absolute((MAP_W - MAP_SIDEBAR_W - 640.0) / 2.0, MAP_H - 128.0)
+            .w(640.0)
+            .child(super::composer::composer_card(&s.model, &s.composer)),
+    );
 
     row()
         .key("stark-map")
@@ -321,6 +334,9 @@ mod tests {
         }
         let (rect, _) = rt.presented("chat:ws-general:chat-1").unwrap();
         assert!((rect[3] - 420.0).abs() < 2.0, "full card height 420");
+        for key in ["map-composer-float", "composer-card", "composer-send"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
     }
 
     #[test]

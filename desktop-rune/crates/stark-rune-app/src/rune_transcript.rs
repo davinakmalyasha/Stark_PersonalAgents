@@ -36,6 +36,8 @@ pub struct RuneTranscriptState {
     pub live: bool,
     pub api_host: String,
     pub api_port: u16,
+    /// Settings sheet visibility.
+    pub settings_open: bool,
     /// Frames streamed from the run thread, drained by the `poll` hook.
     /// `None` on clone: a copied state never inherits a live socket.
     pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
@@ -51,6 +53,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("live", &self.live)
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
+            .field("settings_open", &self.settings_open)
             .field("inbox", &self.inbox.is_some())
             .finish()
     }
@@ -66,6 +69,7 @@ impl Clone for RuneTranscriptState {
             live: self.live,
             api_host: self.api_host.clone(),
             api_port: self.api_port,
+            settings_open: self.settings_open,
             inbox: None,
         }
     }
@@ -96,6 +100,7 @@ impl RuneTranscriptState {
             live: true,
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
+            settings_open: false,
             inbox: None,
         }
     }
@@ -129,6 +134,7 @@ impl RuneTranscriptState {
             live: false,
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
+            settings_open: false,
             inbox: None,
         }
     }
@@ -292,12 +298,30 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         .h_full()
         .fill(bg())
         .child(
-            text(s.title.clone())
-                .key("transcript-title")
+            row()
+                .key("transcript-head")
+                .w_full()
+                .items_center()
                 .px(16.0)
                 .pt(14.0)
                 .pb(10.0)
-                .color(rune::color::hex("#f2f2f5").unwrap_or(rune::Color::BLACK)),
+                .child(
+                    text(s.title.clone())
+                        .key("transcript-title")
+                        .grow(1.0)
+                        .color(rune::color::hex("#f2f2f5").unwrap_or(rune::Color::BLACK)),
+                )
+                .child(
+                    text("Settings".to_string())
+                        .key("settings-open")
+                        .role("button")
+                        .label("Open settings")
+                        .font(rune::tok::TextStyle::new(11.0, 500.0))
+                        .color(rune::color::hex("#8a8a93").unwrap_or(rune::Color::BLACK))
+                        .on_press(|s: &mut RuneTranscriptState| {
+                            s.settings_open = true;
+                        }),
+                ),
         )
         .child(viewport);
     if s.live {
@@ -318,7 +342,7 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         |s: &mut RuneTranscriptState| &mut s.edit,
         stage_send,
     );
-    root.child(
+    root = root.child(
         rune::el()
             .key("composer-dock")
             .w_full()
@@ -326,7 +350,97 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
             .pt(6.0)
             .pb(14.0)
             .child(composer_card),
-    )
+    );
+    if s.settings_open {
+        root = root.child(settings_sheet(s));
+    }
+    root
+}
+
+/// Settings sheet: dim backdrop + centred card, focus-trapped while mounted.
+/// Backdrop press and Escape both dismiss (Rune `modal` machinery).
+fn settings_sheet(s: &RuneTranscriptState) -> El {
+    let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
+    let label = rune::tok::TextStyle::new(12.0, 500.0);
+    let value = rune::tok::TextStyle::new(12.0, 400.0);
+    let setting_row = |key: &str, name: &str, val: String| {
+        row()
+            .key(format!("settings-row-{key}"))
+            .w_full()
+            .items_center()
+            .py(9.0)
+            .child(
+                text(name.to_string())
+                    .key(format!("settings-{key}-label"))
+                    .grow(1.0)
+                    .font(label)
+                    .color(ink("#a1a1aa")),
+            )
+            .child(
+                text(val)
+                    .key(format!("settings-{key}-value"))
+                    .font(value)
+                    .color(ink("#e4e4e7")),
+            )
+    };
+    rune::el()
+        .key("settings-overlay")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(rune::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.6,
+        })
+        .center()
+        .modal(true, |s: &mut RuneTranscriptState| {
+            s.settings_open = false;
+        })
+        .child(
+            col()
+                .key("settings-card")
+                .w(380.0)
+                .radius(16.0)
+                .fill(ink("#141417"))
+                .border(1.0, ink("#ffffff14"))
+                .px(20.0)
+                .pt(16.0)
+                .pb(16.0)
+                .gap(4.0)
+                .child(
+                    row()
+                        .key("settings-head")
+                        .w_full()
+                        .items_center()
+                        .child(
+                            text("Settings".to_string())
+                                .key("settings-title")
+                                .grow(1.0)
+                                .font(rune::tok::TextStyle::new(13.0, 700.0))
+                                .color(ink("#f4f4f5")),
+                        )
+                        .child(
+                            text("×".to_string())
+                                .key("settings-close")
+                                .role("button")
+                                .label("Close settings")
+                                .font(rune::tok::TextStyle::new(14.0, 400.0))
+                                .color(ink("#8a8a93"))
+                                .on_press(|s: &mut RuneTranscriptState| {
+                                    s.settings_open = false;
+                                }),
+                        ),
+                )
+                .child(setting_row("model", "Model", s.model.clone()))
+                .child(setting_row("theme", "Theme", "Dark".to_string()))
+                .child(setting_row(
+                    "backend",
+                    "Backend",
+                    format!("{}:{}", s.api_host, s.api_port),
+                )),
+        )
 }
 
 fn init_screenshot() -> RuneTranscriptState {
@@ -339,6 +453,11 @@ fn apply_screenshot(s: &mut RuneTranscriptState) {
 
 fn apply_stress(s: &mut RuneTranscriptState) {
     *s = RuneTranscriptState::stress();
+}
+
+fn apply_settings(s: &mut RuneTranscriptState) {
+    *s = RuneTranscriptState::screenshot();
+    s.settings_open = true;
 }
 
 /// `poll` hook: drain run frames queued by the transport thread into rows.
@@ -377,7 +496,11 @@ pub fn spec() -> AppSpec<RuneTranscriptState> {
         w.start == 0 && w.end == rows.len()
     });
     AppSpec {
-        scenes: &[("screenshot", apply_screenshot), ("stress", apply_stress)],
+        scenes: &[
+            ("screenshot", apply_screenshot),
+            ("stress", apply_stress),
+            ("settings", apply_settings),
+        ],
         poll: Some(drain_run_inbox),
         ..AppSpec::new(
             "Stark Transcript",
@@ -517,6 +640,50 @@ mod tests {
         assert!(!s.live);
         assert!(s.inbox.is_none(), "dead inbox dropped");
         assert!(!drain_run_inbox(&mut s, 1.0, &mut run_tx));
+    }
+
+    #[test]
+    fn settings_opens_closes_and_traps_background() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(
+            RuneTranscriptState::screenshot(),
+            transcript_view,
+            (468.0, 720.0),
+            env,
+        );
+        rt.frame(0.0);
+        assert!(rt.find("settings-card").is_none());
+        // Open from the title bar.
+        let (x, y) = rt.find("settings-open").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(rt.state.settings_open);
+        for key in ["settings-card", "settings-title", "settings-close"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        // Background is inert: tapping send dismisses the sheet (backdrop)
+        // instead of staging a row.
+        let n = rt.state.rows.len();
+        let (sx, sy) = rt.find("composer-send").unwrap();
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        rt.frame(0.0);
+        assert!(!rt.state.settings_open, "backdrop press dismisses");
+        assert_eq!(rt.state.rows.len(), n, "no row staged behind the modal");
+        // Reopen, then Escape dismisses via the modal machinery.
+        let (x, y) = rt.find("settings-open").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(rt.state.settings_open);
+        rt.key(KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert!(!rt.state.settings_open, "Escape dismisses");
     }
 
     #[test]

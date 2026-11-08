@@ -412,7 +412,7 @@ fn xml_escape(s: &str) -> String {
 
 fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
-    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
+    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
     eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
 }

@@ -124,7 +124,7 @@ function FileRail({ session, files, loading, activeFile, onOpenFile, onRefresh, 
 
   if (collapsed) {
     return (
-      <div className="w-10 shrink-0 border-r house-hairline bg-[#0d0d11]/70 flex flex-col items-center py-2 gap-1.5">
+      <div className="w-10 shrink-0 border-r house-hairline bg-[#0d0d0d]/70 flex flex-col items-center py-2 gap-1.5">
         <button onClick={onToggleCollapsed} title="Show explorer" className="grid place-items-center w-7 h-7 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.07] cursor-pointer">
           <PanelRightOpen size={14} className="rotate-180" />
         </button>
@@ -136,7 +136,7 @@ function FileRail({ session, files, loading, activeFile, onOpenFile, onRefresh, 
   }
 
   return (
-    <aside className="w-[236px] shrink-0 border-r house-hairline bg-[#0d0d11]/70 backdrop-blur-sm flex flex-col min-h-0">
+    <aside className="w-[236px] shrink-0 border-r house-hairline bg-[#0d0d0d]/70 backdrop-blur-sm flex flex-col min-h-0">
       <div className="flex items-center gap-1.5 px-2.5 pt-2.5 pb-2 shrink-0">
         <Code2 size={13} className="text-zinc-400 shrink-0" />
         <span className="flex-1 min-w-0 truncate text-[12px] font-semibold text-zinc-200" title={session.workspacePath || session.workspaceName}>
@@ -235,7 +235,7 @@ function EditorPane({ openFiles, activeFile, content, loading, onActivateFile, o
               onClick={() => onActivateFile(path)}
               title={path}
               className={`group flex items-center gap-1.5 pl-3 pr-1.5 border-r house-hairline cursor-pointer select-none shrink-0 max-w-[190px] transition-colors ${
-                isActive ? 'bg-[#111116] text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.03]'
+                isActive ? 'bg-[#111111] text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.03]'
               }`}
             >
               <FileText size={11} className={isActive ? 'text-zinc-400' : 'text-zinc-600'} />
@@ -307,7 +307,7 @@ function ActivityPanel({ steps, artifacts, terminalLog, isRunning, collapsed, on
 
   if (collapsed) {
     return (
-      <div className="w-10 shrink-0 border-l house-hairline bg-[#0d0d11]/70 flex flex-col items-center py-2 gap-1.5">
+      <div className="w-10 shrink-0 border-l house-hairline bg-[#0d0d0d]/70 flex flex-col items-center py-2 gap-1.5">
         <button onClick={onToggleCollapsed} title="Show agent activity" className="grid place-items-center w-7 h-7 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.07] cursor-pointer">
           <PanelLeftOpen size={14} className="rotate-180" />
         </button>
@@ -318,7 +318,7 @@ function ActivityPanel({ steps, artifacts, terminalLog, isRunning, collapsed, on
   const files: ArtifactFile[] = artifacts?.files ?? [];
 
   return (
-    <aside className="w-[300px] shrink-0 border-l house-hairline bg-[#0d0d11]/70 backdrop-blur-sm flex flex-col min-h-0">
+    <aside className="w-[300px] shrink-0 border-l house-hairline bg-[#0d0d0d]/70 backdrop-blur-sm flex flex-col min-h-0">
       <div className="flex items-center gap-0.5 px-2 pt-2 pb-1.5 border-b house-hairline shrink-0">
         {(['activity', 'diff', 'terminal'] as ActivityTab[]).map((t) => (
           <button
@@ -544,7 +544,7 @@ export default function CodingIDE({ session, runner, isGlobalRunning, onCloseIde
       />
 
       {/* Docked chat panel — same HouseChat chrome as the home card, on the right. */}
-      <aside className="w-[380px] shrink-0 border-l house-hairline bg-[#0f0f13] flex flex-col min-h-0 overflow-hidden">
+      <aside className="w-[380px] shrink-0 border-l house-hairline bg-[#0f0f0f] flex flex-col min-h-0 overflow-hidden">
         <HouseChat
           variant="ide-panel"
           title={session.title}
@@ -585,7 +585,7 @@ export default function CodingIDE({ session, runner, isGlobalRunning, onCloseIde
 
       {/* Quick "new file hint" when the project is completely empty */}
       {files.length === 0 && !filesLoading && openFiles.length === 0 && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full border house-hairline bg-[#101014]/85 backdrop-blur text-[11px] text-zinc-400 select-none pointer-events-none">
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 py-1.5 rounded-full border house-hairline bg-[#101010]/85 backdrop-blur text-[11px] text-zinc-400 select-none pointer-events-none">
           <Plus size={11} />
           Empty project — describe what to build in the chat panel
         </div>

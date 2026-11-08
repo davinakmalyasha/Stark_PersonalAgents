@@ -378,7 +378,7 @@ export default function HouseSidebar({
             {pinned && <Pin size={10} className="text-zinc-500 shrink-0 rotate-45" />}
             {showWs && !spawned && <span className="text-[9.5px] text-zinc-600 shrink-0 truncate max-w-[64px]">{row.ws.name}</span>}
             <span className="text-[10px] text-zinc-600 flex-shrink-0 tabular-nums">{relativeTime(row.updatedAt)}</span>
-            <div className="absolute right-1 hidden group-hover:flex items-center gap-0.5 bg-[#18181d] rounded-md border border-white/[0.06] px-0.5 py-0.5">
+            <div className="absolute right-1 hidden group-hover:flex items-center gap-0.5 bg-[#181818] rounded-md border border-white/[0.06] px-0.5 py-0.5">
               <button
                 title={pinned ? 'Unpin' : 'Pin'}
                 onClick={(e) => { e.stopPropagation(); onTogglePin(row.sid); }}
@@ -726,8 +726,8 @@ export default function HouseSidebar({
       <aside
         className={`house-sidebar-panel flex flex-col select-none ${
           persistent
-            ? 'relative inset-auto z-10 w-[248px] shrink-0 bg-[#0f0f13] border-r house-hairline'
-            : `fixed inset-y-0 left-0 z-50 w-[248px] bg-[#0f0f13] border-r house-hairline transition-transform duration-300 ease-out ${
+            ? 'relative inset-auto z-10 w-[248px] shrink-0 bg-[#0f0f0f] border-r house-hairline'
+            : `fixed inset-y-0 left-0 z-50 w-[248px] bg-[#0f0f0f] border-r house-hairline transition-transform duration-300 ease-out ${
               open ? 'translate-x-0' : '-translate-x-full'
             }`
         }`}
@@ -756,7 +756,7 @@ export default function HouseSidebar({
                 <div
                   role="menu"
                   aria-label="Chat mode"
-                  className="absolute left-0 top-[calc(100%+6px)] z-50 w-[248px] rounded-xl border border-white/[0.09] bg-[#15151a] shadow-2xl overflow-hidden"
+                  className="absolute left-0 top-[calc(100%+6px)] z-50 w-[248px] rounded-xl border border-white/[0.09] bg-[#151515] shadow-2xl overflow-hidden"
                 >
                   {(['general', 'coding', 'house'] as const).map((key) => {
                     const active = modeOf(chatsFilter) === key;

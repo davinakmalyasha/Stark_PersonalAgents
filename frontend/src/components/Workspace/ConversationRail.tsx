@@ -108,18 +108,24 @@ export default function ConversationRail({ messages, scrollRef, contentRef }: Pr
   const activeIndex = markers.findIndex((marker) => marker.id === hovered);
   const active = activeIndex >= 0 ? markers[activeIndex] : null;
 
+  // Keep the six dashes as one compact stack instead of stretching them down
+  // the full chat height. 14px spacing reads like a single timeline pill.
+  const markerTop = (index: number) => {
+    const offset = (index - (markers.length - 1) / 2) * 14;
+    return `calc(50% + ${offset}px)`;
+  };
+
   return (
     <div className="conversation-rail" aria-label="Turn timeline">
       <div className="conversation-rail-marks">
         {markers.map((marker, index) => {
           const isActive = marker.id === hovered;
-          const top = markers.length === 1 ? 50 : 10 + (index / (markers.length - 1)) * 80;
           return (
             <button
               key={`${marker.id}-${index}`}
               type="button"
               className={`conversation-rail-mark is-${marker.role} ${isActive ? 'is-active' : ''}`}
-              style={{ top: `${top}%` }}
+              style={{ top: markerTop(index) }}
               onPointerEnter={() => setHovered(marker.id)}
               onPointerLeave={() => setHovered((current) => (current === marker.id ? null : current))}
               onFocus={() => setHovered(marker.id)}
@@ -135,7 +141,7 @@ export default function ConversationRail({ messages, scrollRef, contentRef }: Pr
       {active && (
         <div
           className="conversation-rail-preview"
-          style={{ top: `${markers.length === 1 ? 50 : 10 + (activeIndex / (markers.length - 1)) * 80}%` }}
+          style={{ top: markerTop(activeIndex) }}
           role="tooltip"
         >
           <div className="conversation-rail-preview-head">

@@ -97,7 +97,7 @@ export default function HouseProjectsPanel({
             >
               <span className="relative grid place-items-center w-9 h-9 flex-none rounded-xl border border-white/[0.075] bg-white/[0.035] text-[10px] font-bold text-zinc-300">
                 {initials(title)}
-                <span className={`absolute -right-0.5 -bottom-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0f0f13] ${dot(project.status, waiting)}`} />
+                <span className={`absolute -right-0.5 -bottom-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0f0f0f] ${dot(project.status, waiting)}`} />
               </span>
               <span className="min-w-0 flex-1">
                 <span className="flex items-baseline gap-2">

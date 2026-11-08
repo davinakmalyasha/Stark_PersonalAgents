@@ -1,3 +1,5 @@
 # Build output never committed: regenerate with desktop-rune/web/build.sh.
 web/pkg/
 target/
+# Release packages: regenerate with desktop-rune/packaging/package.sh.
+dist/

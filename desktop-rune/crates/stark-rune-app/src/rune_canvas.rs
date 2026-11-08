@@ -374,13 +374,13 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             .child(super::composer::composer_card(
                 &s.model,
                 &s.edit,
-                |s: &mut S| &mut s.canvas_mut().edit,
+                move |s: &mut S| &mut s.canvas_mut().edit,
                 s.voice_live,
-                |s: &mut S| {
+                move |s: &mut S| {
                     let c = s.canvas_mut();
                     c.voice_live = !c.voice_live;
                 },
-                |s: &mut S| {
+                move |s: &mut S| {
                     let c = s.canvas_mut();
                     let prompt = c.edit.text.trim().to_string();
                     if prompt.is_empty() {

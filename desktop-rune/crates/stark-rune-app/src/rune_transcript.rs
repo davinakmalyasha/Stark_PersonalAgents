@@ -327,28 +327,35 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
 
 /// Host access for views composed into a larger shell: handlers stay typed to
 /// the shell state while reading transcript data. The standalone transcript
-/// view hosts itself.
+/// view hosts itself. Threads (`Main` chat vs `Personal` room) select which
+/// transcript a composed view reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thread {
+    Main,
+    Personal,
+}
+
 pub trait TranscriptHost {
-    fn transcript(&self) -> &RuneTranscriptState;
-    fn transcript_mut(&mut self) -> &mut RuneTranscriptState;
+    fn thread(&self, which: Thread) -> &RuneTranscriptState;
+    fn thread_mut(&mut self, which: Thread) -> &mut RuneTranscriptState;
 }
 
 impl TranscriptHost for RuneTranscriptState {
-    fn transcript(&self) -> &RuneTranscriptState {
+    fn thread(&self, _which: Thread) -> &RuneTranscriptState {
         self
     }
-    fn transcript_mut(&mut self) -> &mut RuneTranscriptState {
+    fn thread_mut(&mut self, _which: Thread) -> &mut RuneTranscriptState {
         self
     }
 }
 
 pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>) -> El {
-    transcript_body::<RuneTranscriptState>(s)
+    transcript_body::<RuneTranscriptState>(s, Thread::Main)
 }
 
 /// Transcript body shared by the standalone view and the shell: rows read
-/// `s`, handlers resolve through `S: TranscriptHost`.
-pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> El {
+/// `s`, handlers resolve through `S: TranscriptHost` for `which` thread.
+pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
     // Index-built rows: layout builds only the mounted window (viewport + up to
     // two viewports either side), so a 10k transcript commits in window time.
     // Handlers must find items by key, never by index (see `RowSource` docs).
@@ -364,9 +371,9 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> 
             ESTIMATED_ROW_H,
             // Typed to the window state `S` (Rune checks the registration):
             // read rows through the host, never by closing over `s`.
-            |s: &S, i| Cow::Borrowed(s.transcript().rows[i].key.as_str()),
-            |s: &S, i| {
-                let r = &s.transcript().rows[i];
+            move |s: &S, i| Cow::Borrowed(s.thread(which).rows[i].key.as_str()),
+            move |s: &S, i| {
+                let r = &s.thread(which).rows[i];
                 // Role palette from `canvas.css` `.canvas-bubble*`: user
                 // #28282f, agent #19191e, error rose, system quiet; 22px
                 // avatars, 11px/650 name headers, 12.5px wrapped bodies.
@@ -469,8 +476,8 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> 
                         .label("Open settings")
                         .font(rune::tok::TextStyle::new(11.0, 500.0))
                         .color(rune::color::hex("#8a8a93").unwrap_or(rune::Color::BLACK))
-                        .on_press(|s: &mut S| {
-                            s.transcript_mut().settings_open = true;
+                        .on_press(move |s: &mut S| {
+                            s.thread_mut(which).settings_open = true;
                         }),
                 ),
         )
@@ -490,13 +497,13 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> 
     let composer_card = super::composer::composer_card(
         &s.model,
         &s.edit,
-        |s: &mut S| &mut s.transcript_mut().edit,
+        move |s: &mut S| &mut s.thread_mut(which).edit,
         s.voice_live,
-        |s: &mut S| {
-            let t = s.transcript_mut();
+        move |s: &mut S| {
+            let t = s.thread_mut(which);
             t.voice_live = !t.voice_live;
         },
-        |s: &mut S| stage_send(s.transcript_mut()),
+        move |s: &mut S| stage_send(s.thread_mut(which)),
     );
     root = root.child(
         rune::el()
@@ -508,14 +515,14 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> 
             .child(composer_card),
     );
     if s.settings_open {
-        root = root.child(settings_sheet::<S>(s));
+        root = root.child(settings_sheet::<S>(s, which));
     }
     root
 }
 
 /// Settings sheet: dim backdrop + centred card, focus-trapped while mounted.
 /// Backdrop press and Escape both dismiss (Rune `modal` machinery).
-fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> El {
+fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
     let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
     let label = rune::tok::TextStyle::new(12.0, 500.0);
     let value = rune::tok::TextStyle::new(12.0, 400.0);
@@ -551,8 +558,8 @@ fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> El {
             a: 0.6,
         })
         .center()
-        .modal(true, |s: &mut S| {
-            s.transcript_mut().settings_open = false;
+        .modal(true, move |s: &mut S| {
+            s.thread_mut(which).settings_open = false;
         })
         .child(
             col()
@@ -584,8 +591,8 @@ fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState) -> El {
                                 .label("Close settings")
                                 .font(rune::tok::TextStyle::new(14.0, 400.0))
                                 .color(ink("#8a8a93"))
-                                .on_press(|s: &mut S| {
-                                    s.transcript_mut().settings_open = false;
+                                .on_press(move |s: &mut S| {
+                                    s.thread_mut(which).settings_open = false;
                                 }),
                         ),
                 )

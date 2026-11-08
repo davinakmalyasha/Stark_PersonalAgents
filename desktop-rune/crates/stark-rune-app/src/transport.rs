@@ -110,19 +110,58 @@ pub fn post_run(
     on_frame: &mut dyn FnMut(SseFrame),
 ) -> Result<RunOutcome, String> {
     let body = req.to_json().to_string();
+    let head = format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\n",
+        body.len()
+    );
+    let (mut reader, chunked) = request(host, port, "POST", "/api/run", &head, body.as_bytes())?;
+    let mut decoder = SseDecoder::new();
+    let mut frames: Vec<SseFrame> = Vec::new();
+    let mut outcome = RunOutcome {
+        status: "unknown".to_string(),
+    };
+    for bytes in read_body(&mut reader, chunked)? {
+        decoder.push(&bytes, &mut frames);
+        drain(&mut frames, &mut outcome, on_frame);
+    }
+    decoder.finish(&mut frames);
+    drain(&mut frames, &mut outcome, on_frame);
+    Ok(outcome)
+}
+
+/// Blocking `GET` returning a JSON body. Used for status endpoints
+/// (`/api/runs/active`, `/api/cloud/status`).
+pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, String> {
+    let (mut reader, chunked) =
+        request(host, port, "GET", path, "Accept: application/json\r\n", &[])?;
+    let mut raw = Vec::new();
+    for bytes in read_body(&mut reader, chunked)? {
+        raw.extend_from_slice(&bytes);
+    }
+    serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
+}
+
+/// Open a connection, send the request, and return a reader past the
+/// response headers plus whether the body is chunked.
+fn request(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> Result<(BufReader<TcpStream>, bool), String> {
     let addr = format!("{host}:{port}");
     let mut sock = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
     sock.set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
-    let http = format!(
-        "POST /api/run HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let http =
+        format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{headers}Connection: close\r\n\r\n");
     sock.write_all(http.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
-
+    sock.write_all(body).map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(sock);
     let mut status = String::new();
     reader
@@ -145,12 +184,13 @@ pub fn post_run(
             chunked = true;
         }
     }
+    Ok((reader, chunked))
+}
 
-    let mut decoder = SseDecoder::new();
-    let mut frames: Vec<SseFrame> = Vec::new();
-    let mut outcome = RunOutcome {
-        status: "unknown".to_string(),
-    };
+/// Read one body as pieces (streaming-friendly): chunk frames when chunked,
+/// 8KB reads until close otherwise.
+fn read_body(reader: &mut BufReader<TcpStream>, chunked: bool) -> Result<Vec<Vec<u8>>, String> {
+    let mut pieces = Vec::new();
     if chunked {
         loop {
             let mut size_line = String::new();
@@ -170,8 +210,7 @@ pub fn post_run(
             reader
                 .read_exact(&mut crlf)
                 .map_err(|e| format!("chunk end: {e}"))?;
-            decoder.push(&chunk, &mut frames);
-            drain(&mut frames, &mut outcome, on_frame);
+            pieces.push(chunk);
         }
     } else {
         loop {
@@ -180,13 +219,10 @@ pub fn post_run(
             if n == 0 {
                 break;
             }
-            decoder.push(&buf[..n], &mut frames);
-            drain(&mut frames, &mut outcome, on_frame);
+            pieces.push(buf[..n].to_vec());
         }
     }
-    decoder.finish(&mut frames);
-    drain(&mut frames, &mut outcome, on_frame);
-    Ok(outcome)
+    Ok(pieces)
 }
 
 fn drain(frames: &mut Vec<SseFrame>, outcome: &mut RunOutcome, on_frame: &mut dyn FnMut(SseFrame)) {

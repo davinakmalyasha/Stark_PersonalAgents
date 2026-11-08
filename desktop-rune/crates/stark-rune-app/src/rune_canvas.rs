@@ -29,6 +29,7 @@ pub struct MapCard {
     pub x: f32,
     pub y: f32,
     pub compact: bool,
+    pub running: bool,
 }
 
 impl MapCard {
@@ -66,6 +67,7 @@ impl CanvasState {
                     x: 36.0,
                     y: 36.0,
                     compact: false,
+                    running: false,
                 },
                 MapCard {
                     id: "chat:ws-general:chat-2".to_string(),
@@ -75,6 +77,7 @@ impl CanvasState {
                     x: 520.0,
                     y: 36.0,
                     compact: false,
+                    running: false,
                 },
                 MapCard {
                     id: "chat:ws-general:chat-3".to_string(),
@@ -84,6 +87,7 @@ impl CanvasState {
                     x: 60.0,
                     y: 480.0,
                     compact: true,
+                    running: false,
                 },
                 MapCard {
                     id: "chat:ws-general:chat-4".to_string(),
@@ -93,6 +97,7 @@ impl CanvasState {
                     x: 560.0,
                     y: 480.0,
                     compact: true,
+                    running: true,
                 },
             ],
             edges: vec![(
@@ -134,72 +139,121 @@ pub fn edge_cubic(parent: &MapCard, child: &MapCard) -> Path {
 
 fn card_view(card: &MapCard) -> El {
     let (w, h) = card.size();
+    let radius = if card.compact { 16.0 } else { 18.0 };
     let id = card.id.clone();
     let drag_id = card.id.clone();
-    col()
+    // Running cards: brighter border + glow, like `.canvas-card.is-running`.
+    let border = if card.running {
+        ink("#ffffff38")
+    } else {
+        ink("#ffffff14")
+    };
+    let mut view = col()
         .key(card.id.clone())
         .absolute(card.x, card.y)
         .size(w, h)
-        .radius(if card.compact { 16.0 } else { 18.0 })
+        .radius(radius)
         .fill(ink("#0b0b0e"))
-        .border(1.0, ink("#ffffff14"))
-        .child(
-            // Drag handle: header only, like `[data-canvas-drag-handle]`.
-            row()
-                .key(format!("{id}-head"))
-                .w_full()
-                .items_center()
-                .gap(10.0)
-                .px(14.0)
-                .pt(14.0)
-                .pb(10.0)
-                .on_drag(move |s: &mut CanvasState, drag: &mut Drag, _tx| {
-                    let home = s.press_home;
-                    let Some(card) = s.card_mut(&drag_id) else {
-                        return;
-                    };
-                    match drag.phase {
-                        Phase::Down => {
-                            s.press_home = Some((card.x, card.y));
-                        }
-                        Phase::Move | Phase::Up => {
-                            if let Some((hx, hy)) = home {
-                                card.x = hx + drag.dx;
-                                card.y = hy + drag.dy;
-                            }
-                            if matches!(drag.phase, Phase::Up) {
-                                s.press_home = None;
-                            }
-                        }
+        .border(1.0, border)
+        .clip_rounded(radius);
+    if card.running {
+        view = view
+            .shadow(
+                0.0,
+                44.0,
+                rune::Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.05,
+                },
+            )
+            // Sweep sheen: 110pt bar sliding across on the 2.6s linear loop,
+            // clipped to the card. Mirrors `canvas-border-sweep`.
+            .child(
+                rune::el()
+                    .key(format!("{id}-sheen"))
+                    .absolute(0.0, 0.0)
+                    .size(110.0, h)
+                    .linear_gradient(
+                        std::f32::consts::FRAC_PI_2,
+                        [
+                            (0.0, ink("#ffffff00")),
+                            (0.5, ink("#ffffff1f")),
+                            (1.0, ink("#ffffff00")),
+                        ],
+                    )
+                    .looping(
+                        rune::LoopSpec::slide(2.6, [-130.0, 0.0], [w + 20.0, 0.0])
+                            .easing(rune::Easing::LINEAR),
+                    ),
+            );
+    }
+    // Status pill: breathing dot while running (`house-breathe` language).
+    let mut head = row()
+        .key(format!("{id}-head"))
+        .w_full()
+        .items_center()
+        .gap(10.0)
+        .px(14.0)
+        .pt(14.0)
+        .pb(10.0)
+        .on_drag(move |s: &mut CanvasState, drag: &mut Drag, _tx| {
+            let home = s.press_home;
+            let Some(card) = s.card_mut(&drag_id) else {
+                return;
+            };
+            match drag.phase {
+                Phase::Down => {
+                    s.press_home = Some((card.x, card.y));
+                }
+                Phase::Move | Phase::Up => {
+                    if let Some((hx, hy)) = home {
+                        card.x = hx + drag.dx;
+                        card.y = hy + drag.dy;
                     }
-                })
-                .child(
-                    col()
-                        .key(format!("{id}-titles"))
-                        .grow(1.0)
-                        .min_h(0.0)
-                        .child(
-                            text(card.title.clone())
-                                .key(format!("{id}-title"))
-                                .font(rune::tok::TextStyle::new(15.0, 600.0))
-                                .color(ink("#f2f2f5")),
-                        )
-                        .child(
-                            text(card.subtitle.clone())
-                                .key(format!("{id}-subtitle"))
-                                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                                .color(ink("#8a8a93")),
-                        ),
-                ),
-        )
+                    if matches!(drag.phase, Phase::Up) {
+                        s.press_home = None;
+                    }
+                }
+            }
+        })
         .child(
-            text(card.preview.clone())
-                .key(format!("{id}-preview"))
-                .px(16.0)
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .wrap()
-                .color(ink("#92959e")),
-        )
+            col()
+                .key(format!("{id}-titles"))
+                .grow(1.0)
+                .min_h(0.0)
+                .child(
+                    text(card.title.clone())
+                        .key(format!("{id}-title"))
+                        .font(rune::tok::TextStyle::new(15.0, 600.0))
+                        .color(ink("#f2f2f5")),
+                )
+                .child(
+                    text(card.subtitle.clone())
+                        .key(format!("{id}-subtitle"))
+                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .color(ink("#8a8a93")),
+                ),
+        );
+    if card.running {
+        head = head.child(
+            rune::el()
+                .key(format!("{id}-status"))
+                .size(8.0, 8.0)
+                .radius(4.0)
+                .fill(ink("#ededf0"))
+                .looping(rune::LoopSpec::opacity(2.2, 0.0, 0.35, 1.0)),
+        );
+    }
+    view.child(head).child(
+        text(card.preview.clone())
+            .key(format!("{id}-preview"))
+            .px(16.0)
+            .font(rune::tok::TextStyle::new(11.0, 400.0))
+            .wrap()
+            .color(ink("#92959e")),
+    )
 }
 
 pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
@@ -356,6 +410,33 @@ mod tests {
         assert!(
             (x1 - (x0 + 40.0)).abs() < 2.0 && (y1 - (y0 + 30.0)).abs() < 2.0,
             "card follows pointer: ({x0},{y0}) -> ({x1},{y1})"
+        );
+    }
+
+    #[test]
+    fn running_card_has_sheen_status_and_motion() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
+        rt.frame(0.0);
+        let run_id = "chat:ws-general:chat-4";
+        let idle_id = "chat:ws-general:chat-1";
+        for key in [format!("{run_id}-sheen"), format!("{run_id}-status")] {
+            assert!(rt.find(&key).is_some(), "{key} mounted on running card");
+        }
+        assert!(
+            rt.find(&format!("{idle_id}-sheen")).is_none(),
+            "idle card has no sheen"
+        );
+        // The sweep travels on the virtual clock: half a period later the
+        // sheen rect has moved.
+        let x0 = rt.presented(&format!("{run_id}-sheen")).unwrap().0[0];
+        for _ in 0..78 {
+            rt.frame(1.0 / 60.0);
+        }
+        let x1 = rt.presented(&format!("{run_id}-sheen")).unwrap().0[0];
+        assert!(
+            (x1 - x0).abs() > 5.0,
+            "sheen travels: {x0} -> {x1} over half a period"
         );
     }
 

@@ -16,9 +16,7 @@ use std::net::TcpStream;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::stream::RunRequest;
-use crate::stream::{infer_event, SseFrame};
+use crate::stream::{infer_event, RunRequest, SseFrame};
 
 /// Incremental SSE decoder over raw bytes. Handles UTF-8 split across chunks
 /// (only complete lines up to the last valid `\n` are processed) and keeps
@@ -185,6 +183,90 @@ pub async fn fetch_json(path: &str) -> Result<serde_json::Value, String> {
         .as_string()
         .ok_or("non-string json")?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// Web `POST /api/run` with ReadableStream SSE decode — the browser twin of
+/// native [`post_run`]. Frames stream into `emit` as they arrive; the shared
+/// `SseDecoder` keeps framing rules identical on both targets.
+#[cfg(target_arch = "wasm32")]
+pub async fn post_run_stream(req: &RunRequest, emit: &mut dyn FnMut(SseFrame)) {
+    let outcome = post_run_stream_inner(req, emit).await;
+    if let Err(message) = outcome {
+        emit(SseFrame {
+            event: "error".to_string(),
+            data: serde_json::json!({"message": message}),
+        });
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn post_run_stream_inner(
+    req: &RunRequest,
+    emit: &mut dyn FnMut(SseFrame),
+) -> Result<String, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let url = "http://127.0.0.1:8124/api/run".to_string();
+    let body = req.to_json().to_string();
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_body(&wasm_bindgen::JsValue::from_str(&body));
+    init.set_headers(&{
+        let h = web_sys::Headers::new().map_err(|e| format!("headers: {e:?}"))?;
+        h.set("Content-Type", "application/json")
+            .map_err(|e| format!("headers: {e:?}"))?;
+        h.into()
+    });
+    let request = web_sys::Request::new_with_str_and_init(&url, &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let stream = resp.body().ok_or("no body")?;
+    let reader = stream
+        .get_reader()
+        .dyn_into::<web_sys::ReadableStreamDefaultReader>()
+        .map_err(|e| format!("reader: {e:?}"))?;
+    let mut decoder = SseDecoder::new();
+    let mut frames = Vec::new();
+    let mut status = "unknown".to_string();
+    loop {
+        let chunk = JsFuture::from(reader.read())
+            .await
+            .map_err(|e| format!("read: {e:?}"))?;
+        let done = js_sys::Reflect::get(&chunk, &"done".into())
+            .map_err(|e| format!("done: {e:?}"))?
+            .as_bool()
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        let value = js_sys::Reflect::get(&chunk, &"value".into())
+            .map_err(|e| format!("value: {e:?}"))?;
+        let bytes = js_sys::Uint8Array::from(value).to_vec();
+        decoder.push(&bytes, &mut frames);
+        for frame in frames.drain(..) {
+            if frame.event == "done" {
+                if let Some(s) = frame.data.get("status").and_then(|v| v.as_str()) {
+                    status = s.to_string();
+                }
+            }
+            emit(frame);
+        }
+    }
+    decoder.finish(&mut frames);
+    for frame in frames.drain(..) {
+        emit(frame);
+    }
+    Ok(status)
 }
 
 /// Open a connection, send the request, and return a reader past the

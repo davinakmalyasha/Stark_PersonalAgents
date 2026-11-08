@@ -125,19 +125,29 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
             |s: &RuneTranscriptState, i| Cow::Borrowed(s.rows[i].key.as_str()),
             |s: &RuneTranscriptState, i| {
                 let row = &s.rows[i];
+                // Internal padding (never margins/gaps): unvisited estimates stay
+                // valid and measured heights match. `.wrap()` binds text to the
+                // row width; rows are `w_full` so bubbles wrap at card width
+                // like `.canvas-bubble` (10px 13px, 12.5px/1.55) in MessageStream.
                 col()
                     .key(row.key.clone())
                     .role("bubble")
                     .label(row.role.to_string())
+                    .w_full()
                     .radius(14.0)
                     .fill(card_bg())
-                    .child(text(row.body.clone()))
+                    .px(13.0)
+                    .py(10.0)
+                    .child(text(row.body.clone()).wrap())
             },
         );
+    // Bounded root (window height) + growing viewport: the viewport takes the
+    // free space between title and composer instead of pushing the composer
+    // off-screen (an `h_full` viewport in an auto-height column does that).
     let viewport = col()
         .key("transcript-viewport")
         .w_full()
-        .h_full()
+        .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: true })
         .child(stack);
@@ -149,6 +159,9 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         .child(
             text(s.title.clone())
                 .key("transcript-title")
+                .px(16.0)
+                .pt(14.0)
+                .pb(10.0)
                 .color(rune::color::hex("#f2f2f5").unwrap_or(rune::Color::BLACK)),
         )
         .child(viewport);
@@ -165,7 +178,11 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         } else {
             s.composer.clone()
         })
-        .key("composer"),
+        .key("composer")
+        .px(16.0)
+        .pt(10.0)
+        .pb(14.0)
+        .color(rune::color::hex("#74747d").unwrap_or(rune::Color::BLACK)),
     )
 }
 

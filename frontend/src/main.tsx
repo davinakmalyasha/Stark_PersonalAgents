@@ -13,7 +13,27 @@ if ('serviceWorker' in navigator) {
       .then((registrations) => Promise.all(registrations.map((registration) => registration.unregister())))
       .catch(() => {})
   } else if (import.meta.env.PROD) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {})
+    // The installed PWA precaches index.html + assets, so a new deploy is
+    // invisible until the SW updates. Check on every load, on focus, and
+    // every minute; reload once when the new worker takes control.
+    let reloading = false
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (reloading) return
+      reloading = true
+      window.location.reload()
+    })
+    const register = () => {
+      navigator.serviceWorker
+        .register('/sw.js', { updateViaCache: 'none' })
+        .then((registration) => registration.update().catch(() => {}))
+        .catch(() => {})
+    }
+    register()
+    window.addEventListener('online', register)
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) register()
+    })
+    window.setInterval(register, 60_000)
   }
 }
 

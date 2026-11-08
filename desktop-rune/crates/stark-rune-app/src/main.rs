@@ -26,6 +26,8 @@ mod composer;
 #[cfg(feature = "rune-real")]
 mod rooms;
 #[cfg(feature = "rune-real")]
+mod projects;
+#[cfg(feature = "rune-real")]
 mod rune_canvas;
 #[cfg(feature = "rune-real")]
 mod rune_transcript;

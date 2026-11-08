@@ -7,6 +7,7 @@
 
 use rune::{col, row, text, AppSpec, Cx, El};
 
+use crate::projects::{ProjectsHost, ProjectsState, projects_view, refresh_projects};
 use crate::rooms::{
     drain_results, house_view, memory_view, refresh_house, refresh_memory, HouseHost, HouseState,
     MemoryHost, MemoryState,
@@ -18,7 +19,7 @@ use crate::rune_transcript::{
 
 /// Shell routes. `Map` is the home canvas; `Chat` the main transcript;
 /// `Personal` the personal room; `Cloud` the runs board; `House` the smart
-/// home; `Memory` the memory index.
+/// home; `Memory` the memory index; `Projects` the group board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Route {
     #[default]
@@ -28,6 +29,7 @@ pub enum Route {
     Cloud,
     House,
     Memory,
+    Projects,
 }
 
 /// One active run, mirroring `ActiveRun` (`GET /api/runs/active`).
@@ -123,6 +125,7 @@ pub struct ShellState {
     pub cloud: CloudState,
     pub house: HouseState,
     pub memory: MemoryState,
+    pub projects: ProjectsState,
 }
 
 impl Default for ShellState {
@@ -139,6 +142,7 @@ impl Default for ShellState {
             cloud: CloudState::default(),
             house: HouseState::default(),
             memory: MemoryState::default(),
+            projects: ProjectsState::default(),
         }
     }
 }
@@ -173,6 +177,12 @@ impl HouseHost for ShellState {
 impl MemoryHost for ShellState {
     fn memory_mut(&mut self) -> &mut MemoryState {
         &mut self.memory
+    }
+}
+
+impl ProjectsHost for ShellState {
+    fn projects_mut(&mut self) -> &mut ProjectsState {
+        &mut self.projects
     }
 }
 
@@ -212,6 +222,7 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
         Route::Cloud => cloud_view(&s.cloud),
         Route::House => house_view::<ShellState>(&s.house),
         Route::Memory => memory_view::<ShellState>(&s.memory),
+        Route::Projects => projects_view::<ShellState>(&s.projects),
     };
     col()
         .key("stark-shell")
@@ -232,7 +243,8 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
                 .child(tab(s, Route::Personal, "Personal", "tab-personal"))
                 .child(tab(s, Route::Cloud, "Cloud", "tab-cloud"))
                 .child(tab(s, Route::House, "House", "tab-house"))
-                .child(tab(s, Route::Memory, "Memory", "tab-memory")),
+                .child(tab(s, Route::Memory, "Memory", "tab-memory"))
+                .child(tab(s, Route::Projects, "Projects", "tab-projects")),
         )
         .child(body)
 }
@@ -368,6 +380,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed |= s.canvas.voice.drain(1.0 / 60.0);
     changed |= poll_house(s, clock);
     changed |= poll_memory(s, clock);
+    changed |= poll_projects(s, clock);
     // Cloud inbox first (a refresh may have landed), then auto-refresh.
     let mut seen = false;
     while let Some(msg) = s.cloud.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -430,8 +443,7 @@ fn poll_house(s: &mut ShellState, clock: f64) -> bool {
 }
 
 /// Drain the memory inbox; auto-refresh at most every 15s.
-fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
-    let (msgs, _) = drain_results(&mut s.memory.inbox);
+fn poll_memory(s: &mut ShellState, clock: f64) -> bool {    let (msgs, _) = drain_results(&mut s.memory.inbox);
     let mut changed = false;
     for msg in msgs {
         match msg {
@@ -449,6 +461,31 @@ fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
     }
     if s.memory.auto && !s.memory.loading && clock - s.memory.last_ok > 15.0 {
         refresh_memory(&mut s.memory);
+        changed = true;
+    }
+    changed
+}
+
+/// Drain the projects inbox; auto-refresh at most every 15s.
+fn poll_projects(s: &mut ShellState, clock: f64) -> bool {
+    let (msgs, _) = drain_results(&mut s.projects.inbox);
+    let mut changed = false;
+    for msg in msgs {
+        match msg {
+            Ok(snap) => {
+                s.projects.projects = snap.projects;
+                s.projects.error = None;
+                s.projects.last_ok = clock;
+            }
+            Err(message) => {
+                s.projects.error = Some(message);
+            }
+        }
+        s.projects.loading = false;
+        changed = true;
+    }
+    if s.projects.auto && !s.projects.loading && clock - s.projects.last_ok > 15.0 {
+        refresh_projects(&mut s.projects);
         changed = true;
     }
     changed
@@ -482,6 +519,10 @@ fn apply_memory(s: &mut ShellState) {
     s.route = Route::Memory;
 }
 
+fn apply_projects(s: &mut ShellState) {
+    s.route = Route::Projects;
+}
+
 pub fn shell_spec() -> AppSpec<ShellState> {
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
@@ -491,6 +532,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("cloud", apply_cloud),
         ("house", apply_house),
         ("memory", apply_memory),
+        ("projects", apply_projects),
     ];
     spec.poll = Some(shell_poll);
     spec
@@ -710,6 +752,66 @@ mod tests {
         assert_eq!(rt.state.memory.workspaces[0].entries, 7);
         rt.frame(0.0);
         assert!(rt.find("memory-ws-_general-name").is_some());
+    }
+
+    #[test]
+    fn projects_board_loads_from_mock() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut raw = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"projects":[{"id":"p1","title":"Website","status":"doing","items_done":3,"items_total":4,"awaiting_approval":1},{"id":"p2","goal":"Docs","status":"paused","items_done":0,"items_total":0,"milestones_done":1,"milestones_total":2,"awaiting_approval":0}],"scoped":false}"#;
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        });
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.projects.host = "127.0.0.1".to_string();
+        state.projects.port = port;
+        state.projects.auto = false;
+        state.route = Route::Projects;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("projects-board").is_some());
+        let (x, y) = rt.find("projects-refresh").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut run_tx = rune::Tx::default();
+        let mut waited = 0;
+        while rt.state.projects.projects.is_empty() && waited < 500 {
+            rt.update(|s, tx| {
+                shell_poll(s, 0.0, tx);
+            });
+            rt.frame(0.0);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert_eq!(rt.state.projects.projects.len(), 2);
+        rt.frame(0.0);
+        for key in ["projects-p1-title", "projects-p1-bar", "projects-p2-title"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        let _ = run_tx;
     }
 
     #[test]

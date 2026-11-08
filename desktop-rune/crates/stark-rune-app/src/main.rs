@@ -17,6 +17,8 @@ use stark_kit::{draft_id, Role};
 use stark_theme::{color, layout};
 
 #[cfg(feature = "rune-real")]
+mod rune_canvas;
+#[cfg(feature = "rune-real")]
 mod rune_transcript;
 
 // ---------------------------------------------------------------------------
@@ -405,10 +407,33 @@ fn xml_escape(s: &str) -> String {
 fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
     eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
+    eprintln!("stark-rune --rune-canvas-snap <png>  (1280x720 canvas map PNG)");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--rune-canvas-snap") {
+        #[cfg(not(feature = "rune-real"))]
+        {
+            let _ = pos;
+            eprintln!("--rune-canvas-snap needs --features rune-real.");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "rune-real")]
+        {
+            let png = args.get(pos + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--rune-canvas-snap <png> is required");
+                std::process::exit(2);
+            });
+            rune_canvas::run_canvas_headless(vec![
+                "--snap".to_string(),
+                png,
+                "--scale".to_string(),
+                "1".to_string(),
+            ]);
+            return;
+        }
+    }
     if let Some(pos) = args.iter().position(|a| a == "--rune-snap") {
         #[cfg(not(feature = "rune-real"))]
         {

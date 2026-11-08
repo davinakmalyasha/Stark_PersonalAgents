@@ -21,7 +21,7 @@ export default function HouseMobileNav({ view, onView, onNewChat, onOpenSettings
   return (
     <nav
       aria-label="Workspace"
-      className="md:hidden shrink-0 flex items-stretch gap-1 px-2 pt-1 border-t house-hairline bg-[#0c0c0f]"
+      className="md:hidden shrink-0 flex items-stretch gap-1 px-2 pt-1 border-t house-hairline bg-[#0c0c0c]"
       style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 4px)' }}
     >
       <button onClick={() => onView('chats')} className={item(view === 'chats')} aria-label="Chats" aria-pressed={view === 'chats'}>

@@ -976,7 +976,7 @@ export default function App() {
   const lastModelName = lastCall ? lastCall.model : (model || 'Automatic Fallback');
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#0c0c0e] text-zinc-100 overflow-hidden font-sans">
+    <div className="flex flex-col h-screen w-screen bg-[#0c0c0c] text-zinc-100 overflow-hidden font-sans">
       <TitleBar
         tabs={cwTabs}
         activeKey={cwActiveKey}
@@ -985,7 +985,7 @@ export default function App() {
         onDropTab={handleCwDrop}
         onOpenSettings={() => setIsSettingsOpen(true)}
       />
-      <div className="app-shell flex flex-1 min-h-0" style={{ backgroundColor: '#0c0c0e' }}>
+      <div className="app-shell flex flex-1 min-h-0" style={{ backgroundColor: '#0c0c0c' }}>
         <Sidebar
           activeWorkspaceId={activeWorkspace?.id ?? null}
           activeChatId={activeChat?.id ?? null}

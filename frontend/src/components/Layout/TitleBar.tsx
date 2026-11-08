@@ -60,7 +60,7 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
 
   return (
     <header
-      className={`relative flex items-center select-none flex-shrink-0 h-[38px] bg-[#0c0c0e] border-b border-zinc-800/60 pl-2 pr-0 gap-2 z-50 ${dragOver ? 'bg-white/[0.04]' : ''}`}
+      className={`relative flex items-center select-none flex-shrink-0 h-[38px] bg-[#0c0c0c] border-b border-zinc-800/60 pl-2 pr-0 gap-2 z-50 ${dragOver ? 'bg-white/[0.04]' : ''}`}
       style={{ WebkitAppRegion: 'drag' } as AppRegionStyle}
       data-tauri-drag-region="deep"
       onDragOver={(e) => {
@@ -106,7 +106,7 @@ export default function TitleBar({ tabs = [], activeKey, onActivateTab, onCloseT
                 style={{ background: wsColor(t.workspaceName) }}
               >
                 {(t.workspaceName?.[0] || 'C').toUpperCase()}
-                {isLive && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-400 animate-pulse ring-2 ring-[#0c0c0e]" />}
+                {isLive && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-400 animate-pulse ring-2 ring-[#0c0c0c]" />}
               </span>
               <span className="truncate">{t.title || 'Untitled'}</span>
               <button

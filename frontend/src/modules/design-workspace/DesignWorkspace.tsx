@@ -491,7 +491,7 @@ export default function DesignWorkspace({ embedded = false, initialWorkspaceId, 
 
       {/* Subagent drill-in */}
       {subagentView && workspace && (
-        <div className="absolute inset-0 z-40 bg-[#0c0c0f] flex flex-col px-4 sm:px-8 lg:px-12 py-4">
+        <div className="absolute inset-0 z-40 bg-[#0c0c0c] flex flex-col px-4 sm:px-8 lg:px-12 py-4">
           <div className="max-w-[1100px] w-full mx-auto flex-1 min-h-0 flex flex-col">
             <SubagentSessionView
               workspaceId={subagentView.workspaceId || workspace.id}

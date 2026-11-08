@@ -166,7 +166,7 @@ export default function AgentCanvas(props: Props) {
       </div>
 
       {subagentView && (
-        <div className="absolute top-0 right-0 h-full w-[440px] bg-[#0c0c0f] border-l border-zinc-800 shadow-2xl flex flex-col z-50">
+        <div className="absolute top-0 right-0 h-full w-[440px] bg-[#0c0c0c] border-l border-zinc-800 shadow-2xl flex flex-col z-50">
           <div className="flex-1 min-h-0 px-3 pt-1 pb-3">
             <SubagentSessionView
               workspaceId={subagentView.workspaceId || props.workspaceId || ''}

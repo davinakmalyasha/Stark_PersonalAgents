@@ -104,7 +104,7 @@ export default function CloudRuns() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#0c0c0e] text-zinc-100 overflow-hidden font-sans">
+    <div className="flex flex-col h-screen w-screen bg-[#0c0c0c] text-zinc-100 overflow-hidden font-sans">
       <header className="flex h-[52px] shrink-0 items-center justify-between border-b border-white/10 px-4 sm:px-6">
         <div className="flex items-center gap-3">
           <button

@@ -21,7 +21,7 @@ export default function HouseRail({ view, onView, onNewChat, onOpenSettings, onO
   return (
     <nav
       aria-label="Workspace"
-      className="flex flex-col items-center gap-1 py-3 px-1.5 shrink-0 border-r house-hairline bg-[#0c0c0f] z-20"
+      className="flex flex-col items-center gap-1 py-3 px-1.5 shrink-0 border-r house-hairline bg-[#0c0c0c] z-20"
       style={{ WebkitAppRegion: 'drag' } as CSSProperties}
     >
       <div style={{ WebkitAppRegion: 'no-drag' } as CSSProperties} className="flex flex-col items-center gap-1">

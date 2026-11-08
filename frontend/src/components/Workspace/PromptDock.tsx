@@ -207,6 +207,13 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
     if (usagePinned) return;
     cancelUsageClose();
     usageCloseTimer.current = window.setTimeout(() => {
+      // Moving from the orb into the portaled panel fires leave/enter in an
+      // order that can resurrect this timer. Trust the actual hover state at
+      // fire time, not event ordering.
+      if (usageOrbRef.current?.matches(':hover') || document.querySelector('.usage-popover-portal:hover')) {
+        usageCloseTimer.current = null;
+        return;
+      }
       setUsageOpen(false);
       usageCloseTimer.current = null;
     }, 260);

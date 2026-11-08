@@ -7,11 +7,10 @@ import {
   fetchCloudStatus,
   fetchWorkspaces,
   sendToCloud,
-  type ChatSummary,
   type CloudHandoff,
   type CloudStatus,
-  type WorkspaceInfo,
 } from '../services/api';
+import type { ChatSummary, WorkspaceInfo } from '../types';
 
 function formatTime(value?: string | null): string {
   if (!value) return '—';

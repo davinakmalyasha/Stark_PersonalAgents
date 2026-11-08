@@ -582,10 +582,7 @@ mod tests {
     #[test]
     fn non_git_workspace_skips_branch() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            ensure_cloud_branch(dir.path(), "cloud/test-123456").unwrap(),
-            false
-        );
+        assert!(!ensure_cloud_branch(dir.path(), "cloud/test-123456").unwrap());
     }
 
     #[test]

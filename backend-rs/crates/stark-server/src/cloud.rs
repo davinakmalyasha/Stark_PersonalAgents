@@ -172,7 +172,7 @@ pub struct SendRequest {
 /// Virtual workspaces (`_general`, `_house`, `_personal`, `_dfd`) are built in,
 /// never registered. Their chats live in the harness root with no repo, so a
 /// handoff carries the chat only and skips branch/clone work.
-fn virtual_record(harness_root: &Path, id: &str) -> Option<stark_store::WorkspaceRecord> {
+fn virtual_record(id: &str) -> Option<stark_store::WorkspaceRecord> {
     let name = match id {
         "_general" => "General",
         "_house" => "House",
@@ -193,14 +193,13 @@ fn virtual_record(harness_root: &Path, id: &str) -> Option<stark_store::Workspac
 }
 
 fn resolve_workspace(
-    harness_root: &Path,
     registry: &stark_store::WorkspaceRegistry,
     id: &str,
 ) -> Result<stark_store::WorkspaceRecord, String> {
     if let Some(record) = registry.get(id) {
         return Ok(record);
     }
-    virtual_record(harness_root, id).ok_or_else(|| format!("unknown workspace '{id}'"))
+    virtual_record(id).ok_or_else(|| format!("unknown workspace '{id}'"))
 }
 
 /// Builds the handoff package and records it. Pushes to the VPS when
@@ -212,7 +211,7 @@ pub async fn build_handoff(
     request: SendRequest,
 ) -> Result<CloudHandoff, String> {
     let registry = stark_store::WorkspaceRegistry::new(harness_root);
-    let record = resolve_workspace(harness_root, &registry, &request.workspace_id)?;
+    let record = resolve_workspace(&registry, &request.workspace_id)?;
     let chat = match request.chat_id.as_deref() {
         Some(chat_id) => Some(
             store
@@ -440,7 +439,7 @@ pub async fn receive_package(
         .unwrap_or_else(|| "cloud/import".to_string());
 
     let registry = stark_store::WorkspaceRegistry::new(harness_root);
-    let record = if let Some(virtual_ws) = virtual_record(harness_root, workspace_id) {
+    let record = if let Some(virtual_ws) = virtual_record(workspace_id) {
         virtual_ws
     } else if let Some(existing) = registry.get(workspace_id) {
         existing

@@ -419,6 +419,10 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Pinned Rune revision and app version, stamped into release builds.
+pub const RUNE_REV: &str = "a7f276c3630f85a06a0230295da4d2bd172d8d3b";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
     eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
@@ -426,6 +430,7 @@ fn print_usage() {
     eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <map|chat|personal|cloud|house|memory>]  (unified shell PNG)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
     eprintln!("stark-rune --api-get <path> [--api-port <n>]  (live GET against stark-server)");
+    eprintln!("stark-rune --version  (app version + pinned Rune revision)");
 }
 
 fn main() {
@@ -444,6 +449,10 @@ fn main() {
 #[cfg(not(target_arch = "wasm32"))]
 fn run_cli() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version") {
+        println!("stark-rune {APP_VERSION} (rune {RUNE_REV})");
+        return;
+    }
     if let Some(pos) = args.iter().position(|a| a == "--api-get") {
         #[cfg(not(feature = "rune-real"))]
         {

@@ -169,6 +169,40 @@ pub struct SendRequest {
     pub branch: Option<String>,
 }
 
+/// Virtual workspaces (`_general`, `_house`, `_personal`, `_dfd`) are built in,
+/// never registered. Their chats live in the harness root with no repo, so a
+/// handoff carries the chat only and skips branch/clone work.
+fn virtual_record(harness_root: &Path, id: &str) -> Option<stark_store::WorkspaceRecord> {
+    let name = match id {
+        "_general" => "General",
+        "_house" => "House",
+        "_personal" => "Personal",
+        "_dfd" => "DFD",
+        _ => return None,
+    };
+    Some(stark_store::WorkspaceRecord {
+        id: id.to_string(),
+        name: name.to_string(),
+        path: String::new(),
+        root: None,
+        rel: None,
+        repo: None,
+        branch: None,
+        added_at: now_iso(),
+    })
+}
+
+fn resolve_workspace(
+    harness_root: &Path,
+    registry: &stark_store::WorkspaceRegistry,
+    id: &str,
+) -> Result<stark_store::WorkspaceRecord, String> {
+    if let Some(record) = registry.get(id) {
+        return Ok(record);
+    }
+    virtual_record(harness_root, id).ok_or_else(|| format!("unknown workspace '{id}'"))
+}
+
 /// Builds the handoff package and records it. Pushes to the VPS when
 /// `STARK_CLOUD_URL` + `STARK_CLOUD_TOKEN` are configured; otherwise the
 /// handoff stays `staged` with its package path.
@@ -178,9 +212,7 @@ pub async fn build_handoff(
     request: SendRequest,
 ) -> Result<CloudHandoff, String> {
     let registry = stark_store::WorkspaceRegistry::new(harness_root);
-    let record = registry
-        .get(&request.workspace_id)
-        .ok_or_else(|| format!("unknown workspace '{}'", request.workspace_id))?;
+    let record = resolve_workspace(harness_root, &registry, &request.workspace_id)?;
     let chat = match request.chat_id.as_deref() {
         Some(chat_id) => Some(
             store
@@ -408,7 +440,9 @@ pub async fn receive_package(
         .unwrap_or_else(|| "cloud/import".to_string());
 
     let registry = stark_store::WorkspaceRegistry::new(harness_root);
-    let record = if let Some(existing) = registry.get(workspace_id) {
+    let record = if let Some(virtual_ws) = virtual_record(harness_root, workspace_id) {
+        virtual_ws
+    } else if let Some(existing) = registry.get(workspace_id) {
         existing
     } else {
         let name = workspace_manifest
@@ -607,6 +641,53 @@ mod tests {
         let loaded = load_handoffs(dir.path());
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].branch, "cloud/demo-abc");
+    }
+
+    #[tokio::test]
+    async fn virtual_workspace_handoff_is_chat_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = stark_store::ChatStore::open(dir.path()).await.unwrap();
+        let created = store
+            .create_chat("_general", "", "General chat", "test-model")
+            .await
+            .unwrap();
+        let chat_id = created["id"].as_str().unwrap().to_string();
+        store
+            .add_message(&chat_id, "user", "hi", None)
+            .await
+            .unwrap();
+        let handoff = build_handoff(
+            dir.path(),
+            &store,
+            SendRequest {
+                chat_id: Some(chat_id.clone()),
+                workspace_id: "_general".to_string(),
+                task: None,
+                branch: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(handoff.workspace_id, "_general");
+        assert!(handoff.workspace_rel.is_none());
+        assert!(handoff.branch.starts_with("cloud/general-chat-"));
+        // Receive on another machine: chat lands under the virtual workspace,
+        // with no registry entry and no folder.
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = stark_store::ChatStore::open(dir_b.path()).await.unwrap();
+        let package = cloud_dir(dir.path()).join("out").join(&handoff.package);
+        let bytes = std::fs::read(&package).unwrap();
+        let received = receive_package(dir_b.path(), &store_b, &bytes)
+            .await
+            .unwrap();
+        assert_eq!(received.workspace_id, "_general");
+        let imported = store_b.get_chat(&chat_id).await.unwrap().unwrap();
+        assert_eq!(imported["workspaceId"], "_general");
+        assert!(
+            stark_store::WorkspaceRegistry::new(dir_b.path())
+                .get("_general")
+                .is_none()
+        );
     }
 
     #[tokio::test]

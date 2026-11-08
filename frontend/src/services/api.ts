@@ -10,3 +10,4 @@ export * from './api/canvas';
 export * from './api/agents';
 export * from './api/memory';
 export * from './api/stream';
+export * from './api/cloud';

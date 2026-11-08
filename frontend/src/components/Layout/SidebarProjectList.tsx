@@ -2,6 +2,7 @@ import { Folder, ChevronRight, ChevronDown, Plus, Trash2, Pencil, Bot, CornerDow
 import type { WorkspaceInfo, ChatSummary } from '../../types';
 import { useState, useRef, useEffect } from 'react';
 import { updateChatTitle } from '../../services/api';
+import CloudBadge from './CloudBadge';
 import { isSpawnedChat } from '../../utils/chatHierarchy';
 
 interface Props {
@@ -189,6 +190,7 @@ export default function SidebarProjectList({
                         <div className="relative flex items-center h-5">
                           <span className="text-[10px] text-zinc-600 flex-shrink-0 ml-1 tabular-nums group-hover:opacity-0 transition-opacity duration-200">{relativeTime(chat.updatedAt)}</span>
                           <div className="absolute right-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                            <CloudBadge chatId={chat.id} workspaceId={ws.id} live={isLive} />
                             <button onClick={(e) => startEditing(e, chat.id, chat.title)} className="p-1.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700 transition-all rounded-md flex-shrink-0 cursor-pointer" title="Rename conversation"><Pencil size={12} /></button>
                             <button onClick={(e) => handleDeleteChat(e, ws, chat.id)} className="p-1.5 text-zinc-400 hover:text-red-400 hover:bg-zinc-700 transition-all rounded-md flex-shrink-0 cursor-pointer" title="Delete conversation"><Trash2 size={12} /></button>
                           </div>

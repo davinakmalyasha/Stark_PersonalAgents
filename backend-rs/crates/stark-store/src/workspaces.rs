@@ -218,6 +218,27 @@ impl WorkspaceRegistry {
     pub fn stored_records(&self) -> Vec<WorkspaceRecord> {
         self.load().workspaces
     }
+
+    /// Insert-or-replace by id, preserving the id so chats, delegations and
+    /// memory keep pointing at the same project on every machine. The path is
+    /// resolved for this machine from `root`/`rel` when portable.
+    pub fn upsert_record(&self, record: WorkspaceRecord) -> Result<WorkspaceRecord, String> {
+        if record.id.trim().is_empty() {
+            return Err("workspace id is required".to_string());
+        }
+        let mut registry = self.load();
+        if let Some(stored) = registry
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == record.id)
+        {
+            *stored = record.clone();
+        } else {
+            registry.workspaces.push(record.clone());
+        }
+        self.save(&registry)?;
+        Ok(resolve_record(record, &projects_root()))
+    }
 }
 
 /// Splits an absolute path into a portable `(root token, relative)` pair when

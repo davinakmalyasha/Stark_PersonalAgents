@@ -1331,6 +1331,118 @@ impl ChatStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Faithful chat import for cloud handoffs: upserts the chat row by id
+    /// (same id on both machines, so canvas watches and delegations keep
+    /// working) and replaces its messages, preserving timestamps, trace flags
+    /// and metadata. The `chat` value is the shape `get_chat` returns.
+    pub async fn import_chat_snapshot(
+        &self,
+        chat: &Value,
+        workspace_id: &str,
+        workspace_path: &str,
+    ) -> Result<(), StoreError> {
+        let id = chat
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| StoreError::Invalid("chat snapshot has no id".to_string()))?;
+        validate_chat_id(id)?;
+        let title = chat
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("New Chat");
+        let model = chat.get("model").and_then(Value::as_str).unwrap_or("");
+        let created_at = chat
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(now_iso);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO chats
+                (id, workspace_id, workspace_path, title, model, created_at, updated_at, message_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'build')
+            ON CONFLICT(id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                workspace_path = excluded.workspace_path,
+                title = excluded.title,
+                model = excluded.model,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(workspace_id)
+        .bind(workspace_path)
+        .bind(title)
+        .bind(model)
+        .bind(&created_at)
+        .bind(now_iso())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM messages WHERE chat_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let empty = Vec::new();
+        let messages = chat
+            .get("messages")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+            let timestamp = message
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(now_iso);
+            let metadata = message.get("metadata");
+            let is_trace = metadata
+                .and_then(|metadata| metadata.get("isTrace"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let metadata_text = metadata
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| StoreError::Invalid(error.to_string()))?;
+            let msg_id = message
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| value.starts_with("msg-"))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("msg-{}", Uuid::new_v4().simple()));
+            sqlx::query(
+                "INSERT INTO messages (id, chat_id, role, content, timestamp, is_trace, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&msg_id)
+            .bind(id)
+            .bind(role)
+            .bind(content)
+            .bind(&timestamp)
+            .bind(if is_trace { 1 } else { 0 })
+            .bind(metadata_text)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE chats SET message_count = (SELECT COUNT(*) FROM messages WHERE chat_id = ?), updated_at = ? WHERE id = ?",
+        )
+        .bind(id)
+        .bind(now_iso())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn messages_from(
         &self,
         chat_id: &str,

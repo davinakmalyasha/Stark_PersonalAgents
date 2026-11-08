@@ -1,4 +1,4 @@
-import { FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
+import { Cloud, FolderKanban, Home, Settings, SquarePen } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
 export type SideView = 'chats' | 'projects';
@@ -9,10 +9,11 @@ interface Props {
   onView: (view: SideView) => void;
   onNewChat: () => void;
   onOpenSettings: () => void;
+  onOpenCloud: () => void;
   waiting: number;
 }
 
-export default function HouseRail({ view, onView, onNewChat, onOpenSettings, waiting }: Props) {
+export default function HouseRail({ view, onView, onNewChat, onOpenSettings, onOpenCloud, waiting }: Props) {
   const btn = (active: boolean) =>
     `house-rail-btn grid place-items-center w-9 h-9 rounded-xl cursor-pointer shrink-0 ${
       active ? 'bg-white/[0.10] text-white' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.07]'
@@ -52,6 +53,14 @@ export default function HouseRail({ view, onView, onNewChat, onOpenSettings, wai
               {waiting}
             </span>
           )}
+        </button>
+        <button
+          onClick={onOpenCloud}
+          title="Cloud runs"
+          aria-label="Cloud runs"
+          className={btn(false)}
+        >
+          <Cloud size={17} />
         </button>
       </div>
       <span className="flex-1" />

@@ -432,11 +432,11 @@ export default function House() {
     </div>
   );
 
-  // Initial blank (#0c0c0e) while the session layer boots.
+  // Initial blank (#0c0c0c) while the session layer boots.
   if (!sessions.booted) {
     if (sessions.bootError) {
       return (
-        <div className="fixed inset-0 grid place-items-center bg-[#0c0c0e] px-6 select-none">
+        <div className="fixed inset-0 grid place-items-center bg-[#0c0c0c] px-6 select-none">
           <div className="flex max-w-sm flex-col items-center gap-4 text-center">
             <img src={iconUrl} alt="Stark" width={72} height={72} style={{ borderRadius: 18 }} />
             <div className="space-y-1.5">
@@ -456,7 +456,7 @@ export default function House() {
       );
     }
     return (
-      <div className="fixed inset-0 grid place-items-center bg-[#0c0c0e] select-none">
+      <div className="fixed inset-0 grid place-items-center bg-[#0c0c0c] select-none">
         <div className="flex flex-col items-center gap-4 animate-[splashIn_.35s_ease]">
           <img src={iconUrl} alt="Stark" width={96} height={96} style={{ borderRadius: 24 }} className="shadow-[0_8px_32px_rgba(0,0,0,.45)]" />
           <div className="flex gap-1.5">
@@ -487,6 +487,7 @@ export default function House() {
           onView={handleSideView}
           onNewChat={handleNewSession}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          onOpenCloud={() => { window.location.hash = '#/cloud'; }}
           waiting={projects.reduce((n, p) => n + (p.awaiting_approval || 0), 0)}
         />
       </div>
@@ -524,7 +525,7 @@ export default function House() {
           onLaunchHouse={launchHouse}
         />
       ) : (
-        <div className="w-[248px] max-md:w-full shrink-0 bg-[#0f0f13] border-r house-hairline min-h-0">
+        <div className="w-[248px] max-md:w-full shrink-0 bg-[#0f0f0f] border-r house-hairline min-h-0">
           <HouseProjectsPanel
             projects={projects}
             projectsScoped={projectsScoped}
@@ -541,7 +542,7 @@ export default function House() {
           <>
             {/* Chat is visible immediately under the exiting IDE — feels like the IDE slides away */}
             {generalChatView}
-            <div className="absolute inset-0 z-10 flex ide-exit bg-[#0a0a0d]">
+            <div className="absolute inset-0 z-10 flex ide-exit bg-[#0a0a0a]">
               <CodingIDE
                 key={exitingIdeTab.id}
                 session={exitingIdeTab}

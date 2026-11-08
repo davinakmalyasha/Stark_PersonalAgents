@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Minimize2, Maximize2, Search, Download, RotateCcw, GitBranch } from 'lucide-react';
+import { Minimize2, Maximize2, Search, Download, RotateCcw, GitBranch, Cloud } from 'lucide-react';
 import type { ChatMessage, AppState, ChatAttachment, ModelOption } from '../../types';
 import type { TraceStep } from '../../utils/logParser';
 import PromptDock from './PromptDock';
@@ -8,7 +8,7 @@ import MessageStream from './MessageStream';
 import { AttachmentDropProvider, FileDropSurface } from './AttachmentDrop';
 import NotesButton from '../Notes/NotesButton';
 import CanvasModeBadge from '../Canvas/CanvasModeBadge';
-import { getChatSnapshots, restoreRun, setChatMode, forkChat, type SnapshotGroup } from '../../services/api';
+import { getChatSnapshots, restoreRun, setChatMode, forkChat, sendToCloud, type SnapshotGroup } from '../../services/api';
 
 interface Props {
   messages: ChatMessage[];
@@ -69,6 +69,26 @@ export default function ChatView({
   const [showRewind, setShowRewind] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [forkNote, setForkNote] = useState<string | null>(null);
+  const [cloudNote, setCloudNote] = useState<string | null>(null);
+  const [cloudBusy, setCloudBusy] = useState(false);
+
+  const sendChatToCloud = async () => {
+    if (!workspaceId || !chatId || cloudBusy) return;
+    setCloudBusy(true);
+    setCloudNote(null);
+    try {
+      const handoff = await sendToCloud({ workspace_id: workspaceId, chat_id: chatId });
+      setCloudNote(
+        handoff.status === 'sent'
+          ? `Sent on ${handoff.branch}. Continue it on the VPS — same chat id.`
+          : `Staged on ${handoff.branch}. VPS not configured — see #/cloud.`,
+      );
+    } catch (error) {
+      setCloudNote(error instanceof Error ? error.message : 'Send failed.');
+    } finally {
+      setCloudBusy(false);
+    }
+  };
 
   const forkChatNow = async () => {
     if (!workspaceId || !chatId) return;
@@ -179,7 +199,19 @@ export default function ChatView({
         >
           <GitBranch size={14} />
         </button>
+        <button
+          onClick={() => void sendChatToCloud()}
+          disabled={!workspaceId || !chatId || isRunning || cloudBusy}
+          className="pressable p-2 bg-zinc-900/95 border border-zinc-800/80 hover:bg-zinc-800 hover:border-zinc-700/80 rounded-xl text-zinc-400 hover:text-zinc-100 transition-all cursor-pointer shadow-xl flex items-center justify-center disabled:opacity-40"
+          title="Send this chat to Cloud (VPS) on a cloud/branch"
+          style={{ width: '32px', height: '32px' }}
+        >
+          <Cloud size={14} className={cloudBusy ? 'animate-pulse' : undefined} />
+        </button>
       </div>
+      {cloudNote && (
+        <div className="mx-4 mt-1 text-[11.5px] text-sky-300/90">{cloudNote}</div>
+      )}
       {forkNote && (
         <div className="mx-4 mt-1 text-[11.5px] text-zinc-500">{forkNote}</div>
       )}

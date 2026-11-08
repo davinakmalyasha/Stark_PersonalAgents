@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Brain, Code2, House as HouseIcon, User } from 'lucide-react';
+import { Brain, Cloud as CloudIcon, Code2, House as HouseIcon, User } from 'lucide-react';
 import App from './App';
+import CloudRuns from './cloud/CloudRuns';
 import House from './house/House';
 import HomeOrb from './house/HomeOrb';
 import HousePortal from './house/HousePortal';
@@ -13,13 +14,14 @@ import UpdateToast from './components/Layout/UpdateToast';
 import { onAuthRejected } from './services/remoteAuth';
 import { startAutoUpdate } from './utils/appUpdate';
 
-type Route = 'home' | 'coding' | 'house' | 'personal' | 'memory'
+type Route = 'home' | 'coding' | 'house' | 'personal' | 'memory' | 'cloud'
 
 function getRoute(): Route {
   const hash = window.location.hash
   if (hash.startsWith('#/coding')) return 'coding'
   if (hash.startsWith('#/house')) return 'house'
   if (hash.startsWith('#/personal')) return 'personal'
+  if (hash.startsWith('#/cloud')) return 'cloud'
   // Legacy #/admin links redirect home; the admin surface was removed.
   if (hash.startsWith('#/admin')) return 'home'
   if (hash.startsWith('#/memory')) return 'memory'
@@ -127,6 +129,19 @@ export default function AppShell() {
           <HousePortal
             label="Entering Workspace Memory"
             icon={<Brain size={22} />}
+            leaving={portalLeaving}
+          />
+        )}
+      </>
+    )
+  } else if (route === 'cloud') {
+    content = (
+      <>
+        <CloudRuns />
+        {portalVisible && (
+          <HousePortal
+            label="Entering Cloud Runs"
+            icon={<CloudIcon size={22} />}
             leaving={portalLeaving}
           />
         )}

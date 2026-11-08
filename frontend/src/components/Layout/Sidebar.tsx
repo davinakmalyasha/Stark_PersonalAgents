@@ -7,6 +7,7 @@ import { apiUrl, fetchWorkspaces, addWorkspace, removeWorkspace, fetchChats, cre
 import type { WorkspaceInfo, ChatSummary, ChatData, AgentNode } from '../../types';
 import SidebarProjectList from './SidebarProjectList';
 import SidebarAddFolderModal from './SidebarAddFolderModal';
+import CloudBadge from './CloudBadge';
 import AgentTreePanel from './AgentTreePanel';
 
 interface Props {
@@ -268,7 +269,7 @@ export default function Sidebar({
       className="sidebar-shell flex flex-col flex-shrink-0 select-none overflow-hidden"
       style={{
         width: collapsed ? 56 : 248,
-        backgroundColor: '#151518',
+        backgroundColor: '#151515',
         borderColor: 'rgba(63, 63, 70, 0.45)'
       }}
     >
@@ -382,7 +383,7 @@ export default function Sidebar({
                             )}
                           </span>
                         )}
-                        {!isEditing && <><span className="text-[10px] text-zinc-600 flex-shrink-0 ml-1 tabular-nums group-hover:opacity-0">{relativeTime(chat.updatedAt)}</span><div className="absolute right-1 hidden items-center gap-0.5 rounded bg-zinc-800 group-hover:flex"><button onClick={(event) => { event.stopPropagation(); setGeneralChatName(chat.title || ''); setEditingGeneralChatId(chat.id); }} className="p-1 text-zinc-400 hover:text-white" title="Rename"><Pencil size={11}/></button><button onClick={(event) => handleDeleteChat(event, wsForRow, chat.id)} className="p-1 text-zinc-400 hover:text-white" title="Delete"><Trash2 size={11}/></button></div></>}
+                        {!isEditing && <><span className="text-[10px] text-zinc-600 flex-shrink-0 ml-1 tabular-nums group-hover:opacity-0">{relativeTime(chat.updatedAt)}</span><div className="absolute right-1 hidden items-center gap-0.5 rounded bg-zinc-800 group-hover:flex"><CloudBadge chatId={chat.id} workspaceId={wsForRow.id} live={isLive} /><button onClick={(event) => { event.stopPropagation(); setGeneralChatName(chat.title || ''); setEditingGeneralChatId(chat.id); }} className="p-1 text-zinc-400 hover:text-white" title="Rename"><Pencil size={11}/></button><button onClick={(event) => handleDeleteChat(event, wsForRow, chat.id)} className="p-1 text-zinc-400 hover:text-white" title="Delete"><Trash2 size={11}/></button></div></>}
                       </div>
                     );
                   };

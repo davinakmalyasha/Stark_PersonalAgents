@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowUp, Check, ChevronDown, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
+import { ArrowUp, Check, ChevronDown, Cloud, CloudOff, FileText, Image, Plus, Square, X, AudioLines } from 'lucide-react';
 import type { ChatAttachment, ModelOption } from '../../types';
 import { chatAttachmentUrl, fetchProvider, type ProviderInfo } from '../../services/api';
 import { useOptionalAttachmentDrop } from './AttachmentDrop';
@@ -71,10 +71,12 @@ function RestoredFileThumb({ attachment, workspaceId, chatId }: {
   return <div className="file-chip"><FileText size={16} /></div>;
 }
 
-function UsagePopover({ orbRef, open, onClose, totalCost, totalInput, totalOutput, cacheRate, activeContextTokens, onOpenStats }: {
+function UsagePopover({ orbRef, open, onClose, onHoverStart, onHoverEnd, totalCost, totalInput, totalOutput, cacheRate, activeContextTokens, onOpenStats }: {
   orbRef: React.RefObject<HTMLButtonElement | null>;
   open: boolean;
   onClose: () => void;
+  onHoverStart: () => void;
+  onHoverEnd: () => void;
   totalCost: number;
   totalInput: number;
   totalOutput: number;
@@ -134,6 +136,8 @@ function UsagePopover({ orbRef, open, onClose, totalCost, totalInput, totalOutpu
       style={{ left: pos.left, top: pos.top }}
       role="dialog"
       aria-label="Usage"
+      onPointerEnter={onHoverStart}
+      onPointerLeave={onHoverEnd}
     >
       <div className="usage-popover-title">Usage</div>
       <div className="usage-line"><span>Cost</span><strong>${totalCost.toFixed(5)}</strong></div>
@@ -159,9 +163,55 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
   const [openMenu, setOpenMenu] = useState<'model' | null>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const [providerInfo, setProviderInfo] = useState<ProviderInfo | null>(null);
+  // Run target: where this chat's next prompt goes. Persisted per chat so a
+  // refresh keeps Local vs Cloud. Cloud transfer itself lands next — this
+  // toggle + the row badge already read the live runs/active + health data.
+  const [runTarget, setRunTarget] = useState<'local' | 'cloud'>(() => {
+    try {
+      return window.localStorage.getItem(`stark.runTarget.${chatId ?? 'none'}`) === 'cloud' ? 'cloud' : 'local';
+    } catch { return 'local'; }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(`stark.runTarget.${chatId ?? 'none'}`, runTarget);
+    } catch { /* private mode */ }
+  }, [runTarget, chatId]);
+  useEffect(() => {
+    try {
+      setRunTarget(window.localStorage.getItem(`stark.runTarget.${chatId ?? 'none'}`) === 'cloud' ? 'cloud' : 'local');
+    } catch { /* keep current */ }
+  }, [chatId]);
   const [usageOpen, setUsageOpen] = useState(false);
+  const [usagePinned, setUsagePinned] = useState(false);
   const usageOrbRef = useRef<HTMLButtonElement | null>(null);
+  const usageCloseTimer = useRef<number | null>(null);
   const askBatch = useAskBatchForChat(chatId);
+
+  const cancelUsageClose = useCallback(() => {
+    if (usageCloseTimer.current) {
+      window.clearTimeout(usageCloseTimer.current);
+      usageCloseTimer.current = null;
+    }
+  }, []);
+  const openUsage = useCallback((pin = false) => {
+    cancelUsageClose();
+    setUsageOpen(true);
+    if (pin) setUsagePinned(true);
+  }, [cancelUsageClose]);
+  const closeUsage = useCallback(() => {
+    cancelUsageClose();
+    setUsageOpen(false);
+    setUsagePinned(false);
+  }, [cancelUsageClose]);
+  const scheduleUsageClose = useCallback(() => {
+    if (usagePinned) return;
+    cancelUsageClose();
+    usageCloseTimer.current = window.setTimeout(() => {
+      setUsageOpen(false);
+      usageCloseTimer.current = null;
+    }, 260);
+  }, [usagePinned, cancelUsageClose]);
+  useEffect(() => () => cancelUsageClose(), [cancelUsageClose]);
 
   // The old label was hardcoded to "OpenCode Go" even when the server was on
   // another gateway. Read the live provider from the backend instead.
@@ -329,12 +379,66 @@ export default function PromptDock({ onSend, onCancel, isRunning, isVoiceMode, o
         <div className="prompt-toolbar">
           <div className="flex items-center gap-1">
             <button type="button" onClick={() => inputRef.current?.click()} className="tool-button" title="Attach files"><Plus size={18} /></button>
+            <div
+              className="flex items-center rounded-lg border border-zinc-800 overflow-hidden"
+              role="radiogroup"
+              aria-label="Run target"
+              title={runTarget === 'cloud' ? 'Run on Cloud (VPS) — preference saved per chat' : 'Run on Local — click to target Cloud (VPS)'}
+            >
+              <button
+                type="button"
+                role="radio"
+                aria-checked={runTarget === 'local'}
+                onClick={() => setRunTarget('local')}
+                className={`px-2 py-1.5 text-[11px] font-medium transition-colors cursor-pointer ${runTarget === 'local' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}
+              >
+                Local
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={runTarget === 'cloud'}
+                onClick={() => setRunTarget('cloud')}
+                className={`px-2 py-1.5 flex items-center gap-1 text-[11px] font-medium transition-colors cursor-pointer ${runTarget === 'cloud' ? 'bg-sky-500/20 text-sky-300 drop-shadow-[0_0_6px_rgba(125,211,252,0.5)]' : 'text-zinc-500 hover:text-zinc-300'}`}
+              >
+                {runTarget === 'cloud' ? <Cloud size={12} className="animate-pulse" /> : <CloudOff size={12} />}
+                Cloud
+              </button>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <span className="hidden sm:block text-[10px] text-zinc-600">{totalAttachments ? `${totalAttachments} attachment${totalAttachments > 1 ? 's' : ''}` : ''}</span>
-            <div className="usage-control" onMouseLeave={() => setUsageOpen(false)}>
-              <button ref={usageOrbRef} type="button" className="usage-orb" title={`Context ${contextPercent.toFixed(0)}% of 1M`} aria-label={`Context ${contextPercent.toFixed(0)} percent`} aria-expanded={usageOpen} aria-haspopup="dialog" onClick={() => setUsageOpen((open) => !open)} onMouseEnter={() => setUsageOpen(true)} onFocus={() => setUsageOpen(true)}><svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100`, stroke: contextPercent >= 95 ? '#f87171' : contextPercent >= 85 ? '#fbbf24' : undefined }}/></svg><span style={contextPercent >= 95 ? { color: '#f87171' } : contextPercent >= 85 ? { color: '#fbbf24' } : undefined}>{Math.round(contextPercent)}</span></button>
-              <UsagePopover orbRef={usageOrbRef} open={usageOpen} onClose={() => setUsageOpen(false)} totalCost={totalCost} totalInput={totalInput} totalOutput={totalOutput} cacheRate={cacheRate} activeContextTokens={activeContextTokens} onOpenStats={onOpenStats} />
+            <div className="usage-control">
+              <button
+                ref={usageOrbRef}
+                type="button"
+                className="usage-orb"
+                title={`Context ${contextPercent.toFixed(0)}% of 1M`}
+                aria-label={`Context ${contextPercent.toFixed(0)} percent`}
+                aria-expanded={usageOpen}
+                aria-haspopup="dialog"
+                onClick={() => { if (usagePinned) closeUsage(); else openUsage(true); }}
+                onMouseEnter={() => openUsage()}
+                onMouseLeave={scheduleUsageClose}
+                onFocus={() => openUsage()}
+                onBlur={scheduleUsageClose}
+              >
+                <svg viewBox="0 0 40 40" className="usage-ring" aria-hidden="true"><circle className="usage-ring-track" cx="20" cy="20" r="16" pathLength="100"/><circle className="usage-ring-progress" cx="20" cy="20" r="16" pathLength="100" style={{ strokeDasharray: `${contextPercent} 100`, stroke: contextPercent >= 95 ? '#f87171' : contextPercent >= 85 ? '#fbbf24' : undefined }}/></svg>
+                <span style={contextPercent >= 95 ? { color: '#f87171' } : contextPercent >= 85 ? { color: '#fbbf24' } : undefined}>{Math.round(contextPercent)}</span>
+              </button>
+              <UsagePopover
+                orbRef={usageOrbRef}
+                open={usageOpen}
+                onClose={closeUsage}
+                onHoverStart={() => openUsage()}
+                onHoverEnd={scheduleUsageClose}
+                totalCost={totalCost}
+                totalInput={totalInput}
+                totalOutput={totalOutput}
+                cacheRate={cacheRate}
+                activeContextTokens={activeContextTokens}
+                onOpenStats={onOpenStats}
+              />
             </div>
             <button
               type="button"

@@ -40,6 +40,7 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+mod cloud;
 mod data_transfer;
 mod pairing;
 mod screen_routes;
@@ -104,6 +105,33 @@ impl RunManager {
 
     fn running_count(&self) -> usize {
         self.runs.len()
+    }
+
+    fn list_active(&self) -> Vec<Value> {
+        let mut out: Vec<Value> = self
+            .runs
+            .iter()
+            .map(|entry| {
+                json!({
+                    "running": true,
+                    "chat_id": entry.key(),
+                    "workspace_path": entry.workspace_path,
+                    "started_at": entry.started_at,
+                })
+            })
+            .collect();
+        out.sort_by(|left, right| {
+            left.get("started_at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .cmp(
+                    right
+                        .get("started_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )
+        });
+        out
     }
 
     fn steer(&self, chat_id: &str, message: &str) -> bool {
@@ -832,6 +860,17 @@ async fn main() -> anyhow::Result<()> {
             "/api/memory/{workspace_id}/entries/{entry_id}/pin",
             post(memory_pin_handler),
         )
+        .route("/api/cloud/status", get(cloud_status_handler))
+        .route("/api/cloud/handoffs", get(cloud_handoffs_handler))
+        .route(
+            "/api/cloud/handoffs/{handoff_id}",
+            get(cloud_handoff_handler),
+        )
+        .route("/api/cloud/send", post(cloud_send_handler))
+        .route(
+            "/api/cloud/receive",
+            post(cloud_receive_handler).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -1460,11 +1499,7 @@ Attached files:
     }
     // Concurrency cap: bounds parallel runs so a burst degrades into a clear
     // 429 instead of an OOM kill. Raise STARK_MAX_CONCURRENT_RUNS per host.
-    let cap = std::env::var("STARK_MAX_CONCURRENT_RUNS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(10);
+    let cap = concurrent_cap();
     let running = state.runs.running_count();
     if running >= cap {
         return Err((
@@ -2342,7 +2377,31 @@ async fn abort_handler(
 }
 
 async fn health_handler() -> Json<Value> {
-    Json(json!({"ok": true, "code_version": "stark-rs-0.1"}))
+    Json(json!({
+        "ok": true,
+        "code_version": "stark-rs-0.1",
+        "origin": server_origin(),
+        "cap": concurrent_cap(),
+    }))
+}
+
+/// Which machine this server is: "local" by default, "vps" when
+/// `STARK_ORIGIN=vps` is set on the cloud box. The frontend cloud badge
+/// reads this — no absolute paths ever leave the server.
+fn server_origin() -> String {
+    std::env::var("STARK_ORIGIN")
+        .ok()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+fn concurrent_cap() -> usize {
+    std::env::var("STARK_MAX_CONCURRENT_RUNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2420,7 +2479,100 @@ async fn active_handler(
             "started_at": started_at,
         });
     }
+    // Cloud badge data: every running chat (drives per-row dots + the
+    // details drawer), plus the host origin and concurrency cap. The
+    // legacy per-chat fields above stay byte-identical.
+    if let Ok(mut map) = serde_json::from_value::<serde_json::Map<String, Value>>(active.clone()) {
+        map.insert("runs".to_string(), json!(state.runs.list_active()));
+        map.insert("cap".to_string(), json!(concurrent_cap()));
+        map.insert("origin".to_string(), json!(server_origin()));
+        return Json(Value::Object(map));
+    }
     Json(active)
+}
+
+/// Cloud handoff status: which machine this is, whether a VPS target is
+/// configured (host only, never the token), the concurrency cap, and the
+/// currently running chats. Powers the Cloud runs view and the per-chat
+/// cloud badge.
+async fn cloud_status_handler(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({
+        "origin": server_origin(),
+        "cap": concurrent_cap(),
+        "configured": cloud::cloud_configured(),
+        "cloud_host": cloud::cloud_host(),
+        "runs": state.runs.list_active(),
+    }))
+}
+
+async fn cloud_handoffs_handler(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({ "handoffs": cloud::load_handoffs(&state.harness_root) }))
+}
+
+async fn cloud_handoff_handler(
+    State(state): State<ServerState>,
+    Path(handoff_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let handoff = cloud::load_handoffs(&state.harness_root)
+        .into_iter()
+        .find(|item| item.id == handoff_id)
+        .ok_or_else(|| not_found(format!("unknown handoff '{handoff_id}'")))?;
+    Ok(Json(json!({ "handoff": handoff })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudSendRequest {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    workspace_id: String,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+async fn cloud_send_handler(
+    State(state): State<ServerState>,
+    Json(request): Json<CloudSendRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if request.workspace_id.trim().is_empty() {
+        return Err(bad_request("workspace_id is required".to_string()));
+    }
+    match cloud::build_handoff(
+        &state.harness_root,
+        &state.store,
+        cloud::SendRequest {
+            chat_id: request
+                .chat_id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            workspace_id: request.workspace_id.trim().to_string(),
+            task: request
+                .task
+                .map(|task| task.trim().to_string())
+                .filter(|task| !task.is_empty()),
+            branch: request
+                .branch
+                .map(|branch| branch.trim().to_string())
+                .filter(|branch| !branch.is_empty()),
+        },
+    )
+    .await
+    {
+        Ok(handoff) => Ok(Json(json!({ "handoff": handoff }))),
+        Err(error) => Err(bad_request(error)),
+    }
+}
+
+async fn cloud_receive_handler(
+    State(state): State<ServerState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match cloud::receive_package(&state.harness_root, &state.store, &body).await {
+        Ok(handoff) => Ok(Json(json!({ "handoff": handoff }))),
+        Err(error) => Err(bad_request(error)),
+    }
 }
 
 async fn agents_handler(State(state): State<ServerState>) -> Json<Value> {

@@ -230,6 +230,32 @@ Re-cloning keeps the existing workspace id, so chats and sessions reconnect to
 the same project instead of creating a duplicate. The tool reports the id and
 the folder relative to the projects root, never the absolute path.
 
+## Cloud handoffs (Send to Cloud)
+
+A handoff moves one chat (or a whole workspace) to the VPS — not a full
+backup. `POST /api/cloud/send {chat_id?, workspace_id, task?, branch?}`
+packages the chat row + messages, its rollout trace, the portable workspace
+record (`id`/`rel`/`repo`, never an absolute path), and the workspace memory
+index into `.deep_agents/cloud/out/<id>.zip`, points a `cloud/<slug>-<short>`
+branch at `HEAD` when the folder is a git repo (no checkout, local work is
+untouched), and records the handoff in `.deep_agents/cloud/handoffs.json`.
+
+- When `STARK_CLOUD_URL` + `STARK_CLOUD_TOKEN` (a VPS pairing-device token)
+  are set, the package is pushed to `POST /api/cloud/receive` and the handoff
+  goes `staged → sent`; otherwise it stays `staged` with its package path for
+  a manual carry.
+- The VPS imports by id (chat upsert, workspace `upsert_record` + shallow
+  re-clone from the stored repo when the folder is missing, `cloud/<…>`
+  branch pointer, rollout + memory written only when absent), so canvas
+  watches and delegations keep working. The manifest lists exclusions; `.env`,
+  job queues, checkpoints, logs, and WAL files never travel.
+- UI: per-chat `☁` badge (glow = live run) with Send + run details, dock
+  `Local | Cloud` toggle saved per chat, `Send to Cloud` in the chat toolbar,
+  and the `#/cloud` room (left-rail Cloud icon) with status, send form, and
+  the handoff queue.
+- `GET /api/cloud/status` reports `{origin, cap, configured, cloud_host,
+  runs[]}` and drives the badge glow plus the room header.
+
 ## Portable data (exports)
 
 `Settings → Backup & move` (or `GET /api/data/export`) produces one zip:

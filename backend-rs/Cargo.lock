@@ -4187,6 +4187,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hound",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

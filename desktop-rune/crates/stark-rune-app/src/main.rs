@@ -16,6 +16,9 @@
 use stark_kit::{draft_id, Role};
 use stark_theme::{color, layout};
 
+#[cfg(feature = "rune-real")]
+mod rune_transcript;
+
 // ---------------------------------------------------------------------------
 // Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)
 // ---------------------------------------------------------------------------
@@ -401,10 +404,51 @@ fn xml_escape(s: &str) -> String {
 
 fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
+    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--rune-snap") {
+        #[cfg(not(feature = "rune-real"))]
+        {
+            let _ = pos;
+            eprintln!("--rune-snap needs --features rune-real (pinned rune checkout + GPU).");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "rune-real")]
+        {
+            let png = args.get(pos + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--rune-snap <png> is required");
+                std::process::exit(2);
+            });
+            let mut scene = String::from("screenshot");
+            let mut scale = String::from("2");
+            let mut k = 0;
+            while k < args.len() {
+                if args[k] == "--rune-scene" && k + 1 < args.len() {
+                    scene = args[k + 1].clone();
+                    k += 2;
+                    continue;
+                }
+                if args[k] == "--rune-scale" && k + 1 < args.len() {
+                    scale = args[k + 1].clone();
+                    k += 2;
+                    continue;
+                }
+                k += 1;
+            }
+            rune_transcript::run_headless_or_windowed(vec![
+                "--snap".to_string(),
+                png,
+                "--scene".to_string(),
+                scene,
+                "--scale".to_string(),
+                scale,
+            ]);
+            return;
+        }
+    }
     if !args.iter().any(|a| a == "--headless") {
         eprintln!("Stark Rune rewrite (branch `rune-rewrite`). Byte-identical UI lives here; `main` keeps Tauri+React.");
         eprintln!("Run headless: stark-rune --headless --dump-tree tree.txt --golden golden.svg");

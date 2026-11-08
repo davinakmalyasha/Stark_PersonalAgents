@@ -12,6 +12,16 @@ path = "src/main.rs"
 stark-theme = { path = "../stark-theme" }
 stark-kit = { path = "../stark-kit" }
 
-# Real Rune integration (requires network). Pinned `dev` rev; `dev` is never
-# rewritten upstream. Uncomment when online:
-# rune = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+[features]
+# Real Rune rendering. Off by default so headless goldens + unit tests stay
+# GPU-free and offline. Enable once the pinned `dev` checkout is fetched:
+# `cargo test -p stark-rune-app --features rune-real`
+default = []
+rune-real = ["dep:rune"]
+
+[dependencies.rune]
+git = "https://github.com/anomalyco/rune"
+rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b"
+package = "rune"
+default-features = false
+optional = true

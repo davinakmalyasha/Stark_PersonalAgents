@@ -44,14 +44,34 @@
 - `crates/stark-kit` — pure canvas math ported from `CanvasStage.tsx`/`canvasTypes.ts`.
 - `crates/stark-rune-app` — `El` tree (mirrors `rune::El`), `view()`, scripted input, goldens.
 
-## Real Rune dep (needs network)
+## Real Rune dep (pinned, offline-optional)
 
 ```toml
-rune = { git = "https://github.com/anomalyco/rune", rev = "<dev rev>" }
+[dependencies.rune]
+git = "https://github.com/anomalyco/rune"
+rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b" # `dev`, never rewritten
+package = "rune"
+default-features = false  # headless + core rendering, no OS integrations
+optional = true
 ```
 
-Pin a `dev` rev (`dev` never rewritten). Until then, `El`/`view()` here are
-structurally identical so the swap is mechanical.
+```bash
+cargo test -p stark-kit -p stark-theme                              # offline, GPU-free
+cargo test -p stark-rune-app --features rune-real                    # real Rune Runtime, GPU-free
+cargo run -p stark-rune-app --features rune-real -- \
+  --rune-snap target/rune-goldens/transcript.png --rune-scene screenshot  # real wgpu PNG (needs GPU)
+```
+
+## Transcript (MessageStream port)
+
+- Pure math: `crates/stark-kit/src/transcript.rs` — role-based height
+  estimates, overscanned `realize()` window (`f64` extents, bottom-exact),
+  `stick_bottom` follow-the-end. 5 tests, incl. 10k-row subset proof.
+- Real view: `crates/stark-rune-app/src/rune_transcript.rs` — scroll viewport
+  (`.scroll(stick_bottom)`, bounded `.h_full().min_h(0.0)`) + growth stack
+  (`.growth().virtualize(EST)`) with keyed bubble rows, title, live status,
+  composer. `spec()` ships `screenshot` + `stress` scenes with a debug
+  parity assert tying `realize()` to the shipped scene.
 
 ## Commands
 

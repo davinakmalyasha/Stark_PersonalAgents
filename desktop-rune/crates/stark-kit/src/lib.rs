@@ -5,8 +5,12 @@
 //! - `frontend/src/canvas/canvasTypes.ts` (`draftId`, `makeItem`, `DEFAULT_VIEW`)
 //! - `frontend/src/canvas/CanvasStage.tsx` (`clamp`, wheel zoom, `fitView`,
 //!   `focusChat`, edge bezier path, auto-map sync signature)
+//! - `frontend/src/components/Workspace/MessageStream.tsx` (transcript rows,
+//!   virtualized window, `stick_bottom` follow-the-end — see `transcript`)
 //!
 //! No raw style literals here — sizes come from `stark-theme`.
+
+pub mod transcript;
 
 use stark_theme::layout;
 

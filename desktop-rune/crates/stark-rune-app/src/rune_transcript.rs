@@ -28,14 +28,51 @@ pub struct RowData {
     pub body: String,
 }
 
-#[derive(Debug, Clone, Default)]
 pub struct RuneTranscriptState {
     pub title: String,
     pub rows: Vec<RowData>,
     pub composer: String,
     pub model: String,
     pub live: bool,
+    pub api_host: String,
+    pub api_port: u16,
+    /// Frames streamed from the run thread, drained by the `poll` hook.
+    /// `None` on clone: a copied state never inherits a live socket.
+    pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
 }
+
+impl std::fmt::Debug for RuneTranscriptState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuneTranscriptState")
+            .field("title", &self.title)
+            .field("rows", &self.rows)
+            .field("composer", &self.composer)
+            .field("model", &self.model)
+            .field("live", &self.live)
+            .field("api_host", &self.api_host)
+            .field("api_port", &self.api_port)
+            .field("inbox", &self.inbox.is_some())
+            .finish()
+    }
+}
+
+impl Clone for RuneTranscriptState {
+    fn clone(&self) -> Self {
+        Self {
+            title: self.title.clone(),
+            rows: self.rows.clone(),
+            composer: self.composer.clone(),
+            model: self.model.clone(),
+            live: self.live,
+            api_host: self.api_host.clone(),
+            api_port: self.api_port,
+            inbox: None,
+        }
+    }
+}
+
+pub const DEFAULT_API_HOST: &str = "127.0.0.1";
+pub const DEFAULT_API_PORT: u16 = 8124;
 
 impl RuneTranscriptState {
     /// Screenshot scene: mirrors `AppState::default` card-4 (the running chat).
@@ -57,6 +94,9 @@ impl RuneTranscriptState {
             composer: String::new(),
             model: "Automatic Fallback".to_string(),
             live: true,
+            api_host: DEFAULT_API_HOST.to_string(),
+            api_port: DEFAULT_API_PORT,
+            inbox: None,
         }
     }
 
@@ -87,6 +127,9 @@ impl RuneTranscriptState {
             composer: String::new(),
             model: "Automatic Fallback".to_string(),
             live: false,
+            api_host: DEFAULT_API_HOST.to_string(),
+            api_port: DEFAULT_API_PORT,
+            inbox: None,
         }
     }
 
@@ -225,8 +268,9 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
         );
     }
     // Composer card: shared `.premium-surface` dock (see `composer.rs`).
-    // Send stages the draft as a user row and marks the run live; the
-    // `stream.rs` transport replays the backend SSE into the same rows.
+    // Send stages the draft as a user row, marks the run live, and spawns the
+    // blocking `POST /api/run` thread; frames land in `inbox`, drained by the
+    // `poll` hook before every frame. The UI thread never blocks.
     let composer_card =
         super::composer::composer_card(&s.model, &s.composer, |s: &mut RuneTranscriptState| {
             let prompt = s.composer.trim().to_string();
@@ -237,10 +281,32 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
             s.rows.push(RowData {
                 key: format!("user-{n}"),
                 role: "user",
-                body: prompt,
+                body: prompt.clone(),
             });
             s.live = true;
             s.composer.clear();
+            let req = crate::stream::RunRequest {
+                prompt,
+                model: s.model.clone(),
+                temperature: 0.7,
+                workspace_path: String::new(),
+                chat_id: String::new(),
+                workspace_kind: "general".to_string(),
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            s.inbox = Some(rx);
+            let (host, port) = (s.api_host.clone(), s.api_port);
+            std::thread::spawn(move || {
+                let mut emit = |frame: crate::stream::SseFrame| {
+                    let _ = tx.send(frame);
+                };
+                if let Err(message) = crate::transport::post_run(&host, port, &req, &mut emit) {
+                    let _ = tx.send(crate::stream::SseFrame {
+                        event: "error".to_string(),
+                        data: serde_json::json!({"message": message}),
+                    });
+                }
+            });
         });
     root.child(
         rune::el()
@@ -265,6 +331,30 @@ fn apply_stress(s: &mut RuneTranscriptState) {
     *s = RuneTranscriptState::stress();
 }
 
+/// `poll` hook: drain run frames queued by the transport thread into rows.
+/// Returns true when state changed (requests another frame).
+pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune::Tx) -> bool {
+    let mut changed = false;
+    while let Some(frame) = s.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        crate::stream::apply_frame(s, &frame);
+        changed = true;
+    }
+    if changed {
+        // Sender gone and queue empty: run over, drop the inbox so idle frames
+        // stop polling a dead channel.
+        let dead = s.inbox.as_ref().is_some_and(|rx| {
+            matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            )
+        });
+        if dead {
+            s.inbox = None;
+        }
+    }
+    changed
+}
+
 /// AppSpec for headless `--snap` / windowed runs.
 pub fn spec() -> AppSpec<RuneTranscriptState> {
     // Parity self-check (debug only): the pure window math must cover the whole
@@ -278,6 +368,7 @@ pub fn spec() -> AppSpec<RuneTranscriptState> {
     });
     AppSpec {
         scenes: &[("screenshot", apply_screenshot), ("stress", apply_stress)],
+        poll: Some(drain_run_inbox),
         ..AppSpec::new(
             "Stark Transcript",
             (468.0, 720.0),
@@ -329,6 +420,10 @@ mod tests {
         let mut init = RuneTranscriptState::screenshot();
         init.composer = "hello agent".to_string();
         init.live = false;
+        // Closed port: the spawned run thread fails into the undrained channel
+        // (Runtime::new wires no poll), so staging assertions stay exact and no
+        // real server is ever touched.
+        init.api_port = 1;
         let n = init.rows.len();
         let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
         rt.frame(0.0);
@@ -342,6 +437,34 @@ mod tests {
         assert!(rt.state.live);
         assert!(rt.state.composer.is_empty());
         assert!(rt.find(&rt.state.rows[n].key).is_some());
+        assert!(rt.state.inbox.is_some(), "run thread owns the inbox");
+    }
+
+    #[test]
+    fn poll_drain_applies_queued_frames_and_drops_dead_inbox() {
+        use crate::stream::SseFrame;
+        let mut s = RuneTranscriptState::screenshot();
+        let n = s.rows.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.inbox = Some(rx);
+        tx.send(SseFrame {
+            event: "delta".to_string(),
+            data: serde_json::json!({"kind":"text","text":"hi"}),
+        })
+        .unwrap();
+        tx.send(SseFrame {
+            event: "done".to_string(),
+            data: serde_json::json!({"status":"ok"}),
+        })
+        .unwrap();
+        drop(tx);
+        let mut run_tx = rune::Tx::default();
+        assert!(drain_run_inbox(&mut s, 0.0, &mut run_tx));
+        assert_eq!(s.rows.len(), n + 1);
+        assert_eq!(s.rows.last().unwrap().body, "hi");
+        assert!(!s.live);
+        assert!(s.inbox.is_none(), "dead inbox dropped");
+        assert!(!drain_run_inbox(&mut s, 1.0, &mut run_tx));
     }
 
     #[test]

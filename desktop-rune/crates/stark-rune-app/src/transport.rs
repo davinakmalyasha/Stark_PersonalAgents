@@ -1,0 +1,289 @@
+//! Blocking HTTP transport for `POST /api/run` with incremental SSE decode.
+//!
+//! `std` only (no async runtime): the Rune UI thread never blocks — the send
+//! handler spawns one thread running [`post_run`], which streams frames into
+//! an `mpsc` channel drained by the `poll` hook before every frame.
+//!
+//! Framing mirrors `frontend/src/services/api/stream.ts`: `event:` + `data:`
+//! lines, blank-line dispatch, trailing-buffer flush. Bodies may be
+//! `Transfer-Encoding: chunked` (axum SSE) or close-delimited.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use crate::stream::{infer_event, RunRequest, SseFrame};
+
+/// Incremental SSE decoder over raw bytes. Handles UTF-8 split across chunks
+/// (only complete lines up to the last valid `\n` are processed) and keeps
+/// `event:`/`data:` state across pushes.
+#[derive(Debug, Default)]
+pub struct SseDecoder {
+    raw: Vec<u8>,
+    event: String,
+    data: Vec<String>,
+}
+
+impl SseDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push bytes, appending decoded frames to `out`.
+    pub fn push(&mut self, bytes: &[u8], out: &mut Vec<SseFrame>) {
+        self.raw.extend_from_slice(bytes);
+        let valid = match std::str::from_utf8(&self.raw) {
+            Ok(_) => self.raw.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        let end = self.raw[..valid]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        if end == 0 {
+            return;
+        }
+        // SAFETY: `end` is within the valid UTF-8 prefix at a `\n` boundary.
+        let text = String::from_utf8(self.raw[..end].to_vec()).expect("valid prefix");
+        self.raw.drain(..end);
+        for line in text.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if let Some(name) = line.strip_prefix("event:") {
+                self.event = name.trim().to_string();
+            } else if let Some(payload) = line.strip_prefix("data:") {
+                self.data.push(payload.trim().to_string());
+            } else if line.trim().is_empty() {
+                self.dispatch(out);
+            }
+        }
+    }
+
+    /// End of stream: flush the trailing buffer like `streamPipeline` does.
+    pub fn finish(&mut self, out: &mut Vec<SseFrame>) {
+        if !self.raw.is_empty() {
+            let tail = String::from_utf8_lossy(&self.raw).into_owned();
+            self.raw.clear();
+            for line in tail.split('\n') {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if let Some(name) = line.strip_prefix("event:") {
+                    self.event = name.trim().to_string();
+                } else if let Some(payload) = line.strip_prefix("data:") {
+                    self.data.push(payload.trim().to_string());
+                }
+            }
+        }
+        self.dispatch(out);
+    }
+
+    fn dispatch(&mut self, out: &mut Vec<SseFrame>) {
+        if self.data.is_empty() {
+            self.event.clear();
+            return;
+        }
+        let joined = self.data.join("\n");
+        if let Ok(data) = serde_json::from_str(&joined) {
+            let event = if self.event.is_empty() {
+                infer_event(&data)
+            } else {
+                std::mem::take(&mut self.event)
+            };
+            out.push(SseFrame { event, data });
+        }
+        self.event.clear();
+        self.data.clear();
+    }
+}
+
+/// Outcome of [`post_run`]: the terminal `done` status, if the server sent one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunOutcome {
+    pub status: String,
+}
+
+/// Blocking `POST /api/run`, streaming frames to `on_frame` as they arrive.
+/// Chunked and close-delimited bodies both supported. Errors are strings so
+/// the UI thread can surface them as an `error` frame.
+pub fn post_run(
+    host: &str,
+    port: u16,
+    req: &RunRequest,
+    on_frame: &mut dyn FnMut(SseFrame),
+) -> Result<RunOutcome, String> {
+    let body = req.to_json().to_string();
+    let addr = format!("{host}:{port}");
+    let mut sock = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(120)))
+        .map_err(|e| e.to_string())?;
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let http = format!(
+        "POST /api/run HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(http.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut reader = BufReader::new(sock);
+    let mut status = String::new();
+    reader
+        .read_line(&mut status)
+        .map_err(|e| format!("status: {e}"))?;
+    if !status.contains("200") {
+        return Err(format!("HTTP {}", status.trim()));
+    }
+    let mut chunked = false;
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("headers: {e}"))?;
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        if t.to_ascii_lowercase().starts_with("transfer-encoding:") && t.contains("chunked") {
+            chunked = true;
+        }
+    }
+
+    let mut decoder = SseDecoder::new();
+    let mut frames: Vec<SseFrame> = Vec::new();
+    let mut outcome = RunOutcome {
+        status: "unknown".to_string(),
+    };
+    if chunked {
+        loop {
+            let mut size_line = String::new();
+            reader
+                .read_line(&mut size_line)
+                .map_err(|e| format!("chunk size: {e}"))?;
+            let size = u64::from_str_radix(size_line.trim(), 16)
+                .map_err(|_| format!("bad chunk size {size_line:?}"))?;
+            if size == 0 {
+                break;
+            }
+            let mut chunk = vec![0u8; size as usize];
+            reader
+                .read_exact(&mut chunk)
+                .map_err(|e| format!("chunk: {e}"))?;
+            let mut crlf = [0u8; 2];
+            reader
+                .read_exact(&mut crlf)
+                .map_err(|e| format!("chunk end: {e}"))?;
+            decoder.push(&chunk, &mut frames);
+            drain(&mut frames, &mut outcome, on_frame);
+        }
+    } else {
+        loop {
+            let mut buf = [0u8; 8192];
+            let n = reader.read(&mut buf).map_err(|e| format!("body: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            decoder.push(&buf[..n], &mut frames);
+            drain(&mut frames, &mut outcome, on_frame);
+        }
+    }
+    decoder.finish(&mut frames);
+    drain(&mut frames, &mut outcome, on_frame);
+    Ok(outcome)
+}
+
+fn drain(frames: &mut Vec<SseFrame>, outcome: &mut RunOutcome, on_frame: &mut dyn FnMut(SseFrame)) {
+    for frame in frames.drain(..) {
+        if frame.event == "done" {
+            if let Some(status) = frame.data.get("status").and_then(|v| v.as_str()) {
+                outcome.status = status.to_string();
+            }
+        }
+        on_frame(frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn decoder_handles_split_lines_and_multibyte() {
+        let mut dec = SseDecoder::new();
+        let mut out = Vec::new();
+        // "…" (3 bytes) split across chunks; lines split mid-way too.
+        dec.push(
+            "event: delta\ndata: {\"kind\":\"text\",\"text\":\"42 …".as_bytes(),
+            &mut out,
+        );
+        assert!(out.is_empty());
+        dec.push("90.4\"}\n\n".as_bytes(), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data["text"], serde_json::json!("42 …90.4"));
+    }
+
+    /// Full client↔server round trip over a real socket with chunked SSE.
+    #[test]
+    fn post_run_streams_chunked_sse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Read headers + exact body.
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("Content-Length:") {
+                    content_len = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+            let sent = String::from_utf8(body).unwrap();
+            assert!(request_line.starts_with("POST /api/run "), "{request_line}");
+            assert!(sent.contains("\"workspace_kind\":\"general\""), "{sent}");
+            // Chunked SSE, deliberately fragmented: one logical line split
+            // across two chunks to prove incremental decode.
+            let parts: &[&[u8]] = &[
+                b"event: delta\r\ndata: {\"kind\":\"text\",\"text\":\"hel",
+                b"lo\"}\r\n\r\nevent: done\r\ndata: {\"status\":\"ok\"}\r\n\r\n",
+            ];
+            let mut head =
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec();
+            sock.write_all(&head).unwrap();
+            head.clear();
+            for part in parts {
+                sock.write_all(format!("{:x}\r\n", part.len()).as_bytes())
+                    .unwrap();
+                // Split the write itself to fragment TCP segments.
+                let mid = part.len() / 2;
+                sock.write_all(&part[..mid]).unwrap();
+                sock.write_all(&part[mid..]).unwrap();
+                sock.write_all(b"\r\n").unwrap();
+            }
+            sock.write_all(b"0\r\n\r\n").unwrap();
+        });
+
+        let req = RunRequest {
+            prompt: "hi".to_string(),
+            model: "m".to_string(),
+            temperature: 0.7,
+            workspace_path: String::new(),
+            chat_id: "c1".to_string(),
+            workspace_kind: "general".to_string(),
+        };
+        let mut got: Vec<SseFrame> = Vec::new();
+        let outcome = post_run("127.0.0.1", port, &req, &mut |f| got.push(f)).unwrap();
+        server.join().unwrap();
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].data["text"], serde_json::json!("hello"));
+        assert_eq!(got[1].event, "done");
+    }
+}

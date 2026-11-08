@@ -48,45 +48,19 @@ pub struct SseFrame {
 
 /// Parse an SSE byte stream into frames. Tolerates a missing trailing blank
 /// line (flushes the buffer, like `streamPipeline`'s `done` path) and skips
-/// undecodable `data:` lines.
+/// undecodable `data:` lines. Implemented over [`crate::transport::SseDecoder`]
+/// so streaming and one-shot parsing share framing rules.
 pub fn parse_sse_stream(text: &str) -> Vec<SseFrame> {
-    let mut frames = Vec::new();
-    let mut event = String::new();
-    let mut data_lines: Vec<String> = Vec::new();
-    let flush = |event: &mut String, data_lines: &mut Vec<String>, frames: &mut Vec<SseFrame>| {
-        if data_lines.is_empty() {
-            event.clear();
-            return;
-        }
-        let joined = data_lines.join("\n");
-        if let Ok(data) = serde_json::from_str::<Value>(&joined) {
-            let kind = if event.is_empty() {
-                infer_event(&data)
-            } else {
-                event.clone()
-            };
-            frames.push(SseFrame { event: kind, data });
-        }
-        event.clear();
-        data_lines.clear();
-    };
-    for line in text.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(name) = line.strip_prefix("event:") {
-            event = name.trim().to_string();
-        } else if let Some(payload) = line.strip_prefix("data:") {
-            data_lines.push(payload.trim().to_string());
-        } else if line.trim().is_empty() {
-            flush(&mut event, &mut data_lines, &mut frames);
-        }
-    }
-    flush(&mut event, &mut data_lines, &mut frames);
-    frames
+    let mut decoder = crate::transport::SseDecoder::new();
+    let mut out = Vec::new();
+    decoder.push(text.as_bytes(), &mut out);
+    decoder.finish(&mut out);
+    out
 }
 
 /// Frames without an `event:` line: `done`/`error` payloads and `AppState`
 /// snapshots (anything with `active_node`/`state_version`) are classified.
-fn infer_event(data: &Value) -> String {
+pub(crate) fn infer_event(data: &Value) -> String {
     if data.get("status").is_some() {
         "done".to_string()
     } else if data.get("error").is_some() && data.get("active_node").is_none() {

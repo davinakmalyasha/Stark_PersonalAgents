@@ -24,6 +24,8 @@ mod rune_canvas;
 mod rune_transcript;
 #[cfg(feature = "rune-real")]
 mod stream;
+#[cfg(feature = "rune-real")]
+mod transport;
 
 // ---------------------------------------------------------------------------
 // Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)

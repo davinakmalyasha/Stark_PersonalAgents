@@ -4,6 +4,14 @@ members = [
     "crates/stark-theme",
     "crates/stark-kit",
     "crates/stark-rune-app",
+    "crates/stark-rune-web",
+]
+# stark-rune-web links only for wasm32 (MinGW ld cannot link its cdylib on
+# Windows-GNU): host builds/tests skip it unless named with `-p`.
+default-members = [
+    "crates/stark-theme",
+    "crates/stark-kit",
+    "crates/stark-rune-app",
 ]
 
 [workspace.package]

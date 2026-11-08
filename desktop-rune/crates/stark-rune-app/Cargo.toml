@@ -8,6 +8,9 @@ license.workspace = true
 name = "stark-rune"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["rlib"]
+
 [dependencies]
 stark-theme = { path = "../stark-theme" }
 stark-kit = { path = "../stark-kit" }
@@ -26,4 +29,7 @@ git = "https://github.com/anomalyco/rune"
 rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b"
 package = "rune"
 default-features = false
+# embedded-fonts: web has no system-font discovery; bundle Inter + Plex Mono
+# so glyphs render in the browser (native keeps working unchanged).
+features = ["embedded-fonts"]
 optional = true

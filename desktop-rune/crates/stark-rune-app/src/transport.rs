@@ -16,9 +16,9 @@ use std::net::TcpStream;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use crate::stream::{infer_event, SseFrame};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::stream::RunRequest;
+use crate::stream::{infer_event, SseFrame};
 
 /// Incremental SSE decoder over raw bytes. Handles UTF-8 split across chunks
 /// (only complete lines up to the last valid `\n` are processed) and keeps
@@ -143,7 +143,8 @@ pub fn post_run(
 /// Blocking `GET` returning a JSON body. Used for status endpoints
 /// (`/api/runs/active`, `/api/cloud/status`). Native only (see `post_run`).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, String> {    let (mut reader, chunked) =
+pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, String> {
+    let (mut reader, chunked) =
         request(host, port, "GET", path, "Accept: application/json\r\n", &[])?;
     let mut raw = Vec::new();
     for bytes in read_body(&mut reader, chunked)? {

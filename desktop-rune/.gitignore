@@ -1,0 +1,3 @@
+# Build output never committed: regenerate with desktop-rune/web/build.sh.
+web/pkg/
+target/

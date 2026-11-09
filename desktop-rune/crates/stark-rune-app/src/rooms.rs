@@ -7,7 +7,7 @@
 //! - `GET /api/memory` → `{enabled, workspaces:[{id,kind,name,
 //!   status:{entryCount,…}}]}`.
 //!
-//! Device actuation (`PUT /api/house/devices/{id}`) is deliberately NOT
+//! Device actuation (`PATCH /api/house/devices/{id}`) is deliberately NOT
 //! wired: it moves blinds/cameras in the user's home. Refresh/display only.
 //! Views are generic over host traits like the transcript/canvas families.
 
@@ -42,7 +42,8 @@ impl HouseDevice {
     pub fn from_json(v: &serde_json::Value) -> Self {
         let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let state = v.get("state").cloned().unwrap_or_default();
-        // Compact one-line summary: on/off, position %, or key count.
+        // Compact one-line summary covering `DeviceState` (`house.types.ts`):
+        // power/position first, then locks, climate, sensors, key count.
         let state_line = state
             .get("on")
             .and_then(|x| x.as_bool())
@@ -54,10 +55,64 @@ impl HouseDevice {
                 }
             })
             .or_else(|| {
+                state.get("power").and_then(|x| x.as_bool()).map(|on| {
+                    if on {
+                        "on".to_string()
+                    } else {
+                        "off".to_string()
+                    }
+                })
+            })
+            .or_else(|| {
+                state
+                    .get("brightness")
+                    .and_then(|x| x.as_f64())
+                    .map(|b| format!("{}%", b.round() as i64))
+            })
+            .or_else(|| {
                 state
                     .get("position")
                     .and_then(|x| x.as_f64())
                     .map(|p| format!("{}%", (p * 100.0).round() as i64))
+            })
+            .or_else(|| {
+                state.get("locked").and_then(|x| x.as_bool()).map(|l| {
+                    if l {
+                        "locked".to_string()
+                    } else {
+                        "unlocked".to_string()
+                    }
+                })
+            })
+            .or_else(|| {
+                state
+                    .get("targetTemp")
+                    .and_then(|x| x.as_f64())
+                    .map(|t| format!("{t}°"))
+            })
+            .or_else(|| {
+                state
+                    .get("temperature")
+                    .and_then(|x| x.as_f64())
+                    .map(|t| format!("{t}°"))
+            })
+            .or_else(|| {
+                state.get("recording").and_then(|x| x.as_bool()).map(|r| {
+                    if r {
+                        "rec".to_string()
+                    } else {
+                        "idle".to_string()
+                    }
+                })
+            })
+            .or_else(|| {
+                state.get("motion").and_then(|x| x.as_bool()).map(|m| {
+                    if m {
+                        "motion".to_string()
+                    } else {
+                        "clear".to_string()
+                    }
+                })
             })
             .or_else(|| {
                 state.as_object().map(|o| {
@@ -573,7 +628,7 @@ mod tests {
         assert_eq!(snap.devices.len(), 2);
         assert_eq!(snap.devices[0].state_line, "50%");
         assert!(snap.devices[0].online);
-        assert_eq!(snap.devices[1].state_line, "1 keys");
+        assert_eq!(snap.devices[1].state_line, "rec");
         assert!(!snap.devices[1].online);
     }
 

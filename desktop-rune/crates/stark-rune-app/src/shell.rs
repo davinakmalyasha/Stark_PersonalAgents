@@ -7,7 +7,7 @@
 
 use rune::{col, row, text, AppSpec, Cx, El};
 
-use crate::projects::{ProjectsHost, ProjectsState, projects_view, refresh_projects};
+use crate::projects::{projects_view, refresh_projects, ProjectsHost, ProjectsState};
 use crate::rooms::{
     drain_results, house_view, memory_view, refresh_house, refresh_memory, HouseHost, HouseState,
     MemoryHost, MemoryState,
@@ -17,14 +17,15 @@ use crate::rune_transcript::{
     drain_run_inbox, transcript_body, RuneTranscriptState, Thread, TranscriptHost,
 };
 
-/// Shell routes. `Map` is the home canvas; `Chat` the main transcript;
-/// `Personal` the personal room; `Cloud` the runs board; `House` the smart
-/// home; `Memory` the memory index; `Projects` the group board.
+/// Shell routes. `Home` is the map canvas (`#/`); `Coding` the main transcript
+/// (`#/coding`); `Personal` the personal room; `Cloud` the runs board;
+/// `House` the smart home; `Memory` the memory index; `Projects` the group
+/// board. Names match `AppShell.tsx` where a React route exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Route {
     #[default]
-    Map,
-    Chat,
+    Home,
+    Coding,
     Personal,
     Cloud,
     House,
@@ -135,7 +136,7 @@ impl Default for ShellState {
         personal.rows = vec![];
         personal.live = false;
         Self {
-            route: Route::Map,
+            route: Route::Home,
             transcript: RuneTranscriptState::screenshot(),
             personal,
             canvas: CanvasState::map(),
@@ -216,8 +217,8 @@ fn tab(s: &ShellState, route: Route, label: &str, key: &str) -> El {
 
 pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
     let body = match s.route {
-        Route::Map => canvas_body::<ShellState>(&s.canvas),
-        Route::Chat => transcript_body::<ShellState>(&s.transcript, Thread::Main),
+        Route::Home => canvas_body::<ShellState>(&s.canvas),
+        Route::Coding => transcript_body::<ShellState>(&s.transcript, Thread::Main),
         Route::Personal => transcript_body::<ShellState>(&s.personal, Thread::Personal),
         Route::Cloud => cloud_view(&s.cloud),
         Route::House => house_view::<ShellState>(&s.house),
@@ -238,8 +239,8 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
                 .px(12.0)
                 .pt(10.0)
                 .pb(6.0)
-                .child(tab(s, Route::Map, "Map", "tab-map"))
-                .child(tab(s, Route::Chat, "Chat", "tab-chat"))
+                .child(tab(s, Route::Home, "Home", "tab-home"))
+                .child(tab(s, Route::Coding, "Coding", "tab-coding"))
                 .child(tab(s, Route::Personal, "Personal", "tab-personal"))
                 .child(tab(s, Route::Cloud, "Cloud", "tab-cloud"))
                 .child(tab(s, Route::House, "House", "tab-house"))
@@ -443,7 +444,8 @@ fn poll_house(s: &mut ShellState, clock: f64) -> bool {
 }
 
 /// Drain the memory inbox; auto-refresh at most every 15s.
-fn poll_memory(s: &mut ShellState, clock: f64) -> bool {    let (msgs, _) = drain_results(&mut s.memory.inbox);
+fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
+    let (msgs, _) = drain_results(&mut s.memory.inbox);
     let mut changed = false;
     for msg in msgs {
         match msg {
@@ -495,12 +497,12 @@ fn init_shell() -> ShellState {
     ShellState::default()
 }
 
-fn apply_map(s: &mut ShellState) {
-    s.route = Route::Map;
+fn apply_home(s: &mut ShellState) {
+    s.route = Route::Home;
 }
 
-fn apply_chat(s: &mut ShellState) {
-    s.route = Route::Chat;
+fn apply_coding(s: &mut ShellState) {
+    s.route = Route::Coding;
 }
 
 fn apply_personal(s: &mut ShellState) {
@@ -526,8 +528,8 @@ fn apply_projects(s: &mut ShellState) {
 pub fn shell_spec() -> AppSpec<ShellState> {
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
-        ("map", apply_map),
-        ("chat", apply_chat),
+        ("home", apply_home),
+        ("coding", apply_coding),
         ("personal", apply_personal),
         ("cloud", apply_cloud),
         ("house", apply_house),
@@ -556,19 +558,19 @@ mod tests {
         assert!(rt.find("canvas-world").is_some());
         assert!(rt.find("transcript-viewport").is_none());
         // Type in Chat without leaving Map? Switch first, then type.
-        let (x, y) = rt.find("tab-chat").unwrap();
+        let (x, y) = rt.find("tab-coding").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert_eq!(rt.state.route, Route::Chat);
+        assert_eq!(rt.state.route, Route::Coding);
         assert!(rt.find("transcript-viewport").is_some());
         assert!(rt.find("canvas-world").is_none());
         // Map state survives the round trip.
-        let (x, y) = rt.find("tab-map").unwrap();
+        let (x, y) = rt.find("tab-home").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert_eq!(rt.state.route, Route::Map);
+        assert_eq!(rt.state.route, Route::Home);
         assert!(rt.find("chat:ws-general:chat-1").is_some());
     }
 
@@ -796,7 +798,6 @@ mod tests {
         for _ in 0..5 {
             rt.frame(1.0 / 60.0);
         }
-        let mut run_tx = rune::Tx::default();
         let mut waited = 0;
         while rt.state.projects.projects.is_empty() && waited < 500 {
             rt.update(|s, tx| {
@@ -811,7 +812,6 @@ mod tests {
         for key in ["projects-p1-title", "projects-p1-bar", "projects-p2-title"] {
             assert!(rt.find(key).is_some(), "{key} mounted");
         }
-        let _ = run_tx;
     }
 
     #[test]
@@ -821,7 +821,7 @@ mod tests {
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         // Stage a run from Chat, flip to Map, drain via shell poll.
-        let (x, y) = rt.find("tab-chat").unwrap();
+        let (x, y) = rt.find("tab-coding").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
@@ -829,7 +829,7 @@ mod tests {
         rt.state.transcript.edit.text = "hi".to_string();
         crate::rune_transcript::stage_send(&mut rt.state.transcript);
         assert!(rt.state.transcript.live);
-        let (x, y) = rt.find("tab-map").unwrap();
+        let (x, y) = rt.find("tab-home").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);

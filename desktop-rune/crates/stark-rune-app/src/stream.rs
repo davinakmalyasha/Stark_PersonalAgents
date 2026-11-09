@@ -144,6 +144,19 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
             "state"
         }
         "done" => {
+            // Mirrors `streamPipeline`: `status === 'error'` fails the run
+            // instead of landing it clean.
+            if frame.data.get("status").and_then(Value::as_str) == Some("error") {
+                let msg = frame
+                    .data
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The agent pipeline failed.");
+                live_row(state).body = msg.to_string();
+                live_row(state).role = "error";
+                state.live = false;
+                return "failed";
+            }
             state.live = false;
             "done"
         }
@@ -236,5 +249,19 @@ mod tests {
         assert_eq!(statuses, vec!["failed"]);
         assert!(!s.live);
         assert_eq!(s.rows.last().unwrap().role, "error");
+    }
+
+    #[test]
+    fn replay_done_error_fails_like_stream_pipeline() {
+        let mut s = state();
+        s.live = true;
+        let statuses = replay(
+            &mut s,
+            "event: done\ndata: {\"status\":\"error\",\"error\":\"pipeline blew up\"}\n\n",
+        );
+        assert_eq!(statuses, vec!["failed"]);
+        assert!(!s.live);
+        assert_eq!(s.rows.last().unwrap().role, "error");
+        assert_eq!(s.rows.last().unwrap().body, "pipeline blew up");
     }
 }

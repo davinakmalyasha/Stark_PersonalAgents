@@ -7,9 +7,7 @@
 //! Read-only: detail/ops (`pause`/`resume`/`close`) stay server-side until
 //! the modal port. Empty board is the honest state when none exist.
 
-use rune::{El, col, row, text};
-
-use crate::rooms::{HouseHost, MemoryHost};
+use rune::{col, row, text, El};
 
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
@@ -34,11 +32,7 @@ impl GroupProject {
             .and_then(|x| x.as_str())
             .map(str::to_string)
             .filter(|t| !t.is_empty())
-            .or_else(|| {
-                v.get("goal")
-                    .and_then(|x| x.as_str())
-                    .map(str::to_string)
-            })
+            .or_else(|| v.get("goal").and_then(|x| x.as_str()).map(str::to_string))
             .unwrap_or_default();
         let (mut done, mut total) = (u64_of("items_done"), u64_of("items_total"));
         if total == 0 {
@@ -46,7 +40,11 @@ impl GroupProject {
             total = u64_of("milestones_total");
         }
         Self {
-            id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            id: v
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             title,
             status: v
                 .get("status")
@@ -85,8 +83,14 @@ impl ProjectsSnapshot {
         }
     }
 
-    pub fn fetch(host: &str, port: u16) -> Result<Self, String> {
-        let v = crate::transport::get_json(host, port, "/api/groups")?;
+    pub fn fetch(host: &str, port: u16, workspace_id: &str) -> Result<Self, String> {
+        // Mirrors `fetchGroupProjects`: server-side scoping, empty = global.
+        let path = if workspace_id.trim().is_empty() {
+            "/api/groups".to_string()
+        } else {
+            format!("/api/groups?workspace_id={}", workspace_id.trim())
+        };
+        let v = crate::transport::get_json(host, port, &path)?;
         Ok(Self::from_json(&v))
     }
 }
@@ -94,6 +98,8 @@ impl ProjectsSnapshot {
 pub struct ProjectsState {
     pub host: String,
     pub port: u16,
+    /// Server-side scope (`fetchGroupProjects(workspaceId)`); empty = global.
+    pub workspace_id: String,
     pub projects: Vec<GroupProject>,
     pub loading: bool,
     pub error: Option<String>,
@@ -117,6 +123,7 @@ impl Clone for ProjectsState {
         Self {
             host: self.host.clone(),
             port: self.port,
+            workspace_id: self.workspace_id.clone(),
             projects: self.projects.clone(),
             loading: self.loading,
             error: self.error.clone(),
@@ -132,6 +139,7 @@ impl Default for ProjectsState {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8124,
+            workspace_id: String::new(),
             projects: Vec::new(),
             loading: false,
             error: None,
@@ -156,9 +164,15 @@ pub fn refresh_projects(s: &mut ProjectsState) {
     s.error = None;
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
+    let ws = s.workspace_id.clone();
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        let result = match crate::transport::fetch_json("/api/groups").await {
+        let path = if ws.trim().is_empty() {
+            "/api/groups".to_string()
+        } else {
+            format!("/api/groups?workspace_id={}", ws.trim())
+        };
+        let result = match crate::transport::fetch_json(&path).await {
             Ok(v) => Ok(ProjectsSnapshot::from_json(&v)),
             Err(e) => Err(e),
         };
@@ -168,7 +182,7 @@ pub fn refresh_projects(s: &mut ProjectsState) {
     {
         let (host, port) = (s.host.clone(), s.port);
         std::thread::spawn(move || {
-            let _ = tx.send(ProjectsSnapshot::fetch(&host, port));
+            let _ = tx.send(ProjectsSnapshot::fetch(&host, port, &ws));
         });
     }
 }
@@ -309,7 +323,11 @@ fn progress_bar(id: &str, fraction: f32) -> El {
                 .grow(fill.max(1.0))
                 .min_h(0.0),
         )
-        .child(rune::el().key(format!("projects-{id}-rest")).grow((1000.0 - fill).max(1.0)))
+        .child(
+            rune::el()
+                .key(format!("projects-{id}-rest"))
+                .grow((1000.0 - fill).max(1.0)),
+        )
 }
 
 #[cfg(test)]

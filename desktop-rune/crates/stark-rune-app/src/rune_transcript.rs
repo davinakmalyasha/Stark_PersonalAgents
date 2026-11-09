@@ -169,7 +169,9 @@ fn bg() -> rune::Color {
 /// Render a message body as markdown blocks: paras/headings/lists become
 /// `rich` runs (bold weight, inline-code mono + merged backgrounds), fenced
 /// code becomes a mono block on a dark well. Mirrors `Markdown.tsx`.
-fn render_body(key: &str, body: &str) -> El {
+/// `body_ink` is the role text color (`#dedee5` user, `#d2d2da` agent, per
+/// `canvas.css`).
+fn render_body(key: &str, body: &str, body_ink: &'static str) -> El {
     use stark_kit::markdown::{Block, Inline};
     let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
     let body_style = rune::tok::TextStyle::new(12.5, 400.0);
@@ -213,7 +215,7 @@ fn render_body(key: &str, body: &str) -> El {
                     rune::rich(content, spans)
                         .key(format!("{key}-p-{i}"))
                         .font(body_style)
-                        .color(ink("#d2d2da")),
+                        .color(ink(body_ink)),
                 );
             }
             Block::Heading {
@@ -246,7 +248,7 @@ fn render_body(key: &str, body: &str) -> El {
                             .child(
                                 rune::rich(content, spans)
                                     .font(body_style)
-                                    .color(ink("#d2d2da")),
+                                    .color(ink(body_ink)),
                             ),
                     );
                 }
@@ -385,21 +387,41 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             move |s: &S, i| Cow::Borrowed(s.thread(which).rows[i].key.as_str()),
             move |s: &S, i| {
                 let r = &s.thread(which).rows[i];
-                // Role palette from `canvas.css` `.canvas-bubble*`: user
-                // #28282f, agent #19191e, error rose, system quiet; 22px
-                // avatars, 11px/650 name headers, 12.5px wrapped bodies.
-                let (fill, avatar_bg, initial, name) = match r.role {
-                    "user" => ("#28282f", "#303038", "Y", "You"),
-                    "error" => ("#2a1a1d", "#3a2226", "!", "Error"),
-                    "system" => ("#101013", "#24242a", "S", "System"),
-                    _ => ("#19191e", "#24242a", "A", "Assistant"),
+                // Role palette from `canvas.css` `.canvas-bubble*`: per-role
+                // fills, hairlines (agent .05 / user .075 / live .10), and
+                // the translucent rose error system; 22px avatars, 11px/650
+                // `#f0f0f3` name headers, role-tinted 12.5px bodies
+                // (`#dedee5` user, `#d2d2da` agent).
+                let (fill, hair_a, avatar_bg, initial, initial_ink, name, body_ink) = match r.role {
+                    "user" => (
+                        "#28282f", 0.075, "#303038", "Y", "#e6e6ec", "You", "#dedee5",
+                    ),
+                    "error" => (
+                        "#fb718511",
+                        0.24,
+                        "#3a2226",
+                        "!",
+                        "#f0f0f3",
+                        "Error",
+                        "#d2d2da",
+                    ),
+                    "system" => (
+                        "#101013", 0.05, "#24242a", "S", "#c9c9d1", "System", "#d2d2da",
+                    ),
+                    _ => (
+                        "#19191e", 0.05, "#24242a", "A", "#c9c9d1", "Agent", "#d2d2da",
+                    ),
                 };
                 let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-                let hairline = rune::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.06,
+                let hairline = if r.role == "error" {
+                    rune::color::hex("#fb71853d").unwrap_or(rune::Color::BLACK)
+                } else {
+                    rune::Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: hair_a,
+                    }
                 };
                 let name_style = rune::tok::TextStyle::new(11.0, 650.0);
                 let initial_style = rune::tok::TextStyle::new(9.5, 700.0);
@@ -413,9 +435,10 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                     .child(
                         text(name.to_string())
                             .key(format!("{}-name", r.key))
-                            .font(name_style),
+                            .font(name_style)
+                            .color(ink("#f0f0f3")),
                     )
-                    .child(render_body(&r.key, &r.body));
+                    .child(render_body(&r.key, &r.body, body_ink));
                 let bubble = if r.role == "user" {
                     // Content-sized (no `grow`) + `justify_end` row hugs right
                     // like `.canvas-bubble-row.is-user`. `max_w` bounds the
@@ -438,7 +461,11 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                             .radius(11.0)
                             .fill(ink(avatar_bg))
                             .center()
-                            .child(text(initial.to_string()).font(initial_style)),
+                            .child(
+                                text(initial.to_string())
+                                    .font(initial_style)
+                                    .color(ink(initial_ink)),
+                            ),
                     )
                     .child(bubble);
                 if r.role == "user" {

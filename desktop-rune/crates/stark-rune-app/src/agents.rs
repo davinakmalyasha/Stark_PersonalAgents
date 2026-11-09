@@ -739,10 +739,7 @@ pub fn relative_time(value: &str) -> String {
         let days = era * 146097 + doe - 719468;
         Some(days * 86400 + h * 3600 + mi * 60 + s)
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = (crate::notes::now_millis() / 1000) as i64;
     let then = match parse() {
         Some(t) => t,
         None => return String::new(),
@@ -1768,10 +1765,8 @@ mod tests {
 
     #[test]
     fn relative_time_buckets() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = (crate::notes::now_millis() / 1000) as i64;
+
         assert_eq!(relative_time(&now.to_string()), "just now");
         assert_eq!(relative_time(&(now - 70).to_string()), "1m ago");
         assert_eq!(relative_time(&(now - 7200).to_string()), "2h ago");

@@ -88,6 +88,7 @@ impl ProjectsSnapshot {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn fetch(host: &str, port: u16, workspace_id: &str) -> Result<Self, String> {
         // Mirrors `fetchGroupProjects`: server-side scoping, empty = global.
         let path = if workspace_id.trim().is_empty() {
@@ -255,18 +256,19 @@ pub fn create_project(s: &mut ProjectsState) {
         let body = serde_json::json!({ "goal": goal, "workspace_id": ws });
         let result = match crate::transport::fetch_send("POST", "/api/groups", Some(&body)).await {
             Err(e) => Err(e),
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                let path = if ws.trim().is_empty() {
+                    "/api/groups".to_string()
+                } else {
+                    format!("/api/groups?workspace_id={}", ws.trim())
+                };
+                match crate::transport::fetch_json(&path).await {
+                    Ok(v) => Ok(ProjectsSnapshot::from_json(&v)),
+                    Err(e) => Err(e),
+                }
+            }
         };
-        let _ = tx.send(result.and_then(|_| {
-            let path = if ws.trim().is_empty() {
-                "/api/groups".to_string()
-            } else {
-                format!("/api/groups?workspace_id={}", ws.trim())
-            };
-            crate::transport::fetch_json(&path)
-                .map(|v| ProjectsSnapshot::from_json(&v))
-                .map_err(|e| e)
-        }));
+        let _ = tx.send(result);
     });
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {

@@ -249,10 +249,7 @@ pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) {
 /// Now as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), matching the server wire
 /// shape the other time helpers parse.
 pub fn now_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let secs = (crate::notes::now_millis() / 1000) as i64;
     // Days → civil date (Howard Hinnant's algorithm, inverted).
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);

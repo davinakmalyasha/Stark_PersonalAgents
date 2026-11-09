@@ -20,17 +20,27 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+/// Wall-clock millis. `SystemTime` panics on wasm32-unknown-unknown (no OS
+/// clock), so the web build reads `Date.now()` instead.
+pub fn now_millis() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
 /// Mint an opaque thread id (`rune-<millis>`). React reuses the persistent
 /// `chat.id`; Rune threads mint one at construction so notes/abort have a
 /// stable scope before the first send.
 pub fn mint_id(prefix: &str) -> String {
-    format!(
-        "{prefix}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    )
+    format!("{prefix}-{}", now_millis())
 }
 
 /// One checklist item.

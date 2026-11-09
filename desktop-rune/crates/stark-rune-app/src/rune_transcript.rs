@@ -350,6 +350,18 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
     if prompt.is_empty() {
         return;
     }
+    s.edit.text.clear();
+    s.edit.anchor = 0;
+    s.edit.focus = 0;
+    stage_send_prompt(s, prompt);
+}
+
+/// Stage an explicit prompt (map dock sends land here with the dock's text).
+pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return;
+    }
     let n = s.rows.len();
     s.rows.push(RowData {
         key: format!("user-{n}"),
@@ -357,9 +369,6 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
         body: prompt.clone(),
     });
     s.live = true;
-    s.edit.text.clear();
-    s.edit.anchor = 0;
-    s.edit.focus = 0;
     // The abort path needs the same id the run started with: mint one per
     // thread on first send (React reuses the persistent `chat.id`).
     if s.chat_id.trim().is_empty() {
@@ -427,11 +436,14 @@ pub fn stage_abort(s: &mut RuneTranscriptState) {
 /// Host access for views composed into a larger shell: handlers stay typed to
 /// the shell state while reading transcript data. The standalone transcript
 /// view hosts itself. Threads (`Main` chat vs `Personal` room) select which
-/// transcript a composed view reads and writes.
+/// transcript a composed view reads and writes; `Open` is the transcript
+/// sheet's card thread (resolved through the sessions map — one page, chat
+/// types only, no workspace routes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Thread {
     Main,
     Personal,
+    Open,
 }
 
 pub trait TranscriptHost {
@@ -695,7 +707,9 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
 
 /// Settings sheet: dim backdrop + centred card, focus-trapped while mounted.
 /// Backdrop press and Escape both dismiss (Rune `modal` machinery).
-fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
+/// Settings sheet (public for the shell's global gear; the transcript dock
+/// uses it too).
+pub fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
     let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
     let label = rune::tok::TextStyle::new(12.0, 500.0);
     let value = rune::tok::TextStyle::new(12.0, 400.0);

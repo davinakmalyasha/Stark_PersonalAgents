@@ -1,9 +1,10 @@
-//! Unified shell — transcript and canvas map under one `AppSpec` with route tabs.
+//! Single-page shell — one window, chat types only, no workspace routes.
 //!
-//! Mirrors `frontend/src/AppShell.tsx` hash routes (`home` map + `coding`
-//! transcript): one window, one state, tab bar switching. Sub-views stay
-//! mounted per route (no cross-route element keys), and both states survive
-//! switching — a running stream keeps draining while the map is up.
+//! Layout mirrors the desktop app: session tabs on top (one per open chat +
+//! New session), then a row of icon rail + side panel + canvas map. The rail
+//! switches the panel (Chats / Agents / Group / Cloud / Memory / House); the
+//! canvas always stays mounted, so a running stream keeps draining whatever
+//! panel is up. A transcript sheet opens over the map for the active session.
 
 use rune::{col, row, text, AppSpec, Cx, El};
 
@@ -13,30 +14,13 @@ use crate::rooms::{
     drain_results, house_view, memory_view, poll_memory_detail, refresh_house, refresh_memory,
     HouseHost, HouseState, MemoryHost, MemoryState,
 };
-use crate::rune_canvas::{canvas_body, CanvasHost, CanvasState};
+use crate::rune_canvas::{chats_panel, CanvasHost, CanvasState, RailTab, SessionsHost};
 use crate::rune_transcript::{
     drain_run_inbox, transcript_body, RuneTranscriptState, Thread, TranscriptHost,
 };
 
-/// Shell routes. `Home` is the map canvas (`#/`); `Coding` the main transcript
-/// (`#/coding`); `Personal` the personal room; `Cloud` the runs board;
-/// `House` the smart home; `Memory` the memory index. Names match
-/// `AppShell.tsx` where a React route exists. Projects live in the Home
-/// sidebar rail (`useGroupProjects` panel), never as a route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Route {
-    #[default]
-    Home,
-    Coding,
-    Personal,
-    Cloud,
-    House,
-    Memory,
-}
-
 #[derive(Debug, Clone)]
 pub struct ShellState {
-    pub route: Route,
     pub transcript: RuneTranscriptState,
     pub personal: RuneTranscriptState,
     pub canvas: CanvasState,
@@ -54,7 +38,6 @@ impl Default for ShellState {
         // Distinct thread scope (notes + abort key off it, like `chat.id`).
         personal.chat_id = crate::notes::mint_id("rune-personal");
         Self {
-            route: Route::Home,
             transcript: RuneTranscriptState::screenshot(),
             personal,
             canvas: CanvasState::map(),
@@ -70,12 +53,21 @@ impl TranscriptHost for ShellState {
         match which {
             Thread::Main => &self.transcript,
             Thread::Personal => &self.personal,
+            // The sheet's card thread; falls back to Main when closed.
+            Thread::Open => self.canvas.sheet_thread().unwrap_or(&self.transcript),
         }
     }
     fn thread_mut(&mut self, which: Thread) -> &mut RuneTranscriptState {
         match which {
             Thread::Main => &mut self.transcript,
             Thread::Personal => &mut self.personal,
+            Thread::Open => {
+                if self.canvas.sessions.sheet.is_some() && self.canvas.sheet_thread().is_some() {
+                    self.canvas.sheet_thread_mut().expect("checked above")
+                } else {
+                    &mut self.transcript
+                }
+            }
         }
     }
 }
@@ -116,23 +108,63 @@ impl CloudHost for ShellState {
     }
 }
 
+impl SessionsHost for ShellState {
+    fn sessions_mut(&mut self) -> &mut crate::rune_canvas::Sessions {
+        &mut self.canvas.sessions
+    }
+    fn sessions(&self) -> &crate::rune_canvas::Sessions {
+        &self.canvas.sessions
+    }
+}
+
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
-fn tab(s: &ShellState, route: Route, label: &str, key: &str) -> El {
-    let active = s.route == route;
-    let mut el = text(label.to_string())
-        .key(key.to_string())
+/// One session tab: card title + close. Press selects and focuses the card;
+/// double-press opens its transcript sheet (React opens the chat view).
+fn session_tab(s: &ShellState, id: &str) -> El {
+    let title = s
+        .canvas
+        .card(id)
+        .map(|c| c.title.clone())
+        .or_else(|| s.canvas.sessions.threads.get(id).map(|t| t.title.clone()))
+        .unwrap_or_else(|| "Chat".to_string());
+    let active = s.canvas.active_id == id;
+    let select = id.to_string();
+    let open = id.to_string();
+    let close = id.to_string();
+    let mut el = row()
+        .key(format!("session-{id}"))
         .role("tab")
-        .font(rune::tok::TextStyle::new(12.0, 600.0))
-        .px(14.0)
-        .py(8.0)
+        .items_center()
+        .gap(6.0)
+        .px(10.0)
+        .py(6.0)
         .radius(8.0)
         .color(ink(if active { "#f4f4f5" } else { "#71717a" }))
         .on_press(move |s: &mut ShellState| {
-            s.route = route;
-        });
+            s.canvas.select_card(&select);
+        })
+        .on_double_press(move |s: &mut ShellState| {
+            s.canvas.open_sheet(&open);
+        })
+        .child(
+            text(title)
+                .font(rune::tok::TextStyle::new(12.0, 600.0))
+                .color(ink(if active { "#f4f4f5" } else { "#a1a1aa" })),
+        )
+        .child(
+            text("×".to_string())
+                .key(format!("session-{id}-close"))
+                .role("button")
+                .label("Close session")
+                .font(rune::tok::TextStyle::new(12.0, 400.0))
+                .color(ink("#71717a"))
+                .on_press(move |s: &mut ShellState| {
+                    s.canvas.close_session(&close);
+                }),
+        );
     if active {
         el = el.fill(rune::Color {
             r: 1.0,
@@ -144,47 +176,251 @@ fn tab(s: &ShellState, route: Route, label: &str, key: &str) -> El {
     el
 }
 
+/// Icon rail button (glyph + label for assistive tech).
+fn rail_button(s: &ShellState, tab: RailTab) -> El {
+    let active = s.canvas.rail == tab;
+    let mut el = rune::el()
+        .key(format!("rail-{}", tab.label()))
+        .role("button")
+        .label(format!("{} panel", tab.label()))
+        .size(40.0, 40.0)
+        .radius(11.0)
+        .center()
+        .on_press(move |s: &mut ShellState| {
+            s.canvas.rail = tab;
+        })
+        .child(
+            text(tab.glyph().to_string())
+                .font(rune::tok::TextStyle::new(16.0, 400.0))
+                .color(ink(if active { "#f4f4f5" } else { "#71717a" })),
+        );
+    if active {
+        el = el.fill(rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.08,
+        });
+    }
+    el
+}
+
+/// Side panel content for the active rail tab. Chat-local panels read the
+/// canvas; cloud/memory/house read shell state.
+fn side_panel(s: &ShellState) -> El {
+    let mut panel = col()
+        .key("side-panel")
+        .w(crate::rune_canvas::MAP_SIDEBAR_W - crate::rune_canvas::RAIL_W)
+        .h_full()
+        .fill(ink("#0f0f0f"))
+        .px(12.0)
+        .pt(12.0)
+        .gap(8.0);
+    match s.canvas.rail {
+        RailTab::Chats => {
+            panel = panel.child(chats_panel::<ShellState>(&s.canvas));
+        }
+        RailTab::Agents => {
+            panel = panel.child(crate::agents::agents_section::<ShellState>(
+                &s.canvas.agents,
+            ));
+        }
+        RailTab::Group => {
+            panel = panel.child(crate::projects::projects_section::<ShellState>(
+                &s.canvas.projects,
+            ));
+        }
+        RailTab::Cloud => {
+            panel = panel.child(cloud_view::<ShellState>(&s.cloud));
+        }
+        RailTab::Memory => {
+            panel = panel.child(memory_view::<ShellState>(&s.memory));
+        }
+        RailTab::House => {
+            panel = panel.child(house_view::<ShellState>(&s.house));
+        }
+    }
+    panel
+}
+
+/// Transcript sheet for the open session: full thread (stream, notes,
+/// composer, settings) over the map, like opening a chat.
+fn transcript_sheet(s: &ShellState) -> Option<El> {
+    let id = s.canvas.sessions.sheet.clone()?;
+    let thread = s.canvas.sessions.threads.get(&id)?;
+    let mut sheet = col()
+        .key("session-sheet")
+        .w(560.0)
+        .h_full()
+        .radius(16.0)
+        .fill(ink("#0a0a0a"))
+        .border(1.0, ink("#ffffff26"))
+        .child(
+            row()
+                .key("session-sheet-head")
+                .w_full()
+                .items_center()
+                .px(14.0)
+                .pt(10.0)
+                .pb(6.0)
+                .child(
+                    text(thread.title.clone())
+                        .key("session-sheet-title")
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(13.0, 650.0))
+                        .color(ink("#f2f2f5")),
+                )
+                .child(
+                    text("×".to_string())
+                        .key("session-sheet-close")
+                        .role("button")
+                        .label("Close chat")
+                        .font(rune::tok::TextStyle::new(14.0, 400.0))
+                        .color(ink("#8a8a93"))
+                        .on_press(move |s: &mut ShellState| {
+                            s.canvas.close_sheet();
+                        }),
+                ),
+        )
+        .child(transcript_body::<ShellState>(thread, Thread::Open));
+    Some(sheet)
+}
+
 pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
-    let body = match s.route {
-        Route::Home => canvas_body::<ShellState>(&s.canvas),
-        Route::Coding => transcript_body::<ShellState>(&s.transcript, Thread::Main),
-        Route::Personal => transcript_body::<ShellState>(&s.personal, Thread::Personal),
-        Route::Cloud => cloud_view::<ShellState>(&s.cloud),
-        Route::House => house_view::<ShellState>(&s.house),
-        Route::Memory => memory_view::<ShellState>(&s.memory),
-    };
-    col()
+    let mut tabs = row()
+        .key("shell-tabs")
+        .w_full()
+        .items_center()
+        .gap(4.0)
+        .px(12.0)
+        .pt(10.0)
+        .pb(6.0);
+    for id in s.canvas.sessions.order.clone() {
+        tabs = tabs.child(session_tab(s, &id));
+    }
+    tabs = tabs.child(
+        text("+ New session".to_string())
+            .key("session-new")
+            .role("button")
+            .label("New session")
+            .font(rune::tok::TextStyle::new(12.0, 600.0))
+            .px(12.0)
+            .py(6.0)
+            .radius(8.0)
+            .color(ink("#71717a"))
+            .on_press(move |s: &mut ShellState| {
+                s.canvas.new_session();
+            }),
+    );
+    let rail = col()
+        .key("icon-rail")
+        .w(crate::rune_canvas::RAIL_W)
+        .h_full()
+        .fill(ink("#0c0c0d"))
+        .items_center()
+        .pt(10.0)
+        .gap(4.0)
+        .child(
+            text("+".to_string())
+                .key("rail-new")
+                .role("button")
+                .label("New session")
+                .font(rune::tok::TextStyle::new(16.0, 400.0))
+                .color(ink("#a1a1aa"))
+                .on_press(move |s: &mut ShellState| {
+                    s.canvas.new_session();
+                }),
+        )
+        .child(rail_button(s, RailTab::Chats))
+        .child(rail_button(s, RailTab::Agents))
+        .child(rail_button(s, RailTab::Group))
+        .child(rail_button(s, RailTab::Cloud))
+        .child(rail_button(s, RailTab::Memory))
+        .child(rail_button(s, RailTab::House))
+        .child(
+            text("⚙".to_string())
+                .key("rail-settings")
+                .role("button")
+                .label("Open settings")
+                .font(rune::tok::TextStyle::new(16.0, 400.0))
+                .color(ink("#71717a"))
+                .on_press(move |s: &mut ShellState| {
+                    s.thread_mut(Thread::Main).settings_open = true;
+                }),
+        );
+    let main = row()
+        .key("stark-main")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(ink("#0a0a0a"))
+        .child(rail)
+        .child(side_panel(s))
+        .child(crate::rune_canvas::canvas_body::<ShellState>(&s.canvas));
+    let mut root = col()
         .key("stark-shell")
         .w_full()
         .h_full()
         .fill(ink("#0a0a0a"))
-        .child(
-            row()
-                .key("shell-tabs")
-                .w_full()
-                .items_center()
-                .gap(4.0)
-                .px(12.0)
-                .pt(10.0)
-                .pb(6.0)
-                .child(tab(s, Route::Home, "Home", "tab-home"))
-                .child(tab(s, Route::Coding, "Coding", "tab-coding"))
-                .child(tab(s, Route::Personal, "Personal", "tab-personal"))
-                .child(tab(s, Route::Cloud, "Cloud", "tab-cloud"))
-                .child(tab(s, Route::House, "House", "tab-house"))
-                .child(tab(s, Route::Memory, "Memory", "tab-memory")),
-        )
-        .child(body)
+        .child(tabs)
+        .child(main);
+    if s.canvas.sessions.sheet.is_some() {
+        if let Some(sheet) = transcript_sheet(s) {
+            root = root.child(
+                rune::el()
+                    .key("session-overlay")
+                    .absolute(0.0, 0.0)
+                    .w_full()
+                    .h_full()
+                    .fill(rune::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.6,
+                    })
+                    .center()
+                    .modal(true, move |s: &mut ShellState| {
+                        s.canvas.close_sheet();
+                    })
+                    .child(sheet),
+            );
+        }
+    }
+    if s.canvas.agents.selected.is_some() {
+        root = root.child(crate::agents::agent_sheet::<ShellState>(&s.canvas.agents));
+    }
+    if s.transcript.settings_open {
+        root = root.child(crate::rune_transcript::settings_sheet::<ShellState>(
+            &s.transcript,
+            Thread::Main,
+        ));
+    }
+    root
 }
 
-/// `poll` drains transcript inboxes whatever route is up and refreshes
-/// status rooms at most every 10–15s, so runs started in Chat keep streaming
-/// on the Map.
+/// `poll` drains every session thread (runs + notes) whatever panel is up
+/// and refreshes status rooms at most every 10–15s, so runs started from the
+/// dock keep streaming on the map. Card `running` flags mirror thread liveness.
 pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = drain_run_inbox(&mut s.transcript, clock, tx);
     changed |= drain_run_inbox(&mut s.personal, clock, tx);
     changed |= crate::notes::poll_notes_state(&mut s.transcript.notes);
     changed |= crate::notes::poll_notes_state(&mut s.personal.notes);
+    // Session threads: drain + sync card flags.
+    let ids: Vec<String> = s.canvas.sessions.order.clone();
+    for id in ids {
+        if let Some(thread) = s.canvas.sessions.threads.get_mut(&id) {
+            changed |= drain_run_inbox(thread, clock, tx);
+            changed |= crate::notes::poll_notes_state(&mut thread.notes);
+            let live = thread.live;
+            if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == id) {
+                if card.running != live {
+                    card.running = live;
+                    changed = true;
+                }
+            }
+        }
+    }
     changed |= s.canvas.voice.drain(1.0 / 60.0);
     changed |= poll_house(s, clock);
     changed |= poll_memory(s, clock);
@@ -257,43 +493,30 @@ fn init_shell() -> ShellState {
 }
 
 fn apply_home(s: &mut ShellState) {
-    s.route = Route::Home;
+    // One page: every scene lands on the map. The rail picks the panel.
+    s.canvas.rail = RailTab::Chats;
 }
 
-fn apply_coding(s: &mut ShellState) {
-    s.route = Route::Coding;
+fn apply_panel_cloud(s: &mut ShellState) {
+    s.canvas.rail = RailTab::Cloud;
 }
 
-fn apply_personal(s: &mut ShellState) {
-    s.route = Route::Personal;
-}
-
-fn apply_cloud(s: &mut ShellState) {
-    s.route = Route::Cloud;
-}
-
-fn apply_house(s: &mut ShellState) {
-    s.route = Route::House;
-}
-
-fn apply_memory(s: &mut ShellState) {
-    s.route = Route::Memory;
+fn apply_panel_memory(s: &mut ShellState) {
+    s.canvas.rail = RailTab::Memory;
 }
 
 pub fn shell_spec() -> AppSpec<ShellState> {
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
         ("home", apply_home),
-        ("coding", apply_coding),
-        ("personal", apply_personal),
-        ("cloud", apply_cloud),
-        ("house", apply_house),
-        ("memory", apply_memory),
-        // Compatibility aliases mirror `AppShell.tsx`: the removed admin
-        // surface lands home, `#/design` (now a workspace addon) lands on
-        // the coding transcript.
+        ("cloud", apply_panel_cloud),
+        ("memory", apply_panel_memory),
+        // Compatibility aliases: everything lands on the one page.
+        ("coding", apply_home),
+        ("personal", apply_home),
+        ("house", apply_home),
         ("admin", apply_home),
-        ("design", apply_coding),
+        ("design", apply_home),
     ];
     spec.poll = Some(shell_poll);
     spec
@@ -309,50 +532,77 @@ mod tests {
     use rune::{Env, Runtime};
 
     #[test]
-    fn tabs_switch_routes_and_preserve_state() {
+    fn single_page_mounts_tabs_rail_panel_and_canvas() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
-        // Map first: canvas keys present, transcript rows absent.
+        // Session tabs seeded from the scene cards, rail + chats panel up,
+        // canvas always mounted — one page, no routes.
+        assert!(rt.find("session-chat:ws-general:chat-1").is_some());
+        assert!(rt.find("session-new").is_some());
+        assert!(rt.find("icon-rail").is_some());
+        assert!(rt.find("map-sidebar").is_some());
         assert!(rt.find("canvas-world").is_some());
-        assert!(rt.find("transcript-viewport").is_none());
-        // Type in Chat without leaving Map? Switch first, then type.
-        let (x, y) = rt.find("tab-coding").unwrap();
+        // Rail switches the panel; the canvas never unmounts.
+        let (x, y) = rt.find("rail-Cloud").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(0.0);
-        assert_eq!(rt.state.route, Route::Coding);
-        assert!(rt.find("transcript-viewport").is_some());
-        assert!(rt.find("canvas-world").is_none());
-        // Map state survives the round trip.
-        let (x, y) = rt.find("tab-home").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(0.0);
-        assert_eq!(rt.state.route, Route::Home);
-        assert!(rt.find("chat:ws-general:chat-1").is_some());
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.canvas.rail, RailTab::Cloud);
+        assert!(rt.find("cloud-board").is_some());
+        assert!(rt.find("canvas-world").is_some(), "canvas stays mounted");
     }
 
     #[test]
-    fn personal_room_has_own_thread() {
+    fn session_tabs_select_new_and_close() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
-        let (x, y) = rt.find("tab-personal").unwrap();
+        let n = rt.state.canvas.sessions.order.len();
+        // New session adds a card + tab and selects it.
+        let (x, y) = rt.find("session-new").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(0.0);
-        assert_eq!(rt.state.route, Route::Personal);
-        assert!(rt.find("transcript-viewport").is_some());
-        // Main thread rows are not mounted in the personal room.
-        assert!(rt.find("msg-0").is_none());
-        // Sending in personal stages only there.
-        let main_rows = rt.state.transcript.rows.len();
-        rt.state.personal.api_port = 1;
-        rt.state.personal.edit.text = "personal hi".to_string();
-        crate::rune_transcript::stage_send(&mut rt.state.personal);
-        assert_eq!(rt.state.personal.rows.len(), 1);
-        assert_eq!(rt.state.transcript.rows.len(), main_rows);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.canvas.sessions.order.len(), n + 1);
+        let id = rt.state.canvas.active_id.clone();
+        assert!(rt.find(&format!("session-{id}")).is_some());
+        // Tab press focuses the first scene card.
+        let first = "chat:ws-general:chat-1".to_string();
+        let (x, y) = rt.find(&format!("session-{first}")).unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.canvas.active_id, first);
+        // Close removes the tab, card and thread.
+        let (x, y) = rt.find(&format!("session-{id}-close")).unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.canvas.sessions.order.contains(&id));
+        assert!(rt.state.canvas.card(&id).is_none());
+        assert!(!rt.state.canvas.sessions.threads.contains_key(&id));
+    }
+
+    #[test]
+    fn personal_thread_stays_independent() {
+        // The Personal thread still exists as fallback state (standalone
+        // transcript spec); sending there never touches Main.
+        let mut state = ShellState::default();
+        let main_rows = state.transcript.rows.len();
+        state.personal.api_port = 1;
+        state.personal.edit.text = "personal hi".to_string();
+        crate::rune_transcript::stage_send(&mut state.personal);
+        assert_eq!(state.personal.rows.len(), 1);
+        assert_eq!(state.transcript.rows.len(), main_rows);
     }
 
     #[test]
@@ -406,7 +656,7 @@ mod tests {
         state.cloud.host = "127.0.0.1".to_string();
         state.cloud.port = port;
         state.cloud.auto = false;
-        state.route = Route::Cloud;
+        state.canvas.rail = RailTab::Cloud;
         let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         assert!(rt.find("cloud-board").is_some());
@@ -491,7 +741,7 @@ mod tests {
         state.memory.host = "127.0.0.1".to_string();
         state.memory.port = mem_port;
         state.memory.auto = false;
-        state.route = Route::House;
+        state.canvas.rail = RailTab::House;
         let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         assert!(rt.find("house-board").is_some());
@@ -515,12 +765,14 @@ mod tests {
         assert_eq!(rt.state.house.devices[0].state_line, "100%");
         rt.frame(0.0);
         assert!(rt.find("house-dev-blind-living-name").is_some());
-        // Memory tab loads its board the same way.
-        let (x, y) = rt.find("tab-memory").unwrap();
+        // Memory panel loads its board the same way.
+        let (x, y) = rt.find("rail-Memory").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(0.0);
-        assert_eq!(rt.state.route, Route::Memory);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.canvas.rail, RailTab::Memory);
         // Settle frames after the route switch before tapping: hit-testing
         // lags one commit in stepped headless frames (real windows run
         // continuously, so hits are always fresh there).
@@ -580,12 +832,12 @@ mod tests {
         });
         let env = Env::new(true, 1.0);
         let mut state = ShellState::default();
-        // The rail lives on Home now (no Projects route): scope global, poll
-        // off, and read through the canvas projects state.
+        // Projects live in the Group panel now: scope global, poll off, and
+        // read through the canvas projects state.
         state.canvas.projects.host = "127.0.0.1".to_string();
         state.canvas.projects.port = port;
         state.canvas.projects.auto = false;
-        state.route = Route::Home;
+        state.canvas.rail = RailTab::Group;
         let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
         assert!(rt.find("side-projects").is_some());
@@ -617,25 +869,24 @@ mod tests {
     }
 
     #[test]
-    fn shell_send_and_poll_stream_while_on_map() {
+    fn shell_send_and_poll_stream_across_panels() {
         use crate::stream::SseFrame;
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
         rt.frame(0.0);
-        // Stage a run from Chat, flip to Map, drain via shell poll.
-        let (x, y) = rt.find("tab-coding").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(0.0);
+        // Stage a run on Main, flip to the Cloud panel, drain via shell poll:
+        // one page, so the run lands whatever panel is up.
         rt.state.transcript.api_port = 1;
         rt.state.transcript.edit.text = "hi".to_string();
         crate::rune_transcript::stage_send(&mut rt.state.transcript);
         assert!(rt.state.transcript.live);
-        let (x, y) = rt.find("tab-home").unwrap();
+        let (x, y) = rt.find("rail-Cloud").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
-        rt.frame(0.0);
-        // Simulate the run thread delivering frames; poll applies them on Map.
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        // Simulate the run thread delivering frames; poll applies them.
         let tx = rt.state.transcript.inbox.take();
         let (f_tx, f_rx) = std::sync::mpsc::channel();
         rt.state.transcript.inbox = Some(f_rx);
@@ -654,5 +905,36 @@ mod tests {
             .rows
             .iter()
             .any(|r| r.body.contains("42")));
+    }
+
+    #[test]
+    fn dock_send_runs_active_session_and_opens_sheet() {
+        // Map dock send lands in the ACTIVE card thread (chat types only)
+        // and opens its transcript sheet.
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.edit.text = "hello map".to_string();
+        let active = state.canvas.active_id.clone();
+        // Point the active thread at the dead port (deterministic: the run
+        // thread fails fast into an error frame).
+        {
+            let thread = state.canvas.thread_mut(&active);
+            thread.api_port = 1;
+        }
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("composer-send").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(
+            rt.state.canvas.sessions.sheet.as_deref(),
+            Some(active.as_str())
+        );
+        let thread = rt.state.canvas.sessions.threads.get(&active).unwrap();
+        assert!(thread.rows.iter().any(|r| r.body == "hello map"));
+        assert!(rt.find("session-sheet").is_some(), "sheet mounts");
     }
 }

@@ -660,19 +660,20 @@ pub fn format_time(value: &str) -> String {
 }
 
 fn stat_cell(label: &str, value: String, key: String) -> El {
-    col()
+    row()
         .key(key)
-        .grow(1.0)
-        .min_h(0.0)
-        .gap(2.0)
+        .w_full()
+        .items_center()
+        .gap(8.0)
         .child(
             text(label.to_string())
-                .font(rune::tok::TextStyle::new(10.0, 600.0))
+                .grow(1.0)
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
                 .color(ink("#71717a")),
         )
         .child(
             text(value)
-                .font(rune::tok::TextStyle::new(12.0, 400.0).mono())
+                .font(rune::tok::TextStyle::new(11.0, 400.0).mono())
                 .color(ink("#e4e4e7")),
         )
 }
@@ -698,8 +699,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(ink("#0a0a0a"))
-        .px(24.0)
-        .pt(18.0)
+        .pt(4.0)
         .gap(10.0)
         .child(
             row()
@@ -808,20 +808,14 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                         .font(rune::tok::TextStyle::new(12.0, 700.0))
                         .color(ink("#e4e4e7")),
                 )
-                .child(
-                    row()
-                        .key("cloud-grid-row")
-                        .w_full()
-                        .gap(10.0)
-                        .child(stat_cell("Origin", origin, "cloud-origin".to_string()))
-                        .child(stat_cell("Running", cap, "cloud-running".to_string()))
-                        .child(stat_cell("VPS target", vps, "cloud-vps".to_string()))
-                        .child(stat_cell(
-                            "Handoffs",
-                            s.handoffs.len().to_string(),
-                            "cloud-handoffs-count".to_string(),
-                        )),
-                ),
+                .child(stat_cell("Origin", origin, "cloud-origin".to_string()))
+                .child(stat_cell("Running", cap, "cloud-running".to_string()))
+                .child(stat_cell("VPS target", vps, "cloud-vps".to_string()))
+                .child(stat_cell(
+                    "Handoffs",
+                    s.handoffs.len().to_string(),
+                    "cloud-handoffs-count".to_string(),
+                )),
         );
         if !s.status.as_ref().is_some_and(|st| st.configured) {
             body = body.child(

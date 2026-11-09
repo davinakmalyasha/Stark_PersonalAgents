@@ -104,6 +104,8 @@ pub struct ProjectsState {
     pub host: String,
     pub port: u16,
     /// Server-side scope (`fetchGroupProjects(workspaceId)`); empty = global.
+    /// Chats are the only type now, so this stays empty (global) — the field
+    /// remains because the server still scopes when a caller sets it.
     pub workspace_id: String,
     /// Last `scoped` flag the server reported (drives the rail badge).
     pub scoped: bool,
@@ -113,6 +115,11 @@ pub struct ProjectsState {
     pub last_ok: f64,
     pub auto: bool,
     pub inbox: Option<std::sync::mpsc::Receiver<Result<ProjectsSnapshot, String>>>,
+    /// New-project form (`NewProjectDialog` inline half): open flag, goal
+    /// draft, and the in-flight create (explicit press = go-ahead).
+    pub new_open: bool,
+    pub goal_edit: rune::TextEdit,
+    pub creating: bool,
 }
 
 impl std::fmt::Debug for ProjectsState {
@@ -138,6 +145,9 @@ impl Clone for ProjectsState {
             last_ok: self.last_ok,
             auto: self.auto,
             inbox: None,
+            new_open: self.new_open,
+            goal_edit: self.goal_edit.clone(),
+            creating: self.creating,
         }
     }
 }
@@ -155,6 +165,9 @@ impl Default for ProjectsState {
             last_ok: 0.0,
             auto: true,
             inbox: None,
+            new_open: false,
+            goal_edit: rune::TextEdit::new(""),
+            creating: false,
         }
     }
 }
@@ -215,6 +228,7 @@ pub fn poll_projects_state(s: &mut ProjectsState, clock: f64) -> bool {
             }
         }
         s.loading = false;
+        s.creating = false;
         changed = true;
     }
     if s.auto && !s.loading && clock - s.last_ok > 15.0 {
@@ -223,12 +237,51 @@ pub fn poll_projects_state(s: &mut ProjectsState, clock: f64) -> bool {
     }
     changed
 }
-/// Projects sidebar section: the per-workspace panel React mounts beside the
-/// workspace (`useGroupProjects(workspaceId)`), not a top-level route. Scoped
-/// by `ProjectsState.workspace_id` (empty = global); the `scoped` badge shows
-/// which the server applied. Mounted at the bottom of the Home sidebar. (The
-/// old full-board `projects_view` was removed with the 7th route; the section
-/// shares its card renderer.)
+/// Create a project (`createGroupProject`: `POST /api/groups
+/// {goal, workspace_id}`), then re-fetch the list into the same inbox.
+/// Explicit press = user go-ahead. No-op on empty goal or while busy.
+pub fn create_project(s: &mut ProjectsState) {
+    let goal = s.goal_edit.text.trim().to_string();
+    if goal.is_empty() || s.loading || s.creating {
+        return;
+    }
+    s.creating = true;
+    s.error = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.inbox = Some(rx);
+    let (host, port, ws) = (s.host.clone(), s.port, s.workspace_id.clone());
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let body = serde_json::json!({ "goal": goal, "workspace_id": ws });
+        let result = match crate::transport::fetch_send("POST", "/api/groups", Some(&body)).await {
+            Err(e) => Err(e),
+            Ok(_) => Ok(()),
+        };
+        let _ = tx.send(result.and_then(|_| {
+            let path = if ws.trim().is_empty() {
+                "/api/groups".to_string()
+            } else {
+                format!("/api/groups?workspace_id={}", ws.trim())
+            };
+            crate::transport::fetch_json(&path)
+                .map(|v| ProjectsSnapshot::from_json(&v))
+                .map_err(|e| e)
+        }));
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let body = serde_json::json!({ "goal": goal, "workspace_id": ws });
+        let created =
+            crate::transport::send_json(&host, port, "POST", "/api/groups", &body).map(|_| ());
+        let result = created.and_then(|_| ProjectsSnapshot::fetch(&host, port, &ws));
+        let _ = tx.send(result);
+    });
+}
+
+/// Projects sidebar section: the Group panel's project list
+/// (`useGroupProjects` + `GroupProjectModal` list half). Scoped by
+/// `ProjectsState.workspace_id` (empty = global, the only mode now — chats
+/// are the only type); the `scoped` badge shows what the server applied.
 pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
     let mut body = col().key("side-projects").w_full().gap(6.0).pt(10.0).child(
         row()
@@ -290,6 +343,61 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
                 .key("side-projects-error")
                 .font(rune::tok::TextStyle::new(10.0, 400.0))
                 .color(ink("#fda4af")),
+        );
+    }
+    // New project (`NewProjectDialog` inline half): toggle + goal + create.
+    body = body.child(
+        text(if s.new_open { "Close" } else { "+ New project" }.to_string())
+            .key("side-projects-new")
+            .role("button")
+            .label("New project")
+            .font(rune::tok::TextStyle::new(11.0, 600.0))
+            .px(10.0)
+            .py(6.0)
+            .radius(8.0)
+            .fill(ink("#ffffff0d"))
+            .color(ink("#d4d4d8"))
+            .on_press(|s: &mut S| {
+                s.projects_mut().new_open = !s.projects_mut().new_open;
+            }),
+    );
+    if s.new_open {
+        body = body.child(
+            col()
+                .key("side-projects-form")
+                .w_full()
+                .gap(8.0)
+                .radius(12.0)
+                .fill(ink("#141417"))
+                .border(1.0, ink("#ffffff14"))
+                .px(10.0)
+                .py(8.0)
+                .child(
+                    rune::text_input(&s.goal_edit, rune::tok::TextStyle::new(12.0, 400.0))
+                        .key("side-projects-goal")
+                        .w_full()
+                        .placeholder("Project goal…", ink("#52525b"))
+                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                        .on_edit(move |s: &mut S| &mut s.projects_mut().goal_edit),
+                )
+                .child(
+                    text(if s.creating { "Creating…" } else { "Create" }.to_string())
+                        .key("side-projects-create")
+                        .role("button")
+                        .label("Create project")
+                        .font(rune::tok::TextStyle::new(11.0, 600.0))
+                        .px(10.0)
+                        .py(6.0)
+                        .radius(8.0)
+                        .fill(ink("#ffffff"))
+                        .color(ink("#0a0a0d"))
+                        .on_press(move |s: &mut S| {
+                            let p = s.projects_mut();
+                            create_project(p);
+                            p.new_open = false;
+                            p.goal_edit.text.clear();
+                        }),
+                ),
         );
     }
     body

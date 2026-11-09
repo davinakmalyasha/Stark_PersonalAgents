@@ -13,12 +13,56 @@
 //!   `stark-kit::edge_path` (34pt, 0.48 factor). Inert so it never steals drags.
 //! - headless PNG: `--rune-canvas-snap out.png` (1280x720 `map` scene).
 
-use rune::{col, row, text, AppSpec, Cx, Drag, El, LineCap, Path, Phase, Shape};
+use rune::{col, row, text, text_input, AppSpec, Cx, Drag, El, LineCap, Path, Phase, Shape};
 
 pub const MAP_W: f32 = 1280.0;
 pub const MAP_H: f32 = 900.0;
-pub const MAP_SIDEBAR_W: f32 = 248.0;
+/// Side panel width (icon rail + panel, like the desktop layout).
+pub const MAP_SIDEBAR_W: f32 = 300.0;
+/// Icon rail width; the chat panel takes the rest.
+pub const RAIL_W: f32 = 52.0;
 pub const DOT_STEP: f32 = 26.0;
+/// Chat kinds (the workspace dropdown). Chats are the only type — no
+/// workspace scoping, everything lives in side tabs on one page.
+pub const CHAT_KINDS: [&str; 4] = ["Main", "Coding", "House", "General"];
+
+/// Side panel tab (the icon rail). One page: the panel switches, the canvas
+/// stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RailTab {
+    #[default]
+    Chats,
+    Agents,
+    Group,
+    Cloud,
+    Memory,
+    House,
+}
+
+impl RailTab {
+    pub fn glyph(self) -> &'static str {
+        match self {
+            RailTab::Chats => "⌂",
+            RailTab::Agents => "◫",
+            RailTab::Group => "▤",
+            RailTab::Cloud => "☁",
+            RailTab::Memory => "◍",
+            RailTab::House => "△",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RailTab::Chats => "Chats",
+            RailTab::Agents => "Agents",
+            RailTab::Group => "Group chats",
+            RailTab::Cloud => "Cloud",
+            RailTab::Memory => "Memory",
+            RailTab::House => "House",
+        }
+    }
+}
+
 /// Zoom limits mirror `CanvasStage.tsx` (`clamp(scale, 0.45, 1.8)`).
 pub const CAM_MIN_SCALE: f32 = 0.45;
 pub const CAM_MAX_SCALE: f32 = 1.8;
@@ -88,6 +132,9 @@ pub struct MapCard {
     pub title: String,
     pub subtitle: String,
     pub preview: String,
+    /// Chat kind (the dropdown filter). Chats are the only type — this is a
+    /// category label, never a workspace scope.
+    pub kind: String,
     pub x: f32,
     pub y: f32,
     pub compact: bool,
@@ -107,6 +154,58 @@ impl MapCard {
     }
 }
 
+/// Sessions: one transcript thread per chat card plus the sidebar's search
+/// and kind filter. Keyed by card id; `order` is the session tab order and
+/// `sheet` the open transcript sheet (none = canvas only).
+pub struct Sessions {
+    pub threads: std::collections::HashMap<String, crate::rune_transcript::RuneTranscriptState>,
+    pub order: Vec<String>,
+    pub sheet: Option<String>,
+    pub search: rune::TextEdit,
+    pub kind: String,
+}
+
+impl std::fmt::Debug for Sessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sessions")
+            .field("threads", &self.threads.keys().collect::<Vec<_>>())
+            .field("order", &self.order)
+            .field("sheet", &self.sheet)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl Clone for Sessions {
+    fn clone(&self) -> Self {
+        Self {
+            threads: self.threads.clone(),
+            order: self.order.clone(),
+            sheet: self.sheet.clone(),
+            search: self.search.clone(),
+            kind: self.kind.clone(),
+        }
+    }
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            threads: std::collections::HashMap::new(),
+            order: Vec::new(),
+            sheet: None,
+            search: rune::TextEdit::new(""),
+            kind: "General".to_string(),
+        }
+    }
+}
+
+/// Host access for session state (threads, sheet, filters).
+pub trait SessionsHost {
+    fn sessions_mut(&mut self) -> &mut Sessions;
+    fn sessions(&self) -> &Sessions;
+}
+
 pub struct CanvasState {
     pub cards: Vec<MapCard>,
     pub edges: Vec<(String, String)>,
@@ -118,6 +217,12 @@ pub struct CanvasState {
     pub edit: rune::TextEdit,
     /// Selected chat id; sidebar rows and cards key off the same ids.
     pub active_id: String,
+    /// Side panel tab (icon rail). The canvas always stays; the panel swaps.
+    pub rail: RailTab,
+    /// Sessions: one transcript thread per chat card, the open sheet, and
+    /// the sidebar's search + kind filter. Chats are the only type, so all
+    /// threads live here — no per-route transcript states.
+    pub sessions: Sessions,
     /// Camera (pan + zoom); chrome stays fixed while the world scales.
     pub cam: Camera,
     /// Group projects scoped to the workspace (`useGroupProjects` twin);
@@ -129,7 +234,8 @@ pub struct CanvasState {
     /// Mic capture bus (levels, notes, stop flag, inbox).
     pub voice: crate::voice::VoiceBus,
     /// Prompts staged from the map dock, awaiting run dispatch.
-    pub outbox: Vec<String>,
+    /// Kind dropdown open in the chats panel.
+    pub kind_open: bool,
 }
 
 impl std::fmt::Debug for CanvasState {
@@ -141,7 +247,6 @@ impl std::fmt::Debug for CanvasState {
             .field("edit", &self.edit.text)
             .field("active_id", &self.active_id)
             .field("voice", &self.voice)
-            .field("outbox", &self.outbox)
             .finish()
     }
 }
@@ -156,11 +261,13 @@ impl Clone for CanvasState {
             model: self.model.clone(),
             edit: self.edit.clone(),
             active_id: self.active_id.clone(),
+            rail: self.rail,
+            sessions: self.sessions.clone(),
             cam: self.cam,
             projects: self.projects.clone(),
             agents: self.agents.clone(),
             voice: self.voice.clone(),
-            outbox: self.outbox.clone(),
+            kind_open: self.kind_open,
         }
     }
 }
@@ -174,13 +281,14 @@ impl Default for CanvasState {
 impl CanvasState {
     /// Screenshot scene: the four home cards + one spawn edge.
     pub fn map() -> Self {
-        Self {
+        let mut state = Self {
             cards: vec![
                 MapCard {
                     id: "chat:ws-general:chat-1".to_string(),
                     title: "New Conversation".to_string(),
                     subtitle: "General · Orchestrator".to_string(),
                     preview: "452 ÷ 5 = 90.4 (exactly 90 remainder 2)".to_string(),
+                    kind: "General".to_string(),
                     x: 36.0,
                     y: 36.0,
                     compact: false,
@@ -191,6 +299,7 @@ impl CanvasState {
                     title: "New Conversation".to_string(),
                     subtitle: "General · Orchestrator".to_string(),
                     preview: "No messages yet.".to_string(),
+                    kind: "Coding".to_string(),
                     x: 520.0,
                     y: 36.0,
                     compact: false,
@@ -201,6 +310,7 @@ impl CanvasState {
                     title: "arithmetic 329+3823".to_string(),
                     subtitle: "General · spawned".to_string(),
                     preview: "Good to meet you, Davin.".to_string(),
+                    kind: "General".to_string(),
                     x: 60.0,
                     y: 480.0,
                     compact: true,
@@ -211,6 +321,7 @@ impl CanvasState {
                     title: "New Chat".to_string(),
                     subtitle: "General · running".to_string(),
                     preview: "Playing now in your YouTube tab…".to_string(),
+                    kind: "General".to_string(),
                     x: 560.0,
                     y: 480.0,
                     compact: true,
@@ -226,16 +337,150 @@ impl CanvasState {
             model: "Automatic Fallback".to_string(),
             edit: rune::TextEdit::new(""),
             active_id: "chat:ws-general:chat-1".to_string(),
+            rail: RailTab::Chats,
+            sessions: Sessions::default(),
             cam: Camera::default(),
             projects: crate::projects::ProjectsState::default(),
             agents: crate::agents::AgentsState::default(),
             voice: crate::voice::VoiceBus::default(),
-            outbox: Vec::new(),
+            kind_open: false,
+        };
+        state.seed_sessions();
+        state
+    }
+
+    /// Seed session tabs from the scene cards (cards predate threads;
+    /// threads materialize on open/send).
+    pub fn seed_sessions(&mut self) {
+        for card in &self.cards {
+            if !self.sessions.order.contains(&card.id) {
+                self.sessions.order.push(card.id.clone());
+            }
+        }
+        if self.active_id.is_empty() {
+            self.active_id = self.sessions.order.first().cloned().unwrap_or_default();
         }
     }
 
     pub fn card(&self, id: &str) -> Option<&MapCard> {
         self.cards.iter().find(|c| c.id == id)
+    }
+
+    /// Focus the camera on a card (session tab switch centers it).
+    pub fn focus_card(&mut self, id: &str) {
+        let (cx, cy) = match self.card(id) {
+            Some(card) => {
+                let (w, h) = card.size();
+                (card.x + w / 2.0, card.y + h / 2.0)
+            }
+            None => return,
+        };
+        let vw = MAP_W - MAP_SIDEBAR_W;
+        let k = self.cam.scale;
+        self.cam.x = vw / 2.0 - cx * k;
+        self.cam.y = MAP_H / 2.0 - cy * k;
+    }
+
+    /// Select a session: active row + camera focus.
+    pub fn select_card(&mut self, id: &str) {
+        if self.card(id).is_none() {
+            return;
+        }
+        self.active_id = id.to_string();
+        self.focus_card(id);
+    }
+
+    /// Get-or-create the transcript thread for a card.
+    pub fn thread_mut(&mut self, id: &str) -> &mut crate::rune_transcript::RuneTranscriptState {
+        if !self.sessions.threads.contains_key(id) {
+            let title = self
+                .card(id)
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| "New Chat".to_string());
+            let mut thread = crate::rune_transcript::RuneTranscriptState::screenshot();
+            thread.title = title;
+            thread.rows = Vec::new();
+            thread.live = false;
+            thread.chat_id = crate::notes::mint_id("rune-chat");
+            self.sessions.threads.insert(id.to_string(), thread);
+            if !self.sessions.order.contains(&id.to_string()) {
+                self.sessions.order.push(id.to_string());
+            }
+        }
+        self.sessions
+            .threads
+            .get_mut(id)
+            .expect("thread ensured above")
+    }
+
+    /// Open the transcript sheet for a card (ensures its thread).
+    pub fn open_sheet(&mut self, id: &str) {
+        if self.card(id).is_none() {
+            return;
+        }
+        self.select_card(id);
+        let _ = self.thread_mut(id);
+        self.sessions.sheet = Some(id.to_string());
+    }
+
+    pub fn close_sheet(&mut self) {
+        self.sessions.sheet = None;
+    }
+
+    /// The sheet's thread, if a sheet is open.
+    pub fn sheet_thread(&self) -> Option<&crate::rune_transcript::RuneTranscriptState> {
+        self.sessions
+            .sheet
+            .as_ref()
+            .and_then(|id| self.sessions.threads.get(id))
+    }
+
+    pub fn sheet_thread_mut(&mut self) -> Option<&mut crate::rune_transcript::RuneTranscriptState> {
+        let id = self.sessions.sheet.clone()?;
+        self.sessions.threads.get_mut(&id)
+    }
+
+    /// New session: card (current kind, cascaded) + thread + select.
+    /// Returns the card id for the tab bar.
+    pub fn new_session(&mut self) -> String {
+        let n = self.cards.len();
+        let id = format!("chat:local:{}", crate::notes::mint_id("s"));
+        let kind = self.sessions.kind.clone();
+        self.cards.push(MapCard {
+            id: id.clone(),
+            title: "New Chat".to_string(),
+            subtitle: format!("{kind} · fresh"),
+            preview: "No messages yet.".to_string(),
+            kind,
+            x: 36.0 + ((n * 84) % 420) as f32,
+            y: 36.0 + ((n * 64) % 320) as f32,
+            compact: false,
+            running: false,
+        });
+        let _ = self.thread_mut(&id);
+        self.select_card(&id);
+        id
+    }
+
+    /// Close a session: card + thread + tab go; selection and sheet fall
+    /// back to the first remaining session (local scene state only — no
+    /// server chats exist behind these cards).
+    pub fn close_session(&mut self, id: &str) {
+        self.cards.retain(|c| c.id != id);
+        self.sessions.threads.remove(id);
+        self.sessions.order.retain(|o| o != id);
+        if self.sessions.sheet.as_deref() == Some(id) {
+            self.sessions.sheet = None;
+        }
+        if self.active_id == id {
+            self.active_id = self
+                .sessions
+                .order
+                .first()
+                .or_else(|| self.cards.first().map(|c| &c.id))
+                .cloned()
+                .unwrap_or_default();
+        }
     }
 }
 
@@ -263,10 +508,27 @@ pub trait CanvasHost {
 }
 
 /// Home hosting: the map canvas plus its projects rail. One bound covers
-/// both, so the sidebar can never disagree with the board state.
-pub trait HomeHost: CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost {}
+/// the canvas-local panels (chats, projects, agents, sessions), so the
+/// sidebar can never disagree with the board state. Cloud/memory/house
+/// panels render shell-side (their state lives on `ShellState`).
+pub trait HomeHost:
+    CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost + SessionsHost
+{
+}
 
-impl<T: CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost> HomeHost for T {}
+impl<T: CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost + SessionsHost>
+    HomeHost for T
+{
+}
+
+impl SessionsHost for CanvasState {
+    fn sessions_mut(&mut self) -> &mut Sessions {
+        &mut self.sessions
+    }
+    fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+}
 
 impl CanvasHost for CanvasState {
     fn canvas_mut(&mut self) -> &mut CanvasState {
@@ -475,7 +737,7 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
 }
 
 /// Canvas body shared by the standalone view and the shell.
-pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
+pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
     let dot = rune::Color {
         r: 1.0,
         g: 1.0,
@@ -561,16 +823,16 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
         world = world.child(card_view::<S>(card, card.id == s.active_id));
     }
     // Fixed-chrome area: clips the scaled world, holds composer + HUD.
+    // `grow` (not `h_full`): shares a shell row without overflowing it.
     let mut canvas = col()
         .key("canvas-area")
         .grow(1.0)
-        .h_full()
+        .min_h(0.0)
         .fill(ink("#08080a"))
         .clip_rounded(0.0)
         .child(world);
     // Floating composer, centred over the canvas like `HouseChat`'s dock:
-    // 640pt wide, bottom-anchored. Same card as the transcript dock; send
-    // stages into the outbox for run dispatch.
+    // 640pt wide, bottom-anchored. Same card as the transcript dock.
     canvas = canvas.child(
         rune::el()
             .key("map-composer-float")
@@ -585,20 +847,24 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
                     let c = s.canvas_mut();
                     c.voice.set_live(!c.voice.live);
                 },
-                // The map dock stages into the outbox (no live run of its
-                // own), so it never shows Stop; cancellation lives on the
-                // transcript dock that owns the run.
+                // The map dock sends into the ACTIVE session's thread and opens
+                // its sheet — chats are the only type, so every prompt lands
+                // in a chat thread (no dead-letter outbox). It never shows
+                // Stop; cancellation lives on the sheet that owns the run.
                 (false, move |_s: &mut S| {}),
                 move |s: &mut S| {
                     let c = s.canvas_mut();
                     let prompt = c.edit.text.trim().to_string();
-                    if prompt.is_empty() {
+                    if prompt.is_empty() || c.active_id.is_empty() {
                         return;
                     }
-                    c.outbox.push(prompt);
                     c.edit.text.clear();
                     c.edit.anchor = 0;
                     c.edit.focus = 0;
+                    let id = c.active_id.clone();
+                    let thread = c.thread_mut(&id);
+                    crate::rune_transcript::stage_send_prompt(thread, prompt);
+                    c.sessions.sheet = Some(id);
                 },
             )),
     );
@@ -663,10 +929,17 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
     // Sidebar rows mirror the cards: the active chat carries the white-9%
     // wash (`.house-sidebar-row.is-active`); a press switches selection.
     // Rows key off card ids so the board and the list can never disagree.
-    let mut sidebar = col()
+    // NOTE: the side panel (chats/projects/agents/cloud/…) renders
+    // shell-side — `canvas_body` is the canvas area only, so the panel can
+    // swap while the map stays mounted. `chats_panel` below is the Chats tab.
+    canvas
+}
+
+/// Chats panel: kind dropdown + new chat, live search, and one row per chat
+/// filtered by kind + query. A row press selects and focuses the card.
+pub fn chats_panel<S: CanvasHost + SessionsHost + 'static>(s: &CanvasState) -> El {
+    let mut panel = col()
         .key("map-sidebar")
-        // Fixed width, full row height (never `MAP_H`: the row shares shell
-        // space with the tab bar).
         .w(MAP_SIDEBAR_W)
         .h_full()
         .fill(ink("#0f0f0f"))
@@ -674,18 +947,91 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
         .pt(14.0)
         .gap(8.0)
         .child(
-            text("General".to_string())
-                .key("map-filter")
-                .font(rune::tok::TextStyle::new(15.0, 600.0))
-                .color(ink("#fafafa")),
-        )
-        .child(
-            text("Search chats...".to_string())
-                .key("map-search")
-                .font(rune::tok::TextStyle::new(12.0, 400.0))
-                .color(ink("#8a8a8a")),
+            row()
+                .key("map-kindrow")
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .child(
+                    row()
+                        .key("map-kind")
+                        .grow(1.0)
+                        .items_center()
+                        .gap(6.0)
+                        .role("button")
+                        .label("Switch chat kind")
+                        .on_press(move |s: &mut S| {
+                            let c = s.canvas_mut();
+                            c.kind_open = !c.kind_open;
+                        })
+                        .child(
+                            text(s.sessions.kind.clone())
+                                .font(rune::tok::TextStyle::new(15.0, 600.0))
+                                .color(ink("#fafafa")),
+                        )
+                        .child(
+                            text(if s.kind_open { "▴" } else { "▾" }.to_string())
+                                .font(rune::tok::TextStyle::new(10.0, 600.0))
+                                .color(ink("#71717a")),
+                        ),
+                )
+                .child(
+                    text("+".to_string())
+                        .key("map-new")
+                        .role("button")
+                        .label("New chat")
+                        .font(rune::tok::TextStyle::new(15.0, 400.0))
+                        .color(ink("#a1a1aa"))
+                        .on_press(move |s: &mut S| {
+                            s.canvas_mut().new_session();
+                        }),
+                ),
         );
+    if s.kind_open {
+        for kind in CHAT_KINDS {
+            let current = s.sessions.kind == kind;
+            let target = kind.to_string();
+            panel = panel.child(
+                row()
+                    .key(format!("map-kind-{kind}"))
+                    .w_full()
+                    .items_center()
+                    .gap(8.0)
+                    .radius(8.0)
+                    .px(10.0)
+                    .py(6.0)
+                    .fill(ink(if current { "#1b1b20" } else { "#00000000" }))
+                    .role("button")
+                    .label(format!("Show {kind} chats"))
+                    .on_press(move |s: &mut S| {
+                        let c = s.canvas_mut();
+                        c.sessions.kind = target.clone();
+                        c.kind_open = false;
+                    })
+                    .child(
+                        text(kind.to_string())
+                            .font(rune::tok::TextStyle::new(12.0, 500.0))
+                            .color(ink(if current { "#e4e4e7" } else { "#a1a1aa" })),
+                    ),
+            );
+        }
+    }
+    panel = panel.child(
+        text_input(&s.sessions.search, rune::tok::TextStyle::new(12.0, 400.0))
+            .key("map-search")
+            .w_full()
+            .placeholder("Search chats...", ink("#8a8a8a"))
+            .caret(ink("#f2f2f4"), ink("#3b82f6"))
+            .on_edit(move |s: &mut S| &mut s.canvas_mut().sessions.search),
+    );
+    let query = s.sessions.search.text.trim().to_lowercase();
     for card in &s.cards {
+        if card.kind != s.sessions.kind {
+            continue;
+        }
+        if !query.is_empty() && !card.title.to_lowercase().contains(&query) {
+            continue;
+        }
         let row_id = format!("side-{}", card.id);
         let active = card.id == s.active_id;
         let target = card.id.clone();
@@ -697,8 +1043,10 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
             .radius(8.0)
             .px(10.0)
             .py(8.0)
+            .role("button")
+            .label(format!("Open {}", card.title))
             .on_press(move |s: &mut S| {
-                s.canvas_mut().active_id = target.clone();
+                s.canvas_mut().select_card(&target);
             });
         if active {
             item = item.fill(rune::Color {
@@ -717,7 +1065,7 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
                     .fill(ink("#fafafa")),
             );
         }
-        sidebar = sidebar.child(
+        panel = panel.child(
             item.child(
                 text(card.title.clone())
                     .key(format!("side-{}-title", card.id))
@@ -726,34 +1074,7 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
             ),
         );
     }
-    // Projects rail (`useGroupProjects` panel): scoped to the workspace, part
-    // of Home — never a route. React mounts it beside the workspace; the map
-    // sidebar is that place here.
-    sidebar = sidebar.child(super::projects::projects_section::<S>(&s.projects));
-    // Agent delegations (`AgentTreePanel`): same rail, below projects.
-    sidebar = sidebar.child(super::agents::agents_section::<S>(&s.agents));
-
-    let map = row()
-        .key("stark-map")
-        .w_full()
-        // `grow`, not `h_full`: fills a standalone window and shares a shell
-        // column with the tab bar without overflowing it.
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(ink("#0a0a0a"))
-        .child(sidebar)
-        .child(canvas);
-    // Agent drawer mounts over the whole map (React's fixed overlay).
-    let mut root = col()
-        .key("map-root")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .child(map);
-    if s.agents.selected.is_some() {
-        root = root.child(super::agents::agent_sheet::<S>(&s.agents));
-    }
-    root
+    panel
 }
 
 fn init_map() -> CanvasState {
@@ -782,7 +1103,6 @@ mod tests {
             "chat:ws-general:chat-1",
             "chat:ws-general:chat-4",
             "canvas-edges",
-            "map-sidebar",
         ] {
             assert!(rt.find(key).is_some(), "{key} laid out");
         }
@@ -794,15 +1114,38 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_press_switches_active_chat() {
+    fn chats_panel_filters_searches_and_selects() {
+        fn panel_view(s: &CanvasState, _: &mut rune::Cx<CanvasState>) -> El {
+            col()
+                .key("panel-root")
+                .w_full()
+                .h_full()
+                .child(canvas_body::<CanvasState>(s))
+                .child(chats_panel::<CanvasState>(s))
+        }
         let env = Env::new(true, 1.0);
-        let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
+        let mut rt = Runtime::new(CanvasState::map(), panel_view, (MAP_W, MAP_H), env);
         rt.frame(0.0);
-        assert_eq!(rt.state.active_id, "chat:ws-general:chat-1");
-        let target = "side-chat:ws-general:chat-2-title";
-        assert!(rt.find(target).is_some(), "row title mounted");
-        let row = "side-chat:ws-general:chat-2";
-        let (x, y) = rt.find(row).unwrap();
+        assert!(rt.find("map-sidebar").is_some(), "panel mounts");
+        assert!(rt.find("map-search").is_some(), "live search mounts");
+        assert!(rt.find("map-kind").is_some(), "kind dropdown mounts");
+        // Kind filter: Coding shows only chat-2.
+        let (x, y) = rt.find("map-kind").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (x, y) = rt.find("map-kind-Coding").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.find("side-chat:ws-general:chat-2").is_some());
+        assert!(rt.find("side-chat:ws-general:chat-1").is_none());
+        // Row press selects + focuses.
+        let (x, y) = rt.find("side-chat:ws-general:chat-2").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
@@ -881,9 +1224,9 @@ mod tests {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
         rt.frame(0.0);
-        // World (1000, 800): clear of cards, composer and HUD; window x adds
-        // the 248pt sidebar.
-        let (x0, y0) = (248.0 + 1000.0, 800.0);
+        // World (950, 800): clear of cards, composer and HUD (standalone
+        // canvas fills the window — no rail offset here).
+        let (x0, y0) = (950.0, 800.0);
         let card_before = (rt.state.cards[0].x, rt.state.cards[0].y);
         rt.pointer_down(x0, y0);
         rt.frame(1.0 / 60.0);

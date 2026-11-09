@@ -1779,6 +1779,26 @@ mod tests {
         assert_eq!(relative_time("not-a-date"), "");
     }
 
+    /// Section + sheet mounted shell-style (the tree lives in the side
+    /// panel now, not the canvas body).
+    fn section_view(
+        s: &crate::rune_canvas::CanvasState,
+        _: &mut rune::Cx<crate::rune_canvas::CanvasState>,
+    ) -> rune::El {
+        let mut root = rune::col()
+            .key("agents-test-root")
+            .w_full()
+            .h_full()
+            .child(crate::rune_canvas::canvas_body::<
+                crate::rune_canvas::CanvasState,
+            >(s))
+            .child(agents_section::<crate::rune_canvas::CanvasState>(&s.agents));
+        if s.agents.selected.is_some() {
+            root = root.child(agent_sheet::<crate::rune_canvas::CanvasState>(&s.agents));
+        }
+        root
+    }
+
     #[test]
     fn tree_mounts_and_select_opens_sheet() {
         let env = Env::new(true, 1.0);
@@ -1790,7 +1810,7 @@ mod tests {
         init.agents.auto = false;
         let mut rt = Runtime::new(
             init,
-            crate::rune_canvas::canvas_view,
+            section_view,
             (crate::rune_canvas::MAP_W, crate::rune_canvas::MAP_H),
             env,
         );
@@ -1843,7 +1863,7 @@ mod tests {
         init.agents.tab = AgentTab::Worktree;
         let mut rt = Runtime::new(
             init,
-            crate::rune_canvas::canvas_view,
+            section_view,
             (crate::rune_canvas::MAP_W, crate::rune_canvas::MAP_H),
             env,
         );

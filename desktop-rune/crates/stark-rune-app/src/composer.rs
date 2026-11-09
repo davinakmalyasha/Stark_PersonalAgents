@@ -91,16 +91,21 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
 /// model pill, spacer, voice toggle + meter, and white send circle. `w_full`
 /// — callers set the width. `on_send` runs on send-button press and field
 /// submit; `on_voice` toggles capture; each view wires its own state type
-/// through `edit_of`.
+/// through `edit_of`. While `running` the send circle becomes the Stop square
+/// (`index.css .send-button.stop`: white circle, dark square, "Stop
+/// execution") and presses `on_cancel` — React's `isRunning && empty → Stop`
+/// simplified: a live run always stops first, a second prompt waits its turn.
 pub fn composer_card<S: 'static>(
     model: &str,
     edit: &TextEdit,
     edit_of: impl for<'a> Fn(&'a mut S) -> &'a mut TextEdit + 'static,
     voice: (bool, f32, Option<&str>),
     on_voice: impl Fn(&mut S) + 'static,
+    stop: (bool, impl Fn(&mut S) + 'static),
     on_send: impl Fn(&mut S) + 'static,
 ) -> El {
     let (voice_live, voice_level, voice_note) = voice;
+    let (running, on_cancel) = stop;
     let on_send = std::rc::Rc::new(on_send);
     let submit = {
         let on_send = on_send.clone();
@@ -196,7 +201,22 @@ pub fn composer_card<S: 'static>(
                     voice_meter(voice_live, voice_level, voice_note),
                 )
                 .child(voice_button(voice_live, on_voice))
-                .child(
+                .child(if running {
+                    rune::el()
+                        .key("composer-stop")
+                        .role("button")
+                        .label("Stop execution")
+                        .size(34.0, 34.0)
+                        .radius(17.0)
+                        .fill(ink("#ffffff"))
+                        .center()
+                        .on_press(on_cancel)
+                        .child(
+                            text("■".to_string())
+                                .font(rune::tok::TextStyle::new(12.0, 650.0))
+                                .color(ink("#111113")),
+                        )
+                } else {
                     rune::el()
                         .key("composer-send")
                         .role("button")
@@ -213,7 +233,7 @@ pub fn composer_card<S: 'static>(
                             text("↑".to_string())
                                 .font(rune::tok::TextStyle::new(16.0, 650.0))
                                 .color(ink("#111113")),
-                        ),
-                ),
+                        )
+                }),
         )
 }

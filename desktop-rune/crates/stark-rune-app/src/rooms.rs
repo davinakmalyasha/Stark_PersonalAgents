@@ -264,6 +264,63 @@ impl MemoryWs {
     }
 }
 
+/// One memory record: the request plus its consolidated summary.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemoryRecord {
+    pub id: String,
+    pub request: String,
+    pub summary: String,
+    pub created: String,
+}
+
+impl MemoryRecord {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        Self {
+            id: str_of("id"),
+            request: str_of("request"),
+            summary: str_of("summary"),
+            created: str_of("createdAt"),
+        }
+    }
+}
+
+/// Workspace detail (`GET /api/memory/{id}?records=`): long-form summary
+/// plus the newest records. Topics/entries tables stay server-side — the
+/// records are what the workspace view actually reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemoryDetail {
+    pub summary: String,
+    pub records: Vec<MemoryRecord>,
+}
+
+impl MemoryDetail {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            summary: v
+                .get("summary")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            records: v
+                .get("records")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().map(MemoryRecord::from_json).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn fetch(host: &str, port: u16, workspace_id: &str) -> Result<Self, String> {
+        let v = crate::transport::get_json(
+            host,
+            port,
+            &format!("/api/memory/{workspace_id}?records=20"),
+        )?;
+        Ok(Self::from_json(&v))
+    }
+}
+
 pub struct MemoryState {
     pub host: String,
     pub port: u16,
@@ -273,6 +330,14 @@ pub struct MemoryState {
     pub last_ok: f64,
     pub auto: bool,
     pub inbox: Option<std::sync::mpsc::Receiver<Result<Vec<MemoryWs>, String>>>,
+    /// Selected workspace id (`MemoryWorkspace` active tab); its detail
+    /// renders below the list.
+    pub selected: String,
+    /// Detail for `selected` (`GET /api/memory/{id}?records=`).
+    pub detail: Option<MemoryDetail>,
+    pub detail_loading: bool,
+    pub detail_error: Option<String>,
+    pub detail_inbox: Option<std::sync::mpsc::Receiver<Result<MemoryDetail, String>>>,
 }
 
 impl std::fmt::Debug for MemoryState {
@@ -296,6 +361,11 @@ impl Clone for MemoryState {
             last_ok: self.last_ok,
             auto: self.auto,
             inbox: None,
+            selected: self.selected.clone(),
+            detail: self.detail.clone(),
+            detail_loading: self.detail_loading,
+            detail_error: self.detail_error.clone(),
+            detail_inbox: None,
         }
     }
 }
@@ -311,6 +381,11 @@ impl Default for MemoryState {
             last_ok: 0.0,
             auto: true,
             inbox: None,
+            selected: String::new(),
+            detail: None,
+            detail_loading: false,
+            detail_error: None,
+            detail_inbox: None,
         }
     }
 }
@@ -400,6 +475,70 @@ pub fn refresh_memory(s: &mut MemoryState) {
             let _ = tx.send(MemoryState::fetch(&host, port));
         });
     }
+}
+
+/// Select a workspace and load its detail. Tapping the active row again
+/// collapses it (React's tab toggle).
+pub fn select_memory(s: &mut MemoryState, id: &str) {
+    if s.selected == id {
+        s.selected.clear();
+        s.detail = None;
+        s.detail_error = None;
+        return;
+    }
+    s.selected = id.to_string();
+    s.detail = None;
+    s.detail_error = None;
+    refresh_memory_detail(s);
+}
+
+/// Detail worker (`GET /api/memory/{id}?records=20`). No-op while one is in
+/// flight; a second tap collapses via [`select_memory`] instead of stacking.
+pub fn refresh_memory_detail(s: &mut MemoryState) {
+    if s.detail_loading || s.selected.trim().is_empty() {
+        return;
+    }
+    s.detail_loading = true;
+    s.detail_error = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.detail_inbox = Some(rx);
+    let ws = s.selected.clone();
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let path = format!("/api/memory/{ws}?records=20");
+        let result = match crate::transport::fetch_json(&path).await {
+            Ok(v) => Ok(MemoryDetail::from_json(&v)),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (host, port) = (s.host.clone(), s.port);
+        std::thread::spawn(move || {
+            let _ = tx.send(MemoryDetail::fetch(&host, port, &ws));
+        });
+    }
+}
+
+/// Drain the detail inbox. Shared by every host like the list polls.
+pub fn poll_memory_detail(s: &mut MemoryState) -> bool {
+    let (msgs, _) = drain_results(&mut s.detail_inbox);
+    let mut changed = false;
+    for msg in msgs {
+        match msg {
+            Ok(detail) => {
+                s.detail = Some(detail);
+                s.detail_error = None;
+            }
+            Err(message) => {
+                s.detail_error = Some(message);
+            }
+        }
+        s.detail_loading = false;
+        changed = true;
+    }
+    changed
 }
 
 fn refresh_button<S: 'static>(key: &str, loading: bool, on_press: impl Fn(&mut S) + 'static) -> El {
@@ -566,36 +705,158 @@ pub fn memory_view<S: MemoryHost + 'static>(s: &MemoryState) -> El {
         );
     }
     for ws in &s.workspaces {
-        body = body.child(
-            row()
-                .key(format!("memory-ws-{id}", id = ws.id))
-                .w_full()
-                .items_center()
-                .gap(10.0)
-                .radius(10.0)
-                .fill(ink("#141417"))
-                .border(1.0, ink("#ffffff14"))
-                .px(12.0)
-                .py(9.0)
-                .child(
-                    text(ws.name.clone())
-                        .key(format!("memory-ws-{id}-name", id = ws.id))
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(12.0, 600.0))
-                        .color(ink("#e4e4e7")),
-                )
-                .child(
-                    text(format!("{} entries", ws.entries))
-                        .key(format!("memory-ws-{id}-count", id = ws.id))
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(ink("#8a8a93")),
-                ),
-        );
+        let id = ws.id.clone();
+        let selected = ws.id == s.selected;
+        let mut item = row()
+            .key(format!("memory-ws-{id}", id = ws.id))
+            .w_full()
+            .items_center()
+            .gap(10.0)
+            .radius(10.0)
+            .fill(ink(if selected { "#1b1b20" } else { "#141417" }))
+            .border(1.0, ink(if selected { "#ffffff30" } else { "#ffffff14" }))
+            .px(12.0)
+            .py(9.0)
+            .role("button")
+            .label(format!("Open {name} memory", name = ws.name))
+            .on_press(move |s: &mut S| {
+                select_memory(s.memory_mut(), &id);
+            })
+            .child(
+                text(ws.name.clone())
+                    .key(format!("memory-ws-{id}-name", id = ws.id))
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(12.0, 600.0))
+                    .color(ink("#e4e4e7")),
+            )
+            .child(
+                text(format!("{} entries", ws.entries))
+                    .key(format!("memory-ws-{id}-count", id = ws.id))
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(ink("#8a8a93")),
+            );
+        if selected {
+            item = item.child(
+                text(if s.detail_loading { "…" } else { "▾" }.to_string())
+                    .key(format!("memory-ws-{id}-chev", id = ws.id))
+                    .font(rune::tok::TextStyle::new(11.0, 600.0))
+                    .color(ink("#71717a")),
+            );
+        }
+        body = body.child(item);
     }
+    body = memory_detail_view(body, s);
     if let Some(err) = &s.error {
         body = body.child(
             text(err.clone())
                 .key("memory-error")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#fda4af")),
+        );
+    }
+    body
+}
+
+/// Detail panel for the selected workspace: long-form summary plus newest
+/// records (`MemoryWorkspace` detail half). Read-only: summary edits and
+/// consolidation stay behind explicit buttons server-side for now.
+fn memory_detail_view(mut body: El, s: &MemoryState) -> El {
+    if s.selected.trim().is_empty() {
+        return body;
+    }
+    body = body.child(
+        row()
+            .key("memory-detail-head")
+            .w_full()
+            .items_center()
+            .gap(8.0)
+            .child(
+                text("Detail".to_string())
+                    .key("memory-detail-title")
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(12.0, 600.0))
+                    .color(ink("#a1a1aa")),
+            )
+            .child(
+                text(if s.detail_loading {
+                    "…".to_string()
+                } else {
+                    format!(
+                        "{} records",
+                        s.detail.as_ref().map(|d| d.records.len()).unwrap_or(0)
+                    )
+                })
+                .key("memory-detail-count")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#71717a")),
+            ),
+    );
+    if let Some(detail) = &s.detail {
+        let summary = if detail.summary.trim().is_empty() {
+            "No long-form summary yet.".to_string()
+        } else {
+            detail.summary.clone()
+        };
+        body = body.child(
+            text(summary)
+                .key("memory-detail-summary")
+                .font(rune::tok::TextStyle::new(12.0, 400.0))
+                .wrap()
+                .color(ink("#c9c9d1")),
+        );
+        if detail.records.is_empty() && !s.detail_loading {
+            body = body.child(
+                text("no records yet".to_string())
+                    .key("memory-detail-empty")
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(ink("#52525b")),
+            );
+        }
+        for r in &detail.records {
+            body = body.child(
+                col()
+                    .key(format!("memory-record-{id}", id = r.id))
+                    .w_full()
+                    .gap(4.0)
+                    .radius(10.0)
+                    .fill(ink("#141417"))
+                    .border(1.0, ink("#ffffff14"))
+                    .px(12.0)
+                    .py(9.0)
+                    .child(
+                        row()
+                            .key(format!("memory-record-{id}-head", id = r.id))
+                            .w_full()
+                            .items_center()
+                            .gap(8.0)
+                            .child(
+                                text(r.request.clone())
+                                    .key(format!("memory-record-{id}-request", id = r.id))
+                                    .grow(1.0)
+                                    .font(rune::tok::TextStyle::new(12.0, 600.0))
+                                    .color(ink("#e4e4e7")),
+                            )
+                            .child(
+                                text(r.created.clone())
+                                    .key(format!("memory-record-{id}-created", id = r.id))
+                                    .font(rune::tok::TextStyle::new(10.0, 400.0))
+                                    .color(ink("#71717a")),
+                            ),
+                    )
+                    .child(
+                        text(r.summary.clone())
+                            .key(format!("memory-record-{id}-summary", id = r.id))
+                            .font(rune::tok::TextStyle::new(11.5, 400.0))
+                            .wrap()
+                            .color(ink("#a1a1aa")),
+                    ),
+            );
+        }
+    }
+    if let Some(err) = &s.detail_error {
+        body = body.child(
+            text(err.clone())
+                .key("memory-detail-error")
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
                 .color(ink("#fda4af")),
         );
@@ -652,5 +913,37 @@ mod tests {
         };
         assert_eq!(s.workspaces[0].entries, 12);
         assert_eq!(s.workspaces[1].entries, 0);
+    }
+
+    #[test]
+    fn memory_detail_parses_records_and_summary() {
+        let v = serde_json::json!({
+            "summary": "Likes terse replies.",
+            "records": [
+                {"id": "r1", "request": "Summarize this", "summary": "Did it",
+                 "createdAt": "2026-11-01"},
+                {"id": "r2", "request": "Second", "summary": "", "createdAt": ""},
+            ],
+        });
+        let d = MemoryDetail::from_json(&v);
+        assert_eq!(d.summary, "Likes terse replies.");
+        assert_eq!(d.records.len(), 2);
+        assert_eq!(d.records[0].request, "Summarize this");
+        assert_eq!(d.records[1].summary, "");
+        // Missing keys default empty, never null-panic.
+        let empty = MemoryDetail::from_json(&serde_json::json!({}));
+        assert_eq!(empty, MemoryDetail::default());
+    }
+
+    #[test]
+    fn select_memory_toggles_and_collapses() {
+        let mut s = MemoryState::default();
+        select_memory(&mut s, "ws1");
+        assert_eq!(s.selected, "ws1");
+        // Worker spawned (or failed instantly with no server — either way the
+        // loading flag was set and no detail landed).
+        select_memory(&mut s, "ws1");
+        assert!(s.selected.is_empty(), "second tap collapses");
+        assert!(s.detail.is_none());
     }
 }

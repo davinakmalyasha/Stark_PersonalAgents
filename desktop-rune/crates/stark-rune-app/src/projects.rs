@@ -70,6 +70,10 @@ impl GroupProject {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProjectsSnapshot {
     pub projects: Vec<GroupProject>,
+    /// Server-side scoping (`fetchGroupProjects(workspaceId)`): a coding
+    /// workspace sees only its own folder's projects, everything else sees
+    /// them all. The hook only carries the id; the server decides.
+    pub scoped: bool,
 }
 
 impl ProjectsSnapshot {
@@ -80,6 +84,7 @@ impl ProjectsSnapshot {
                 .and_then(|x| x.as_array())
                 .map(|a| a.iter().map(GroupProject::from_json).collect())
                 .unwrap_or_default(),
+            scoped: v.get("scoped").and_then(|x| x.as_bool()).unwrap_or(false),
         }
     }
 
@@ -100,6 +105,8 @@ pub struct ProjectsState {
     pub port: u16,
     /// Server-side scope (`fetchGroupProjects(workspaceId)`); empty = global.
     pub workspace_id: String,
+    /// Last `scoped` flag the server reported (drives the rail badge).
+    pub scoped: bool,
     pub projects: Vec<GroupProject>,
     pub loading: bool,
     pub error: Option<String>,
@@ -124,6 +131,7 @@ impl Clone for ProjectsState {
             host: self.host.clone(),
             port: self.port,
             workspace_id: self.workspace_id.clone(),
+            scoped: self.scoped,
             projects: self.projects.clone(),
             loading: self.loading,
             error: self.error.clone(),
@@ -140,6 +148,7 @@ impl Default for ProjectsState {
             host: "127.0.0.1".to_string(),
             port: 8124,
             workspace_id: String::new(),
+            scoped: false,
             projects: Vec::new(),
             loading: false,
             error: None,
@@ -187,115 +196,165 @@ pub fn refresh_projects(s: &mut ProjectsState) {
     }
 }
 
-/// Projects board: title + refresh, then one card per project with a
-/// progress bar, status chip, and waiting badge.
-pub fn projects_view<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
-    let mut body = col()
-        .key("projects-board")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(ink("#0a0a0a"))
-        .px(24.0)
-        .pt(18.0)
-        .gap(10.0)
-        .child(
-            row()
-                .key("projects-head")
-                .w_full()
-                .items_center()
-                .child(
-                    text("Projects".to_string())
-                        .key("projects-title")
-                        .grow(1.0)
-                        .font(rune::tok::TextStyle::new(15.0, 650.0))
-                        .color(ink("#f2f2f5")),
-                )
-                .child(
-                    text(if s.loading { "…" } else { "Refresh" }.to_string())
-                        .key("projects-refresh")
-                        .role("button")
-                        .label("Refresh projects")
-                        .font(rune::tok::TextStyle::new(11.0, 600.0))
-                        .px(12.0)
-                        .py(8.0)
-                        .radius(8.0)
-                        .fill(ink("#ffffff0d"))
-                        .color(ink("#d4d4d8"))
-                        .on_press(|s: &mut S| {
-                            refresh_projects(s.projects_mut());
-                        }),
-                ),
-        );
+/// Drain the inbox and auto-refresh at most every 15s (the supervisor ticks
+/// every 15s; polling faster is waste — `useGroupProjects` POLL_MS). Shared
+/// by every host so the board, the rail and the shell drain identically.
+pub fn poll_projects_state(s: &mut ProjectsState, clock: f64) -> bool {
+    let (msgs, _) = crate::rooms::drain_results(&mut s.inbox);
+    let mut changed = false;
+    for msg in msgs {
+        match msg {
+            Ok(snap) => {
+                s.projects = snap.projects;
+                s.scoped = snap.scoped;
+                s.error = None;
+                s.last_ok = clock;
+            }
+            Err(message) => {
+                s.error = Some(message);
+            }
+        }
+        s.loading = false;
+        changed = true;
+    }
+    if s.auto && !s.loading && clock - s.last_ok > 15.0 {
+        refresh_projects(s);
+        changed = true;
+    }
+    changed
+}
+/// Projects sidebar section: the per-workspace panel React mounts beside the
+/// workspace (`useGroupProjects(workspaceId)`), not a top-level route. Scoped
+/// by `ProjectsState.workspace_id` (empty = global); the `scoped` badge shows
+/// which the server applied. Mounted at the bottom of the Home sidebar. (The
+/// old full-board `projects_view` was removed with the 7th route; the section
+/// shares its card renderer.)
+pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
+    let mut body = col().key("side-projects").w_full().gap(6.0).pt(10.0).child(
+        row()
+            .key("side-projects-head")
+            .w_full()
+            .items_center()
+            .gap(6.0)
+            .child(
+                text("Projects".to_string())
+                    .key("side-projects-title")
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(11.0, 600.0))
+                    .color(ink("#8a8a93")),
+            )
+            .child(
+                text(if s.scoped { "Scoped" } else { "All" }.to_string())
+                    .key("side-projects-scope")
+                    .font(rune::tok::TextStyle::new(9.0, 600.0))
+                    .px(6.0)
+                    .py(2.0)
+                    .radius(5.0)
+                    .fill(ink("#ffffff0d"))
+                    .color(ink("#71717a")),
+            )
+            .child(
+                text(if s.loading { "…" } else { "↻" }.to_string())
+                    .key("side-projects-refresh")
+                    .role("button")
+                    .label("Refresh projects")
+                    .font(rune::tok::TextStyle::new(12.0, 600.0))
+                    .color(ink("#a1a1aa"))
+                    .on_press(|s: &mut S| {
+                        refresh_projects(s.projects_mut());
+                    }),
+            ),
+    );
     if s.projects.is_empty() && !s.loading {
         body = body.child(
-            text("no projects yet — start one from a workspace".to_string())
-                .key("projects-empty")
-                .font(rune::tok::TextStyle::new(12.0, 400.0))
+            text("No projects".to_string())
+                .key("side-projects-empty")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
                 .color(ink("#52525b")),
         );
     }
     for p in &s.projects {
-        body = body.child(
-            col()
-                .key(format!("projects-{id}", id = p.id))
-                .w_full()
-                .gap(8.0)
-                .radius(12.0)
-                .fill(ink("#141417"))
-                .border(1.0, ink("#ffffff14"))
-                .px(14.0)
-                .py(12.0)
-                .child(
-                    row()
-                        .key(format!("projects-{id}-head", id = p.id))
-                        .w_full()
-                        .items_center()
-                        .gap(8.0)
-                        .child(
-                            text(p.title.clone())
-                                .key(format!("projects-{id}-title", id = p.id))
-                                .grow(1.0)
-                                .font(rune::tok::TextStyle::new(13.0, 600.0))
-                                .color(ink("#e4e4e7")),
-                        )
-                        .child(
-                            text(p.status.clone())
-                                .key(format!("projects-{id}-status", id = p.id))
-                                .font(rune::tok::TextStyle::new(10.0, 600.0))
-                                .px(8.0)
-                                .py(3.0)
-                                .radius(6.0)
-                                .fill(ink("#ffffff0d"))
-                                .color(ink("#a1a1aa")),
-                        ),
-                )
-                .child(progress_bar(&p.id, p.fraction()))
-                .child(
-                    text(format!("{} of {} items", p.done, p.total))
-                        .key(format!("projects-{id}-counts", id = p.id))
-                        .font(rune::tok::TextStyle::new(10.0, 400.0))
-                        .color(ink("#71717a")),
-                ),
-        );
+        body = body.child(project_card("side-projects", p, true));
     }
     if p_waiting_note(s) {
         body = body.child(
-            text("some projects are waiting on you".to_string())
-                .key("projects-waiting")
-                .font(rune::tok::TextStyle::new(11.0, 600.0))
+            text("waiting on you".to_string())
+                .key("side-projects-waiting")
+                .font(rune::tok::TextStyle::new(10.0, 600.0))
                 .color(ink("#fcd34d")),
         );
     }
     if let Some(err) = &s.error {
         body = body.child(
             text(err.clone())
-                .key("projects-error")
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .key("side-projects-error")
+                .font(rune::tok::TextStyle::new(10.0, 400.0))
                 .color(ink("#fda4af")),
         );
     }
     body
+}
+
+/// One project card. `prefix` namespaces keys (`projects` board vs
+/// `side-projects` section); `compact` tightens padding/type for the rail.
+fn project_card(prefix: &str, p: &GroupProject, compact: bool) -> El {
+    let (pad_x, pad_y, title_size) = if compact {
+        (10.0, 8.0, 12.0)
+    } else {
+        (14.0, 12.0, 13.0)
+    };
+    let mut card = col()
+        .key(format!("{prefix}-{id}", id = p.id))
+        .w_full()
+        .gap(if compact { 6.0 } else { 8.0 })
+        .radius(12.0)
+        .fill(ink("#141417"))
+        .border(1.0, ink("#ffffff14"))
+        .px(pad_x)
+        .py(pad_y)
+        .child(
+            row()
+                .key(format!("{prefix}-{id}-head", id = p.id))
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .child(
+                    text(p.title.clone())
+                        .key(format!("{prefix}-{id}-title", id = p.id))
+                        .grow(1.0)
+                        .font(rune::tok::TextStyle::new(title_size, 600.0))
+                        .color(ink("#e4e4e7")),
+                )
+                .child(
+                    text(p.status.clone())
+                        .key(format!("{prefix}-{id}-status", id = p.id))
+                        .font(rune::tok::TextStyle::new(10.0, 600.0))
+                        .px(8.0)
+                        .py(3.0)
+                        .radius(6.0)
+                        .fill(ink("#ffffff0d"))
+                        .color(ink("#a1a1aa")),
+                ),
+        )
+        .child(progress_bar(
+            &format!("{prefix}-{id}", id = p.id),
+            p.fraction(),
+        ))
+        .child(
+            text(format!("{} of {} items", p.done, p.total))
+                .key(format!("{prefix}-{id}-counts", id = p.id))
+                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                .color(ink("#71717a")),
+        );
+    if p.waiting > 0 {
+        card = card.child(
+            text(format!("{} waiting", p.waiting))
+                .key(format!("{prefix}-{id}-waiting", id = p.id))
+                .font(rune::tok::TextStyle::new(10.0, 600.0))
+                .color(ink("#fcd34d")),
+        );
+    }
+    card
 }
 
 fn p_waiting_note(s: &ProjectsState) -> bool {
@@ -304,18 +363,19 @@ fn p_waiting_note(s: &ProjectsState) -> bool {
 
 /// 4pt progress track with a fractional fill. The fill width is a fraction of
 /// the track: implemented as a row where the fill grows and a spacer takes
-/// the rest, so no absolute measuring is needed.
-fn progress_bar(id: &str, fraction: f32) -> El {
+/// the rest, so no absolute measuring is needed. `stem` is the full key stem
+/// (`projects-p1`, `side-projects-p1`) — the bar/fill/rest keys hang off it.
+fn progress_bar(stem: &str, fraction: f32) -> El {
     let fill = (fraction.clamp(0.0, 1.0) * 1000.0).round() / 10.0;
     row()
-        .key(format!("projects-{id}-bar"))
+        .key(format!("{stem}-bar"))
         .w_full()
         .h(4.0)
         .radius(2.0)
         .fill(ink("#ffffff12"))
         .child(
             rune::el()
-                .key(format!("projects-{id}-fill"))
+                .key(format!("{stem}-fill"))
                 .h_full()
                 .radius(2.0)
                 .fill(ink("#d4d4d8"))
@@ -325,7 +385,7 @@ fn progress_bar(id: &str, fraction: f32) -> El {
         )
         .child(
             rune::el()
-                .key(format!("projects-{id}-rest"))
+                .key(format!("{stem}-rest"))
                 .grow((1000.0 - fill).max(1.0)),
         )
 }

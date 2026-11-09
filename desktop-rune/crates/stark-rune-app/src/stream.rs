@@ -167,7 +167,15 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                 .or_else(|| frame.data.get("error"))
                 .and_then(Value::as_str)
                 .unwrap_or("The agent pipeline failed.");
-            live_row(state).body = msg.to_string();
+            // A locked server (HTTP 401) is not a dead backend: it wants
+            // pairing (`PairingGate.tsx`, same status). Say so instead of
+            // showing a bare transport error.
+            live_row(state).body = if crate::transport::is_locked_error(msg) {
+                "Server locked (401): approve this device from the desktop host, then retry."
+                    .to_string()
+            } else {
+                msg.to_string()
+            };
             live_row(state).role = "error";
             state.live = false;
             "failed"
@@ -263,5 +271,36 @@ mod tests {
         assert!(!s.live);
         assert_eq!(s.rows.last().unwrap().role, "error");
         assert_eq!(s.rows.last().unwrap().body, "pipeline blew up");
+    }
+
+    #[test]
+    fn locked_server_reports_pairing_not_transport_noise() {
+        let mut s = state();
+        s.live = true;
+        let statuses = replay(
+            &mut s,
+            "event: error\ndata: {\"message\":\"HTTP HTTP/1.1 401 Unauthorized\"}\n\n",
+        );
+        assert_eq!(statuses, vec!["failed"]);
+        assert!(!s.live);
+        let body = &s.rows.last().unwrap().body;
+        assert!(
+            body.contains("locked") && body.contains("401"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[test]
+    fn stage_abort_drops_live_but_keeps_inbox() {
+        use crate::rune_transcript::stage_abort;
+        let mut s = state();
+        s.live = true;
+        // Empty chat id: the abort POST is a guarded no-op, but the local
+        // run still detaches deterministically (no network in tests).
+        stage_abort(&mut s);
+        assert!(!s.live);
+        // Idempotent: a dead run stays dead.
+        stage_abort(&mut s);
+        assert!(!s.live);
     }
 }

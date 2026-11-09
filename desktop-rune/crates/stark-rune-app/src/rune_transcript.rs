@@ -36,6 +36,10 @@ pub struct RuneTranscriptState {
     pub live: bool,
     pub api_host: String,
     pub api_port: u16,
+    /// Chat id sent with `POST /api/run` and used by `POST /api/abort` —
+    /// mirrors the React `chat.id` both `streamPipeline` and `abortRun`
+    /// carry. Empty until the first send stages one.
+    pub chat_id: String,
     /// Settings sheet visibility.
     pub settings_open: bool,
     /// Mic capture bus (levels, notes, stop flag, inbox).
@@ -55,6 +59,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("live", &self.live)
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
+            .field("chat_id", &self.chat_id)
             .field("settings_open", &self.settings_open)
             .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
@@ -72,6 +77,7 @@ impl Clone for RuneTranscriptState {
             live: self.live,
             api_host: self.api_host.clone(),
             api_port: self.api_port,
+            chat_id: self.chat_id.clone(),
             settings_open: self.settings_open,
             voice: self.voice.clone(),
             inbox: None,
@@ -104,6 +110,7 @@ impl RuneTranscriptState {
             live: true,
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
+            chat_id: String::new(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -139,6 +146,7 @@ impl RuneTranscriptState {
             live: false,
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
+            chat_id: String::new(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -254,6 +262,49 @@ fn render_body(key: &str, body: &str, body_ink: &'static str) -> El {
                 }
                 stack = stack.child(list);
             }
+            Block::Table { headers, rows } => {
+                // `Markdown.tsx` table: bordered well, uppercase header row,
+                // hairline cell dividers. Cells share the width equally.
+                let mut table = col()
+                    .key(format!("{key}-table-{i}"))
+                    .w_full()
+                    .radius(8.0)
+                    .fill(ink("#0b0b0e"))
+                    .border(1.0, ink("#ffffff1f"))
+                    .px(10.0)
+                    .py(6.0)
+                    .gap(4.0);
+                let mut head = row().key(format!("{key}-tr-{i}-h")).w_full().gap(8.0);
+                for (j, cell) in headers.iter().enumerate() {
+                    let (content, mut spans) = runs(cell);
+                    spans.push(rune::Span::new(0, content.len()).weight(650.0));
+                    head = head.child(
+                        rune::rich(content, spans)
+                            .key(format!("{key}-th-{i}-{j}"))
+                            .grow(1.0)
+                            .min_h(0.0)
+                            .font(rune::tok::TextStyle::new(11.0, 400.0))
+                            .color(ink("#e4e4e7")),
+                    );
+                }
+                table = table.child(head);
+                for (r, row_cells) in rows.iter().enumerate() {
+                    let mut tr = row().key(format!("{key}-tr-{i}-{r}")).w_full().gap(8.0);
+                    for (j, cell) in row_cells.iter().enumerate() {
+                        let (content, spans) = runs(cell);
+                        tr = tr.child(
+                            rune::rich(content, spans)
+                                .key(format!("{key}-td-{i}-{r}-{j}"))
+                                .grow(1.0)
+                                .min_h(0.0)
+                                .font(body_style)
+                                .color(ink(body_ink)),
+                        );
+                    }
+                    table = table.child(tr);
+                }
+                stack = stack.child(table);
+            }
             Block::Code { lang, text: code } => {
                 let mut block = col()
                     .key(format!("{key}-code-{i}"))
@@ -303,12 +354,23 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
     s.edit.text.clear();
     s.edit.anchor = 0;
     s.edit.focus = 0;
+    // The abort path needs the same id the run started with: mint one per
+    // thread on first send (React reuses the persistent `chat.id`).
+    if s.chat_id.trim().is_empty() {
+        s.chat_id = format!(
+            "rune-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+    }
     let req = crate::stream::RunRequest {
         prompt,
         model: s.model.clone(),
         temperature: 0.7,
         workspace_path: String::new(),
-        chat_id: String::new(),
+        chat_id: s.chat_id.clone(),
         workspace_kind: "general".to_string(),
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -335,6 +397,30 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
                 data: serde_json::json!({"message": message}),
             });
         }
+    });
+}
+
+/// Shared stop path (composer Stop button): `POST /api/abort {chat_id}` on a
+/// worker thread — fire-and-forget like React's `abortRun` from Stop handlers
+/// (fetch-abort alone only detaches this client while the run keeps burning
+/// tokens) — then mark the run dead locally. The inbox stays open so the
+/// backend's `turn_aborted` / `done` frames still land instead of stranding
+/// the live row.
+pub fn stage_abort(s: &mut RuneTranscriptState) {
+    if !s.live {
+        return;
+    }
+    s.live = false;
+    let (host, port, chat_id) = (s.api_host.clone(), s.api_port, s.chat_id.clone());
+    // Browsers have no TCP sockets: abort over fetch, same as the run itself.
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = crate::transport::fetch_abort(&chat_id).await;
+        let _ = (host, port);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let _ = crate::transport::post_abort(&host, port, &chat_id);
     });
 }
 
@@ -386,6 +472,16 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             // read rows through the host, never by closing over `s`.
             move |s: &S, i| Cow::Borrowed(s.thread(which).rows[i].key.as_str()),
             move |s: &S, i| {
+                let t = s.thread(which);
+                // Live row: the streaming agent row (last, non-user, non-error)
+                // while a run is in flight. Mirrors
+                // `.canvas-bubble-row.is-live .canvas-bubble` (`#1b1b20`, .10
+                // hairline) plus the 3-dot `.canvas-bubble-typing` bounce
+                // (1.1s period, .14s stagger).
+                let live_row = t.live
+                    && i + 1 == t.rows.len()
+                    && t.rows[i].role != "user"
+                    && t.rows[i].role != "error";
                 let r = &s.thread(which).rows[i];
                 // Role palette from `canvas.css` `.canvas-bubble*`: per-role
                 // fills, hairlines (agent .05 / user .075 / live .10), and
@@ -413,7 +509,14 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                     ),
                 };
                 let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-                let hairline = if r.role == "error" {
+                let hairline = if live_row {
+                    rune::Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.10,
+                    }
+                } else if r.role == "error" {
                     rune::color::hex("#fb71853d").unwrap_or(rune::Color::BLACK)
                 } else {
                     rune::Color {
@@ -428,7 +531,7 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                 let bubble = col()
                     .key(format!("{}-bubble", r.key))
                     .radius(14.0)
-                    .fill(ink(fill))
+                    .fill(ink(if live_row { "#1b1b20" } else { fill }))
                     .border(1.0, hairline)
                     .px(13.0)
                     .py(10.0)
@@ -439,6 +542,27 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                             .color(ink("#f0f0f3")),
                     )
                     .child(render_body(&r.key, &r.body, body_ink));
+                // Typing bounce on the live row only (`.canvas-bubble-typing`).
+                let bubble = if live_row {
+                    let mut dots = row()
+                        .key(format!("{}-typing", r.key))
+                        .items_center()
+                        .gap(3.0)
+                        .pt(4.0);
+                    for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
+                        dots = dots.child(
+                            rune::el()
+                                .key(format!("{}-typing-{n}", r.key))
+                                .size(3.0, 3.0)
+                                .radius(1.5)
+                                .fill(ink("#9b9ba5"))
+                                .looping(rune::LoopSpec::opacity(1.1, delay, 0.35, 1.0)),
+                        );
+                    }
+                    bubble.child(dots)
+                } else {
+                    bubble
+                };
                 let bubble = if r.role == "user" {
                     // Content-sized (no `grow`) + `justify_end` row hugs right
                     // like `.canvas-bubble-row.is-user`. `max_w` bounds the
@@ -541,6 +665,7 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             let on = !s.thread_mut(which).voice.live;
             s.thread_mut(which).voice.set_live(on);
         },
+        (s.live, move |s: &mut S| stage_abort(s.thread_mut(which))),
         move |s: &mut S| stage_send(s.thread_mut(which)),
     );
     root = root.child(
@@ -636,6 +761,11 @@ fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: T
                 )
                 .child(setting_row("model", "Model", s.model.clone()))
                 .child(setting_row("theme", "Theme", "Dark".to_string()))
+                .child(setting_row(
+                    "version",
+                    "Version",
+                    format!("stark-rune {}", env!("CARGO_PKG_VERSION")),
+                ))
                 .child(setting_row(
                     "backend",
                     "Backend",
@@ -755,8 +885,22 @@ mod tests {
         }
         assert!(rt.find("composer-card").is_some());
         assert!(rt.find("composer-input").is_some());
-        assert!(rt.find("composer-send").is_some());
+        // The screenshot scene is mid-run (`live: true`), so the dock shows
+        // Stop, not Send (`.send-button.stop`).
+        assert!(rt.find("composer-stop").is_some());
+        assert!(rt.find("composer-send").is_none());
         assert!(rt.find("model-pill").is_some());
+    }
+
+    #[test]
+    fn dead_run_shows_send_again() {
+        let env = Env::new(true, 1.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 800.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("composer-send").is_some());
+        assert!(rt.find("composer-stop").is_none());
     }
 
     #[test]
@@ -858,12 +1002,11 @@ mod tests {
     fn settings_opens_closes_and_traps_background() {
         use rune::{Key, KeyEvent, Mods};
         let env = Env::new(true, 2.0);
-        let mut rt = Runtime::new(
-            RuneTranscriptState::screenshot(),
-            transcript_view,
-            (468.0, 720.0),
-            env,
-        );
+        // Dead run: the dock shows Send, so the backdrop-tap half of this
+        // test exercises the send path, not Stop.
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
         rt.frame(0.0);
         assert!(rt.find("settings-card").is_none());
         // Open from the title bar.

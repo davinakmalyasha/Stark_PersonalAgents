@@ -151,6 +151,44 @@ pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, 
     serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
 }
 
+/// Blocking `POST /api/abort {chat_id}` — mirrors `abortRun`
+/// (`stream.ts`): tells the backend to actually cancel the run (inbox abort +
+/// pydantic-ai token), not just detach this client. Fire-and-forget from Stop
+/// handlers; the response body is a bare `{ok}`. Empty `chat_id` is a no-op
+/// (`false`), like the React guard. Native only.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn post_abort(host: &str, port: u16, chat_id: &str) -> bool {
+    if chat_id.trim().is_empty() {
+        return false;
+    }
+    let body = serde_json::json!({"chat_id": chat_id}).to_string();
+    let head = format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\nAccept: application/json\r\n",
+        body.len()
+    );
+    let Ok((mut reader, chunked)) =
+        request(host, port, "POST", "/api/abort", &head, body.as_bytes())
+    else {
+        return false;
+    };
+    let mut raw = Vec::new();
+    for bytes in read_body(&mut reader, chunked).unwrap_or_default() {
+        raw.extend_from_slice(&bytes);
+    }
+    serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+        .unwrap_or(true)
+}
+
+/// `true` when a transport error means the server is locked and wants
+/// pairing, not a dead backend: HTTP 401 (see `PairingGate.tsx` — the
+/// phone-side gate over the same status). The native desktop is the pairing
+/// host, so callers show the "locked" notice instead of the gate itself.
+pub fn is_locked_error(message: &str) -> bool {
+    message.contains("401")
+}
+
 /// Web `fetch` GET returning JSON — the browser twin of [`get_json`].
 /// Same contract; the page talks to the LAN backend over plain HTTP
 /// (default `127.0.0.1:8124`, mirroring the desktop default). CORS is open
@@ -183,6 +221,50 @@ pub async fn fetch_json(path: &str) -> Result<serde_json::Value, String> {
         .as_string()
         .ok_or("non-string json")?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// Web `fetch` POST `/api/abort` — the browser twin of [`post_abort`].
+/// Same contract (`{chat_id}` → `{ok}`); empty id is a no-op.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_abort(chat_id: &str) -> bool {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    if chat_id.trim().is_empty() {
+        return false;
+    }
+    let url = "http://127.0.0.1:8124/api/abort".to_string();
+    let body = serde_json::json!({"chat_id": chat_id}).to_string();
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => return false,
+    };
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_body(&wasm_bindgen::JsValue::from_str(&body));
+    init.set_headers(&{
+        let h = match web_sys::Headers::new() {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        if h.set("Content-Type", "application/json").is_err() {
+            return false;
+        }
+        h.into()
+    });
+    let request = match web_sys::Request::new_with_str_and_init(&url, &init) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let resp_value = match JsFuture::from(window.fetch_with_request(&request)).await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let resp: web_sys::Response = match resp_value.dyn_into() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    resp.ok()
 }
 
 /// Web `POST /api/run` with ReadableStream SSE decode — the browser twin of

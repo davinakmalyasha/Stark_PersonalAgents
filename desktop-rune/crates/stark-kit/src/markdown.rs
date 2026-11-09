@@ -18,9 +18,21 @@ pub enum Inline {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Para(Vec<Inline>),
-    Heading { level: u8, text: Vec<Inline> },
+    Heading {
+        level: u8,
+        text: Vec<Inline>,
+    },
     List(Vec<Vec<Inline>>),
-    Code { lang: String, text: String },
+    Code {
+        lang: String,
+        text: String,
+    },
+    /// GFM table: header cells + body rows (cells already inline-parsed, so
+    /// `**bold**` and `` `code` `` work inside cells like `Markdown.tsx`).
+    Table {
+        headers: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
 }
 
 /// Split `text` into inline segments, tracking byte offsets.
@@ -73,6 +85,39 @@ fn parse_inlines(text: &str) -> Vec<Inline> {
     out
 }
 
+/// Split a `| a | b |` row into trimmed cells. Leading/trailing pipes are
+/// optional; a line without any pipe is not a row (`None`).
+fn split_row(line: &str) -> Option<Vec<String>> {
+    if !line.contains('|') {
+        return None;
+    }
+    let mut cells: Vec<String> = line.split('|').map(|c| c.trim().to_string()).collect();
+    // Drop the empties from outer pipes (`| a |` → ["", "a", ""]).
+    if cells.first().is_some_and(|c| c.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|c| c.is_empty()) {
+        cells.pop();
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    Some(cells)
+}
+
+/// A delimiter row: every cell is `:?-+:?` (`|---|---|`, `---|:---:`).
+fn is_delimiter(line: &str) -> bool {
+    let Some(cells) = split_row(line) else {
+        return false;
+    };
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let c = c.trim();
+            let c = c.strip_prefix(':').unwrap_or(c);
+            let c = c.strip_suffix(':').unwrap_or(c);
+            c.len() >= 3 && c.chars().all(|ch| ch == '-')
+        })
+}
 /// Parse message markdown into blocks.
 pub fn parse(text: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
@@ -98,7 +143,11 @@ pub fn parse(text: &str) -> Vec<Block> {
         }
     };
 
-    for line in text.split('\n') {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut li = 0;
+    while li < lines.len() {
+        let line = lines[li];
+        li += 1;
         if let Some((lang, buf)) = fence.as_mut() {
             if line.trim_start().starts_with("```") {
                 let text = buf.join("\n");
@@ -134,6 +183,24 @@ pub fn parse(text: &str) -> Vec<Block> {
         } else if line.trim().is_empty() {
             flush_para(&mut para, &mut blocks);
             flush_list(&mut list, &mut blocks);
+        } else if split_row(line).is_some() && lines.get(li).is_some_and(|next| is_delimiter(next))
+        {
+            // GFM table: header row + delimiter + body rows. Consumes the
+            // delimiter and every following pipe row; a non-row line ends it.
+            let headers = split_row(line)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| parse_inlines(&c))
+                .collect();
+            li += 1; // delimiter
+            let mut rows = Vec::new();
+            while let Some(cells) = lines.get(li).and_then(|l| split_row(l)) {
+                rows.push(cells.into_iter().map(|c| parse_inlines(&c)).collect());
+                li += 1;
+            }
+            flush_para(&mut para, &mut blocks);
+            flush_list(&mut list, &mut blocks);
+            blocks.push(Block::Table { headers, rows });
         } else {
             if !list.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
                 flush_list(&mut list, &mut blocks);
@@ -201,6 +268,28 @@ mod tests {
     fn unclosed_fence_keeps_content() {
         let blocks = parse("```py\nprint(1)");
         assert!(matches!(blocks[0], Block::Code { .. }));
+    }
+
+    #[test]
+    fn gfm_table_parses_header_and_rows() {
+        let blocks = parse("| a | b |\n|---|---|\n| 1 | **x** |\n| 2 | `y` |");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Table { headers, rows } => {
+                assert_eq!(headers.len(), 2);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][1], vec![Inline::Bold("x".to_string())]);
+                assert_eq!(rows[1][1], vec![Inline::Code("y".to_string())]);
+            }
+            b => panic!("expected table, got {b:?}"),
+        }
+    }
+
+    #[test]
+    fn pipes_without_delimiter_stay_para() {
+        let blocks = parse("a | b\nc | d");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], Block::Para(_)));
     }
 
     #[test]

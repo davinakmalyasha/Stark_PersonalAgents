@@ -134,6 +134,8 @@ impl Default for ShellState {
         personal.title = "Personal".to_string();
         personal.rows = vec![];
         personal.live = false;
+        // Distinct thread scope (notes + abort key off it, like `chat.id`).
+        personal.chat_id = crate::notes::mint_id("rune-personal");
         Self {
             route: Route::Home,
             transcript: RuneTranscriptState::screenshot(),
@@ -182,6 +184,12 @@ impl MemoryHost for ShellState {
 impl ProjectsHost for ShellState {
     fn projects_mut(&mut self) -> &mut crate::projects::ProjectsState {
         &mut self.canvas.projects
+    }
+}
+
+impl crate::agents::AgentsHost for ShellState {
+    fn agents_mut(&mut self) -> &mut crate::agents::AgentsState {
+        &mut self.canvas.agents
     }
 }
 
@@ -374,10 +382,13 @@ pub fn refresh_cloud(s: &mut ShellState) {
 pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = drain_run_inbox(&mut s.transcript, clock, tx);
     changed |= drain_run_inbox(&mut s.personal, clock, tx);
+    changed |= crate::notes::poll_notes_state(&mut s.transcript.notes);
+    changed |= crate::notes::poll_notes_state(&mut s.personal.notes);
     changed |= s.canvas.voice.drain(1.0 / 60.0);
     changed |= poll_house(s, clock);
     changed |= poll_memory(s, clock);
     changed |= poll_projects(s, clock);
+    changed |= crate::agents::poll_agents_state(&mut s.canvas.agents, clock);
     // Cloud inbox first (a refresh may have landed), then auto-refresh.
     let mut seen = false;
     while let Some(msg) = s.cloud.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {

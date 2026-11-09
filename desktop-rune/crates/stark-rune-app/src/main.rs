@@ -22,7 +22,11 @@ use stark_kit::{draft_id, Role};
 use stark_theme::{color, layout};
 
 #[cfg(feature = "rune-real")]
+mod agents;
+#[cfg(feature = "rune-real")]
 mod composer;
+#[cfg(feature = "rune-real")]
+mod notes;
 #[cfg(feature = "rune-real")]
 mod projects;
 #[cfg(feature = "rune-real")]

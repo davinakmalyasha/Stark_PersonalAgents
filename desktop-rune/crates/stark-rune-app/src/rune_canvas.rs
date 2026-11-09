@@ -123,6 +123,9 @@ pub struct CanvasState {
     /// Group projects scoped to the workspace (`useGroupProjects` twin);
     /// rendered as a rail section, never a route.
     pub projects: crate::projects::ProjectsState,
+    /// Agent delegations (`AgentTreePanel` twin); tree in the sidebar,
+    /// detail as a sheet.
+    pub agents: crate::agents::AgentsState,
     /// Mic capture bus (levels, notes, stop flag, inbox).
     pub voice: crate::voice::VoiceBus,
     /// Prompts staged from the map dock, awaiting run dispatch.
@@ -155,6 +158,7 @@ impl Clone for CanvasState {
             active_id: self.active_id.clone(),
             cam: self.cam,
             projects: self.projects.clone(),
+            agents: self.agents.clone(),
             voice: self.voice.clone(),
             outbox: self.outbox.clone(),
         }
@@ -224,6 +228,7 @@ impl CanvasState {
             active_id: "chat:ws-general:chat-1".to_string(),
             cam: Camera::default(),
             projects: crate::projects::ProjectsState::default(),
+            agents: crate::agents::AgentsState::default(),
             voice: crate::voice::VoiceBus::default(),
             outbox: Vec::new(),
         }
@@ -259,9 +264,9 @@ pub trait CanvasHost {
 
 /// Home hosting: the map canvas plus its projects rail. One bound covers
 /// both, so the sidebar can never disagree with the board state.
-pub trait HomeHost: CanvasHost + crate::projects::ProjectsHost {}
+pub trait HomeHost: CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost {}
 
-impl<T: CanvasHost + crate::projects::ProjectsHost> HomeHost for T {}
+impl<T: CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost> HomeHost for T {}
 
 impl CanvasHost for CanvasState {
     fn canvas_mut(&mut self) -> &mut CanvasState {
@@ -272,6 +277,12 @@ impl CanvasHost for CanvasState {
 impl crate::projects::ProjectsHost for CanvasState {
     fn projects_mut(&mut self) -> &mut crate::projects::ProjectsState {
         &mut self.projects
+    }
+}
+
+impl crate::agents::AgentsHost for CanvasState {
+    fn agents_mut(&mut self) -> &mut crate::agents::AgentsState {
+        &mut self.agents
     }
 }
 
@@ -719,8 +730,10 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
     // of Home — never a route. React mounts it beside the workspace; the map
     // sidebar is that place here.
     sidebar = sidebar.child(super::projects::projects_section::<S>(&s.projects));
+    // Agent delegations (`AgentTreePanel`): same rail, below projects.
+    sidebar = sidebar.child(super::agents::agents_section::<S>(&s.agents));
 
-    row()
+    let map = row()
         .key("stark-map")
         .w_full()
         // `grow`, not `h_full`: fills a standalone window and shares a shell
@@ -729,7 +742,18 @@ pub fn canvas_body<S: HomeHost + 'static>(s: &CanvasState) -> El {
         .min_h(0.0)
         .fill(ink("#0a0a0a"))
         .child(sidebar)
-        .child(canvas)
+        .child(canvas);
+    // Agent drawer mounts over the whole map (React's fixed overlay).
+    let mut root = col()
+        .key("map-root")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(map);
+    if s.agents.selected.is_some() {
+        root = root.child(super::agents::agent_sheet::<S>(&s.agents));
+    }
+    root
 }
 
 fn init_map() -> CanvasState {

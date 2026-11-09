@@ -151,6 +151,32 @@ pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, 
     serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
 }
 
+/// Blocking JSON write (`POST`/`PATCH`/`PUT`/`DELETE`) returning the parsed
+/// body. Native only. Powers the notes/agent panels, whose writes are all
+/// explicit button presses (user go-ahead at press time, like composer send).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn send_json(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let raw = body.to_string();
+    let head = format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\nAccept: application/json\r\n",
+        raw.len()
+    );
+    let (mut reader, chunked) = request(host, port, method, path, &head, raw.as_bytes())?;
+    let mut buf = Vec::new();
+    for bytes in read_body(&mut reader, chunked)? {
+        buf.extend_from_slice(&bytes);
+    }
+    if buf.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_slice(&buf).map_err(|e| format!("json: {e}"))
+}
 /// Blocking `POST /api/abort {chat_id}` — mirrors `abortRun`
 /// (`stream.ts`): tells the backend to actually cancel the run (inbox abort +
 /// pydantic-ai token), not just detach this client. Fire-and-forget from Stop
@@ -216,6 +242,57 @@ pub async fn fetch_json(path: &str) -> Result<serde_json::Value, String> {
     let json = JsFuture::from(resp.json().map_err(|e| format!("json: {e:?}"))?)
         .await
         .map_err(|e| format!("body: {e:?}"))?;
+    let text = js_sys::JSON::stringify(&json)
+        .map_err(|e| format!("stringify: {e:?}"))?
+        .as_string()
+        .ok_or("non-string json")?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// Web `fetch` JSON write — the browser twin of [`send_json`]. `body=None`
+/// sends a bodiless request (cancel/merge/discard style).
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_send(
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let url = format!("http://127.0.0.1:8124{path}");
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method(method);
+    init.set_mode(web_sys::RequestMode::Cors);
+    if let Some(b) = body {
+        init.set_body(&wasm_bindgen::JsValue::from_str(&b.to_string()));
+    }
+    init.set_headers(&{
+        let h = web_sys::Headers::new().map_err(|e| format!("headers: {e:?}"))?;
+        h.set("Content-Type", "application/json")
+            .map_err(|e| format!("headers: {e:?}"))?;
+        h.into()
+    });
+    let request = web_sys::Request::new_with_str_and_init(&url, &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch {path}: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let json = JsFuture::from(resp.json().map_err(|e| format!("json: {e:?}"))?)
+        .await
+        .map_err(|e| format!("body: {e:?}"))?;
+    if json.is_null() || json.is_undefined() {
+        return Ok(serde_json::Value::Null);
+    }
     let text = js_sys::JSON::stringify(&json)
         .map_err(|e| format!("stringify: {e:?}"))?
         .as_string()

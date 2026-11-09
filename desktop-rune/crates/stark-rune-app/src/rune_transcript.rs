@@ -40,6 +40,8 @@ pub struct RuneTranscriptState {
     /// mirrors the React `chat.id` both `streamPipeline` and `abortRun`
     /// carry. Empty until the first send stages one.
     pub chat_id: String,
+    /// Sticky notes for this thread (chat scope, like `ChatView.tsx`).
+    pub notes: crate::notes::NotesState,
     /// Settings sheet visibility.
     pub settings_open: bool,
     /// Mic capture bus (levels, notes, stop flag, inbox).
@@ -60,6 +62,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
             .field("chat_id", &self.chat_id)
+            .field("notes", &self.notes.notes.len())
             .field("settings_open", &self.settings_open)
             .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
@@ -78,6 +81,7 @@ impl Clone for RuneTranscriptState {
             api_host: self.api_host.clone(),
             api_port: self.api_port,
             chat_id: self.chat_id.clone(),
+            notes: self.notes.clone(),
             settings_open: self.settings_open,
             voice: self.voice.clone(),
             inbox: None,
@@ -110,7 +114,8 @@ impl RuneTranscriptState {
             live: true,
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
-            chat_id: String::new(),
+            chat_id: crate::notes::mint_id("rune"),
+            notes: crate::notes::NotesState::default(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -146,7 +151,8 @@ impl RuneTranscriptState {
             live: false,
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: DEFAULT_API_PORT,
-            chat_id: String::new(),
+            chat_id: crate::notes::mint_id("rune"),
+            notes: crate::notes::NotesState::default(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -357,13 +363,7 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
     // The abort path needs the same id the run started with: mint one per
     // thread on first send (React reuses the persistent `chat.id`).
     if s.chat_id.trim().is_empty() {
-        s.chat_id = format!(
-            "rune-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
+        s.chat_id = crate::notes::mint_id("rune");
     }
     let req = crate::stream::RunRequest {
         prompt,
@@ -622,6 +622,7 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                 .key("transcript-head")
                 .w_full()
                 .items_center()
+                .gap(8.0)
                 .px(16.0)
                 .pt(14.0)
                 .pb(10.0)
@@ -631,6 +632,12 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                         .grow(1.0)
                         .color(rune::color::hex("#f2f2f5").unwrap_or(rune::Color::BLACK)),
                 )
+                // Sticky notes (chat scope, like `ChatView.tsx`'s NotesButton).
+                .child(super::notes::notes_button::<S>(
+                    &s.notes,
+                    which,
+                    s.chat_id.clone(),
+                ))
                 .child(
                     text("Settings".to_string())
                         .key("settings-open")
@@ -679,6 +686,9 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
     );
     if s.settings_open {
         root = root.child(settings_sheet::<S>(s, which));
+    }
+    if s.notes.open {
+        root = root.child(super::notes::notes_sheet::<S>(&s.notes, which));
     }
     root
 }
@@ -901,6 +911,36 @@ mod tests {
         rt.frame(0.0);
         assert!(rt.find("composer-send").is_some());
         assert!(rt.find("composer-stop").is_none());
+    }
+
+    #[test]
+    fn notes_button_opens_sheet_and_add_form() {
+        let env = Env::new(true, 1.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 800.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("notes-open").is_some(), "notes button mounted");
+        assert!(rt.find("notes-overlay").is_none());
+        let (x, y) = rt.find("notes-open").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.thread(Thread::Main).notes.open, "sheet opens");
+        assert!(rt.find("notes-overlay").is_some(), "overlay mounts");
+        assert!(rt.find("notes-card").is_some());
+        // Add form toggles (worker fails with no server — form still mounts).
+        let (x, y) = rt.find("notes-add").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        for key in ["notes-form", "notes-title-input", "notes-save"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
     }
 
     #[test]

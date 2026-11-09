@@ -3,8 +3,14 @@
 //! native CLI; lib and bin compile the same modules below.
 
 #[cfg(feature = "rune-real")]
+#[path = "agents.rs"]
+pub mod agents;
+#[cfg(feature = "rune-real")]
 #[path = "composer.rs"]
 pub mod composer;
+#[cfg(feature = "rune-real")]
+#[path = "notes.rs"]
+pub mod notes;
 #[cfg(feature = "rune-real")]
 #[path = "projects.rs"]
 pub mod projects;

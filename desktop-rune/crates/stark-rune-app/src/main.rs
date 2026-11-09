@@ -24,6 +24,8 @@ use stark_theme::{color, layout};
 #[cfg(feature = "rune-real")]
 mod agents;
 #[cfg(feature = "rune-real")]
+mod cloud;
+#[cfg(feature = "rune-real")]
 mod composer;
 #[cfg(feature = "rune-real")]
 mod notes;

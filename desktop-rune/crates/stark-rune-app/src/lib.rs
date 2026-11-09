@@ -6,6 +6,9 @@
 #[path = "agents.rs"]
 pub mod agents;
 #[cfg(feature = "rune-real")]
+#[path = "cloud.rs"]
+pub mod cloud;
+#[cfg(feature = "rune-real")]
 #[path = "composer.rs"]
 pub mod composer;
 #[cfg(feature = "rune-real")]

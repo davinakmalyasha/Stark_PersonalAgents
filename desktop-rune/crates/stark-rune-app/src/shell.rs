@@ -7,6 +7,7 @@
 
 use rune::{col, row, text, AppSpec, Cx, El};
 
+use crate::cloud::{cloud_view, poll_cloud_state, CloudHost, CloudState};
 use crate::projects::{poll_projects_state, ProjectsHost};
 use crate::rooms::{
     drain_results, house_view, memory_view, poll_memory_detail, refresh_house, refresh_memory,
@@ -31,90 +32,6 @@ pub enum Route {
     Cloud,
     House,
     Memory,
-}
-
-/// One active run, mirroring `ActiveRun` (`GET /api/runs/active`).
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct CloudActive {
-    pub running: bool,
-    pub workspace_path: String,
-    pub chat_id: String,
-    pub started_at: String,
-}
-
-impl CloudActive {
-    pub fn from_json(v: &serde_json::Value) -> Self {
-        let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        Self {
-            running: v.get("running").and_then(|x| x.as_bool()).unwrap_or(false),
-            workspace_path: str_of("workspace_path"),
-            chat_id: str_of("chat_id"),
-            started_at: str_of("started_at"),
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn fetch(host: &str, port: u16) -> Result<Self, String> {
-        let v = crate::transport::get_json(host, port, "/api/runs/active")?;
-        Ok(Self::from_json(&v))
-    }
-}
-
-pub struct CloudState {
-    pub host: String,
-    pub port: u16,
-    pub active: Option<CloudActive>,
-    pub loading: bool,
-    pub error: Option<String>,
-    pub last_ok: f64,
-    pub auto: bool,
-    pub inbox: Option<std::sync::mpsc::Receiver<Result<CloudActive, String>>>,
-}
-
-impl std::fmt::Debug for CloudState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CloudState")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("active", &self.active)
-            .field("loading", &self.loading)
-            .field("error", &self.error)
-            .field("last_ok", &self.last_ok)
-            .field("auto", &self.auto)
-            .field("inbox", &self.inbox.is_some())
-            .finish()
-    }
-}
-
-impl Clone for CloudState {
-    fn clone(&self) -> Self {
-        Self {
-            host: self.host.clone(),
-            port: self.port,
-            active: self.active.clone(),
-            loading: self.loading,
-            error: self.error.clone(),
-            last_ok: self.last_ok,
-            auto: self.auto,
-            inbox: None,
-        }
-    }
-}
-
-impl Default for CloudState {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 8124,
-            active: None,
-            loading: false,
-            error: None,
-            last_ok: 0.0,
-            auto: true,
-            inbox: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +110,12 @@ impl crate::agents::AgentsHost for ShellState {
     }
 }
 
+impl CloudHost for ShellState {
+    fn cloud_mut(&mut self) -> &mut CloudState {
+        &mut self.cloud
+    }
+}
+
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
@@ -226,7 +149,7 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
         Route::Home => canvas_body::<ShellState>(&s.canvas),
         Route::Coding => transcript_body::<ShellState>(&s.transcript, Thread::Main),
         Route::Personal => transcript_body::<ShellState>(&s.personal, Thread::Personal),
-        Route::Cloud => cloud_view(&s.cloud),
+        Route::Cloud => cloud_view::<ShellState>(&s.cloud),
         Route::House => house_view::<ShellState>(&s.house),
         Route::Memory => memory_view::<ShellState>(&s.memory),
     };
@@ -254,128 +177,6 @@ pub fn shell_view(s: &ShellState, _: &mut Cx<ShellState>) -> El {
         .child(body)
 }
 
-/// Cloud runs board: the live `/api/runs/active` status plus a refresh that
-/// re-fetches on a worker thread. Mirrors `CloudRuns.tsx` refresh semantics
-/// (manual refresh + 10s auto poll, keep-last-on-failure).
-fn cloud_view(s: &CloudState) -> El {
-    let status = match &s.active {
-        Some(a) if a.running => "Running",
-        Some(_) => "Idle",
-        None => "Unknown",
-    };
-    let detail = match &s.active {
-        Some(a) if !a.workspace_path.is_empty() => a.workspace_path.clone(),
-        Some(a) if !a.chat_id.is_empty() => format!("chat {}", a.chat_id),
-        _ => "no run reported yet".to_string(),
-    };
-    let mut body = col()
-        .key("cloud-board")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .fill(ink("#0a0a0a"))
-        .px(24.0)
-        .pt(18.0)
-        .gap(10.0)
-        .child(
-            text("Cloud runs".to_string())
-                .key("cloud-title")
-                .font(rune::tok::TextStyle::new(15.0, 650.0))
-                .color(ink("#f2f2f5")),
-        )
-        .child(
-            row()
-                .key("cloud-status")
-                .w_full()
-                .items_center()
-                .gap(10.0)
-                .radius(12.0)
-                .fill(ink("#141417"))
-                .border(1.0, ink("#ffffff14"))
-                .px(14.0)
-                .py(12.0)
-                .child(
-                    rune::el()
-                        .key("cloud-dot")
-                        .size(8.0, 8.0)
-                        .radius(4.0)
-                        .fill(ink(if status == "Running" {
-                            "#7ee0a8"
-                        } else {
-                            "#52525b"
-                        })),
-                )
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_h(0.0)
-                        .child(
-                            text(status.to_string())
-                                .key("cloud-state")
-                                .font(rune::tok::TextStyle::new(13.0, 600.0))
-                                .color(ink("#e4e4e7")),
-                        )
-                        .child(
-                            text(detail)
-                                .key("cloud-detail")
-                                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                                .color(ink("#8a8a93")),
-                        ),
-                )
-                .child(
-                    text(if s.loading { "…" } else { "Refresh" }.to_string())
-                        .key("cloud-refresh")
-                        .role("button")
-                        .label("Refresh cloud status")
-                        .font(rune::tok::TextStyle::new(11.0, 600.0))
-                        .px(12.0)
-                        .py(8.0)
-                        .radius(8.0)
-                        .fill(ink("#ffffff0d"))
-                        .color(ink("#d4d4d8"))
-                        .on_press(|s: &mut ShellState| {
-                            refresh_cloud(s);
-                        }),
-                ),
-        );
-    if let Some(err) = &s.error {
-        body = body.child(
-            text(err.clone())
-                .key("cloud-error")
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#fda4af")),
-        );
-    }
-    body
-}
-
-/// Spawn a worker-thread refresh of `/api/runs/active`. No-op while one is in
-/// flight; failures surface as an error row, never a stuck spinner. On wasm
-/// (no sockets yet) the refresh records a pending note instead of hanging.
-pub fn refresh_cloud(s: &mut ShellState) {
-    if s.cloud.loading {
-        return;
-    }
-    s.cloud.loading = true;
-    s.cloud.error = None;
-    let (tx, rx) = std::sync::mpsc::channel();
-    s.cloud.inbox = Some(rx);
-    let (host, port) = (s.cloud.host.clone(), s.cloud.port);
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async move {
-        let result = match crate::transport::fetch_json("/api/runs/active").await {
-            Ok(v) => Ok(CloudActive::from_json(&v)),
-            Err(e) => Err(e),
-        };
-        let _ = tx.send(result);
-        let _ = (host, port);
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::spawn(move || {
-        let _ = tx.send(CloudActive::fetch(&host, port));
-    });
-}
-
 /// `poll` drains transcript inboxes whatever route is up and refreshes
 /// status rooms at most every 10–15s, so runs started in Chat keep streaming
 /// on the Map.
@@ -389,38 +190,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed |= poll_memory(s, clock);
     changed |= poll_projects(s, clock);
     changed |= crate::agents::poll_agents_state(&mut s.canvas.agents, clock);
-    // Cloud inbox first (a refresh may have landed), then auto-refresh.
-    let mut seen = false;
-    while let Some(msg) = s.cloud.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
-        match msg {
-            Ok(active) => {
-                s.cloud.active = Some(active);
-                s.cloud.error = None;
-                s.cloud.last_ok = clock;
-            }
-            Err(message) => {
-                s.cloud.error = Some(message);
-            }
-        }
-        s.cloud.loading = false;
-        seen = true;
-    }
-    if seen {
-        let dead = s.cloud.inbox.as_ref().is_some_and(|rx| {
-            matches!(
-                rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Disconnected)
-            )
-        });
-        if dead {
-            s.cloud.inbox = None;
-        }
-        changed = true;
-    }
-    if s.cloud.auto && !s.cloud.loading && clock - s.cloud.last_ok > 10.0 {
-        refresh_cloud(s);
-        changed = true;
-    }
+    changed |= poll_cloud_state(&mut s.cloud, clock);
     changed
 }
 
@@ -592,25 +362,44 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let mut raw = Vec::new();
-            loop {
-                let n = sock.read(&mut buf).unwrap();
-                raw.extend_from_slice(&buf[..n]);
-                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+            // Serve the active read and the board status read; anything else
+            // gets an empty handoffs-shaped 404 (best-effort pickers).
+            for _ in 0..4 {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 4096];
+                let mut raw = Vec::new();
+                while let Ok(n) = sock.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
+                let head = String::from_utf8_lossy(&raw);
+                let body = if head.contains("/api/runs/active") {
+                    r#"{"running":true,"workspace_path":"D:/proj","chat_id":"c9","started_at":"2026-11-09T00:00:00Z"}"#.to_string()
+                } else if head.contains("/api/cloud/status") {
+                    r#"{"origin":"desk","cap":4,"configured":false,"runs":[]}"#.to_string()
+                } else if head.contains("/api/cloud/handoffs") {
+                    r#"{"handoffs":[{"id":"h1","chat_id":"c9","workspace_id":"ws1","branch":"cloud/x","task":"fix","status":"staged","origin":"desk","package":"p.zip","updated_at":"2026-11-09T14:30:00Z"}]}"#.to_string()
+                } else if head.contains("/api/workspaces") {
+                    r#"{"workspaces":[]}"#.to_string()
+                } else {
+                    r#"{}"#.to_string()
+                };
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
             }
-            let body = r#"{"running":true,"workspace_path":"D:/proj","chat_id":"c9","started_at":"2026-11-09T00:00:00Z"}"#;
-            sock.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .unwrap();
         });
         let env = Env::new(true, 1.0);
         let mut state = ShellState::default();
@@ -627,11 +416,14 @@ mod tests {
         rt.frame(0.0);
         assert!(rt.state.cloud.loading);
         // Poll until the worker thread's message lands (local mock: ms).
-        let mut run_tx = rune::Tx::default();
+        // `rt.update` (not direct `rt.state` mutation) commits the tree —
+        // direct mutation leaves a stale commit behind.
         let mut waited = 0;
-        while rt.state.cloud.active.is_none() && waited < 500 {
-            shell_poll(&mut rt.state, 0.0, &mut run_tx);
-            if rt.state.cloud.active.is_none() {
+        while (rt.state.cloud.active.is_none() || rt.state.cloud.status.is_none()) && waited < 500 {
+            rt.update(|s, tx| {
+                shell_poll(s, 0.0, tx);
+            });
+            if rt.state.cloud.active.is_none() || rt.state.cloud.status.is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 waited += 1;
             }
@@ -640,6 +432,20 @@ mod tests {
         assert!(active.running);
         assert_eq!(active.workspace_path, "D:/proj");
         assert!(!rt.state.cloud.loading);
+        // Board: status grid, staged handoff chip, unconfigured hint.
+        // Settle frames: the handoff subtree commits a frame behind the
+        // section shell (headless hit-testing lags one commit).
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        for key in [
+            "cloud-grid",
+            "cloud-handoffs",
+            "cloud-handoff-h1-status",
+            "cloud-unconfigured",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
     }
 
     #[test]

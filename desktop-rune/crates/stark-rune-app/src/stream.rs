@@ -97,6 +97,28 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                     state.live = true;
                     "streaming"
                 }
+                // Token usage (`TokenUsageRecord` → `delta kind:"usage"`):
+                // totals feed the dock orb + popover (`combinedTokenUsage`).
+                "usage" => {
+                    let u64_of = |k: &str| frame.data.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                    let input = u64_of("input");
+                    let u = &mut state.usage;
+                    u.input += input;
+                    u.output += u64_of("output");
+                    u.cache_hit += frame
+                        .data
+                        .get("cached_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    u.cost += frame
+                        .data
+                        .get("cost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    u.active = input;
+                    state.live = true;
+                    "metered"
+                }
                 "tool_started" => {
                     let tool = frame
                         .data
@@ -274,6 +296,23 @@ mod tests {
         assert!(!s.live);
         assert_eq!(s.rows.last().unwrap().role, "error");
         assert_eq!(s.rows.last().unwrap().body, "pipeline blew up");
+    }
+
+    #[test]
+    fn usage_frames_meter_the_orb() {
+        let mut s = state();
+        let statuses = replay(
+            &mut s,
+            "event: delta\ndata: {\"kind\":\"usage\",\"input\":200000,\"output\":50,\"cached_tokens\":1000,\"cost\":0.002}\n\n",
+        );
+        assert_eq!(statuses, vec!["metered"]);
+        assert_eq!(s.usage.input, 200000);
+        assert_eq!(s.usage.output, 50);
+        assert_eq!(s.usage.cache_hit, 1000);
+        assert!((s.usage.cost - 0.002).abs() < 1e-9);
+        assert_eq!(s.usage.active, 200000);
+        // 200k/1M = 20%.
+        assert!((s.usage.context_percent() - 20.0).abs() < 1e-6);
     }
 
     #[test]

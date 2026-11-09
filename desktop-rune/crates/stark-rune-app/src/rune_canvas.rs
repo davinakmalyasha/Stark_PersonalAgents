@@ -1212,38 +1212,76 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         .child(world);
     // Floating composer, centred over the canvas like `HouseChat`'s dock:
     // 640pt wide, bottom-anchored. Same card as the transcript dock.
+    // Toolbar chrome follows the ACTIVE thread; unwritten threads read the
+    // defaults, like a fresh chat.
+    let fallback_usage = crate::rune_transcript::UsageTotals::default();
+    let active_thread = s.sessions.threads.get(&s.active_id);
+    let dock_meta = super::composer::ComposerMeta {
+        target: active_thread
+            .map(|t| t.run_target.as_str())
+            .unwrap_or("local"),
+        usage: active_thread.map(|t| &t.usage).unwrap_or(&fallback_usage),
+        usage_open: active_thread.map(|t| t.usage_open).unwrap_or(false),
+        provider_label: active_thread
+            .map(|t| t.provider.label.as_str())
+            .unwrap_or(""),
+        provider_warn: active_thread.map(|t| t.provider.warn).unwrap_or(false),
+    };
     canvas = canvas.child(
         rune::el()
             .key("map-composer-float")
             .absolute((MAP_W - MAP_SIDEBAR_W - 640.0) / 2.0, MAP_H - 128.0)
             .w(640.0)
             .child(super::composer::composer_card(
-                &s.model,
                 &s.edit,
                 move |s: &mut S| &mut s.canvas_mut().edit,
                 s.voice.meter(),
-                move |s: &mut S| {
-                    let c = s.canvas_mut();
-                    c.voice.set_live(!c.voice.live);
-                },
-                // The map dock sends into the ACTIVE session's thread and opens
-                // its sheet — chats are the only type, so every prompt lands
-                // in a chat thread (no dead-letter outbox). It never shows
-                // Stop; cancellation lives on the sheet that owns the run.
-                (false, move |_s: &mut S| {}),
-                move |s: &mut S| {
-                    let c = s.canvas_mut();
-                    let prompt = c.edit.text.trim().to_string();
-                    if prompt.is_empty() || c.active_id.is_empty() {
-                        return;
-                    }
-                    c.edit.text.clear();
-                    c.edit.anchor = 0;
-                    c.edit.focus = 0;
-                    let id = c.active_id.clone();
-                    let thread = c.thread_mut(&id);
-                    crate::rune_transcript::stage_send_prompt(thread, prompt);
-                    c.sessions.sheet = Some(id);
+                false,
+                dock_meta,
+                super::composer::ComposerButtons {
+                    voice: std::rc::Rc::new(move |s: &mut S| {
+                        let c = s.canvas_mut();
+                        c.voice.set_live(!c.voice.live);
+                    }),
+                    cancel: std::rc::Rc::new(move |_s: &mut S| {}),
+                    local: std::rc::Rc::new(move |s: &mut S| {
+                        let id = s.canvas_mut().active_id.clone();
+                        if !id.is_empty() {
+                            s.canvas_mut().thread_mut(&id).run_target = "local".to_string();
+                        }
+                    }),
+                    cloud: std::rc::Rc::new(move |s: &mut S| {
+                        let id = s.canvas_mut().active_id.clone();
+                        if !id.is_empty() {
+                            s.canvas_mut().thread_mut(&id).run_target = "cloud".to_string();
+                        }
+                    }),
+                    usage: std::rc::Rc::new(move |s: &mut S| {
+                        let id = s.canvas_mut().active_id.clone();
+                        if !id.is_empty() {
+                            let open = s.canvas_mut().thread_mut(&id).usage_open;
+                            s.canvas_mut().thread_mut(&id).usage_open = !open;
+                        }
+                    }),
+                    send: std::rc::Rc::new(move |s: &mut S| {
+                        // The map dock sends into the ACTIVE session's thread
+                        // and opens its sheet — chats are the only type, so
+                        // every prompt lands in a chat thread. It never shows
+                        // Stop; cancellation lives on the sheet that owns the
+                        // run.
+                        let c = s.canvas_mut();
+                        let prompt = c.edit.text.trim().to_string();
+                        if prompt.is_empty() || c.active_id.is_empty() {
+                            return;
+                        }
+                        c.edit.text.clear();
+                        c.edit.anchor = 0;
+                        c.edit.focus = 0;
+                        let id = c.active_id.clone();
+                        let thread = c.thread_mut(&id);
+                        crate::rune_transcript::stage_send_prompt(thread, prompt);
+                        c.sessions.sheet = Some(id);
+                    }),
                 },
             )),
     );

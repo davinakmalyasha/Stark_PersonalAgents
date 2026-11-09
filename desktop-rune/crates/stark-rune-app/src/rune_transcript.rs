@@ -31,6 +31,136 @@ pub struct RowData {
     pub at: String,
 }
 
+/// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
+/// totals grow from `delta kind:"usage"` frames (`input/output`,
+/// `cached_tokens?`, `cost?`); `active` is the last call's input and drives
+/// the context orb (`activeContextTokens = lastCall?.input || 0`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UsageTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_hit: u64,
+    pub cost: f64,
+    pub active: u64,
+}
+
+impl UsageTotals {
+    /// Context percent of 1M (`contextPercent`).
+    pub fn context_percent(&self) -> f64 {
+        ((self.active as f64 / 1_000_000.0) * 100.0).min(100.0)
+    }
+}
+
+/// Live provider label (`fetchProvider` → `ProviderInfo`): `OpenCode Go`
+/// when the gateway is opencode, else `provider_label || provider`. `warn`
+/// mirrors the trigger's `is-warning` (no key or a provider health error).
+/// The agent-config modal it opens is unported, so the pill is a display.
+#[derive(Debug)]
+pub struct ProviderState {
+    pub label: String,
+    pub warn: bool,
+    pub loading: bool,
+    pub last_ok: f64,
+    pub inbox: Option<std::sync::mpsc::Receiver<Result<ProviderState, String>>>,
+}
+
+impl Clone for ProviderState {
+    fn clone(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            warn: self.warn,
+            loading: self.loading,
+            last_ok: self.last_ok,
+            inbox: None,
+        }
+    }
+}
+
+impl Default for ProviderState {
+    fn default() -> Self {
+        Self {
+            label: "Provider".to_string(),
+            warn: false,
+            loading: false,
+            last_ok: 0.0,
+            inbox: None,
+        }
+    }
+}
+
+impl ProviderState {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let provider = str_of("provider");
+        let label = if provider == "opencode" {
+            "OpenCode Go".to_string()
+        } else {
+            let named = str_of("provider_label");
+            if named.is_empty() {
+                if provider.is_empty() {
+                    "Provider".to_string()
+                } else {
+                    provider.clone()
+                }
+            } else {
+                named
+            }
+        };
+        let health = v
+            .get("health")
+            .and_then(|x| x.as_object())
+            .and_then(|o| o.get(&provider))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        Self {
+            label,
+            warn: !v.get("has_key").and_then(|x| x.as_bool()).unwrap_or(false)
+                || !health.is_empty(),
+            loading: false,
+            last_ok: 0.0,
+            inbox: None,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn fetch(host: &str, port: u16) -> Result<Self, String> {
+        let v = crate::transport::get_json(host, port, "/api/provider")?;
+        Ok(Self::from_json(&v))
+    }
+}
+
+/// Refresh the provider label at most every 30s (`PromptDock` interval).
+/// Failures keep the last label (the effect swallows errors).
+pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) {
+    let (msgs, _) = crate::rooms::drain_results(&mut s.provider.inbox);
+    for msg in msgs {
+        if let Ok(next) = msg {
+            s.provider.label = next.label;
+            s.provider.warn = next.warn;
+            s.provider.last_ok = clock;
+        }
+        s.provider.loading = false;
+    }
+    if !s.provider.loading && clock - s.provider.last_ok > 30.0 {
+        s.provider.loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.provider.inbox = Some(rx);
+        let (host, port) = (s.api_host.clone(), s.api_port);
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match crate::transport::fetch_json("/api/provider").await {
+                Ok(v) => Ok(ProviderState::from_json(&v)),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(result);
+            let _ = (host, port);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let _ = tx.send(ProviderState::fetch(&host, port));
+        });
+    }
+}
 /// Now as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), matching the server wire
 /// shape the other time helpers parse.
 pub fn now_iso() -> String {
@@ -96,6 +226,18 @@ pub struct RuneTranscriptState {
     pub chat_id: String,
     /// Sticky notes for this thread (chat scope, like `ChatView.tsx`).
     pub notes: crate::notes::NotesState,
+    /// Run target (`PromptDock runTarget`, persisted per chat — here per
+    /// thread, the session's lifetime). `"local"` default; `"cloud"` only
+    /// changes where the NEXT prompt is marked to go — the transfer itself
+    /// lands next, same as React, so sends behave identically either way.
+    pub run_target: String,
+    /// Usage totals for the orb + popover (`combinedTokenUsage`).
+    pub usage: UsageTotals,
+    /// Usage popover open (tap the orb; React hovers — tap is the honest
+    /// native equivalent, no hover targeting headlessly).
+    pub usage_open: bool,
+    /// Live provider pill (`fetchProvider`, 30s refresh).
+    pub provider: ProviderState,
     /// Settings sheet visibility.
     pub settings_open: bool,
     /// Mic capture bus (levels, notes, stop flag, inbox).
@@ -117,6 +259,8 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("api_port", &self.api_port)
             .field("chat_id", &self.chat_id)
             .field("notes", &self.notes.notes.len())
+            .field("run_target", &self.run_target)
+            .field("usage", &self.usage)
             .field("settings_open", &self.settings_open)
             .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
@@ -136,6 +280,16 @@ impl Clone for RuneTranscriptState {
             api_port: self.api_port,
             chat_id: self.chat_id.clone(),
             notes: self.notes.clone(),
+            run_target: self.run_target.clone(),
+            usage: self.usage.clone(),
+            usage_open: self.usage_open,
+            provider: ProviderState {
+                label: self.provider.label.clone(),
+                warn: self.provider.warn,
+                loading: self.provider.loading,
+                last_ok: self.provider.last_ok,
+                inbox: None,
+            },
             settings_open: self.settings_open,
             voice: self.voice.clone(),
             inbox: None,
@@ -172,6 +326,10 @@ impl RuneTranscriptState {
             api_port: DEFAULT_API_PORT,
             chat_id: crate::notes::mint_id("rune"),
             notes: crate::notes::NotesState::default(),
+            run_target: "local".to_string(),
+            usage: UsageTotals::default(),
+            usage_open: false,
+            provider: ProviderState::default(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -210,6 +368,10 @@ impl RuneTranscriptState {
             api_port: DEFAULT_API_PORT,
             chat_id: crate::notes::mint_id("rune"),
             notes: crate::notes::NotesState::default(),
+            run_target: "local".to_string(),
+            usage: UsageTotals::default(),
+            usage_open: false,
+            provider: ProviderState::default(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -744,16 +906,35 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
     // live, and spawns the blocking `POST /api/run` thread; frames land in
     // `inbox`, drained by the `poll` hook before every frame.
     let composer_card = super::composer::composer_card(
-        &s.model,
         &s.edit,
         move |s: &mut S| &mut s.thread_mut(which).edit,
         s.voice.meter(),
-        move |s: &mut S| {
-            let on = !s.thread_mut(which).voice.live;
-            s.thread_mut(which).voice.set_live(on);
+        s.live,
+        super::composer::ComposerMeta {
+            target: &s.run_target,
+            usage: &s.usage,
+            usage_open: s.usage_open,
+            provider_label: &s.provider.label,
+            provider_warn: s.provider.warn,
         },
-        (s.live, move |s: &mut S| stage_abort(s.thread_mut(which))),
-        move |s: &mut S| stage_send(s.thread_mut(which)),
+        super::composer::ComposerButtons {
+            voice: std::rc::Rc::new(move |s: &mut S| {
+                let on = !s.thread_mut(which).voice.live;
+                s.thread_mut(which).voice.set_live(on);
+            }),
+            cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
+            local: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).run_target = "local".to_string();
+            }),
+            cloud: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).run_target = "cloud".to_string();
+            }),
+            usage: std::rc::Rc::new(move |s: &mut S| {
+                let open = s.thread_mut(which).usage_open;
+                s.thread_mut(which).usage_open = !open;
+            }),
+            send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
+        },
     );
     root = root.child(
         rune::el()
@@ -1001,7 +1182,76 @@ mod tests {
         // Stop, not Send (`.send-button.stop`).
         assert!(rt.find("composer-stop").is_some());
         assert!(rt.find("composer-send").is_none());
-        assert!(rt.find("model-pill").is_some());
+        // PromptDock toolbar: run target, usage orb, provider pill.
+        for key in [
+            "composer-target",
+            "composer-target-local",
+            "composer-target-cloud",
+            "composer-usage",
+            "composer-provider",
+            "composer-div",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+    }
+
+    #[test]
+    fn provider_parses_opencode_label_and_warns_without_key() {
+        let v = serde_json::json!({
+            "provider": "opencode", "provider_label": "x",
+            "base_url": "http://x", "model_flash": "m",
+            "has_key": false, "health": {},
+        });
+        let p = ProviderState::from_json(&v);
+        // Gateway id wins over the label; missing key warns.
+        assert_eq!(p.label, "OpenCode Go");
+        assert!(p.warn);
+        let ok = ProviderState::from_json(&serde_json::json!({
+            "provider": "deepseek", "provider_label": "DeepSeek",
+            "has_key": true, "health": {},
+        }));
+        assert_eq!(ok.label, "DeepSeek");
+        assert!(!ok.warn);
+        let sick = ProviderState::from_json(&serde_json::json!({
+            "provider": "deepseek", "has_key": true,
+            "health": {"deepseek": "boom"},
+        }));
+        assert!(sick.warn);
+    }
+
+    #[test]
+    fn dock_target_flips_and_usage_opens() {
+        let env = Env::new(true, 1.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 800.0), env);
+        rt.frame(0.0);
+        assert_eq!(rt.state.run_target, "local");
+        let (x, y) = rt.find("composer-target-cloud").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.run_target, "cloud", "toggle flips target");
+        // Usage popover opens on orb tap with zeroed rows.
+        assert!(rt.find("composer-usage-popover").is_none());
+        let (x, y) = rt.find("composer-usage").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.usage_open, "orb toggles popover");
+        for key in [
+            "composer-usage-popover",
+            "composer-usage-cost",
+            "composer-usage-tokens",
+            "composer-usage-context",
+            "composer-usage-cache",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
     }
 
     #[test]

@@ -87,31 +87,256 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
     button
 }
 
-/// Premium-surface composer: gradient card, live 15px input, toolbar with
-/// model pill, spacer, voice toggle + meter, and white send circle. `w_full`
-/// — callers set the width. `on_send` runs on send-button press and field
-/// submit; `on_voice` toggles capture; each view wires its own state type
-/// through `edit_of`. While `running` the send circle becomes the Stop square
+/// Plain data for the toolbar (borrowed per frame; no handlers).
+pub struct ComposerMeta<'a> {
+    /// `"local"` | `"cloud"` (`runTarget`).
+    pub target: &'a str,
+    /// Usage totals for the orb + popover.
+    pub usage: &'a super::rune_transcript::UsageTotals,
+    /// Usage popover open.
+    pub usage_open: bool,
+    /// Live provider label (`OpenCode Go`, …).
+    pub provider_label: &'a str,
+    /// Amber pill (no key or provider error).
+    pub provider_warn: bool,
+}
+
+/// Run-target toggle (`radiogroup`): Local active is zinc-on-zinc-800,
+/// Cloud active is sky with a pulsing cloud; inactive sides are dim zinc.
+/// Flipping only re-marks the next prompt (the transfer lands next — sends
+/// behave identically either way, same as React).
+fn target_toggle<S: 'static>(
+    target: &str,
+    on_local: impl Fn(&mut S) + 'static,
+    on_cloud: impl Fn(&mut S) + 'static,
+) -> El {
+    let cloud_active = target == "cloud";
+    let mut cloud_icon = text("☁".to_string())
+        .key("composer-target-cloud-icon")
+        .font(rune::tok::TextStyle::new(11.0, 400.0))
+        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" }));
+    if cloud_active {
+        // React pulses the cloud icon (`animate-pulse`); same rhythm here.
+        cloud_icon = cloud_icon.looping(rune::LoopSpec::opacity(1.4, 0.0, 0.4, 1.0));
+    }
+    row()
+        .key("composer-target")
+        .items_center()
+        .radius(8.0)
+        .fill(ink("#00000000"))
+        .border(1.0, ink("#27272a"))
+        .child(
+            text("Local".to_string())
+                .key("composer-target-local")
+                .role("button")
+                .label("Run on Local — click to target Cloud (VPS)")
+                .font(rune::tok::TextStyle::new(11.0, 500.0))
+                .px(8.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(ink(if cloud_active { "#00000000" } else { "#27272a" }))
+                .color(ink(if cloud_active { "#71717a" } else { "#f4f4f5" }))
+                .on_press(on_local),
+        )
+        .child(
+            row()
+                .key("composer-target-cloud")
+                .items_center()
+                .gap(4.0)
+                .role("button")
+                .label("Run on Cloud (VPS) — preference saved per chat")
+                .px(8.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(ink(if cloud_active {
+                    "#0c4a6e66"
+                } else {
+                    "#00000000"
+                }))
+                .on_press(on_cloud)
+                .child(cloud_icon)
+                .child(
+                    text("Cloud".to_string())
+                        .font(rune::tok::TextStyle::new(11.0, 500.0))
+                        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" })),
+                ),
+        )
+}
+
+/// While `running` the send circle becomes the Stop square
 /// (`index.css .send-button.stop`: white circle, dark square, "Stop
 /// execution") and presses `on_cancel` — React's `isRunning && empty → Stop`
 /// simplified: a live run always stops first, a second prompt waits its turn.
+/// Usage orb (`usage-orb`): 31px circle, tabular number = context percent,
+/// ring track underneath. The progress arc is tessellated segments stroked
+/// round-capped (Rune has no arc primitive) — same 3px width, same color
+/// steps (95+ red, 85+ amber, else light).
+fn usage_orb<S: 'static>(
+    usage: &super::rune_transcript::UsageTotals,
+    on_usage: impl Fn(&mut S) + 'static,
+) -> El {
+    let pct = usage.context_percent();
+    let ring_ink = if pct >= 95.0 {
+        "#f87171"
+    } else if pct >= 85.0 {
+        "#fbbf24"
+    } else {
+        "#e5e5e8"
+    };
+    let number_ink = if pct >= 95.0 {
+        "#f87171"
+    } else if pct >= 85.0 {
+        "#fbbf24"
+    } else {
+        "#dadade"
+    };
+    // Tessellated arc from -90°, clockwise, over `pct` of the circle.
+    let mut pts = Vec::new();
+    let steps = 28usize;
+    let frac = (pct / 100.0).clamp(0.0, 1.0);
+    let n = (frac * steps as f64).round() as usize;
+    for i in 0..=n.max(1).min(steps) {
+        let a =
+            -std::f32::consts::FRAC_PI_2 + (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
+        pts.push([15.5 + 13.0 * a.cos(), 15.5 + 13.0 * a.sin()]);
+    }
+    let mut orb = rune::el()
+        .key("composer-usage")
+        .role("button")
+        .label(format!("Context {:.0}% of 1M", pct))
+        .size(31.0, 31.0)
+        .radius(15.5)
+        .center()
+        .on_press(on_usage)
+        .child(
+            text(format!("{:.0}", pct))
+                .font(rune::tok::TextStyle::new(9.0, 400.0))
+                .color(ink(number_ink)),
+        );
+    if n > 0 {
+        orb = orb.child(
+            rune::el()
+                .key("composer-usage-ring")
+                .absolute(0.0, 0.0)
+                .size(31.0, 31.0)
+                .inert()
+                .shape(rune::Shape::new().stroke_with(
+                    pts,
+                    false,
+                    3.0,
+                    rune::LineCap::Round,
+                    ink(ring_ink),
+                )),
+        );
+    }
+    orb
+}
+
+/// Usage popover: Cost / Tokens / Context / Cache rows. React hovers (portal
+/// above the orb); Rune taps the orb and the panel expands under the toolbar
+/// (no portal/hover targeting headlessly — position differs, content identical).
+/// No "View details" row: the stats surface is unported.
+fn usage_popover(usage: &super::rune_transcript::UsageTotals) -> El {
+    let line = |key: &str, label: &str, value: String| {
+        row()
+            .key(format!("composer-usage-{key}"))
+            .w_full()
+            .items_center()
+            .child(
+                text(label.to_string())
+                    .grow(1.0)
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(ink("#a2a2aa")),
+            )
+            .child(
+                text(value)
+                    .font(rune::tok::TextStyle::new(11.0, 500.0))
+                    .color(ink("#e8e8eb")),
+            )
+    };
+    let cache_rate = if usage.input > 0 {
+        (usage.cache_hit as f64 / usage.input as f64) * 100.0
+    } else {
+        0.0
+    };
+    col()
+        .key("composer-usage-popover")
+        .w_full()
+        .gap(3.0)
+        .radius(12.0)
+        .fill(ink("#252529"))
+        .border(1.0, ink("#ffffff1f"))
+        .px(10.0)
+        .py(8.0)
+        .child(
+            text("Usage".to_string())
+                .font(rune::tok::TextStyle::new(12.0, 600.0))
+                .color(ink("#f0f0f2")),
+        )
+        .child(line("cost", "Cost", format!("${:.5}", usage.cost)))
+        .child(line(
+            "tokens",
+            "Tokens",
+            (usage.input + usage.output).to_string(),
+        ))
+        .child(line("context", "Context", usage.active.to_string()))
+        .child(line("cache", "Cache", format!("{cache_rate:.1}%")))
+}
+
+/// Provider pill (`provider-trigger`): live gateway label, amber when the
+/// key is missing or the provider reports an error. Display only — the agent
+/// config modal it opens is unported.
+fn provider_pill(label: &str, warn: bool) -> El {
+    text(if label.is_empty() {
+        "Provider".to_string()
+    } else {
+        label.to_string()
+    })
+    .key("composer-provider")
+    .font(rune::tok::TextStyle::new(11.0, 400.0))
+    .px(8.0)
+    .py(7.0)
+    .radius(9.0)
+    .fill(rune::Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 0.04,
+    })
+    .border(1.0, ink("#ffffff12"))
+    .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
+}
+
+/// Premium-surface composer (`PromptDock`): 15px input, then the toolbar —
+/// run-target toggle, spacer, usage orb (+popover), provider pill, voice
+/// toggle + meter, send/stop. `w_full` — callers set the width. `on_send`
+/// runs on send-button press and field submit; each view wires its own state
+/// type through `edit_of`. No attach button / drop overlay: file pickers and
+/// drag-drop have no Rune target (documented, not faked).
+/// Toolbar handlers, boxed so the card takes six params, not ten.
+pub struct ComposerButtons<S: 'static> {
+    pub voice: std::rc::Rc<dyn Fn(&mut S)>,
+    pub cancel: std::rc::Rc<dyn Fn(&mut S)>,
+    pub local: std::rc::Rc<dyn Fn(&mut S)>,
+    pub cloud: std::rc::Rc<dyn Fn(&mut S)>,
+    pub usage: std::rc::Rc<dyn Fn(&mut S)>,
+    pub send: std::rc::Rc<dyn Fn(&mut S)>,
+}
+
 pub fn composer_card<S: 'static>(
-    model: &str,
     edit: &TextEdit,
     edit_of: impl for<'a> Fn(&'a mut S) -> &'a mut TextEdit + 'static,
     voice: (bool, f32, Option<&str>),
-    on_voice: impl Fn(&mut S) + 'static,
-    stop: (bool, impl Fn(&mut S) + 'static),
-    on_send: impl Fn(&mut S) + 'static,
+    running: bool,
+    meta: ComposerMeta<'_>,
+    buttons: ComposerButtons<S>,
 ) -> El {
     let (voice_live, voice_level, voice_note) = voice;
-    let (running, on_cancel) = stop;
-    let on_send = std::rc::Rc::new(on_send);
     let submit = {
-        let on_send = on_send.clone();
+        let on_send = buttons.send.clone();
         move |s: &mut S, _tx: &mut Tx| on_send(s)
     };
-    col()
+    let card = col()
         .key("composer-card")
         .w_full()
         .radius(18.0)
@@ -159,48 +384,53 @@ pub fn composer_card<S: 'static>(
                 .on_edit(edit_of)
                 .on_submit(submit),
         )
+        // Toolbar top hairline (`.prompt-toolbar border-top` — Rune draws
+        // all-side borders only, so a 1pt rule stands in).
+        .child(
+            rune::el()
+                .key("composer-div")
+                .w_full()
+                .h(1.0)
+                .fill(rune::Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.07,
+                }),
+        )
         .child(
             row()
                 .key("composer-toolbar")
                 .w_full()
                 .items_center()
                 .gap(8.0)
-                .child(
-                    row()
-                        .key("model-pill")
-                        .items_center()
-                        .gap(6.0)
-                        .radius(9.0)
-                        .fill(rune::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.04,
-                        })
-                        .px(8.0)
-                        .py(6.0)
-                        .child(
-                            rune::el()
-                                .key("model-dot")
-                                .size(6.0, 6.0)
-                                .radius(3.0)
-                                .fill(ink("#aa8dff")),
-                        )
-                        .child(
-                            text(model.to_string())
-                                .key("model-name")
-                                .font(rune::tok::TextStyle::new(11.0, 500.0))
-                                .color(ink("#c9c9d1")),
-                        ),
-                )
+                .child(target_toggle::<S>(
+                    meta.target,
+                    {
+                        let local = buttons.local.clone();
+                        move |s: &mut S| local(s)
+                    },
+                    {
+                        let cloud = buttons.cloud.clone();
+                        move |s: &mut S| cloud(s)
+                    },
+                ))
                 .child(spacer())
+                .child(usage_orb::<S>(meta.usage, {
+                    let usage = buttons.usage.clone();
+                    move |s: &mut S| usage(s)
+                }))
+                .child(provider_pill(meta.provider_label, meta.provider_warn))
                 .child(
                     // Voice toggle (`.prompt-voice-button`) with a 5-bar level
                     // meter beside it while live. Levels come from the capture
                     // thread via the voice bus; without a mic the note says so.
                     voice_meter(voice_live, voice_level, voice_note),
                 )
-                .child(voice_button(voice_live, on_voice))
+                .child(voice_button(voice_live, {
+                    let voice = buttons.voice.clone();
+                    move |s: &mut S| voice(s)
+                }))
                 .child(if running {
                     rune::el()
                         .key("composer-stop")
@@ -210,7 +440,10 @@ pub fn composer_card<S: 'static>(
                         .radius(17.0)
                         .fill(ink("#ffffff"))
                         .center()
-                        .on_press(on_cancel)
+                        .on_press({
+                            let cancel = buttons.cancel.clone();
+                            move |s: &mut S| cancel(s)
+                        })
                         .child(
                             text("■".to_string())
                                 .font(rune::tok::TextStyle::new(12.0, 650.0))
@@ -226,7 +459,7 @@ pub fn composer_card<S: 'static>(
                         .fill(ink("#ffffff"))
                         .center()
                         .on_press({
-                            let on_send = on_send.clone();
+                            let on_send = buttons.send.clone();
                             move |s: &mut S| on_send(s)
                         })
                         .child(
@@ -235,5 +468,10 @@ pub fn composer_card<S: 'static>(
                                 .color(ink("#111113")),
                         )
                 }),
-        )
+        );
+    let mut card = card;
+    if meta.usage_open {
+        card = card.child(usage_popover(meta.usage));
+    }
+    card
 }

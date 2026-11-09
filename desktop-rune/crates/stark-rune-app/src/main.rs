@@ -22,6 +22,8 @@ use stark_kit::{draft_id, Role};
 use stark_theme::{color, layout};
 
 #[cfg(feature = "rune-real")]
+mod agent_config;
+#[cfg(feature = "rune-real")]
 mod agents;
 #[cfg(feature = "rune-real")]
 mod cloud;
@@ -41,6 +43,8 @@ mod rune_transcript;
 mod shell;
 #[cfg(feature = "rune-real")]
 mod stream;
+#[cfg(feature = "rune-real")]
+mod token_stats;
 #[cfg(feature = "rune-real")]
 mod transport;
 #[cfg(feature = "rune-real")]

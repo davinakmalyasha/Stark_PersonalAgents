@@ -102,20 +102,33 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                 "usage" => {
                     let u64_of = |k: &str| frame.data.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                     let input = u64_of("input");
-                    let u = &mut state.usage;
-                    u.input += input;
-                    u.output += u64_of("output");
-                    u.cache_hit += frame
+                    let output = u64_of("output");
+                    let hits = frame
                         .data
                         .get("cached_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    u.cost += frame
+                    let cost = frame
                         .data
                         .get("cost")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
+                    let u = &mut state.usage;
+                    u.input += input;
+                    u.output += output;
+                    u.cache_hit += hits;
+                    u.cost += cost;
                     u.active = input;
+                    u.calls.push(crate::rune_transcript::UsageCall {
+                        agent: "chat".to_string(),
+                        model: state.model.clone(),
+                        input,
+                        output,
+                        hits,
+                        misses: input.saturating_sub(hits),
+                        cost,
+                        at: crate::rune_transcript::now_iso(),
+                    });
                     state.live = true;
                     "metered"
                 }

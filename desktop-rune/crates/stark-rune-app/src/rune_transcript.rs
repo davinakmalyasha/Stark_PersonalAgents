@@ -42,6 +42,23 @@ pub struct UsageTotals {
     pub cache_hit: u64,
     pub cost: f64,
     pub active: u64,
+    /// Per-call rows (`TokenCall`) for the stats modal. `agent` is always
+    /// `"chat"` — usage deltas carry no agent name (React merges server-side
+    /// rows that do); model/timestamp stamp at record time.
+    pub calls: Vec<UsageCall>,
+}
+
+/// One request row (`TokenCall`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UsageCall {
+    pub agent: String,
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub cost: f64,
+    pub at: String,
 }
 
 impl UsageTotals {
@@ -304,6 +321,11 @@ pub struct RuneTranscriptState {
     /// Usage popover open (tap the orb; React hovers — tap is the honest
     /// native equivalent, no hover targeting headlessly).
     pub usage_open: bool,
+    /// Usage stats modal open (`TokenStatsModal`, per thread).
+    pub stats_open: bool,
+    /// Agents & providers modal state (per thread — the pill lives in every
+    /// dock, so every thread owns its modal).
+    pub agent_config: crate::agent_config::AgentConfigState,
     /// Model options (`GET /api/models` → `{models:[{id,name}]}`), fetched
     /// once per thread lifetime (React fetches on mount; 60s retry keeps a
     /// cold start honest).
@@ -362,6 +384,8 @@ impl Clone for RuneTranscriptState {
             run_target: self.run_target.clone(),
             usage: self.usage.clone(),
             usage_open: self.usage_open,
+            stats_open: self.stats_open,
+            agent_config: self.agent_config.clone(),
             models: self.models.clone(),
             models_loading: self.models_loading,
             models_ok: self.models_ok,
@@ -414,6 +438,8 @@ impl RuneTranscriptState {
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
             usage_open: false,
+            stats_open: false,
+            agent_config: crate::agent_config::AgentConfigState::default(),
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
@@ -462,6 +488,8 @@ impl RuneTranscriptState {
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
             usage_open: false,
+            stats_open: false,
+            agent_config: crate::agent_config::AgentConfigState::default(),
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
@@ -1042,6 +1070,13 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                 s.thread_mut(which).model = id;
                 s.thread_mut(which).model_open = false;
             }),
+            stats: std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).stats_open = true;
+                s.thread_mut(which).usage_open = false;
+            }),
+            config: std::rc::Rc::new(move |s: &mut S| {
+                crate::agent_config::open_agent_config(&mut s.thread_mut(which).agent_config);
+            }),
         },
     );
     root = root.child(
@@ -1058,6 +1093,21 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
     }
     if s.notes.open {
         root = root.child(super::notes::notes_sheet::<S>(&s.notes, which));
+    }
+    if s.stats_open {
+        root = root.child(super::token_stats::stats_sheet::<S>(
+            &s.usage,
+            &s.model,
+            std::rc::Rc::new(move |s: &mut S| {
+                s.thread_mut(which).stats_open = false;
+            }),
+        ));
+    }
+    if s.agent_config.open {
+        root = root.child(super::agent_config::agent_config_sheet::<S>(
+            &s.agent_config,
+            which,
+        ));
     }
     root
 }

@@ -1895,6 +1895,22 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     // Map dock: no model list, so these never fire.
                     model_menu: std::rc::Rc::new(move |_s: &mut S| {}),
                     model_pick: std::rc::Rc::new(move |_s: &mut S, _id: String| {}),
+                    stats: std::rc::Rc::new(move |s: &mut S| {
+                        let id = s.canvas_mut().active_id.clone();
+                        if !id.is_empty() {
+                            let thread = s.canvas_mut().thread_mut(&id);
+                            thread.stats_open = true;
+                            thread.usage_open = false;
+                        }
+                    }),
+                    config: std::rc::Rc::new(move |s: &mut S| {
+                        let id = s.canvas_mut().active_id.clone();
+                        if !id.is_empty() {
+                            crate::agent_config::open_agent_config(
+                                &mut s.canvas_mut().thread_mut(&id).agent_config,
+                            );
+                        }
+                    }),
                 },
             )),
     );

@@ -3,6 +3,9 @@
 //! native CLI; lib and bin compile the same modules below.
 
 #[cfg(feature = "rune-real")]
+#[path = "agent_config.rs"]
+pub mod agent_config;
+#[cfg(feature = "rune-real")]
 #[path = "agents.rs"]
 pub mod agents;
 #[cfg(feature = "rune-real")]
@@ -32,6 +35,9 @@ pub mod shell;
 #[cfg(feature = "rune-real")]
 #[path = "stream.rs"]
 pub mod stream;
+#[cfg(feature = "rune-real")]
+#[path = "token_stats.rs"]
+pub mod token_stats;
 #[cfg(feature = "rune-real")]
 #[path = "transport.rs"]
 pub mod transport;

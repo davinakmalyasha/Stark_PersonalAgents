@@ -219,7 +219,7 @@ fn usage_orb<S: 'static>(
         .size(31.0, 31.0)
         .radius(15.5)
         .center()
-        .on_press(on_usage)
+        .on_press(move |s: &mut S| on_usage(s))
         .child(
             text(format!("{:.0}", pct))
                 .font(rune::tok::TextStyle::new(9.0, 400.0))
@@ -244,11 +244,14 @@ fn usage_orb<S: 'static>(
     orb
 }
 
-/// Usage popover: Cost / Tokens / Context / Cache rows. React hovers (portal
-/// above the orb); Rune taps the orb and the panel expands under the toolbar
-/// (no portal/hover targeting headlessly — position differs, content identical).
-/// No "View details" row: the stats surface is unported.
-fn usage_popover(usage: &super::rune_transcript::UsageTotals) -> El {
+/// Usage popover: Cost / Tokens / Context / Cache rows + View details.
+/// React hovers (portal above the orb); Rune taps the orb and the panel
+/// expands under the toolbar (no portal/hover targeting headlessly —
+/// position differs, content identical).
+fn usage_popover<S: 'static>(
+    usage: &super::rune_transcript::UsageTotals,
+    on_stats: Press<S>,
+) -> El {
     let line = |key: &str, label: &str, value: String| {
         row()
             .key(format!("composer-usage-{key}"))
@@ -293,18 +296,31 @@ fn usage_popover(usage: &super::rune_transcript::UsageTotals) -> El {
         ))
         .child(line("context", "Context", usage.active.to_string()))
         .child(line("cache", "Cache", format!("{cache_rate:.1}%")))
+        .child(
+            text("View details".to_string())
+                .key("composer-usage-details")
+                .role("button")
+                .label("Open usage details")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .w_full()
+                .py(8.0)
+                .color(ink("#e8e8eb"))
+                .on_press(move |s: &mut S| on_stats(s)),
+        )
 }
 
 /// Provider pill (`provider-trigger`): live gateway label, amber when the
-/// key is missing or the provider reports an error. Display only — the agent
-/// config modal it opens is unported.
-fn provider_pill(label: &str, warn: bool) -> El {
+/// key is missing or the provider reports an error. Opens the agents &
+/// providers modal, like React.
+fn provider_pill<S: 'static>(label: &str, warn: bool, on_config: Press<S>) -> El {
     text(if label.is_empty() {
         "Provider".to_string()
     } else {
         label.to_string()
     })
     .key("composer-provider")
+    .role("button")
+    .label("Configure agents and providers")
     .font(rune::tok::TextStyle::new(11.0, 400.0))
     .px(8.0)
     .py(7.0)
@@ -317,6 +333,7 @@ fn provider_pill(label: &str, warn: bool) -> El {
     })
     .border(1.0, ink("#ffffff12"))
     .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
+    .on_press(move |s: &mut S| on_config(s))
 }
 
 /// Model dropup (`provider-dropup`): trigger with the current model +
@@ -437,6 +454,10 @@ pub struct ComposerButtons<S: 'static> {
     pub send: Press<S>,
     pub model_menu: Press<S>,
     pub model_pick: Pick<S>,
+    /// Usage popover "View details" → stats modal.
+    pub stats: Press<S>,
+    /// Provider pill → agents & providers modal.
+    pub config: Press<S>,
 }
 
 pub fn composer_card<S: 'static>(
@@ -536,7 +557,11 @@ pub fn composer_card<S: 'static>(
                     let usage = buttons.usage.clone();
                     move |s: &mut S| usage(s)
                 }))
-                .child(provider_pill(meta.provider_label, meta.provider_warn))
+                .child(provider_pill(
+                    meta.provider_label,
+                    meta.provider_warn,
+                    buttons.config.clone(),
+                ))
                 .child(if meta.models.is_empty() {
                     // Map dock: no model list (like `HouseChat`) — the
                     // provider pill above is the only pill, per screenshot.
@@ -603,7 +628,7 @@ pub fn composer_card<S: 'static>(
         );
     let mut card = card;
     if meta.usage_open {
-        card = card.child(usage_popover(meta.usage));
+        card = card.child(usage_popover::<S>(meta.usage, buttons.stats.clone()));
     }
     card
 }

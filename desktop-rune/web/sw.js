@@ -2,7 +2,11 @@
 // shell available. Mirrors frontend/public/sw.js policy: API responses are
 // never cached (chats must be live; the API is cross-origin anyway, so the
 // worker never even sees those requests).
-const CACHE = 'stark-rune-v1';
+//
+// `/pkg/` (the wasm bundle) is network-first: a cache-first wasm once served
+// a stale CRASHING build indefinitely (CACHE never bumped). App shell art
+// stays cache-first for instant offline opens.
+const CACHE = 'stark-rune-v2';
 const SHELL = [
   './',
   './index.html',
@@ -48,6 +52,23 @@ self.addEventListener('fetch', (event) => {
           return response;
         })
         .catch(() => caches.match('./index.html')),
+    );
+    return;
+  }
+
+  // Wasm bundle: network-first with cache fallback (fresh code wins,
+  // offline still opens).
+  if (url.pathname.startsWith('/pkg/')) {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          if (response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE).then((cache) => cache.put(request, copy)).catch(() => {});
+          }
+          return response;
+        })
+        .catch(() => caches.match(request)),
     );
     return;
   }

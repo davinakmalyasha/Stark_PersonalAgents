@@ -10,7 +10,7 @@
  *                   (workspace_kind="design"). It opens inside the coding
  *                   workspace, not as a separate workspace route.
  */
-export type ModuleId = 'ide' | 'open-design';
+export type ModuleId = 'open-design';
 
 export interface ModuleDef {
   id: ModuleId;
@@ -26,19 +26,12 @@ export interface ModuleDef {
 
 export const MODULES: ModuleDef[] = [
   {
-    id: 'ide',
-    label: 'IDE',
-    detail: 'IDE — coding surface for this workspace (Dev agent context)',
-    icon: 'code',
-    route: '#/coding',
-  },
-  {
     id: 'open-design',
     label: 'OpenDesign',
     detail:
       'OpenDesign — agent-led UI design iteration for this workspace (straight to the UI subagent loop)',
     icon: 'palette',
-    route: '#/coding?addon=design',
+    route: '#/design',
   },
 ];
 

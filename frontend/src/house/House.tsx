@@ -1,5 +1,4 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Code2 } from 'lucide-react';
 import iconUrl from '../assets/stark-icon.png';
 import HouseHeader from './HouseHeader';
 import HouseRail, { type SideView } from './HouseRail';
@@ -7,7 +6,6 @@ import HouseMobileNav from './HouseMobileNav';
 import HouseProjectsPanel from './HouseProjectsPanel';
 import HouseChat from './HouseChat';
 import HouseSidebar from './HouseSidebar';
-import HousePortal from './HousePortal';
 import CodingIDE from './CodingIDE';
 import NewProjectDialog from './NewProjectDialog';
 import SubagentTabsPane from './SubagentTabsPane';
@@ -29,9 +27,9 @@ import { setBusy } from '../utils/runtimeBusy';
 import '../house/house.css';
 
 const CanvasStage = lazy(() => import('../canvas/CanvasStage'));
+const DesignWorkspace = lazy(() => import('../modules/design-workspace/DesignWorkspace'));
 
 export default function House() {
-  const [transitioning, setTransitioning] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() =>
     typeof window === 'undefined' ? true : window.matchMedia('(min-width: 768px)').matches,
   );
@@ -69,6 +67,9 @@ export default function House() {
   // projects started from its own folder, while General sees them all. The
   // rule itself lives on the server — this only carries the id.
   const [openProjectId, setOpenProjectId] = useState<string | null>(null);
+  // OpenDesign overlay (single-page shell: the addon opens here, embedded,
+  // instead of the removed coding workspace).
+  const [designOpen, setDesignOpen] = useState<{ wsId: string; chatId: string } | null>(null);
   const groupScopeId = activeTab?.workspaceId || home.workspaceId || '';
   const { projects, scoped: projectsScoped, refresh: refreshProjects } = useGroupProjects(groupScopeId);
 
@@ -169,6 +170,20 @@ export default function House() {
       window.history.replaceState(null, '', '#/');
     }
   }, [sessions.booted, openChat]);
+
+  // `#/design?ws=&chat=` deep link opens the OpenDesign overlay inline.
+  useEffect(() => {
+    if (!sessions.booted) return;
+    const h = window.location.hash;
+    if (!h.startsWith('#/design')) return;
+    const qi = h.indexOf('?');
+    const params = new URLSearchParams(qi >= 0 ? h.slice(qi + 1) : '');
+    setDesignOpen({
+      wsId: params.get('ws') || '',
+      chatId: params.get('chat') || '',
+    });
+    window.history.replaceState(null, '', '#/');
+  }, [sessions.booted]);
 
   // Rail/nav view click: always open (or switch) the panel. Collapsing is the
   // backdrop on mobile and the rail staying open on desktop — no tiny close
@@ -288,15 +303,6 @@ export default function House() {
     });
   }, [closeTab, sessions]);
 
-  const handleLaunchRoom = useCallback((room: 'personal' | 'house') => {
-    if (transitioning) return;
-    setSidebarOpen(false);
-    setTransitioning(true);
-    setTimeout(() => {
-      window.location.hash = room === 'personal' ? '#/personal' : '#/house';
-    }, 320);
-  }, [transitioning]);
-
   // ── Send gating: one pipeline at a time, globally ──
   const foreignRunActive = sessions.isGlobalRunning
     && (!!sessions.runningTabId && sessions.runningTabId !== activeTabId);
@@ -314,33 +320,6 @@ export default function House() {
     }
     home.handleSend(prompt, files);
   }, [home, runner.isRunning, foreignRunActive, notifyBlocked]);
-
-  const launchCoding = useCallback(() => {
-    if (transitioning) return;
-    setSidebarOpen(false);
-    setTransitioning(true);
-    setTimeout(() => {
-      window.location.hash = '#/coding';
-    }, 320);
-  }, [transitioning]);
-
-  const launchPersonal = useCallback(() => {
-    if (transitioning) return;
-    setSidebarOpen(false);
-    setTransitioning(true);
-    setTimeout(() => {
-      window.location.hash = '#/personal';
-    }, 320);
-  }, [transitioning]);
-
-  const launchHouse = useCallback(() => {
-    if (transitioning) return;
-    setSidebarOpen(false);
-    setTransitioning(true);
-    setTimeout(() => {
-      window.location.hash = '#/house';
-    }, 320);
-  }, [transitioning]);
 
   const activeGeneralTitle = useMemo(
     () => home.chats.find((c) => c.id === home.activeChatId)?.title ?? 'New conversation',
@@ -371,18 +350,16 @@ export default function House() {
             errors={activeErrors}
             liveMessages={liveMessagesByChat}
             onCloseTab={sessions.closeTab}
+            // Single-page shell: every chat opens inline in a tab/sheet.
+            // The standalone coding workspace was removed — no `#/coding`.
             onOpenChat={(wsId, chatId) => {
-              const ws = sessions.workspaces.find((w) => w.id === wsId);
-              if (ws && !ws.isGeneral && !ws.isHouse && !ws.isPersonal && !(ws as { isDfd?: boolean }).isDfd) {
-                window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(chatId)}`;
-              } else {
-                sessions.openChat(wsId, chatId);
-              }
+              sessions.openChat(wsId, chatId);
             }}
             onOpenGroup={(projectId) => { setOpenProjectId(projectId); }}
             onOpenAddon={(wsId, addonId, chatId) => {
+              if (addonId !== 'design') return;
               const cid = chatId || sessions.chatsByWs[wsId]?.[0]?.id || '';
-              window.location.hash = `#/coding?ws=${encodeURIComponent(wsId)}&chat=${encodeURIComponent(cid)}&addon=${addonId}`;
+              setDesignOpen({ wsId, chatId: cid });
             }}
             onSendToChat={async (wsId, chatId, text, files = []) => {
               const ws = sessions.workspaces.find((w) => w.id === wsId);
@@ -533,12 +510,8 @@ export default function House() {
           onNewChat={handleNewSession}
           onNewProject={openNewWorkspace}
           onNewChatInProject={handleNewChatIn}
-          onOpenRoom={handleLaunchRoom}
           onRenameChat={handleRenameChat}
           onDeleteChat={handleDeleteChat}
-          onLaunchPersonal={launchPersonal}
-          onLaunchCoding={launchCoding}
-          onLaunchHouse={launchHouse}
         />
       ) : sideView === 'cloud' ? (
         <div className="w-[248px] max-md:w-full shrink-0 bg-[#0f0f0f] border-r house-hairline min-h-0">
@@ -637,9 +610,17 @@ export default function House() {
         />
       )}
 
-      {transitioning && (
-        <HousePortal label="Entering Coding Workspace" icon={<Code2 size={22} />} />
+      {designOpen && (
+        <Suspense fallback={null}>
+          <DesignWorkspace
+            embedded
+            initialWorkspaceId={designOpen.wsId || undefined}
+            initialChatId={designOpen.chatId || undefined}
+            onClose={() => setDesignOpen(null)}
+          />
+        </Suspense>
       )}
+
     </div>
   );
 }

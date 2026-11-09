@@ -1,159 +1,30 @@
-import { useEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
-import { Brain, Cloud as CloudIcon, Code2, House as HouseIcon, User } from 'lucide-react';
-import App from './App';
-import CloudRuns from './cloud/CloudRuns';
+import { useEffect, useState } from 'react';
 import House from './house/House';
-import HomeOrb from './house/HomeOrb';
-import HousePortal from './house/HousePortal';
-import HouseWorkspace from './house-workspace/HouseWorkspace';
-import PersonalWorkspace from './personal-workspace/PersonalWorkspace';
-import MemoryWorkspace from './memory/MemoryWorkspace';
 import PairingGate from './components/Layout/PairingGate';
 import UpdateToast from './components/Layout/UpdateToast';
 import { onAuthRejected } from './services/remoteAuth';
 import { startAutoUpdate } from './utils/appUpdate';
 
-type Route = 'home' | 'coding' | 'house' | 'personal' | 'memory' | 'cloud'
-
-function getRoute(): Route {
-  const hash = window.location.hash
-  if (hash.startsWith('#/coding')) return 'coding'
-  if (hash.startsWith('#/house')) return 'house'
-  if (hash.startsWith('#/personal')) return 'personal'
-  if (hash.startsWith('#/cloud')) return 'cloud'
-  // Legacy #/admin links redirect home; the admin surface was removed.
-  if (hash.startsWith('#/admin')) return 'home'
-  if (hash.startsWith('#/memory')) return 'memory'
-  // OpenDesign is a workspace addon now; #/design is a compatibility alias.
-  if (hash.startsWith('#/design')) return 'coding'
-  return 'home'
-}
-
 /**
- * Top-level shell: the House (global assistant home) is the root.
- * The Coding Workspace (the existing app, untouched) is a room
- * entered via `#/coding`. The House Workspace (smart home control)
- * is a room entered via `#/house`. The Personal Workspace is a room
- * entered via `#/personal` (reserved shell). The Design module
- * OpenDesign is an addon inside the coding workspace, not a room.
- * Entering shows the white portal ring transition while the workspace boots.
+ * Top-level shell: one page. The House (global assistant home) is the app —
+ * every chat, panel and overlay lives here. Legacy room links (`#/coding`,
+ * `#/house`, `#/personal`, `#/memory`, `#/cloud`, `#/admin`) all land home;
+ * `#/design` opens the OpenDesign overlay on home.
  *
- * Desktop auto-update lives here (not in the coding App) so every route
- * checks on launch and shows the same status toast.
+ * Desktop auto-update checks on launch and shows the same status toast.
  */
 export default function AppShell() {
-  const [route, setRoute] = useState<Route>(getRoute)
-  const [portalVisible, setPortalVisible] = useState(false)
-  const [portalLeaving, setPortalLeaving] = useState(false)
   const [needsPairing, setNeedsPairing] = useState(false)
-  const prevRoute = useRef<Route>(getRoute())
 
   // Remote access: when the server rejects us (401) show the pairing gate.
   useEffect(() => onAuthRejected(() => setNeedsPairing(true)), [])
 
-  // Signed desktop auto-update: applies on every route, restarts when idle.
+  // Signed desktop auto-update: applies on launch, restarts when idle.
   useEffect(() => startAutoUpdate(), [])
-
-  useEffect(() => {
-    const onHash = () => setRoute(getRoute())
-    window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
-  }, [])
-
-  // Show the white circular portal while a workspace mounts
-  useEffect(() => {
-    const prev = prevRoute.current
-    prevRoute.current = route
-    if (route !== 'home' && prev !== route) {
-      setPortalVisible(true)
-      setPortalLeaving(false)
-      const t1 = window.setTimeout(() => setPortalLeaving(true), 1400)
-      const t2 = window.setTimeout(() => setPortalVisible(false), 1750)
-      return () => {
-        window.clearTimeout(t1)
-        window.clearTimeout(t2)
-      }
-    }
-    return undefined
-  }, [route])
-
-  let content: ReactNode
-  if (needsPairing) {
-    content = <PairingGate />
-  } else if (route === 'coding') {
-    content = (
-      <>
-        <App />
-        <HomeOrb />
-        {portalVisible && (
-          <HousePortal
-            label="Entering Coding Workspace"
-            icon={<Code2 size={22} />}
-            leaving={portalLeaving}
-          />
-        )}
-      </>
-    )
-  } else if (route === 'house') {
-    content = (
-      <>
-        <HouseWorkspace />
-        {portalVisible && (
-          <HousePortal
-            label="Entering House Workspace"
-            icon={<HouseIcon size={22} />}
-            leaving={portalLeaving}
-          />
-        )}
-      </>
-    )
-  } else if (route === 'personal') {
-    content = (
-      <>
-        <PersonalWorkspace />
-        {portalVisible && (
-          <HousePortal
-            label="Entering Personal Workspace"
-            icon={<User size={22} />}
-            leaving={portalLeaving}
-          />
-        )}
-      </>
-    )
-  } else if (route === 'memory') {
-    content = (
-      <>
-        <MemoryWorkspace />
-        {portalVisible && (
-          <HousePortal
-            label="Entering Workspace Memory"
-            icon={<Brain size={22} />}
-            leaving={portalLeaving}
-          />
-        )}
-      </>
-    )
-  } else if (route === 'cloud') {
-    content = (
-      <>
-        <CloudRuns />
-        {portalVisible && (
-          <HousePortal
-            label="Entering Cloud Runs"
-            icon={<CloudIcon size={22} />}
-            leaving={portalLeaving}
-          />
-        )}
-      </>
-    )
-  } else {
-    content = <House />
-  }
 
   return (
     <>
-      {content}
+      {needsPairing ? <PairingGate /> : <House />}
       <UpdateToast />
     </>
   )

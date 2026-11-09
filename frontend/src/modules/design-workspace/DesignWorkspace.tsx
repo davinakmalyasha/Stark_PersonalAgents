@@ -122,10 +122,6 @@ export default function DesignWorkspace({ embedded = false, initialWorkspaceId, 
     }
     window.location.hash = '#/';
   };
-  const openInCoding = () => {
-    if (!workspace) return;
-    window.location.hash = `#/coding?ws=${encodeURIComponent(workspace.id)}&chat=${encodeURIComponent(chatId || '')}`;
-  };
 
   const startBox = (e: React.PointerEvent) => {
     if (!annotate || e.button !== 0) return;
@@ -348,8 +344,8 @@ export default function DesignWorkspace({ embedded = false, initialWorkspaceId, 
           </button>
           <button
             type="button"
-            onClick={openInCoding}
-            title="Open this chat in the full Coding Workspace"
+            onClick={goHome}
+            title="Back to home"
             className="grid place-items-center w-7 h-7 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.07] cursor-pointer"
           >
             <ExternalLink size={13} />
@@ -478,7 +474,6 @@ export default function DesignWorkspace({ embedded = false, initialWorkspaceId, 
           onCancel={cancel}
           onToggleVoice={() => {}}
           onOpenStats={() => {}}
-          onOpenInWorkspace={openInCoding}
           onCloseIde={goHome}
           onOpenSubagent={(childId, label, childWorkspace) => setSubagentView({ childId, label, workspaceId: childWorkspace })}
           workspaceId={workspace.id}

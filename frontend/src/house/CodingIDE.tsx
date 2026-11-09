@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ChevronDown, ChevronRight, Code2, ExternalLink, FileText, Folder, FolderOpen,
+  ChevronDown, ChevronRight, Code2, FileText, Folder, FolderOpen,
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search,
   TerminalSquare, Wrench, Lightbulb, Info, GitCompare, Plus,
 } from 'lucide-react';
@@ -144,13 +144,6 @@ function FileRail({ session, files, loading, activeFile, onOpenFile, onRefresh, 
         </span>
         <button onClick={onRefresh} title="Refresh files" className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-white hover:bg-white/[0.07] cursor-pointer">
           <RefreshCw size={12} />
-        </button>
-        <button
-          onClick={() => { window.location.hash = `#/coding?ws=${encodeURIComponent(session.workspaceId)}&chat=${encodeURIComponent(session.chatId)}`; }}
-          title="Open this chat in the full Coding Workspace"
-          className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-white hover:bg-white/[0.07] cursor-pointer"
-        >
-          <ExternalLink size={12} />
         </button>
         <button onClick={onToggleCollapsed} title="Hide explorer" className="grid place-items-center w-6 h-6 rounded-md text-zinc-600 hover:text-white hover:bg-white/[0.07] cursor-pointer">
           <PanelLeftClose size={13} />
@@ -564,7 +557,6 @@ export default function CodingIDE({ session, runner, isGlobalRunning, onCloseIde
           onCancel={runner.cancel}
           onToggleVoice={() => {}}
           onOpenStats={() => {}}
-          onOpenInWorkspace={() => { window.location.hash = `#/coding?ws=${encodeURIComponent(session.workspaceId)}&chat=${encodeURIComponent(session.chatId)}`; }}
           onCloseIde={onCloseIde}
           onOpenSubagent={subagents.open}
           workspaceId={session.workspaceId}

@@ -36,12 +36,8 @@ interface Props {
   onNewChat?: () => void;
   onNewProject?: () => void;
   onNewChatInProject?: (workspaceId: string) => void;
-  onOpenRoom?: (room: 'house' | 'personal') => void;
   onRenameChat: (workspaceId: string, chatId: string, title: string) => void;
   onDeleteChat: (workspaceId: string, chatId: string) => void;
-  onLaunchPersonal: () => void;
-  onLaunchCoding: () => void;
-  onLaunchHouse: () => void;
 }
 
 interface RowChat extends ChatSummary {
@@ -112,7 +108,7 @@ export default function HouseSidebar({
   open, onClose, workspaces, chatsByWs,
   persistent = false,
   activeTabId, runningTabId, pinnedChats, chatsFilter = 'general', onFilterChange, onTogglePin,
-  onOpenSession, onNewChat, onNewChatInProject, onOpenRoom,
+  onOpenSession, onNewChat, onNewChatInProject,
   onRenameChat, onDeleteChat,
 }: Props) {
   const [modeOpen, setModeOpen] = useState(false);
@@ -510,7 +506,6 @@ export default function HouseSidebar({
 
     if (chatsFilter === 'house' || chatsFilter === 'personal') {
       const isPersonalMode = chatsFilter === 'personal';
-      const roomLabel = isPersonalMode ? 'General' : 'House';
       const roomWs = isPersonalMode
         ? personalWs
         : (houseWs ?? workspaces.find((w) => (w as { isHouse?: boolean }).isHouse));
@@ -524,15 +519,6 @@ export default function HouseSidebar({
                 {isPersonalMode ? 'No General chats yet.' : 'No house chats yet.'}
               </p>
             </div>
-          )}
-          {!isPersonalMode && (
-            <button
-              onClick={() => { onOpenRoom?.('house'); onClose(); }}
-              className="mx-3 mt-2 flex items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11.5px] text-zinc-300 hover:bg-white/[0.09] transition-colors cursor-pointer"
-            >
-              <ChevronRight size={12} />
-              Open {roomLabel} Workspace
-            </button>
           )}
         </div>
       );

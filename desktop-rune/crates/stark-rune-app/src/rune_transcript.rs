@@ -129,6 +129,74 @@ impl ProviderState {
     }
 }
 
+/// One model entry (`GET /api/models` → `{models:[{id,name,provider}]}`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModelOption {
+    pub id: String,
+    pub name: String,
+}
+
+impl ModelOption {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            id: v
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }
+    }
+}
+
+/// Fetch the model list once per thread (60s retry on failure).
+pub fn poll_models_state(s: &mut RuneTranscriptState, clock: f64) {
+    let (msgs, _) = crate::rooms::drain_results(&mut s.models_inbox);
+    for msg in msgs {
+        if let Ok(models) = msg {
+            s.models = models;
+            s.models_ok = true;
+        }
+        s.models_loading = false;
+        s.models_last_try = clock;
+    }
+    if !s.models_loading && !s.models_ok && clock - s.models_last_try > 60.0 {
+        s.models_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.models_inbox = Some(rx);
+        let (host, port) = (s.api_host.clone(), s.api_port);
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match crate::transport::fetch_json("/api/models").await {
+                Ok(v) => Ok(v
+                    .get("models")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().map(ModelOption::from_json).collect())
+                    .unwrap_or_default()),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(result);
+            let _ = (host, port);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let result = match crate::transport::get_json(&host, port, "/api/models") {
+                Ok(v) => Ok(v
+                    .get("models")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().map(ModelOption::from_json).collect())
+                    .unwrap_or_default()),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(result);
+        });
+    }
+}
+
 /// Refresh the provider label at most every 30s (`PromptDock` interval).
 /// Failures keep the last label (the effect swallows errors).
 pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) {
@@ -236,6 +304,16 @@ pub struct RuneTranscriptState {
     /// Usage popover open (tap the orb; React hovers — tap is the honest
     /// native equivalent, no hover targeting headlessly).
     pub usage_open: bool,
+    /// Model options (`GET /api/models` → `{models:[{id,name}]}`), fetched
+    /// once per thread lifetime (React fetches on mount; 60s retry keeps a
+    /// cold start honest).
+    pub models: Vec<ModelOption>,
+    pub models_loading: bool,
+    pub models_ok: bool,
+    pub models_last_try: f64,
+    /// Model dropup open (`provider-menu`).
+    pub model_open: bool,
+    pub models_inbox: Option<std::sync::mpsc::Receiver<Result<Vec<ModelOption>, String>>>,
     /// Live provider pill (`fetchProvider`, 30s refresh).
     pub provider: ProviderState,
     /// Settings sheet visibility.
@@ -261,6 +339,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("notes", &self.notes.notes.len())
             .field("run_target", &self.run_target)
             .field("usage", &self.usage)
+            .field("models", &self.models.len())
             .field("settings_open", &self.settings_open)
             .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
@@ -283,6 +362,12 @@ impl Clone for RuneTranscriptState {
             run_target: self.run_target.clone(),
             usage: self.usage.clone(),
             usage_open: self.usage_open,
+            models: self.models.clone(),
+            models_loading: self.models_loading,
+            models_ok: self.models_ok,
+            models_last_try: self.models_last_try,
+            model_open: self.model_open,
+            models_inbox: None,
             provider: ProviderState {
                 label: self.provider.label.clone(),
                 warn: self.provider.warn,
@@ -329,6 +414,12 @@ impl RuneTranscriptState {
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
             usage_open: false,
+            models: Vec::new(),
+            models_loading: false,
+            models_ok: false,
+            models_last_try: 0.0,
+            model_open: false,
+            models_inbox: None,
             provider: ProviderState::default(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
@@ -371,6 +462,12 @@ impl RuneTranscriptState {
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
             usage_open: false,
+            models: Vec::new(),
+            models_loading: false,
+            models_ok: false,
+            models_last_try: 0.0,
+            model_open: false,
+            models_inbox: None,
             provider: ProviderState::default(),
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
@@ -916,6 +1013,9 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             usage_open: s.usage_open,
             provider_label: &s.provider.label,
             provider_warn: s.provider.warn,
+            model: &s.model,
+            models: &s.models,
+            model_open: s.model_open,
         },
         super::composer::ComposerButtons {
             voice: std::rc::Rc::new(move |s: &mut S| {
@@ -934,6 +1034,14 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                 s.thread_mut(which).usage_open = !open;
             }),
             send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
+            model_menu: std::rc::Rc::new(move |s: &mut S| {
+                let open = s.thread_mut(which).model_open;
+                s.thread_mut(which).model_open = !open;
+            }),
+            model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
+                s.thread_mut(which).model = id;
+                s.thread_mut(which).model_open = false;
+            }),
         },
     );
     root = root.child(
@@ -1217,6 +1325,55 @@ mod tests {
             "health": {"deepseek": "boom"},
         }));
         assert!(sick.warn);
+    }
+
+    #[test]
+    fn model_menu_lists_and_picks() {
+        let env = Env::new(true, 1.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        init.models = vec![
+            ModelOption {
+                id: "m1".to_string(),
+                name: "Model One".to_string(),
+            },
+            ModelOption {
+                id: "m2".to_string(),
+                name: "Model Two".to_string(),
+            },
+        ];
+        init.models_ok = true;
+        init.model = "m1".to_string();
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 800.0), env);
+        rt.frame(0.0);
+        // Provider pill + model trigger both mount (ChatView twin).
+        assert!(rt.find("composer-provider").is_some());
+        assert!(rt.find("composer-model-trigger").is_some());
+        assert!(rt.find("composer-model-menu").is_none());
+        let (x, y) = rt.find("composer-model-trigger").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.model_open, "trigger opens menu");
+        for key in [
+            "composer-model-menu",
+            "composer-model-Automatic Fallback",
+            "composer-model-m1",
+            "composer-model-m2",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        // Pick switches the model and closes the menu (onModelChange).
+        let (x, y) = rt.find("composer-model-m2").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.model, "m2");
+        assert!(!rt.state.model_open);
     }
 
     #[test]

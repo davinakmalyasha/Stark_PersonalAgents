@@ -1768,8 +1768,54 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         .grow(1.0)
         .min_h(0.0)
         .fill(ink("#08080a"))
-        .clip_rounded(0.0)
-        .child(world);
+        .clip_rounded(0.0);
+    if s.cards.is_empty() {
+        // Empty canvas (`canvas-empty`, map variant): Add button + copy.
+        // Chrome (HUD, dock, fab) still mounts around it.
+        canvas = canvas.child(
+            col()
+                .key("canvas-empty")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .center()
+                .gap(10.0)
+                .child(
+                    row()
+                        .key("canvas-empty-add")
+                        .items_center()
+                        .gap(6.0)
+                        .px(14.0)
+                        .py(8.0)
+                        .radius(9.0)
+                        .fill(ink("#ffffff0d"))
+                        .border(1.0, ink("#ffffff14"))
+                        .role("button")
+                        .label("Add to canvas")
+                        .on_press(move |s: &mut S| {
+                            s.canvas_mut().add_open = true;
+                        })
+                        .child(
+                            text("+".to_string())
+                                .font(rune::tok::TextStyle::new(14.0, 600.0))
+                                .color(ink("#e4e4e7")),
+                        )
+                        .child(
+                            text("Add to Canvas".to_string())
+                                .font(rune::tok::TextStyle::new(12.0, 600.0))
+                                .color(ink("#e4e4e7")),
+                        ),
+                )
+                .child(
+                    text("Open a chat and it will appear here automatically.".to_string())
+                        .key("canvas-empty-copy")
+                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .color(ink("#71717a")),
+                ),
+        );
+    } else {
+        canvas = canvas.child(world);
+    }
     // Floating composer, centred over the canvas like `HouseChat`'s dock:
     // 640pt wide, bottom-anchored. Same card as the transcript dock.
     // Toolbar chrome follows the ACTIVE thread; unwritten threads read the
@@ -1786,6 +1832,10 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             .map(|t| t.provider.label.as_str())
             .unwrap_or(""),
         provider_warn: active_thread.map(|t| t.provider.warn).unwrap_or(false),
+        // Map dock: no model list (like `HouseChat` — provider pill only).
+        model: "",
+        models: &[],
+        model_open: false,
     };
     canvas = canvas.child(
         rune::el()
@@ -1842,6 +1892,9 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         crate::rune_transcript::stage_send_prompt(thread, prompt);
                         c.sessions.sheet = Some(id);
                     }),
+                    // Map dock: no model list, so these never fire.
+                    model_menu: std::rc::Rc::new(move |_s: &mut S| {}),
+                    model_pick: std::rc::Rc::new(move |_s: &mut S, _id: String| {}),
                 },
             )),
     );
@@ -1948,7 +2001,10 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 })),
         )
         .child(
-            text("Drag to pan · drag cards to arrange".to_string())
+            // Exact `CanvasStage` copy (design parity). NOTE: scroll-to-zoom
+            // has no element-level Rune target yet — buttons zoom, wheel is
+            // ignored. The string stays identical so the pixels match.
+            text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
                 .key("cam-hint")
                 .absolute(vw - 244.0, 48.0)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))

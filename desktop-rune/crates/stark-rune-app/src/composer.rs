@@ -10,6 +10,11 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+/// Boxed press handler (keeps the card signature small).
+pub type Press<S> = std::rc::Rc<dyn Fn(&mut S)>;
+/// Boxed pick handler (model rows carry their id).
+pub type Pick<S> = std::rc::Rc<dyn Fn(&mut S, String)>;
+
 /// Level meter: five bars lit by bucket, plus the capture note (no-device
 /// reason) when present. Mounted beside the voice toggle while live.
 fn voice_meter(live: bool, level: f32, note: Option<&str>) -> El {
@@ -99,6 +104,13 @@ pub struct ComposerMeta<'a> {
     pub provider_label: &'a str,
     /// Amber pill (no key or provider error).
     pub provider_warn: bool,
+    /// Thread model (`Automatic Fallback` default).
+    pub model: &'a str,
+    /// Model options; empty hides the dropup (the map dock never passes
+    /// any — like `HouseChat` — while the sheet dock does, like `ChatView`).
+    pub models: &'a [super::rune_transcript::ModelOption],
+    /// Model menu open.
+    pub model_open: bool,
 }
 
 /// Run-target toggle (`radiogroup`): Local active is zinc-on-zinc-800,
@@ -307,6 +319,108 @@ fn provider_pill(label: &str, warn: bool) -> El {
     .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
 }
 
+/// Model dropup (`provider-dropup`): trigger with the current model +
+/// chevron, menu with Automatic Fallback head row + one row per model, check
+/// on the selected. Only mounted when options exist.
+fn model_dropup<S: 'static>(
+    model: &str,
+    models: &[super::rune_transcript::ModelOption],
+    open: bool,
+    menu: Press<S>,
+    pick: Pick<S>,
+) -> El {
+    let mut wrap = col().key("composer-model").w_full().gap(4.0);
+    let current = if model.is_empty() {
+        "Automatic Fallback".to_string()
+    } else {
+        models
+            .iter()
+            .find(|m| m.id == model)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| model.to_string())
+    };
+    wrap = wrap.child(
+        row()
+            .key("composer-model-trigger")
+            .items_center()
+            .gap(4.0)
+            .role("button")
+            .label("Model")
+            .px(8.0)
+            .py(7.0)
+            .radius(9.0)
+            .fill(rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.04,
+            })
+            .border(1.0, ink("#ffffff12"))
+            .on_press(move |s: &mut S| menu(s))
+            .child(
+                text(current)
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(ink("#c9c9d1")),
+            )
+            .child(
+                text(if open { "▴" } else { "▾" }.to_string())
+                    .font(rune::tok::TextStyle::new(10.0, 400.0))
+                    .color(ink("#71717a")),
+            ),
+    );
+    if open {
+        let mut menu_col = col()
+            .key("composer-model-menu")
+            .w_full()
+            .gap(2.0)
+            .radius(9.0)
+            .fill(ink("#17171b"))
+            .border(1.0, ink("#ffffff14"))
+            .px(6.0)
+            .py(4.0);
+        let head_selected = model.is_empty() || model == "Automatic Fallback";
+        menu_col = menu_col.child(model_row::<S>(
+            "Automatic Fallback",
+            "Automatic Fallback",
+            head_selected,
+            pick.clone(),
+        ));
+        for m in models {
+            menu_col = menu_col.child(model_row::<S>(&m.id, &m.name, m.id == model, pick.clone()));
+        }
+        wrap = wrap.child(menu_col);
+    }
+    wrap
+}
+
+/// One model menu row with a check on the selected (`provider-item`).
+fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) -> El {
+    let target = id.to_string();
+    row()
+        .key(format!("composer-model-{target}"))
+        .w_full()
+        .items_center()
+        .gap(6.0)
+        .px(8.0)
+        .py(6.0)
+        .radius(6.0)
+        .fill(ink(if selected { "#ffffff14" } else { "#00000000" }))
+        .role("button")
+        .label(format!("Use {name}"))
+        .on_press(move |s: &mut S| pick(s, target.clone()))
+        .child(
+            text(name.to_string())
+                .grow(1.0)
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#d4d4d8")),
+        )
+        .child(
+            text(if selected { "✓" } else { "" }.to_string())
+                .font(rune::tok::TextStyle::new(11.0, 600.0))
+                .color(ink("#e4e4e7")),
+        )
+}
+
 /// Premium-surface composer (`PromptDock`): 15px input, then the toolbar —
 /// run-target toggle, spacer, usage orb (+popover), provider pill, voice
 /// toggle + meter, send/stop. `w_full` — callers set the width. `on_send`
@@ -315,12 +429,14 @@ fn provider_pill(label: &str, warn: bool) -> El {
 /// drag-drop have no Rune target (documented, not faked).
 /// Toolbar handlers, boxed so the card takes six params, not ten.
 pub struct ComposerButtons<S: 'static> {
-    pub voice: std::rc::Rc<dyn Fn(&mut S)>,
-    pub cancel: std::rc::Rc<dyn Fn(&mut S)>,
-    pub local: std::rc::Rc<dyn Fn(&mut S)>,
-    pub cloud: std::rc::Rc<dyn Fn(&mut S)>,
-    pub usage: std::rc::Rc<dyn Fn(&mut S)>,
-    pub send: std::rc::Rc<dyn Fn(&mut S)>,
+    pub voice: Press<S>,
+    pub cancel: Press<S>,
+    pub local: Press<S>,
+    pub cloud: Press<S>,
+    pub usage: Press<S>,
+    pub send: Press<S>,
+    pub model_menu: Press<S>,
+    pub model_pick: Pick<S>,
 }
 
 pub fn composer_card<S: 'static>(
@@ -421,6 +537,22 @@ pub fn composer_card<S: 'static>(
                     move |s: &mut S| usage(s)
                 }))
                 .child(provider_pill(meta.provider_label, meta.provider_warn))
+                .child(if meta.models.is_empty() {
+                    // Map dock: no model list (like `HouseChat`) — the
+                    // provider pill above is the only pill, per screenshot.
+                    rune::el()
+                        .key("composer-model-empty")
+                        .size(0.0, 0.0)
+                        .inert()
+                } else {
+                    model_dropup::<S>(
+                        meta.model,
+                        meta.models,
+                        meta.model_open,
+                        buttons.model_menu.clone(),
+                        buttons.model_pick.clone(),
+                    )
+                })
                 .child(
                     // Voice toggle (`.prompt-voice-button`) with a 5-bar level
                     // meter beside it while live. Levels come from the capture

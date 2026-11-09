@@ -397,6 +397,8 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed |= crate::notes::poll_notes_state(&mut s.personal.notes);
     crate::rune_transcript::poll_provider_state(&mut s.transcript, clock);
     crate::rune_transcript::poll_provider_state(&mut s.personal, clock);
+    crate::rune_transcript::poll_models_state(&mut s.transcript, clock);
+    crate::rune_transcript::poll_models_state(&mut s.personal, clock);
     // Session threads: drain + sync card flags.
     let ids: Vec<String> = s.canvas.sessions.order.clone();
     for id in ids {
@@ -404,6 +406,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
             changed |= drain_run_inbox(thread, clock, tx);
             changed |= crate::notes::poll_notes_state(&mut thread.notes);
             crate::rune_transcript::poll_provider_state(thread, clock);
+            crate::rune_transcript::poll_models_state(thread, clock);
             let live = thread.live;
             if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == id) {
                 if card.running != live {

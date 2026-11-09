@@ -581,7 +581,10 @@ mod tests {
         }
         assert!(!rt.state.canvas.sessions.order.contains(&id));
         assert!(rt.state.canvas.card(&id).is_none());
-        assert!(!rt.state.canvas.sessions.threads.contains_key(&id));
+        // Thread survives the close (reopen restores history); the closed
+        // id is listed for the Add menu.
+        assert!(rt.state.canvas.sessions.threads.contains_key(&id));
+        assert!(rt.state.canvas.closed.iter().any(|(cid, _)| cid == &id));
     }
 
     #[test]

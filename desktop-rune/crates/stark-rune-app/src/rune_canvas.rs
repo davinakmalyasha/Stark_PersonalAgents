@@ -126,6 +126,12 @@ impl Camera {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapCardItem {
+    Chat,
+    Project,
+}
+
 #[derive(Debug, Clone)]
 pub struct MapCard {
     pub id: String,
@@ -135,6 +141,12 @@ pub struct MapCard {
     /// Chat kind (the dropdown filter). Chats are the only type — this is a
     /// category label, never a workspace scope.
     pub kind: String,
+    /// Chat cards host threads + docks; project cards are info displays
+    /// (title, progress, waiting) added from the Group list.
+    pub item: MapCardItem,
+    /// Project snapshot for `MapCardItem::Project` (mirrors the modal list
+    /// rows — no extra fetch).
+    pub project: Option<crate::projects::GroupProject>,
     pub x: f32,
     pub y: f32,
     pub compact: bool,
@@ -237,6 +249,13 @@ pub struct CanvasState {
     pub agents_open: Option<String>,
     /// Kind dropdown open in the chats panel.
     pub kind_open: bool,
+    /// Add menu (`CanvasAddMenu`): open flag, tab, live search.
+    pub add_open: bool,
+    pub add_tab: String,
+    pub add_search: rune::TextEdit,
+    /// Closed chats available for re-adding (id, title). Threads survive
+    /// the close, so reopening restores history.
+    pub closed: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for CanvasState {
@@ -269,6 +288,10 @@ impl Clone for CanvasState {
             agents: self.agents.clone(),
             voice: self.voice.clone(),
             kind_open: self.kind_open,
+            add_open: self.add_open,
+            add_tab: self.add_tab.clone(),
+            add_search: self.add_search.clone(),
+            closed: self.closed.clone(),
             inputs: self.inputs.clone(),
             agents_open: self.agents_open.clone(),
         }
@@ -295,6 +318,8 @@ impl CanvasState {
                     x: 36.0,
                     y: 36.0,
                     compact: false,
+                    item: MapCardItem::Chat,
+                    project: None,
                     running: false,
                 },
                 MapCard {
@@ -306,6 +331,8 @@ impl CanvasState {
                     x: 520.0,
                     y: 36.0,
                     compact: false,
+                    item: MapCardItem::Chat,
+                    project: None,
                     running: false,
                 },
                 MapCard {
@@ -317,6 +344,8 @@ impl CanvasState {
                     x: 60.0,
                     y: 480.0,
                     compact: true,
+                    item: MapCardItem::Chat,
+                    project: None,
                     running: false,
                 },
                 MapCard {
@@ -328,6 +357,8 @@ impl CanvasState {
                     x: 560.0,
                     y: 480.0,
                     compact: true,
+                    item: MapCardItem::Chat,
+                    project: None,
                     running: true,
                 },
             ],
@@ -347,6 +378,10 @@ impl CanvasState {
             agents: crate::agents::AgentsState::default(),
             voice: crate::voice::VoiceBus::default(),
             kind_open: false,
+            add_open: false,
+            add_tab: "chats".to_string(),
+            add_search: rune::TextEdit::new(""),
+            closed: Vec::new(),
             inputs: std::collections::HashMap::new(),
             agents_open: None,
         };
@@ -468,6 +503,8 @@ impl CanvasState {
             subtitle: format!("{kind} · fresh"),
             preview: "No messages yet.".to_string(),
             kind,
+            item: MapCardItem::Chat,
+            project: None,
             x: 36.0 + ((n * 84) % 420) as f32,
             y: 36.0 + ((n * 64) % 320) as f32,
             compact: false,
@@ -481,12 +518,17 @@ impl CanvasState {
         id
     }
 
-    /// Close a session: card + thread + tab go; selection and sheet fall
-    /// back to the first remaining session (local scene state only — no
-    /// server chats exist behind these cards).
+    /// Close a session: the card and tab go, but the thread stays — reopening
+    /// from the Add menu restores its history (closing a tab never deletes
+    /// the chat, like React). Selection and sheet fall back to the first
+    /// remaining session.
     pub fn close_session(&mut self, id: &str) {
+        if let Some(card) = self.cards.iter().find(|c| c.id == id) {
+            if card.item == MapCardItem::Chat && !self.closed.iter().any(|(cid, _)| cid == id) {
+                self.closed.push((id.to_string(), card.title.clone()));
+            }
+        }
         self.cards.retain(|c| c.id != id);
-        self.sessions.threads.remove(id);
         self.sessions.order.retain(|o| o != id);
         if self.sessions.sheet.as_deref() == Some(id) {
             self.sessions.sheet = None;
@@ -500,6 +542,82 @@ impl CanvasState {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// Re-add a closed chat to the canvas (Add menu → Chats). History is
+    /// intact — the thread survived the close. Lands top-left in view, like
+    /// `addDraft` (`screenX 10, screenY 78 + n·430` into world points).
+    pub fn add_draft_chat(&mut self, id: &str) {
+        if self.card(id).is_some() {
+            self.add_open = false;
+            return;
+        }
+        let title = self
+            .closed
+            .iter()
+            .find(|(cid, _)| cid == id)
+            .map(|(_, t)| t.clone())
+            .or_else(|| self.sessions.threads.get(id).map(|t| t.title.clone()))
+            .unwrap_or_else(|| "Chat".to_string());
+        let n = self.cards.len();
+        let k = self.cam.scale.max(CAM_MIN_SCALE);
+        self.cards.push(MapCard {
+            id: id.to_string(),
+            title,
+            subtitle: format!("{} · restored", self.sessions.kind),
+            preview: "No messages yet.".to_string(),
+            kind: self.sessions.kind.clone(),
+            item: MapCardItem::Chat,
+            project: None,
+            x: (10.0 - self.cam.x) / k,
+            y: (78.0 + n as f32 * 430.0 - self.cam.y) / k,
+            compact: false,
+            running: false,
+        });
+        self.closed.retain(|(cid, _)| cid != id);
+        let _ = self.thread_mut(id);
+        self.inputs
+            .entry(id.to_string())
+            .or_insert_with(|| rune::TextEdit::new(""));
+        if !self.sessions.order.contains(&id.to_string()) {
+            self.sessions.order.push(id.to_string());
+        }
+        self.select_card(id);
+        self.add_open = false;
+    }
+
+    /// Add a project card (Add menu → Projects). Info display from the stored
+    /// snapshot — no fetch; the Group panel owns the live list.
+    pub fn add_draft_project(&mut self, pid: &str) {
+        let id = format!("project:{pid}");
+        if self.card(&id).is_some() {
+            self.add_open = false;
+            return;
+        }
+        let Some(p) = self.projects.projects.iter().find(|p| p.id == pid).cloned() else {
+            return;
+        };
+        let n = self.cards.len();
+        let k = self.cam.scale.max(CAM_MIN_SCALE);
+        self.cards.push(MapCard {
+            id: id.clone(),
+            title: if p.title.is_empty() {
+                pid.to_string()
+            } else {
+                p.title.clone()
+            },
+            subtitle: format!("Project · {} items", p.total),
+            preview: String::new(),
+            kind: self.sessions.kind.clone(),
+            item: MapCardItem::Project,
+            project: Some(p),
+            x: (10.0 - self.cam.x) / k,
+            y: (78.0 + n as f32 * 430.0 - self.cam.y) / k,
+            compact: true,
+            running: false,
+        });
+        self.select_card(&id);
+        self.add_open = false;
     }
 }
 
@@ -547,6 +665,202 @@ impl crate::agents::AgentsHost for CanvasState {
 /// Compact card bubble (`CanvasChatBubble` at card scale): avatar, name head
 /// (+ `auto` badge, typing dots when live), plain wrapped text, clock foot.
 /// Card bodies render raw text like `.canvas-bubble-text` — no markdown pass.
+/// Project card (`CanvasItemCard` project branch): title, progress bar,
+/// item counts, waiting badge. Display-only — the Group panel owns the live
+/// list, and project ops live there; the card has no open target (documented,
+/// not faked).
+fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> El {
+    let (w, h) = card.size();
+    let p = card.project.clone().unwrap_or_default();
+    let waiting = p.waiting > 0;
+    let border = if active {
+        ink("#ffffff4d")
+    } else if waiting {
+        // `.canvas-card.is-waiting`: amber border.
+        ink("#fcd34d42")
+    } else {
+        ink("#ffffff16")
+    };
+    let id = card.id.clone();
+    let drag_id = card.id.clone();
+    let close_id = id.clone();
+    let frac = p.fraction();
+    let fill = (frac.clamp(0.0, 1.0) * 1000.0).round() / 10.0;
+    col()
+        .key(card.id.clone())
+        .absolute(card.x, card.y)
+        .size(w, h)
+        .radius(16.0)
+        .fill(ink("#0b0b0e"))
+        .linear_gradient(
+            std::f32::consts::PI,
+            [
+                (0.0, ink("#ffffff08")),
+                (0.36, ink("#ffffff02")),
+                (1.0, ink("#0000000c")),
+            ],
+        )
+        .border(1.0, border)
+        .shadow(
+            26.0,
+            70.0,
+            rune::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.50,
+            },
+        )
+        .clip_rounded(16.0)
+        .child(
+            row()
+                .key(format!("{id}-head"))
+                .w_full()
+                .items_center()
+                .gap(8.0)
+                .px(14.0)
+                .pt(14.0)
+                .pb(10.0)
+                .on_drag(move |s: &mut S, drag: &mut Drag, _tx| {
+                    let idx = match s.canvas_mut().cards.iter().position(|c| c.id == drag_id) {
+                        Some(i) => i,
+                        None => return,
+                    };
+                    match drag.phase {
+                        Phase::Down => {
+                            let c = s.canvas_mut();
+                            c.press_home = Some((c.cards[idx].x, c.cards[idx].y));
+                        }
+                        Phase::Move | Phase::Up => {
+                            let c = s.canvas_mut();
+                            let k = c.cam.scale.max(CAM_MIN_SCALE);
+                            if let Some((hx, hy)) = c.press_home {
+                                c.cards[idx].x = hx + drag.dx / k;
+                                c.cards[idx].y = hy + drag.dy / k;
+                            }
+                            if matches!(drag.phase, Phase::Up) {
+                                c.press_home = None;
+                            }
+                        }
+                    }
+                })
+                .child(
+                    rune::el().key(format!("{id}-grip")).child(
+                        text("⋮⋮".to_string())
+                            .font(rune::tok::TextStyle::new(11.0, 700.0))
+                            .color(ink("#52525b")),
+                    ),
+                )
+                .child(
+                    rune::el()
+                        .key(format!("{id}-typeicon"))
+                        .size(22.0, 22.0)
+                        .radius(6.0)
+                        .fill(ink("#24242a"))
+                        .center()
+                        .child(
+                            text("▤".to_string())
+                                .font(rune::tok::TextStyle::new(11.0, 700.0))
+                                .color(ink("#c9c9d1")),
+                        ),
+                )
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .child(
+                            text(card.title.clone())
+                                .key(format!("{id}-title"))
+                                .font(rune::tok::TextStyle::new(13.5, 600.0))
+                                .color(ink("#f2f2f5")),
+                        )
+                        .child(
+                            text(card.subtitle.clone())
+                                .key(format!("{id}-subtitle"))
+                                .font(rune::tok::TextStyle::new(10.5, 400.0))
+                                .color(ink("#8a8a93")),
+                        ),
+                )
+                .child(
+                    text("×".to_string())
+                        .key(format!("{id}-close"))
+                        .role("button")
+                        .label(format!("Remove {}", card.title))
+                        .font(rune::tok::TextStyle::new(13.0, 400.0))
+                        .color(ink("#71717a"))
+                        .on_press(move |s: &mut S| {
+                            s.canvas_mut().close_session(&close_id);
+                        }),
+                ),
+        )
+        .child(
+            col()
+                .key(format!("{id}-projbody"))
+                .w_full()
+                .gap(6.0)
+                .px(14.0)
+                .child(
+                    row()
+                        .key(format!("{id}-bar"))
+                        .w_full()
+                        .h(4.0)
+                        .radius(2.0)
+                        .fill(ink("#ffffff12"))
+                        .child(
+                            rune::el()
+                                .key(format!("{id}-fill"))
+                                .h_full()
+                                .radius(2.0)
+                                .fill(ink("#d4d4d8"))
+                                .grow(fill.max(1.0))
+                                .min_h(0.0),
+                        )
+                        .child(
+                            rune::el()
+                                .key(format!("{id}-rest"))
+                                .grow((1000.0 - fill).max(1.0)),
+                        ),
+                )
+                .child(
+                    text(format!("{} of {} items", p.done, p.total))
+                        .key(format!("{id}-counts"))
+                        .font(rune::tok::TextStyle::new(10.0, 400.0))
+                        .color(ink("#71717a")),
+                ),
+        )
+        .child(
+            text(if waiting {
+                format!("{} waiting on you", p.waiting)
+            } else {
+                String::new()
+            })
+            .key(format!("{id}-waiting"))
+            .px(14.0)
+            .font(rune::tok::TextStyle::new(10.0, 600.0))
+            .color(ink("#fcd34d")),
+        )
+        .child(
+            rune::el()
+                .key(format!("{id}-port-top"))
+                .absolute(w / 2.0 - 4.5, -4.5)
+                .size(9.0, 9.0)
+                .radius(4.5)
+                .fill(ink("#1b1b20"))
+                .border(1.0, ink("#44444c"))
+                .inert(),
+        )
+        .child(
+            rune::el()
+                .key(format!("{id}-port-bottom"))
+                .absolute(w / 2.0 - 4.5, h - 4.5)
+                .size(9.0, 9.0)
+                .radius(4.5)
+                .fill(ink("#1b1b20"))
+                .border(1.0, ink("#44444c"))
+                .inert(),
+        )
+}
+
 fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) -> El {
     let (fill, hair_a, avatar_bg, initial, name, body_ink) = match r.role {
         "user" => ("#28282f", 0.075, "#303038", "U", "You", "#dedee5"),
@@ -672,6 +986,9 @@ fn card_view<S: CanvasHost + 'static>(
     kids: &[(String, String)],
     menu_open: bool,
 ) -> El {
+    if card.item == MapCardItem::Project {
+        return project_card_view::<S>(card, active);
+    }
     let (w, h) = card.size();
     let radius = if card.compact { 16.0 } else { 18.0 };
     let id = card.id.clone();
@@ -1094,6 +1411,249 @@ fn card_view<S: CanvasHost + 'static>(
     view
 }
 
+/// Add menu (`CanvasAddMenu`): search + Chats/Projects/Addons tabs with
+/// counts + rows. Chats are closed sessions (history intact); projects come
+/// from the Group list; addons have no Rune target yet ("No addons
+/// available"). Tap adds at the visible top-left (`addDraft` math) and closes
+/// the menu. No drag-drop onto the canvas (no DnD target — click only).
+pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
+    let q = s.add_search.text.trim().to_lowercase();
+    // Chats tab: closed sessions matching the query (all are addable —
+    // nothing closed is on the canvas).
+    let chats: Vec<(String, String)> = s
+        .closed
+        .iter()
+        .filter(|(_, title)| q.is_empty() || title.to_lowercase().contains(&q))
+        .cloned()
+        .collect();
+    let projects: Vec<crate::projects::GroupProject> = s
+        .projects
+        .projects
+        .iter()
+        .filter(|p| {
+            q.is_empty() || p.title.to_lowercase().contains(&q) || p.id.to_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect();
+    let on_canvas = |id: &str| s.cards.iter().any(|c| c.id == id);
+    let mut list = col().key("canvas-add-list").w_full().gap(2.0);
+    if s.add_tab == "chats" {
+        if chats.is_empty() {
+            list = list.child(
+                text(if q.is_empty() {
+                    "No chats available.".to_string()
+                } else {
+                    format!("Nothing matches “{q}”.")
+                })
+                .key("canvas-add-empty")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#71717a")),
+            );
+        }
+        for (cid, title) in &chats {
+            let target = cid.clone();
+            list = list.child(add_row::<S>(
+                &format!("canvas-add-chat-{cid}"),
+                title.clone(),
+                "Chat".to_string(),
+                "▤".to_string(),
+                false,
+                move |s: &mut S| {
+                    s.canvas_mut().add_draft_chat(&target);
+                },
+            ));
+        }
+    } else if s.add_tab == "projects" {
+        if projects.is_empty() {
+            list = list.child(
+                text(if q.is_empty() {
+                    "No projects available.".to_string()
+                } else {
+                    format!("Nothing matches “{q}”.")
+                })
+                .key("canvas-add-empty")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#71717a")),
+            );
+        }
+        for p in &projects {
+            let pid = p.id.clone();
+            let added = on_canvas(&format!("project:{pid}"));
+            list = list.child(add_row::<S>(
+                &format!("canvas-add-project-{pid}"),
+                if p.title.is_empty() {
+                    pid.clone()
+                } else {
+                    p.title.clone()
+                },
+                format!("{}/{} items", p.done, p.total),
+                "▤".to_string(),
+                added,
+                move |s: &mut S| {
+                    s.canvas_mut().add_draft_project(&pid);
+                },
+            ));
+        }
+    } else {
+        // Addons: OpenDesign is unported — honest empty state, same copy
+        // shape as the other tabs.
+        list = list.child(
+            text("No addons available.".to_string())
+                .key("canvas-add-empty")
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#71717a")),
+        );
+    }
+    let mut tabs = row().key("canvas-add-tabs").w_full().gap(2.0);
+    for (tab, label, count) in [
+        ("chats", "Chats", chats.len()),
+        ("projects", "Projects", projects.len()),
+        ("addons", "Addons", 0usize),
+    ] {
+        let active = s.add_tab == tab;
+        let target = tab.to_string();
+        tabs = tabs.child(
+            row()
+                .key(format!("canvas-add-tab-{tab}"))
+                .items_center()
+                .gap(4.0)
+                .px(6.0)
+                .py(2.0)
+                .radius(4.0)
+                .fill(ink(if active { "#ffffff17" } else { "#00000000" }))
+                .role("button")
+                .label(format!("{label} tab"))
+                .on_press(move |s: &mut S| {
+                    s.canvas_mut().add_tab = target.clone();
+                })
+                .child(
+                    text(label.to_string())
+                        .font(rune::tok::TextStyle::new(9.0, 500.0))
+                        .color(ink(if active { "#ffffff" } else { "#71717a" })),
+                )
+                .child(
+                    text(count.to_string())
+                        .font(rune::tok::TextStyle::new(8.0, 400.0))
+                        .color(ink("#52525b")),
+                ),
+        );
+    }
+    col()
+        .key("canvas-add-menu")
+        .absolute(14.0, 44.0)
+        .w(300.0)
+        .radius(10.0)
+        .fill(ink("#121317fa"))
+        .border(1.0, ink("#ffffff17"))
+        .shadow(
+            0.0,
+            70.0,
+            rune::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.55,
+            },
+        )
+        .px(8.0)
+        .pt(6.0)
+        .pb(6.0)
+        .gap(4.0)
+        .child(
+            row()
+                .key("canvas-add-searchrow")
+                .w_full()
+                .items_center()
+                .gap(6.0)
+                .px(8.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(ink("#ffffff08"))
+                .child(
+                    text("⌕".to_string())
+                        .font(rune::tok::TextStyle::new(10.0, 400.0))
+                        .color(ink("#52525b")),
+                )
+                .child(
+                    text_input(&s.add_search, rune::tok::TextStyle::new(10.5, 400.0))
+                        .key("canvas-add-search")
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .placeholder("Add chat, project, or addon…", ink("#52525b"))
+                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                        .on_edit(move |s: &mut S| &mut s.canvas_mut().add_search),
+                )
+                .child(
+                    text("×".to_string())
+                        .key("canvas-add-close")
+                        .role("button")
+                        .label("Close add menu")
+                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .color(ink("#71717a"))
+                        .on_press(move |s: &mut S| {
+                            s.canvas_mut().add_open = false;
+                        }),
+                ),
+        )
+        .child(tabs)
+        .child(list)
+}
+
+/// One add-menu row: icon, title, subtitle, plus (or emerald check when
+/// already on the canvas). `on_add` is a no-op for added rows.
+fn add_row<S: 'static>(
+    key: &str,
+    title: String,
+    subtitle: String,
+    icon: String,
+    added: bool,
+    on_add: impl Fn(&mut S) + 'static,
+) -> El {
+    let mut btn = row()
+        .key(key.to_string())
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .radius(6.0)
+        .px(8.0)
+        .py(4.0)
+        .role("button")
+        .label(if added {
+            "Already on the canvas".to_string()
+        } else {
+            format!("{title} — click to add")
+        })
+        .child(
+            text(icon)
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#52525b")),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_h(0.0)
+                .child(
+                    text(title)
+                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .color(ink("#d4d4d8")),
+                )
+                .child(
+                    text(subtitle)
+                        .font(rune::tok::TextStyle::new(9.0, 400.0))
+                        .color(ink("#52525b")),
+                ),
+        )
+        .child(
+            text(if added { "✓" } else { "+" }.to_string())
+                .font(rune::tok::TextStyle::new(11.0, 600.0))
+                .color(ink(if added { "#34d399" } else { "#52525b" })),
+        );
+    if !added {
+        btn = btn.on_press(on_add);
+    }
+    btn
+}
+
 pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
     canvas_body::<CanvasState>(s)
 }
@@ -1286,9 +1846,60 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             )),
     );
 
+    // Add button (`.canvas-add-fab`): Plus + "Add", top-left fixed chrome.
+    canvas = canvas.child(
+        row()
+            .key("canvas-add")
+            .absolute(14.0, 12.0)
+            .items_center()
+            .gap(5.0)
+            .h(26.0)
+            .radius(7.0)
+            .fill(ink("#0f0f12b8"))
+            .border(1.0, ink("#ffffff14"))
+            .px(9.0)
+            .role("button")
+            .label("Add to canvas")
+            .on_press(move |s: &mut S| {
+                s.canvas_mut().add_open = true;
+            })
+            .child(
+                text("+".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 600.0))
+                    .color(ink("#a9abb3")),
+            )
+            .child(
+                text("Add".to_string())
+                    .font(rune::tok::TextStyle::new(9.5, 600.0))
+                    .color(ink("#a9abb3")),
+            ),
+    );
+    if s.add_open {
+        // Backdrop catcher (React's window pointerdown): anything outside
+        // the menu closes it. Transparent, below the menu.
+        canvas = canvas.child(
+            rune::el()
+                .key("canvas-add-backdrop")
+                .absolute(0.0, 0.0)
+                .size(vw, MAP_H)
+                .fill(rune::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                })
+                .role("button")
+                .label("Close add menu")
+                .modal(true, move |s: &mut S| {
+                    s.canvas_mut().add_open = false;
+                }),
+        );
+        canvas = canvas.child(add_menu::<S>(s));
+    }
     // Camera HUD (`CanvasStage` map controls): zoom out/in at the React
     // 0.86/1.16 steps, fit-to-view, and layout reset. Fixed chrome — never
     // scaled with the world.
+    // (Add menu lives just above: `add_menu` + `add_row`.)
     let hud_btn = |key: &str, label: &str| {
         rune::el()
             .key(format!("cam-{key}"))
@@ -1606,6 +2217,103 @@ mod tests {
             threads.get(empty).map(|t| t.rows.len()).unwrap_or(0) == 0,
             "other threads untouched"
         );
+    }
+
+    #[test]
+    fn add_menu_reopens_closed_chats_and_projects() {
+        fn menu_view(s: &CanvasState, _: &mut rune::Cx<CanvasState>) -> El {
+            col()
+                .key("menu-test-root")
+                .w_full()
+                .h_full()
+                .child(canvas_body::<CanvasState>(s))
+        }
+        let env = Env::new(true, 1.0);
+        let mut init = CanvasState::map();
+        init.agents.auto = false;
+        // Projects list with one entry for the Projects tab.
+        init.projects.projects = vec![crate::projects::GroupProject {
+            id: "p1".to_string(),
+            title: "Website".to_string(),
+            status: "doing".to_string(),
+            done: 3,
+            total: 4,
+            waiting: 1,
+        }];
+        init.projects.auto = false;
+        // Close chat-2 so the Chats tab has exactly one row.
+        init.close_session("chat:ws-general:chat-2");
+        assert!(init.card("chat:ws-general:chat-2").is_none());
+        let mut rt = Runtime::new(init, menu_view, (MAP_W, MAP_H), env);
+        rt.frame(0.0);
+        assert!(rt.find("canvas-add").is_some(), "fab mounts");
+        let (x, y) = rt.find("canvas-add").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        // Menu: search + three tabs with counts (1 closed chat, 1 project).
+        for key in [
+            "canvas-add-menu",
+            "canvas-add-search",
+            "canvas-add-tab-chats",
+            "canvas-add-tab-projects",
+            "canvas-add-tab-addons",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        // Re-add the closed chat: card + tab return, thread intact.
+        let (x, y) = rt.find("canvas-add-chat-chat:ws-general:chat-2").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.card("chat:ws-general:chat-2").is_some());
+        assert!(rt
+            .state
+            .sessions
+            .order
+            .contains(&"chat:ws-general:chat-2".to_string()));
+        assert!(!rt.state.add_open, "menu closes on add");
+        // Projects tab: add the project card with its progress bar.
+        let (x, y) = rt.find("canvas-add").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (x, y) = rt.find("canvas-add-tab-projects").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (x, y) = rt.find("canvas-add-project-p1").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        for key in ["project:p1-bar", "project:p1-fill", "project:p1-counts"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        assert!(rt.state.card("project:p1").is_some(), "project card lands");
+        // Addons tab: honest empty state.
+        let (x, y) = rt.find("canvas-add").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (x, y) = rt.find("canvas-add-tab-addons").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.find("canvas-add-empty").is_some(), "addons empty state");
     }
 
     #[test]

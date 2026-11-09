@@ -14,7 +14,7 @@ fn ink(hex: &'static str) -> rune::Color {
 }
 
 /// One board row. Progress prefers item counts, falls back to milestones.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GroupProject {
     pub id: String,
     pub title: String,

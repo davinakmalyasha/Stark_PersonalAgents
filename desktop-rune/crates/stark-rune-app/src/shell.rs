@@ -14,7 +14,7 @@ use crate::rooms::{
     drain_results, house_view, memory_view, poll_memory_detail, refresh_house, refresh_memory,
     HouseHost, HouseState, MemoryHost, MemoryState,
 };
-use crate::rune_canvas::{chats_panel, CanvasHost, CanvasState, RailTab, SessionsHost};
+use crate::rune_canvas::{chats_panel, CanvasHost, CanvasState, RailTab};
 use crate::rune_transcript::{
     drain_run_inbox, transcript_body, RuneTranscriptState, Thread, TranscriptHost,
 };
@@ -52,7 +52,6 @@ impl TranscriptHost for ShellState {
     fn thread(&self, which: Thread) -> &RuneTranscriptState {
         match which {
             Thread::Main => &self.transcript,
-            Thread::Personal => &self.personal,
             // The sheet's card thread; falls back to Main when closed.
             Thread::Open => self.canvas.sheet_thread().unwrap_or(&self.transcript),
         }
@@ -60,7 +59,6 @@ impl TranscriptHost for ShellState {
     fn thread_mut(&mut self, which: Thread) -> &mut RuneTranscriptState {
         match which {
             Thread::Main => &mut self.transcript,
-            Thread::Personal => &mut self.personal,
             Thread::Open => {
                 if self.canvas.sessions.sheet.is_some() && self.canvas.sheet_thread().is_some() {
                     self.canvas.sheet_thread_mut().expect("checked above")
@@ -105,15 +103,6 @@ impl crate::agents::AgentsHost for ShellState {
 impl CloudHost for ShellState {
     fn cloud_mut(&mut self) -> &mut CloudState {
         &mut self.cloud
-    }
-}
-
-impl SessionsHost for ShellState {
-    fn sessions_mut(&mut self) -> &mut crate::rune_canvas::Sessions {
-        &mut self.canvas.sessions
-    }
-    fn sessions(&self) -> &crate::rune_canvas::Sessions {
-        &self.canvas.sessions
     }
 }
 
@@ -248,7 +237,7 @@ fn side_panel(s: &ShellState) -> El {
 fn transcript_sheet(s: &ShellState) -> Option<El> {
     let id = s.canvas.sessions.sheet.clone()?;
     let thread = s.canvas.sessions.threads.get(&id)?;
-    let mut sheet = col()
+    let sheet = col()
         .key("session-sheet")
         .w(560.0)
         .h_full()

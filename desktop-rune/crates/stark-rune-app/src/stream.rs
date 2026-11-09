@@ -79,6 +79,7 @@ fn live_row(state: &mut RuneTranscriptState) -> &mut RowData {
             key: LIVE_ROW_KEY.to_string(),
             role: "agent",
             body: String::new(),
+            at: crate::rune_transcript::now_iso(),
         });
     }
     state.rows.last_mut().expect("live row just pushed")
@@ -106,6 +107,7 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                         key: format!("tool-{}-{}", state.rows.len(), tool),
                         role: "system",
                         body: format!("running {tool}…"),
+                        at: crate::rune_transcript::now_iso(),
                     });
                     "tool"
                 }
@@ -128,6 +130,7 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                         } else {
                             format!("{tool} failed")
                         },
+                        at: crate::rune_transcript::now_iso(),
                     });
                     "tool"
                 }

@@ -200,12 +200,6 @@ impl Default for Sessions {
     }
 }
 
-/// Host access for session state (threads, sheet, filters).
-pub trait SessionsHost {
-    fn sessions_mut(&mut self) -> &mut Sessions;
-    fn sessions(&self) -> &Sessions;
-}
-
 pub struct CanvasState {
     pub cards: Vec<MapCard>,
     pub edges: Vec<(String, String)>,
@@ -234,6 +228,13 @@ pub struct CanvasState {
     /// Mic capture bus (levels, notes, stop flag, inbox).
     pub voice: crate::voice::VoiceBus,
     /// Prompts staged from the map dock, awaiting run dispatch.
+    /// Per-card message drafts (`canvas-card-input`): keyed by card id, like
+    /// React's per-card `draft` state. The send button mirrors
+    /// `disabled={sending || running || empty}` — type-ahead while running,
+    /// no double-send.
+    pub inputs: std::collections::HashMap<String, rune::TextEdit>,
+    /// Card id whose connected-agents menu is open (single open at a time).
+    pub agents_open: Option<String>,
     /// Kind dropdown open in the chats panel.
     pub kind_open: bool,
 }
@@ -268,6 +269,8 @@ impl Clone for CanvasState {
             agents: self.agents.clone(),
             voice: self.voice.clone(),
             kind_open: self.kind_open,
+            inputs: self.inputs.clone(),
+            agents_open: self.agents_open.clone(),
         }
     }
 }
@@ -344,18 +347,24 @@ impl CanvasState {
             agents: crate::agents::AgentsState::default(),
             voice: crate::voice::VoiceBus::default(),
             kind_open: false,
+            inputs: std::collections::HashMap::new(),
+            agents_open: None,
         };
         state.seed_sessions();
         state
     }
 
     /// Seed session tabs from the scene cards (cards predate threads;
-    /// threads materialize on open/send).
+    /// threads materialize on open/send). Draft inputs are ensured too, so
+    /// the card dock always has a backing field.
     pub fn seed_sessions(&mut self) {
         for card in &self.cards {
             if !self.sessions.order.contains(&card.id) {
                 self.sessions.order.push(card.id.clone());
             }
+            self.inputs
+                .entry(card.id.clone())
+                .or_insert_with(|| rune::TextEdit::new(""));
         }
         if self.active_id.is_empty() {
             self.active_id = self.sessions.order.first().cloned().unwrap_or_default();
@@ -413,6 +422,13 @@ impl CanvasState {
             .expect("thread ensured above")
     }
 
+    /// Get-or-create the message draft for a card.
+    pub fn input_mut(&mut self, id: &str) -> &mut rune::TextEdit {
+        self.inputs
+            .entry(id.to_string())
+            .or_insert_with(|| rune::TextEdit::new(""))
+    }
+
     /// Open the transcript sheet for a card (ensures its thread).
     pub fn open_sheet(&mut self, id: &str) {
         if self.card(id).is_none() {
@@ -458,6 +474,9 @@ impl CanvasState {
             running: false,
         });
         let _ = self.thread_mut(&id);
+        self.inputs
+            .entry(id.clone())
+            .or_insert_with(|| rune::TextEdit::new(""));
         self.select_card(&id);
         id
     }
@@ -507,29 +526,6 @@ pub trait CanvasHost {
     fn canvas_mut(&mut self) -> &mut CanvasState;
 }
 
-/// Home hosting: the map canvas plus its projects rail. One bound covers
-/// the canvas-local panels (chats, projects, agents, sessions), so the
-/// sidebar can never disagree with the board state. Cloud/memory/house
-/// panels render shell-side (their state lives on `ShellState`).
-pub trait HomeHost:
-    CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost + SessionsHost
-{
-}
-
-impl<T: CanvasHost + crate::projects::ProjectsHost + crate::agents::AgentsHost + SessionsHost>
-    HomeHost for T
-{
-}
-
-impl SessionsHost for CanvasState {
-    fn sessions_mut(&mut self) -> &mut Sessions {
-        &mut self.sessions
-    }
-    fn sessions(&self) -> &Sessions {
-        &self.sessions
-    }
-}
-
 impl CanvasHost for CanvasState {
     fn canvas_mut(&mut self) -> &mut CanvasState {
         self
@@ -548,7 +544,134 @@ impl crate::agents::AgentsHost for CanvasState {
     }
 }
 
-fn card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> El {
+/// Compact card bubble (`CanvasChatBubble` at card scale): avatar, name head
+/// (+ `auto` badge, typing dots when live), plain wrapped text, clock foot.
+/// Card bodies render raw text like `.canvas-bubble-text` — no markdown pass.
+fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) -> El {
+    let (fill, hair_a, avatar_bg, initial, name, body_ink) = match r.role {
+        "user" => ("#28282f", 0.075, "#303038", "U", "You", "#dedee5"),
+        "error" => ("#fb718511", 0.24, "#3a2226", "!", "Error", "#d2d2da"),
+        "system" => ("#101013", 0.05, "#24242a", "S", "System", "#d2d2da"),
+        _ => ("#19191e", 0.05, "#24242a", "A", "Agent", "#d2d2da"),
+    };
+    let hairline = if r.role == "error" {
+        ink("#fb71853d")
+    } else if live_row {
+        rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.10,
+        }
+    } else {
+        rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: hair_a,
+        }
+    };
+    let mut head = row().items_center().gap(6.0).child(
+        text(name.to_string())
+            .font(rune::tok::TextStyle::new(10.0, 650.0))
+            .color(ink("#f0f0f3")),
+    );
+    if r.role == "agent" || r.role == "system" {
+        // `auto` badge in the head row, like `.canvas-bubble-badge`.
+        head = head.child(
+            text("auto".to_string())
+                .key(format!("{id}-mini-{}-badge", r.key))
+                .font(rune::tok::TextStyle::new(8.0, 600.0))
+                .px(5.0)
+                .py(1.0)
+                .radius(5.0)
+                .fill(ink("#2b2b32"))
+                .color(ink("#9696a0")),
+        );
+    }
+    let mut bubble = col()
+        .key(format!("{id}-mini-{}", r.key))
+        .radius(12.0)
+        .fill(ink(if live_row { "#1b1b20" } else { fill }))
+        .border(1.0, hairline)
+        .px(10.0)
+        .py(8.0)
+        .child(head)
+        .child(
+            text(r.body.clone())
+                .font(rune::tok::TextStyle::new(11.5, 400.0))
+                .wrap()
+                .color(ink(body_ink)),
+        );
+    if live_row {
+        let mut dots = row().items_center().gap(3.0).pt(4.0);
+        for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
+            dots = dots.child(
+                rune::el()
+                    .key(format!("{id}-mini-{}-t{n}", r.key))
+                    .size(3.0, 3.0)
+                    .radius(1.5)
+                    .fill(ink("#9b9ba5"))
+                    .looping(rune::LoopSpec::opacity(1.1, delay, 0.35, 1.0)),
+            );
+        }
+        bubble = bubble.child(dots);
+    }
+    let t = crate::rune_transcript::clock(&r.at);
+    if !t.is_empty() {
+        bubble = bubble.child(
+            text(t)
+                .key(format!("{id}-mini-{}-time", r.key))
+                .font(rune::tok::TextStyle::new(9.0, 400.0))
+                .color(ink("#71717a")),
+        );
+    }
+    let message = row()
+        .key(format!("{id}-minrow-{}", r.key))
+        .w_full()
+        .gap(6.0);
+    if r.role == "user" {
+        message
+            .child(bubble.max_w(300.0))
+            .child(
+                rune::el()
+                    .size(18.0, 18.0)
+                    .radius(9.0)
+                    .fill(ink(avatar_bg))
+                    .center()
+                    .child(
+                        text(initial.to_string())
+                            .font(rune::tok::TextStyle::new(8.0, 700.0))
+                            .color(ink("#e6e6ec")),
+                    ),
+            )
+            .justify_end()
+    } else {
+        message
+            .child(
+                rune::el()
+                    .size(18.0, 18.0)
+                    .radius(9.0)
+                    .fill(ink(avatar_bg))
+                    .center()
+                    .child(
+                        text(initial.to_string())
+                            .font(rune::tok::TextStyle::new(8.0, 700.0))
+                            .color(ink("#c9c9d1")),
+                    ),
+            )
+            .child(bubble.grow(1.0).min_h(0.0))
+    }
+}
+
+fn card_view<S: CanvasHost + 'static>(
+    card: &MapCard,
+    active: bool,
+    thread: Option<&crate::rune_transcript::RuneTranscriptState>,
+    input: &rune::TextEdit,
+    kids: &[(String, String)],
+    menu_open: bool,
+) -> El {
     let (w, h) = card.size();
     let radius = if card.compact { 16.0 } else { 18.0 };
     let id = card.id.clone();
@@ -627,12 +750,51 @@ fn card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> El {
                     ),
             );
     }
-    // Status pill: breathing dot while running (`house-breathe` language).
-    let mut head = row()
+    // Card status from the thread (`childStatus`): the run dot while live,
+    // failed on an error tail, done once rows exist, idle otherwise. Queued
+    // has no Rune-side signal (no server row until detail loads) — running
+    // covers the in-flight case.
+    let (live, status): (bool, &'static str) = match thread {
+        Some(t) if t.live => (true, "running"),
+        Some(t) if t.rows.last().is_some_and(|r| r.role == "error") => (false, "failed"),
+        Some(t) if !t.rows.is_empty() => (false, "done"),
+        _ => (false, "idle"),
+    };
+    // Status badge (`StatusBadge`): pulse while running, ✓ done, ✕ failed,
+    // quiet dot idle. Rune has no icon font — glyphs, same geometry.
+    let badge: El = match status {
+        "running" => rune::el()
+            .key(format!("{id}-badge"))
+            .size(8.0, 8.0)
+            .radius(4.0)
+            .fill(ink("#ededf0"))
+            .looping(rune::LoopSpec::opacity(2.2, 0.0, 0.35, 1.0)),
+        "done" => text("✓".to_string())
+            .key(format!("{id}-badge"))
+            .font(rune::tok::TextStyle::new(11.0, 700.0))
+            .color(ink("#34d399")),
+        "failed" => text("✕".to_string())
+            .key(format!("{id}-badge"))
+            .font(rune::tok::TextStyle::new(11.0, 700.0))
+            .color(ink("#f87171")),
+        _ => rune::el()
+            .key(format!("{id}-badge"))
+            .size(6.0, 6.0)
+            .radius(3.0)
+            .fill(ink("#52525b")),
+    };
+    let open_id = id.clone();
+    let close_id = id.clone();
+    let menu_id = id.clone();
+    // Header (`canvas-card-head`): grip (the drag handle), type icon, linked
+    // title + subtitle, status, agents menu, close. The title opens the chat
+    // (`titleOpen`); close removes the card (`onRemove` — same as tab × here,
+    // local scene state only).
+    let head = row()
         .key(format!("{id}-head"))
         .w_full()
         .items_center()
-        .gap(10.0)
+        .gap(8.0)
         .px(14.0)
         .pt(14.0)
         .pb(10.0)
@@ -663,51 +825,250 @@ fn card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> El {
             }
         })
         .child(
-            col()
+            row()
                 .key(format!("{id}-titles"))
                 .grow(1.0)
                 .min_h(0.0)
                 .child(
-                    text(card.title.clone())
-                        .key(format!("{id}-title"))
-                        // Compact cards step down (15px → 13.5px), like
-                        // `.canvas-card.is-compact .canvas-card-title`.
-                        .font(rune::tok::TextStyle::new(
-                            if card.compact { 13.5 } else { 15.0 },
-                            600.0,
-                        ))
-                        .color(ink("#f2f2f5")),
+                    rune::el().key(format!("{id}-grip")).child(
+                        text("⋮⋮".to_string())
+                            .font(rune::tok::TextStyle::new(11.0, 700.0))
+                            .color(ink("#52525b")),
+                    ),
                 )
                 .child(
-                    text(card.subtitle.clone())
-                        .key(format!("{id}-subtitle"))
-                        // Compact: 11.5px → 10.5px (`.canvas-card-subtitle`).
-                        .font(rune::tok::TextStyle::new(
-                            if card.compact { 10.5 } else { 11.5 },
-                            400.0,
-                        ))
-                        .color(ink("#8a8a93")),
+                    rune::el()
+                        .key(format!("{id}-typeicon"))
+                        .size(22.0, 22.0)
+                        .radius(6.0)
+                        .fill(ink("#24242a"))
+                        .center()
+                        .child(
+                            text(
+                                card.kind
+                                    .chars()
+                                    .next()
+                                    .unwrap_or('C')
+                                    .to_uppercase()
+                                    .to_string(),
+                            )
+                            .font(rune::tok::TextStyle::new(11.0, 700.0))
+                            .color(ink("#c9c9d1")),
+                        ),
+                )
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .role("button")
+                        .label(format!("Open {}", card.title))
+                        .on_press(move |s: &mut S| {
+                            s.canvas_mut().open_sheet(&open_id);
+                        })
+                        .child(
+                            text(card.title.clone())
+                                .key(format!("{id}-title"))
+                                // Compact cards step down (15px → 13.5px), like
+                                // `.canvas-card.is-compact .canvas-card-title`.
+                                .font(rune::tok::TextStyle::new(
+                                    if card.compact { 13.5 } else { 15.0 },
+                                    600.0,
+                                ))
+                                .color(ink("#f2f2f5")),
+                        )
+                        .child(
+                            text(card.subtitle.clone())
+                                .key(format!("{id}-subtitle"))
+                                // Compact: 11.5px → 10.5px (`.canvas-card-subtitle`).
+                                .font(rune::tok::TextStyle::new(
+                                    if card.compact { 10.5 } else { 11.5 },
+                                    400.0,
+                                ))
+                                .color(ink("#8a8a93")),
+                        ),
                 ),
-        );
-    if card.running {
-        head = head.child(
-            rune::el()
-                .key(format!("{id}-status"))
-                .size(8.0, 8.0)
-                .radius(4.0)
-                .fill(ink("#ededf0"))
-                .looping(rune::LoopSpec::opacity(2.2, 0.0, 0.35, 1.0)),
-        );
-    }
-    view.child(head)
+        )
+        .child(badge)
+        .child({
+            let mut agents_btn = row()
+                .key(format!("{id}-agents"))
+                .items_center()
+                .gap(4.0)
+                .role("button")
+                .label(format!("Connected agents ({})", kids.len()))
+                .on_press(move |s: &mut S| {
+                    let c = s.canvas_mut();
+                    if c.agents_open.as_deref() == Some(menu_id.as_str()) {
+                        c.agents_open = None;
+                    } else {
+                        c.agents_open = Some(menu_id.clone());
+                    }
+                })
+                .child(
+                    text("⤢".to_string())
+                        .font(rune::tok::TextStyle::new(12.0, 400.0))
+                        .color(ink("#71717a")),
+                );
+            if !kids.is_empty() {
+                agents_btn = agents_btn.child(
+                    text(kids.len().to_string())
+                        .key(format!("{id}-agents-count"))
+                        .font(rune::tok::TextStyle::new(9.0, 600.0))
+                        .color(ink("#a1a1aa")),
+                );
+            }
+            agents_btn
+        })
         .child(
+            text("×".to_string())
+                .key(format!("{id}-close"))
+                .role("button")
+                .label(format!("Close {}", card.title))
+                .font(rune::tok::TextStyle::new(13.0, 400.0))
+                .color(ink("#71717a"))
+                .on_press(move |s: &mut S| {
+                    s.canvas_mut().close_session(&close_id);
+                }),
+        );
+    // Conversation (`canvas-card-conversation`): the thread's last rows as
+    // compact bubbles, or the empty line when nothing ran yet.
+    let convo = match thread {
+        Some(t) if !t.rows.is_empty() => {
+            let mut convo = col().key(format!("{id}-convo")).w_full().gap(8.0).px(14.0);
+            let n = t.rows.len();
+            for r in t.rows.iter().skip(n.saturating_sub(4)) {
+                convo = convo.child(mini_bubble(&id, r, live && r.key == "live-agent"));
+            }
+            convo
+        }
+        _ => col().key(format!("{id}-convo")).w_full().px(14.0).child(
             text(card.preview.clone())
                 .key(format!("{id}-preview"))
-                .px(16.0)
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .font(rune::tok::TextStyle::new(11.5, 400.0))
                 .wrap()
                 .color(ink("#92959e")),
+        ),
+    };
+    view = view.child(head);
+    // Connected-agents menu (`canvas-card-agent-menu`): child chats of this
+    // card; a press selects the child.
+    if menu_open {
+        let mut menu = col()
+            .key(format!("{id}-agents-menu"))
+            .w_full()
+            .gap(2.0)
+            .px(14.0)
+            .child(
+                text("Connected agents".to_string())
+                    .font(rune::tok::TextStyle::new(9.0, 600.0))
+                    .color(ink("#52525b")),
+            );
+        if kids.is_empty() {
+            menu = menu.child(
+                text("No connected agents.".to_string())
+                    .font(rune::tok::TextStyle::new(10.0, 400.0))
+                    .color(ink("#52525b")),
+            );
+        }
+        for (kid_id, kid_title) in kids {
+            let target = kid_id.clone();
+            menu = menu.child(
+                row()
+                    .key(format!("{id}-agent-{kid_id}"))
+                    .w_full()
+                    .items_center()
+                    .gap(8.0)
+                    .radius(6.0)
+                    .px(8.0)
+                    .py(5.0)
+                    .role("button")
+                    .label(format!("Open {kid_title}"))
+                    .on_press(move |s: &mut S| {
+                        let c = s.canvas_mut();
+                        c.agents_open = None;
+                        c.select_card(&target);
+                    })
+                    .child(
+                        text(kid_title.clone())
+                            .font(rune::tok::TextStyle::new(11.0, 500.0))
+                            .color(ink("#d4d4d8")),
+                    ),
+            );
+        }
+        view = view.child(menu);
+    }
+    view = view.child(convo);
+    // Card dock (`canvas-card-dock`): per-card input + send. Placeholder and
+    // disabled state mirror the React form exactly: type-ahead while the run
+    // is live, no double-send. No attach button / drop overlay / ask panel —
+    // file pickers, drag-drop and agent questions have no Rune target
+    // (documented, not faked).
+    let draft_empty = input.text.trim().is_empty();
+    let send_id = id.clone();
+    let edit_id = id.clone();
+    let dock = row()
+        .key(format!("{id}-dock"))
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .px(14.0)
+        .pt(8.0)
+        .child(
+            text_input(input, rune::tok::TextStyle::new(12.0, 400.0))
+                .key(format!("{id}-input"))
+                .grow(1.0)
+                .min_h(0.0)
+                .placeholder(
+                    if live {
+                        "Agent is running — you can type ahead…"
+                    } else {
+                        "Message this chat…"
+                    },
+                    ink("#52525b"),
+                )
+                .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                .on_edit(move |s: &mut S| s.canvas_mut().input_mut(&edit_id)),
         )
+        .child({
+            let disabled = live || draft_empty;
+            let send_label = id.clone();
+            rune::el()
+                .key(format!("{id}-send"))
+                .role("button")
+                .label(format!("Send to {send_label}"))
+                .size(28.0, 28.0)
+                .radius(14.0)
+                .fill(ink(if disabled { "#2a2a2e" } else { "#ffffff" }))
+                .center()
+                .on_press(move |s: &mut S| {
+                    let c = s.canvas_mut();
+                    let prompt = c
+                        .inputs
+                        .get(&send_id)
+                        .map(|e| e.text.trim().to_string())
+                        .unwrap_or_default();
+                    if prompt.is_empty() {
+                        return;
+                    }
+                    if c.sessions.threads.get(&send_id).is_some_and(|t| t.live) {
+                        return;
+                    }
+                    if let Some(e) = c.inputs.get_mut(&send_id) {
+                        e.text.clear();
+                        e.anchor = 0;
+                        e.focus = 0;
+                    }
+                    let thread = c.thread_mut(&send_id);
+                    crate::rune_transcript::stage_send_prompt(thread, prompt);
+                })
+                .child(
+                    text("↑".to_string())
+                        .font(rune::tok::TextStyle::new(13.0, 650.0))
+                        .color(ink(if disabled { "#71717a" } else { "#111113" })),
+                )
+        });
+    view = view
+        .child(dock)
         // Edge ports (`.canvas-card-port`): 9px dots centred on the top and
         // bottom rims where the beziers land. Inert (`pointer-events: none`).
         .child(
@@ -729,7 +1090,8 @@ fn card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> El {
                 .fill(ink("#1b1b20"))
                 .border(1.0, ink("#44444c"))
                 .inert(),
-        )
+        );
+    view
 }
 
 pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
@@ -820,7 +1182,24 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             .shape(shape),
     );
     for card in &s.cards {
-        world = world.child(card_view::<S>(card, card.id == s.active_id));
+        let kids: Vec<(String, String)> = s
+            .edges
+            .iter()
+            .filter(|(p, _)| p == &card.id)
+            .filter_map(|(_, c)| s.card(c).map(|k| (k.id.clone(), k.title.clone())))
+            .collect();
+        let blank = rune::TextEdit::new("");
+        // Inputs are ensured in `seed_sessions`/`new_session`; the blank is
+        // a borrow-safe fallback that never renders (every card has one).
+        let input = s.inputs.get(&card.id).unwrap_or(&blank);
+        world = world.child(card_view::<S>(
+            card,
+            card.id == s.active_id,
+            s.sessions.threads.get(&card.id),
+            input,
+            &kids,
+            s.agents_open.as_deref() == Some(card.id.as_str()),
+        ));
     }
     // Fixed-chrome area: clips the scaled world, holds composer + HUD.
     // `grow` (not `h_full`): shares a shell row without overflowing it.
@@ -937,7 +1316,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
 
 /// Chats panel: kind dropdown + new chat, live search, and one row per chat
 /// filtered by kind + query. A row press selects and focuses the card.
-pub fn chats_panel<S: CanvasHost + SessionsHost + 'static>(s: &CanvasState) -> El {
+pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
     let mut panel = col()
         .key("map-sidebar")
         .w(MAP_SIDEBAR_W)
@@ -1114,6 +1493,84 @@ mod tests {
     }
 
     #[test]
+    fn card_shows_mini_thread_and_sends_into_it() {
+        fn card_view_only(s: &CanvasState, _: &mut rune::Cx<CanvasState>) -> El {
+            col()
+                .key("card-test-root")
+                .w_full()
+                .h_full()
+                .child(canvas_body::<CanvasState>(s))
+        }
+        let env = Env::new(true, 1.0);
+        let mut init = CanvasState::map();
+        init.agents.auto = false;
+        // Seed a thread with two stamped rows on chat-1; chat-2 stays empty.
+        let id = "chat:ws-general:chat-1".to_string();
+        let thread = init.thread_mut(&id);
+        thread.api_port = 1;
+        thread.rows = vec![
+            crate::rune_transcript::RowData {
+                key: "u1".to_string(),
+                role: "user",
+                body: "hey how much 4152-5".to_string(),
+                at: "2026-11-09T14:44:00Z".to_string(),
+            },
+            crate::rune_transcript::RowData {
+                key: "a1".to_string(),
+                role: "agent",
+                body: "4152 ÷ 5 = 830.4".to_string(),
+                at: "2026-11-09T14:44:30Z".to_string(),
+            },
+        ];
+        let mut rt = Runtime::new(init, card_view_only, (MAP_W, MAP_H), env);
+        rt.frame(0.0);
+        let card = "chat:ws-general:chat-1";
+        let empty = "chat:ws-general:chat-2";
+        // Mini bubbles + clocks mount; the empty card shows its preview.
+        for key in [
+            format!("{card}-convo"),
+            format!("{card}-mini-u1-time"),
+            format!("{card}-mini-a1"),
+            format!("{card}-input"),
+            format!("{card}-send"),
+            format!("{empty}-preview"),
+        ] {
+            assert!(rt.find(&key).is_some(), "{key} mounted");
+        }
+        // Header chrome: badge (done ✓), agents menu, close.
+        for key in [
+            format!("{card}-badge"),
+            format!("{card}-agents"),
+            format!("{card}-close"),
+        ] {
+            assert!(rt.find(&key).is_some(), "{key} mounted");
+        }
+        // Per-card send lands in THIS thread only (api_port 1: the run
+        // thread fails fast into an error frame, deterministically).
+        rt.state.inputs.get_mut(card).unwrap().text = "ping".to_string();
+        let (x, y) = rt.find(&format!("{card}-send")).unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let threads = &rt.state.sessions.threads;
+        assert!(
+            threads
+                .get(card)
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| r.body == "ping"),
+            "prompt lands in card thread"
+        );
+        assert!(
+            threads.get(empty).map(|t| t.rows.len()).unwrap_or(0) == 0,
+            "other threads untouched"
+        );
+    }
+
+    #[test]
     fn chats_panel_filters_searches_and_selects() {
         fn panel_view(s: &CanvasState, _: &mut rune::Cx<CanvasState>) -> El {
             col()
@@ -1252,7 +1709,10 @@ mod tests {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(CanvasState::map(), canvas_view, (MAP_W, MAP_H), env);
         rt.frame(0.0);
-        let (x, y) = rt.find("chat:ws-general:chat-1-head").unwrap();
+        // Drag from the grip: the head now carries buttons (title opens the
+        // sheet), so the grip is the drag-safe spot — like React's
+        // `GripVertical` handle inside `data-canvas-drag-handle`.
+        let (x, y) = rt.find("chat:ws-general:chat-1-grip").unwrap();
         let (x0, y0) = (rt.state.cards[0].x, rt.state.cards[0].y);
         rt.pointer_down(x, y);
         rt.frame(1.0 / 60.0);
@@ -1274,7 +1734,7 @@ mod tests {
         rt.frame(0.0);
         let run_id = "chat:ws-general:chat-4";
         let idle_id = "chat:ws-general:chat-1";
-        for key in [format!("{run_id}-sheen"), format!("{run_id}-status")] {
+        for key in [format!("{run_id}-sheen"), format!("{run_id}-badge")] {
             assert!(rt.find(&key).is_some(), "{key} mounted on running card");
         }
         assert!(

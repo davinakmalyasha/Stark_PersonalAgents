@@ -26,6 +26,60 @@ pub struct RowData {
     pub key: String,
     pub role: &'static str,
     pub body: String,
+    /// ISO-8601 creation stamp (`CanvasChatBubble clock()` renders it as
+    /// `hh:MM AM/PM` in the bubble foot). Empty for scene fixtures.
+    pub at: String,
+}
+
+/// Now as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), matching the server wire
+/// shape the other time helpers parse.
+pub fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Days → civil date (Howard Hinnant's algorithm, inverted).
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        if m <= 2 { y + 1 } else { y },
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// `02:44 PM` (`CanvasChatBubble clock()`): locale 12h clock. Empty in,
+/// empty out.
+pub fn clock(iso: &str) -> String {
+    let digits: String = iso.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 12 {
+        return String::new();
+    }
+    let part = |from: usize, len: usize| digits[from..from + len].parse::<i64>().unwrap_or(0);
+    let (h, mi) = (part(8, 2), part(10, 2));
+    if mi > 59 || h > 23 {
+        return String::new();
+    }
+    let (h12, ap) = match h {
+        0 => (12, "AM"),
+        1..=11 => (h, "AM"),
+        12 => (12, "PM"),
+        _ => (h - 12, "PM"),
+    };
+    format!("{h12:02}:{mi:02} {ap}")
 }
 
 pub struct RuneTranscriptState {
@@ -102,11 +156,13 @@ impl RuneTranscriptState {
                     key: "msg-0".to_string(),
                     role: "user",
                     body: "can you use a music api or smth, makes green green real, playing now in your tab, something like that, and play that in current youtube".to_string(),
+                    at: "2026-11-09T14:44:00Z".to_string(),
                 },
                 RowData {
                     key: "msg-1".to_string(),
                     role: "agent",
                     body: "Playing now in your YouTube tab: **massive green day** — `Cinnamon Girl` (8yr-old).\n\n```text\ntrack is running (04:48)\n```".to_string(),
+                    at: "2026-11-09T14:45:00Z".to_string(),
                 },
             ],
             edit: TextEdit::new(""),
@@ -141,6 +197,7 @@ impl RuneTranscriptState {
                 key: format!("msg-{i}"),
                 role,
                 body,
+                at: String::new(),
             });
         }
         Self {
@@ -367,6 +424,7 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
         key: format!("user-{n}"),
         role: "user",
         body: prompt.clone(),
+        at: now_iso(),
     });
     s.live = true;
     // The abort path needs the same id the run started with: mint one per
@@ -435,14 +493,12 @@ pub fn stage_abort(s: &mut RuneTranscriptState) {
 
 /// Host access for views composed into a larger shell: handlers stay typed to
 /// the shell state while reading transcript data. The standalone transcript
-/// view hosts itself. Threads (`Main` chat vs `Personal` room) select which
-/// transcript a composed view reads and writes; `Open` is the transcript
+/// view hosts itself. `Main` is the fallback thread; `Open` is the transcript
 /// sheet's card thread (resolved through the sessions map — one page, chat
 /// types only, no workspace routes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Thread {
     Main,
-    Personal,
     Open,
 }
 
@@ -554,6 +610,18 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                             .color(ink("#f0f0f3")),
                     )
                     .child(render_body(&r.key, &r.body, body_ink));
+                // Bubble foot (`canvas-bubble-foot`): `hh:MM AM/PM`, nothing
+                // else — copy/rewind need clipboard + server endpoints Rune
+                // has no target for, so they stay out (documented, not faked).
+                let bubble = match clock(&r.at) {
+                    t if t.is_empty() => bubble,
+                    t => bubble.child(
+                        text(t)
+                            .key(format!("{}-time", r.key))
+                            .font(rune::tok::TextStyle::new(10.0, 400.0))
+                            .color(ink("#71717a")),
+                    ),
+                };
                 // Typing bounce on the live row only (`.canvas-bubble-typing`).
                 let bubble = if live_row {
                     let mut dots = row()
@@ -890,6 +958,24 @@ mod tests {
     use rune::{Env, Runtime};
 
     #[test]
+    fn clock_shapes() {
+        assert_eq!(clock("2026-11-09T14:44:00Z"), "02:44 PM");
+        assert_eq!(clock("2026-11-09T00:05:00Z"), "12:05 AM");
+        assert_eq!(clock("2026-11-09T12:00:00Z"), "12:00 PM");
+        assert_eq!(clock(""), "");
+        assert_eq!(clock("garbage"), "");
+    }
+
+    #[test]
+    fn now_iso_roundtrips_through_agents_relative_time() {
+        // Same wire shape the server emits; the agents helper parses it.
+        let iso = now_iso();
+        assert!(iso.len() >= 20 && iso.ends_with('Z'));
+        assert_eq!(crate::agents::relative_time(&iso), "just now");
+        assert_eq!(clock(&iso).len(), 8);
+    }
+
+    #[test]
     fn transcript_commits_and_rows_are_findable() {
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(
@@ -909,6 +995,8 @@ mod tests {
         }
         assert!(rt.find("composer-card").is_some());
         assert!(rt.find("composer-input").is_some());
+        // Scene rows carry stamps, so bubble feet render the clock.
+        assert!(rt.find("msg-0-time").is_some());
         // The screenshot scene is mid-run (`live: true`), so the dock shows
         // Stop, not Send (`.send-button.stop`).
         assert!(rt.find("composer-stop").is_some());

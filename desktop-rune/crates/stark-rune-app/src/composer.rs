@@ -17,39 +17,44 @@ pub type Pick<S> = std::rc::Rc<dyn Fn(&mut S, String)>;
 
 /// Level meter: five bars lit by bucket, plus the capture note (no-device
 /// reason) when present. Mounted beside the voice toggle while live.
-fn voice_meter(live: bool, level: f32, note: Option<&str>) -> El {
-    let lit = if live {
-        crate::voice::lit_bars(level)
-    } else {
-        0
-    };
-    let mut bars = row().key("voice-meter").items_center().gap(3.0);
-    for i in 0..5 {
-        let h = 4.0 + i as f32 * 3.0;
-        bars = bars.child(
-            rune::el()
-                .key(format!("voice-bar-{i}"))
-                .size(3.0, h)
-                .radius(1.5)
-                .fill(ink(if live && i < lit {
-                    "#ededf0"
-                } else {
-                    "#3a3a40"
-                })),
-        );
-    }
-    let mut meter = col().key("voice-meter-wrap").gap(2.0).child(bars);
-    if live {
-        if let Some(note) = note {
-            meter = meter.child(
-                text(note.to_string())
-                    .key("voice-note")
-                    .font(rune::tok::TextStyle::new(10.0, 400.0))
-                    .color(ink("#8a8a93")),
-            );
-        }
-    }
-    meter
+fn attach_button() -> El {
+    // `.tool-button` (Plus 18): React's file picker. Rune has no attachment
+    // pipeline yet, so the control is present but inert — the dock's shape
+    // still matches HouseChat.
+    let color = ink("#b4b4bc");
+    let plus = rune::Shape::new()
+        .line([12.0, 5.0], [12.0, 19.0], 1.8, rune::LineCap::Round, color)
+        .line([5.0, 12.0], [19.0, 12.0], 1.8, rune::LineCap::Round, color)
+        .view_box(24.0, 24.0);
+    rune::el()
+        .key("composer-attach")
+        .role("button")
+        .label("Attach files")
+        .size(30.0, 30.0)
+        .radius(10.0)
+        .center()
+        .inert()
+        .child(rune::el().size(18.0, 18.0).inert().shape(plus))
+}
+
+/// Lucide `AudioLines` (16pt) inside the voice toggle.
+fn voice_icon(color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([2.0, 10.0])
+        .line_to([2.0, 13.0])
+        .move_to([6.0, 6.0])
+        .line_to([6.0, 17.0])
+        .move_to([10.0, 3.0])
+        .line_to([10.0, 21.0])
+        .move_to([14.0, 8.0])
+        .line_to([14.0, 15.0])
+        .move_to([18.0, 5.0])
+        .line_to([18.0, 18.0])
+        .move_to([22.0, 10.0])
+        .line_to([22.0, 13.0]);
+    rune::Shape::new()
+        .stroke_path(&p, 1.8, rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
 }
 
 /// Voice toggle button. `S` is the owning view's state type.
@@ -84,9 +89,9 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
         button = button.fill(ink("#303035")).child(
             rune::el()
                 .key("composer-voice-dot")
-                .size(8.0, 8.0)
-                .radius(4.0)
-                .fill(ink("#b6b6be")),
+                .size(16.0, 16.0)
+                .inert()
+                .shape(voice_icon(ink("#b6b6be"))),
         );
     }
     button
@@ -117,19 +122,43 @@ pub struct ComposerMeta<'a> {
 /// Cloud active is sky with a pulsing cloud; inactive sides are dim zinc.
 /// Flipping only re-marks the next prompt (the transfer lands next — sends
 /// behave identically either way, same as React).
+/// Lucide `CloudOff` / `Cloud` at a 12pt box for the run-target toggle.
+fn cloud_icon(off: bool, color: rune::Color) -> rune::Shape {
+    let mut p = rune::Path::new()
+        .move_to([7.0, 7.8])
+        .cubic_to([4.8, 9.0], [3.5, 11.0], [3.5, 13.2])
+        .cubic_to([3.5, 16.0], [5.8, 18.0], [8.6, 18.0])
+        .line_to([17.3, 18.0])
+        .cubic_to([19.9, 18.0], [21.5, 16.0], [21.5, 13.7])
+        .cubic_to([21.5, 11.5], [19.7, 9.8], [17.5, 9.8])
+        .line_to([16.8, 9.8])
+        .cubic_to([16.2, 6.2], [13.2, 4.0], [10.0, 4.8])
+        .cubic_to([9.1, 5.0], [8.1, 5.6], [7.3, 6.4]);
+    if off {
+        p = p.move_to([3.0, 3.0]).line_to([21.0, 21.0]);
+    }
+    rune::Shape::new()
+        .stroke_path(&p, 1.7, rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
 fn target_toggle<S: 'static>(
     target: &str,
     on_local: impl Fn(&mut S) + 'static,
     on_cloud: impl Fn(&mut S) + 'static,
 ) -> El {
     let cloud_active = target == "cloud";
-    let mut cloud_icon = text("☁".to_string())
+    let mut cloud = rune::el()
         .key("composer-target-cloud-icon")
-        .font(rune::tok::TextStyle::new(11.0, 400.0))
-        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" }));
+        .size(12.0, 12.0)
+        .inert()
+        .shape(cloud_icon(
+            !cloud_active,
+            ink(if cloud_active { "#7dd3fc" } else { "#71717a" }),
+        ));
     if cloud_active {
         // React pulses the cloud icon (`animate-pulse`); same rhythm here.
-        cloud_icon = cloud_icon.looping(rune::LoopSpec::opacity(1.4, 0.0, 0.4, 1.0));
+        cloud = cloud.looping(rune::LoopSpec::opacity(1.4, 0.0, 0.4, 1.0));
     }
     row()
         .key("composer-target")
@@ -137,12 +166,18 @@ fn target_toggle<S: 'static>(
         .radius(8.0)
         .fill(ink("#00000000"))
         .border(1.0, ink("#27272a"))
+        .border_layout()
         .child(
             text("Local".to_string())
                 .key("composer-target-local")
                 .role("button")
                 .label("Run on Local — click to target Cloud (VPS)")
-                .font(rune::tok::TextStyle::new(11.0, 500.0))
+                .font({
+                    // `text-[11px]` at Tailwind's 1.5 line-height.
+                    let mut style = rune::tok::TextStyle::new(11.0, 500.0);
+                    style.line_height = 16.5;
+                    style
+                })
                 .px(8.0)
                 .py(6.0)
                 .radius(6.0)
@@ -166,10 +201,14 @@ fn target_toggle<S: 'static>(
                     "#00000000"
                 }))
                 .on_press(on_cloud)
-                .child(cloud_icon)
+                .child(cloud)
                 .child(
                     text("Cloud".to_string())
-                        .font(rune::tok::TextStyle::new(11.0, 500.0))
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(11.0, 500.0);
+                            style.line_height = 16.5;
+                            style
+                        })
                         .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" })),
                 ),
         )
@@ -225,6 +264,28 @@ fn usage_orb<S: 'static>(
                 .font(rune::tok::TextStyle::new(9.0, 400.0))
                 .color(ink(number_ink)),
         );
+    // Track ring (`.usage-ring-track`): always visible, even at 0%.
+    let track: Vec<[f32; 2]> = (0..steps)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2
+                + (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
+            [15.5 + 13.0 * a.cos(), 15.5 + 13.0 * a.sin()]
+        })
+        .collect();
+    orb = orb.child(
+        rune::el()
+            .key("composer-usage-track")
+            .absolute(0.0, 0.0)
+            .size(31.0, 31.0)
+            .inert()
+            .shape(rune::Shape::new().stroke_with(
+                track,
+                true,
+                2.2,
+                rune::LineCap::Round,
+                ink("#ffffff21"),
+            )),
+    );
     if n > 0 {
         orb = orb.child(
             rune::el()
@@ -235,7 +296,7 @@ fn usage_orb<S: 'static>(
                 .shape(rune::Shape::new().stroke_with(
                     pts,
                     false,
-                    3.0,
+                    2.2,
                     rune::LineCap::Round,
                     ink(ring_ink),
                 )),
@@ -321,7 +382,12 @@ fn provider_pill<S: 'static>(label: &str, warn: bool, on_config: Press<S>) -> El
     .key("composer-provider")
     .role("button")
     .label("Configure agents and providers")
-    .font(rune::tok::TextStyle::new(11.0, 400.0))
+    .font({
+        // `.provider-trigger`: font-size 11px, line-height 1.
+        let mut style = rune::tok::TextStyle::new(11.0, 400.0);
+        style.line_height = 11.0;
+        style
+    })
     .px(8.0)
     .py(7.0)
     .radius(9.0)
@@ -332,6 +398,7 @@ fn provider_pill<S: 'static>(label: &str, warn: bool, on_config: Press<S>) -> El
         a: 0.04,
     })
     .border(1.0, ink("#ffffff12"))
+    .border_layout()
     .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
     .on_press(move |s: &mut S| on_config(s))
 }
@@ -346,7 +413,7 @@ fn model_dropup<S: 'static>(
     menu: Press<S>,
     pick: Pick<S>,
 ) -> El {
-    let mut wrap = col().key("composer-model").w_full().gap(4.0);
+    let mut wrap = col().key("composer-model").gap(4.0);
     let current = if model.is_empty() {
         "Automatic Fallback".to_string()
     } else {
@@ -468,11 +535,64 @@ pub fn composer_card<S: 'static>(
     meta: ComposerMeta<'_>,
     buttons: ComposerButtons<S>,
 ) -> El {
-    let (voice_live, voice_level, voice_note) = voice;
+    let (voice_live, _voice_level, _voice_note) = voice;
     let submit = {
         let on_send = buttons.send.clone();
         move |s: &mut S, _tx: &mut Tx| on_send(s)
     };
+    // Send / Stop (`.send-button`): violet when a prompt is staged, white at
+    // 72% while empty+idle, rose while running an empty prompt.
+    let has_text = !edit.text.trim().is_empty();
+    let mut send_btn = rune::el()
+        .role("button")
+        .label(if running { "Stop execution" } else { "Send" })
+        .size(34.0, 34.0)
+        .radius(17.0)
+        .center();
+    if running && !has_text {
+        send_btn = send_btn
+            .key("composer-stop")
+            .fill(ink("#5d3544"))
+            .on_press({
+                let cancel = buttons.cancel.clone();
+                move |s: &mut S| cancel(s)
+            })
+            .child(
+                text("■".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 650.0))
+                    .color(ink("#ffbac9")),
+            );
+    } else if has_text {
+        send_btn = send_btn
+            .key("composer-send")
+            .linear_gradient(
+                135.0 * std::f32::consts::PI / 180.0,
+                [(0.0, ink("#aa8dff")), (1.0, ink("#7860d9"))],
+            )
+            .on_press({
+                let on_send = buttons.send.clone();
+                move |s: &mut S| on_send(s)
+            })
+            .child(
+                text("↑".to_string())
+                    .font(rune::tok::TextStyle::new(16.0, 650.0))
+                    .color(ink("#ffffff")),
+            );
+    } else {
+        send_btn = send_btn
+            .key("composer-send")
+            .fill(ink("#ffffff"))
+            .opacity(0.72)
+            .on_press({
+                let on_send = buttons.send.clone();
+                move |s: &mut S| on_send(s)
+            })
+            .child(
+                text("↑".to_string())
+                    .font(rune::tok::TextStyle::new(16.0, 650.0))
+                    .color(ink("#111113")),
+            );
+    }
     let card = col()
         .key("composer-card")
         .w_full()
@@ -491,6 +611,7 @@ pub fn composer_card<S: 'static>(
                 a: 0.08,
             },
         )
+        .border_layout()
         .shadow(
             14.0,
             42.0,
@@ -501,130 +622,115 @@ pub fn composer_card<S: 'static>(
                 a: 0.34,
             },
         )
-        .px(12.0)
-        .pt(10.0)
-        .pb(10.0)
-        .gap(8.0)
+        // React's `.prompt-dock` has no padding of its own: the input wrapper
+        // is 54pt (10/4 + 40pt textarea) and the toolbar 54pt (border + 9/10
+        // + 34pt controls), so the bordered dock is exactly 110pt.
         .child(
-            text_input(edit, rune::tok::TextStyle::new(15.0, 400.0))
-                .key("composer-input")
+            col()
+                .key("composer-input-wrap")
                 .w_full()
-                .placeholder(
-                    if voice_live {
-                        "Listening…"
-                    } else {
-                        "Ask anything"
-                    },
-                    ink("#74747d"),
-                )
-                .caret(ink("#f2f2f4"), ink("#3b82f6"))
-                .on_edit(edit_of)
-                .on_submit(submit),
-        )
-        // Toolbar top hairline (`.prompt-toolbar border-top` — Rune draws
-        // all-side borders only, so a 1pt rule stands in).
-        .child(
-            rune::el()
-                .key("composer-div")
-                .w_full()
-                .h(1.0)
-                .fill(rune::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.07,
-                }),
-        )
-        .child(
-            row()
-                .key("composer-toolbar")
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .child(target_toggle::<S>(
-                    meta.target,
-                    {
-                        let local = buttons.local.clone();
-                        move |s: &mut S| local(s)
-                    },
-                    {
-                        let cloud = buttons.cloud.clone();
-                        move |s: &mut S| cloud(s)
-                    },
-                ))
-                .child(spacer())
-                .child(usage_orb::<S>(meta.usage, {
-                    let usage = buttons.usage.clone();
-                    move |s: &mut S| usage(s)
-                }))
-                .child(provider_pill(
-                    meta.provider_label,
-                    meta.provider_warn,
-                    buttons.config.clone(),
-                ))
-                .child(if meta.models.is_empty() {
-                    // Map dock: no model list (like `HouseChat`) — the
-                    // provider pill above is the only pill, per screenshot.
-                    rune::el()
-                        .key("composer-model-empty")
-                        .size(0.0, 0.0)
-                        .inert()
-                } else {
-                    model_dropup::<S>(
-                        meta.model,
-                        meta.models,
-                        meta.model_open,
-                        buttons.model_menu.clone(),
-                        buttons.model_pick.clone(),
-                    )
-                })
+                .px(12.0)
+                .pt(10.0)
+                .pb(4.0)
                 .child(
-                    // Voice toggle (`.prompt-voice-button`) with a 5-bar level
-                    // meter beside it while live. Levels come from the capture
-                    // thread via the voice bus; without a mic the note says so.
-                    voice_meter(voice_live, voice_level, voice_note),
+                    text_input(edit, rune::tok::TextStyle::new(15.0, 400.0))
+                        .key("composer-input")
+                        .w_full()
+                        .h(40.0)
+                        .placeholder(
+                            if voice_live {
+                                "Listening…"
+                            } else {
+                                "Ask anything"
+                            },
+                            ink("#74747d"),
+                        )
+                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                        .on_edit(edit_of)
+                        .on_submit(submit),
+                ),
+        )
+        .child(
+            col()
+                .key("composer-toolbar-wrap")
+                .w_full()
+                .px(12.0)
+                // Toolbar top hairline (`.prompt-toolbar border-top` — Rune
+                // draws all-side borders only, so a 1pt rule stands in).
+                .child(
+                    rune::el()
+                        .key("composer-div")
+                        .w_full()
+                        .h(1.0)
+                        .fill(rune::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 0.07,
+                        }),
                 )
-                .child(voice_button(voice_live, {
-                    let voice = buttons.voice.clone();
-                    move |s: &mut S| voice(s)
-                }))
-                .child(if running {
-                    rune::el()
-                        .key("composer-stop")
-                        .role("button")
-                        .label("Stop execution")
-                        .size(34.0, 34.0)
-                        .radius(17.0)
-                        .fill(ink("#ffffff"))
-                        .center()
-                        .on_press({
-                            let cancel = buttons.cancel.clone();
-                            move |s: &mut S| cancel(s)
-                        })
+                .child(
+                    row()
+                        .key("composer-toolbar")
+                        .w_full()
+                        .items_center()
+                        .px(2.0)
+                        .pt(9.0)
+                        .pb(10.0)
+                        .gap(8.0)
                         .child(
-                            text("■".to_string())
-                                .font(rune::tok::TextStyle::new(12.0, 650.0))
-                                .color(ink("#111113")),
+                            row()
+                                .key("composer-left")
+                                .items_center()
+                                .gap(4.0)
+                                .child(attach_button())
+                                .child(target_toggle::<S>(
+                                    meta.target,
+                                    {
+                                        let local = buttons.local.clone();
+                                        move |s: &mut S| local(s)
+                                    },
+                                    {
+                                        let cloud = buttons.cloud.clone();
+                                        move |s: &mut S| cloud(s)
+                                    },
+                                )),
                         )
-                } else {
-                    rune::el()
-                        .key("composer-send")
-                        .role("button")
-                        .label("Send")
-                        .size(34.0, 34.0)
-                        .radius(17.0)
-                        .fill(ink("#ffffff"))
-                        .center()
-                        .on_press({
-                            let on_send = buttons.send.clone();
-                            move |s: &mut S| on_send(s)
+                        .child(spacer())
+                        .child(usage_orb::<S>(meta.usage, {
+                            let usage = buttons.usage.clone();
+                            move |s: &mut S| usage(s)
+                        }))
+                        .child(provider_pill(
+                            meta.provider_label,
+                            meta.provider_warn,
+                            buttons.config.clone(),
+                        ))
+                        .child(if meta.models.is_empty() {
+                            // Map dock: no model list (HouseChat never passes
+                            // `onModelChange`). The negative margin cancels
+                            // the flex gap so the right cluster still packs
+                            // provider → voice at 8pt like React.
+                            rune::el()
+                                .key("composer-model-empty")
+                                .size(0.0, 0.0)
+                                .ml(-8.0)
+                                .inert()
+                        } else {
+                            model_dropup::<S>(
+                                meta.model,
+                                meta.models,
+                                meta.model_open,
+                                buttons.model_menu.clone(),
+                                buttons.model_pick.clone(),
+                            )
                         })
-                        .child(
-                            text("↑".to_string())
-                                .font(rune::tok::TextStyle::new(16.0, 650.0))
-                                .color(ink("#111113")),
-                        )
-                }),
+                        .child(voice_button(voice_live, {
+                            let voice = buttons.voice.clone();
+                            move |s: &mut S| voice(s)
+                        }))
+                        .child(send_btn),
+                ),
         );
     let mut card = card;
     if meta.usage_open {

@@ -26,6 +26,8 @@ mod agent_config;
 #[cfg(feature = "rune-real")]
 mod agents;
 #[cfg(feature = "rune-real")]
+mod chats;
+#[cfg(feature = "rune-real")]
 mod cloud;
 #[cfg(feature = "rune-real")]
 mod composer;
@@ -584,6 +586,7 @@ fn run_cli() {
                 std::process::exit(2);
             });
             let mut scene = String::from("home");
+            let mut extra = Vec::new();
             let mut k = 0;
             while k < args.len() {
                 if args[k] == "--rune-route" && k + 1 < args.len() {
@@ -591,16 +594,30 @@ fn run_cli() {
                     k += 2;
                     continue;
                 }
+                // Pass Rune's own headless flags through (`--tree`, `--at`,
+                // `--size`) so agent screenshots and rect dumps agree.
+                if matches!(
+                    args[k].as_str(),
+                    "--tree" | "--at" | "--size" | "--frames" | "--script" | "--start"
+                ) && k + 1 < args.len()
+                {
+                    extra.push(args[k].clone());
+                    extra.push(args[k + 1].clone());
+                    k += 2;
+                    continue;
+                }
                 k += 1;
             }
-            shell::run_shell_headless(vec![
+            let mut run_args = vec![
                 "--snap".to_string(),
                 png,
                 "--scene".to_string(),
                 scene,
                 "--scale".to_string(),
                 "1".to_string(),
-            ]);
+            ];
+            run_args.extend(extra);
+            shell::run_shell_headless(run_args);
             return;
         }
     }

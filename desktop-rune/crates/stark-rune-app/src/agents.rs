@@ -704,43 +704,23 @@ pub trait AgentsHost {
     fn agents_mut(&mut self) -> &mut AgentsState;
 }
 
+/// Parse a chat/agent timestamp: bare epoch seconds or ISO-8601
+/// `YYYY-MM-DDTHH:MM:SSZ` (the server's wire shape). Naive stamps are local
+/// wall time, matching `new Date()` in the React sidebar.
+pub fn parse_timestamp(value: &str) -> Option<i64> {
+    if let Ok(secs) = value.trim().parse::<i64>() {
+        return Some(secs);
+    }
+    crate::rune_transcript::iso_epoch_secs(value)
+}
+
 /// `just now / 42s ago / 3m ago / 5h ago / 2d ago` (`relativeTime`).
 pub fn relative_time(value: &str) -> String {
     if value.trim().is_empty() {
         return String::new();
     }
-    let parse = || -> Option<i64> {
-        // Bare epoch seconds first, then ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`
-        // (the server's wire shape) via days-from-civil — exact, no tables.
-        if let Ok(secs) = value.trim().parse::<i64>() {
-            return Some(secs);
-        }
-        let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.len() < 14 {
-            return None;
-        }
-        let part = |from: usize, len: usize| digits[from..from + len].parse::<i64>().unwrap_or(0);
-        let (y, mo, d, h, mi, s) = (
-            part(0, 4),
-            part(4, 2),
-            part(6, 2),
-            part(8, 2),
-            part(10, 2),
-            part(12, 2),
-        );
-        let mut y = y;
-        if mo <= 2 {
-            y -= 1;
-        }
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        let days = era * 146097 + doe - 719468;
-        Some(days * 86400 + h * 3600 + mi * 60 + s)
-    };
     let now = (crate::notes::now_millis() / 1000) as i64;
-    let then = match parse() {
+    let then = match parse_timestamp(value) {
         Some(t) => t,
         None => return String::new(),
     };

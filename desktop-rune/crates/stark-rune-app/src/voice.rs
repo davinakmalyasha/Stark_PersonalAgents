@@ -160,6 +160,7 @@ pub fn decay_level(current: f32, peak: f32, dt: f32) -> f32 {
 }
 
 /// How many of the 5 meter bars a level lights.
+#[cfg(test)]
 pub fn lit_bars(level: f32) -> usize {
     if level <= 0.0 {
         return 0;

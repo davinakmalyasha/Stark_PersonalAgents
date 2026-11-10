@@ -21,7 +21,7 @@ use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
 use stark_kit::transcript::{TranscriptRow, ESTIMATED_ROW_H};
 
 /// Row content fed to both the pure window math and the Rune view.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RowData {
     pub key: String,
     pub role: &'static str,
@@ -29,6 +29,10 @@ pub struct RowData {
     /// ISO-8601 creation stamp (`CanvasChatBubble clock()` renders it as
     /// `hh:MM AM/PM` in the bubble foot). Empty for scene fixtures.
     pub at: String,
+    /// `metadata.duration` for the "Worked for …" trace divider.
+    pub duration: String,
+    pub show_trace: bool,
+    pub hide_body: bool,
 }
 
 /// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
@@ -78,6 +82,9 @@ pub struct ProviderState {
     pub warn: bool,
     pub loading: bool,
     pub last_ok: f64,
+    /// Start of the last attempt (success or failure) — failure must not
+    /// retry every frame.
+    pub last_try: f64,
     pub inbox: Option<std::sync::mpsc::Receiver<Result<ProviderState, String>>>,
 }
 
@@ -88,6 +95,7 @@ impl Clone for ProviderState {
             warn: self.warn,
             loading: self.loading,
             last_ok: self.last_ok,
+            last_try: self.last_try,
             inbox: None,
         }
     }
@@ -100,6 +108,7 @@ impl Default for ProviderState {
             warn: false,
             loading: false,
             last_ok: 0.0,
+            last_try: f64::NEG_INFINITY,
             inbox: None,
         }
     }
@@ -135,6 +144,7 @@ impl ProviderState {
                 || !health.is_empty(),
             loading: false,
             last_ok: 0.0,
+            last_try: 0.0,
             inbox: None,
         }
     }
@@ -170,19 +180,25 @@ impl ModelOption {
     }
 }
 
-/// Fetch the model list once per thread (60s retry on failure).
-pub fn poll_models_state(s: &mut RuneTranscriptState, clock: f64) {
+/// Fetch the model list once per thread (60s retry on failure). Returns
+/// whether a result landed (so the shell commits the new dropup).
+pub fn poll_models_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
+    let mut changed = false;
     let (msgs, _) = crate::rooms::drain_results(&mut s.models_inbox);
     for msg in msgs {
         if let Ok(models) = msg {
-            s.models = models;
+            if s.models != models {
+                s.models = models;
+                changed = true;
+            }
             s.models_ok = true;
         }
         s.models_loading = false;
         s.models_last_try = clock;
     }
-    if !s.models_loading && !s.models_ok && clock - s.models_last_try > 60.0 {
+    if s.services_auto && !s.models_loading && !s.models_ok && clock - s.models_last_try > 60.0 {
         s.models_loading = true;
+        s.models_last_try = clock;
         let (tx, rx) = std::sync::mpsc::channel();
         s.models_inbox = Some(rx);
         let (host, port) = (s.api_host.clone(), s.api_port);
@@ -212,22 +228,29 @@ pub fn poll_models_state(s: &mut RuneTranscriptState, clock: f64) {
             let _ = tx.send(result);
         });
     }
+    changed
 }
 
 /// Refresh the provider label at most every 30s (`PromptDock` interval).
 /// Failures keep the last label (the effect swallows errors).
-pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) {
+pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
+    let mut changed = false;
     let (msgs, _) = crate::rooms::drain_results(&mut s.provider.inbox);
     for msg in msgs {
         if let Ok(next) = msg {
+            if s.provider.label != next.label || s.provider.warn != next.warn {
+                changed = true;
+            }
             s.provider.label = next.label;
             s.provider.warn = next.warn;
             s.provider.last_ok = clock;
         }
         s.provider.loading = false;
+        s.provider.last_try = clock;
     }
-    if !s.provider.loading && clock - s.provider.last_ok > 30.0 {
+    if s.services_auto && !s.provider.loading && clock - s.provider.last_try > 30.0 {
         s.provider.loading = true;
+        s.provider.last_try = clock;
         let (tx, rx) = std::sync::mpsc::channel();
         s.provider.inbox = Some(rx);
         let (host, port) = (s.api_host.clone(), s.api_port);
@@ -245,6 +268,7 @@ pub fn poll_provider_state(s: &mut RuneTranscriptState, clock: f64) {
             let _ = tx.send(ProviderState::fetch(&host, port));
         });
     }
+    changed
 }
 /// Now as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), matching the server wire
 /// shape the other time helpers parse.
@@ -273,18 +297,12 @@ pub fn now_iso() -> String {
     )
 }
 
-/// `02:44 PM` (`CanvasChatBubble clock()`): locale 12h clock. Empty in,
-/// empty out.
+/// `02:44 PM` (`CanvasChatBubble clock()`): the browser's local 12h clock.
+/// Empty in, empty out.
 pub fn clock(iso: &str) -> String {
-    let digits: String = iso.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() < 12 {
+    let Some((_, _, _, h, mi)) = local_parts(iso) else {
         return String::new();
-    }
-    let part = |from: usize, len: usize| digits[from..from + len].parse::<i64>().unwrap_or(0);
-    let (h, mi) = (part(8, 2), part(10, 2));
-    if mi > 59 || h > 23 {
-        return String::new();
-    }
+    };
     let (h12, ap) = match h {
         0 => (12, "AM"),
         1..=11 => (h, "AM"),
@@ -292,6 +310,253 @@ pub fn clock(iso: &str) -> String {
         _ => (h - 12, "PM"),
     };
     format!("{h12:02}:{mi:02} {ap}")
+}
+
+/// Local calendar day key (`YYYY-MM-DD`) — the transcript's divider grouping
+/// (`MessageStream.dayKey`, `Date.toDateString` in local time).
+pub fn day_key(iso: &str) -> String {
+    local_parts(iso)
+        .map(|(y, m, d, _, _)| format!("{y:04}-{m:02}-{d:02}"))
+        .unwrap_or_default()
+}
+
+/// Date divider label (`MessageStream.dayLabel`): `Today`, `Yesterday`, or
+/// `Mon D` (adds the year only when it differs from today's).
+pub fn day_label(iso: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Some((y, m, d, _, _)) = local_parts(iso) else {
+        return String::new();
+    };
+    let today = local_parts_from_secs((crate::notes::now_millis() / 1000) as i64);
+    if let Some((ty, tm, td, _, _)) = today {
+        if (y, m, d) == (ty, tm, td) {
+            return "Today".to_string();
+        }
+        let yesterday = days_from_civil(ty as i64, tm as i64, td as i64) - 1;
+        if days_from_civil(y as i64, m as i64, d as i64) == yesterday {
+            return "Yesterday".to_string();
+        }
+        let month = MONTHS
+            .get(m.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or("");
+        return if y == ty {
+            format!("{month} {d}")
+        } else {
+            format!("{month} {d}, {y}")
+        };
+    }
+    let month = MONTHS
+        .get(m.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("");
+    format!("{month} {d}")
+}
+
+/// Parse the server's ISO stamp to UTC epoch seconds.
+/// Calendar fields from a server timestamp plus whether it carried a zone.
+/// Server chat stamps come in both shapes: `...Z` (UTC) and a naive
+/// `2026-10-25T11:37:32.113796` that `new Date()` reads as local time.
+fn iso_fields(iso: &str) -> Option<(i64, i64, i64, i64, i64, i64, bool)> {
+    let digits: String = iso.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 12 {
+        return None;
+    }
+    let part = |from: usize, len: usize| digits.get(from..from + len)?.parse::<i64>().ok();
+    let (y, mo, d) = (part(0, 4)?, part(4, 2)?, part(6, 2)?);
+    let (h, mi) = (part(8, 2)?, part(10, 2)?);
+    let s = if digits.len() >= 14 { part(12, 2)? } else { 0 };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    let has_zone = iso.trim_end().ends_with('Z')
+        || iso
+            .chars()
+            .skip(10)
+            .any(|c| c == '+' || (c == '-' && iso.chars().filter(|x| *x == '-').count() > 2));
+    Some((y, mo, d, h, mi, s, !has_zone))
+}
+
+/// Parse a server stamp to UTC epoch seconds. Naive stamps are read as the
+/// browser reads them: local wall time.
+pub(crate) fn iso_epoch_secs(iso: &str) -> Option<i64> {
+    let (y, mo, d, h, mi, s, naive) = iso_fields(iso)?;
+    if naive {
+        return naive_local_epoch(y, mo, d, h, mi, s);
+    }
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+}
+
+/// Local wall-clock fields → UTC epoch. `None`/fallback stays UTC when the
+/// platform has no zone API.
+#[cfg(target_arch = "wasm32")]
+fn naive_local_epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+    let date = js_sys::Date::new_with_year_month_day_hr_min_sec(
+        y as u32,
+        (mo - 1) as i32,
+        d as i32,
+        h as i32,
+        mi as i32,
+        s as i32,
+    );
+    let ms = date.get_time();
+    if ms.is_nan() {
+        return None;
+    }
+    Some((ms / 1000.0) as i64)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn naive_local_epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn TzSpecificLocalTimeToSystemTime(
+            tz: *const core::ffi::c_void,
+            local: *const SystemTime,
+            utc: *mut SystemTime,
+        ) -> i32;
+        fn SystemTimeToFileTime(st: *const SystemTime, ft: *mut u64) -> i32;
+    }
+    const EPOCH_AS_FILETIME: i64 = 11_644_473_600;
+    let local = SystemTime {
+        year: y as u16,
+        month: mo as u16,
+        day: d as u16,
+        hour: h as u16,
+        minute: mi as u16,
+        second: s as u16,
+        ..SystemTime::default()
+    };
+    let mut utc = SystemTime::default();
+    // SAFETY: plain Win32 structs with valid pointers for the call duration.
+    if unsafe { TzSpecificLocalTimeToSystemTime(core::ptr::null(), &local, &mut utc) } == 0 {
+        return None;
+    }
+    let mut ft = 0u64;
+    if unsafe { SystemTimeToFileTime(&utc, &mut ft) } == 0 {
+        return None;
+    }
+    Some((ft / 10_000_000) as i64 - EPOCH_AS_FILETIME)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn naive_local_epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+}
+
+/// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
+}
+
+/// Local calendar fields for a UTC epoch (year, month, day, hour, minute).
+#[cfg(target_arch = "wasm32")]
+fn local_parts_from_secs(secs: i64) -> Option<(i32, u32, u32, u32, u32)> {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64((secs * 1000) as f64));
+    Some((
+        date.get_full_year() as i32,
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+    ))
+}
+
+/// Windows local time (`SystemTimeToTzSpecificLocalTime`), DST-correct.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn local_parts_from_secs(secs: i64) -> Option<(i32, u32, u32, u32, u32)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FileTimeToSystemTime(ft: *const u64, st: *mut SystemTime) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(
+            tz: *const core::ffi::c_void,
+            utc: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+    }
+    const EPOCH_AS_FILETIME: i64 = 11_644_473_600;
+    let ft = ((secs + EPOCH_AS_FILETIME) as u128 * 10_000_000) as u64;
+    let mut utc = SystemTime::default();
+    let mut local = SystemTime::default();
+    // SAFETY: plain Win32 structs with valid pointers for the call duration.
+    let ok = unsafe { FileTimeToSystemTime(&ft, &mut utc) };
+    if ok == 0 {
+        return None;
+    }
+    let ok = unsafe { SystemTimeToTzSpecificLocalTime(core::ptr::null(), &utc, &mut local) };
+    if ok == 0 {
+        return None;
+    }
+    Some((
+        local.year as i32,
+        local.month as u32,
+        local.day as u32,
+        local.hour as u32,
+        local.minute as u32,
+    ))
+}
+
+/// Non-Windows native fallback: UTC (the browser and Windows builds carry
+/// the real local zone).
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn local_parts_from_secs(secs: i64) -> Option<(i32, u32, u32, u32, u32)> {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    Some((y, m, d, (rem / 3600) as u32, ((rem % 3600) / 60) as u32))
+}
+
+fn local_parts(iso: &str) -> Option<(i32, u32, u32, u32, u32)> {
+    let (y, mo, d, h, mi, _, naive) = iso_fields(iso)?;
+    if naive {
+        return Some((y as i32, mo as u32, d as u32, h as u32, mi as u32));
+    }
+    local_parts_from_secs(iso_epoch_secs(iso)?)
 }
 
 pub struct RuneTranscriptState {
@@ -335,6 +600,9 @@ pub struct RuneTranscriptState {
     pub models_inbox: Option<std::sync::mpsc::Receiver<Result<Vec<ModelOption>, String>>>,
     /// Live provider pill (`fetchProvider`, 30s refresh).
     pub provider: ProviderState,
+    /// Background status fetches (`/api/provider`, `/api/models`) run only in
+    /// the real app entry; unit tests and headless scenes stay offline.
+    pub services_auto: bool,
     /// Settings sheet visibility.
     pub settings_open: bool,
     /// Mic capture bus (levels, notes, stop flag, inbox).
@@ -394,8 +662,10 @@ impl Clone for RuneTranscriptState {
                 warn: self.provider.warn,
                 loading: self.provider.loading,
                 last_ok: self.provider.last_ok,
+                last_try: self.provider.last_try,
                 inbox: None,
             },
+            services_auto: self.services_auto,
             settings_open: self.settings_open,
             voice: self.voice.clone(),
             inbox: None,
@@ -417,12 +687,14 @@ impl RuneTranscriptState {
                     role: "user",
                     body: "can you use a music api or smth, makes green green real, playing now in your tab, something like that, and play that in current youtube".to_string(),
                     at: "2026-11-09T14:44:00Z".to_string(),
+                    ..RowData::default()
                 },
                 RowData {
                     key: "msg-1".to_string(),
                     role: "agent",
                     body: "Playing now in your YouTube tab: **massive green day** — `Cinnamon Girl` (8yr-old).\n\n```text\ntrack is running (04:48)\n```".to_string(),
                     at: "2026-11-09T14:45:00Z".to_string(),
+                    ..RowData::default()
                 },
             ],
             edit: TextEdit::new(""),
@@ -440,10 +712,11 @@ impl RuneTranscriptState {
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
-            models_last_try: 0.0,
+            models_last_try: f64::NEG_INFINITY,
             model_open: false,
             models_inbox: None,
             provider: ProviderState::default(),
+            services_auto: false,
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -470,6 +743,7 @@ impl RuneTranscriptState {
                 role,
                 body,
                 at: String::new(),
+                ..RowData::default()
             });
         }
         Self {
@@ -490,10 +764,11 @@ impl RuneTranscriptState {
             models: Vec::new(),
             models_loading: false,
             models_ok: false,
-            models_last_try: 0.0,
+            models_last_try: f64::NEG_INFINITY,
             model_open: false,
             models_inbox: None,
             provider: ProviderState::default(),
+            services_auto: false,
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
@@ -527,9 +802,19 @@ fn bg() -> rune::Color {
 /// `body_ink` is the role text color (`#dedee5` user, `#d2d2da` agent, per
 /// `canvas.css`).
 fn render_body(key: &str, body: &str, body_ink: &'static str) -> El {
+    render_body_styled(key, body, body_ink, rune::tok::TextStyle::new(12.5, 400.0))
+}
+
+/// Markdown renderer at a caller-chosen type scale (home rows are 15.5pt,
+/// the sheet keeps 12.5pt).
+fn render_body_styled(
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    body_style: rune::tok::TextStyle,
+) -> El {
     use stark_kit::markdown::{Block, Inline};
     let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-    let body_style = rune::tok::TextStyle::new(12.5, 400.0);
     /// Flatten inlines to (text, spans) with byte offsets.
     fn runs(inlines: &[Inline]) -> (String, Vec<rune::Span>) {
         let mut text = String::new();
@@ -709,6 +994,7 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
         role: "user",
         body: prompt.clone(),
         at: now_iso(),
+        ..RowData::default()
     });
     s.live = true;
     // The abort path needs the same id the run started with: mint one per
@@ -807,17 +1093,674 @@ pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>)
 /// Transcript body shared by the standalone view and the shell: rows read
 /// `s`, handlers resolve through `S: TranscriptHost` for `which` thread.
 pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
+    // Thread-local running banner lives in `transcript_body` (the shell's
+    // sheet drops its own when the thread is live — see `sheet_running`).
+    if s.live {
+        return col()
+            .key(format!("transcript-body-live-{}", s.chat_id))
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .fill(bg())
+            .child(transcript_view_body::<S>(s, which));
+    }
+    transcript_view_body::<S>(s, which)
+}
+
+/// The body without the live banner (sheet uses this + its own banner).
+pub fn transcript_view_body<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+) -> El {
+    transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0)
+}
+
+/// Deduped home transcript state (`MessageStream`): agent rows that merely
+/// repeat an error row disappear, and rows group under local-day dividers.
+struct HomeRows {
+    visible: Vec<bool>,
+    dividers: Vec<Option<String>>,
+}
+
+impl HomeRows {
+    fn new(rows: &[RowData]) -> Self {
+        // `normalizeError`: trim, collapse whitespace, lowercase.
+        fn normalize(text: &str) -> String {
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        }
+        let errors: Vec<String> = rows
+            .iter()
+            .filter(|r| r.role == "error" && !r.body.trim().is_empty())
+            .map(|r| normalize(&r.body))
+            .collect();
+        let mut visible = vec![true; rows.len()];
+        for (i, r) in rows.iter().enumerate() {
+            if r.role != "agent" || r.body.trim().is_empty() || errors.is_empty() {
+                continue;
+            }
+            let text = normalize(&r.body);
+            if errors.iter().any(|e| e == &text) {
+                visible[i] = false;
+                continue;
+            }
+            if let Some(rest) = text.strip_prefix("error:") {
+                let rest = rest.trim();
+                if errors.iter().any(|e| {
+                    e.contains(rest) || text.contains(e.trim_start_matches("error:").trim())
+                }) {
+                    visible[i] = false;
+                }
+            }
+        }
+        let mut dividers = vec![None; rows.len()];
+        let mut previous_day = String::new();
+        for i in 0..rows.len() {
+            if !visible[i] {
+                continue;
+            }
+            let day = day_key(&rows[i].at);
+            if !day.is_empty() && day != previous_day {
+                dividers[i] = Some(day_label(&rows[i].at));
+            }
+            previous_day = day;
+        }
+        Self { visible, dividers }
+    }
+}
+
+fn home_ink(hex: &'static str) -> rune::Color {
+    rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
+}
+
+fn home_rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
+    // Rune `Color` is linear RGB; CSS/React values here are sRGB.
+    fn linear(c: f32) -> f32 {
+        let c = c / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    rune::Color {
+        r: linear(r),
+        g: linear(g),
+        b: linear(b),
+        a,
+    }
+}
+
+/// Home message type scale: 15.5pt at React's `leading-[1.85]`.
+fn home_body_style() -> rune::tok::TextStyle {
+    let mut style = rune::tok::TextStyle::new(15.5, 400.0);
+    style.line_height = 15.5 * 1.85;
+    style
+}
+
+/// Lucide `Copy` at a 24-unit box.
+fn home_icon_copy(color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([10.0, 8.0])
+        .line_to([20.0, 8.0])
+        .cubic_to([21.1, 8.0], [22.0, 8.9], [22.0, 10.0])
+        .line_to([22.0, 20.0])
+        .cubic_to([22.0, 21.1], [21.1, 22.0], [20.0, 22.0])
+        .line_to([10.0, 22.0])
+        .cubic_to([8.9, 22.0], [8.0, 21.1], [8.0, 20.0])
+        .line_to([8.0, 10.0])
+        .cubic_to([8.0, 8.9], [8.9, 8.0], [10.0, 8.0])
+        .close()
+        .move_to([4.0, 16.0])
+        .cubic_to([2.9, 16.0], [2.0, 15.1], [2.0, 14.0])
+        .line_to([2.0, 4.0])
+        .cubic_to([2.0, 2.9], [2.9, 2.0], [4.0, 2.0])
+        .line_to([14.0, 2.0])
+        .cubic_to([15.1, 2.0], [16.0, 2.9], [16.0, 4.0]);
+    rune::Shape::new()
+        .stroke_path(&p, 2.0, rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `RotateCcw` at a 24-unit box (rewind / retry).
+fn home_icon_rotate(color: rune::Color) -> rune::Shape {
+    const K: f32 = 4.971;
+    let p = rune::Path::new()
+        .move_to([12.0, 3.0])
+        .cubic_to([12.0 + K, 3.0], [21.0, 12.0 - K], [21.0, 12.0])
+        .cubic_to([21.0, 12.0 + K], [12.0 + K, 21.0], [12.0, 21.0])
+        .cubic_to([12.0 - K, 21.0], [3.0, 12.0 + K], [3.0, 12.0])
+        .cubic_to([3.0, 9.9], [3.8, 7.8], [5.2, 6.2])
+        .move_to([3.0, 3.0])
+        .line_to([3.0, 8.0])
+        .line_to([8.0, 8.0]);
+    rune::Shape::new()
+        .stroke_path(&p, 2.0, rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `CircleAlert` at a 24-unit box.
+fn home_icon_alert(color: rune::Color) -> rune::Shape {
+    let circle = rune::Path::new()
+        .move_to([12.0, 2.0])
+        .cubic_to([17.5, 2.0], [22.0, 6.5], [22.0, 12.0])
+        .cubic_to([22.0, 17.5], [17.5, 22.0], [12.0, 22.0])
+        .cubic_to([6.5, 22.0], [2.0, 17.5], [2.0, 12.0])
+        .cubic_to([2.0, 6.5], [6.5, 2.0], [12.0, 2.0])
+        .close();
+    rune::Shape::new()
+        .stroke_path(&circle, 1.8, rune::LineCap::Round, color)
+        .line([12.0, 8.0], [12.0, 12.0], 1.8, rune::LineCap::Round, color)
+        .line(
+            [12.0, 16.0],
+            [12.01, 16.0],
+            1.8,
+            rune::LineCap::Round,
+            color,
+        )
+        .view_box(24.0, 24.0)
+}
+
+fn home_icon_button(key: String, label: &'static str, size: f32, icon: rune::Shape) -> El {
+    rune::el()
+        .key(key)
+        .role("button")
+        .label(label)
+        .size(size, size)
+        .radius(6.0)
+        .center()
+        .child(rune::el().size(12.0, 12.0).inert().shape(icon))
+}
+
+/// `chat-date-divider`: hairlines fading from the edges + uppercase pill.
+fn home_divider(label: &str) -> El {
+    let line = || {
+        rune::el().grow(1.0).h(1.0).linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            [
+                (0.0, home_ink("#ffffff00")),
+                (0.5, home_ink("#ffffff12")),
+                (1.0, home_ink("#ffffff00")),
+            ],
+        )
+    };
+    row()
+        .w_full()
+        .items_center()
+        .gap(10.0)
+        .mt(6.0)
+        .mb(18.0)
+        .child(line())
+        .child(
+            text(label.to_ascii_uppercase())
+                .font(rune::tok::TextStyle::new(9.0, 600.0))
+                .color(home_ink("#5f5f68"))
+                .px(8.0)
+                .py(2.0)
+                .radius(999.0)
+                .border(1.0, home_ink("#ffffff0f"))
+                .fill(home_ink("#ffffff05")),
+        )
+        .child(line())
+}
+
+fn home_user_row(r: &RowData, max_w: f32) -> El {
+    let stamp = clock(&r.at);
+    let bubble = col()
+        .key(format!("{}-bubble", r.key))
+        .radius(14.0)
+        .linear_gradient(
+            145.0_f32.to_radians(),
+            [
+                (0.0, home_rgba(48.0, 48.0, 51.0, 0.92)),
+                (1.0, home_rgba(35.0, 35.0, 38.0, 0.95)),
+            ],
+        )
+        .border(1.0, home_ink("#ffffff17"))
+        .border_layout()
+        .px(16.0)
+        .py(10.0)
+        .max_w(max_w)
+        .child(
+            render_body_styled(&r.key, &r.body, "#e4e4e7", home_body_style())
+                .pt(12.0)
+                .pb(12.0),
+        );
+    let mut actions = row()
+        .key(format!("{}-actions", r.key))
+        .w_full()
+        .justify_end()
+        .items_center()
+        .gap(4.0)
+        .mt(4.0)
+        .pr(2.0);
+    if !stamp.is_empty() {
+        actions = actions.child(
+            text(stamp)
+                .key(format!("{}-time", r.key))
+                .font({
+                    let mut style = rune::tok::TextStyle::new(10.0, 400.0);
+                    style.line_height = 15.0;
+                    style
+                })
+                .color(home_ink("#52525b")),
+        );
+    }
+    actions = actions
+        .child(home_icon_button(
+            format!("{}-copy", r.key),
+            "Copy message",
+            24.0,
+            home_icon_copy(home_ink("#52525b")),
+        ))
+        .child(home_icon_button(
+            format!("{}-rewind", r.key),
+            "Rewind to this message",
+            24.0,
+            home_icon_rotate(home_ink("#52525b")),
+        ));
+    col()
+        .key(format!("{}-group", r.key))
+        .w_full()
+        .mb(24.0)
+        .child(row().w_full().justify_end().child(bubble))
+        .child(actions)
+}
+
+/// Collapsed run divider (`TraceAccordion` complete header): full-width
+/// "Worked for 8s ›" with a bottom hairline, then the 9pt collapsed-body
+/// spacer. The dropdown contents stay closed, exactly like the default UI.
+fn home_trace_header(r: &RowData) -> El {
+    let label = if r.duration.is_empty() {
+        "Worked".to_string()
+    } else {
+        format!("Worked for {}", r.duration)
+    };
+    col()
+        .key(format!("{}-trace", r.key))
+        .w_full()
+        .mt(8.0)
+        .mb(22.0)
+        .child(
+            row()
+                .key(format!("{}-trace-head", r.key))
+                .w_full()
+                .h(42.0)
+                .items_center()
+                .gap(7.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], home_ink("#ffffff16"))
+                .border_layout()
+                .child(
+                    text(label)
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(13.0, 500.0);
+                            style.line_height = 19.5;
+                            style
+                        })
+                        .color(home_ink("#a4a4ad")),
+                )
+                .child(
+                    rune::el()
+                        .key(format!("{}-trace-chevron", r.key))
+                        .size(14.0, 14.0)
+                        .inert()
+                        .shape({
+                            let p = rune::Path::new()
+                                .move_to([9.0, 6.0])
+                                .line_to([15.0, 12.0])
+                                .line_to([9.0, 18.0]);
+                            rune::Shape::new()
+                                .stroke_path(&p, 2.0, rune::LineCap::Round, home_ink("#71717a"))
+                                .view_box(24.0, 24.0)
+                        }),
+                ),
+        )
+        .child(rune::el().key(format!("{}-trace-gap", r.key)).h(9.0))
+}
+
+fn home_agent_row(r: &RowData, live: bool) -> El {
+    let mut response = render_body_styled(&r.key, &r.body, "#e4e4e7", home_body_style())
+        .pt(12.0)
+        .pb(12.0);
+    if live {
+        let mut dots = row()
+            .key(format!("{}-typing", r.key))
+            .items_center()
+            .gap(3.0)
+            .pt(4.0);
+        for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
+            dots = dots.child(
+                rune::el()
+                    .key(format!("{}-typing-{n}", r.key))
+                    .size(3.0, 3.0)
+                    .radius(1.5)
+                    .fill(home_ink("#9b9ba5"))
+                    .looping(rune::LoopSpec::opacity(1.1, delay, 0.35, 1.0)),
+            );
+        }
+        response = response.child(dots);
+    }
+    let mono = {
+        let mut style = rune::tok::TextStyle::new(10.5, 400.0).mono();
+        // `.agent-message-footer`: text-[10.5px] at leading 1.5.
+        style.line_height = 15.75;
+        style
+    };
+    let mut footer = row()
+        .key(format!("{}-footer", r.key))
+        .items_center()
+        .gap(12.0)
+        .mt(8.0)
+        .child(
+            text("↑0".to_string())
+                .key(format!("{}-in", r.key))
+                .font(mono)
+                .color(home_ink("#52525b")),
+        )
+        .child(
+            text("↓0".to_string())
+                .key(format!("{}-out", r.key))
+                .font(mono)
+                .color(home_ink("#52525b")),
+        );
+    let stamp = clock(&r.at);
+    if !stamp.is_empty() {
+        footer = footer.child(
+            text(stamp)
+                .key(format!("{}-time", r.key))
+                .font(mono)
+                .color(home_ink("#52525b")),
+        );
+    }
+    let mut group = col()
+        .key(format!("{}-group", r.key))
+        .w_full()
+        .mb(24.0)
+        .hover_group();
+    if r.show_trace {
+        group = group.child(home_trace_header(r));
+    }
+    if !r.hide_body {
+        group = group.child(response);
+    }
+    group.child(footer).child(home_agent_actions(r))
+}
+
+/// Hover-revealed agent actions (React reserves the 25pt row at rest).
+fn home_agent_actions(r: &RowData) -> El {
+    row()
+        .key(format!("{}-actions", r.key))
+        .w_full()
+        .h(25.0)
+        .justify_end()
+        .items_center()
+        .gap(2.0)
+        .mt(8.0)
+        .group_opacity(0.0, 1.0)
+        .child(home_icon_button(
+            format!("{}-retry", r.key),
+            "Retry — re-run the last request",
+            25.0,
+            home_icon_rotate(home_ink("#71717a")),
+        ))
+        .child(home_icon_button(
+            format!("{}-copy", r.key),
+            "Copy to clipboard",
+            25.0,
+            home_icon_copy(home_ink("#71717a")),
+        ))
+}
+
+fn home_error_row(r: &RowData) -> El {
+    let mut body_style = rune::tok::TextStyle::new(13.0, 400.0);
+    body_style.line_height = 13.0 * 1.625;
+    let body = text(r.body.clone())
+        .key(format!("{}-error-text", r.key))
+        .font(body_style)
+        .wrap_anywhere()
+        .color(home_rgba(252.0, 165.0, 165.0, 0.9));
+    let retry = row()
+        .key(format!("{}-retry", r.key))
+        .role("button")
+        .label("Retry")
+        .items_center()
+        .gap(4.0)
+        .px(8.0)
+        .py(4.0)
+        .radius(6.0)
+        .border(1.0, home_rgba(248.0, 113.0, 113.0, 0.15))
+        .border_layout()
+        .fill(home_rgba(248.0, 113.0, 113.0, 0.06))
+        .child(
+            rune::el()
+                .size(10.0, 10.0)
+                .inert()
+                .shape(home_icon_rotate(home_rgba(254.0, 202.0, 202.0, 0.9))),
+        )
+        .child(
+            text("Retry".to_string())
+                .font({
+                    let mut style = rune::tok::TextStyle::new(10.0, 500.0);
+                    style.line_height = 15.0;
+                    style
+                })
+                .color(home_rgba(254.0, 202.0, 202.0, 0.9)),
+        );
+    let copy = row()
+        .key(format!("{}-copy", r.key))
+        .role("button")
+        .label("Copy")
+        .items_center()
+        .gap(4.0)
+        .px(8.0)
+        .py(4.0)
+        .radius(6.0)
+        .child(
+            rune::el()
+                .size(10.0, 10.0)
+                .inert()
+                .shape(home_icon_copy(home_ink("#71717a"))),
+        )
+        .child(
+            text("Copy".to_string())
+                .font({
+                    let mut style = rune::tok::TextStyle::new(10.0, 400.0);
+                    style.line_height = 15.0;
+                    style
+                })
+                .color(home_ink("#71717a")),
+        );
+    col()
+        .key(format!("{}-group", r.key))
+        .w_full()
+        .mb(24.0)
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .py(4.0)
+                .child(
+                    rune::el()
+                        .key(format!("{}-alert", r.key))
+                        .size(15.0, 15.0)
+                        .mt(3.0)
+                        .inert()
+                        .shape(home_icon_alert(home_rgba(248.0, 113.0, 113.0, 0.9))),
+                )
+                .child(
+                    col().grow(1.0).min_w(0.0).child(body).child(
+                        row()
+                            .items_center()
+                            .gap(4.0)
+                            .mt(6.0)
+                            .child(retry)
+                            .child(copy),
+                    ),
+                ),
+        )
+}
+
+/// One home row (`MessageStream` + `MessageBubble`): local-day divider, then
+/// the role's flat layout — no avatars, no bubble names, 24pt group spacing.
+fn home_row(t: &RuneTranscriptState, i: usize, meta: &HomeRows, max_w: f32) -> El {
+    let r = &t.rows[i];
+    let mut root = col().key(r.key.clone()).w_full();
+    if let Some(label) = &meta.dividers[i] {
+        root = root.child(home_divider(label));
+    }
+    if !meta.visible[i] {
+        return root;
+    }
+    let live = t.live && i + 1 == t.rows.len() && r.role != "user" && r.role != "error";
+    let group = match r.role {
+        "user" => home_user_row(r, max_w),
+        "error" => home_error_row(r),
+        _ => home_agent_row(r, live),
+    };
+    root.child(group)
+}
+
+/// `ConversationRail`: up to six 7×2 turn dashes centered in a 24pt column
+/// at the scroll area's left edge (React hides it below two turns).
+fn conversation_rail(rows: &[RowData]) -> Option<El> {
+    let mut turns: Vec<Vec<&RowData>> = Vec::new();
+    let mut current: Vec<&RowData> = Vec::new();
+    for r in rows.iter().filter(|r| !r.body.trim().is_empty()) {
+        if r.role == "user" && !current.is_empty() {
+            turns.push(std::mem::take(&mut current));
+        }
+        current.push(r);
+    }
+    if !current.is_empty() {
+        turns.push(current);
+    }
+    if turns.len() < 2 {
+        return None;
+    }
+    let role_of = |turn: &[&RowData]| {
+        if turn.iter().any(|r| r.role == "user") {
+            "user"
+        } else if turn.iter().any(|r| r.role == "error") {
+            "error"
+        } else {
+            "agent"
+        }
+    };
+    let mut markers: Vec<(&str, String)> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, turn)| (role_of(turn), format!("mark-{i}")))
+        .collect();
+    if markers.len() > 6 {
+        // Fold everything older than the newest five into one quiet dash.
+        let earlier = markers.len() - 5;
+        let mut folded = vec![("system", "mark-earlier".to_string())];
+        folded.extend(markers.drain(earlier..));
+        markers = folded;
+    }
+    let mut rail = col()
+        .key("conversation-rail")
+        .w(24.0)
+        .pin(Some(4.0), Some(16.0), None, Some(16.0))
+        .justify_center()
+        .inert();
+    for (role, id) in markers {
+        let color = match role {
+            "user" => rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.46,
+            },
+            "error" => home_rgba(251.0, 113.0, 133.0, 0.72),
+            "system" => rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.18,
+            },
+            _ => rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.28,
+            },
+        };
+        rail = rail.child(
+            row()
+                .key(format!("conversation-{id}"))
+                .w(24.0)
+                .h(14.0)
+                .items_center()
+                .child(rune::el().size(7.0, 2.0).radius(1.0).fill(color)),
+        );
+    }
+    Some(rail)
+}
+
+/// Home chat card body (`HouseChat` `variant="home"`): no header row — the
+/// card is the floating conversation panel, just messages + prompt dock.
+pub fn home_transcript_body<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    card_w: f32,
+    window_h: f32,
+) -> El {
+    // React caps the user bubble at 85% of the message column: card width
+    // minus its 8pt side gutters, hairlines, and the scroll area's pl-8/pr-4.
+    let max_w = ((card_w - 18.0 - 48.0) * 0.85).max(120.0);
+    transcript_body_with::<S>(s, which, false, true, false, max_w, window_h)
+}
+
+fn transcript_body_with<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    show_head: bool,
+    dock_compact: bool,
+    show_sheets: bool,
+    home_max_w: f32,
+    window_h: f32,
+) -> El {
     // Index-built rows: layout builds only the mounted window (viewport + up to
     // two viewports either side), so a 10k transcript commits in window time.
     // Handlers must find items by key, never by index (see `RowSource` docs).
     // Thread padding lives on the stack (outside rows, estimates stay valid);
     // user rows `justify_end` with content-sized bubbles like
     // `.canvas-bubble-row.is-user`; agent bubbles `grow` full width.
-    let stack = col()
-        .key("transcript-stack")
-        .px(12.0)
-        .growth(GrowthSpec::default())
-        .virtual_rows(
+    let home = !show_head;
+    // React's home scroll area is `pl-8 pr-4 py-3`; the sheet keeps 12pt.
+    let mut stack = col().key("transcript-stack").growth(GrowthSpec::default());
+    stack = if home {
+        stack.pl(32.0).pr(16.0).pt(12.0).pb(12.0)
+    } else {
+        stack.px(12.0)
+    };
+    let home_rows = if home {
+        Some(HomeRows::new(&s.rows))
+    } else {
+        None
+    };
+    // Empty home thread (`MessageStream` isEmpty): a 60vh drop surface with
+    // the centered "What to do Boss?" prompt. It lives inside the scroll
+    // area, so the card caps at 74vh and the prompt sits at the bottom
+    // (stick-to-bottom), exactly like React.
+    let stack = if home && s.rows.is_empty() {
+        stack.child(
+            col()
+                .key("transcript-empty")
+                .w_full()
+                .h((window_h * 0.6).max(80.0))
+                .center()
+                .child(
+                    text("What to do Boss?".to_string())
+                        .font(rune::tok::TextStyle::new(19.0, 500.0))
+                        .color(home_ink("#ffffff")),
+                ),
+        )
+    } else {
+        stack.virtual_rows(
             s.rows.len(),
             ESTIMATED_ROW_H,
             // Typed to the window state `S` (Rune checks the registration):
@@ -825,6 +1768,9 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             move |s: &S, i| Cow::Borrowed(s.thread(which).rows[i].key.as_str()),
             move |s: &S, i| {
                 let t = s.thread(which);
+                if let Some(meta) = &home_rows {
+                    return home_row(t, i, meta, home_max_w);
+                }
                 // Live row: the streaming agent row (last, non-user, non-error)
                 // while a run is in flight. Mirrors
                 // `.canvas-bubble-row.is-live .canvas-bubble` (`#1b1b20`, .10
@@ -962,7 +1908,8 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                     message
                 }
             },
-        );
+        )
+    };
     // Bounded root (window height) + growing viewport: the viewport takes the
     // free space between title and composer instead of pushing the composer
     // off-screen (an `h_full` viewport in an auto-height column does that).
@@ -979,9 +1926,14 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
         // `grow`, not `h_full`: fills a standalone window and shares a shell
         // column with the tab bar without overflowing it.
         .grow(1.0)
-        .min_h(0.0)
-        .fill(bg())
-        .child(
+        .min_h(0.0);
+    // The home card supplies the surface (rgba 13,13,16/.94); the standalone
+    // sheet still paints its own opaque page background.
+    if show_head {
+        root = root.fill(bg());
+    }
+    if show_head {
+        root = root.child(
             row()
                 .key("transcript-head")
                 .w_full()
@@ -1013,8 +1965,22 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
                             s.thread_mut(which).settings_open = true;
                         }),
                 ),
-        )
+        );
+    }
+    // `MessageStream` wrapper: scroll area plus the turn-mark rail pinned to
+    // its left edge (React mounts the rail above the scroller).
+    let mut view = col()
+        .key("transcript-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
         .child(viewport);
+    if let Some(rail) = conversation_rail(&s.rows) {
+        view = view.child(rail);
+    }
+    root = root.child(view);
+    // Thread-local running banner: the standalone view carries it here; the
+    // shell's sheet drops it (sheet keeps its own).
     if s.live {
         root = root.child(
             text("Running".to_string())
@@ -1039,7 +2005,9 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             provider_label: &s.provider.label,
             provider_warn: s.provider.warn,
             model: &s.model,
-            models: &s.models,
+            // HouseChat's PromptDock never passes `onModelChange`, so the
+            // home card has no model dropup (React renders provider only).
+            models: if dock_compact { &[] } else { &s.models },
             model_open: s.model_open,
         },
         super::composer::ComposerButtons {
@@ -1076,35 +2044,47 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
             }),
         },
     );
-    root = root.child(
+    let dock = if dock_compact {
+        // Inside the home chat card the outer card owns the 8pt gutter and
+        // React nests two wrappers here: HouseChat `pt-1` then PromptDock's
+        // `px-2 pt-1.5 pb-1.5` (safe-area inline override = 6pt bottom).
+        rune::el()
+            .key("composer-dock")
+            .w_full()
+            .px(8.0)
+            .pt(10.0)
+            .pb(6.0)
+    } else {
         rune::el()
             .key("composer-dock")
             .w_full()
             .px(16.0)
             .pt(6.0)
             .pb(14.0)
-            .child(composer_card),
-    );
-    if s.settings_open {
-        root = root.child(settings_sheet::<S>(s, which));
-    }
-    if s.notes.open {
-        root = root.child(super::notes::notes_sheet::<S>(&s.notes, which));
-    }
-    if s.stats_open {
-        root = root.child(super::token_stats::stats_sheet::<S>(
-            &s.usage,
-            &s.model,
-            std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).stats_open = false;
-            }),
-        ));
-    }
-    if s.agent_config.open {
-        root = root.child(super::agent_config::agent_config_sheet::<S>(
-            &s.agent_config,
-            which,
-        ));
+    };
+    root = root.child(dock.child(composer_card));
+    if show_sheets {
+        if s.settings_open {
+            root = root.child(settings_sheet::<S>(s, which));
+        }
+        if s.notes.open {
+            root = root.child(super::notes::notes_sheet::<S>(&s.notes, which));
+        }
+        if s.stats_open {
+            root = root.child(super::token_stats::stats_sheet::<S>(
+                &s.usage,
+                &s.model,
+                std::rc::Rc::new(move |s: &mut S| {
+                    s.thread_mut(which).stats_open = false;
+                }),
+            ));
+        }
+        if s.agent_config.open {
+            root = root.child(super::agent_config::agent_config_sheet::<S>(
+                &s.agent_config,
+                which,
+            ));
+        }
     }
     root
 }
@@ -1295,11 +2275,33 @@ mod tests {
 
     #[test]
     fn clock_shapes() {
-        assert_eq!(clock("2026-11-09T14:44:00Z"), "02:44 PM");
-        assert_eq!(clock("2026-11-09T00:05:00Z"), "12:05 AM");
-        assert_eq!(clock("2026-11-09T12:00:00Z"), "12:00 PM");
+        // The clock is local time (React `toLocaleTimeString`), so only the
+        // shape is timezone-independent; the date math itself is covered by
+        // `day_label_groups_a_fresh_stamp_as_today`.
+        for iso in [
+            "2026-11-09T14:44:00Z",
+            "2026-11-09T00:05:00Z",
+            "2026-11-09T12:00:00Z",
+        ] {
+            let value = clock(iso);
+            assert_eq!(value.len(), 8, "{iso} → {value}");
+            assert!(
+                value.ends_with(" AM") || value.ends_with(" PM"),
+                "{iso} → {value}"
+            );
+        }
         assert_eq!(clock(""), "");
         assert_eq!(clock("garbage"), "");
+        // Naive stamps are local wall time (React `new Date()`), not UTC.
+        assert_eq!(clock("2026-11-09T14:44:00"), "02:44 PM");
+        assert_eq!(day_label("2026-11-01T14:44:00"), "Nov 1");
+    }
+
+    #[test]
+    fn day_label_groups_a_fresh_stamp_as_today() {
+        let iso = now_iso();
+        assert_eq!(day_key(&iso).len(), 10);
+        assert_eq!(day_label(&iso), "Today");
     }
 
     #[test]
@@ -1661,7 +2663,6 @@ mod tests {
             rt.state.voice
         );
         assert!(rt.find("composer-voice-dot").is_some());
-        assert!(rt.find("voice-meter").is_some());
         let (x, y) = rt.find("composer-voice").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);

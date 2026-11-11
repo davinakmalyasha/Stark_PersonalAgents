@@ -40,7 +40,7 @@ web-sys = { version = "=0.3.106", features = [
 # GPU-free and offline. Enable once the pinned `dev` checkout is fetched:
 # `cargo test -p stark-rune-app --features rune-real`
 default = []
-rune-real = ["dep:rune"]
+rune-real = ["dep:rune", "dep:rune-kit"]
 
 [dependencies.rune]
 git = "https://github.com/anomalyco/rune"
@@ -50,4 +50,13 @@ default-features = false
 # embedded-fonts: web has no system-font discovery; bundle Inter + Plex Mono
 # so glyphs render in the browser (native keeps working unchanged).
 features = ["embedded-fonts"]
+optional = true
+
+# OpenCode's syntax scanners and diff engine, reused without its skin or block
+# layout: Stark renders every margin/line box itself to match React exactly.
+[dependencies.rune-kit]
+git = "https://github.com/anomalyco/rune"
+rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b"
+package = "rune-kit"
+default-features = false
 optional = true

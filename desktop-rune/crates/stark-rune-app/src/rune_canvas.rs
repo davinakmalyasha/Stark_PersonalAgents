@@ -195,6 +195,7 @@ fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcript::RowDat
         duration: r.duration.clone(),
         show_trace: r.show_trace,
         hide_body: r.hide_body,
+        event: r.event.clone(),
     }
 }
 

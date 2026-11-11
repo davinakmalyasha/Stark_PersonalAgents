@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 stark-theme = { path = "../stark-theme" }
+pulldown-cmark = { version = "0.13", default-features = false }

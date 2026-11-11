@@ -20,6 +20,9 @@ use std::borrow::Cow;
 use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
 use stark_kit::transcript::{TranscriptRow, ESTIMATED_ROW_H};
 
+#[path = "rune_transcript/md_render.rs"]
+mod md_render;
+
 /// Row content fed to both the pure window math and the Rune view.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RowData {
@@ -33,6 +36,8 @@ pub struct RowData {
     pub duration: String,
     pub show_trace: bool,
     pub hide_body: bool,
+    /// `metadata.kind` for `SessionEventDivider`: `"aborted"` or `"compaction"`.
+    pub event: String,
 }
 
 /// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
@@ -610,6 +615,12 @@ pub struct RuneTranscriptState {
     /// Frames streamed from the run thread, drained by the `poll` hook.
     /// `None` on clone: a copied state never inherits a live socket.
     pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
+    /// The key of the code block whose copy button shows the Check state.
+    pub copied_code: Option<String>,
+    /// When that copy happened; cleared after React's 1.8s.
+    pub copied_at: Option<std::time::Instant>,
+    /// Diff blocks whose "Show all N lines" button has been pressed.
+    pub expanded_diffs: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for RuneTranscriptState {
@@ -630,6 +641,8 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("settings_open", &self.settings_open)
             .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
+            .field("copied_code", &self.copied_code)
+            .field("expanded_diffs", &self.expanded_diffs.len())
             .finish()
     }
 }
@@ -669,12 +682,24 @@ impl Clone for RuneTranscriptState {
             settings_open: self.settings_open,
             voice: self.voice.clone(),
             inbox: None,
+            copied_code: self.copied_code.clone(),
+            copied_at: self.copied_at,
+            expanded_diffs: self.expanded_diffs.clone(),
         }
     }
 }
 
 pub const DEFAULT_API_HOST: &str = "127.0.0.1";
 pub const DEFAULT_API_PORT: u16 = 8124;
+
+/// The port every client uses. `STARK_API_PORT` lets the parity rig point
+/// both frontends at a frozen fixture server without stopping the live one.
+pub fn api_port() -> u16 {
+    std::env::var("STARK_API_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_API_PORT)
+}
 
 impl RuneTranscriptState {
     /// Screenshot scene: mirrors `AppState::default` card-4 (the running chat).
@@ -701,7 +726,7 @@ impl RuneTranscriptState {
             model: "Automatic Fallback".to_string(),
             live: true,
             api_host: DEFAULT_API_HOST.to_string(),
-            api_port: DEFAULT_API_PORT,
+            api_port: api_port(),
             chat_id: crate::notes::mint_id("rune"),
             notes: crate::notes::NotesState::default(),
             run_target: "local".to_string(),
@@ -720,6 +745,9 @@ impl RuneTranscriptState {
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
+            copied_code: None,
+            copied_at: None,
+            expanded_diffs: std::collections::HashSet::new(),
         }
     }
 
@@ -753,7 +781,7 @@ impl RuneTranscriptState {
             model: "Automatic Fallback".to_string(),
             live: false,
             api_host: DEFAULT_API_HOST.to_string(),
-            api_port: DEFAULT_API_PORT,
+            api_port: api_port(),
             chat_id: crate::notes::mint_id("rune"),
             notes: crate::notes::NotesState::default(),
             run_target: "local".to_string(),
@@ -772,6 +800,9 @@ impl RuneTranscriptState {
             settings_open: false,
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
+            copied_code: None,
+            copied_at: None,
+            expanded_diffs: std::collections::HashSet::new(),
         }
     }
 
@@ -796,177 +827,28 @@ fn bg() -> rune::Color {
     rune::color::hex("#0a0a0a").unwrap_or(rune::Color::BLACK)
 }
 
-/// Render a message body as markdown blocks: paras/headings/lists become
-/// `rich` runs (bold weight, inline-code mono + merged backgrounds), fenced
-/// code becomes a mono block on a dark well. Mirrors `Markdown.tsx`.
-/// `body_ink` is the role text color (`#dedee5` user, `#d2d2da` agent, per
-/// `canvas.css`).
-fn render_body(key: &str, body: &str, body_ink: &'static str) -> El {
-    render_body_styled(key, body, body_ink, rune::tok::TextStyle::new(12.5, 400.0))
+/// Markdown block rendering lives in `md_render` (a direct `Markdown.tsx` port).
+fn render_body<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+) -> El {
+    md_render::render_body(s, which, key, body, body_ink)
 }
 
-/// Markdown renderer at a caller-chosen type scale (home rows are 15.5pt,
-/// the sheet keeps 12.5pt).
-fn render_body_styled(
+/// Markdown at a caller-chosen type scale (home rows are 15.5pt, the sheet
+/// keeps 12.5pt).
+fn render_body_styled<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
     key: &str,
     body: &str,
     body_ink: &'static str,
     body_style: rune::tok::TextStyle,
 ) -> El {
-    use stark_kit::markdown::{Block, Inline};
-    let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-    /// Flatten inlines to (text, spans) with byte offsets.
-    fn runs(inlines: &[Inline]) -> (String, Vec<rune::Span>) {
-        let mut text = String::new();
-        let mut spans = Vec::new();
-        for inline in inlines {
-            let (chunk, span) = match inline {
-                Inline::Text(t) => (t.clone(), None),
-                Inline::Bold(t) => {
-                    let s = rune::Span::new(text.len(), text.len() + t.len()).weight(650.0);
-                    (t.clone(), Some(s))
-                }
-                Inline::Code(t) => {
-                    let s = rune::Span::new(text.len(), text.len() + t.len()).mono().bg(
-                        rune::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.07,
-                        },
-                        2.0,
-                    );
-                    (t.clone(), Some(s))
-                }
-            };
-            text.push_str(&chunk);
-            if let Some(s) = span {
-                spans.push(s);
-            }
-        }
-        (text, spans)
-    }
-    let mut stack = col().key(format!("{key}-md")).w_full().gap(6.0);
-    for (i, block) in stark_kit::markdown::parse(body).iter().enumerate() {
-        match block {
-            Block::Para(inlines) => {
-                let (content, spans) = runs(inlines);
-                stack = stack.child(
-                    rune::rich(content, spans)
-                        .key(format!("{key}-p-{i}"))
-                        .font(body_style)
-                        .color(ink(body_ink)),
-                );
-            }
-            Block::Heading {
-                level,
-                text: inlines,
-            } => {
-                let (content, mut spans) = runs(inlines);
-                spans.push(
-                    rune::Span::new(0, content.len())
-                        .weight(650.0)
-                        .size(17.0 - *level as f32),
-                );
-                stack = stack.child(
-                    rune::rich(content, spans)
-                        .key(format!("{key}-h-{i}"))
-                        .font(body_style)
-                        .color(ink("#f0f0f3")),
-                );
-            }
-            Block::List(items) => {
-                let mut list = col().key(format!("{key}-ul-{i}")).w_full().gap(2.0);
-                for (j, item) in items.iter().enumerate() {
-                    let (content, spans) = runs(item);
-                    list = list.child(
-                        row()
-                            .key(format!("{key}-li-{i}-{j}"))
-                            .w_full()
-                            .gap(8.0)
-                            .child(text("•".to_string()).font(body_style).color(ink("#8a8a93")))
-                            .child(
-                                rune::rich(content, spans)
-                                    .font(body_style)
-                                    .color(ink(body_ink)),
-                            ),
-                    );
-                }
-                stack = stack.child(list);
-            }
-            Block::Table { headers, rows } => {
-                // `Markdown.tsx` table: bordered well, uppercase header row,
-                // hairline cell dividers. Cells share the width equally.
-                let mut table = col()
-                    .key(format!("{key}-table-{i}"))
-                    .w_full()
-                    .radius(8.0)
-                    .fill(ink("#0b0b0e"))
-                    .border(1.0, ink("#ffffff1f"))
-                    .px(10.0)
-                    .py(6.0)
-                    .gap(4.0);
-                let mut head = row().key(format!("{key}-tr-{i}-h")).w_full().gap(8.0);
-                for (j, cell) in headers.iter().enumerate() {
-                    let (content, mut spans) = runs(cell);
-                    spans.push(rune::Span::new(0, content.len()).weight(650.0));
-                    head = head.child(
-                        rune::rich(content, spans)
-                            .key(format!("{key}-th-{i}-{j}"))
-                            .grow(1.0)
-                            .min_h(0.0)
-                            .font(rune::tok::TextStyle::new(11.0, 400.0))
-                            .color(ink("#e4e4e7")),
-                    );
-                }
-                table = table.child(head);
-                for (r, row_cells) in rows.iter().enumerate() {
-                    let mut tr = row().key(format!("{key}-tr-{i}-{r}")).w_full().gap(8.0);
-                    for (j, cell) in row_cells.iter().enumerate() {
-                        let (content, spans) = runs(cell);
-                        tr = tr.child(
-                            rune::rich(content, spans)
-                                .key(format!("{key}-td-{i}-{r}-{j}"))
-                                .grow(1.0)
-                                .min_h(0.0)
-                                .font(body_style)
-                                .color(ink(body_ink)),
-                        );
-                    }
-                    table = table.child(tr);
-                }
-                stack = stack.child(table);
-            }
-            Block::Code { lang, text: code } => {
-                let mut block = col()
-                    .key(format!("{key}-code-{i}"))
-                    .w_full()
-                    .radius(8.0)
-                    .fill(ink("#0b0b0e"))
-                    .border(1.0, ink("#ffffff14"))
-                    .px(10.0)
-                    .py(8.0)
-                    .gap(6.0);
-                if !lang.is_empty() {
-                    block = block.child(
-                        text(lang.clone())
-                            .key(format!("{key}-code-{i}-lang"))
-                            .font(rune::tok::TextStyle::new(10.0, 600.0))
-                            .color(ink("#71717a")),
-                    );
-                }
-                stack = stack.child(
-                    block.child(
-                        rune::rich(code.clone(), vec![])
-                            .key(format!("{key}-code-{i}-body"))
-                            .font(rune::tok::TextStyle::new(12.0, 400.0).mono())
-                            .color(ink("#dfe0e4")),
-                    ),
-                );
-            }
-        }
-    }
-    stack
+    md_render::render_body_styled(s, which, key, body, body_ink, body_style)
 }
 
 /// Shared send path (button + Enter): stage the field as a user row, mark the
@@ -1306,7 +1188,11 @@ fn home_divider(label: &str) -> El {
         .child(line())
         .child(
             text(label.to_ascii_uppercase())
-                .font(rune::tok::TextStyle::new(9.0, 600.0))
+                .font({
+                    let mut style = rune::tok::TextStyle::new(9.0, 600.0);
+                    style.line_height = 12.8;
+                    style
+                })
                 .color(home_ink("#5f5f68"))
                 .px(8.0)
                 .py(2.0)
@@ -1317,7 +1203,7 @@ fn home_divider(label: &str) -> El {
         .child(line())
 }
 
-fn home_user_row(r: &RowData, max_w: f32) -> El {
+fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData, max_w: f32) -> El {
     let stamp = clock(&r.at);
     let bubble = col()
         .key(format!("{}-bubble", r.key))
@@ -1335,7 +1221,7 @@ fn home_user_row(r: &RowData, max_w: f32) -> El {
         .py(10.0)
         .max_w(max_w)
         .child(
-            render_body_styled(&r.key, &r.body, "#e4e4e7", home_body_style())
+            render_body_styled::<S>(s, which, &r.key, &r.body, "#e4e4e7", home_body_style())
                 .pt(12.0)
                 .pb(12.0),
         );
@@ -1436,10 +1322,16 @@ fn home_trace_header(r: &RowData) -> El {
         .child(rune::el().key(format!("{}-trace-gap", r.key)).h(9.0))
 }
 
-fn home_agent_row(r: &RowData, live: bool) -> El {
-    let mut response = render_body_styled(&r.key, &r.body, "#e4e4e7", home_body_style())
-        .pt(12.0)
-        .pb(12.0);
+fn home_agent_row<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    r: &RowData,
+    live: bool,
+) -> El {
+    let mut response =
+        render_body_styled::<S>(s, which, &r.key, &r.body, "#e4e4e7", home_body_style())
+            .pt(12.0)
+            .pb(12.0);
     if live {
         let mut dots = row()
             .key(format!("{}-typing", r.key))
@@ -1618,9 +1510,174 @@ fn home_error_row(r: &RowData) -> El {
         )
 }
 
+/// Lucide `Square` at a 24-unit box.
+fn home_icon_square(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([5.0, 3.0])
+        .line_to([19.0, 3.0])
+        .cubic_to([20.1, 3.0], [21.0, 3.9], [21.0, 5.0])
+        .line_to([21.0, 19.0])
+        .cubic_to([21.0, 20.1], [20.1, 21.0], [19.0, 21.0])
+        .line_to([5.0, 21.0])
+        .cubic_to([3.9, 21.0], [3.0, 20.1], [3.0, 19.0])
+        .line_to([3.0, 5.0])
+        .cubic_to([3.0, 3.9], [3.9, 3.0], [5.0, 3.0])
+        .close();
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `Archive` at a 24-unit box.
+fn home_icon_archive(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([3.0, 3.0])
+        .line_to([21.0, 3.0])
+        .line_to([21.0, 8.0])
+        .line_to([3.0, 8.0])
+        .close()
+        .move_to([5.0, 8.0])
+        .line_to([5.0, 19.0])
+        .cubic_to([5.0, 20.1], [5.9, 21.0], [7.0, 21.0])
+        .line_to([17.0, 21.0])
+        .cubic_to([18.1, 21.0], [19.0, 20.1], [19.0, 19.0])
+        .line_to([19.0, 8.0])
+        .move_to([10.0, 12.0])
+        .line_to([14.0, 12.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// `SessionEventDivider` (`MessageBubble.tsx` + `.session-event*` CSS): the
+/// hairline-framed "Session aborted / compacted" status row.
+fn home_session_event(r: &RowData) -> El {
+    let aborted = r.event == "aborted";
+    let line = || {
+        rune::el().grow(1.0).h(1.0).linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            [
+                (0.0, home_rgba(255.0, 255.0, 255.0, 0.0)),
+                (0.5, home_rgba(255.0, 255.0, 255.0, 0.09)),
+                (1.0, home_rgba(255.0, 255.0, 255.0, 0.0)),
+            ],
+        )
+    };
+    let icon = if aborted {
+        home_icon_square(10.0, home_ink("#fcd34d"))
+    } else {
+        home_icon_archive(11.0, home_ink("#8b8b94"))
+    };
+    let icon_box = rune::el()
+        .key(format!("{}-icon", r.key))
+        .size(18.0, 18.0)
+        .radius(6.0)
+        .border(
+            1.0,
+            if aborted {
+                home_rgba(252.0, 211.0, 77.0, 0.2)
+            } else {
+                home_rgba(255.0, 255.0, 255.0, 0.08)
+            },
+        )
+        .fill(if aborted {
+            home_rgba(252.0, 211.0, 77.0, 0.06)
+        } else {
+            home_rgba(255.0, 255.0, 255.0, 0.035)
+        })
+        .center()
+        .inert()
+        .child(rune::el().size(10.0, 10.0).inert().shape(icon));
+    let mut main = row()
+        .key(format!("{}-main", r.key))
+        .items_center()
+        .gap(6.0)
+        .shrink()
+        .child(icon_box)
+        .child(
+            text(if aborted {
+                "Session aborted".to_string()
+            } else {
+                "Session compacted".to_string()
+            })
+            .font({
+                let mut style = rune::tok::TextStyle::new(10.5, 600.0);
+                style.line_height = 14.0;
+                style.tracking = 0.01;
+                style
+            })
+            .color(if aborted {
+                home_ink("#e4c46a")
+            } else {
+                home_ink("#a1a1a9")
+            }),
+        );
+    if aborted {
+        main = main.child(
+            text("partial response kept".to_string())
+                .font({
+                    let mut style = rune::tok::TextStyle::new(9.5, 400.0).mono();
+                    style.line_height = 9.5;
+                    style
+                })
+                .color(home_ink("#5f5f68")),
+        );
+    }
+    if aborted {
+        main = main.child(
+            row()
+                .key(format!("{}-retry", r.key))
+                .role("button")
+                .label("Retry")
+                .items_center()
+                .gap(3.0)
+                .ml(3.0)
+                .px(6.0)
+                .py(3.0)
+                .radius(6.0)
+                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
+                .border_layout()
+                .fill(home_rgba(255.0, 255.0, 255.0, 0.04))
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.1))
+                .child(
+                    rune::el()
+                        .size(10.0, 10.0)
+                        .inert()
+                        .shape(home_icon_rotate(10.0, home_ink("#cfcfd6"))),
+                )
+                .child(
+                    text("Retry".to_string())
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(9.0, 400.0);
+                            style.line_height = 12.0;
+                            style
+                        })
+                        .color(home_ink("#cfcfd6")),
+                ),
+        );
+    }
+    row()
+        .key(format!("{}-session-event", r.key))
+        .w_full()
+        .items_center()
+        .gap(10.0)
+        .mt(10.0)
+        .mb(24.0)
+        .child(line())
+        .child(main)
+        .child(line())
+}
+
 /// One home row (`MessageStream` + `MessageBubble`): local-day divider, then
 /// the role's flat layout — no avatars, no bubble names, 24pt group spacing.
-fn home_row(t: &RuneTranscriptState, i: usize, meta: &HomeRows, max_w: f32) -> El {
+fn home_row<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    i: usize,
+    meta: &HomeRows,
+    max_w: f32,
+) -> El {
+    let t = s.thread(which);
     let r = &t.rows[i];
     let mut root = col().key(r.key.clone()).w_full();
     if let Some(label) = &meta.dividers[i] {
@@ -1630,10 +1687,14 @@ fn home_row(t: &RuneTranscriptState, i: usize, meta: &HomeRows, max_w: f32) -> E
         return root;
     }
     let live = t.live && i + 1 == t.rows.len() && r.role != "user" && r.role != "error";
-    let group = match r.role {
-        "user" => home_user_row(r, max_w),
-        "error" => home_error_row(r),
-        _ => home_agent_row(r, live),
+    let group = if !r.event.is_empty() {
+        home_session_event(r)
+    } else {
+        match r.role {
+            "user" => home_user_row::<S>(s, which, r, max_w),
+            "error" => home_error_row(r),
+            _ => home_agent_row::<S>(s, which, r, live),
+        }
     };
     root.child(group)
 }
@@ -1785,7 +1846,7 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
             move |s: &S, i| {
                 let t = s.thread(which);
                 if let Some(meta) = &home_rows {
-                    return home_row(t, i, meta, home_max_w);
+                    return home_row::<S>(s, which, i, meta, home_max_w);
                 }
                 // Live row: the streaming agent row (last, non-user, non-error)
                 // while a run is in flight. Mirrors
@@ -1855,7 +1916,7 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
                             .font(name_style)
                             .color(ink("#f0f0f3")),
                     )
-                    .child(render_body(&r.key, &r.body, body_ink));
+                    .child(render_body::<S>(s, which, &r.key, &r.body, body_ink));
                 // Bubble foot (`canvas-bubble-foot`): `hh:MM AM/PM`, nothing
                 // else — copy/rewind need clipboard + server endpoints Rune
                 // has no target for, so they stay out (documented, not faked).
@@ -2227,6 +2288,14 @@ fn apply_voice(s: &mut RuneTranscriptState) {
 /// Returns true when state changed (requests another frame).
 pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune::Tx) -> bool {
     let mut changed = false;
+    // `Markdown.tsx`'s copy button shows the Check for 1.8s.
+    if s.copied_at
+        .is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(1800))
+    {
+        s.copied_code = None;
+        s.copied_at = None;
+        changed = true;
+    }
     while let Some(frame) = s.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
         crate::stream::apply_frame(s, &frame);
         changed = true;
@@ -2718,7 +2787,7 @@ mod tests {
             env,
         );
         rt.frame(0.0);
-        for key in ["msg-1-md", "msg-1-code-1", "msg-1-code-1-body"] {
+        for key in ["msg-1-b0-p", "msg-1-b1-code", "msg-1-b1-code-body"] {
             assert!(rt.find(key).is_some(), "{key} mounted");
         }
     }

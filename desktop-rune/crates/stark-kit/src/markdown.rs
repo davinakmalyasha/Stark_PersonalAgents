@@ -1,17 +1,48 @@
-//! Minimal markdown for transcript rows — mirrors the `Markdown.tsx`
-//! (`react-markdown` + `remark-gfm`) subset agent replies actually use.
+//! Full GFM markdown for transcript rows — mirrors `Markdown.tsx`
+//! (`react-markdown` + `remark-gfm`).
 //!
-//! Supported: fenced code blocks (```lang), `#` headings, `- ` list items,
-//! paragraphs, and inline `**bold**` + `` `code` ``. Everything else passes
-//! through as plain text. `std` only; byte offsets are always char-boundary
-//! safe. Full GFM tables/syntax-highlighting arrive later.
+//! Parsing is `pulldown-cmark` (tables, strikethrough, task lists, autolinks,
+//! nested lists, quotes, rules, links, images). Rendering stays in
+//! `stark-rune-app` so every margin, colour and line box can match React's
+//! Tailwind classes exactly. `std` only; byte offsets are always
+//! char-boundary safe.
+
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// Inline segment with byte offsets into its block text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inline {
     Text(String),
-    Bold(String),
+    Bold(Vec<Inline>),
+    Italic(Vec<Inline>),
+    Strike(Vec<Inline>),
     Code(String),
+    Link {
+        href: String,
+        text: Vec<Inline>,
+    },
+    Image {
+        src: String,
+        alt: String,
+    },
+    /// `  \n` / `<br>`: a hard line break.
+    Break,
+}
+
+/// One list item: its blocks and a GFM task checkbox when the source marks it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListItem {
+    pub checked: Option<bool>,
+    pub blocks: Vec<Block>,
+}
+
+/// Table column alignment (`:---`, `:---:`, `---:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 /// One rendered block.
@@ -22,282 +53,624 @@ pub enum Block {
         level: u8,
         text: Vec<Inline>,
     },
-    List(Vec<Vec<Inline>>),
+    List {
+        ordered: bool,
+        start: u64,
+        items: Vec<ListItem>,
+    },
     Code {
         lang: String,
         text: String,
     },
-    /// GFM table: header cells + body rows (cells already inline-parsed, so
-    /// `**bold**` and `` `code` `` work inside cells like `Markdown.tsx`).
     Table {
         headers: Vec<Vec<Inline>>,
         rows: Vec<Vec<Vec<Inline>>>,
+        align: Vec<Align>,
+    },
+    Quote(Vec<Block>),
+    Rule,
+    Image {
+        src: String,
+        alt: String,
     },
 }
 
-/// Split `text` into inline segments, tracking byte offsets.
-fn parse_inlines(text: &str) -> Vec<Inline> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    let mut plain_start = 0usize;
-    let flush_plain = |out: &mut Vec<Inline>, plain_start: &mut usize, end: usize| {
-        if *plain_start < end {
-            out.push(Inline::Text(text[*plain_start..end].to_string()));
-            *plain_start = end;
+fn options() -> Options {
+    let mut o = Options::empty();
+    o.insert(Options::ENABLE_TABLES);
+    o.insert(Options::ENABLE_STRIKETHROUGH);
+    o.insert(Options::ENABLE_TASKLISTS);
+    o.insert(Options::ENABLE_FOOTNOTES);
+    // remark-gfm's autolink literals and GitHub's other extensions.
+    o.insert(Options::ENABLE_GFM);
+    o
+}
+
+fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn align(a: Alignment) -> Align {
+    match a {
+        Alignment::None => Align::None,
+        Alignment::Left => Align::Left,
+        Alignment::Center => Align::Center,
+        Alignment::Right => Align::Right,
+    }
+}
+
+enum Frame {
+    Root(Vec<Block>),
+    Quote(Vec<Block>),
+    Item {
+        checked: Option<bool>,
+        blocks: Vec<Block>,
+        /// Tight list items have no `Paragraph` event; their inline text collects here
+        /// and flushes to a `Para` before the next block (or when the item ends).
+        inline: Vec<Inline>,
+    },
+    Para(Vec<Inline>),
+    Heading {
+        level: u8,
+        text: Vec<Inline>,
+    },
+    Emphasis(Vec<Inline>),
+    Strong(Vec<Inline>),
+    Strike(Vec<Inline>),
+    Link {
+        href: String,
+        text: Vec<Inline>,
+    },
+    Image {
+        src: String,
+        alt: String,
+    },
+    Code {
+        lang: String,
+        text: String,
+    },
+    List {
+        ordered: bool,
+        start: u64,
+        items: Vec<ListItem>,
+    },
+    Table {
+        align: Vec<Align>,
+        header: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+        in_head: bool,
+    },
+    TableRow(Vec<Vec<Inline>>),
+    TableCell(Vec<Inline>),
+}
+
+/// Append an inline to the nearest inline container (or an image's alt text).
+fn push_inline(frames: &mut [Frame], inline: Inline) {
+    if let Some(Frame::Image { alt, .. }) = frames.last_mut() {
+        match inline {
+            Inline::Text(t) | Inline::Code(t) => alt.push_str(&t),
+            Inline::Break => alt.push(' '),
+            _ => {}
         }
-    };
-    while i < bytes.len() {
-        if text[i..].starts_with("**") {
-            if let Some(close) = text[i + 2..].find("**") {
-                let inner = &text[i + 2..i + 2 + close];
-                if !inner.is_empty() && !inner.contains('\n') {
-                    flush_plain(&mut out, &mut plain_start, i);
-                    out.push(Inline::Bold(inner.to_string()));
-                    i += 2 + close + 2;
-                    plain_start = i;
-                    continue;
-                }
+        return;
+    }
+    for frame in frames.iter_mut().rev() {
+        match frame {
+            Frame::Para(v)
+            | Frame::Heading { text: v, .. }
+            | Frame::Emphasis(v)
+            | Frame::Strong(v)
+            | Frame::Strike(v)
+            | Frame::Link { text: v, .. }
+            | Frame::TableCell(v) => {
+                push_or_merge(v, inline);
+                return;
             }
-            i += 2;
-        } else if bytes[i] == b'`' {
-            if let Some(close) = text[i + 1..].find('`') {
-                let inner = &text[i + 1..i + 1 + close];
-                if !inner.is_empty() && !inner.contains('\n') {
-                    flush_plain(&mut out, &mut plain_start, i);
-                    out.push(Inline::Code(inner.to_string()));
-                    i += 1 + close + 1;
-                    plain_start = i;
-                    continue;
-                }
+            // A tight list item: text arrives with no `Paragraph` event.
+            Frame::Item { inline: v, .. } => {
+                push_or_merge(v, inline);
+                return;
             }
-            i += 1;
+            Frame::Root(_) | Frame::Quote(_) => break,
+            _ => {}
+        }
+    }
+}
+
+/// Push an inline, merging adjacent plain text so soft breaks stay one run.
+fn push_or_merge(target: &mut Vec<Inline>, inline: Inline) {
+    if let Inline::Text(text) = &inline {
+        if let Some(Inline::Text(last)) = target.last_mut() {
+            last.push_str(text);
+            return;
+        }
+    }
+    target.push(inline);
+}
+
+/// Split bare `http(s)://` and `www.` literals out of text the way remark-gfm's
+/// autolink literals do. Explicit links are never re-linked.
+fn push_text(frames: &mut [Frame], text: &str) {
+    if frames.iter().rev().any(|f| matches!(f, Frame::Link { .. })) {
+        push_inline(frames, Inline::Text(text.to_string()));
+        return;
+    }
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some((at, prefix)) = find_url(rest) else {
+            push_inline(frames, Inline::Text(rest.to_string()));
+            return;
+        };
+        if at > 0 {
+            push_inline(frames, Inline::Text(rest[..at].to_string()));
+        }
+        let tail = &rest[at..];
+        let mut end = tail
+            .find(|c: char| c.is_whitespace() || c == '<' || c == '"')
+            .unwrap_or(tail.len());
+        while end > 0 {
+            let c = tail[..end].chars().next_back().unwrap_or(' ');
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+                end -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let url = &tail[..end];
+        if url.len() > prefix.len() {
+            let href = if prefix == "www." {
+                format!("https://{url}")
+            } else {
+                url.to_string()
+            };
+            push_inline(
+                frames,
+                Inline::Link {
+                    href,
+                    text: vec![Inline::Text(url.to_string())],
+                },
+            );
         } else {
-            // Advance one char to keep offsets boundary-safe.
-            let ch_len = text[i..].chars().next().map_or(1, |c| c.len_utf8());
-            i += ch_len;
+            push_inline(frames, Inline::Text(url.to_string()));
+        }
+        rest = &tail[end..];
+    }
+}
+
+fn find_url(text: &str) -> Option<(usize, &'static str)> {
+    let http = text.find("http://").map(|i| (i, "http://"));
+    let https = text.find("https://").map(|i| (i, "https://"));
+    let www = text.find("www.").map(|i| (i, "www."));
+    [http, https, www]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(i, _)| *i)
+}
+
+/// Flush a tight list item's implicit paragraph before another block joins it.
+fn flush_item_inline(frames: &mut [Frame]) {
+    for frame in frames.iter_mut().rev() {
+        if let Frame::Item { inline, blocks, .. } = frame {
+            if !inline.is_empty() {
+                blocks.push(Block::Para(std::mem::take(inline)));
+            }
+            return;
+        }
+        if matches!(frame, Frame::Root(_) | Frame::Quote(_)) {
+            return;
         }
     }
-    flush_plain(&mut out, &mut plain_start, text.len());
-    if out.is_empty() {
-        out.push(Inline::Text(String::new()));
-    }
-    out
 }
 
-/// Split a `| a | b |` row into trimmed cells. Leading/trailing pipes are
-/// optional; a line without any pipe is not a row (`None`).
-fn split_row(line: &str) -> Option<Vec<String>> {
-    if !line.contains('|') {
-        return None;
+/// Append a block to the nearest block container (root, quote or list item).
+fn push_block(frames: &mut [Frame], block: Block) {
+    flush_item_inline(frames);
+    for frame in frames.iter_mut().rev() {
+        match frame {
+            Frame::Root(v) | Frame::Quote(v) | Frame::Item { blocks: v, .. } => {
+                v.push(block);
+                return;
+            }
+            _ => {}
+        }
     }
-    let mut cells: Vec<String> = line.split('|').map(|c| c.trim().to_string()).collect();
-    // Drop the empties from outer pipes (`| a |` → ["", "a", ""]).
-    if cells.first().is_some_and(|c| c.is_empty()) {
-        cells.remove(0);
-    }
-    if cells.last().is_some_and(|c| c.is_empty()) {
-        cells.pop();
-    }
-    if cells.is_empty() {
-        return None;
-    }
-    Some(cells)
 }
 
-/// A delimiter row: every cell is `:?-+:?` (`|---|---|`, `---|:---:`).
-fn is_delimiter(line: &str) -> bool {
-    let Some(cells) = split_row(line) else {
-        return false;
-    };
-    !cells.is_empty()
-        && cells.iter().all(|c| {
-            let c = c.trim();
-            let c = c.strip_prefix(':').unwrap_or(c);
-            let c = c.strip_suffix(':').unwrap_or(c);
-            c.len() >= 3 && c.chars().all(|ch| ch == '-')
-        })
+fn end_emphasis(frames: &mut Vec<Frame>) {
+    let Some(frame) = frames.pop() else { return };
+    match frame {
+        Frame::Emphasis(text) => push_inline(frames, Inline::Italic(text)),
+        Frame::Strong(text) => push_inline(frames, Inline::Bold(text)),
+        Frame::Strike(text) => push_inline(frames, Inline::Strike(text)),
+        _ => {}
+    }
 }
+
 /// Parse message markdown into blocks.
 pub fn parse(text: &str) -> Vec<Block> {
-    let mut blocks = Vec::new();
-    let mut para: Vec<String> = Vec::new();
-    let mut list: Vec<String> = Vec::new();
-    let mut fence: Option<(String, Vec<String>)> = None;
-
-    let flush_para = |para: &mut Vec<String>, blocks: &mut Vec<Block>| {
-        if !para.is_empty() {
-            let joined = para.join("\n");
-            if !joined.trim().is_empty() {
-                blocks.push(Block::Para(parse_inlines(&joined)));
+    let mut frames = vec![Frame::Root(Vec::new())];
+    for event in Parser::new_ext(text, options()) {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => frames.push(Frame::Para(Vec::new())),
+                Tag::Heading { level, .. } => frames.push(Frame::Heading {
+                    level: heading_level(level),
+                    text: Vec::new(),
+                }),
+                Tag::BlockQuote(_) => frames.push(Frame::Quote(Vec::new())),
+                Tag::CodeBlock(kind) => {
+                    let lang = match kind {
+                        CodeBlockKind::Fenced(info) => info
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches(|c| c == '{' || c == '}')
+                            .to_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
+                    frames.push(Frame::Code {
+                        lang,
+                        text: String::new(),
+                    });
+                }
+                Tag::List(start) => frames.push(Frame::List {
+                    ordered: start.is_some(),
+                    start: start.unwrap_or(1),
+                    items: Vec::new(),
+                }),
+                Tag::Item => frames.push(Frame::Item {
+                    checked: None,
+                    blocks: Vec::new(),
+                    inline: Vec::new(),
+                }),
+                Tag::Emphasis => frames.push(Frame::Emphasis(Vec::new())),
+                Tag::Strong => frames.push(Frame::Strong(Vec::new())),
+                Tag::Strikethrough => frames.push(Frame::Strike(Vec::new())),
+                Tag::Link { dest_url, .. } => frames.push(Frame::Link {
+                    href: dest_url.to_string(),
+                    text: Vec::new(),
+                }),
+                Tag::Image { dest_url, .. } => frames.push(Frame::Image {
+                    src: dest_url.to_string(),
+                    alt: String::new(),
+                }),
+                Tag::Table(aligns) => frames.push(Frame::Table {
+                    align: aligns.into_iter().map(align).collect(),
+                    header: Vec::new(),
+                    rows: Vec::new(),
+                    in_head: false,
+                }),
+                Tag::TableHead => {
+                    for frame in frames.iter_mut().rev() {
+                        if let Frame::Table { in_head, .. } = frame {
+                            *in_head = true;
+                            break;
+                        }
+                    }
+                }
+                Tag::TableRow => frames.push(Frame::TableRow(Vec::new())),
+                Tag::TableCell => frames.push(Frame::TableCell(Vec::new())),
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                TagEnd::Paragraph => {
+                    if let Some(Frame::Para(text)) = frames.pop() {
+                        push_block(&mut frames, Block::Para(text));
+                    }
+                }
+                TagEnd::Heading(_) => {
+                    if let Some(Frame::Heading { level, text }) = frames.pop() {
+                        push_block(&mut frames, Block::Heading { level, text });
+                    }
+                }
+                TagEnd::BlockQuote(_) => {
+                    if let Some(Frame::Quote(blocks)) = frames.pop() {
+                        push_block(&mut frames, Block::Quote(blocks));
+                    }
+                }
+                TagEnd::CodeBlock => {
+                    if let Some(Frame::Code { lang, text }) = frames.pop() {
+                        push_block(&mut frames, Block::Code { lang, text });
+                    }
+                }
+                TagEnd::List(_) => {
+                    if let Some(Frame::List {
+                        ordered,
+                        start,
+                        items,
+                    }) = frames.pop()
+                    {
+                        push_block(
+                            &mut frames,
+                            Block::List {
+                                ordered,
+                                start,
+                                items,
+                            },
+                        );
+                    }
+                }
+                TagEnd::Item => {
+                    flush_item_inline(&mut frames);
+                    if let Some(Frame::Item {
+                        checked, blocks, ..
+                    }) = frames.pop()
+                    {
+                        if let Some(Frame::List { items, .. }) = frames.last_mut() {
+                            items.push(ListItem { checked, blocks });
+                        }
+                    }
+                }
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                    end_emphasis(&mut frames);
+                }
+                TagEnd::Link => {
+                    if let Some(Frame::Link { href, text }) = frames.pop() {
+                        push_inline(&mut frames, Inline::Link { href, text });
+                    }
+                }
+                TagEnd::Image => {
+                    if let Some(Frame::Image { src, alt }) = frames.pop() {
+                        push_inline(&mut frames, Inline::Image { src, alt });
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(Frame::Table {
+                        align,
+                        header,
+                        rows,
+                        ..
+                    }) = frames.pop()
+                    {
+                        push_block(
+                            &mut frames,
+                            Block::Table {
+                                headers: header,
+                                rows,
+                                align,
+                            },
+                        );
+                    }
+                }
+                TagEnd::TableHead => {
+                    for frame in frames.iter_mut().rev() {
+                        if let Frame::Table { in_head, .. } = frame {
+                            *in_head = false;
+                            break;
+                        }
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(Frame::TableRow(row)) = frames.pop() {
+                        if let Some(Frame::Table { rows, .. }) = frames.last_mut() {
+                            rows.push(row);
+                        }
+                    }
+                }
+                TagEnd::TableCell => {
+                    if let Some(Frame::TableCell(cell)) = frames.pop() {
+                        if let Some(Frame::Table {
+                            in_head: true,
+                            header,
+                            ..
+                        }) = frames.last_mut()
+                        {
+                            header.push(cell);
+                        } else if let Some(Frame::TableRow(row)) = frames.last_mut() {
+                            row.push(cell);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                if let Some(Frame::Code { text: code, .. }) = frames.last_mut() {
+                    code.push_str(&text);
+                } else {
+                    push_text(&mut frames, &text);
+                }
             }
-            para.clear();
-        }
-    };
-    let flush_list = |list: &mut Vec<String>, blocks: &mut Vec<Block>| {
-        if !list.is_empty() {
-            blocks.push(Block::List(
-                list.iter().map(|item| parse_inlines(item)).collect(),
-            ));
-            list.clear();
-        }
-    };
-
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut li = 0;
-    while li < lines.len() {
-        let line = lines[li];
-        li += 1;
-        if let Some((lang, buf)) = fence.as_mut() {
-            if line.trim_start().starts_with("```") {
-                let text = buf.join("\n");
-                blocks.push(Block::Code {
-                    lang: lang.clone(),
-                    text,
-                });
-                fence = None;
-            } else {
-                buf.push(line.to_string());
+            Event::Code(text) => push_inline(&mut frames, Inline::Code(text.to_string())),
+            Event::SoftBreak => push_inline(&mut frames, Inline::Text(" ".to_string())),
+            Event::HardBreak => push_inline(&mut frames, Inline::Break),
+            Event::Rule => push_block(&mut frames, Block::Rule),
+            Event::TaskListMarker(checked) => {
+                for frame in frames.iter_mut().rev() {
+                    if let Frame::Item { checked: slot, .. } = frame {
+                        *slot = Some(checked);
+                        break;
+                    }
+                }
             }
-            continue;
-        }
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("```") {
-            flush_para(&mut para, &mut blocks);
-            flush_list(&mut list, &mut blocks);
-            fence = Some((rest.trim().to_string(), Vec::new()));
-        } else if let Some(item) = trimmed.strip_prefix("- ") {
-            flush_para(&mut para, &mut blocks);
-            list.push(item.to_string());
-        } else if let Some(hashes) = trimmed.strip_prefix('#') {
-            let level = 1 + hashes.chars().take_while(|&c| c == '#').count().min(5) as u8;
-            let body = trimmed[level as usize..]
-                .trim_start_matches(' ')
-                .to_string();
-            flush_para(&mut para, &mut blocks);
-            flush_list(&mut list, &mut blocks);
-            blocks.push(Block::Heading {
-                level,
-                text: parse_inlines(&body),
-            });
-        } else if line.trim().is_empty() {
-            flush_para(&mut para, &mut blocks);
-            flush_list(&mut list, &mut blocks);
-        } else if split_row(line).is_some() && lines.get(li).is_some_and(|next| is_delimiter(next))
-        {
-            // GFM table: header row + delimiter + body rows. Consumes the
-            // delimiter and every following pipe row; a non-row line ends it.
-            let headers = split_row(line)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|c| parse_inlines(&c))
-                .collect();
-            li += 1; // delimiter
-            let mut rows = Vec::new();
-            while let Some(cells) = lines.get(li).and_then(|l| split_row(l)) {
-                rows.push(cells.into_iter().map(|c| parse_inlines(&c)).collect());
-                li += 1;
+            Event::Html(text) | Event::InlineHtml(text) => {
+                push_inline(&mut frames, Inline::Text(text.to_string()));
             }
-            flush_para(&mut para, &mut blocks);
-            flush_list(&mut list, &mut blocks);
-            blocks.push(Block::Table { headers, rows });
-        } else {
-            if !list.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
-                flush_list(&mut list, &mut blocks);
+            Event::FootnoteReference(name) => {
+                push_inline(&mut frames, Inline::Text(format!("[^{name}]")));
             }
-            para.push(line.to_string());
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                push_inline(&mut frames, Inline::Text(text.to_string()));
+            }
         }
     }
-    // Unclosed fence renders as code (never drops content).
-    if let Some((lang, buf)) = fence {
-        blocks.push(Block::Code {
-            lang,
-            text: buf.join("\n"),
-        });
+    let mut root = Vec::new();
+    for frame in frames {
+        if let Frame::Root(mut blocks) = frame {
+            root.append(&mut blocks);
+        }
     }
-    flush_para(&mut para, &mut blocks);
-    flush_list(&mut list, &mut blocks);
-    blocks
+    root
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn text(s: &str) -> Inline {
+        Inline::Text(s.to_string())
+    }
+
     #[test]
     fn plain_para_stays_single_text() {
         let blocks = parse("hello world");
+        assert_eq!(blocks, vec![Block::Para(vec![text("hello world")])]);
+    }
+
+    #[test]
+    fn bold_italic_strike_and_code_inlines() {
+        let blocks = parse("a **b** c *d* e ~~f~~ g `h`");
+        let Block::Para(inl) = &blocks[0] else {
+            panic!("{blocks:?}");
+        };
         assert_eq!(
-            blocks,
-            vec![Block::Para(vec![Inline::Text("hello world".to_string())])]
+            inl,
+            &vec![
+                text("a "),
+                Inline::Bold(vec![text("b")]),
+                text(" c "),
+                Inline::Italic(vec![text("d")]),
+                text(" e "),
+                Inline::Strike(vec![text("f")]),
+                text(" g "),
+                Inline::Code("h".into()),
+            ]
         );
     }
 
     #[test]
-    fn bold_and_code_inlines() {
-        let blocks = parse("run **cargo test** with `グリーン` ok");
+    fn link_and_autolink() {
+        let blocks = parse("see [docs](https://example.com) and https://opencode.ai");
+        let Block::Para(inl) = &blocks[0] else {
+            panic!("{blocks:?}");
+        };
+        assert!(matches!(
+            &inl[1],
+            Inline::Link { href, .. } if href == "https://example.com"
+        ));
+        assert!(inl
+            .iter()
+            .any(|i| matches!(i, Inline::Link { href, .. } if href == "https://opencode.ai")));
+    }
+
+    #[test]
+    fn headings_carry_their_level() {
+        let blocks = parse("# One\n\n### Three");
         assert_eq!(
             blocks,
-            vec![Block::Para(vec![
-                Inline::Text("run ".to_string()),
-                Inline::Bold("cargo test".to_string()),
-                Inline::Text(" with ".to_string()),
-                Inline::Code("グリーン".to_string()),
-                Inline::Text(" ok".to_string()),
-            ])]
+            vec![
+                Block::Heading {
+                    level: 1,
+                    text: vec![text("One")]
+                },
+                Block::Heading {
+                    level: 3,
+                    text: vec![text("Three")]
+                },
+            ]
         );
     }
 
     #[test]
-    fn fence_heading_list_blocks() {
-        let blocks = parse("# T\n\n- a\n- b\n\n```rs\nlet x = 1;\n```\ntail");
-        assert_eq!(blocks.len(), 4);
-        assert!(matches!(blocks[0], Block::Heading { level: 1, .. }));
-        assert!(matches!(blocks[1], Block::List(_)));
-        match &blocks[2] {
-            Block::Code { lang, text } => {
-                assert_eq!(lang, "rs");
-                assert_eq!(text, "let x = 1;");
-            }
-            b => panic!("expected code, got {b:?}"),
-        }
-        assert!(matches!(blocks[3], Block::Para(_)));
+    fn unordered_ordered_and_task_lists_nest() {
+        let blocks = parse("- one\n- two\n  - nested\n\n1. first\n2. [x] done\n3. [ ] todo");
+        assert_eq!(blocks.len(), 2);
+        let Block::List {
+            ordered: false,
+            items,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].checked, None);
+        assert!(matches!(
+            &items[1].blocks[1],
+            Block::List { ordered: false, .. }
+        ));
+        let Block::List {
+            ordered: true,
+            start: 1,
+            items,
+        } = &blocks[1]
+        else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(items[1].checked, Some(true));
+        assert_eq!(items[2].checked, Some(false));
+    }
+
+    #[test]
+    fn fenced_code_keeps_language_and_body() {
+        let blocks = parse("```rust\nlet x = 1;\n```");
+        assert_eq!(
+            blocks,
+            vec![Block::Code {
+                lang: "rust".into(),
+                text: "let x = 1;\n".into()
+            }]
+        );
     }
 
     #[test]
     fn unclosed_fence_keeps_content() {
-        let blocks = parse("```py\nprint(1)");
-        assert!(matches!(blocks[0], Block::Code { .. }));
+        let blocks = parse("```\nstill here");
+        assert_eq!(
+            blocks,
+            vec![Block::Code {
+                lang: String::new(),
+                text: "still here".into()
+            }]
+        );
     }
 
     #[test]
-    fn gfm_table_parses_header_and_rows() {
-        let blocks = parse("| a | b |\n|---|---|\n| 1 | **x** |\n| 2 | `y` |");
-        assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            Block::Table { headers, rows } => {
-                assert_eq!(headers.len(), 2);
-                assert_eq!(rows.len(), 2);
-                assert_eq!(rows[0][1], vec![Inline::Bold("x".to_string())]);
-                assert_eq!(rows[1][1], vec![Inline::Code("y".to_string())]);
-            }
-            b => panic!("expected table, got {b:?}"),
-        }
+    fn gfm_table_parses_header_rows_and_alignment() {
+        let blocks = parse("| a | b |\n|:--|--:|\n| 1 | 2 |");
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                headers: vec![vec![text("a")], vec![text("b")]],
+                rows: vec![vec![vec![text("1")], vec![text("2")]]],
+                align: vec![Align::Left, Align::Right],
+            }]
+        );
     }
 
     #[test]
-    fn pipes_without_delimiter_stay_para() {
-        let blocks = parse("a | b\nc | d");
-        assert_eq!(blocks.len(), 1);
-        assert!(matches!(blocks[0], Block::Para(_)));
+    fn quote_and_rule() {
+        let blocks = parse("> quoted\n\n---");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Quote(vec![Block::Para(vec![text("quoted")])]),
+                Block::Rule,
+            ]
+        );
+    }
+
+    #[test]
+    fn soft_break_is_a_space_hard_break_is_a_break() {
+        let blocks = parse("one\ntwo  \nthree");
+        let Block::Para(inl) = &blocks[0] else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(inl, &vec![text("one two"), Inline::Break, text("three")]);
     }
 
     #[test]
     fn lone_markers_stay_literal() {
-        let blocks = parse("a ** b ` c");
-        assert_eq!(
-            blocks,
-            vec![Block::Para(vec![Inline::Text("a ** b ` c".to_string())])]
-        );
+        let blocks = parse("a * b ** c ` d");
+        let Block::Para(inl) = &blocks[0] else {
+            panic!("{blocks:?}");
+        };
+        assert!(inl.iter().all(|i| matches!(i, Inline::Text(_))));
     }
 }

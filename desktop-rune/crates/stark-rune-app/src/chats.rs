@@ -129,6 +129,9 @@ pub struct ChatMsgRow {
     /// Timeline ends in a tool/reasoning segment: React keeps the flattened
     /// content out of the answer lane (trace-only row).
     pub hide_body: bool,
+    /// `metadata.kind`: `"aborted"` or `"compaction"` renders
+    /// `SessionEventDivider` instead of a bubble.
+    pub event: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -302,6 +305,12 @@ fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                             })
                         })
                         .unwrap_or(false);
+                    let event = meta
+                        .and_then(|x| x.get("kind"))
+                        .and_then(|x| x.as_str())
+                        .filter(|k| *k == "aborted" || *k == "compaction")
+                        .unwrap_or_default()
+                        .to_string();
                     ChatMsgRow {
                         key: opt_str_of(m, "id").unwrap_or_else(|| format!("msg-{i}")),
                         role: match str_of(m, "role").as_str() {
@@ -313,6 +322,7 @@ fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                         duration,
                         show_trace: is_trace && (activity > 0 || step_activity),
                         hide_body: timeline_len > 0 && !last_is_text,
+                        event,
                     }
                 })
                 .collect()
@@ -438,7 +448,7 @@ pub fn refresh(chats: &mut ChatsState) {
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let host = crate::rune_transcript::DEFAULT_API_HOST;
-        let port = crate::rune_transcript::DEFAULT_API_PORT;
+        let port = crate::rune_transcript::api_port();
         let _ = tx.send(ChatsMsg::Snapshot(fetch_snapshot(host, port)));
     });
 }
@@ -462,7 +472,7 @@ pub fn refresh_messages(chats: &mut ChatsState, workspace_id: &str, chat_id: &st
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let host = crate::rune_transcript::DEFAULT_API_HOST;
-        let port = crate::rune_transcript::DEFAULT_API_PORT;
+        let port = crate::rune_transcript::api_port();
         let rows =
             crate::transport::get_json(host, port, &format!("/api/workspaces/{ws}/chats/{chat}"))
                 .map(|v| parse_messages(&v))

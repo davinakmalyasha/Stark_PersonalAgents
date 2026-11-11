@@ -2735,6 +2735,8 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                                     // the switcher is 34.5pt with py-1.5.
                                     let mut style = rune::tok::TextStyle::new(15.0, 600.0);
                                     style.line_height = 22.5;
+                                    // React `tracking-tight`: -0.025em at 15pt.
+                                    style.tracking = -0.375;
                                     style
                                 })
                                 .color(ink("#fafafa")),

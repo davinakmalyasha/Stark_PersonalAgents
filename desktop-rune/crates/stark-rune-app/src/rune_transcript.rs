@@ -1191,6 +1191,8 @@ fn home_divider(label: &str) -> El {
                 .font({
                     let mut style = rune::tok::TextStyle::new(9.0, 600.0);
                     style.line_height = 12.8;
+                    // `.chat-date-label` `letter-spacing: .05em`.
+                    style.tracking = 0.45;
                     style
                 })
                 .color(home_ink("#5f5f68"))
@@ -1603,7 +1605,8 @@ fn home_session_event(r: &RowData) -> El {
             .font({
                 let mut style = rune::tok::TextStyle::new(10.5, 600.0);
                 style.line_height = 14.0;
-                style.tracking = 0.01;
+                // `.session-event-label` `letter-spacing: .01em`.
+                style.tracking = 0.105;
                 style
             })
             .color(if aborted {
@@ -1832,7 +1835,12 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
                 .center()
                 .child(
                     text("What to do Boss?".to_string())
-                        .font(rune::tok::TextStyle::new(19.0, 500.0))
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(19.0, 500.0);
+                            // `tracking-tight`: -0.025em.
+                            style.tracking = -0.475;
+                            style
+                        })
                         .color(home_ink("#ffffff")),
                 ),
         )

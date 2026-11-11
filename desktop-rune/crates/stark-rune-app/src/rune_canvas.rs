@@ -1770,9 +1770,14 @@ fn card_view<S: CanvasHost + 'static>(
                     crate::rune_transcript::stage_send_prompt(thread, prompt);
                 })
                 .child(
-                    text("↑".to_string())
-                        .font(rune::tok::TextStyle::new(13.0, 650.0))
-                        .color(ink(if disabled { "#71717a" } else { "#111113" })),
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(crate::lucide_arrow_up(
+                            12.0,
+                            2.0,
+                            ink(if disabled { "#5e626b" } else { "#0a0a0d" }),
+                        )),
                 )
         });
     view = view
@@ -2322,32 +2327,38 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 .items_center()
                 .gap(1.0)
                 .child(
-                    hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d"))).on_press(
-                        move |s: &mut S| {
+                    hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d"))).on_press_tx(
+                        move |s: &mut S, tx| {
                             let c = s.canvas_mut();
                             c.cam_auto = false;
                             c.cam.zoom_by(0.86);
+                            c.sync_cam_live();
+                            // The world scales at draw time; no view run.
+                            tx.live_only();
                         },
                     ),
                 )
                 .child(
-                    hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d"))).on_press(
-                        move |s: &mut S| {
+                    hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d"))).on_press_tx(
+                        move |s: &mut S, tx| {
                             let c = s.canvas_mut();
                             c.cam_auto = false;
                             c.cam.zoom_by(1.16);
+                            c.sync_cam_live();
+                            tx.live_only();
                         },
                     ),
                 )
                 .child(
-                    hud_icon("fit", "Fit to view", icon_scan(ink("#81848d"))).on_press(
-                        move |s: &mut S| {
+                    hud_icon("fit", "Fit to view", icon_scan(ink("#81848d"))).on_press_tx(
+                        move |s: &mut S, tx| {
                             let c = s.canvas_mut();
                             let cards = c.cards.clone();
                             let (vw, vh) = (c.view_w, c.view_h);
                             c.cam.fit_in(&cards, vw, vh);
                             c.sync_cam_live();
                             c.cam_auto = true;
+                            tx.live_only();
                         },
                     ),
                 )
@@ -3571,6 +3582,11 @@ mod tests {
             "zoom in steps: {}",
             rt.state.cam.scale
         );
+        assert!(
+            (rt.state.cam_scale_live.get() - rt.state.cam.scale).abs() < 1e-4,
+            "live scale follows the camera: {}",
+            rt.state.cam_scale_live.get()
+        );
         let (x, y) = rt.find("cam-reset").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
@@ -3582,6 +3598,11 @@ mod tests {
             (rt.state.cam.scale - 0.84033614).abs() < 0.01,
             "reset fits the stock board: {}",
             rt.state.cam.scale
+        );
+        assert!(
+            (rt.state.cam_scale_live.get() - rt.state.cam.scale).abs() < 1e-4,
+            "live scale follows a fit: {}",
+            rt.state.cam_scale_live.get()
         );
     }
 
@@ -3611,6 +3632,11 @@ mod tests {
             (rt.state.cards[0].x, rt.state.cards[0].y),
             card_before,
             "cards stay put while panning"
+        );
+        assert_eq!(
+            rt.state.cam_live.get(),
+            [rt.state.cam.x, rt.state.cam.y],
+            "live offset follows the camera"
         );
         // The camera is published through live_offset/live_scale; the drawn
         // rect must follow without any layout change to the card itself.

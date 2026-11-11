@@ -58,21 +58,29 @@ compares softened images so font anti-aliasing stops dominating.
 
 | capture | full mean | right mean | align |
 |---|---|---|---|
-| frozen fixtures, 1× | **2.130** | **2.751** | (0, 0) |
+| frozen fixtures, 1× | **2.117** | **2.763** | (0, 0) |
 
 The renderer embeds the exact `InterVariable.ttf` the browser loads (the
-built-in static Inter shifted every text box); that plus the live camera took
-the baseline from 2.306 to 2.130.
+built-in static Inter shifted every text box), matches React's Tailwind
+letter-spacing, and draws the send/stop icons as the same Lucide geometry.
+Those plus the live camera took the baseline from 2.306 to 2.117.
 
 Release native renders pixel-identical to debug (mean 0.0) at ~4× the
-speed: animating p50 3.0–4.0 ms, forced repaint p50 2.5 ms, zero draws at
-rest. Canvas pan/zoom publishes through Rune `Live` values and says
-`tx.live_only()`, so dragging the map never rebuilds the view. The release
-wasm is 11.2 MB before the embedded font (debug was 76.9 MB).
+speed: animating p50 4.8 ms, forced repaint p50 2.5 ms, zero draws at rest.
+Canvas pan/zoom publishes through Rune `Live` values (world offset/scale,
+grid offset) and says `tx.live_only()`, so panning or zooming never rebuilds
+the view or relayouts text. The release wasm is 12.04 MB with the embedded
+face (debug was 76.9 MB).
 
-The remaining difference is text rasterisation (Chrome glyph AA vs Rune's
-DirectWrite/Skia-gamma atlas), not geometry. Any `align` other than `(0, 0)`
-is a real layout shift and should be fixed first.
+`STARK_FONT_SMOOTHING=off|on|directwrite` is a rig-only knob for the shell
+snapshot. DirectWrite is the shipped default and measures best (2.117 vs
+2.28 Off / 2.33 On against the same React capture).
+
+The remaining difference is glyph rasterisation, not geometry. Chrome draws
+subpixel (LCD) antialiasing on opaque surfaces such as the prompt dock
+(visible RGB fringes there), while Rune's pinned renderer draws grayscale;
+those pixels can never match exactly. Any `align` other than `(0, 0)` is a
+real layout shift and should be fixed first.
 
 ## State scripts
 

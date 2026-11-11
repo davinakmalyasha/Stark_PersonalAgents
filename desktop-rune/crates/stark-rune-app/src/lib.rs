@@ -55,3 +55,33 @@ pub mod voice;
 pub(crate) fn lucide_stroke(size: f32) -> f32 {
     size * (2.0 / 24.0)
 }
+
+/// Lucide `ArrowUp` (`m5 12 7-7 7 7` + `M12 19V5`) at `size` points.
+/// `stroke_units` is the 24-unit stroke (2.0 normally, 2.4 in the send button).
+#[cfg(feature = "rune-real")]
+pub(crate) fn lucide_arrow_up(size: f32, stroke_units: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([5.0, 12.0])
+        .line_to([12.0, 5.0])
+        .line_to([19.0, 12.0])
+        .move_to([12.0, 19.0])
+        .line_to([12.0, 5.0]);
+    rune::Shape::new()
+        .stroke_path(
+            &p,
+            size * (stroke_units / 24.0),
+            rune::LineCap::Round,
+            color,
+        )
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `Square` drawn as a filled shape (`fill="currentColor"`):
+/// an 18-unit rounded rect inset 3 units in the 24-unit box.
+#[cfg(feature = "rune-real")]
+pub(crate) fn lucide_square_filled(size: f32, color: rune::Color) -> rune::El {
+    rune::el()
+        .size(size * (18.0 / 24.0), size * (18.0 / 24.0))
+        .radius(size * (2.0 / 24.0))
+        .fill(color)
+}

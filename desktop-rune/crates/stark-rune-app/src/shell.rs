@@ -1057,7 +1057,18 @@ pub fn shell_spec() -> AppSpec<ShellState> {
 }
 
 pub fn run_shell_headless(extra_args: Vec<String>) {
-    rune::App::new(shell_spec()).args(extra_args).run();
+    // `STARK_FONT_SMOOTHING` is a parity-rig knob: DirectWrite is the
+    // Windows default (Chromium's path), `off`/`on` are the portable
+    // pipelines. It never changes the shipped default.
+    let mut app = rune::App::new(shell_spec());
+    if let Ok(mode) = std::env::var("STARK_FONT_SMOOTHING") {
+        app = app.font_smoothing(match mode.as_str() {
+            "off" => rune::FontSmoothing::Off,
+            "on" => rune::FontSmoothing::On,
+            _ => rune::FontSmoothing::DirectWrite,
+        });
+    }
+    app.args(extra_args).run();
 }
 
 #[cfg(test)]

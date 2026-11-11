@@ -628,9 +628,11 @@ pub fn composer_card<S: 'static>(
                 move |s: &mut S| cancel(s)
             })
             .child(
-                text("■".to_string())
-                    .font(rune::tok::TextStyle::new(12.0, 650.0))
-                    .color(ink("#ffbac9")),
+                rune::el()
+                    .size(14.0, 14.0)
+                    .inert()
+                    .center()
+                    .child(crate::lucide_square_filled(14.0, ink("#ffbac9"))),
             );
     } else if has_text {
         send_btn = send_btn
@@ -644,9 +646,10 @@ pub fn composer_card<S: 'static>(
                 move |s: &mut S| on_send(s)
             })
             .child(
-                text("↑".to_string())
-                    .font(rune::tok::TextStyle::new(16.0, 650.0))
-                    .color(ink("#ffffff")),
+                rune::el()
+                    .size(16.0, 16.0)
+                    .inert()
+                    .shape(crate::lucide_arrow_up(16.0, 2.4, ink("#ffffff"))),
             );
     } else {
         send_btn = send_btn
@@ -658,9 +661,10 @@ pub fn composer_card<S: 'static>(
                 move |s: &mut S| on_send(s)
             })
             .child(
-                text("↑".to_string())
-                    .font(rune::tok::TextStyle::new(16.0, 650.0))
-                    .color(ink("#111113")),
+                rune::el()
+                    .size(16.0, 16.0)
+                    .inert()
+                    .shape(crate::lucide_arrow_up(16.0, 2.4, ink("#111113"))),
             );
     }
     let card = col()

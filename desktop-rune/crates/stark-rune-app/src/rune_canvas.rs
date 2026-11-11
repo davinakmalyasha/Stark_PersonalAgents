@@ -270,6 +270,14 @@ pub struct CanvasState {
     pub sessions: Sessions,
     /// Camera (pan + zoom); chrome stays fixed while the world scales.
     pub cam: Camera,
+    /// Presentation copy of the camera. Pan and zoom publish here and say
+    /// `tx.live_only()`, so dragging the map never rebuilds the view (Rune
+    /// binds offsets/scales at draw time; hit tests follow them).
+    pub cam_live: rune::Live<[f32; 2]>,
+    pub cam_scale_live: rune::Live<f32>,
+    /// Dot grid offset: camera pan modulo the 26pt tile. The field is one
+    /// tile larger than the viewport, so wrapping by a tile is invisible.
+    pub grid_live: rune::Live<[f32; 2]>,
     /// Camera follows the content (React `fitView`) until the first manual
     /// pan/zoom; the shell refits when the window resizes.
     pub cam_auto: bool,
@@ -347,6 +355,9 @@ impl Clone for CanvasState {
             rail: self.rail,
             sessions: self.sessions.clone(),
             cam: self.cam,
+            cam_live: self.cam_live.clone(),
+            cam_scale_live: self.cam_scale_live.clone(),
+            grid_live: self.grid_live.clone(),
             cam_auto: self.cam_auto,
             cam_fitted: self.cam_fitted,
             layout_meta: self.layout_meta.clone(),
@@ -447,6 +458,9 @@ impl CanvasState {
             rail: RailTab::Chats,
             sessions: Sessions::default(),
             cam: Camera::default(),
+            cam_live: rune::Live::new([0.0, 0.0]),
+            cam_scale_live: rune::Live::new(1.0),
+            grid_live: rune::Live::new([0.0, 0.0]),
             cam_auto: true,
             cam_fitted: false,
             layout_meta: std::collections::HashMap::new(),
@@ -639,6 +653,7 @@ impl CanvasState {
         if self.cam_auto && !self.cam_fitted {
             let (vw, vh) = (self.view_w, self.view_h);
             self.cam.fit_in(&self.cards, vw, vh);
+            self.sync_cam_live();
             self.cam_fitted = true;
         }
     }
@@ -700,6 +715,17 @@ impl CanvasState {
         true
     }
 
+    /// Publish the camera to its live presentation values. Call after any
+    /// mutation a view rebuild might not accompany.
+    pub fn sync_cam_live(&self) {
+        self.cam_live.set([self.cam.x, self.cam.y]);
+        self.cam_scale_live.set(self.cam.scale);
+        self.grid_live.set([
+            (self.cam.x + DOT_STEP / 2.0).rem_euclid(DOT_STEP),
+            (self.cam.y + DOT_STEP / 2.0).rem_euclid(DOT_STEP),
+        ]);
+    }
+
     /// React `relayout` (Reset layout): auto cards snap back to their tidy-tree
     /// slots, manual drafts stay put, then the map refits.
     pub fn relayout(&mut self) {
@@ -723,6 +749,7 @@ impl CanvasState {
         let cards = self.cards.clone();
         let (vw, vh) = (self.view_w, self.view_h);
         self.cam.fit_in(&cards, vw, vh);
+        self.sync_cam_live();
         self.cam_auto = true;
         self.cam_fitted = true;
         self.press_home = None;
@@ -744,6 +771,7 @@ impl CanvasState {
         self.cam.scale = k;
         self.cam.x = vw / 2.0 - cx * k;
         self.cam.y = vh / 2.0 - cy * k;
+        self.sync_cam_live();
         self.cam_auto = false;
     }
 
@@ -2037,10 +2065,11 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
     // React's `[data-canvas-ui]`.
     let mut world = col()
         .key("canvas-world")
-        .absolute(s.cam.x, s.cam.y)
+        .absolute(0.0, 0.0)
+        .live_offset(&s.cam_live)
         .size(vw, vh)
         .origin(0.0, 0.0)
-        .scale(s.cam.scale);
+        .live_scale(&s.cam_scale_live);
     // Background pan surface: fixed, unscaled (React `CanvasStage` drag on
     // the stage). Cards sit above it, so empty presses pan while header
     // presses drag cards.
@@ -2049,10 +2078,10 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         .absolute(0.0, 0.0)
         .size(vw, vh)
         .fill(ink("#08080a"))
-        .on_drag(move |s: &mut S, drag: &mut Drag, _tx| {
-            let c = s.canvas_mut();
+        .on_drag(move |s: &mut S, drag: &mut Drag, tx| {
             match drag.phase {
                 Phase::Down => {
+                    let c = s.canvas_mut();
                     c.press_pan = Some((c.cam.x, c.cam.y));
                 }
                 Phase::Move | Phase::Up => {
@@ -2061,9 +2090,12 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         c.cam.x = hx + drag.dx;
                         c.cam.y = hy + drag.dy;
                         c.cam_auto = false;
+                        c.sync_cam_live();
+                        // The world and grid follow at draw time; no view run.
+                        tx.live_only();
                     }
                     if matches!(drag.phase, Phase::Up) {
-                        c.press_pan = None;
+                        s.canvas_mut().press_pan = None;
                     }
                 }
             }
@@ -2073,14 +2105,15 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
     let mut grid = col()
         .key("canvas-grid")
         .absolute(0.0, 0.0)
-        .size(vw, vh)
+        .live_offset(&s.grid_live)
+        .size(vw + DOT_STEP, vh + DOT_STEP)
         .inert();
-    let ox = (s.cam.x + DOT_STEP / 2.0).rem_euclid(DOT_STEP);
-    let oy = (s.cam.y + DOT_STEP / 2.0).rem_euclid(DOT_STEP);
-    let mut gy = oy;
-    while gy < vh {
-        let mut gx = ox;
-        while gx < vw {
+    // The field is anchored at 0 and one tile larger than the viewport; the
+    // live grid offset supplies the camera remainder, so a pan never rebuilds.
+    let mut gy = 0.0;
+    while gy < vh + DOT_STEP {
+        let mut gx = 0.0;
+        while gx < vw + DOT_STEP {
             grid = grid.child(
                 rune::el()
                     .key(format!("dot-{gx:.0}x{gy:.0}"))
@@ -2313,6 +2346,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                             let cards = c.cards.clone();
                             let (vw, vh) = (c.view_w, c.view_h);
                             c.cam.fit_in(&cards, vw, vh);
+                            c.sync_cam_live();
                             c.cam_auto = true;
                         },
                     ),
@@ -3161,7 +3195,11 @@ fn init_map() -> CanvasState {
 }
 
 pub fn canvas_spec() -> AppSpec<CanvasState> {
-    AppSpec::new("Stark Canvas", (MAP_W, MAP_H), init_map, canvas_view)
+    AppSpec {
+        fonts: &[include_bytes!("../assets/InterVariable.ttf")],
+        families: ("Inter", "ui-monospace"),
+        ..AppSpec::new("Stark Canvas", (MAP_W, MAP_H), init_map, canvas_view)
+    }
 }
 
 pub fn run_canvas_headless(extra_args: Vec<String>) {
@@ -3554,6 +3592,7 @@ mod tests {
         // canvas fills the window — no rail offset here).
         let (x0, y0) = (950.0, 800.0);
         let card_before = (rt.state.cards[0].x, rt.state.cards[0].y);
+        let drawn_before = rt.find("chat:ws-general:chat-1").expect("card drawn");
         rt.pointer_down(x0, y0);
         rt.frame(1.0 / 60.0);
         rt.pointer_move(x0 + 40.0, y0 + 30.0);
@@ -3570,6 +3609,14 @@ mod tests {
             (rt.state.cards[0].x, rt.state.cards[0].y),
             card_before,
             "cards stay put while panning"
+        );
+        // The camera is published through live_offset/live_scale; the drawn
+        // rect must follow without any layout change to the card itself.
+        let drawn_after = rt.find("chat:ws-general:chat-1").expect("card still drawn");
+        assert!(
+            (drawn_after.0 - drawn_before.0 - 40.0).abs() < 2.0
+                && (drawn_after.1 - drawn_before.1 - 30.0).abs() < 2.0,
+            "drawn card follows the live camera: {drawn_before:?} -> {drawn_after:?}"
         );
     }
 

@@ -7,7 +7,15 @@ SIZE=${2:-800x573}
 SCRIPT=${3:-}
 AT=${4:-4}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=${STARK_RUNE_BIN:-D:/cargo-target/stark/debug/stark-rune.exe}
+if [ -z "${STARK_RUNE_BIN:-}" ]; then
+  if [ -x "D:/cargo-target/stark/release/stark-rune.exe" ]; then
+    BIN=D:/cargo-target/stark/release/stark-rune.exe
+  else
+    BIN=D:/cargo-target/stark/debug/stark-rune.exe
+  fi
+else
+  BIN=$STARK_RUNE_BIN
+fi
 ARGS=(--rune-shell-snap "$OUT" --size "$SIZE" --at "$AT")
 if [ -n "$SCRIPT" ]; then
   ARGS+=(--script "$ROOT/desktop-rune/parity/scripts/$SCRIPT")

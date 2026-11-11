@@ -2337,6 +2337,8 @@ pub fn spec() -> AppSpec<RuneTranscriptState> {
             ("voice", apply_voice),
         ],
         poll: Some(drain_run_inbox),
+        fonts: &[include_bytes!("../assets/InterVariable.ttf")],
+        families: ("Inter", "ui-monospace"),
         ..AppSpec::new(
             "Stark Transcript",
             (468.0, 720.0),

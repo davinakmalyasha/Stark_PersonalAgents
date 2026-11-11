@@ -1033,6 +1033,10 @@ fn apply_panel_memory(s: &mut ShellState) {
     s.canvas.rail = RailTab::Memory;
 }
 
+/// The exact Inter variable face the browser loads from Google Fonts.
+/// The built-in static Inter is close but not the same instance.
+const SHELL_FONTS: &[&[u8]] = &[include_bytes!("../assets/InterVariable.ttf")];
+
 pub fn shell_spec() -> AppSpec<ShellState> {
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
@@ -1047,6 +1051,8 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("design", apply_home),
     ];
     spec.poll = Some(shell_poll);
+    spec.fonts = SHELL_FONTS;
+    spec.families = ("Inter", "ui-monospace");
     spec
 }
 

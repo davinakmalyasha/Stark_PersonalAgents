@@ -73,12 +73,16 @@ Release native renders pixel-identical to debug (mean 0.0) at ~4× the
 speed: animating p50 4.8 ms, forced repaint p50 2.5 ms, zero draws at rest.
 Canvas pan/zoom publishes through Rune `Live` values (world offset/scale,
 grid offset) and says `tx.live_only()`, so panning or zooming never rebuilds
-the view or relayouts text. The release wasm is 12.04 MB with the embedded
+the view or relayouts text. The release wasm is 12.06 MB with the embedded
 face (debug was 76.9 MB).
 
 `STARK_FONT_SMOOTHING=off|on|directwrite` is a rig-only knob for the shell
 snapshot. DirectWrite is the shipped default and measures best (2.117 vs
 2.28 Off / 2.33 On against the same React capture).
+
+Relative-time labels (`20d`) are computed from the wall clock at capture
+time, not the fixture, so a capture taken across a day boundary can differ
+on those labels by a few pixels. Capture React and native back-to-back.
 
 `boot_home.json` is deliberately empty: the fixture `/api/ui/state` already
 opens the "hello" chat, so a capture must not tap the sidebar (a tap calls

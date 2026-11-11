@@ -558,6 +558,8 @@ pub struct GraphCard {
     pub compact: bool,
     pub is_tab: bool,
     pub depth: usize,
+    /// Parent card id when this card nests under another (`CanvasItem.parentItemId`).
+    pub parent_item_id: Option<String>,
 }
 
 /// Tidy-tree placement, line for line from `buildCanvasGraph`.
@@ -794,6 +796,7 @@ pub fn layout(snapshot: &ChatSnapshot) -> (Vec<GraphCard>, Vec<(String, String)>
         if let Some(parent) = &node.parent {
             edges.push((format!("chat:{parent}"), id.clone()));
         }
+        let parent_item_id = node.parent.as_ref().map(|parent| format!("chat:{parent}"));
         cards.push(GraphCard {
             id,
             workspace_id: node.chat.workspace_id.clone(),
@@ -805,6 +808,7 @@ pub fn layout(snapshot: &ChatSnapshot) -> (Vec<GraphCard>, Vec<(String, String)>
             compact: node.depth > 0,
             is_tab: node.is_tab,
             depth: node.depth,
+            parent_item_id,
         });
     }
     (cards, edges)

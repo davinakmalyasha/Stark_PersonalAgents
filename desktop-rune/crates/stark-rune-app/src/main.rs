@@ -56,6 +56,14 @@ mod voice;
 // Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)
 // ---------------------------------------------------------------------------
 
+/// Lucide draws its 2-unit stroke at a 24-unit viewBox and scales it with the
+/// icon. Rune's `view_box` leaves stroke widths in points, so callers pass the
+/// icon's point size here to keep the drawn weight identical to React.
+#[cfg(feature = "rune-real")]
+pub(crate) fn lucide_stroke(size: f32) -> f32 {
+    size * (2.0 / 24.0)
+}
+
 /// Base path. Desktop talks to `127.0.0.1:8124`; Vite PWA proxies `/api`.
 pub const API_BASE: &str = "/api";
 /// Resolved dev default (Rust server). Python legacy is `:8123`.

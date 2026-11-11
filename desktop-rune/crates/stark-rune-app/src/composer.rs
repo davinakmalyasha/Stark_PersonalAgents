@@ -23,8 +23,20 @@ fn attach_button() -> El {
     // still matches HouseChat.
     let color = ink("#b4b4bc");
     let plus = rune::Shape::new()
-        .line([12.0, 5.0], [12.0, 19.0], 1.8, rune::LineCap::Round, color)
-        .line([5.0, 12.0], [19.0, 12.0], 1.8, rune::LineCap::Round, color)
+        .line(
+            [12.0, 5.0],
+            [12.0, 19.0],
+            crate::lucide_stroke(18.0),
+            rune::LineCap::Round,
+            color,
+        )
+        .line(
+            [5.0, 12.0],
+            [19.0, 12.0],
+            crate::lucide_stroke(18.0),
+            rune::LineCap::Round,
+            color,
+        )
         .view_box(24.0, 24.0);
     rune::el()
         .key("composer-attach")
@@ -53,7 +65,7 @@ fn voice_icon(color: rune::Color) -> rune::Shape {
         .move_to([22.0, 10.0])
         .line_to([22.0, 13.0]);
     rune::Shape::new()
-        .stroke_path(&p, 1.8, rune::LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(16.0), rune::LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -124,21 +136,36 @@ pub struct ComposerMeta<'a> {
 /// behave identically either way, same as React).
 /// Lucide `CloudOff` / `Cloud` at a 12pt box for the run-target toggle.
 fn cloud_icon(off: bool, color: rune::Color) -> rune::Shape {
-    let mut p = rune::Path::new()
-        .move_to([7.0, 7.8])
-        .cubic_to([4.8, 9.0], [3.5, 11.0], [3.5, 13.2])
-        .cubic_to([3.5, 16.0], [5.8, 18.0], [8.6, 18.0])
-        .line_to([17.3, 18.0])
-        .cubic_to([19.9, 18.0], [21.5, 16.0], [21.5, 13.7])
-        .cubic_to([21.5, 11.5], [19.7, 9.8], [17.5, 9.8])
-        .line_to([16.8, 9.8])
-        .cubic_to([16.2, 6.2], [13.2, 4.0], [10.0, 4.8])
-        .cubic_to([9.1, 5.0], [8.1, 5.6], [7.3, 6.4]);
+    // Lucide v1.17 `cloud-off` / `cloud`.
+    let mut p = if off {
+        rune::Path::new()
+            .move_to([10.94, 5.27])
+            .cubic_to([13.23, 5.93], [15.03, 7.72], [15.71, 10.0])
+            .line_to([17.5, 10.0])
+            .cubic_to([18.97, 10.0], [20.35, 10.72], [21.19, 11.93])
+            .cubic_to([22.03, 13.13], [22.23, 14.68], [21.72, 16.06])
+            .move_to([18.8, 18.81])
+            .cubic_to([18.38, 18.94], [17.94, 19.0], [17.5, 19.0])
+            .line_to([9.0, 19.0])
+            .cubic_to([5.77, 19.0], [2.96, 16.79], [2.2, 13.65])
+            .cubic_to([1.44, 10.51], [2.92, 7.26], [5.79, 5.78])
+    } else {
+        rune::Path::new()
+            .move_to([17.5, 19.0])
+            .line_to([9.0, 19.0])
+            .cubic_to([5.4, 19.0], [2.38, 16.26], [2.03, 12.67])
+            .cubic_to([1.69, 9.09], [4.12, 5.82], [7.66, 5.13])
+            .cubic_to([11.2, 4.44], [14.68, 6.55], [15.71, 10.0])
+            .line_to([17.5, 10.0])
+            .cubic_to([19.99, 10.0], [22.0, 12.01], [22.0, 14.5])
+            .cubic_to([22.0, 16.99], [19.99, 19.0], [17.5, 19.0])
+            .close()
+    };
     if off {
-        p = p.move_to([3.0, 3.0]).line_to([21.0, 21.0]);
+        p = p.move_to([2.0, 2.0]).line_to([22.0, 22.0]);
     }
     rune::Shape::new()
-        .stroke_path(&p, 1.7, rune::LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(12.0), rune::LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -218,14 +245,50 @@ fn target_toggle<S: 'static>(
 /// (`index.css .send-button.stop`: white circle, dark square, "Stop
 /// execution") and presses `on_cancel` — React's `isRunning && empty → Stop`
 /// simplified: a live run always stops first, a second prompt waits its turn.
+/// A smooth circle as four cubic arcs (Rune has no arc primitive; the usage
+/// ring is a scaled SVG circle, so a tessellated track shows as dots).
+fn circle_path(cx: f32, cy: f32, r: f32) -> rune::Path {
+    const K: f32 = 0.552_284_8;
+    let k = r * K;
+    rune::Path::new()
+        .move_to([cx, cy - r])
+        .cubic_to([cx + k, cy - r], [cx + r, cy - k], [cx + r, cy])
+        .cubic_to([cx + r, cy + k], [cx + k, cy + r], [cx, cy + r])
+        .cubic_to([cx - k, cy + r], [cx - r, cy + k], [cx - r, cy])
+        .cubic_to([cx - r, cy - k], [cx - k, cy - r], [cx, cy - r])
+        .close()
+}
+
+/// A translucent annulus as a single fill: Rune blends translucent strokes
+/// twice wherever neighbouring segments meet, which brightens a stroked ring
+/// (~13% track renders at ~24%). Outer ring clockwise, inner reversed, with
+/// the slit tucked under the 12 o'clock progress cap.
+fn ring_fill(cx: f32, cy: f32, r_in: f32, r_out: f32) -> Vec<[f32; 2]> {
+    const N: usize = 96;
+    let mut pts = Vec::with_capacity(N * 2);
+    let at = |i: usize, r: f32| {
+        let a = -std::f32::consts::FRAC_PI_2 + (i as f32 / N as f32) * 2.0 * std::f32::consts::PI;
+        [cx + r * a.cos(), cy + r * a.sin()]
+    };
+    for i in 0..N {
+        pts.push(at(i, r_out));
+    }
+    for i in (0..N).rev() {
+        pts.push(at(i, r_in));
+    }
+    pts
+}
+
 /// Usage orb (`usage-orb`): 31px circle, tabular number = context percent,
-/// ring track underneath. The progress arc is tessellated segments stroked
-/// round-capped (Rune has no arc primitive) — same 3px width, same color
-/// steps (95+ red, 85+ amber, else light).
+/// ring track underneath. React scales a 40-unit SVG circle (r16, stroke 3)
+/// into a 29pt box inset 1pt, so the drawn radius is 11.6 and the stroke
+/// 2.175. The progress arc is tessellated (round caps, 3px-equivalent).
 fn usage_orb<S: 'static>(
     usage: &super::rune_transcript::UsageTotals,
     on_usage: impl Fn(&mut S) + 'static,
 ) -> El {
+    const RADIUS: f32 = 11.6;
+    const WIDTH: f32 = 2.175;
     let pct = usage.context_percent();
     let ring_ink = if pct >= 95.0 {
         "#f87171"
@@ -241,15 +304,15 @@ fn usage_orb<S: 'static>(
     } else {
         "#dadade"
     };
-    // Tessellated arc from -90°, clockwise, over `pct` of the circle.
+    // Tessellated arc from 12 o'clock, clockwise, over `pct` of the circle.
     let mut pts = Vec::new();
-    let steps = 28usize;
+    let steps = 64usize;
     let frac = (pct / 100.0).clamp(0.0, 1.0);
     let n = (frac * steps as f64).round() as usize;
-    for i in 0..=n.max(1).min(steps) {
+    for i in 0..=n.min(steps) {
         let a =
             -std::f32::consts::FRAC_PI_2 + (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
-        pts.push([15.5 + 13.0 * a.cos(), 15.5 + 13.0 * a.sin()]);
+        pts.push([15.5 + RADIUS * a.cos(), 15.5 + RADIUS * a.sin()]);
     }
     let mut orb = rune::el()
         .key("composer-usage")
@@ -261,32 +324,39 @@ fn usage_orb<S: 'static>(
         .on_press(move |s: &mut S| on_usage(s))
         .child(
             text(format!("{:.0}", pct))
-                .font(rune::tok::TextStyle::new(9.0, 400.0))
+                .font({
+                    let mut style = rune::tok::TextStyle::new(9.0, 400.0);
+                    style.features = "'tnum' 1";
+                    style
+                })
                 .color(ink(number_ink)),
         );
     // Track ring (`.usage-ring-track`): always visible, even at 0%.
-    let track: Vec<[f32; 2]> = (0..steps)
-        .map(|i| {
-            let a = -std::f32::consts::FRAC_PI_2
-                + (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
-            [15.5 + 13.0 * a.cos(), 15.5 + 13.0 * a.sin()]
-        })
-        .collect();
     orb = orb.child(
         rune::el()
             .key("composer-usage-track")
             .absolute(0.0, 0.0)
             .size(31.0, 31.0)
             .inert()
-            .shape(rune::Shape::new().stroke_with(
-                track,
-                true,
-                2.2,
-                rune::LineCap::Round,
+            .shape(rune::Shape::new().fill(
+                ring_fill(15.5, 15.5, RADIUS - WIDTH / 2.0, RADIUS + WIDTH / 2.0),
                 ink("#ffffff21"),
             )),
     );
-    if n > 0 {
+    if n == 0 && frac <= 0.0 {
+        // `strokeDasharray: "0 100"` with a round cap paints a single dot.
+        orb = orb.child(
+            rune::el()
+                .key("composer-usage-ring")
+                .absolute(0.0, 0.0)
+                .size(31.0, 31.0)
+                .inert()
+                .shape(rune::Shape::new().fill_path(
+                    &circle_path(15.5, 15.5 - RADIUS, WIDTH / 2.0),
+                    ink(ring_ink),
+                )),
+        );
+    } else if !pts.is_empty() {
         orb = orb.child(
             rune::el()
                 .key("composer-usage-ring")
@@ -296,7 +366,7 @@ fn usage_orb<S: 'static>(
                 .shape(rune::Shape::new().stroke_with(
                     pts,
                     false,
-                    2.2,
+                    WIDTH,
                     rune::LineCap::Round,
                     ink(ring_ink),
                 )),
@@ -633,21 +703,27 @@ pub fn composer_card<S: 'static>(
                 .pt(10.0)
                 .pb(4.0)
                 .child(
-                    text_input(edit, rune::tok::TextStyle::new(15.0, 400.0))
-                        .key("composer-input")
-                        .w_full()
-                        .h(40.0)
-                        .placeholder(
-                            if voice_live {
-                                "Listening…"
-                            } else {
-                                "Ask anything"
-                            },
-                            ink("#74747d"),
-                        )
-                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
-                        .on_edit(edit_of)
-                        .on_submit(submit),
+                    text_input(edit, {
+                        // `.prompt-input`: 15px at line-height 1.55, padding 3px top.
+                        let mut style = rune::tok::TextStyle::new(15.0, 400.0);
+                        style.line_height = 15.0 * 1.55;
+                        style
+                    })
+                    .key("composer-input")
+                    .w_full()
+                    .h(40.0)
+                    .pt(3.0)
+                    .placeholder(
+                        if voice_live {
+                            "Listening…"
+                        } else {
+                            "Ask anything"
+                        },
+                        ink("#74747deb"),
+                    )
+                    .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                    .on_edit(edit_of)
+                    .on_submit(submit),
                 ),
         )
         .child(

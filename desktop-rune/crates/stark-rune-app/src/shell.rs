@@ -35,14 +35,14 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
-/// One stroked icon from a 24×24 path, Lucide geometry at 18pt.
-fn icon_shape(path: Path, color: rune::Color) -> Shape {
+/// One stroked icon from a 24×24 path, Lucide geometry scaled to `size`.
+fn icon_shape(path: Path, size: f32, color: rune::Color) -> Shape {
     Shape::new()
-        .stroke_path(&path, 1.7, LineCap::Round, color)
+        .stroke_path(&path, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
-fn icon_new_chat(color: rune::Color) -> Shape {
+fn icon_new_chat(size: f32, color: rune::Color) -> Shape {
     // SquarePen: rectangle with an open top-right corner + pen.
     let mut p = Path::new()
         .move_to([12.0, 3.0])
@@ -61,101 +61,118 @@ fn icon_new_chat(color: rune::Color) -> Shape {
         .line_to([8.0, 16.0])
         .line_to([9.0, 12.0])
         .close();
-    icon_shape(p, color)
+    icon_shape(p, size, color)
 }
 
-fn icon_home(color: rune::Color) -> Shape {
+fn icon_home(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `house` (alias `Home`): door + rounded-eave roof.
     let p = Path::new()
+        .move_to([15.0, 21.0])
+        .line_to([15.0, 13.0])
+        .cubic_to([15.0, 12.45], [14.55, 12.0], [14.0, 12.0])
+        .line_to([10.0, 12.0])
+        .cubic_to([9.45, 12.0], [9.0, 12.45], [9.0, 13.0])
+        .line_to([9.0, 21.0])
         .move_to([3.0, 10.0])
-        .line_to([12.0, 3.0])
-        .line_to([21.0, 10.0])
-        .line_to([21.0, 20.0])
-        .cubic_to([21.0, 20.6], [20.6, 21.0], [20.0, 21.0])
-        .line_to([4.0, 21.0])
-        .cubic_to([3.4, 21.0], [3.0, 20.6], [3.0, 20.0])
-        .close()
-        .move_to([9.0, 21.0])
-        .line_to([9.0, 14.0])
-        .line_to([15.0, 14.0])
-        .line_to([15.0, 21.0]);
-    icon_shape(p, color)
-}
-
-fn icon_folder(color: rune::Color) -> Shape {
-    // FolderKanban: folder outline + two kanban ticks.
-    let p = Path::new()
-        .move_to([3.0, 6.0])
-        .line_to([9.0, 6.0])
-        .line_to([11.0, 3.5])
-        .line_to([19.0, 3.5])
-        .cubic_to([20.1, 3.5], [21.0, 4.4], [21.0, 5.5])
+        .cubic_to([3.0, 9.41], [3.26, 8.85], [3.71, 8.47])
+        .line_to([10.71, 2.47])
+        .cubic_to([11.45, 1.84], [12.55, 1.84], [13.29, 2.47])
+        .line_to([20.29, 8.47])
+        .cubic_to([20.74, 8.85], [21.0, 9.41], [21.0, 10.0])
         .line_to([21.0, 19.0])
         .cubic_to([21.0, 20.1], [20.1, 21.0], [19.0, 21.0])
         .line_to([5.0, 21.0])
         .cubic_to([3.9, 21.0], [3.0, 20.1], [3.0, 19.0])
-        .close()
-        .move_to([9.0, 11.0])
-        .line_to([9.0, 16.0])
-        .move_to([13.0, 11.0])
-        .line_to([13.0, 14.0]);
-    icon_shape(p, color)
+        .close();
+    icon_shape(p, size, color)
 }
 
-fn icon_cloud(color: rune::Color) -> Shape {
+fn icon_folder(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `folder-kanban`: tabbed folder + three kanban ticks.
     let p = Path::new()
-        .move_to([6.5, 19.0])
-        .cubic_to([4.0, 19.0], [2.0, 17.0], [2.0, 14.5])
-        .cubic_to([2.0, 12.2], [3.6, 10.3], [5.8, 10.0])
-        .cubic_to([6.6, 6.8], [9.6, 4.5], [13.0, 5.0])
-        .cubic_to([16.4, 5.5], [18.8, 8.2], [18.9, 11.6])
-        .cubic_to([21.2, 12.0], [22.8, 14.0], [22.5, 16.3])
-        .cubic_to([22.2, 18.2], [20.6, 19.5], [18.7, 19.5])
-        .line_to([6.5, 19.0]);
-    icon_shape(p, color)
+        .move_to([4.0, 20.0])
+        .line_to([20.0, 20.0])
+        .cubic_to([21.1, 20.0], [22.0, 19.1], [22.0, 18.0])
+        .line_to([22.0, 8.0])
+        .cubic_to([22.0, 6.9], [21.1, 6.0], [20.0, 6.0])
+        .line_to([12.07, 6.0])
+        .cubic_to([11.4, 6.0], [10.78, 5.66], [10.41, 5.1])
+        .line_to([9.59, 3.9])
+        .cubic_to([9.22, 3.34], [8.6, 3.0], [7.93, 3.0])
+        .line_to([4.0, 3.0])
+        .cubic_to([2.9, 3.0], [2.0, 3.9], [2.0, 5.0])
+        .line_to([2.0, 18.0])
+        .cubic_to([2.0, 19.1], [2.9, 20.0], [4.0, 20.0])
+        .close()
+        .move_to([8.0, 10.0])
+        .line_to([8.0, 14.0])
+        .move_to([12.0, 10.0])
+        .line_to([12.0, 12.0])
+        .move_to([16.0, 10.0])
+        .line_to([16.0, 16.0]);
+    icon_shape(p, size, color)
 }
 
-fn icon_settings(color: rune::Color) -> Shape {
-    // Cog: hub + ring + eight teeth (Lucide Settings silhouette at 17pt).
-    let hub = Path::new()
-        .move_to([15.2, 12.0])
-        .cubic_to([15.2, 13.77], [13.77, 15.2], [12.0, 15.2])
-        .cubic_to([10.23, 15.2], [8.8, 13.77], [8.8, 12.0])
-        .cubic_to([8.8, 10.23], [10.23, 8.8], [12.0, 8.8])
-        .cubic_to([13.77, 8.8], [15.2, 10.23], [15.2, 12.0])
+fn icon_cloud(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `cloud`.
+    let p = Path::new()
+        .move_to([17.5, 19.0])
+        .line_to([9.0, 19.0])
+        .cubic_to([5.4, 19.0], [2.38, 16.26], [2.03, 12.67])
+        .cubic_to([1.69, 9.09], [4.12, 5.82], [7.66, 5.13])
+        .cubic_to([11.2, 4.44], [14.68, 6.55], [15.71, 10.0])
+        .line_to([17.5, 10.0])
+        .cubic_to([19.99, 10.0], [22.0, 12.01], [22.0, 14.5])
+        .cubic_to([22.0, 16.99], [19.99, 19.0], [17.5, 19.0])
         .close();
-    let ring = Path::new()
-        .move_to([18.6, 12.0])
-        .cubic_to([18.6, 15.65], [15.65, 18.6], [12.0, 18.6])
-        .cubic_to([8.35, 18.6], [5.4, 15.65], [5.4, 12.0])
-        .cubic_to([5.4, 8.35], [8.35, 5.4], [12.0, 5.4])
-        .cubic_to([15.65, 5.4], [18.6, 8.35], [18.6, 12.0])
-        .close();
-    // Draw the hub + ring, then eight short teeth bridging outward.
-    let mut shape = Shape::new()
-        .stroke_path(&hub, 1.7, LineCap::Round, color)
-        .stroke_path(&ring, 1.7, LineCap::Round, color);
-    for i in 0..8 {
-        let a = i as f32 * std::f32::consts::FRAC_PI_4;
-        let (sin, cos) = (a.sin(), a.cos());
-        shape = shape.line(
-            [12.0 + cos * 5.4, 12.0 + sin * 5.4],
-            [12.0 + cos * 8.6, 12.0 + sin * 8.6],
-            1.7,
-            LineCap::Round,
-            color,
-        );
-    }
-    shape.view_box(24.0, 24.0)
+    icon_shape(p, size, color)
 }
 
-fn rail_icon(tab: RailTab, color: rune::Color) -> Shape {
+fn icon_settings(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `settings`: six-lobed gear outline + centre circle.
+    let p = Path::new()
+        .move_to([9.67, 4.14])
+        .cubic_to([9.79, 2.93], [10.79, 2.02], [12.0, 2.02])
+        .cubic_to([13.21, 2.02], [14.22, 2.93], [14.33, 4.14])
+        .cubic_to([14.4, 4.9], [14.83, 5.58], [15.49, 5.96])
+        .cubic_to([16.15, 6.34], [16.96, 6.37], [17.65, 6.05])
+        .cubic_to([18.75, 5.55], [20.04, 5.97], [20.64, 7.01])
+        .cubic_to([21.24, 8.05], [20.96, 9.38], [19.98, 10.08])
+        .cubic_to([19.35, 10.52], [18.98, 11.24], [18.98, 12.0])
+        .cubic_to([18.98, 12.76], [19.35, 13.48], [19.98, 13.91])
+        .cubic_to([20.96, 14.62], [21.24, 15.95], [20.64, 16.99])
+        .cubic_to([20.04, 18.03], [18.75, 18.45], [17.65, 17.95])
+        .cubic_to([16.96, 17.63], [16.15, 17.66], [15.49, 18.04])
+        .cubic_to([14.83, 18.42], [14.4, 19.1], [14.33, 19.86])
+        .cubic_to([14.22, 21.06], [13.21, 21.98], [12.0, 21.98])
+        .cubic_to([10.79, 21.98], [9.79, 21.06], [9.67, 19.86])
+        .cubic_to([9.6, 19.1], [9.17, 18.42], [8.51, 18.04])
+        .cubic_to([7.85, 17.66], [7.04, 17.63], [6.35, 17.95])
+        .cubic_to([5.25, 18.45], [3.96, 18.03], [3.36, 16.99])
+        .cubic_to([2.76, 15.95], [3.04, 14.62], [4.02, 13.92])
+        .cubic_to([4.65, 13.48], [5.02, 12.76], [5.02, 12.0])
+        .cubic_to([5.02, 11.24], [4.65, 10.52], [4.02, 10.08])
+        .cubic_to([3.04, 9.38], [2.76, 8.05], [3.36, 7.01])
+        .cubic_to([3.96, 5.97], [5.25, 5.56], [6.35, 6.05])
+        .cubic_to([7.04, 6.37], [7.85, 6.34], [8.51, 5.96])
+        .cubic_to([9.17, 5.58], [9.6, 4.9], [9.67, 4.14])
+        .move_to([12.0, 9.0])
+        .cubic_to([13.66, 9.0], [15.0, 10.34], [15.0, 12.0])
+        .cubic_to([15.0, 13.66], [13.66, 15.0], [12.0, 15.0])
+        .cubic_to([10.34, 15.0], [9.0, 13.66], [9.0, 12.0])
+        .cubic_to([9.0, 10.34], [10.34, 9.0], [12.0, 9.0])
+        .close();
+    icon_shape(p, size, color)
+}
+
+fn rail_icon(tab: RailTab, size: f32, color: rune::Color) -> Shape {
     match tab {
-        RailTab::Chats => icon_home(color),
-        RailTab::Group => icon_folder(color),
-        RailTab::Cloud => icon_cloud(color),
+        RailTab::Chats => icon_home(size, color),
+        RailTab::Group => icon_folder(size, color),
+        RailTab::Cloud => icon_cloud(size, color),
         // Not in React's rail (single-page: chats, projects, cloud only);
         // mapped for completeness if a panel reuses the helper.
-        RailTab::Agents | RailTab::Memory | RailTab::House => icon_home(color),
+        RailTab::Agents | RailTab::Memory | RailTab::House => icon_home(size, color),
     }
 }
 
@@ -263,9 +280,30 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .card(id)
         .map(|c| c.kind.clone())
         .unwrap_or_else(|| "Main".to_string());
+    // `isSpawnedChat`: a chat row with a parent gets the Bot glyph and the
+    // `↳ ` title prefix (React `SessionTabs`).
+    let spawned = s
+        .canvas
+        .chat_rows
+        .iter()
+        .find(|c| c.card_id() == id)
+        .is_some_and(|c| c.parent_chat_id.is_some());
     let active = s.canvas.active_id == id;
+    let running = s.canvas.card(id).map(|c| c.running).unwrap_or(false);
     let select = id.to_string();
     let close = id.to_string();
+    let title_text = if spawned {
+        format!("↳ {title}")
+    } else {
+        title
+    };
+    let mut title_style = rune::tok::TextStyle::new(12.0, 400.0);
+    title_style.line_height = 12.0;
+    // Rune measures text to whole points (`measure` rounds up); React keeps
+    // the fractional advance. Trimming the rounding off the right padding
+    // keeps the tab's outer width — and the next tab's x — exact.
+    let advance = rune::text::advance(&title_text, title_style);
+    let right_pad = 11.0 - (advance.ceil() - advance);
     let mut el = row()
         .key(format!("session-{id}"))
         .role("tab")
@@ -273,7 +311,8 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .h(30.0)
         .items_center()
         .gap(8.0)
-        .px(10.0)
+        .pl(11.0)
+        .pr(right_pad)
         .radius(8.0)
         .border(1.0, ink(if active { "#ffffff24" } else { "#00000000" }))
         .hover_group()
@@ -285,74 +324,123 @@ fn session_tab(s: &ShellState, id: &str) -> El {
                 .key(format!("session-{id}-icon"))
                 .size(12.0, 12.0)
                 .inert()
-                .shape(if kind == "Coding" {
-                    tab_code_icon(ink(if active { "#e4e4e7" } else { "#71717a" }))
+                .shape(if spawned {
+                    crate::rune_canvas::bot_icon(
+                        12.0,
+                        ink(if active { "#e4e4e7" } else { "#71717a" }),
+                    )
+                } else if kind == "Coding" {
+                    tab_code_icon(12.0, ink(if active { "#e4e4e7" } else { "#71717a" }))
                 } else {
-                    tab_chat_icon(ink(if active { "#e4e4e7" } else { "#71717a" }))
+                    tab_chat_icon(12.0, ink(if active { "#e4e4e7" } else { "#71717a" }))
                 }),
         )
         .child(
-            text(title)
+            text(title_text)
+                .key(format!("session-{id}-title"))
                 .grow(1.0)
                 .min_w(0.0)
                 .truncate()
-                .font(rune::tok::TextStyle::new(12.0, 400.0))
+                .font(title_style)
                 .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
-        )
-        .child(
-            rune::el()
-                .key(format!("session-{id}-close"))
-                .role("button")
-                .label("Close session")
-                .size(18.0, 18.0)
-                .center()
-                .radius(6.0)
-                .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
-                .on_press(move |s: &mut ShellState| {
-                    s.canvas.close_session(&close);
-                })
-                .child(rune::el().size(11.0, 11.0).inert().shape({
-                    let color = ink(if active { "#71717a" } else { "#52525b" });
-                    Shape::new()
-                        .line([6.0, 6.0], [18.0, 18.0], 2.0, LineCap::Round, color)
-                        .line([18.0, 6.0], [6.0, 18.0], 2.0, LineCap::Round, color)
-                        .view_box(24.0, 24.0)
-                })),
         );
+    if running {
+        // `session-run-dot` (6pt, breathing glow) between title and close.
+        el = el.child(
+            rune::el()
+                .key(format!("session-{id}-run"))
+                .size(6.0, 6.0)
+                .radius(3.0)
+                .fill(ink("#fafafa"))
+                .shadow(0.0, 8.0, home_glow()),
+        );
+    }
+    el = el.child(
+        rune::el()
+            .key(format!("session-{id}-close"))
+            .role("button")
+            .label("Close session")
+            .size(18.0, 18.0)
+            .center()
+            .radius(6.0)
+            .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
+            .on_press(move |s: &mut ShellState| {
+                s.canvas.close_session(&close);
+            })
+            .child(rune::el().size(11.0, 11.0).inert().shape({
+                let color = ink(if active { "#71717a" } else { "#52525b" });
+                Shape::new()
+                    .line(
+                        [6.0, 6.0],
+                        [18.0, 18.0],
+                        crate::lucide_stroke(11.0),
+                        LineCap::Round,
+                        color,
+                    )
+                    .line(
+                        [18.0, 6.0],
+                        [6.0, 18.0],
+                        crate::lucide_stroke(11.0),
+                        LineCap::Round,
+                        color,
+                    )
+                    .view_box(24.0, 24.0)
+            })),
+    );
     if active {
-        el = el.fill(rune::Color {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 0.10,
-        });
+        el = el
+            .fill(rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.10,
+            })
+            // `shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]`.
+            .box_shadow(rune::Shadow {
+                x: 0.0,
+                y: 1.0,
+                blur: 0.0,
+                spread: 0.0,
+                color: ink("#ffffff0f"),
+                inset: true,
+            });
     }
     el
 }
 
+/// Soft white glow (`box-shadow: 0 0 8px rgba(255,255,255,.65)`).
+fn home_glow() -> rune::Color {
+    rune::Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 0.65,
+    }
+}
+
 /// Tab glyph: `MessageSquare` at 12pt.
-fn tab_chat_icon(color: rune::Color) -> Shape {
+fn tab_chat_icon(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `message-square`.
     let p = Path::new()
-        .move_to([4.0, 4.0])
-        .line_to([20.0, 4.0])
-        .cubic_to([20.6, 4.0], [21.0, 4.4], [21.0, 5.0])
-        .line_to([21.0, 17.0])
-        .cubic_to([21.0, 17.6], [20.6, 18.0], [20.0, 18.0])
-        .line_to([10.0, 18.0])
-        .line_to([6.0, 21.0])
-        .line_to([6.0, 18.0])
-        .line_to([4.0, 18.0])
-        .cubic_to([3.4, 18.0], [3.0, 17.6], [3.0, 17.0])
-        .line_to([3.0, 5.0])
-        .cubic_to([3.0, 4.4], [3.4, 4.0], [4.0, 4.0])
+        .move_to([22.0, 17.0])
+        .cubic_to([22.0, 18.1], [21.1, 19.0], [20.0, 19.0])
+        .line_to([6.83, 19.0])
+        .cubic_to([6.3, 19.0], [5.79, 19.21], [5.41, 19.59])
+        .line_to([3.21, 21.79])
+        .cubic_to([3.01, 21.99], [2.7, 22.05], [2.44, 21.94])
+        .cubic_to([2.17, 21.83], [2.0, 21.57], [2.0, 21.29])
+        .line_to([2.0, 5.0])
+        .cubic_to([2.0, 3.9], [2.9, 3.0], [4.0, 3.0])
+        .line_to([20.0, 3.0])
+        .cubic_to([21.1, 3.0], [22.0, 3.9], [22.0, 5.0])
         .close();
     Shape::new()
-        .stroke_path(&p, 1.7, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
 /// Tab glyph: `Code2` at 12pt.
-fn tab_code_icon(color: rune::Color) -> Shape {
+fn tab_code_icon(size: f32, color: rune::Color) -> Shape {
     let p = Path::new()
         .move_to([18.0, 16.0])
         .line_to([22.0, 12.0])
@@ -363,11 +451,11 @@ fn tab_code_icon(color: rune::Color) -> Shape {
         .move_to([14.5, 4.0])
         .line_to([9.5, 20.0]);
     Shape::new()
-        .stroke_path(&p, 1.7, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
-/// Icon rail button (Lucide-shaped icon + label for assistive tech)./// Icon rail button (Lucide-shaped icon + label for assistive tech).
+/// Icon rail button (Lucide-shaped icon + label for assistive tech).
 fn rail_button(s: &ShellState, tab: RailTab) -> El {
     let active = s.canvas.rail == tab;
     let color = ink(if active { "#fafafa" } else { "#71717a" });
@@ -386,7 +474,7 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
                 .key(format!("rail-{}-icon", tab.label()))
                 .size(17.0, 17.0)
                 .inert()
-                .shape(rail_icon(tab, color)),
+                .shape(rail_icon(tab, 17.0, color)),
         );
     if active {
         el = el.fill(rune::Color {
@@ -549,10 +637,18 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .items_center()
         .gap(4.0)
         .px(16.0)
+        .pb(1.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], ink("#ffffff14"));
     for id in s.canvas.sessions.order.clone() {
         tabs = tabs.child(session_tab(s, &id));
     }
+    let new_style = {
+        let mut style = rune::tok::TextStyle::new(12.0, 400.0);
+        style.line_height = 12.0;
+        style
+    };
+    let new_advance = rune::text::advance("New session", new_style);
+    let new_right_pad = 11.0 - (new_advance.ceil() - new_advance);
     tabs = tabs.child(
         row()
             .key("session-new")
@@ -561,7 +657,8 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             .h(30.0)
             .items_center()
             .gap(6.0)
-            .px(10.0)
+            .pl(11.0)
+            .pr(new_right_pad)
             .radius(8.0)
             .border(1.0, ink("#ffffff1f"))
             .border_dash(3.0, 3.0)
@@ -571,13 +668,26 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             .child(rune::el().size(13.0, 13.0).inert().shape({
                 let color = ink("#71717a");
                 Shape::new()
-                    .line([12.0, 5.0], [12.0, 19.0], 2.0, LineCap::Round, color)
-                    .line([5.0, 12.0], [19.0, 12.0], 2.0, LineCap::Round, color)
+                    .line(
+                        [12.0, 5.0],
+                        [12.0, 19.0],
+                        crate::lucide_stroke(13.0),
+                        LineCap::Round,
+                        color,
+                    )
+                    .line(
+                        [5.0, 12.0],
+                        [19.0, 12.0],
+                        crate::lucide_stroke(13.0),
+                        LineCap::Round,
+                        color,
+                    )
                     .view_box(24.0, 24.0)
             }))
             .child(
                 text("New session".to_string())
-                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .key("session-new-label")
+                    .font(new_style)
                     .color(ink("#71717a")),
             ),
     );
@@ -608,7 +718,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                         .key("rail-new-icon")
                         .size(17.0, 17.0)
                         .inert()
-                        .shape(icon_new_chat(ink("#71717a"))),
+                        .shape(icon_new_chat(17.0, ink("#71717a"))),
                 ),
         )
         .child(
@@ -642,7 +752,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                         .key("rail-settings-icon")
                         .size(17.0, 17.0)
                         .inert()
-                        .shape(icon_settings(ink("#71717a"))),
+                        .shape(icon_settings(17.0, ink("#71717a"))),
                 ),
         );
     let stage_w = (w - RAIL_W - if folded { 0.0 } else { PANEL_W }).max(320.0);

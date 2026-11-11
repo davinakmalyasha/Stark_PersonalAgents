@@ -1201,7 +1201,7 @@ fn home_body_style() -> rune::tok::TextStyle {
 }
 
 /// Lucide `Copy` at a 24-unit box.
-fn home_icon_copy(color: rune::Color) -> rune::Shape {
+fn home_icon_copy(size: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([10.0, 8.0])
         .line_to([20.0, 8.0])
@@ -1220,12 +1220,12 @@ fn home_icon_copy(color: rune::Color) -> rune::Shape {
         .line_to([14.0, 2.0])
         .cubic_to([15.1, 2.0], [16.0, 2.9], [16.0, 4.0]);
     rune::Shape::new()
-        .stroke_path(&p, 2.0, rune::LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
 /// Lucide `RotateCcw` at a 24-unit box (rewind / retry).
-fn home_icon_rotate(color: rune::Color) -> rune::Shape {
+fn home_icon_rotate(size: f32, color: rune::Color) -> rune::Shape {
     const K: f32 = 4.971;
     let p = rune::Path::new()
         .move_to([12.0, 3.0])
@@ -1237,12 +1237,12 @@ fn home_icon_rotate(color: rune::Color) -> rune::Shape {
         .line_to([3.0, 8.0])
         .line_to([8.0, 8.0]);
     rune::Shape::new()
-        .stroke_path(&p, 2.0, rune::LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
 /// Lucide `CircleAlert` at a 24-unit box.
-fn home_icon_alert(color: rune::Color) -> rune::Shape {
+fn home_icon_alert(size: f32, color: rune::Color) -> rune::Shape {
     let circle = rune::Path::new()
         .move_to([12.0, 2.0])
         .cubic_to([17.5, 2.0], [22.0, 6.5], [22.0, 12.0])
@@ -1251,12 +1251,23 @@ fn home_icon_alert(color: rune::Color) -> rune::Shape {
         .cubic_to([2.0, 6.5], [6.5, 2.0], [12.0, 2.0])
         .close();
     rune::Shape::new()
-        .stroke_path(&circle, 1.8, rune::LineCap::Round, color)
-        .line([12.0, 8.0], [12.0, 12.0], 1.8, rune::LineCap::Round, color)
+        .stroke_path(
+            &circle,
+            crate::lucide_stroke(size),
+            rune::LineCap::Round,
+            color,
+        )
+        .line(
+            [12.0, 8.0],
+            [12.0, 12.0],
+            crate::lucide_stroke(size),
+            rune::LineCap::Round,
+            color,
+        )
         .line(
             [12.0, 16.0],
             [12.01, 16.0],
-            1.8,
+            crate::lucide_stroke(size),
             rune::LineCap::Round,
             color,
         )
@@ -1353,13 +1364,13 @@ fn home_user_row(r: &RowData, max_w: f32) -> El {
             format!("{}-copy", r.key),
             "Copy message",
             24.0,
-            home_icon_copy(home_ink("#52525b")),
+            home_icon_copy(12.0, home_ink("#52525b")),
         ))
         .child(home_icon_button(
             format!("{}-rewind", r.key),
             "Rewind to this message",
             24.0,
-            home_icon_rotate(home_ink("#52525b")),
+            home_icon_rotate(12.0, home_ink("#52525b")),
         ));
     col()
         .key(format!("{}-group", r.key))
@@ -1412,7 +1423,12 @@ fn home_trace_header(r: &RowData) -> El {
                                 .line_to([15.0, 12.0])
                                 .line_to([9.0, 18.0]);
                             rune::Shape::new()
-                                .stroke_path(&p, 2.0, rune::LineCap::Round, home_ink("#71717a"))
+                                .stroke_path(
+                                    &p,
+                                    crate::lucide_stroke(14.0),
+                                    rune::LineCap::Round,
+                                    home_ink("#71717a"),
+                                )
                                 .view_box(24.0, 24.0)
                         }),
                 ),
@@ -1503,13 +1519,13 @@ fn home_agent_actions(r: &RowData) -> El {
             format!("{}-retry", r.key),
             "Retry — re-run the last request",
             25.0,
-            home_icon_rotate(home_ink("#71717a")),
+            home_icon_rotate(12.0, home_ink("#71717a")),
         ))
         .child(home_icon_button(
             format!("{}-copy", r.key),
             "Copy to clipboard",
             25.0,
-            home_icon_copy(home_ink("#71717a")),
+            home_icon_copy(12.0, home_ink("#71717a")),
         ))
 }
 
@@ -1537,7 +1553,7 @@ fn home_error_row(r: &RowData) -> El {
             rune::el()
                 .size(10.0, 10.0)
                 .inert()
-                .shape(home_icon_rotate(home_rgba(254.0, 202.0, 202.0, 0.9))),
+                .shape(home_icon_rotate(10.0, home_rgba(254.0, 202.0, 202.0, 0.9))),
         )
         .child(
             text("Retry".to_string())
@@ -1561,7 +1577,7 @@ fn home_error_row(r: &RowData) -> El {
             rune::el()
                 .size(10.0, 10.0)
                 .inert()
-                .shape(home_icon_copy(home_ink("#71717a"))),
+                .shape(home_icon_copy(10.0, home_ink("#71717a"))),
         )
         .child(
             text("Copy".to_string())
@@ -1587,7 +1603,7 @@ fn home_error_row(r: &RowData) -> El {
                         .size(15.0, 15.0)
                         .mt(3.0)
                         .inert()
-                        .shape(home_icon_alert(home_rgba(248.0, 113.0, 113.0, 0.9))),
+                        .shape(home_icon_alert(15.0, home_rgba(248.0, 113.0, 113.0, 0.9))),
                 )
                 .child(
                     col().grow(1.0).min_w(0.0).child(body).child(

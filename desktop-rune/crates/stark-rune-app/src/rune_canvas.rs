@@ -169,6 +169,17 @@ impl MapCard {
     }
 }
 
+/// Structural identity of an auto-synced map card (`CanvasItem.depth`,
+/// `parentItemId`, `isTab` in `CanvasStage`). A session poll keeps the card's
+/// current x/y while this is unchanged, so the map never jumps, and snaps it
+/// back to the fresh tidy-tree slot when the tree shape changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardLayoutMeta {
+    pub is_tab: bool,
+    pub depth: usize,
+    pub parent_item_id: Option<String>,
+}
+
 /// Server message → transcript row (`assistant` already normalized to
 /// `agent` on parse; anything not user/error renders as agent).
 fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcript::RowData {
@@ -261,6 +272,12 @@ pub struct CanvasState {
     /// Camera follows the content (React `fitView`) until the first manual
     /// pan/zoom; the shell refits when the window resizes.
     pub cam_auto: bool,
+    /// `fittedRef`: the map fits once when the first cards arrive, never
+    /// again on a session poll (React preserves the user's pan/zoom).
+    pub cam_fitted: bool,
+    /// Auto-card structure from the last graph sync, mirroring the fields
+    /// `CanvasStage` compares before preserving a card's position.
+    pub layout_meta: std::collections::HashMap<String, CardLayoutMeta>,
     /// Canvas viewport size (the stage area, sidebar and tab bar excluded).
     /// The shell syncs this from the live window each poll; the standalone
     /// canvas spec keeps the 980×900 default.
@@ -330,6 +347,8 @@ impl Clone for CanvasState {
             sessions: self.sessions.clone(),
             cam: self.cam,
             cam_auto: self.cam_auto,
+            cam_fitted: self.cam_fitted,
+            layout_meta: self.layout_meta.clone(),
             view_w: self.view_w,
             view_h: self.view_h,
             projects: self.projects.clone(),
@@ -428,6 +447,8 @@ impl CanvasState {
             sessions: Sessions::default(),
             cam: Camera::default(),
             cam_auto: true,
+            cam_fitted: false,
+            layout_meta: std::collections::HashMap::new(),
             view_w: MAP_W - MAP_SIDEBAR_W,
             view_h: MAP_H,
             projects: crate::projects::ProjectsState::default(),
@@ -502,9 +523,23 @@ impl CanvasState {
         }
         let old: std::collections::HashMap<String, MapCard> =
             self.cards.drain(..).map(|c| (c.id.clone(), c)).collect();
+        let previous_meta = std::mem::take(&mut self.layout_meta);
+        let mut layout_meta = std::collections::HashMap::new();
         let mut cards = Vec::new();
         for g in graph {
             let running = old.get(&g.id).map(|c| c.running).unwrap_or(false);
+            // `CanvasStage` auto-sync: preserve the user's arrangement unless
+            // the card's structural slot (depth / parent / tab) changed.
+            let (x, y) = match (old.get(&g.id), previous_meta.get(&g.id)) {
+                (Some(prev), Some(meta))
+                    if meta.is_tab == g.is_tab
+                        && meta.depth == g.depth
+                        && meta.parent_item_id == g.parent_item_id =>
+                {
+                    (prev.x, prev.y)
+                }
+                _ => (g.x, g.y),
+            };
             let preview = self
                 .chat_rows
                 .iter()
@@ -523,6 +558,14 @@ impl CanvasState {
                 .find(|c| c.card_id() == g.id)
                 .map(|c| Self::kind_for(&c.workspace_kind))
                 .unwrap_or("Main");
+            layout_meta.insert(
+                g.id.clone(),
+                CardLayoutMeta {
+                    is_tab: g.is_tab,
+                    depth: g.depth,
+                    parent_item_id: g.parent_item_id.clone(),
+                },
+            );
             cards.push(MapCard {
                 id: g.id,
                 title: g.title,
@@ -531,8 +574,8 @@ impl CanvasState {
                 kind: kind.to_string(),
                 item: MapCardItem::Chat,
                 project: None,
-                x: g.x,
-                y: g.y,
+                x,
+                y,
                 compact: g.compact,
                 running,
             });
@@ -544,6 +587,7 @@ impl CanvasState {
             }
         }
         self.cards = cards;
+        self.layout_meta = layout_meta;
         self.edges = edges;
         self.sessions.order = self.cards.iter().map(|c| c.id.clone()).collect();
     }
@@ -591,9 +635,10 @@ impl CanvasState {
         } else {
             Some(self.active_id.clone())
         };
-        if self.cam_auto {
+        if self.cam_auto && !self.cam_fitted {
             let (vw, vh) = (self.view_w, self.view_h);
             self.cam.fit_in(&self.cards, vw, vh);
+            self.cam_fitted = true;
         }
     }
 
@@ -641,8 +686,8 @@ impl CanvasState {
         self.cards.iter().find(|c| c.id == id)
     }
 
-    /// Resize the canvas stage (shell poll). Refits while the camera is
-    /// still auto-following; a manual pan/zoom survives resize.
+    /// Resize the canvas stage (shell poll). The camera keeps its view across
+    /// resizes, like React (only the first card set triggers `fitView`).
     pub fn set_viewport(&mut self, w: f32, h: f32) -> bool {
         let w = w.max(320.0);
         let h = h.max(240.0);
@@ -651,10 +696,36 @@ impl CanvasState {
         }
         self.view_w = w;
         self.view_h = h;
-        if self.cam_auto {
-            self.cam.fit_in(&self.cards, w, h);
-        }
         true
+    }
+
+    /// React `relayout` (Reset layout): auto cards snap back to their tidy-tree
+    /// slots, manual drafts stay put, then the map refits.
+    pub fn relayout(&mut self) {
+        let snapshot = crate::chats::ChatSnapshot {
+            open_tabs: self.open_tabs.clone(),
+            active_tab: self.active_tab.clone(),
+            messages: std::collections::HashMap::new(),
+            chats: self.chat_rows.clone(),
+        };
+        let (graph, _) = crate::chats::layout(&snapshot);
+        let positions: std::collections::HashMap<&str, (f32, f32)> =
+            graph.iter().map(|g| (g.id.as_str(), (g.x, g.y))).collect();
+        for card in &mut self.cards {
+            if self.layout_meta.contains_key(&card.id) {
+                if let Some(&(x, y)) = positions.get(card.id.as_str()) {
+                    card.x = x;
+                    card.y = y;
+                }
+            }
+        }
+        let cards = self.cards.clone();
+        let (vw, vh) = (self.view_w, self.view_h);
+        self.cam.fit_in(&cards, vw, vh);
+        self.cam_auto = true;
+        self.cam_fitted = true;
+        self.press_home = None;
+        self.press_pan = None;
     }
 
     /// Focus the camera on a card (session tab switch centers it).
@@ -2144,8 +2215,20 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .shape({
                         let color = ink("#a9abb3");
                         rune::Shape::new()
-                            .line([12.0, 5.0], [12.0, 19.0], 2.0, LineCap::Round, color)
-                            .line([5.0, 12.0], [19.0, 12.0], 2.0, LineCap::Round, color)
+                            .line(
+                                [12.0, 5.0],
+                                [12.0, 19.0],
+                                crate::lucide_stroke(13.0),
+                                LineCap::Round,
+                                color,
+                            )
+                            .line(
+                                [5.0, 12.0],
+                                [19.0, 12.0],
+                                crate::lucide_stroke(13.0),
+                                LineCap::Round,
+                                color,
+                            )
                             .view_box(24.0, 24.0)
                     }),
             )
@@ -2236,19 +2319,8 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 .child(
                     hud_icon("reset", "Reset layout", icon_reset(ink("#81848d"))).on_press(
                         move |s: &mut S| {
-                            // `relayout`: stock card positions plus a fresh fit.
-                            let fresh = CanvasState::map();
-                            let c = s.canvas_mut();
-                            c.cards = fresh.cards;
-                            c.edges = fresh.edges;
-                            c.active_id = fresh.active_id;
-                            c.cam = Camera::default();
-                            c.cam_auto = true;
-                            let cards = c.cards.clone();
-                            let (vw, vh) = (c.view_w, c.view_h);
-                            c.cam.fit_in(&cards, vw, vh);
-                            c.press_home = None;
-                            c.press_pan = None;
+                            // `relayout`: tidy-tree slots again plus a fresh fit.
+                            s.canvas_mut().relayout();
                         },
                     ),
                 ),
@@ -2274,15 +2346,33 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
 /// Minus (13pt camera HUD).
 fn icon_minus(color: rune::Color) -> Shape {
     Shape::new()
-        .line([5.0, 12.0], [19.0, 12.0], 1.7, LineCap::Round, color)
+        .line(
+            [5.0, 12.0],
+            [19.0, 12.0],
+            crate::lucide_stroke(13.0),
+            LineCap::Round,
+            color,
+        )
         .view_box(24.0, 24.0)
 }
 
 /// Plus (13pt camera HUD).
 fn icon_plus(color: rune::Color) -> Shape {
     Shape::new()
-        .line([12.0, 5.0], [12.0, 19.0], 1.7, LineCap::Round, color)
-        .line([5.0, 12.0], [19.0, 12.0], 1.7, LineCap::Round, color)
+        .line(
+            [12.0, 5.0],
+            [12.0, 19.0],
+            crate::lucide_stroke(13.0),
+            LineCap::Round,
+            color,
+        )
+        .line(
+            [5.0, 12.0],
+            [19.0, 12.0],
+            crate::lucide_stroke(13.0),
+            LineCap::Round,
+            color,
+        )
         .view_box(24.0, 24.0)
 }
 
@@ -2306,7 +2396,7 @@ fn icon_scan(color: rune::Color) -> Shape {
         .cubic_to([3.9, 21.0], [3.0, 20.1], [3.0, 19.0])
         .line_to([3.0, 17.0]);
     Shape::new()
-        .stroke_path(&p, 1.7, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(13.0), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -2323,7 +2413,7 @@ fn icon_reset(color: rune::Color) -> Shape {
         .line_to([3.0, 8.0])
         .line_to([8.0, 8.0]);
     Shape::new()
-        .stroke_path(&p, 1.7, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(13.0), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -2363,7 +2453,7 @@ fn kind_icon(kind: &str, color: rune::Color) -> Shape {
                 .move_to([14.5, 4.0])
                 .line_to([9.5, 20.0]);
             Shape::new()
-                .stroke_path(&p, 1.7, LineCap::Round, color)
+                .stroke_path(&p, crate::lucide_stroke(16.0), LineCap::Round, color)
                 .view_box(24.0, 24.0)
         }
         "House" => {
@@ -2379,10 +2469,10 @@ fn kind_icon(kind: &str, color: rune::Color) -> Shape {
                 .line_to([15.0, 14.0])
                 .line_to([15.0, 20.0]);
             Shape::new()
-                .stroke_path(&p, 1.7, LineCap::Round, color)
+                .stroke_path(&p, crate::lucide_stroke(16.0), LineCap::Round, color)
                 .view_box(24.0, 24.0)
         }
-        _ => chat_row_icon(color),
+        _ => chat_row_icon(16.0, color),
     }
 }
 
@@ -2415,18 +2505,18 @@ fn network_icon(color: rune::Color) -> Shape {
         .line_to([16.0, 22.0])
         .close();
     Shape::new()
-        .stroke_path(&p, 1.6, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(14.0), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
 /// Chevron down (Lucide, 14pt) for the sidebar mode switcher.
-fn chevron_down(color: rune::Color) -> Shape {
+fn chevron_down(size: f32, color: rune::Color) -> Shape {
     let p = Path::new()
         .move_to([6.0, 9.0])
         .line_to([12.0, 15.0])
         .line_to([18.0, 9.0]);
     Shape::new()
-        .stroke_path(&p, 2.0, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -2443,39 +2533,39 @@ fn search_icon(color: rune::Color) -> Shape {
         .move_to([21.0, 21.0])
         .line_to([16.65, 16.65]);
     Shape::new()
-        .stroke_path(&p, 1.6, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(11.0), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
-/// Sidebar row glyph: `MessageSquare` (13pt, Lucide proportions).
-fn chat_row_icon(color: rune::Color) -> Shape {
+/// Sidebar row glyph: Lucide v1.17 `message-square`.
+fn chat_row_icon(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `message-square`.
     let p = Path::new()
-        .move_to([4.0, 4.0])
-        .line_to([20.0, 4.0])
-        .cubic_to([20.6, 4.0], [21.0, 4.4], [21.0, 5.0])
-        .line_to([21.0, 17.0])
-        .cubic_to([21.0, 17.6], [20.6, 18.0], [20.0, 18.0])
-        .line_to([10.0, 18.0])
-        .line_to([6.0, 21.0])
-        .line_to([6.0, 18.0])
-        .line_to([4.0, 18.0])
-        .cubic_to([3.4, 18.0], [3.0, 17.6], [3.0, 17.0])
-        .line_to([3.0, 5.0])
-        .cubic_to([3.0, 4.4], [3.4, 4.0], [4.0, 4.0])
+        .move_to([22.0, 17.0])
+        .cubic_to([22.0, 18.1], [21.1, 19.0], [20.0, 19.0])
+        .line_to([6.83, 19.0])
+        .cubic_to([6.3, 19.0], [5.79, 19.21], [5.41, 19.59])
+        .line_to([3.21, 21.79])
+        .cubic_to([3.01, 21.99], [2.7, 22.05], [2.44, 21.94])
+        .cubic_to([2.17, 21.83], [2.0, 21.57], [2.0, 21.29])
+        .line_to([2.0, 5.0])
+        .cubic_to([2.0, 3.9], [2.9, 3.0], [4.0, 3.0])
+        .line_to([20.0, 3.0])
+        .cubic_to([21.1, 3.0], [22.0, 3.9], [22.0, 5.0])
         .close();
     Shape::new()
-        .stroke_path(&p, 1.5, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
 /// Chevron right (Lucide, 14pt) for collapsed spawn nests.
-fn chevron_right(color: rune::Color) -> Shape {
+fn chevron_right(size: f32, color: rune::Color) -> Shape {
     let p = Path::new()
         .move_to([9.0, 18.0])
         .line_to([15.0, 12.0])
         .line_to([9.0, 6.0]);
     Shape::new()
-        .stroke_path(&p, 2.0, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -2490,12 +2580,12 @@ fn corner_down_right(color: rune::Color) -> Shape {
         .line_to([20.0, 15.0])
         .line_to([15.0, 20.0]);
     Shape::new()
-        .stroke_path(&p, 2.0, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(10.0), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
 /// Lucide `Bot` (11–12pt): spawned chats get the agent glyph.
-fn bot_icon(color: rune::Color) -> Shape {
+pub(crate) fn bot_icon(size: f32, color: rune::Color) -> Shape {
     let p = Path::new()
         .move_to([12.0, 8.0])
         .line_to([12.0, 4.0])
@@ -2518,7 +2608,7 @@ fn bot_icon(color: rune::Color) -> Shape {
         .move_to([9.0, 13.0])
         .line_to([9.0, 15.0]);
     Shape::new()
-        .stroke_path(&p, 1.8, LineCap::Round, color)
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
         .view_box(24.0, 24.0)
 }
 
@@ -2557,7 +2647,7 @@ fn sidebar_spawn_row<S: CanvasHost + 'static>(chat: &crate::chats::ChatSummary) 
                 .key(format!("side-kid-{card_id}-bot"))
                 .size(11.0, 11.0)
                 .inert()
-                .shape(bot_icon(ink("#52525b"))),
+                .shape(bot_icon(11.0, ink("#52525b"))),
         )
         .child(
             text(title)
@@ -2619,7 +2709,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                                 .key("map-kind-chevron")
                                 .size(14.0, 14.0)
                                 .inert()
-                                .shape(chevron_down(ink("#71717a"))),
+                                .shape(chevron_down(14.0, ink("#71717a"))),
                         ),
                 )
                 .child(
@@ -2641,8 +2731,20 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                                 .shape({
                                     let color = ink("#71717a");
                                     rune::Shape::new()
-                                        .line([12.0, 5.0], [12.0, 19.0], 2.0, LineCap::Round, color)
-                                        .line([5.0, 12.0], [19.0, 12.0], 2.0, LineCap::Round, color)
+                                        .line(
+                                            [12.0, 5.0],
+                                            [12.0, 19.0],
+                                            crate::lucide_stroke(13.0),
+                                            LineCap::Round,
+                                            color,
+                                        )
+                                        .line(
+                                            [5.0, 12.0],
+                                            [19.0, 12.0],
+                                            crate::lucide_stroke(13.0),
+                                            LineCap::Round,
+                                            color,
+                                        )
                                         .view_box(24.0, 24.0)
                                 }),
                         ),
@@ -2862,7 +2964,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .key(format!("side-{card_id}-icon"))
                         .size(12.0, 12.0)
                         .inert()
-                        .shape(chat_row_icon(ink("#52525b"))),
+                        .shape(chat_row_icon(12.0, ink("#52525b"))),
                 );
             }
             item = item.child(
@@ -2912,9 +3014,9 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         }
                     })
                     .child(rune::el().size(11.0, 11.0).inert().shape(if open {
-                        chevron_down(ink("#52525b"))
+                        chevron_down(11.0, ink("#52525b"))
                     } else {
-                        chevron_right(ink("#52525b"))
+                        chevron_right(11.0, ink("#52525b"))
                     }))
             };
             list = list.child(
@@ -3024,7 +3126,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .key(format!("side-{}-icon", card.id))
                     .size(12.0, 12.0)
                     .inert()
-                    .shape(chat_row_icon(ink("#52525b"))),
+                    .shape(chat_row_icon(12.0, ink("#52525b"))),
             );
         }
         item = item.child(
@@ -3305,6 +3407,69 @@ mod tests {
         rt.pointer_up(x, y);
         rt.frame(0.0);
         assert_eq!(rt.state.active_id, "chat:ws-general:chat-2");
+    }
+
+    #[test]
+    fn session_polls_preserve_positions_and_camera_until_structure_changes() {
+        fn chat(id: &str, updated: &str) -> crate::chats::ChatSummary {
+            crate::chats::ChatSummary {
+                id: id.to_string(),
+                workspace_id: "_general".to_string(),
+                title: id.to_string(),
+                updated_at: updated.to_string(),
+                ..Default::default()
+            }
+        }
+        let mut state = CanvasState::map();
+        state.view_w = 740.0;
+        state.view_h = 500.0;
+        let mut snapshot = crate::chats::ChatSnapshot {
+            open_tabs: vec!["_general:a".into(), "_general:b".into()],
+            active_tab: "_general:a".into(),
+            messages: std::collections::HashMap::new(),
+            chats: vec![
+                chat("a", "2026-01-01T00:00:00Z"),
+                chat("b", "2026-01-02T00:00:00Z"),
+            ],
+        };
+        state.apply_chat_snapshot(&snapshot);
+        assert!(state.cam_fitted, "the first snapshot fits the map");
+        let fitted = state.cam;
+        let a = "chat:_general:a";
+        let b = "chat:_general:b";
+        let (ax, ay) = (state.card(a).unwrap().x, state.card(a).unwrap().y);
+        // A manual arrangement survives poll/resize (React keeps auto items'
+        // x/y and the saved view).
+        {
+            let card = state.cards.iter_mut().find(|c| c.id == a).unwrap();
+            card.x += 120.0;
+            card.y += 45.0;
+        }
+        state.set_viewport(800.0, 520.0);
+        assert_eq!(state.cam, fitted, "resizing does not refit");
+        state.apply_chat_snapshot(&snapshot);
+        assert_eq!(
+            (state.card(a).unwrap().x, state.card(a).unwrap().y),
+            (ax + 120.0, ay + 45.0)
+        );
+        assert_eq!(state.cam, fitted, "a poll does not refit");
+        // `relayout` snaps auto cards back to the tidy-tree slot.
+        state.relayout();
+        assert_eq!(
+            (state.card(a).unwrap().x, state.card(a).unwrap().y),
+            (ax, ay)
+        );
+        // Becoming a child changes the structural slot: the stale x/y is
+        // dropped for the fresh layout position.
+        snapshot.chats[1].parent_chat_id = Some("a".to_string());
+        snapshot.chats[1].parent_workspace_id = Some("_general".to_string());
+        let (fresh, _) = crate::chats::layout(&snapshot);
+        let fresh_b = fresh.iter().find(|g| g.id == b).unwrap();
+        state.apply_chat_snapshot(&snapshot);
+        assert_eq!(
+            state.card(b).map(|c| (c.x, c.y)),
+            Some((fresh_b.x, fresh_b.y))
+        );
     }
 
     #[test]

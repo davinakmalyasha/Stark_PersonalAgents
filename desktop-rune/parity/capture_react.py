@@ -85,6 +85,9 @@ async def capture(args) -> None:
             "--headless=new",
             "--disable-gpu",
             "--no-first-run",
+            # Hide scrollbars from the very first layout: the app's initial
+            # fitView then sees the same stage width as the native window.
+            "--hide-scrollbars",
             f"--user-data-dir={profile}",
             f"--remote-debugging-port={args.port}",
             f"--window-size={w},{h}",

@@ -140,7 +140,6 @@ pub struct MapCard {
     pub id: String,
     pub title: String,
     pub subtitle: String,
-    pub preview: String,
     /// Chat kind (the dropdown filter). Chats are the only type — this is a
     /// category label, never a workspace scope.
     pub kind: String,
@@ -397,7 +396,6 @@ impl CanvasState {
                     id: "chat:ws-general:chat-1".to_string(),
                     title: "New Conversation".to_string(),
                     subtitle: "General · Orchestrator".to_string(),
-                    preview: "452 ÷ 5 = 90.4 (exactly 90 remainder 2)".to_string(),
                     kind: "Main".to_string(),
                     x: 36.0,
                     y: 36.0,
@@ -410,7 +408,6 @@ impl CanvasState {
                     id: "chat:ws-general:chat-2".to_string(),
                     title: "New Conversation".to_string(),
                     subtitle: "General · Orchestrator".to_string(),
-                    preview: "No messages yet.".to_string(),
                     kind: "Coding".to_string(),
                     x: 520.0,
                     y: 36.0,
@@ -423,7 +420,6 @@ impl CanvasState {
                     id: "chat:ws-general:chat-3".to_string(),
                     title: "arithmetic 329+3823".to_string(),
                     subtitle: "General · spawned".to_string(),
-                    preview: "Good to meet you, Davin.".to_string(),
                     kind: "Main".to_string(),
                     x: 60.0,
                     y: 480.0,
@@ -436,7 +432,6 @@ impl CanvasState {
                     id: "chat:ws-general:chat-4".to_string(),
                     title: "New Chat".to_string(),
                     subtitle: "General · running".to_string(),
-                    preview: "Playing now in your YouTube tab…".to_string(),
                     kind: "Main".to_string(),
                     x: 560.0,
                     y: 480.0,
@@ -555,18 +550,6 @@ impl CanvasState {
                 }
                 _ => (g.x, g.y),
             };
-            let preview = self
-                .chat_rows
-                .iter()
-                .find(|c| c.card_id() == g.id)
-                .map(|c| {
-                    if c.last_message.trim().is_empty() {
-                        "No messages yet.".to_string()
-                    } else {
-                        c.last_message.clone()
-                    }
-                })
-                .unwrap_or_else(|| "No messages yet.".to_string());
             let kind = self
                 .chat_rows
                 .iter()
@@ -585,7 +568,6 @@ impl CanvasState {
                 id: g.id,
                 title: g.title,
                 subtitle: g.subtitle,
-                preview,
                 kind: kind.to_string(),
                 item: MapCardItem::Chat,
                 project: None,
@@ -855,7 +837,6 @@ impl CanvasState {
             id: id.clone(),
             title: "New Chat".to_string(),
             subtitle: format!("{kind} · fresh"),
-            preview: "No messages yet.".to_string(),
             kind,
             item: MapCardItem::Chat,
             project: None,
@@ -938,7 +919,6 @@ impl CanvasState {
             id: id.to_string(),
             title,
             subtitle: format!("{} · restored", self.sessions.kind),
-            preview: "No messages yet.".to_string(),
             kind: self.sessions.kind.clone(),
             item: MapCardItem::Chat,
             project: None,
@@ -980,7 +960,6 @@ impl CanvasState {
                 p.title.clone()
             },
             subtitle: format!("Project · {} items", p.total),
-            preview: String::new(),
             kind: self.sessions.kind.clone(),
             item: MapCardItem::Project,
             project: Some(p),
@@ -1234,12 +1213,45 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
         )
 }
 
+/// Lucide `Paperclip` approximation at a 24-unit box (the native card's
+/// attach button is inert; the glyph still matches React's dock).
+fn paperclip_icon(size: f32, color: rune::Color) -> Shape {
+    let p = Path::new()
+        .move_to([16.0, 6.0])
+        .line_to([7.6, 14.4])
+        .cubic_to([6.4, 15.6], [6.4, 17.4], [7.6, 18.6])
+        .cubic_to([8.8, 19.8], [10.6, 19.8], [11.8, 18.6])
+        .line_to([19.0, 11.4])
+        .cubic_to([21.0, 9.4], [21.0, 6.0], [19.0, 4.0])
+        .cubic_to([17.0, 2.0], [13.6, 2.0], [11.6, 4.0])
+        .line_to([4.0, 11.6])
+        .cubic_to([1.4, 14.2], [1.4, 18.4], [4.0, 21.0])
+        .cubic_to([6.6, 23.6], [10.8, 23.6], [13.4, 21.0])
+        .line_to([21.4, 13.0]);
+    Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
 fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) -> El {
-    let (fill, hair_a, avatar_bg, initial, name, body_ink) = match r.role {
-        "user" => ("#28282f", 0.075, "#303038", "U", "You", "#dedee5"),
-        "error" => ("#fb718511", 0.24, "#3a2226", "!", "Error", "#d2d2da"),
-        "system" => ("#101013", 0.05, "#24242a", "S", "System", "#d2d2da"),
-        _ => ("#19191e", 0.05, "#24242a", "A", "Agent", "#d2d2da"),
+    // `CanvasChatBubble` + `.canvas-bubble*`: agent rows put the 22pt avatar
+    // first, user rows put it after the bubble.
+    let (fill, hair_a, avatar_bg, avatar_ink, initial, name, body_ink) = match r.role {
+        "user" => (
+            "#28282f", 0.075, "#303038", "#e6e6ec", "U", "You", "#dedee5",
+        ),
+        "error" => (
+            "#fb718511",
+            0.24,
+            "#24242a",
+            "#c9c9d1",
+            "O",
+            "Error",
+            "#d2d2da",
+        ),
+        _ => (
+            "#19191e", 0.05, "#24242a", "#c9c9d1", "O", "Agent", "#d2d2da",
+        ),
     };
     let hairline = if r.role == "error" {
         ink("#fb71853d")
@@ -1258,13 +1270,13 @@ fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) ->
             a: hair_a,
         }
     };
-    let mut head = row().items_center().gap(6.0).child(
+    let mut head = row().items_center().gap(6.0).mb(5.0).child(
         text(name.to_string())
-            .font(rune::tok::TextStyle::new(10.0, 650.0))
+            .font(rune::tok::TextStyle::new(11.0, 650.0))
             .color(ink("#f0f0f3")),
     );
-    if r.role == "agent" || r.role == "system" {
-        // `auto` badge in the head row, like `.canvas-bubble-badge`.
+    if r.role == "agent" {
+        // `auto` badge (`.canvas-bubble-badge`).
         head = head.child(
             text("auto".to_string())
                 .key(format!("{id}-mini-{}-badge", r.key))
@@ -1278,15 +1290,21 @@ fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) ->
     }
     let mut bubble = col()
         .key(format!("{id}-mini-{}", r.key))
-        .radius(12.0)
+        .radius(14.0)
         .fill(ink(if live_row { "#1b1b20" } else { fill }))
         .border(1.0, hairline)
-        .px(10.0)
-        .py(8.0)
+        .border_layout()
+        .px(13.0)
+        .py(10.0)
+        .max_w(390.0)
         .child(head)
         .child(
             text(r.body.clone())
-                .font(rune::tok::TextStyle::new(11.5, 400.0))
+                .font({
+                    let mut style = rune::tok::TextStyle::new(12.5, 400.0);
+                    style.line_height = 12.5 * 1.55;
+                    style
+                })
                 .wrap()
                 .color(ink(body_ink)),
         );
@@ -1304,50 +1322,54 @@ fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) ->
         }
         bubble = bubble.child(dots);
     }
+    // `.canvas-bubble-foot`: 22pt tall, time pushed right (the hover actions
+    // are invisible at rest but set the height).
     let t = crate::rune_transcript::clock(&r.at);
-    if !t.is_empty() {
-        bubble = bubble.child(
-            text(t)
-                .key(format!("{id}-mini-{}-time", r.key))
-                .font(rune::tok::TextStyle::new(9.0, 400.0))
-                .color(ink("#71717a")),
-        );
-    }
-    let message = row()
-        .key(format!("{id}-minrow-{}", r.key))
-        .w_full()
-        .gap(6.0);
+    bubble = bubble.child(
+        row()
+            .w_full()
+            .items_center()
+            .min_h(22.0)
+            .mt(8.0)
+            .child(rune::el().grow(1.0))
+            .child(
+                text(t)
+                    .key(format!("{id}-mini-{}-time", r.key))
+                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                    .color(ink("#6d6d77")),
+            ),
+    );
+    let avatar = || {
+        rune::el()
+            .size(22.0, 22.0)
+            .mt(2.0)
+            .radius(11.0)
+            .border(1.0, ink("#ffffff12"))
+            .fill(ink(avatar_bg))
+            .center()
+            .child(
+                text(initial.to_string())
+                    .font(rune::tok::TextStyle::new(9.5, 700.0))
+                    .color(ink(avatar_ink)),
+            )
+    };
     if r.role == "user" {
-        message
-            .child(bubble.max_w(300.0))
-            .child(
-                rune::el()
-                    .size(18.0, 18.0)
-                    .radius(9.0)
-                    .fill(ink(avatar_bg))
-                    .center()
-                    .child(
-                        text(initial.to_string())
-                            .font(rune::tok::TextStyle::new(8.0, 700.0))
-                            .color(ink("#e6e6ec")),
-                    ),
-            )
+        row()
+            .key(format!("{id}-minrow-{}", r.key))
+            .w_full()
+            .items_start()
             .justify_end()
+            .gap(8.0)
+            .child(bubble)
+            .child(avatar())
     } else {
-        message
-            .child(
-                rune::el()
-                    .size(18.0, 18.0)
-                    .radius(9.0)
-                    .fill(ink(avatar_bg))
-                    .center()
-                    .child(
-                        text(initial.to_string())
-                            .font(rune::tok::TextStyle::new(8.0, 700.0))
-                            .color(ink("#c9c9d1")),
-                    ),
-            )
-            .child(bubble.grow(1.0).min_h(0.0))
+        row()
+            .key(format!("{id}-minrow-{}", r.key))
+            .w_full()
+            .items_start()
+            .gap(8.0)
+            .child(avatar())
+            .child(bubble)
     }
 }
 
@@ -1638,24 +1660,59 @@ fn card_view<S: CanvasHost + 'static>(
                     s.canvas_mut().close_session(&close_id);
                 }),
         );
-    // Conversation (`canvas-card-conversation`): the thread's last rows as
-    // compact bubbles, or the empty line when nothing ran yet.
-    let convo = match thread {
-        Some(t) if !t.rows.is_empty() => {
-            let mut convo = col().key(format!("{id}-convo")).w_full().gap(8.0).px(14.0);
-            let n = t.rows.len();
-            for r in t.rows.iter().skip(n.saturating_sub(4)) {
-                convo = convo.child(mini_bubble(&id, r, live && r.key == "live-agent"));
+    // Conversation (`canvas-card-conversation`): React shows the latest user
+    // and agent rows, top-aligned in a flex-1 scroll area (2/16/14 padding,
+    // 14pt gap). It must grow, or the dock rides up under the content.
+    let convo = {
+        let base = col()
+            .key(format!("{id}-convo"))
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .gap(14.0)
+            .px(16.0)
+            .pt(2.0)
+            .pb(14.0)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            });
+        match thread {
+            Some(t) if !t.rows.is_empty() => {
+                let mut idxs: Vec<usize> = Vec::new();
+                if let Some(i) = t.rows.iter().rposition(|r| r.role == "user") {
+                    idxs.push(i);
+                }
+                if let Some(i) = t.rows.iter().rposition(|r| r.role != "user") {
+                    idxs.push(i);
+                }
+                idxs.sort_unstable();
+                idxs.dedup();
+                if idxs.is_empty() {
+                    idxs.push(t.rows.len() - 1);
+                }
+                let mut convo = base;
+                for i in idxs {
+                    convo = convo.child(mini_bubble(
+                        &id,
+                        &t.rows[i],
+                        live && t.rows[i].key == "live-agent",
+                    ));
+                }
+                convo
             }
-            convo
+            _ => base.child(
+                rune::el()
+                    .key(format!("{id}-convo-empty"))
+                    .w_full()
+                    .min_h(150.0)
+                    .center()
+                    .child(
+                        text("No messages yet.")
+                            .font(rune::tok::TextStyle::new(11.0, 400.0))
+                            .color(ink("#5f5f69")),
+                    ),
+            ),
         }
-        _ => col().key(format!("{id}-convo")).w_full().px(14.0).child(
-            text(card.preview.clone())
-                .key(format!("{id}-preview"))
-                .font(rune::tok::TextStyle::new(11.5, 400.0))
-                .wrap()
-                .color(ink("#92959e")),
-        ),
     };
     view = view.child(head);
     // Connected-agents menu (`canvas-card-agent-menu`): child chats of this
@@ -1706,47 +1763,71 @@ fn card_view<S: CanvasHost + 'static>(
         view = view.child(menu);
     }
     view = view.child(convo);
-    // Card dock (`canvas-card-dock`): per-card input + send. Placeholder and
-    // disabled state mirror the React form exactly: type-ahead while the run
-    // is live, no double-send. No attach button / drop overlay / ask panel —
-    // file pickers, drag-drop and agent questions have no Rune target
-    // (documented, not faked).
+    // Card dock (`canvas-card-dock`): 4/14/14 padding around the bordered
+    // input wrap; attach (inert — no Rune file picker), input, and the 25pt
+    // send button. React's `sending` spinner state has no native target.
     let draft_empty = input.text.trim().is_empty();
     let send_id = id.clone();
     let edit_id = id.clone();
-    let dock = row()
-        .key(format!("{id}-dock"))
-        .w_full()
-        .items_center()
-        .gap(8.0)
-        .px(14.0)
-        .pt(8.0)
+    let send_disabled = live || draft_empty;
+    let attach = rune::el()
+        .key(format!("{id}-attach"))
+        .size(22.0, 22.0)
+        .radius(6.0)
+        .center()
+        .inert()
         .child(
-            text_input(input, rune::tok::TextStyle::new(12.0, 400.0))
+            rune::el()
+                .size(12.0, 12.0)
+                .inert()
+                .shape(paperclip_icon(12.0, ink("#676b74"))),
+        );
+    let wrap = row()
+        .key(format!("{id}-input-wrap"))
+        .w_full()
+        .min_h(38.0)
+        .items_center()
+        .gap(5.0)
+        .px(5.0)
+        .py(4.0)
+        .radius(10.0)
+        .border(1.0, ink("#ffffff16"))
+        .border_layout()
+        .fill(rune::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.22,
+        })
+        .child(attach)
+        .child(
+            text_input(input, rune::tok::TextStyle::new(10.5, 400.0))
                 .key(format!("{id}-input"))
                 .grow(1.0)
-                .min_h(0.0)
+                .min_w(0.0)
                 .placeholder(
                     if live {
                         "Agent is running — you can type ahead…"
                     } else {
                         "Message this chat…"
                     },
-                    ink("#52525b"),
+                    ink("#5e626b"),
                 )
                 .caret(ink("#f2f2f4"), ink("#3b82f6"))
                 .on_edit(move |s: &mut S| s.canvas_mut().input_mut(&edit_id)),
         )
-        .child({
-            let disabled = live || draft_empty;
-            let send_label = id.clone();
+        .child(
             rune::el()
                 .key(format!("{id}-send"))
                 .role("button")
-                .label(format!("Send to {send_label}"))
-                .size(28.0, 28.0)
-                .radius(14.0)
-                .fill(ink(if disabled { "#2a2a2e" } else { "#ffffff" }))
+                .label(format!("Send to {send_id}"))
+                .size(25.0, 25.0)
+                .radius(8.0)
+                .fill(if send_disabled {
+                    ink("#ffffff14")
+                } else {
+                    ink("#f2f2f4")
+                })
                 .center()
                 .on_press(move |s: &mut S| {
                     let c = s.canvas_mut();
@@ -1776,10 +1857,17 @@ fn card_view<S: CanvasHost + 'static>(
                         .shape(crate::lucide_arrow_up(
                             12.0,
                             2.0,
-                            ink(if disabled { "#5e626b" } else { "#0a0a0d" }),
+                            ink(if send_disabled { "#5e626b" } else { "#0a0a0d" }),
                         )),
-                )
-        });
+                ),
+        );
+    let dock = col()
+        .key(format!("{id}-dock"))
+        .w_full()
+        .px(14.0)
+        .pt(4.0)
+        .pb(14.0)
+        .child(wrap);
     view = view
         .child(dock)
         // Edge ports (`.canvas-card-port`): 9px dots centred on the top and
@@ -3288,7 +3376,7 @@ mod tests {
             format!("{card}-mini-a1"),
             format!("{card}-input"),
             format!("{card}-send"),
-            format!("{empty}-preview"),
+            format!("{empty}-convo-empty"),
         ] {
             assert!(rt.find(&key).is_some(), "{key} mounted");
         }

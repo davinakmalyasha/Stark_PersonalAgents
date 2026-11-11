@@ -535,7 +535,11 @@ fn side_panel(s: &ShellState) -> El {
 /// Width hugs React's `md:max-w-[740px]`, height caps at 74vh.
 fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) -> Option<El> {
     let thread = s.canvas.sheet_thread()?;
-    let card_w = (stage_w - 16.0).clamp(260.0, 740.0);
+    // React caps the wrapper (`md:max-w-[740px]`) and the wrapper's own
+    // `px-2` gutters sit inside that cap: the card is at most 724 wide.
+    // At 800 the stage is narrower than the cap, so this matches the old
+    // `stage_w - 16` exactly.
+    let card_w = stage_w.clamp(260.0, 740.0) - 16.0;
     let mut card = col()
         .key("home-chat-card")
         .w(card_w)
@@ -1075,6 +1079,21 @@ pub fn run_shell_headless(extra_args: Vec<String>) {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+
+    #[test]
+    fn home_card_width_matches_react_wrapper_gutters() {
+        for (w, h, expected) in [(1280.0, 900.0, 724.0), (800.0, 573.0, 487.0)] {
+            let env = Env::new(true, 1.0);
+            let mut rt = Runtime::new(ShellState::default(), shell_view, (w, h), env);
+            rt.frame(0.0);
+            let (rect, _) = rt.presented("home-chat-card").expect("card mounted");
+            assert!(
+                (rect[2] - expected).abs() < 0.51,
+                "{w}x{h}: card width {} != {expected}",
+                rect[2]
+            );
+        }
+    }
 
     #[test]
     fn single_page_mounts_tabs_rail_panel_and_canvas() {

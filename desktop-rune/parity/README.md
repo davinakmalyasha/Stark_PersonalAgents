@@ -58,12 +58,16 @@ compares softened images so font anti-aliasing stops dominating.
 
 | capture | full mean | right mean | align |
 |---|---|---|---|
-| frozen fixtures, 1× | **2.117** | **2.763** | (0, 0) |
+| 800×573 boot | **2.101** | **2.732** | (0, 0) |
+| 1280×900 boot | **2.063** | **2.254** | (0, 0) |
 
 The renderer embeds the exact `InterVariable.ttf` the browser loads (the
 built-in static Inter shifted every text box), matches React's Tailwind
 letter-spacing, and draws the send/stop icons as the same Lucide geometry.
-Those plus the live camera took the baseline from 2.306 to 2.117.
+Those plus the live camera took the baseline from 2.306 to 2.101. At
+1280×900 the fitted canvas cards are visible, so the mini chat cards are
+held to the same standard: flex-1 conversation, `CanvasChatBubble` sizes,
+and the bordered paperclip/input/25pt-send dock.
 
 Release native renders pixel-identical to debug (mean 0.0) at ~4× the
 speed: animating p50 4.8 ms, forced repaint p50 2.5 ms, zero draws at rest.
@@ -75,6 +79,13 @@ face (debug was 76.9 MB).
 `STARK_FONT_SMOOTHING=off|on|directwrite` is a rig-only knob for the shell
 snapshot. DirectWrite is the shipped default and measures best (2.117 vs
 2.28 Off / 2.33 On against the same React capture).
+
+`boot_home.json` is deliberately empty: the fixture `/api/ui/state` already
+opens the "hello" chat, so a capture must not tap the sidebar (a tap calls
+`focusCard`, changes the camera to 0.65×, and hides the fitted map). The
+React capture launches Chrome with `--hide-scrollbars` so the initial
+`fitView` sees the same stage width as the native window; injecting that CSS
+after load leaves the map 5pt off-centre.
 
 The remaining difference is glyph rasterisation, not geometry. Chrome draws
 subpixel (LCD) antialiasing on opaque surfaces such as the prompt dock

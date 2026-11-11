@@ -58,13 +58,13 @@ compares softened images so font anti-aliasing stops dominating.
 
 | capture | full mean | right mean | align |
 |---|---|---|---|
-| 800×573 boot | **2.101** | **2.732** | (0, 0) |
-| 1280×900 boot | **2.063** | **2.254** | (0, 0) |
+| 800×573 boot | **2.103** | **2.732** | (0, 0) |
+| 1280×900 boot | **2.064** | **2.254** | (0, 0) |
 
 The renderer embeds the exact `InterVariable.ttf` the browser loads (the
 built-in static Inter shifted every text box), matches React's Tailwind
 letter-spacing, and draws the send/stop icons as the same Lucide geometry.
-Those plus the live camera took the baseline from 2.306 to 2.101. At
+Those plus the live camera took the baseline from 2.306 to 2.103. At
 1280×900 the fitted canvas cards are visible, so the mini chat cards are
 held to the same standard: flex-1 conversation, `CanvasChatBubble` sizes,
 and the bordered paperclip/input/25pt-send dock.

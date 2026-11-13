@@ -57,6 +57,9 @@ struct Runs {
     spans: Vec<rune::Span>,
     links: Vec<rune::Link>,
     strikes: Vec<(usize, usize, Option<rune::Color>)>,
+    /// Byte ranges of inline-code runs: each carries a 6px pad and 1px border
+    /// in React, which `content_widths` alone cannot see.
+    codes: Vec<(usize, usize)>,
 }
 
 const INLINE_CODE_SIZE: f32 = 13.5;
@@ -87,6 +90,7 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
                 let start = runs.text.len();
                 runs.text.push_str(t);
                 runs.spans.push(inline_code_span(start, runs.text.len()));
+                runs.codes.push((start, runs.text.len()));
             }
             Inline::Bold(inner) => {
                 let start = runs.text.len();
@@ -189,6 +193,16 @@ fn margins(block: &stark_kit::markdown::Block) -> (f32, f32) {
         Block::Rule => (24.0, 24.0),
         Block::Image { .. } => (8.0, 8.0),
     }
+}
+
+/// Bottom margin React keeps inside an agent response after its final block
+/// (`Markdown.tsx` block `mb-*`); the response box ends there, not at the
+/// last glyph.
+pub(super) fn last_margin(body: &str) -> f32 {
+    stark_kit::markdown::parse(body)
+        .last()
+        .map(|b| margins(b).1)
+        .unwrap_or(0.0)
 }
 
 fn heading_style(level: u8) -> TextStyle {
@@ -511,6 +525,61 @@ fn looks_like_diff(lang: &str, text: &str) -> bool {
         || text.contains("\n@@ ")
 }
 
+/// The primitive types Prism's Rust grammar colours as keywords.
+fn is_rust_primitive(text: &str) -> bool {
+    matches!(
+        text,
+        "bool"
+            | "char"
+            | "str"
+            | "f32"
+            | "f64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+    )
+}
+
+/// Prism's Rust `operator` pattern, minus `->`, which stays punctuation.
+fn rust_operator(code: &str, start: usize, end: usize) -> bool {
+    let text = &code[start..end];
+    if text.len() != 1 {
+        return false;
+    }
+    let ch = text.as_bytes()[0];
+    if ch == b'-' && code[end..].starts_with('>') {
+        return false;
+    }
+    if ch == b'>' && code[..start].ends_with('-') {
+        return false;
+    }
+    matches!(
+        ch,
+        b'-' | b'+'
+            | b'*'
+            | b'/'
+            | b'%'
+            | b'!'
+            | b'^'
+            | b'='
+            | b'&'
+            | b'|'
+            | b'<'
+            | b'>'
+            | b'@'
+            | b'?'
+    )
+}
+
 /// React's code block: header (language + copy), then a horizontal code well.
 fn code_block<S: TranscriptHost + 'static>(
     s: &S,
@@ -523,6 +592,10 @@ fn code_block<S: TranscriptHost + 'static>(
         return diff::<S>(s, which, key, code);
     }
     let highlighted = !lang.is_empty() && code.chars().count() <= 40_000;
+    // React's `code` renderer does `String(children).replace(/\n$/, '')`; the
+    // markdown parser keeps that newline, and Rune would lay out an empty
+    // sixteenth line for it.
+    let code = code.strip_suffix('\n').unwrap_or(code);
     let base = if highlighted {
         ink("#abb2bf")
     } else {
@@ -547,18 +620,56 @@ fn code_block<S: TranscriptHost + 'static>(
         .py(4.0)
         .corners([12.0, 12.0, 0.0, 0.0])
         .fill(rgba(24.0, 24.0, 27.0, 0.7))
-        .border(1.0, rgba(39.0, 39.0, 42.0, 0.6))
+        // `.border-b-0`: the body's own top border is the separator.
+        .border_sides([1.0, 1.0, 0.0, 1.0], rgba(39.0, 39.0, 42.0, 0.6))
         .border_layout()
         .child(text(label).font(label_style).color(ink("#71717a")));
     let mut spans = Vec::new();
     if highlighted {
+        use rune_kit::syntax::{Paint, Syntax};
         let theme = syntax_theme();
+        let rust = matches!(lang.to_ascii_lowercase().as_str(), "rust" | "rs");
         for (range, paint) in rune_kit::syntax::highlight(Some(lang), code).iter() {
+            let mut paint = *paint;
+            if rust {
+                // Prism's Rust grammar folds primitive types into `keyword`, paints
+                // operators with the function blue and macros with the property rose.
+                let text = &code[range.clone()];
+                if paint == Paint::Kind(Syntax::Punctuation) {
+                    // The scanner groups adjacent separators (`&[`, `])`); Prism
+                    // splits operators from punctuation, so emit one span per char.
+                    let mut at = range.start;
+                    for ch in text.chars() {
+                        let end = at + ch.len_utf8();
+                        let kind = if rust_operator(code, at, end) {
+                            Syntax::Function
+                        } else {
+                            Syntax::Punctuation
+                        };
+                        spans.push(rune::Span::new(at, end).color(theme.color(kind)));
+                        at = end;
+                    }
+                    continue;
+                }
+                paint = match paint {
+                    Paint::Kind(Syntax::Type) if is_rust_primitive(text) => {
+                        Paint::Kind(Syntax::Keyword)
+                    }
+                    Paint::Kind(Syntax::Function) if text.ends_with('!') => {
+                        Paint::Kind(Syntax::Property)
+                    }
+                    other => other,
+                };
+            }
             let color = match paint {
-                rune_kit::syntax::Paint::Kind(kind) => theme.color(*kind),
-                rune_kit::syntax::Paint::Color(c) => *c,
+                Paint::Kind(kind) => theme.color(kind),
+                Paint::Color(c) => c,
             };
-            spans.push(rune::Span::new(range.start, range.end).color(color));
+            let mut span = rune::Span::new(range.start, range.end).color(color);
+            if paint == Paint::Kind(Syntax::Comment) {
+                span = span.italic();
+            }
+            spans.push(span);
         }
     }
     let code_text = rune::rich(code.to_string(), spans)
@@ -573,10 +684,10 @@ fn code_block<S: TranscriptHost + 'static>(
         .w_full()
         .scroll_x()
         .fill(ink("#09090b"))
-        .border_sides([1.0, 0.0, 1.0, 0.0], rgba(39.0, 39.0, 42.0, 0.6))
+        .border(1.0, rgba(39.0, 39.0, 42.0, 0.6))
         .border_layout()
         .corners([0.0, 0.0, 12.0, 12.0])
-        .child(col().px(16.0).py(16.0).child(code_text));
+        .child(col().px(16.0).pt(17.0).pb(15.0).child(code_text));
     let code_owned = code.to_string();
     let copy_key = format!("{key}-copy");
     let copied = s.thread(which).copied_code.as_deref() == Some(copy_key.as_str());
@@ -758,16 +869,37 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
         style.line_height = 18.6;
         style
     };
+    // The header inherits `.markdown-body`'s 1.85 line-height rather than the
+    // table's 1.55, so its filename and stat rows are taller than the rows.
+    let head_name = {
+        let mut style = TextStyle::new(12.0, 400.0).mono();
+        style.line_height = 12.0 * 1.85;
+        style
+    };
+    let head_stats = {
+        let mut style = TextStyle::new(11.0, 600.0).mono();
+        style.line_height = 11.0 * 1.85;
+        style
+    };
     let mut body = col().key(format!("{key}-diff-lines")).w_full();
     for (i, line) in visible.iter().enumerate() {
         let (bg, fg) = line_style(line.kind);
         let fg = fg.unwrap_or(ink("#a1a1aa"));
         let line_no = |n: Option<u32>| {
-            row().w(42.0).justify_end().px(10.0).child(
-                text(n.map(|n| n.to_string()).unwrap_or_default())
-                    .font(mono)
-                    .color(ink("#52525b")),
-            )
+            row()
+                .w(42.0)
+                .justify_end()
+                .px(10.0)
+                .border_sides([0.0, 1.0, 0.0, 0.0], rgba(39.0, 39.0, 42.0, 0.5))
+                .border_layout()
+                .child(
+                    text(n.map(|n| n.to_string()).unwrap_or_default())
+                        .font(mono)
+                        .color(ink("#52525b"))
+                        // Chrome sits the glyphs one device pixel lower in this line
+                        // box than Rune; shift the paint, not the row.
+                        .offset(0.0, 1.0),
+                )
         };
         let content = text(if line.text.is_empty() {
             " ".to_string()
@@ -780,21 +912,16 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
         .pr(10.0)
         .grow(1.0)
         .min_w(0.0)
-        .wrap_anywhere();
+        .wrap_anywhere()
+        .offset(0.0, 1.0);
         body = body.child(
             row()
                 .key(format!("{key}-diff-{i}"))
                 .w_full()
                 .items_start()
                 .fill(bg)
-                .child(
-                    line_no(line.old)
-                        .border_sides([0.0, 0.0, 0.0, 1.0], rgba(39.0, 39.0, 42.0, 0.5)),
-                )
-                .child(
-                    line_no(line.new)
-                        .border_sides([0.0, 0.0, 0.0, 1.0], rgba(39.0, 39.0, 42.0, 0.5)),
-                )
+                .child(line_no(line.old))
+                .child(line_no(line.new))
                 .child(content),
         );
     }
@@ -815,7 +942,7 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
         .border_layout()
         .child(
             text(header_name)
-                .font(mono)
+                .font(head_name)
                 .color(ink("#d4d4d8"))
                 .truncate(),
         )
@@ -825,40 +952,36 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                 .gap(8.0)
                 .child(
                     text(format!("+{add}"))
-                        .font(TextStyle::new(11.0, 600.0).mono())
+                        .font(head_stats)
                         .color(ink("#34d399")),
                 )
                 .child(
                     text(format!("-{del}"))
-                        .font(TextStyle::new(11.0, 600.0).mono())
+                        .font(head_stats)
                         .color(ink("#f87171")),
                 ),
         );
-    let mut card = col()
-        .key(format!("{key}-diff"))
+    let mut scroll = col()
+        .key(format!("{key}-diff-scroll"))
         .w_full()
-        .radius(8.0)
-        .border(1.0, ink("#27272a"))
-        .fill(rgba(9.0, 9.0, 11.0, 0.6))
-        .clip_rounded(8.0)
-        .child(head)
-        .child(
-            col()
-                .key(format!("{key}-diff-scroll"))
-                .w_full()
-                .max_h(420.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(body),
-        );
+        .max_h(420.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(body);
     if lines.len() > MAX_VISIBLE {
         let label = if expanded {
             "Collapse".to_string()
         } else {
             format!("Show all {} lines", lines.len())
         };
-        card = card.child(
+        let label_style = {
+            let mut style = TextStyle::new(11.5, 600.0);
+            style.line_height = 11.5 * 1.85;
+            style
+        };
+        // React keeps the expander inside the 420px scroller, below the table.
+        scroll = scroll.child(
             row()
                 .key(toggle_key.clone())
                 .role("button")
@@ -875,11 +998,7 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                     13.0,
                     ink("#818cf8"),
                 )))
-                .child(
-                    text(label)
-                        .font(TextStyle::new(11.5, 600.0))
-                        .color(ink("#818cf8")),
-                )
+                .child(text(label).font(label_style).color(ink("#818cf8")))
                 .on_press(move |s: &mut S| {
                     let set = &mut s.thread_mut(which).expanded_diffs;
                     if !set.remove(&toggle_key) {
@@ -888,7 +1007,25 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                 }),
         );
     }
-    card
+    let card = col()
+        .key(format!("{key}-diff-card"))
+        .w_full()
+        .radius(8.0)
+        .border(1.0, ink("#27272a"))
+        .fill(rgba(9.0, 9.0, 11.0, 0.6))
+        .clip_rounded(8.0)
+        .border_layout()
+        .child(head)
+        .child(scroll);
+    // `CodeBlock` wraps `DiffView` in a second, softer rounded border.
+    col()
+        .key(format!("{key}-diff"))
+        .w_full()
+        .radius(12.0)
+        .border(1.0, rgba(39.0, 39.0, 42.0, 0.6))
+        .clip_rounded(12.0)
+        .border_layout()
+        .child(card)
 }
 
 /// React's table: rounded well, uppercase 600 header, hairline row rules.
@@ -901,7 +1038,10 @@ fn table<S: TranscriptHost + 'static>(
     let _ = body;
     let head_style = {
         let mut style = TextStyle::new(13.0, 600.0);
-        style.line_height = 13.0 * 1.85;
+        // The table's `leading-relaxed` (1.625), inherited by the header.
+        style.line_height = 13.0 * 1.625;
+        // `tracking-wider`.
+        style.tracking = 0.65;
         style
     };
     let cell_style = {
@@ -915,44 +1055,46 @@ fn table<S: TranscriptHost + 'static>(
     if cols == 0 {
         return col().key(format!("{key}-table"));
     }
-    let widths = |list: &[stark_kit::markdown::Inline], style: TextStyle| {
+    // Inline code is a padded, bordered inline box in React; `content_widths`
+    // measures the glyphs alone, so add the 6px pad + 1px border on each side.
+    let measure = |list: &[stark_kit::markdown::Inline], style: TextStyle| {
         let mut runs = Runs::default();
         inlines(&mut runs, list, false);
-        rune::text::content_widths(&runs.text, &runs.spans, style)
+        let (_min, max) = rune::text::content_widths(&runs.text, &runs.spans, style);
+        max + 14.0 * runs.codes.len() as f32
     };
-    let mut min = vec![0.0f32; cols];
     let mut max = vec![0.0f32; cols];
     for (j, cell) in headers.iter().enumerate() {
         let mut runs = Runs::default();
         inlines(&mut runs, cell, false);
         let upper = runs.text.to_uppercase();
-        let (mi, ma) = rune::text::content_widths(&upper, &runs.spans, head_style);
-        min[j] = min[j].max(mi);
-        max[j] = max[j].max(ma);
+        let (_min, ma) = rune::text::content_widths(&upper, &runs.spans, head_style);
+        max[j] = max[j].max(ma + 14.0 * runs.codes.len() as f32);
     }
     for row_cells in rows {
-        for (j, cell) in row_cells.iter().enumerate() {
-            let (mi, ma) = widths(cell, cell_style);
-            min[j] = min[j].max(mi);
-            max[j] = max[j].max(ma);
+        for (j, cell) in row_cells.iter().enumerate().take(cols) {
+            max[j] = max[j].max(measure(cell, cell_style));
         }
     }
+    let wanted: Vec<f32> = (0..cols).map(|j| (max[j] + 40.0).max(40.0)).collect();
+    let total: f32 = wanted.iter().sum();
+    let frac: Vec<f32> = wanted.iter().map(|w| w / total).collect();
     let mut head = row()
         .key(format!("{key}-thead"))
         .w_full()
-        .items_start()
         .fill(rgba(24.0, 24.0, 27.0, 0.4));
-    for j in 0..cols {
+    for (j, frac) in frac.iter().enumerate() {
         let cell = headers.get(j).map(Vec::as_slice).unwrap_or(&[]);
         let mut runs = Runs::default();
         inlines(&mut runs, cell, false);
         runs.text = runs.text.to_uppercase();
         let e = rich::<S>(format!("{key}-th-{j}"), runs, head_style, ink("#d4d4d8"))
-            .grow((max[j] + 40.0).max(40.0))
-            .shrink()
-            .min_w(min[j] + 40.0)
+            .w_frac(*frac)
             .px(20.0)
-            .py(14.0)
+            .pt(14.0)
+            // Rune snaps a 0.5pt border to one device pixel; take the half
+            // point out of padding so the header lands on React's 49.625.
+            .pb(13.5)
             .border_sides([0.0, 0.0, 1.0, 0.0], rgba(255.0, 255.0, 255.0, 0.15))
             .border_layout();
         head = head.child(e);
@@ -962,23 +1104,24 @@ fn table<S: TranscriptHost + 'static>(
         let mut tr = row()
             .key(format!("{key}-tr-{r}"))
             .w_full()
-            .items_start()
             .hover(rgba(255.0, 255.0, 255.0, 0.02));
-        for j in 0..cols {
+        for (j, frac) in frac.iter().enumerate() {
             let cell = cells.get(j).map(Vec::as_slice).unwrap_or(&[]);
             let mut runs = Runs::default();
             inlines(&mut runs, cell, false);
+            let code_cell = !runs.codes.is_empty();
             let e = rich::<S>(
                 format!("{key}-td-{r}-{j}"),
                 runs,
                 cell_style,
                 ink("#d4d4d8"),
             )
-            .grow((max[j] + 40.0).max(40.0))
-            .shrink()
-            .min_w(min[j] + 40.0)
+            .w_frac(*frac)
             .px(20.0)
-            .py(14.0)
+            .pt(14.0)
+            // The mono line box runs 1.375pt taller than the 23.5625 line;
+            // React's inline box adds only 0.375, so take 1pt off the bottom.
+            .pb(if code_cell { 13.0 } else { 14.0 })
             .border_sides([0.0, 0.0, 1.0, 0.0], rgba(255.0, 255.0, 255.0, 0.08))
             .border_layout();
             tr = tr.child(e);
@@ -990,7 +1133,10 @@ fn table<S: TranscriptHost + 'static>(
         .w_full()
         .radius(12.0)
         .border(1.0, rgba(255.0, 255.0, 255.0, 0.12))
+        .border_layout()
         .fill(rgba(9.0, 9.0, 11.0, 0.2))
         .clip_rounded(12.0)
+        // React's collapsed last-row border leaves half a point below the rows.
+        .pb(0.5)
         .child(table)
 }

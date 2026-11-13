@@ -15,11 +15,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = pathlib.Path(__file__).resolve().parent
 FIX = HERE / "fixtures"
+SCENARIOS = HERE / "scenarios"
+SCENARIO = ""
+ACTIVE_CHAT = ""
 
 
 def name_for(path: str) -> str:
     clean = path.split("?", 1)[0]
     return clean.strip("/").replace("/", "_") + ".json"
+
+
+def fixture_path(name: str) -> pathlib.Path | None:
+    if SCENARIO:
+        scenario = SCENARIOS / SCENARIO / name
+        if scenario.exists():
+            return scenario
+    base = FIX / name
+    return base if base.exists() else None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -40,7 +52,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(data).encode("utf-8"), "application/json")
 
     def _files(self):
-        return sorted(p.name[:-5] for p in FIX.glob("*.json")) if FIX.is_dir() else []
+        names = set()
+        if FIX.is_dir():
+            names.update(p.name[:-5] for p in FIX.glob("*.json"))
+        if SCENARIO and (SCENARIOS / SCENARIO).is_dir():
+            names.update(p.name[:-5] for p in (SCENARIOS / SCENARIO).glob("*.json"))
+        return sorted(names)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
@@ -67,11 +84,18 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 return
         name = name_for(path)
-        file = FIX / name
-        if not file.exists():
+        file = fixture_path(name)
+        if file is None:
             self._json(404, {"error": "no fixture for " + path, "have": self._files()})
             return
-        self._send(200, file.read_bytes(), "application/json")
+        body = file.read_bytes()
+        if path == "/api/ui/state" and ACTIVE_CHAT:
+            data = json.loads(body)
+            key = ACTIVE_CHAT if ":" in ACTIVE_CHAT else f"_general:{ACTIVE_CHAT}"
+            data["active_tab"] = key
+            data["open_tabs"] = [key]
+            body = json.dumps(data).encode("utf-8")
+        self._send(200, body, "application/json")
 
     def do_PUT(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
@@ -87,13 +111,33 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global SCENARIO, ACTIVE_CHAT
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8125)
+    ap.add_argument(
+        "--scenario",
+        default="",
+        help="overlay fixture directory under parity/scenarios (e.g. md)",
+    )
+    ap.add_argument(
+        "--active-chat",
+        default="",
+        help="rewrite ui/state to open only this chat (chat id or ws:chat)",
+    )
     args = ap.parse_args()
+    SCENARIO = args.scenario
+    ACTIVE_CHAT = args.active_chat
+    if SCENARIO and not (SCENARIOS / SCENARIO).is_dir():
+        raise SystemExit(f"no scenario at {SCENARIOS / SCENARIO}")
     if not FIX.is_dir():
         raise SystemExit(f"no fixtures at {FIX}; run parity/record_fixtures.py first")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"parity fixtures on http://127.0.0.1:{args.port} ({len(list(FIX.glob('*.json')))} files)")
+    extra = f", scenario {SCENARIO}" if SCENARIO else ""
+    active = f", active {ACTIVE_CHAT}" if ACTIVE_CHAT else ""
+    print(
+        f"parity fixtures on http://127.0.0.1:{args.port} "
+        f"({len(list(FIX.glob('*.json')))} files{extra}{active})"
+    )
     server.serve_forever()
 
 

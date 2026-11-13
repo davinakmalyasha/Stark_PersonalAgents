@@ -1,0 +1,26 @@
+{
+  "createdAt": "2026-11-12T11:22:00Z",
+  "id": "chat-md-table",
+  "isPinned": false,
+  "messages": [
+    {
+      "content": "Render the parity table.",
+      "id": "chat-md-table-user",
+      "metadata": {},
+      "role": "user",
+      "timestamp": "2026-11-12T11:22:00Z"
+    },
+    {
+      "content": "The frozen parity numbers:\n\n| Surface | React | Rune | Delta |\n| --- | ---: | ---: | ---: |\n| **Paragraph** | 2.103 | 2.103 | 0.000 |\n| `Code block` | 2.064 | 2.064 | 0.000 |\n| Diff view | 2.254 | 2.254 | 0.000 |",
+      "id": "chat-md-table-agent",
+      "metadata": {},
+      "role": "agent",
+      "timestamp": "2026-11-12T11:22:05Z"
+    }
+  ],
+  "model": "deepseek-v4.1-flash",
+  "title": "Markdown \u00b7 table",
+  "updatedAt": "2026-11-12T11:22:00Z",
+  "workspaceId": "_general",
+  "workspacePath": ""
+}

@@ -195,6 +195,9 @@ fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcript::RowDat
         show_trace: r.show_trace,
         hide_body: r.hide_body,
         event: r.event.clone(),
+        has_usage: r.has_usage,
+        tokens_in: r.tokens_in,
+        tokens_out: r.tokens_out,
     }
 }
 
@@ -1134,12 +1137,12 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
                         ),
                 )
                 .child(
-                    text("×".to_string())
+                    rune::el()
                         .key(format!("{id}-close"))
+                        .size(14.0, 14.0)
                         .role("button")
                         .label(format!("Remove {}", card.title))
-                        .font(rune::tok::TextStyle::new(13.0, 400.0))
-                        .color(ink("#71717a"))
+                        .shape(crate::lucide_x(14.0, 2.0, ink("#71717a")))
                         .on_press(move |s: &mut S| {
                             s.canvas_mut().close_session(&close_id);
                         }),
@@ -1496,14 +1499,16 @@ fn card_view<S: CanvasHost + 'static>(
                 .radius(2.5)
                 .fill(ink(tone))
                 .looping(rune::LoopSpec::opacity(2.2, 0.0, 0.35, 1.0)),
-            "done" => text("✓".to_string())
+            "done" => rune::el()
                 .key(format!("{id}-badge-mark"))
-                .font(rune::tok::TextStyle::new(10.0, 700.0))
-                .color(ink(tone)),
-            "failed" => text("✕".to_string())
+                .size(12.0, 12.0)
+                .inert()
+                .shape(crate::lucide_check(12.0, 2.6, ink(tone))),
+            "failed" => rune::el()
                 .key(format!("{id}-badge-mark"))
-                .font(rune::tok::TextStyle::new(10.0, 700.0))
-                .color(ink(tone)),
+                .size(12.0, 12.0)
+                .inert()
+                .shape(crate::lucide_x(12.0, 2.6, ink(tone))),
             _ => rune::el()
                 .key(format!("{id}-badge-dot"))
                 .size(5.0, 5.0)
@@ -1648,14 +1653,17 @@ fn card_view<S: CanvasHost + 'static>(
             agents_btn
         })
         .child(
-            text("×".to_string())
+            rune::el()
                 .key(format!("{id}-close"))
                 .size(26.0, 26.0)
                 .center()
                 .role("button")
                 .label(format!("Close {}", card.title))
-                .font(rune::tok::TextStyle::new(13.0, 400.0))
-                .color(ink("#71717a"))
+                .child(rune::el().size(14.0, 14.0).inert().shape(crate::lucide_x(
+                    14.0,
+                    2.0,
+                    ink("#71717a"),
+                )))
                 .on_press(move |s: &mut S| {
                     s.canvas_mut().close_session(&close_id);
                 }),
@@ -2068,12 +2076,12 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .on_edit(move |s: &mut S| &mut s.canvas_mut().add_search),
                 )
                 .child(
-                    text("×".to_string())
+                    rune::el()
                         .key("canvas-add-close")
+                        .size(12.0, 12.0)
                         .role("button")
                         .label("Close add menu")
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(ink("#71717a"))
+                        .shape(crate::lucide_x(12.0, 2.0, ink("#71717a")))
                         .on_press(move |s: &mut S| {
                             s.canvas_mut().add_open = false;
                         }),

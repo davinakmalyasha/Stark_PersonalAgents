@@ -843,12 +843,12 @@ fn agent_rows<S: AgentsHost + 'static>(
         }
         if agent.status == "running" || agent.status == "queued" {
             head = head.child(
-                text("×".to_string())
+                rune::el()
                     .key(format!("agent-{id}-cancel", id = agent.id))
+                    .size(12.0, 12.0)
                     .role("button")
                     .label(format!("Cancel {}", agent.display()))
-                    .font(rune::tok::TextStyle::new(11.0, 600.0))
-                    .color(ink("#71717a"))
+                    .shape(crate::lucide_x(12.0, 2.0, ink("#71717a")))
                     .on_press(move |s: &mut S| {
                         dispatch_agent(
                             s.agents_mut(),
@@ -1029,12 +1029,12 @@ pub fn agent_sheet<S: AgentsHost + 'static>(s: &AgentsState) -> El {
                         }),
                 )
                 .child(
-                    text("×".to_string())
+                    rune::el()
                         .key("agent-sheet-close")
+                        .size(14.0, 14.0)
                         .role("button")
                         .label("Close agent details")
-                        .font(rune::tok::TextStyle::new(14.0, 400.0))
-                        .color(ink("#8a8a93"))
+                        .shape(crate::lucide_x(14.0, 2.0, ink("#8a8a93")))
                         .on_press(move |s: &mut S| {
                             let st = s.agents_mut();
                             st.selected = None;

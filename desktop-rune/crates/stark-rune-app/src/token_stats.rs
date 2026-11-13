@@ -490,12 +490,12 @@ pub fn stats_sheet<S: 'static>(
                                 ),
                         )
                         .child(
-                            text("×".to_string())
+                            rune::el()
                                 .key("stats-close")
+                                .size(16.0, 16.0)
                                 .role("button")
                                 .label("Close usage")
-                                .font(rune::tok::TextStyle::new(14.0, 400.0))
-                                .color(ink("#8a8a93"))
+                                .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press({
                                     let close = on_close.clone();
                                     move |s: &mut S| close(s)

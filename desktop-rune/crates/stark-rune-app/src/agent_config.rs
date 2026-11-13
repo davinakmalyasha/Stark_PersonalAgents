@@ -1149,12 +1149,12 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                                 ),
                         )
                         .child(
-                            text("×".to_string())
+                            rune::el()
                                 .key("agentcfg-close")
+                                .size(16.0, 16.0)
                                 .role("button")
                                 .label("Close agents and providers")
-                                .font(rune::tok::TextStyle::new(14.0, 400.0))
-                                .color(ink("#8a8a93"))
+                                .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press(move |s: &mut S| {
                                     s.thread_mut(which).agent_config.open = false;
                                 }),

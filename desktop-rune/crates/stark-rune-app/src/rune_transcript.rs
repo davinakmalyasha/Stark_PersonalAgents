@@ -38,6 +38,11 @@ pub struct RowData {
     pub hide_body: bool,
     /// `metadata.kind` for `SessionEventDivider`: `"aborted"` or `"compaction"`.
     pub event: String,
+    /// `metadata.usage` present: React shows the token/time footer only then.
+    pub has_usage: bool,
+    /// `metadata.usage.total_input_tokens` / `total_output_tokens`.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
 
 /// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
@@ -1190,7 +1195,7 @@ fn home_divider(label: &str) -> El {
             text(label.to_ascii_uppercase())
                 .font({
                     let mut style = rune::tok::TextStyle::new(9.0, 600.0);
-                    style.line_height = 12.8;
+                    style.line_height = 13.5;
                     // `.chat-date-label` `letter-spacing: .05em`.
                     style.tracking = 0.45;
                     style
@@ -1200,6 +1205,7 @@ fn home_divider(label: &str) -> El {
                 .py(2.0)
                 .radius(999.0)
                 .border(1.0, home_ink("#ffffff0f"))
+                .border_layout()
                 .fill(home_ink("#ffffff05")),
         )
         .child(line())
@@ -1333,7 +1339,9 @@ fn home_agent_row<S: TranscriptHost + 'static>(
     let mut response =
         render_body_styled::<S>(s, which, &r.key, &r.body, "#e4e4e7", home_body_style())
             .pt(12.0)
-            .pb(12.0);
+            // React's `.agent-message-response` ends after the last block's
+            // own bottom margin (`mb-12`/`mb-20`), not at the final glyph.
+            .pb(md_render::last_margin(&r.body));
     if live {
         let mut dots = row()
             .key(format!("{}-typing", r.key))
@@ -1364,13 +1372,13 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         .gap(12.0)
         .mt(8.0)
         .child(
-            text("↑0".to_string())
+            text(format!("↑{}", thousands(r.tokens_in)))
                 .key(format!("{}-in", r.key))
                 .font(mono)
                 .color(home_ink("#52525b")),
         )
         .child(
-            text("↓0".to_string())
+            text(format!("↓{}", thousands(r.tokens_out)))
                 .key(format!("{}-out", r.key))
                 .font(mono)
                 .color(home_ink("#52525b")),
@@ -1380,6 +1388,14 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         footer = footer.child(
             text(stamp)
                 .key(format!("{}-time", r.key))
+                .font(mono)
+                .color(home_ink("#52525b")),
+        );
+    }
+    if !r.duration.is_empty() {
+        footer = footer.child(
+            text(r.duration.clone())
+                .key(format!("{}-duration", r.key))
                 .font(mono)
                 .color(home_ink("#52525b")),
         );
@@ -1395,7 +1411,25 @@ fn home_agent_row<S: TranscriptHost + 'static>(
     if !r.hide_body {
         group = group.child(response);
     }
-    group.child(footer).child(home_agent_actions(r))
+    // Per-message chip only when the payload carries `metadata.usage`, and
+    // never while the response is still streaming (`!streamingActive`).
+    if r.has_usage && !live {
+        group = group.child(footer);
+    }
+    group.child(home_agent_actions(r))
+}
+
+/// `toLocaleString()` token grouping (en-US): `1234` → `1,234`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Hover-revealed agent actions (React reserves the 25pt row at rest).
@@ -2241,12 +2275,12 @@ pub fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whic
                                 .color(ink("#f4f4f5")),
                         )
                         .child(
-                            text("×".to_string())
+                            rune::el()
                                 .key("settings-close")
+                                .size(16.0, 16.0)
                                 .role("button")
                                 .label("Close settings")
-                                .font(rune::tok::TextStyle::new(14.0, 400.0))
-                                .color(ink("#8a8a93"))
+                                .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press(move |s: &mut S| {
                                     s.thread_mut(which).settings_open = false;
                                 }),

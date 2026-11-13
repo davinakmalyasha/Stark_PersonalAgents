@@ -28,6 +28,8 @@ mod agents;
 #[cfg(feature = "rune-real")]
 mod chats;
 #[cfg(feature = "rune-real")]
+mod clock;
+#[cfg(feature = "rune-real")]
 mod cloud;
 #[cfg(feature = "rune-real")]
 mod composer;
@@ -72,6 +74,39 @@ pub(crate) fn lucide_arrow_up(size: f32, stroke_units: f32, color: rune::Color) 
         .line_to([19.0, 12.0])
         .move_to([12.0, 19.0])
         .line_to([12.0, 5.0]);
+    rune::Shape::new()
+        .stroke_path(
+            &p,
+            size * (stroke_units / 24.0),
+            rune::LineCap::Round,
+            color,
+        )
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `X` (`M18 6 6 18` + `m6 6 12 12`) at `size` points.
+pub(crate) fn lucide_x(size: f32, stroke_units: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([18.0, 6.0])
+        .line_to([6.0, 18.0])
+        .move_to([6.0, 6.0])
+        .line_to([18.0, 18.0]);
+    rune::Shape::new()
+        .stroke_path(
+            &p,
+            size * (stroke_units / 24.0),
+            rune::LineCap::Round,
+            color,
+        )
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `Check` (`M20 6 9 17l-5-5`) at `size` points.
+pub(crate) fn lucide_check(size: f32, stroke_units: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([20.0, 6.0])
+        .line_to([9.0, 17.0])
+        .line_to([4.0, 12.0]);
     rune::Shape::new()
         .stroke_path(
             &p,

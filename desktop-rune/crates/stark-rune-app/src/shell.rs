@@ -1056,7 +1056,17 @@ pub fn shell_spec() -> AppSpec<ShellState> {
     ];
     spec.poll = Some(shell_poll);
     spec.fonts = SHELL_FONTS;
-    spec.families = ("Inter", "ui-monospace");
+    // Chromium's Tailwind mono stack resolves `ui-monospace` to Consolas on
+    // Windows; Rune's system-mono list prefers Cascadia Mono, so name the
+    // browser's face outright for byte parity. Web keeps the bundled Plex.
+    #[cfg(target_arch = "wasm32")]
+    {
+        spec.families = ("Inter", "IBM Plex Mono");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        spec.families = ("Inter", "Consolas");
+    }
     spec
 }
 

@@ -21,19 +21,10 @@ fn ink(hex: &'static str) -> rune::Color {
 }
 
 /// Wall-clock millis. `SystemTime` panics on wasm32-unknown-unknown (no OS
-/// clock), so the web build reads `Date.now()` instead.
+/// clock), so `clock` reads `Date.now()` there instead. `STARK_PARITY_NOW`
+/// freezes it for the parity rig.
 pub fn now_millis() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        js_sys::Date::now() as u64
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
+    crate::clock::now_millis()
 }
 
 /// Mint an opaque thread id (`rune-<millis>`). React reuses the persistent
@@ -574,12 +565,12 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         }),
                 )
                 .child(
-                    text("×".to_string())
+                    rune::el()
                         .key("notes-close")
+                        .size(14.0, 14.0)
                         .role("button")
                         .label("Close notes")
-                        .font(rune::tok::TextStyle::new(14.0, 400.0))
-                        .color(ink("#8a8a93"))
+                        .shape(crate::lucide_x(14.0, 2.0, ink("#8a8a93")))
                         .on_press(move |s: &mut S| {
                             s.thread_mut(which).notes.open = false;
                         }),

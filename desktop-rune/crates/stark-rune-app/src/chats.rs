@@ -132,6 +132,12 @@ pub struct ChatMsgRow {
     /// `metadata.kind`: `"aborted"` or `"compaction"` renders
     /// `SessionEventDivider` instead of a bubble.
     pub event: String,
+    /// `metadata.usage` is present: React renders the per-message token/time
+    /// footer only then.
+    pub has_usage: bool,
+    /// `metadata.usage.total_input_tokens` / `total_output_tokens`.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -201,6 +207,12 @@ fn opt_str_of(v: &serde_json::Value, key: &str) -> Option<String> {
         .and_then(|x| x.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn u64_of(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key)
+        .and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|n| n.max(0.0) as u64)))
+        .unwrap_or(0)
 }
 
 /// `workspaceKind`/booleans → the actor family used by `canvasActors.ts`.
@@ -311,6 +323,10 @@ fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                         .filter(|k| *k == "aborted" || *k == "compaction")
                         .unwrap_or_default()
                         .to_string();
+                    let has_usage = meta.and_then(|x| x.get("usage")).is_some();
+                    let usage = meta.and_then(|x| x.get("usage"));
+                    let tokens_in = usage.map(|u| u64_of(u, "total_input_tokens")).unwrap_or(0);
+                    let tokens_out = usage.map(|u| u64_of(u, "total_output_tokens")).unwrap_or(0);
                     ChatMsgRow {
                         key: opt_str_of(m, "id").unwrap_or_else(|| format!("msg-{i}")),
                         role: match str_of(m, "role").as_str() {
@@ -323,6 +339,9 @@ fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                         show_trace: is_trace && (activity > 0 || step_activity),
                         hide_body: timeline_len > 0 && !last_is_text,
                         event,
+                        has_usage,
+                        tokens_in,
+                        tokens_out,
                     }
                 })
                 .collect()

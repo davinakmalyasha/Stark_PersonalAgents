@@ -42,6 +42,7 @@ STARK_API_PORT=8125 bash desktop-rune/parity/capture_native.sh \
   /tmp/native.png 800x573 open_hello.json 4
 
 # React: 800x573, 1x, scrollbars hidden, transcript scrolled to its end
+# (both sides default STARK_PARITY_NOW to 2026-11-12T12:00:00Z)
 python desktop-rune/parity/capture_react.py /tmp/react.png \
   --url http://localhost:5200/ --settle 4
 
@@ -80,9 +81,13 @@ face (debug was 76.9 MB).
 snapshot. DirectWrite is the shipped default and measures best (2.117 vs
 2.28 Off / 2.33 On against the same React capture).
 
-Relative-time labels (`20d`) are computed from the wall clock at capture
-time, not the fixture, so a capture taken across a day boundary can differ
-on those labels by a few pixels. Capture React and native back-to-back.
+Relative-time labels (`20d`, `Today`) are computed from the wall clock at
+capture time. Both capture paths pin that clock: `capture_native.sh` exports
+`STARK_PARITY_NOW` (read once by the app; Unix seconds, Unix milliseconds, or
+RFC 3339) and `capture_react.py` installs the matching `Date` shim before the
+app loads and then reloads the page. Both default to
+`2026-11-12T12:00:00Z`. Export `STARK_PARITY_NOW=` (empty) to compare live
+behaviour instead; the app itself keeps the real clock when it is unset.
 
 `boot_home.json` is deliberately empty: the fixture `/api/ui/state` already
 opens the "hello" chat, so a capture must not tap the sidebar (a tap calls
@@ -96,6 +101,59 @@ subpixel (LCD) antialiasing on opaque surfaces such as the prompt dock
 (visible RGB fringes there), while Rune's pinned renderer draws grayscale;
 those pixels can never match exactly. Any `align` other than `(0, 0)` is a
 real layout shift and should be fixed first.
+
+## Markdown showcase parity (2026-11-13)
+
+Synthetic, committed fixtures under `parity/scenarios/md/` cover the three
+tall markdown blocks. Start the fixture server with the overlay and one active
+chat:
+
+```bash
+python desktop-rune/parity/mock_server.py --port 8125 --scenario md \
+  --active-chat chat-md-code   # then chat-md-table / chat-md-diff
+```
+
+Native boots with the transcript stuck to the bottom, so every state starts
+with a wheel-up. The wheel must land in the transcript's **left gutter**, not
+inside a block: code wells and especially the 420pt diff well consume vertical
+wheels and leave the transcript at the bottom. At 800×573 the gutter point is
+`(330, 300)`; at 1280×900 it is `(450, 500)`. Scripts:
+
+| state | 800×573 | 1280×900 |
+|---|---|---|
+| top | `md_*_top.json` (code/table) or `md800_top_left.json` (diff) | `md1280_top.json` |
+| mid | `md_code.json` / `md_table.json` at 210/225, `md800_210_left.json` (diff) | `md1280_210.json` |
+| end | — | `md1280_189.json` (clamps to native max) |
+
+React's scroller clamps `scrollTop` to its own max (copy and table: 189 and
+14 at 1280×900; the diff transcript is taller). Native content ends at the
+same heights, but its max scroll can be a fraction higher (189.34 vs 189), so
+the end captures sit within a third of a pixel. The markdown response ends
+after its **last block's bottom margin** (`mb-12`/`mb-20`); the token/time
+footer is rendered only when `metadata.usage` exists and only while the
+message is not streaming, exactly as `MessageBubble.tsx` does.
+
+| capture | full mean | right mean | align |
+|---|---|---|---|
+| 800×573 code top | **2.144** | **3.172** | (0, 0) |
+| 800×573 code @210 | **2.376** | **3.567** | (0, 0) |
+| 800×573 table top | **1.863** | **2.629** | (0, 0) |
+| 800×573 table @225 | **2.502** | **3.631** | (0, 0) |
+| 800×573 diff top | **2.318** | **3.478** | (0, 0) |
+| 800×573 diff @210 | **2.684** | **4.143** | (0, 0) |
+| 1280×900 code top | **2.032** | **2.444** | (0, 0) |
+| 1280×900 code end | **2.060** | **2.409** | (0, 0) |
+| 1280×900 table top | **1.873** | **2.184** | (0, 0) |
+| 1280×900 table end | **1.876** | **2.192** | (0, 0) |
+| 1280×900 diff top | **1.885** | **2.359** | (0, 0) |
+| 1280×900 diff @210 | **1.887** | **2.254** | (0, 0) |
+
+Geometry matches exactly: code card 385.5 vs 385.406, diff wrapper 463.2 vs
+463.1875, table wrapper 210.19 vs 210.1875; diff rows 18.59 and header 39.2
+match. The diff's remaining delta is Chrome's LCD subpixel antialiasing on
+the opaque card (Rune draws grayscale) plus a one-device-pixel baseline
+difference, corrected with Rune's non-layout `.offset(0, 1)` on diff glyphs.
+Code/table bands are dominated by Consolas-vs-Consolas rasterisation at 12–13.5pt.
 
 ## State scripts
 

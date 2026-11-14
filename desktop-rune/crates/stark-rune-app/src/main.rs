@@ -48,7 +48,13 @@ mod shell;
 #[cfg(feature = "rune-real")]
 mod stream;
 #[cfg(feature = "rune-real")]
+mod stream_accum;
+#[cfg(feature = "rune-real")]
+mod stream_presentation;
+#[cfg(feature = "rune-real")]
 mod token_stats;
+#[cfg(feature = "rune-real")]
+mod tool_labels;
 #[cfg(feature = "rune-real")]
 mod transport;
 #[cfg(feature = "rune-real")]
@@ -605,6 +611,7 @@ fn run_cli() {
                 model: "Automatic Fallback".to_string(),
                 temperature: 0.7,
                 workspace_path: String::new(),
+                workspace_id: "_general".to_string(),
                 chat_id: String::new(),
                 workspace_kind: "general".to_string(),
             };

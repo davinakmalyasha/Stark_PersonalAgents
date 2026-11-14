@@ -177,6 +177,39 @@ pub fn send_json(
     }
     serde_json::from_slice(&buf).map_err(|e| format!("json: {e}"))
 }
+/// Create a chat in a workspace (`createChat`): POST title/model, return id.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_chat(
+    host: &str,
+    port: u16,
+    workspace_id: &str,
+    title: &str,
+) -> Result<String, String> {
+    let path = format!("/api/workspaces/{workspace_id}/chats");
+    let body = serde_json::json!({"title": title, "model": "Automatic Fallback"});
+    let value = send_json(host, port, "POST", &path, &body)?;
+    value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "create chat: missing id".to_string())
+}
+
+/// Browser twin of [`create_chat`].
+#[cfg(target_arch = "wasm32")]
+pub async fn create_chat_wasm(workspace_id: &str, title: &str) -> Result<String, String> {
+    let path = format!("/api/workspaces/{workspace_id}/chats");
+    let body = serde_json::json!({"title": title, "model": "Automatic Fallback"});
+    let value = fetch_send("POST", &path, Some(&body)).await?;
+    value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "create chat: missing id".to_string())
+}
+
 /// Blocking `POST /api/abort {chat_id}` — mirrors `abortRun`
 /// (`stream.ts`): tells the backend to actually cancel the run (inbox abort +
 /// pydantic-ai token), not just detach this client. Fire-and-forget from Stop
@@ -601,6 +634,7 @@ mod tests {
             model: "m".to_string(),
             temperature: 0.7,
             workspace_path: String::new(),
+            workspace_id: "_general".to_string(),
             chat_id: "c1".to_string(),
             workspace_kind: "general".to_string(),
         };

@@ -196,6 +196,8 @@ impl Default for ShellState {
         personal.live = false;
         // Distinct thread scope (notes + abort key off it, like `chat.id`).
         personal.chat_id = crate::notes::mint_id("rune-personal");
+        personal.workspace_id = "_personal".to_string();
+        personal.chat_ready = false;
         Self {
             transcript: RuneTranscriptState::screenshot(),
             personal,
@@ -913,6 +915,18 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
 fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
     use crate::chats::ChatsMsg;
     let mut changed = false;
+    // Persist finished live messages, then refresh the canonical history.
+    changed |= crate::chats::drain_pending_saves(&mut s.chats, &mut s.transcript);
+    changed |= crate::chats::drain_refresh(&mut s.chats, &mut s.transcript);
+    changed |= crate::chats::drain_pending_saves(&mut s.chats, &mut s.personal);
+    changed |= crate::chats::drain_refresh(&mut s.chats, &mut s.personal);
+    let ids: Vec<String> = s.canvas.sessions.threads.keys().cloned().collect();
+    for id in ids {
+        if let Some(thread) = s.canvas.sessions.threads.get_mut(&id) {
+            changed |= crate::chats::drain_pending_saves(&mut s.chats, thread);
+            changed |= crate::chats::drain_refresh(&mut s.chats, thread);
+        }
+    }
     while let Some(msg) = s.chats.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
         match msg {
             ChatsMsg::Snapshot(Ok(snapshot)) => {
@@ -929,7 +943,19 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
                 changed = true;
             }
             ChatsMsg::Messages { key, rows } => {
-                s.canvas.apply_chat_messages(&key, &rows);
+                if !s.canvas.apply_chat_messages(&key, &rows) {
+                    // A new chat created from a local card has no matching
+                    // card id yet; land its history on the visible thread
+                    // whose (workspace, chat) now matches.
+                    if let Some(thread) = s.canvas.sheet_thread_mut() {
+                        if format!("{}:{}", thread.workspace_id, thread.chat_id) == key {
+                            thread.rows =
+                                rows.iter().map(crate::rune_canvas::row_from_chat).collect();
+                            thread.live = false;
+                            thread.aborting = false;
+                        }
+                    }
+                }
                 changed = true;
             }
         }
@@ -1033,6 +1059,33 @@ fn apply_panel_cloud(s: &mut ShellState) {
     s.canvas.rail = RailTab::Cloud;
 }
 
+fn open_demo_sheet(s: &mut ShellState, stream: bool) {
+    s.canvas.rail = RailTab::Chats;
+    let id = s
+        .canvas
+        .cards
+        .iter()
+        .find(|card| card.id.starts_with("chat:"))
+        .map(|card| card.id.clone());
+    let Some(id) = id else { return };
+    let thread = s.canvas.thread_mut(&id);
+    let demo = if stream {
+        RuneTranscriptState::stream_demo()
+    } else {
+        RuneTranscriptState::trace_demo()
+    };
+    *thread = demo;
+    s.canvas.sessions.sheet = Some(id);
+}
+
+fn apply_stream(s: &mut ShellState) {
+    open_demo_sheet(s, true);
+}
+
+fn apply_trace(s: &mut ShellState) {
+    open_demo_sheet(s, false);
+}
+
 fn apply_panel_memory(s: &mut ShellState) {
     s.canvas.rail = RailTab::Memory;
 }
@@ -1045,6 +1098,8 @@ pub fn shell_spec() -> AppSpec<ShellState> {
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
         ("home", apply_home),
+        ("stream", apply_stream),
+        ("trace", apply_trace),
         ("cloud", apply_panel_cloud),
         ("memory", apply_panel_memory),
         // Compatibility aliases: everything lands on the one page.
@@ -1178,7 +1233,7 @@ mod tests {
         state.personal.api_port = 1;
         state.personal.edit.text = "personal hi".to_string();
         crate::rune_transcript::stage_send(&mut state.personal);
-        assert_eq!(state.personal.rows.len(), 1);
+        assert_eq!(state.personal.rows.len(), 2);
         assert_eq!(state.transcript.rows.len(), main_rows);
     }
 
@@ -1478,7 +1533,7 @@ mod tests {
             .transcript
             .rows
             .iter()
-            .any(|r| r.body.contains("42")));
+            .any(|row| row.body.contains("42")));
     }
 
     #[test]

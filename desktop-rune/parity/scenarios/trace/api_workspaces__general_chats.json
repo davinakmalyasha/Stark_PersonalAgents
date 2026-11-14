@@ -1,0 +1,28 @@
+{
+  "chats": [
+    {
+      "createdAt": "2026-11-12T11:20:00Z",
+      "id": "chat-trace",
+      "lastAgent": {
+        "content": "Playing **Cinnamon Girl** in your YouTube tab now — the track is at 04:48.",
+        "id": "chat-trace-agent",
+        "role": "agent",
+        "timestamp": "2026-11-12T11:20:08Z"
+      },
+      "lastKind": "",
+      "lastMessage": "Playing **Cinnamon Girl** in your YouTube tab now — the track is at 04:48.",
+      "lastRole": "agent",
+      "lastUser": {
+        "content": "play that in the current youtube tab",
+        "id": "chat-trace-user",
+        "role": "user",
+        "timestamp": "2026-11-12T11:20:00Z"
+      },
+      "messageCount": 2,
+      "model": "deepseek-v4.1-flash",
+      "status": "done",
+      "title": "Activity trace",
+      "updatedAt": "2026-11-12T11:20:00Z"
+    }
+  ]
+}

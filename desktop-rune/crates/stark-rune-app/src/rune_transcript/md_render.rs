@@ -195,13 +195,28 @@ fn margins(block: &stark_kit::markdown::Block) -> (f32, f32) {
     }
 }
 
+/// `.markdown-compact` overrides (activity notes): 4pt paragraphs/lists and
+/// tighter headings; code/table keep the base block spacing.
+fn margins_compact(block: &stark_kit::markdown::Block, compact: bool) -> (f32, f32) {
+    use stark_kit::markdown::Block;
+    if !compact {
+        return margins(block);
+    }
+    match block {
+        Block::Para(_) => (4.0, 4.0),
+        Block::Heading { .. } => (8.0, 4.0),
+        Block::List { .. } => (4.0, 4.0),
+        other => margins(other),
+    }
+}
+
 /// Bottom margin React keeps inside an agent response after its final block
 /// (`Markdown.tsx` block `mb-*`); the response box ends there, not at the
 /// last glyph.
 pub(super) fn last_margin(body: &str) -> f32 {
-    stark_kit::markdown::parse(body)
+    parse_cached(body)
         .last()
-        .map(|b| margins(b).1)
+        .map(|block| margins(block).1)
         .unwrap_or(0.0)
 }
 
@@ -227,6 +242,7 @@ fn heading_color(level: u8) -> rune::Color {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
@@ -234,23 +250,27 @@ fn block<S: TranscriptHost + 'static>(
     block: &stark_kit::markdown::Block,
     body: TextStyle,
     depth: usize,
+    compact: bool,
+    body_color: rune::Color,
 ) -> El {
     use stark_kit::markdown::Block;
     match block {
         Block::Para(list) => {
             let mut runs = Runs::default();
             inlines(&mut runs, list, false);
-            rich::<S>(format!("{key}-p"), runs, body, ink("#e4e4e7"))
+            rich::<S>(format!("{key}-p"), runs, body, body_color)
         }
         Block::Heading { level, text: list } => {
             let mut runs = Runs::default();
             inlines(&mut runs, list, false);
-            let mut e = rich::<S>(
-                format!("{key}-h"),
-                runs,
-                heading_style(*level),
-                heading_color(*level),
-            );
+            let style = if compact {
+                let mut style = TextStyle::new(13.0, 600.0);
+                style.line_height = 13.0 * 1.7;
+                style
+            } else {
+                heading_style(*level)
+            };
+            let mut e = rich::<S>(format!("{key}-h"), runs, style, heading_color(*level));
             if *level == 2 {
                 e = e
                     .pb(6.0)
@@ -278,10 +298,12 @@ fn block<S: TranscriptHost + 'static>(
                     body,
                     depth + 1,
                     true,
+                    compact,
+                    body_color,
                 )
                 .grow(1.0)
                 .min_w(0.0);
-                let marker = list_marker(*ordered, i, *start, body);
+                let marker = list_marker(*ordered, i, *start, body, body_color);
                 let mut row = row()
                     .key(format!("{key}-li-{i}"))
                     .w_full()
@@ -319,6 +341,8 @@ fn block<S: TranscriptHost + 'static>(
                 body,
                 depth + 1,
                 false,
+                compact,
+                body_color,
             );
             row()
                 .key(format!("{key}-quote"))
@@ -359,6 +383,7 @@ fn block<S: TranscriptHost + 'static>(
 }
 
 /// A block sequence with CSS-style collapsed margins.
+#[allow(clippy::too_many_arguments)]
 fn blocks_inner<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
@@ -367,6 +392,8 @@ fn blocks_inner<S: TranscriptHost + 'static>(
     body: TextStyle,
     depth: usize,
     in_item: bool,
+    compact: bool,
+    body_color: rune::Color,
 ) -> El {
     let _ = depth;
     let mut stack = col().key(format!("{key}-blocks")).w_full();
@@ -375,12 +402,18 @@ fn blocks_inner<S: TranscriptHost + 'static>(
     for (i, b) in list.iter().enumerate() {
         let (mt, mb) = if in_item {
             match b {
-                stark_kit::markdown::Block::Para(_) => (if i == 0 { 0.0 } else { 12.0 }, 12.0),
+                stark_kit::markdown::Block::Para(_) => {
+                    if compact {
+                        (if i == 0 { 0.0 } else { 4.0 }, 4.0)
+                    } else {
+                        (if i == 0 { 0.0 } else { 12.0 }, 12.0)
+                    }
+                }
                 stark_kit::markdown::Block::List { .. } => (4.0, 4.0),
-                other => margins(other),
+                other => margins_compact(other, compact),
             }
         } else {
-            margins(b)
+            margins_compact(b, compact)
         };
         let top = if i == 0 {
             0.0
@@ -391,7 +424,16 @@ fn blocks_inner<S: TranscriptHost + 'static>(
         } else {
             mt.max(prev_mb)
         };
-        let e = block::<S>(s, which, &format!("{key}-b{i}"), b, body, depth + 1);
+        let e = block::<S>(
+            s,
+            which,
+            &format!("{key}-b{i}"),
+            b,
+            body,
+            depth + 1,
+            compact,
+            body_color,
+        );
         stack = stack.child(e.mt(top));
         prev_mb = mb;
         after_heading = matches!(b, stark_kit::markdown::Block::Heading { .. });
@@ -420,15 +462,190 @@ pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
     _body_ink: &'static str,
     body_style: TextStyle,
 ) -> El {
-    let blocks = stark_kit::markdown::parse(body);
+    let blocks = parse_cached(body);
     if blocks.is_empty() {
         return col().key(format!("{key}-md"));
     }
-    blocks_inner::<S>(s, which, key, &blocks, body_style, 0, false)
+    let body_color = ink(_body_ink);
+    blocks_inner::<S>(
+        s, which, key, &blocks, body_style, 0, false, false, body_color,
+    )
+}
+
+/// `.markdown-compact`: activity notes (12.5pt / 1.7, 4pt paragraphs).
+pub(super) fn render_body_compact<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    key: &str,
+    body: &str,
+    _body_ink: &'static str,
+    size: f32,
+) -> El {
+    let blocks = parse_cached(body);
+    if blocks.is_empty() {
+        return col().key(format!("{key}-md"));
+    }
+    let mut style = TextStyle::new(size, 400.0);
+    style.line_height = size * 1.7;
+    let body_color = ink(_body_ink);
+    blocks_inner::<S>(s, which, key, &blocks, style, 0, false, true, body_color)
+}
+
+/// `StreamingMarkdown` from `MessageBubble.tsx`: parse the stable prefix,
+/// keep an unfinished fence as a real code card, and drop a dangling inline
+/// opener so it cannot swallow the rest of the message.
+pub(super) fn render_body_streaming<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    body_style: TextStyle,
+) -> El {
+    if body.is_empty() {
+        return col().key(format!("{key}-stream"));
+    }
+    let split = stream_split(body);
+    let stable = &body[..split];
+    let trailing = &body[split..];
+    if trailing.is_empty() {
+        return render_body_styled(s, which, key, stable, body_ink, body_style);
+    }
+    let mut out = col().key(format!("{key}-stream")).w_full();
+    if !stable.is_empty() {
+        out = out.child(render_body_styled::<S>(
+            s, which, key, stable, body_ink, body_style,
+        ));
+    }
+    if let Some((lang, code)) = parse_open_fence(trailing) {
+        out = out.child(open_fence_card(key, &lang, &code));
+        return out;
+    }
+    // Unclosed inline code / bold: drop the dangling opener when the stable
+    // prefix already opened one.
+    let safe_trailing = strip_dangling_marker(trailing, stable);
+    out.child(
+        text(safe_trailing)
+            .key(format!("{key}-stream-tail"))
+            .font(body_style)
+            .color(ink(body_ink)),
+    )
+}
+
+/// Index where the stable prefix ends (React's `StreamingMarkdown` split).
+fn stream_split(body: &str) -> usize {
+    let fences: Vec<usize> = body.match_indices("```").map(|(at, _)| at).collect();
+    if fences.len() % 2 == 1 {
+        let open = *fences.last().unwrap_or(&0);
+        body[..open].rfind('\n').map_or(open, |at| at + 1)
+    } else {
+        body.len()
+    }
+}
+
+/// Drop a trailing `**`/`~~`/`` ` `` opener only when the stable prefix has
+/// already opened that construct.
+fn strip_dangling_marker(trailing: &str, stable: &str) -> String {
+    let mut safe = trailing.to_string();
+    for marker in ["**", "~~", "`"] {
+        let trimmed = safe.trim_end();
+        if trimmed.ends_with(marker) && stable.contains(marker) {
+            let end = trimmed.len() - marker.len();
+            safe = safe[..end].to_string();
+            break;
+        }
+    }
+    safe
+}
+
+fn parse_open_fence(trailing: &str) -> Option<(String, String)> {
+    let rest = trailing.strip_prefix("```")?;
+    let newline = rest.find('\n')?;
+    let lang = &rest[..newline];
+    if !lang
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '+' || c == '-')
+    {
+        return None;
+    }
+    Some((lang.to_string(), rest[newline + 1..].to_string()))
+}
+
+fn open_fence_card(key: &str, lang: &str, code: &str) -> El {
+    let mut header = row()
+        .key(format!("{key}-stream-head"))
+        .items_center()
+        .px(12.0)
+        .py(4.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], rgba(39.0, 39.0, 42.0, 0.6))
+        .border_layout()
+        .fill(rgba(24.0, 24.0, 27.0, 0.7));
+    header = header.child(
+        text(if lang.is_empty() { "text" } else { lang })
+            .font({
+                let mut style = TextStyle::new(10.0, 400.0).mono();
+                style.line_height = 15.0;
+                style.tracking = 0.5;
+                style
+            })
+            .color(ink("#71717a")),
+    );
+    col()
+        .key(format!("{key}-stream-fence"))
+        .w_full()
+        .my(16.0)
+        .radius(12.0)
+        .border(1.0, rgba(39.0, 39.0, 42.0, 0.6))
+        .border_layout()
+        .fill(ink("#09090b"))
+        .child(header)
+        .child(
+            text(code.to_string())
+                .key(format!("{key}-stream-code"))
+                .font({
+                    let mut style = TextStyle::new(13.0, 400.0).mono();
+                    style.line_height = 19.5;
+                    style
+                })
+                .color(ink("#d4d4d8"))
+                .px(16.0)
+                .py(16.0),
+        )
+}
+
+/// Bounded parse cache for unchanged markdown (completed rows and repeated
+/// frames). Live rows change every delta and fall out naturally.
+fn parse_cached(body: &str) -> std::rc::Rc<Vec<stark_kit::markdown::Block>> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    thread_local! {
+        static CACHE: RefCell<Vec<(String, Rc<Vec<stark_kit::markdown::Block>>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, blocks)) = cache.iter().find(|(text, _)| text == body) {
+            return blocks.clone();
+        }
+        let blocks = Rc::new(stark_kit::markdown::parse(body));
+        if body.len() <= 32_768 {
+            cache.push((body.to_string(), blocks.clone()));
+            if cache.len() > 8 {
+                cache.remove(0);
+            }
+        }
+        blocks
+    })
 }
 
 /// A list marker: `•` in a 6pt box or `1.` right-aligned in 12pt.
-fn list_marker(ordered: bool, index: usize, start: u64, body: TextStyle) -> El {
+fn list_marker(
+    ordered: bool,
+    index: usize,
+    start: u64,
+    body: TextStyle,
+    body_color: rune::Color,
+) -> El {
     if ordered {
         row()
             .w(12.0)
@@ -438,14 +655,14 @@ fn list_marker(ordered: bool, index: usize, start: u64, body: TextStyle) -> El {
             .child(
                 text(format!("{}.", start + index as u64))
                     .font(body)
-                    .color(ink("#e4e4e7")),
+                    .color(body_color),
             )
     } else {
         row()
             .w(6.0)
             .h(body.line_height)
             .center()
-            .child(rune::el().size(4.0, 4.0).radius(2.0).fill(ink("#e4e4e7")))
+            .child(rune::el().size(4.0, 4.0).radius(2.0).fill(body_color))
     }
 }
 
@@ -847,6 +1064,17 @@ fn line_style(kind: DiffKind) -> (rune::Color, Option<rune::Color>) {
     }
 }
 
+/// Render a raw unified diff with the same `DiffView` parity as a fenced
+/// `diff` code block (used by the activity tool panel).
+pub(super) fn render_diff<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    key: &str,
+    raw: &str,
+) -> El {
+    diff(s, which, key, raw)
+}
+
 /// Port of `DiffView.tsx`: header, numbered lines, 800-line collapse.
 fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str) -> El {
     const MAX_VISIBLE: usize = 800;
@@ -1139,4 +1367,45 @@ fn table<S: TranscriptHost + 'static>(
         // React's collapsed last-row border leaves half a point below the rows.
         .pb(0.5)
         .child(table)
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn unclosed_fence_splits_at_its_line_start() {
+        let body = "Intro\n\n```rust\nfn main() {\n";
+        let split = stream_split(body);
+        assert_eq!(&body[..split], "Intro\n\n");
+        assert_eq!(&body[split..], "```rust\nfn main() {\n");
+        assert_eq!(
+            parse_open_fence(&body[split..]),
+            Some(("rust".to_string(), "fn main() {\n".to_string()))
+        );
+    }
+
+    #[test]
+    fn closed_fences_stay_whole() {
+        let body = "```rust\nfn main() {}\n```\n\nafter";
+        assert_eq!(stream_split(body), body.len());
+    }
+
+    #[test]
+    fn fence_without_a_language_or_newline_is_not_a_card() {
+        assert_eq!(parse_open_fence("```"), None);
+        assert_eq!(parse_open_fence("```   \ncode"), None);
+        assert_eq!(
+            parse_open_fence("```text\ncode"),
+            Some(("text".to_string(), "code".to_string()))
+        );
+    }
+
+    #[test]
+    fn dangling_marker_drops_only_when_the_prefix_opened_it() {
+        assert_eq!(strip_dangling_marker("and **", "an **open** bold"), "and ");
+        assert_eq!(strip_dangling_marker("and **", "plain text"), "and **");
+        assert_eq!(strip_dangling_marker("code `", "an `open` span"), "code ");
+        assert_eq!(strip_dangling_marker("tilde ~~", "a ~~strike"), "tilde ");
+    }
 }

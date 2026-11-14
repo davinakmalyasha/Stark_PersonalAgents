@@ -155,6 +155,32 @@ the opaque card (Rune draws grayscale) plus a one-device-pixel baseline
 difference, corrected with Rune's non-layout `.offset(0, 1)` on diff glyphs.
 Code/table bands are dominated by Consolas-vs-Consolas rasterisation at 12–13.5pt.
 
+## Activity trace parity (2026-11-14)
+
+`parity/scenarios/trace/` is a committed, synthetic chat whose assistant row
+carries `metadata.liveTimeline` (reasoning + one completed tool), `isTrace`,
+`duration: "8s"` and a usage chip. It captures the completed "Worked for 8s"
+accordion and the answer/trace split without any real transcript text:
+
+```bash
+python desktop-rune/parity/mock_server.py --port 8125 --scenario trace \
+  --active-chat chat-trace
+STARK_RUNE_BIN=D:/cargo-target/stark/debug/stark-rune.exe \
+  STARK_API_PORT=8125 bash desktop-rune/parity/capture_native.sh \
+  /tmp/trace-native.png 1280x900 "" 4
+python desktop-rune/parity/capture_react.py /tmp/trace-react.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4
+```
+
+The completed divider is the refined full-width `.trace-complete-header`:
+42pt tall, 13pt/500 `#a4a4ad`, a `rgba(255,255,255,.085)` bottom hairline,
+and a 9pt collapsed slot (23pt when open). Like React, a timeline whose last
+segment is a tool leaves `finalText` empty; the answer is owned by the trace,
+not duplicated below it.
+
+Native-only demo routes (`--rune-route stream` / `trace`) render the same
+components without a fixture server for quick visual checks.
+
 ## State scripts
 
 `parity/scripts/*.json` are Rune headless input scripts (`tap`, `wheel`,

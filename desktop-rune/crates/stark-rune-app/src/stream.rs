@@ -1,18 +1,18 @@
 //! Backend run wiring — `POST /api/run` + SSE stream into transcript rows.
 //!
 //! Mirrors `frontend/src/services/api/stream.ts` (`streamPipeline`):
-//! - request body keys: `prompt/model/temperature/workspace_path/chat_id/
-//!   attachments/workspace_kind`.
+//! - request body keys: `prompt/model/temperature/workspace_path/workspace_id/
+//!   chat_id/attachments/workspace_kind`.
 //! - SSE framing: `event:` + `data:` lines, blank-line dispatch, trailing
 //!   buffer flush, `delta/state/done/error/warning/turn_aborted` events.
 //!
-//! Transport (HTTP) stays out: this module parses bytes and mutates
-//! `RuneTranscriptState`, so headless tests replay recorded streams
-//! deterministically. Pure `std` + `serde_json`, no async runtime.
+//! The delta fold lives in [`crate::stream_accum`]; this module only routes
+//! frames and owns the live row's lifecycle.
 
 use serde_json::Value;
 
 use crate::rune_transcript::{RowData, RuneTranscriptState};
+use crate::stream_accum::{Delta, StreamAccum};
 
 /// POST /api/run body. Field names must match `streamPipeline` exactly.
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct RunRequest {
     pub model: String,
     pub temperature: f64,
     pub workspace_path: String,
+    pub workspace_id: String,
     pub chat_id: String,
     pub workspace_kind: String,
 }
@@ -32,6 +33,7 @@ impl RunRequest {
             "model": self.model,
             "temperature": self.temperature,
             "workspace_path": self.workspace_path,
+            "workspace_id": self.workspace_id,
             "chat_id": self.chat_id,
             "attachments": [],
             "workspace_kind": self.workspace_kind,
@@ -74,134 +76,205 @@ pub(crate) fn infer_event(data: &Value) -> String {
 pub const LIVE_ROW_KEY: &str = "live-agent";
 
 fn live_row(state: &mut RuneTranscriptState) -> &mut RowData {
-    if !state.rows.last().is_some_and(|r| r.key == LIVE_ROW_KEY) {
+    if !state
+        .rows
+        .last()
+        .is_some_and(|row| row.key == LIVE_ROW_KEY && row.accum.is_some())
+    {
         state.rows.push(RowData {
             key: LIVE_ROW_KEY.to_string(),
             role: "agent",
-            body: String::new(),
             at: crate::rune_transcript::now_iso(),
+            duration: "active".to_string(),
+            agent_name: "Stark".to_string(),
+            is_streaming: true,
+            accum: Some(StreamAccum::default()),
             ..RowData::default()
         });
     }
-    state.rows.last_mut().expect("live row just pushed")
+    let row = state.rows.last_mut().expect("live row just ensured");
+    if row.accum.is_none() {
+        row.accum = Some(StreamAccum::default());
+        row.is_streaming = true;
+        row.duration = "active".to_string();
+    }
+    row
+}
+
+fn live_accum(state: &mut RuneTranscriptState) -> &mut StreamAccum {
+    live_row(state)
+        .accum
+        .as_mut()
+        .expect("live accumulator ensured")
+}
+
+/// Refresh the row's mirrored live-state fields after a fold. The row owns
+/// the accumulator; these copies are only for cheap rendering/tests.
+fn sync_live(row: &mut RowData) {
+    let Some(acc) = &row.accum else { return };
+    row.retry = acc.retry.clone();
+    row.live_status = acc.status.clone();
+    if !acc.agent.is_empty() {
+        row.agent_name = acc.agent.clone();
+    }
 }
 
 /// Apply one frame to the transcript. Returns a short human status for tests.
 pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'static str {
     match frame.event.as_str() {
+        // Internal frame from the chat-create step. The real id replaces the
+        // locally minted one before `/api/run` starts.
+        "chat" => {
+            let id = frame
+                .data
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if !id.is_empty() {
+                state.chat_id = id.to_string();
+                state.chat_ready = true;
+            }
+            if let Some(workspace) = frame.data.get("workspace_id").and_then(Value::as_str) {
+                if !workspace.is_empty() {
+                    state.workspace_id = workspace.to_string();
+                }
+            }
+            "chat"
+        }
         "delta" => {
+            // Late frames after the terminal event must not resurrect a
+            // finished live row (React's `settled` runs no further UI work).
+            if !state.live {
+                return "ignored";
+            }
             let kind = frame.data.get("kind").and_then(Value::as_str).unwrap_or("");
-            let text = frame.data.get("text").and_then(Value::as_str).unwrap_or("");
+            if kind == "usage" {
+                let u64_of = |key: &str| frame.data.get(key).and_then(Value::as_u64).unwrap_or(0);
+                let input = u64_of("input");
+                let output = u64_of("output");
+                let hits = {
+                    let hits = u64_of("cached_tokens");
+                    if hits > 0 {
+                        hits
+                    } else {
+                        u64_of("cached")
+                    }
+                };
+                let cost = frame
+                    .data
+                    .get("cost")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                {
+                    let acc = live_accum(state);
+                    acc.usage.add(input, output, hits, cost);
+                }
+                let u = &mut state.usage;
+                u.input += input;
+                u.output += output;
+                u.cache_hit += hits;
+                u.cost += cost;
+                u.active = input;
+                u.calls.push(crate::rune_transcript::UsageCall {
+                    agent: "chat".to_string(),
+                    model: state.model.clone(),
+                    input,
+                    output,
+                    hits,
+                    misses: input.saturating_sub(hits),
+                    cost,
+                    at: crate::rune_transcript::now_iso(),
+                });
+                state.live = true;
+                if let Some(row) = state.rows.last_mut() {
+                    sync_live(row);
+                }
+                return "metered";
+            }
+            let delta = Delta::from_value(&frame.data);
+            {
+                let acc = live_accum(state);
+                let mut rate = std::mem::take(&mut acc.rate);
+                acc.apply(&mut rate, &delta, crate::clock::now_millis());
+                acc.rate = rate;
+            }
+            if let Some(row) = state.rows.last_mut() {
+                sync_live(row);
+            }
+            state.live = true;
             match kind {
-                "text" | "reasoning" => {
-                    live_row(state).body.push_str(text);
-                    state.live = true;
-                    "streaming"
-                }
-                // Token usage (`TokenUsageRecord` → `delta kind:"usage"`):
-                // totals feed the dock orb + popover (`combinedTokenUsage`).
-                "usage" => {
-                    let u64_of = |k: &str| frame.data.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-                    let input = u64_of("input");
-                    let output = u64_of("output");
-                    let hits = frame
-                        .data
-                        .get("cached_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let cost = frame
-                        .data
-                        .get("cost")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let u = &mut state.usage;
-                    u.input += input;
-                    u.output += output;
-                    u.cache_hit += hits;
-                    u.cost += cost;
-                    u.active = input;
-                    u.calls.push(crate::rune_transcript::UsageCall {
-                        agent: "chat".to_string(),
-                        model: state.model.clone(),
-                        input,
-                        output,
-                        hits,
-                        misses: input.saturating_sub(hits),
-                        cost,
-                        at: crate::rune_transcript::now_iso(),
-                    });
-                    state.live = true;
-                    "metered"
-                }
-                "tool_started" => {
-                    let tool = frame
-                        .data
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool");
-                    state.rows.push(RowData {
-                        key: format!("tool-{}-{}", state.rows.len(), tool),
-                        role: "system",
-                        body: format!("running {tool}…"),
-                        at: crate::rune_transcript::now_iso(),
-                        ..RowData::default()
-                    });
-                    "tool"
-                }
-                "tool_finished" => {
-                    let tool = frame
-                        .data
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool");
-                    let ok = frame
-                        .data
-                        .get("ok")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    state.rows.push(RowData {
-                        key: format!("tool-{}-{}", state.rows.len(), tool),
-                        role: if ok { "system" } else { "error" },
-                        body: if ok {
-                            format!("{tool} done")
-                        } else {
-                            format!("{tool} failed")
-                        },
-                        at: crate::rune_transcript::now_iso(),
-                        ..RowData::default()
-                    });
-                    "tool"
-                }
+                "text" | "reasoning" => "streaming",
+                "tool_started" | "tool_finished" => "tool",
+                "status" => "status",
+                "end" => "end",
                 _ => "ignored",
             }
         }
         "state" => {
-            if let Some(err) = frame.data.get("error").and_then(Value::as_str) {
-                live_row(state).body = format!("Run failed: {err}");
-                state.live = false;
+            if !state.live {
+                return "ignored";
+            }
+            {
+                let acc = live_accum(state);
+                if let Some(report) = frame
+                    .data
+                    .get("outputs")
+                    .and_then(|v| v.get("agent_report"))
+                    .and_then(Value::as_str)
+                {
+                    acc.report = report.to_string();
+                }
+                if let Some(usage) = frame.data.get("token_usage") {
+                    acc.usage_json = Some(usage.clone());
+                    acc.usage = crate::stream_accum::RunUsage::from_json(usage);
+                }
+                if let Some(artifacts) = frame.data.get("artifacts") {
+                    acc.artifacts = Some(artifacts.clone());
+                }
+                if let Some(error) = frame.data.get("error").and_then(Value::as_str) {
+                    acc.state_error = Some(error.to_string());
+                }
+            }
+            if let Some(error) = frame.data.get("error").and_then(Value::as_str) {
+                crate::rune_transcript::finalize_run(state, Some(error.to_string()), false);
                 return "failed";
+            }
+            if let Some(row) = state.rows.last_mut() {
+                sync_live(row);
             }
             state.live = true;
             "state"
         }
         "done" => {
-            // Mirrors `streamPipeline`: `status === 'error'` fails the run
-            // instead of landing it clean.
+            // Abort already persisted the partial; wait for the backend's
+            // marker, then refresh history once.
+            if state.aborting {
+                state.live = false;
+                state.aborting = false;
+                state.refresh_chat = Some((state.workspace_id.clone(), state.chat_id.clone()));
+                return "done";
+            }
             if frame.data.get("status").and_then(Value::as_str) == Some("error") {
-                let msg = frame
+                let message = frame
                     .data
                     .get("error")
                     .and_then(Value::as_str)
-                    .unwrap_or("The agent pipeline failed.");
-                live_row(state).body = msg.to_string();
-                live_row(state).role = "error";
-                state.live = false;
+                    .unwrap_or("The agent pipeline failed.")
+                    .to_string();
+                crate::rune_transcript::finalize_run(state, Some(message), false);
                 return "failed";
             }
-            state.live = false;
+            crate::rune_transcript::finalize_run(state, None, false);
             "done"
         }
         "error" => {
+            if state.aborting {
+                state.live = false;
+                state.aborting = false;
+                state.refresh_chat = Some((state.workspace_id.clone(), state.chat_id.clone()));
+                return "failed";
+            }
             let msg = frame
                 .data
                 .get("message")
@@ -209,16 +282,13 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                 .and_then(Value::as_str)
                 .unwrap_or("The agent pipeline failed.");
             // A locked server (HTTP 401) is not a dead backend: it wants
-            // pairing (`PairingGate.tsx`, same status). Say so instead of
-            // showing a bare transport error.
-            live_row(state).body = if crate::transport::is_locked_error(msg) {
+            // pairing (`PairingGate.tsx`, same status).
+            let msg = if crate::transport::is_locked_error(msg) {
                 "Server locked (401): approve this device from the desktop host, then retry."
-                    .to_string()
             } else {
-                msg.to_string()
+                msg
             };
-            live_row(state).role = "error";
-            state.live = false;
+            crate::rune_transcript::finalize_run(state, Some(msg.to_string()), false);
             "failed"
         }
         "warning" | "turn_aborted" => "noted",
@@ -230,7 +300,7 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
 pub fn replay(state: &mut RuneTranscriptState, text: &str) -> Vec<&'static str> {
     parse_sse_stream(text)
         .iter()
-        .map(|f| apply_frame(state, f))
+        .map(|frame| apply_frame(state, frame))
         .collect()
 }
 
@@ -249,6 +319,7 @@ mod tests {
             model: "Automatic Fallback".to_string(),
             temperature: 0.7,
             workspace_path: "D:/x".to_string(),
+            workspace_id: "_general".to_string(),
             chat_id: "c1".to_string(),
             workspace_kind: "general".to_string(),
         };
@@ -258,6 +329,7 @@ mod tests {
             "model",
             "temperature",
             "workspace_path",
+            "workspace_id",
             "chat_id",
             "attachments",
             "workspace_kind",
@@ -282,12 +354,13 @@ mod tests {
         let n = s.rows.len();
         let statuses = replay(
             &mut s,
-            "event: delta\ndata: {\"kind\":\"text\",\"text\":\"42\"}\n\nevent: delta\ndata: {\"kind\":\"reasoning\",\"text\":\"…\"}\n\nevent: done\ndata: {\"status\":\"ok\"}\n\n",
+            "event: chat\ndata: {\"id\":\"real-chat\"}\n\nevent: delta\ndata: {\"kind\":\"text\",\"text\":\"42\"}\n\nevent: done\ndata: {\"status\":\"ok\"}\n\n",
         );
-        assert_eq!(statuses, vec!["streaming", "streaming", "done"]);
+        assert_eq!(statuses, vec!["chat", "streaming", "done"]);
         assert_eq!(s.rows.len(), n + 1);
-        assert_eq!(s.rows.last().unwrap().body, "42…");
+        assert_eq!(s.rows.last().unwrap().body, "42");
         assert!(!s.live);
+        assert!(s.rows.last().unwrap().final_text == "42");
     }
 
     #[test]
@@ -306,12 +379,87 @@ mod tests {
         s.live = true;
         let statuses = replay(
             &mut s,
-            "event: done\ndata: {\"status\":\"error\",\"error\":\"pipeline blew up\"}\n\n",
+            "event: delta\ndata: {\"kind\":\"text\",\"text\":\"partial\"}\n\nevent: done\ndata: {\"status\":\"error\",\"error\":\"pipeline blew up\"}\n\n",
         );
-        assert_eq!(statuses, vec!["failed"]);
+        assert_eq!(statuses, vec!["streaming", "failed"]);
         assert!(!s.live);
+        let last = s.rows.last().unwrap();
+        assert_eq!(last.role, "error");
+        assert_eq!(last.body, "pipeline blew up");
+    }
+
+    #[test]
+    fn completion_freezes_timeline_and_queues_metadata() {
+        let mut s = state();
+        s.run_started_ms = Some(crate::clock::monotonic_millis() - 1250.0);
+        s.live = true;
+        let statuses = replay(
+            &mut s,
+            "event: delta\ndata: {\"kind\":\"reasoning\",\"text\":\"think\"}\n\nevent: delta\ndata: {\"kind\":\"tool_started\",\"tool\":\"grep\",\"args\":\"{\\\"pattern\\\":\\\"x\\\"}\"}\n\nevent: delta\ndata: {\"kind\":\"tool_finished\",\"tool\":\"grep\",\"ok\":true,\"ms\":4,\"text\":\"found\"}\n\nevent: delta\ndata: {\"kind\":\"text\",\"text\":\"answer\"}\n\nevent: delta\ndata: {\"kind\":\"usage\",\"input\":10,\"output\":2}\n\nevent: done\ndata: {\"status\":\"complete\"}\n\n",
+        );
+        assert_eq!(statuses.last(), Some(&"done"));
+        let row = s.rows.last().unwrap();
+        assert_eq!(row.body, "answer");
+        assert_eq!(row.activity.len(), 2);
+        assert_eq!(row.duration, "1s");
+        assert!(row.show_trace);
+        assert!(row.has_usage);
+        assert_eq!(row.tokens_in, 10);
+        assert_eq!(row.tokens_out, 2);
+        assert_eq!(s.pending_saves.len(), 1);
+        let save = &s.pending_saves[0];
+        assert_eq!(save.role, "agent");
+        assert_eq!(save.metadata["duration"], serde_json::json!("1s"));
+        assert_eq!(save.metadata["thinking"], serde_json::json!("think"));
+        assert_eq!(
+            save.metadata["liveTimeline"].as_array().map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(save.metadata["usage"]["total_input_tokens"], 10);
+    }
+
+    #[test]
+    fn persisted_round_trip_matches_the_live_presentation() {
+        let mut s = state();
+        s.run_started_ms = Some(crate::clock::monotonic_millis() - 800.0);
+        s.live = true;
+        replay(
+            &mut s,
+            "event: delta\ndata: {\"kind\":\"reasoning\",\"text\":\"plan\"}\n\nevent: delta\ndata: {\"kind\":\"tool_started\",\"tool\":\"read\",\"args\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}\n\nevent: delta\ndata: {\"kind\":\"tool_finished\",\"tool\":\"read\",\"ok\":true,\"ms\":3,\"text\":\"ok\"}\n\nevent: delta\ndata: {\"kind\":\"text\",\"text\":\"done\"}\n\nevent: done\ndata: {\"status\":\"complete\"}\n\n",
+        );
+        let live = s.rows.last().unwrap().clone();
+        let save = s.pending_saves[0].clone();
+        let payload = serde_json::json!({"messages": [{
+            "id": "persisted",
+            "role": "assistant",
+            "content": save.content,
+            "timestamp": "2026-11-12T12:00:00Z",
+            "metadata": save.metadata
+        }]});
+        let parsed = crate::chats::parse_messages(&payload);
+        assert_eq!(parsed[0].body, live.body);
+        assert_eq!(parsed[0].final_text, live.final_text);
+        assert_eq!(parsed[0].activity, live.activity);
+        assert_eq!(parsed[0].duration, live.duration);
+        assert_eq!(parsed[0].tokens_in, live.tokens_in);
+        assert_eq!(parsed[0].tokens_out, live.tokens_out);
+    }
+
+    #[test]
+    fn error_after_partial_persists_agent_then_error() {
+        let mut s = state();
+        s.live = true;
+        let statuses = replay(
+            &mut s,
+            "event: delta\ndata: {\"kind\":\"text\",\"text\":\"partial\"}\n\nevent: error\ndata: {\"message\":\"boom\"}\n\n",
+        );
+        assert_eq!(statuses.last(), Some(&"failed"));
         assert_eq!(s.rows.last().unwrap().role, "error");
-        assert_eq!(s.rows.last().unwrap().body, "pipeline blew up");
+        assert_eq!(s.rows.last().unwrap().body, "boom");
+        assert_eq!(s.pending_saves.len(), 2);
+        assert_eq!(s.pending_saves[0].role, "agent");
+        assert_eq!(s.pending_saves[0].metadata["stopped"], true);
+        assert_eq!(s.pending_saves[1].role, "error");
     }
 
     #[test]
@@ -352,11 +500,17 @@ mod tests {
     fn stage_abort_drops_live_but_keeps_inbox() {
         use crate::rune_transcript::stage_abort;
         let mut s = state();
+        s.rows.push(RowData {
+            key: LIVE_ROW_KEY.to_string(),
+            role: "agent",
+            is_streaming: true,
+            accum: Some(StreamAccum::default()),
+            ..RowData::default()
+        });
         s.live = true;
-        // Empty chat id: the abort POST is a guarded no-op, but the local
-        // run still detaches deterministically (no network in tests).
         stage_abort(&mut s);
         assert!(!s.live);
+        assert!(s.aborting);
         // Idempotent: a dead run stays dead.
         stage_abort(&mut s);
         assert!(!s.live);

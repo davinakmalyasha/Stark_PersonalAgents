@@ -42,8 +42,17 @@ pub mod shell;
 #[path = "stream.rs"]
 pub mod stream;
 #[cfg(feature = "rune-real")]
+#[path = "stream_accum.rs"]
+pub mod stream_accum;
+#[cfg(feature = "rune-real")]
+#[path = "stream_presentation.rs"]
+pub mod stream_presentation;
+#[cfg(feature = "rune-real")]
 #[path = "token_stats.rs"]
 pub mod token_stats;
+#[cfg(feature = "rune-real")]
+#[path = "tool_labels.rs"]
+pub mod tool_labels;
 #[cfg(feature = "rune-real")]
 #[path = "transport.rs"]
 pub mod transport;

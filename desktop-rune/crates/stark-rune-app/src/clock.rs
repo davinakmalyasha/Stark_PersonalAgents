@@ -133,6 +133,23 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// Monotonic millis for run durations. Unlike [`now_millis`] this is never
+/// frozen by the parity clock, so a staged run still measures real elapsed
+/// time in headless tests.
+pub fn monotonic_millis() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

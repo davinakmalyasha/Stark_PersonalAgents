@@ -181,7 +181,7 @@ pub struct CardLayoutMeta {
 
 /// Server message → transcript row (`assistant` already normalized to
 /// `agent` on parse; anything not user/error renders as agent).
-fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcript::RowData {
+pub(crate) fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcript::RowData {
     crate::rune_transcript::RowData {
         key: r.key.clone(),
         role: match r.role.as_str() {
@@ -190,14 +190,29 @@ fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcript::RowDat
             _ => "agent",
         },
         body: r.body.clone(),
+        raw_body: r.raw_body.clone(),
         at: r.at.clone(),
         duration: r.duration.clone(),
         show_trace: r.show_trace,
         hide_body: r.hide_body,
         event: r.event.clone(),
+        event_tokens_before: r.event_tokens_before,
+        event_input: r.event_input,
+        event_output: r.event_output,
         has_usage: r.has_usage,
         tokens_in: r.tokens_in,
         tokens_out: r.tokens_out,
+        agent_name: r.agent_name.clone(),
+        timeline: r.timeline.clone(),
+        activity: r.activity.clone(),
+        final_text: r.final_text.clone(),
+        thinking: r.thinking.clone(),
+        steps: r.steps.clone(),
+        stopped: r.stopped,
+        retry: r.retry.clone(),
+        live_status: r.live_status.clone(),
+        run_usage: r.run_usage.clone(),
+        ..crate::rune_transcript::RowData::default()
     }
 }
 
@@ -644,17 +659,20 @@ impl CanvasState {
     }
 
     /// Fill one card's transcript from a per-chat history fetch.
-    pub fn apply_chat_messages(&mut self, key: &str, rows: &[crate::chats::ChatMsgRow]) {
+    pub fn apply_chat_messages(&mut self, key: &str, rows: &[crate::chats::ChatMsgRow]) -> bool {
         let card_id = format!("chat:{key}");
         let Some(thread) = self.sessions.threads.get_mut(&card_id) else {
-            return;
+            return false;
         };
         thread.rows = rows.iter().map(row_from_chat).collect();
         thread.live = false;
+        thread.aborting = false;
         if let Some((ws, chat)) = key.split_once(':') {
-            let _ = ws;
+            thread.workspace_id = ws.to_string();
             thread.chat_id = chat.to_string();
+            thread.chat_ready = true;
         }
+        true
     }
 
     /// Open a real chat from the sidebar: add it as a tab, place it with the
@@ -675,7 +693,9 @@ impl CanvasState {
             let title = card.title.clone();
             let thread = self.thread_mut(&card_id);
             thread.title = title;
+            thread.workspace_id = workspace_id.to_string();
             thread.chat_id = chat_id.to_string();
+            thread.chat_ready = true;
             thread.rows.clear();
             thread.live = false;
         }
@@ -789,6 +809,15 @@ impl CanvasState {
             thread.rows = Vec::new();
             thread.live = false;
             thread.chat_id = crate::notes::mint_id("rune-chat");
+            if let Some(key) = id.strip_prefix("chat:") {
+                if let Some((ws, chat)) = key.split_once(':') {
+                    thread.workspace_id = ws.to_string();
+                    thread.chat_id = chat.to_string();
+                    thread.chat_ready = !(chat.starts_with("local")
+                        || chat.starts_with("rune-chat")
+                        || chat.starts_with("rune"));
+                }
+            }
             self.sessions.threads.insert(id.to_string(), thread);
             if !self.sessions.order.contains(&id.to_string()) {
                 self.sessions.order.push(id.to_string());

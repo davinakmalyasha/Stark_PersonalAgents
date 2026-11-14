@@ -599,7 +599,7 @@ pub struct ComposerButtons<S: 'static> {
 
 pub fn composer_card<S: 'static>(
     edit: &TextEdit,
-    edit_of: impl for<'a> Fn(&'a mut S) -> &'a mut TextEdit + 'static,
+    edit_of: std::rc::Rc<dyn for<'a> Fn(&'a mut S) -> &'a mut TextEdit>,
     voice: (bool, f32, Option<&str>),
     running: bool,
     meta: ComposerMeta<'_>,
@@ -610,6 +610,40 @@ pub fn composer_card<S: 'static>(
         let on_send = buttons.send.clone();
         move |s: &mut S, _tx: &mut Tx| on_send(s)
     };
+    let key_edit = edit_of.clone();
+    let key_send = buttons.send.clone();
+    let input = text_input(edit, {
+        // `.prompt-input`: 15px at line-height 1.55, padding 3px top.
+        let mut style = rune::tok::TextStyle::new(15.0, 400.0);
+        style.line_height = 15.0 * 1.55;
+        style
+    })
+    .key("composer-input")
+    .w_full()
+    .pt(3.0)
+    .pb(8.0)
+    .placeholder(
+        if voice_live {
+            "Listening…"
+        } else {
+            "Ask anything"
+        },
+        ink("#74747deb"),
+    )
+    .caret(ink("#f2f2f4"), ink("#3b82f6"))
+    .on_edit(move |s: &mut S| edit_of(s))
+    .on_input_key(move |s: &mut S, key: &rune::KeyEvent, _tx: &mut Tx| {
+        if key.key != rune::Key::Enter || key.mods.shift {
+            return false;
+        }
+        // A composition's Return belongs to the input method.
+        if key_edit(s).preedit.is_some() {
+            return false;
+        }
+        key_send(s);
+        true
+    })
+    .on_submit(submit);
     // Send / Stop (`.send-button`): violet when a prompt is staged, white at
     // 72% while empty+idle, rose while running an empty prompt.
     let has_text = !edit.text.trim().is_empty();
@@ -706,29 +740,7 @@ pub fn composer_card<S: 'static>(
                 .px(12.0)
                 .pt(10.0)
                 .pb(4.0)
-                .child(
-                    text_input(edit, {
-                        // `.prompt-input`: 15px at line-height 1.55, padding 3px top.
-                        let mut style = rune::tok::TextStyle::new(15.0, 400.0);
-                        style.line_height = 15.0 * 1.55;
-                        style
-                    })
-                    .key("composer-input")
-                    .w_full()
-                    .h(40.0)
-                    .pt(3.0)
-                    .placeholder(
-                        if voice_live {
-                            "Listening…"
-                        } else {
-                            "Ask anything"
-                        },
-                        ink("#74747deb"),
-                    )
-                    .caret(ink("#f2f2f4"), ink("#3b82f6"))
-                    .on_edit(edit_of)
-                    .on_submit(submit),
-                ),
+                .child(rune::auto_grow(input, 1, 8).min_h(40.0).max_h(180.0)),
         )
         .child(
             col()

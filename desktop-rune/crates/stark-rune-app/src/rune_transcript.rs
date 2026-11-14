@@ -20,6 +20,12 @@ use std::borrow::Cow;
 use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
 use stark_kit::transcript::{TranscriptRow, ESTIMATED_ROW_H};
 
+use crate::stream_accum::{
+    RetryNotice, RunStatusNotice, RunUsage, StreamAccum, StreamSegment, TraceStep,
+};
+
+#[path = "rune_transcript/activity.rs"]
+mod activity;
 #[path = "rune_transcript/md_render.rs"]
 mod md_render;
 
@@ -29,6 +35,9 @@ pub struct RowData {
     pub key: String,
     pub role: &'static str,
     pub body: String,
+    /// Persisted `content` before `presentStream` moved text into the
+    /// timeline (MessageStream dedupe/rail read the raw message).
+    pub raw_body: String,
     /// ISO-8601 creation stamp (`CanvasChatBubble clock()` renders it as
     /// `hh:MM AM/PM` in the bubble foot). Empty for scene fixtures.
     pub at: String,
@@ -38,11 +47,43 @@ pub struct RowData {
     pub hide_body: bool,
     /// `metadata.kind` for `SessionEventDivider`: `"aborted"` or `"compaction"`.
     pub event: String,
+    /// Compaction token metadata (`SessionEventDivider`).
+    pub event_tokens_before: u64,
+    pub event_input: u64,
+    pub event_output: u64,
     /// `metadata.usage` present: React shows the token/time footer only then.
     pub has_usage: bool,
     /// `metadata.usage.total_input_tokens` / `total_output_tokens`.
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Live agent name (`streaming.agent || getAssistantName()`).
+    pub agent_name: String,
+    /// The row is the active run: timeline inline, no completed trace shell.
+    pub is_streaming: bool,
+    /// `metadata.stopped` — "Stopped — partial response kept".
+    pub stopped: bool,
+    /// Persisted `metadata.liveTimeline`, or the live accumulator's segments.
+    pub timeline: Vec<StreamSegment>,
+    /// `presentStream(...).activitySegments` cached for persisted rows.
+    pub activity: Vec<StreamSegment>,
+    /// `presentStream(...).finalText` cached for persisted rows.
+    pub final_text: String,
+    /// `metadata.thinking`, used as a reasoning segment when no timeline exists.
+    pub thinking: String,
+    /// Legacy `metadata.steps`.
+    pub steps: Vec<TraceStep>,
+    /// Completed "Worked for …" accordion open.
+    pub trace_open: bool,
+    /// Per-tool-group open state. Absence means React's default.
+    pub tool_open: std::collections::HashMap<String, bool>,
+    /// Live fold owned by the row (never duplicated in app state).
+    pub accum: Option<StreamAccum>,
+    /// Ephemeral reconnect notice while streaming.
+    pub retry: Option<RetryNotice>,
+    /// Compaction / context notice while streaming.
+    pub live_status: Option<RunStatusNotice>,
+    /// Current run's tokens, persisted into `metadata.usage`.
+    pub run_usage: Option<RunUsage>,
 }
 
 /// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
@@ -581,6 +622,21 @@ pub struct RuneTranscriptState {
     /// mirrors the React `chat.id` both `streamPipeline` and `abortRun`
     /// carry. Empty until the first send stages one.
     pub chat_id: String,
+    /// Real workspace id (`_general`, `_personal`, or a project id).
+    pub workspace_id: String,
+    /// `chat_id` names a chat that exists server-side. Canvas-opened chats
+    /// start true; the home thread creates one before its first send.
+    pub chat_ready: bool,
+    /// Monotonic start of the active run (duration uses `Math.round(ms/1000)`).
+    pub run_started_ms: Option<f64>,
+    /// Abort requested: deltas are ignored until the terminal frame.
+    pub aborting: bool,
+    /// Completed/partial messages waiting for the ChatStore writer.
+    pub pending_saves: Vec<crate::chats::ChatSave>,
+    /// Refresh this chat after an aborted turn settles.
+    pub refresh_chat: Option<(String, String)>,
+    /// Jump-to-latest pill opacity (`on_scroll_offset` writes it live).
+    pub scroll_pill: rune::Live<f32>,
     /// Sticky notes for this thread (chat scope, like `ChatView.tsx`).
     pub notes: crate::notes::NotesState,
     /// Run target (`PromptDock runTarget`, persisted per chat — here per
@@ -639,6 +695,9 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("api_host", &self.api_host)
             .field("api_port", &self.api_port)
             .field("chat_id", &self.chat_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("chat_ready", &self.chat_ready)
+            .field("aborting", &self.aborting)
             .field("notes", &self.notes.notes.len())
             .field("run_target", &self.run_target)
             .field("usage", &self.usage)
@@ -663,6 +722,13 @@ impl Clone for RuneTranscriptState {
             api_host: self.api_host.clone(),
             api_port: self.api_port,
             chat_id: self.chat_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            chat_ready: self.chat_ready,
+            run_started_ms: self.run_started_ms,
+            aborting: self.aborting,
+            pending_saves: Vec::new(),
+            refresh_chat: self.refresh_chat.clone(),
+            scroll_pill: self.scroll_pill.clone(),
             notes: self.notes.clone(),
             run_target: self.run_target.clone(),
             usage: self.usage.clone(),
@@ -733,6 +799,13 @@ impl RuneTranscriptState {
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: api_port(),
             chat_id: crate::notes::mint_id("rune"),
+            workspace_id: "_general".to_string(),
+            chat_ready: false,
+            run_started_ms: None,
+            aborting: false,
+            pending_saves: Vec::new(),
+            refresh_chat: None,
+            scroll_pill: rune::Live::new(0.0),
             notes: crate::notes::NotesState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
@@ -788,6 +861,13 @@ impl RuneTranscriptState {
             api_host: DEFAULT_API_HOST.to_string(),
             api_port: api_port(),
             chat_id: crate::notes::mint_id("rune"),
+            workspace_id: "_general".to_string(),
+            chat_ready: false,
+            run_started_ms: None,
+            aborting: false,
+            pending_saves: Vec::new(),
+            refresh_chat: None,
+            scroll_pill: rune::Live::new(0.0),
             notes: crate::notes::NotesState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
@@ -809,6 +889,144 @@ impl RuneTranscriptState {
             copied_at: None,
             expanded_diffs: std::collections::HashSet::new(),
         }
+    }
+
+    /// Parity scene: a live run mid-tool (reasoning + running/finished tool +
+    /// answer-status note), so the activity timeline is screenshot-testable
+    /// without a server.
+    pub fn stream_demo() -> Self {
+        let mut state = Self::screenshot();
+        state.title = "Stream".to_string();
+        state.live = true;
+        state.chat_id = "stream-demo".to_string();
+        state.chat_ready = true;
+        let mut accum = StreamAccum {
+            agent: "Orchestrator".to_string(),
+            ..StreamAccum::default()
+        };
+        let mut rate = crate::stream_accum::RateAccum::default();
+        accum.apply(
+            &mut rate,
+            &crate::stream_accum::Delta {
+                kind: "reasoning".to_string(),
+                text: "I should inspect the current player state first.".to_string(),
+                agent: Some("Orchestrator".to_string()),
+                ..crate::stream_accum::Delta::default()
+            },
+            1,
+        );
+        accum.apply(
+            &mut rate,
+            &crate::stream_accum::Delta {
+                kind: "tool_started".to_string(),
+                tool: Some("grep".to_string()),
+                args: Some(r#"{"pattern":"Cinnamon Girl","path":"music/"}"#.to_string()),
+                agent: Some("Orchestrator".to_string()),
+                ..crate::stream_accum::Delta::default()
+            },
+            2,
+        );
+        accum.apply(
+            &mut rate,
+            &crate::stream_accum::Delta {
+                kind: "tool_finished".to_string(),
+                tool: Some("grep".to_string()),
+                ok: Some(true),
+                ms: Some(42),
+                text: "music/player.rs:88: Cinnamon Girl".to_string(),
+                agent: Some("Orchestrator".to_string()),
+                ..crate::stream_accum::Delta::default()
+            },
+            3,
+        );
+        accum.apply(
+            &mut rate,
+            &crate::stream_accum::Delta {
+                kind: "text".to_string(),
+                text: "Playing **Cinnamon Girl** in your YouTube tab now — the track is at 04:48."
+                    .to_string(),
+                agent: Some("Orchestrator".to_string()),
+                ..crate::stream_accum::Delta::default()
+            },
+            4,
+        );
+        state.rows = vec![
+            RowData {
+                key: "stream-user".to_string(),
+                role: "user",
+                body: "play that in the current youtube tab".to_string(),
+                at: "2026-11-12T12:00:00Z".to_string(),
+                ..RowData::default()
+            },
+            RowData {
+                key: "stream-live".to_string(),
+                role: "agent",
+                at: "2026-11-12T12:00:04Z".to_string(),
+                duration: "active".to_string(),
+                agent_name: "Orchestrator".to_string(),
+                is_streaming: true,
+                accum: Some(accum),
+                ..RowData::default()
+            },
+        ];
+        state
+    }
+
+    /// Parity scene: a completed row with the trace accordion open.
+    pub fn trace_demo() -> Self {
+        let mut state = Self::screenshot();
+        state.title = "Trace".to_string();
+        state.live = false;
+        let reasoning = StreamSegment::Reasoning {
+            text: "I checked the player state before answering.".to_string(),
+            agent: Some("Orchestrator".to_string()),
+        };
+        let tool = StreamSegment::Tool {
+            ev: crate::stream_accum::LiveToolEvent {
+                id: "trace-tool".to_string(),
+                name: "grep".to_string(),
+                args: Some(r#"{"pattern":"Cinnamon Girl","path":"music/"}"#.to_string()),
+                status: crate::stream_accum::ToolStatus::Done,
+                ok: Some(true),
+                ms: Some(42),
+                preview: Some("music/player.rs:88: Cinnamon Girl".to_string()),
+                agent: Some("Orchestrator".to_string()),
+                children: Vec::new(),
+            },
+        };
+        let answer = "Playing **Cinnamon Girl** in your YouTube tab now — the track is at 04:48.";
+        state.rows = vec![
+            RowData {
+                key: "trace-user".to_string(),
+                role: "user",
+                body: "play that in the current youtube tab".to_string(),
+                at: "2026-11-12T12:00:00Z".to_string(),
+                ..RowData::default()
+            },
+            RowData {
+                key: "trace-agent".to_string(),
+                role: "agent",
+                body: answer.to_string(),
+                at: "2026-11-12T12:00:08Z".to_string(),
+                duration: "8s".to_string(),
+                agent_name: "Orchestrator".to_string(),
+                show_trace: true,
+                trace_open: true,
+                timeline: vec![reasoning.clone(), tool.clone()],
+                activity: vec![reasoning, tool],
+                final_text: answer.to_string(),
+                has_usage: true,
+                tokens_in: 1240,
+                tokens_out: 86,
+                run_usage: Some(RunUsage {
+                    input: 1240,
+                    output: 86,
+                    ..RunUsage::default()
+                }),
+                ..RowData::default()
+            },
+        ];
+        state
     }
 
     pub fn transcript_rows(&self) -> Vec<TranscriptRow> {
@@ -869,10 +1087,37 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
     stage_send_prompt(s, prompt);
 }
 
+/// React `chat.title` for a fresh conversation: first 32 chars + ellipsis.
+fn chat_title(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    let head: String = trimmed.chars().take(32).collect();
+    let head = if head.is_empty() {
+        "New Conversation".to_string()
+    } else {
+        head
+    };
+    if trimmed.chars().count() > 32 {
+        format!("{head}...")
+    } else {
+        head
+    }
+}
+
+impl RuneTranscriptState {
+    /// `workspaceKind` sent with `/api/run` (deterministic routing).
+    pub fn workspace_kind(&self) -> String {
+        match self.workspace_id.as_str() {
+            "_house" => "house".to_string(),
+            "_personal" => "personal".to_string(),
+            _ => "general".to_string(),
+        }
+    }
+}
+
 /// Stage an explicit prompt (map dock sends land here with the dock's text).
 pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
     let prompt = prompt.trim().to_string();
-    if prompt.is_empty() {
+    if prompt.is_empty() || s.live || s.aborting {
         return;
     }
     let n = s.rows.len();
@@ -883,20 +1128,39 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
         at: now_iso(),
         ..RowData::default()
     });
+    // Show the live bubble immediately (React appends `house-live` on send,
+    // before the first delta) with the same Thinking placeholder.
+    s.rows.push(RowData {
+        key: crate::stream::LIVE_ROW_KEY.to_string(),
+        role: "agent",
+        at: now_iso(),
+        duration: "active".to_string(),
+        agent_name: "Stark".to_string(),
+        is_streaming: true,
+        accum: Some(StreamAccum::default()),
+        ..RowData::default()
+    });
     s.live = true;
-    // The abort path needs the same id the run started with: mint one per
-    // thread on first send (React reuses the persistent `chat.id`).
+    s.aborting = false;
+    s.run_started_ms = Some(crate::clock::monotonic_millis());
+    // The abort path needs the same id the run started with.
     if s.chat_id.trim().is_empty() {
         s.chat_id = crate::notes::mint_id("rune");
+        s.chat_ready = false;
     }
     let req = crate::stream::RunRequest {
         prompt,
         model: s.model.clone(),
         temperature: 0.7,
         workspace_path: String::new(),
+        workspace_id: s.workspace_id.clone(),
         chat_id: s.chat_id.clone(),
-        workspace_kind: "general".to_string(),
+        workspace_kind: s.workspace_kind(),
     };
+    let workspace_id = s.workspace_id.clone();
+    let title = chat_title(&req.prompt);
+    let chat_id = s.chat_id.clone();
+    let ready = s.chat_ready && !chat_id.trim().is_empty();
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
     let (host, port) = (s.api_host.clone(), s.api_port);
@@ -904,36 +1168,258 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
     // into the same inbox the poll hook drains. Same rows, same framing.
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
+        let mut done = false;
         let mut emit = |frame: crate::stream::SseFrame| {
+            if frame.event == "done" {
+                done = true;
+            }
             let _ = tx.send(frame);
         };
+        let mut chat_id = chat_id;
+        if !ready {
+            match crate::transport::create_chat_wasm(&workspace_id, &title).await {
+                Ok(id) => {
+                    let _ = tx.send(crate::stream::SseFrame {
+                        event: "chat".to_string(),
+                        data: serde_json::json!({"id": id, "workspace_id": workspace_id}),
+                    });
+                    chat_id = id;
+                }
+                Err(message) => {
+                    let _ = tx.send(crate::stream::SseFrame {
+                        event: "error".to_string(),
+                        data: serde_json::json!({"message": message}),
+                    });
+                    return;
+                }
+            }
+        }
+        let req = crate::stream::RunRequest { chat_id, ..req };
         crate::transport::post_run_stream(&req, &mut emit).await;
+        if !done {
+            let _ = tx.send(crate::stream::SseFrame {
+                event: "done".to_string(),
+                data: serde_json::json!({"status": "complete"}),
+            });
+        }
         let _ = (host, port);
     });
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
+        let mut chat_id = chat_id;
+        if !ready {
+            match crate::transport::create_chat(&host, port, &workspace_id, &title) {
+                Ok(id) => {
+                    let _ = tx.send(crate::stream::SseFrame {
+                        event: "chat".to_string(),
+                        data: serde_json::json!({"id": id, "workspace_id": workspace_id}),
+                    });
+                    chat_id = id;
+                }
+                Err(message) => {
+                    let _ = tx.send(crate::stream::SseFrame {
+                        event: "error".to_string(),
+                        data: serde_json::json!({"message": message}),
+                    });
+                    return;
+                }
+            }
+        }
+        let req = crate::stream::RunRequest { chat_id, ..req };
+        let mut done = false;
         let mut emit = |frame: crate::stream::SseFrame| {
+            if frame.event == "done" {
+                done = true;
+            }
             let _ = tx.send(frame);
         };
-        if let Err(message) = crate::transport::post_run(&host, port, &req, &mut emit) {
-            let _ = tx.send(crate::stream::SseFrame {
-                event: "error".to_string(),
-                data: serde_json::json!({"message": message}),
-            });
+        match crate::transport::post_run(&host, port, &req, &mut emit) {
+            Ok(_) if !done => {
+                let _ = tx.send(crate::stream::SseFrame {
+                    event: "done".to_string(),
+                    data: serde_json::json!({"status": "complete"}),
+                });
+            }
+            Err(message) => {
+                let _ = tx.send(crate::stream::SseFrame {
+                    event: "error".to_string(),
+                    data: serde_json::json!({"message": message}),
+                });
+            }
+            _ => {}
         }
     });
 }
 
-/// Shared stop path (composer Stop button): `POST /api/abort {chat_id}` on a
-/// worker thread — fire-and-forget like React's `abortRun` from Stop handlers
-/// (fetch-abort alone only detaches this client while the run keeps burning
-/// tokens) — then mark the run dead locally. The inbox stays open so the
-/// backend's `turn_aborted` / `done` frames still land instead of stranding
-/// the live row.
-pub fn stage_abort(s: &mut RuneTranscriptState) {
-    if !s.live {
+fn push_error_row(s: &mut RuneTranscriptState, message: &str) -> String {
+    let key = format!("error-{}-{}", crate::clock::now_millis(), s.rows.len());
+    s.rows.push(RowData {
+        key: key.clone(),
+        role: "error",
+        body: message.to_string(),
+        at: now_iso(),
+        ..RowData::default()
+    });
+    key
+}
+
+fn queue_save(
+    s: &mut RuneTranscriptState,
+    role: &str,
+    content: String,
+    metadata: serde_json::Value,
+) {
+    if s.workspace_id.trim().is_empty() || s.chat_id.trim().is_empty() {
         return;
     }
+    s.pending_saves.push(crate::chats::ChatSave {
+        workspace_id: s.workspace_id.clone(),
+        chat_id: s.chat_id.clone(),
+        role: role.to_string(),
+        content,
+        metadata,
+    });
+}
+
+/// Freeze the live row into a normal agent row and queue its persistence.
+///
+/// - `error`: an inline error follows the partial response (React's `onError`
+///   path persists the partial first, then the error).
+/// - `stopped`: Stop button, `metadata.stopped = true`.
+///
+/// Returns true when an assistant save was queued.
+pub fn finalize_run(s: &mut RuneTranscriptState, error: Option<String>, stopped: bool) -> bool {
+    let Some(index) = s
+        .rows
+        .iter()
+        .rposition(|row| row.accum.is_some() && row.is_streaming)
+    else {
+        if let Some(message) = error {
+            push_error_row(s, &message);
+            queue_save(s, "error", message, serde_json::Value::Null);
+        }
+        s.live = false;
+        s.run_started_ms = None;
+        return false;
+    };
+    let Some(accum) = s.rows[index].accum.take() else {
+        return false;
+    };
+    let has_partial = !accum.text.trim().is_empty()
+        || !accum.reasoning.trim().is_empty()
+        || !accum.segments.is_empty()
+        || !accum.report.trim().is_empty();
+    let is_error = error.is_some();
+    let stopped = stopped || is_error;
+    let content = if !accum.text.trim().is_empty() {
+        accum.text.trim().to_string()
+    } else {
+        accum.report.trim().to_string()
+    };
+    let presentation =
+        crate::stream_presentation::present_stream(&accum.segments, &content, false, &[]);
+    let final_text = presentation.final_text;
+    let activity = presentation.activity;
+    let duration = s.run_started_ms.and_then(|start| {
+        let secs = ((crate::clock::monotonic_millis() - start).max(0.0) / 1000.0).round() as u64;
+        (secs > 0).then(|| format!("{secs}s"))
+    });
+    let run_usage = accum.usage.clone();
+    let tokens_in = run_usage.input;
+    let tokens_out = run_usage.output;
+    let has_usage = accum.usage_json.is_some()
+        || run_usage.input > 0
+        || run_usage.output > 0
+        || run_usage.cache_hit > 0
+        || run_usage.cost > 0.0;
+
+    // An error with no partial output removes the empty placeholder; React's
+    // live bubble disappears and only the error row remains.
+    if is_error && !has_partial {
+        s.rows.remove(index);
+    } else if stopped && !has_partial {
+        // Stop before the first token: no partial message is persisted.
+        s.rows.remove(index);
+    } else {
+        let row = &mut s.rows[index];
+        row.body = final_text.clone();
+        row.raw_body = content.clone();
+        row.final_text = final_text.clone();
+        row.timeline = accum.segments.clone();
+        row.activity = activity.clone();
+        row.show_trace = !activity.is_empty();
+        row.hide_body = final_text.trim().is_empty();
+        row.duration = duration.clone().unwrap_or_default();
+        row.at = now_iso();
+        row.agent_name = if accum.agent.is_empty() {
+            row.agent_name.clone()
+        } else {
+            accum.agent.clone()
+        };
+        row.is_streaming = false;
+        row.stopped = stopped;
+        row.has_usage = has_usage;
+        row.tokens_in = tokens_in;
+        row.tokens_out = tokens_out;
+        row.run_usage = Some(run_usage.clone());
+        row.retry = None;
+        row.live_status = None;
+        row.accum = None;
+    }
+
+    let mut queued = false;
+    if !is_error || has_partial {
+        let mut metadata = serde_json::json!({
+            "isTrace": true,
+            "steps": [],
+        });
+        if has_usage {
+            metadata["usage"] = accum
+                .usage_json
+                .clone()
+                .unwrap_or_else(|| run_usage.to_json());
+        }
+        if let Some(duration) = &duration {
+            metadata["duration"] = serde_json::json!(duration);
+        }
+        if !accum.reasoning.trim().is_empty() {
+            metadata["thinking"] = serde_json::json!(accum.reasoning);
+        }
+        if !accum.segments.is_empty() {
+            metadata["liveTimeline"] = serde_json::Value::Array(
+                accum
+                    .segments
+                    .iter()
+                    .map(crate::stream_accum::segment_to_json)
+                    .collect(),
+            );
+        }
+        if stopped {
+            metadata["stopped"] = serde_json::json!(true);
+        }
+        if let Some(artifacts) = &accum.artifacts {
+            metadata["artifacts"] = artifacts.clone();
+        }
+        queue_save(s, "agent", content, metadata);
+        queued = true;
+    }
+    if let Some(message) = error {
+        push_error_row(s, &message);
+        queue_save(s, "error", message, serde_json::Value::Null);
+    }
+    s.live = false;
+    s.run_started_ms = None;
+    queued
+}
+
+/// Shared stop path (composer Stop button): persist the partial immediately
+/// (React's `handleCancel`), then fire-and-forget `POST /api/abort`.
+pub fn stage_abort(s: &mut RuneTranscriptState) {
+    if !s.live || s.aborting {
+        return;
+    }
+    let _ = finalize_run(s, None, true);
+    s.aborting = true;
     s.live = false;
     let (host, port, chat_id) = (s.api_host.clone(), s.api_port, s.chat_id.clone());
     // Browsers have no TCP sockets: abort over fetch, same as the run itself.
@@ -1009,6 +1495,14 @@ struct HomeRows {
     dividers: Vec<Option<String>>,
 }
 
+fn raw_of(row: &RowData) -> &str {
+    if row.raw_body.is_empty() {
+        &row.body
+    } else {
+        &row.raw_body
+    }
+}
+
 impl HomeRows {
     fn new(rows: &[RowData]) -> Self {
         // `normalizeError`: trim, collapse whitespace, lowercase.
@@ -1020,15 +1514,19 @@ impl HomeRows {
         }
         let errors: Vec<String> = rows
             .iter()
-            .filter(|r| r.role == "error" && !r.body.trim().is_empty())
-            .map(|r| normalize(&r.body))
+            .filter(|r| r.role == "error" && !raw_of(r).trim().is_empty())
+            .map(|r| normalize(raw_of(r)))
             .collect();
         let mut visible = vec![true; rows.len()];
         for (i, r) in rows.iter().enumerate() {
-            if r.role != "agent" || r.body.trim().is_empty() || errors.is_empty() {
+            if crate::stream_presentation::is_internal_transport(raw_of(r)) {
+                visible[i] = false;
                 continue;
             }
-            let text = normalize(&r.body);
+            if r.role != "agent" || raw_of(r).trim().is_empty() || errors.is_empty() {
+                continue;
+            }
+            let text = normalize(raw_of(r));
             if errors.iter().any(|e| e == &text) {
                 visible[i] = false;
                 continue;
@@ -1106,6 +1604,19 @@ fn home_icon_copy(size: f32, color: rune::Color) -> rune::Shape {
         .cubic_to([2.0, 2.9], [2.9, 2.0], [4.0, 2.0])
         .line_to([14.0, 2.0])
         .cubic_to([15.1, 2.0], [16.0, 2.9], [16.0, 4.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `ArrowDown` at a 24-unit box (jump-to-latest pill).
+fn home_icon_arrow_down(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([12.0, 5.0])
+        .line_to([12.0, 19.0])
+        .move_to([19.0, 12.0])
+        .line_to([12.0, 19.0])
+        .line_to([5.0, 12.0]);
     rune::Shape::new()
         .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
         .view_box(24.0, 24.0)
@@ -1274,75 +1785,121 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         .child(actions)
 }
 
-/// Collapsed run divider (`TraceAccordion` complete header): full-width
-/// "Worked for 8s ›" with a bottom hairline, then the 9pt collapsed-body
-/// spacer. The dropdown contents stay closed, exactly like the default UI.
-fn home_trace_header(r: &RowData) -> El {
-    let label = if r.duration.is_empty() {
-        "Worked".to_string()
-    } else {
-        format!("Worked for {}", r.duration)
-    };
-    col()
-        .key(format!("{}-trace", r.key))
-        .w_full()
-        .mt(8.0)
-        .mb(22.0)
-        .child(
-            row()
-                .key(format!("{}-trace-head", r.key))
-                .w_full()
-                .h(42.0)
-                .items_center()
-                .gap(7.0)
-                .border_sides([0.0, 0.0, 1.0, 0.0], home_ink("#ffffff16"))
-                .border_layout()
-                .child(
-                    text(label)
-                        .font({
-                            let mut style = rune::tok::TextStyle::new(13.0, 500.0);
-                            style.line_height = 19.5;
-                            style
-                        })
-                        .color(home_ink("#a4a4ad")),
-                )
-                .child(
-                    rune::el()
-                        .key(format!("{}-trace-chevron", r.key))
-                        .size(14.0, 14.0)
-                        .inert()
-                        .shape({
-                            let p = rune::Path::new()
-                                .move_to([9.0, 6.0])
-                                .line_to([15.0, 12.0])
-                                .line_to([9.0, 18.0]);
-                            rune::Shape::new()
-                                .stroke_path(
-                                    &p,
-                                    crate::lucide_stroke(14.0),
-                                    rune::LineCap::Round,
-                                    home_ink("#71717a"),
-                                )
-                                .view_box(24.0, 24.0)
-                        }),
-                ),
-        )
-        .child(rune::el().key(format!("{}-trace-gap", r.key)).h(9.0))
-}
-
 fn home_agent_row<S: TranscriptHost + 'static>(
     s: &S,
     which: Thread,
     r: &RowData,
     live: bool,
 ) -> El {
-    let mut response =
-        render_body_styled::<S>(s, which, &r.key, &r.body, "#e4e4e7", home_body_style())
-            .pt(12.0)
-            // React's `.agent-message-response` ends after the last block's
-            // own bottom margin (`mb-12`/`mb-20`), not at the final glyph.
-            .pb(md_render::last_margin(&r.body));
-    if live {
+    let streaming = r.is_streaming || (live && r.accum.is_some());
+    let presentation = if let Some(acc) = &r.accum {
+        crate::stream_presentation::present_stream(&acc.segments, &acc.text, true, &[])
+    } else if r.final_text.is_empty() && r.activity.is_empty() {
+        // Seed/demo rows carry only `body` (no cached presentation).
+        crate::stream_presentation::present_stream(&r.timeline, &r.body, false, &[])
+    } else {
+        crate::stream_presentation::Presentation {
+            final_text: r.final_text.clone(),
+            activity: r.activity.clone(),
+        }
+    };
+    let final_text = presentation.final_text;
+    let activity = presentation.activity;
+    let retry = r.accum.as_ref().and_then(|acc| acc.retry.as_ref());
+    let live_status = r.accum.as_ref().and_then(|acc| acc.status.as_ref());
+    let mut group = col()
+        .key(format!("{}-group", r.key))
+        .w_full()
+        .mb(24.0)
+        .hover_group();
+
+    if !r.agent_name.is_empty() {
+        group = group.child(
+            text(r.agent_name.to_uppercase())
+                .key(format!("{}-agent-name", r.key))
+                .font({
+                    let mut style = rune::tok::TextStyle::new(11.0, 700.0);
+                    style.line_height = 16.5;
+                    style.tracking = 0.55;
+                    style
+                })
+                .color(home_ink("#71717a"))
+                .mb(6.0),
+        );
+    }
+
+    if streaming {
+        if let Some(retry) = retry {
+            group = group.child(activity::retry_status(&r.key, retry));
+        }
+        if let Some(status) = live_status {
+            group = group.child(activity::live_compaction_status(&r.key, status));
+        }
+        if !activity.is_empty() {
+            group = group.child(activity::activity_timeline::<S>(
+                s, which, &r.key, &activity, true, r,
+            ));
+        } else if final_text.trim().is_empty() && retry.is_none() {
+            group = group.child(activity::thinking_placeholder(&r.key));
+        }
+        if let Some(cards) = activity::live_delegation_cards(r, &activity) {
+            group = group.child(cards);
+        }
+    } else if r.show_trace {
+        group = group.child(activity::trace_accordion::<S>(s, which, r));
+    }
+
+    if r.stopped && !streaming {
+        group = group.child(activity::stopped_badge(&r.key));
+    }
+
+    if !final_text.trim().is_empty() && !r.hide_body {
+        if !streaming && !activity.is_empty() {
+            group = group.child(
+                text("FINAL RESPONSE".to_string())
+                    .key(format!("{}-kicker", r.key))
+                    .font({
+                        let mut style = rune::tok::TextStyle::new(10.0, 700.0);
+                        style.line_height = 15.0;
+                        style.tracking = 0.8;
+                        style
+                    })
+                    .color(home_ink("#8d9099"))
+                    .mb(5.0),
+            );
+        }
+        let response = if streaming {
+            md_render::render_body_streaming::<S>(
+                s,
+                which,
+                &r.key,
+                &final_text,
+                "#e4e4e7",
+                home_body_style(),
+            )
+        } else {
+            render_body_styled::<S>(s, which, &r.key, &final_text, "#e4e4e7", home_body_style())
+        }
+        .pt(12.0)
+        // React's `.agent-message-response` ends after the last block's
+        // own bottom margin (`mb-12`/`mb-20`), not at the final glyph.
+        .pb(md_render::last_margin(&final_text));
+        group = group.child(response);
+        if streaming {
+            group = group.child(
+                text("▍".to_string())
+                    .key(format!("{}-caret", r.key))
+                    .font(home_body_style())
+                    .color(home_ink("#a78bfa"))
+                    .ml(1.0)
+                    .looping(rune::LoopSpec::opacity(0.9, 0.0, 0.0, 1.0)),
+            );
+        }
+    }
+
+    if live && r.accum.is_none() {
+        // Legacy/demo live row (no accumulator): keep the 3-dot typing
+        // bounce under the visible body, as `canvas-bubble-typing` does.
         let mut dots = row()
             .key(format!("{}-typing", r.key))
             .items_center()
@@ -1358,65 +1915,58 @@ fn home_agent_row<S: TranscriptHost + 'static>(
                     .looping(rune::LoopSpec::opacity(1.1, delay, 0.35, 1.0)),
             );
         }
-        response = response.child(dots);
+        group = group.child(dots);
     }
-    let mono = {
-        let mut style = rune::tok::TextStyle::new(10.5, 400.0).mono();
-        // `.agent-message-footer`: text-[10.5px] at leading 1.5.
-        style.line_height = 15.75;
-        style
-    };
-    let mut footer = row()
-        .key(format!("{}-footer", r.key))
-        .items_center()
-        .gap(12.0)
-        .mt(8.0)
-        .child(
-            text(format!("↑{}", thousands(r.tokens_in)))
-                .key(format!("{}-in", r.key))
-                .font(mono)
-                .color(home_ink("#52525b")),
-        )
-        .child(
-            text(format!("↓{}", thousands(r.tokens_out)))
-                .key(format!("{}-out", r.key))
-                .font(mono)
-                .color(home_ink("#52525b")),
-        );
-    let stamp = clock(&r.at);
-    if !stamp.is_empty() {
-        footer = footer.child(
-            text(stamp)
-                .key(format!("{}-time", r.key))
-                .font(mono)
-                .color(home_ink("#52525b")),
-        );
-    }
-    if !r.duration.is_empty() {
-        footer = footer.child(
-            text(r.duration.clone())
-                .key(format!("{}-duration", r.key))
-                .font(mono)
-                .color(home_ink("#52525b")),
-        );
-    }
-    let mut group = col()
-        .key(format!("{}-group", r.key))
-        .w_full()
-        .mb(24.0)
-        .hover_group();
-    if r.show_trace {
-        group = group.child(home_trace_header(r));
-    }
-    if !r.hide_body {
-        group = group.child(response);
-    }
-    // Per-message chip only when the payload carries `metadata.usage`, and
-    // never while the response is still streaming (`!streamingActive`).
-    if r.has_usage && !live {
+
+    if r.has_usage && !streaming {
+        let mono = {
+            let mut style = rune::tok::TextStyle::new(10.5, 400.0).mono();
+            // `.agent-message-footer`: text-[10.5px] at leading 1.5.
+            style.line_height = 15.75;
+            style
+        };
+        let mut footer = row()
+            .key(format!("{}-footer", r.key))
+            .items_center()
+            .gap(12.0)
+            .mt(8.0)
+            .child(
+                text(format!("↑{}", thousands(r.tokens_in)))
+                    .key(format!("{}-in", r.key))
+                    .font(mono)
+                    .color(home_ink("#52525b")),
+            )
+            .child(
+                text(format!("↓{}", thousands(r.tokens_out)))
+                    .key(format!("{}-out", r.key))
+                    .font(mono)
+                    .color(home_ink("#52525b")),
+            );
+        let stamp = clock(&r.at);
+        if !stamp.is_empty() {
+            footer = footer.child(
+                text(stamp)
+                    .key(format!("{}-time", r.key))
+                    .font(mono)
+                    .color(home_ink("#52525b")),
+            );
+        }
         group = group.child(footer);
     }
     group.child(home_agent_actions(r))
+}
+
+/// `compactTokens` (`SessionEventDivider`): `1240` → `1.2k`, `2M` → `2.0M`.
+fn compact_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 10_000 {
+        format!("{:.0}k", value as f64 / 1_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 /// `toLocaleString()` token grouping (en-US): `1234` → `1,234`.
@@ -1455,6 +2005,44 @@ fn home_agent_actions(r: &RowData) -> El {
             25.0,
             home_icon_copy(12.0, home_ink("#71717a")),
         ))
+}
+
+/// `MessageBubble` system note (`.system-message-note`).
+fn home_system_row(r: &RowData) -> El {
+    col()
+        .key(format!("{}-group", r.key))
+        .w_full()
+        .mb(24.0)
+        .child(
+            row()
+                .key(format!("{}-note", r.key))
+                .items_center()
+                .gap(7.0)
+                .mt(2.0)
+                .px(9.0)
+                .py(6.0)
+                .radius(8.0)
+                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.06))
+                .border_layout()
+                .fill(home_rgba(255.0, 255.0, 255.0, 0.018))
+                .child(
+                    rune::el()
+                        .key(format!("{}-dot", r.key))
+                        .size(5.0, 5.0)
+                        .radius(2.5)
+                        .fill(home_ink("#777780")),
+                )
+                .child(
+                    text(r.body.clone())
+                        .key(format!("{}-text", r.key))
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(11.0, 400.0);
+                            style.line_height = 15.4;
+                            style
+                        })
+                        .color(home_ink("#777780")),
+                ),
+        )
 }
 
 fn home_error_row(r: &RowData) -> El {
@@ -1649,6 +2237,33 @@ fn home_session_event(r: &RowData) -> El {
                 home_ink("#a1a1a9")
             }),
         );
+    if !aborted {
+        let meta = if r.event_input > 0 || r.event_output > 0 {
+            let mut parts = Vec::new();
+            if r.event_input > 0 {
+                parts.push(format!("{} in", compact_tokens(r.event_input)));
+            }
+            if r.event_output > 0 {
+                parts.push(format!("{} out", compact_tokens(r.event_output)));
+            }
+            parts.join(" · ")
+        } else if r.event_tokens_before > 0 {
+            format!("{} context", compact_tokens(r.event_tokens_before))
+        } else {
+            String::new()
+        };
+        if !meta.is_empty() {
+            main = main.child(
+                text(meta)
+                    .font({
+                        let mut style = rune::tok::TextStyle::new(9.5, 400.0).mono();
+                        style.line_height = 9.5;
+                        style
+                    })
+                    .color(home_ink("#5f5f68")),
+            );
+        }
+    }
     if aborted {
         main = main.child(
             text("partial response kept".to_string())
@@ -1717,6 +2332,11 @@ fn home_row<S: TranscriptHost + 'static>(
     let t = s.thread(which);
     let r = &t.rows[i];
     let mut root = col().key(r.key.clone()).w_full();
+    if r.role == "user" {
+        root = root.arrives_whole();
+    } else if r.is_streaming {
+        root = root.streaming(true);
+    }
     if let Some(label) = &meta.dividers[i] {
         root = root.child(home_divider(label));
     }
@@ -1730,6 +2350,7 @@ fn home_row<S: TranscriptHost + 'static>(
         match r.role {
             "user" => home_user_row::<S>(s, which, r, max_w),
             "error" => home_error_row(r),
+            "system" => home_system_row(r),
             _ => home_agent_row::<S>(s, which, r, live),
         }
     };
@@ -1741,7 +2362,7 @@ fn home_row<S: TranscriptHost + 'static>(
 fn conversation_rail(rows: &[RowData]) -> Option<El> {
     let mut turns: Vec<Vec<&RowData>> = Vec::new();
     let mut current: Vec<&RowData> = Vec::new();
-    for r in rows.iter().filter(|r| !r.body.trim().is_empty()) {
+    for r in rows.iter().filter(|r| !raw_of(r).trim().is_empty()) {
         if r.role == "user" && !current.is_empty() {
             turns.push(std::mem::take(&mut current));
         }
@@ -2032,12 +2653,19 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     // Bounded root (window height) + growing viewport: the viewport takes the
     // free space between title and composer instead of pushing the composer
     // off-screen (an `h_full` viewport in an auto-height column does that).
+    let pill = s.scroll_pill.clone();
     let viewport = col()
         .key("transcript-viewport")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: true })
+        .on_scroll_offset(move |at| {
+            // React shows the pill past 120pt from the bottom; fade it in
+            // over the following 40pt so it never pops.
+            let distance = (at.max[1] - at.offset[1]).max(0.0);
+            pill.set(((distance - 120.0) / 40.0).clamp(0.0, 1.0));
+        })
         .child(stack);
     let mut root = col()
         .key("stark-transcript")
@@ -2097,6 +2725,58 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     if let Some(rail) = conversation_rail(&s.rows) {
         view = view.child(rail);
     }
+    // Jump-to-latest pill (`.scroll-bottom-pill`). Always mounted with a
+    // live opacity so parity captures at the bottom stay byte-identical.
+    view = view.child(
+        row()
+            .key("scroll-pill-row")
+            .w_full()
+            .pin(Some(0.0), None, Some(0.0), Some(14.0))
+            .justify_center()
+            .child(
+                row()
+                    .key("scroll-bottom-pill")
+                    .role("button")
+                    .label("Jump to latest")
+                    .items_center()
+                    .gap(6.0)
+                    .px(12.0)
+                    .py(6.0)
+                    .radius(999.0)
+                    .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+                    .border_layout()
+                    .fill(home_rgba(24.0, 24.0, 28.0, 0.92))
+                    .shadow(
+                        10.0,
+                        30.0,
+                        rune::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.4,
+                        },
+                    )
+                    .live_opacity(&s.scroll_pill)
+                    .on_press_tx(|_: &mut S, tx: &mut rune::Tx| {
+                        tx.scroll_to_bottom("transcript-viewport");
+                    })
+                    .child(
+                        rune::el()
+                            .size(13.0, 13.0)
+                            .inert()
+                            .shape(home_icon_arrow_down(13.0, home_ink("#cfcfd6"))),
+                    )
+                    .child(
+                        text("Latest".to_string())
+                            .font({
+                                let mut style = rune::tok::TextStyle::new(11.5, 600.0);
+                                style.line_height = 17.25;
+                                style
+                            })
+                            .color(home_ink("#cfcfd6")),
+                    ),
+            ),
+    );
     root = root.child(view);
     // Thread-local running banner: the standalone view carries it here; the
     // shell's sheet drops it (sheet keeps its own).
@@ -2114,7 +2794,7 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     // `inbox`, drained by the `poll` hook before every frame.
     let composer_card = super::composer::composer_card(
         &s.edit,
-        move |s: &mut S| &mut s.thread_mut(which).edit,
+        std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
         s.voice.meter(),
         s.live,
         super::composer::ComposerMeta {
@@ -2353,6 +3033,17 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune:
         });
         if dead {
             s.inbox = None;
+            // React calls `finish()` when the stream closes without a
+            // terminal event, so a dropped connection still lands the
+            // partial answer instead of leaving a live row forever.
+            if s.aborting {
+                s.aborting = false;
+                s.refresh_chat = Some((s.workspace_id.clone(), s.chat_id.clone()));
+                changed = true;
+            } else if s.live {
+                finalize_run(s, None, false);
+                changed = true;
+            }
         }
     }
     // Voice levels ride the same poll at 60fps steps.
@@ -2666,10 +3357,47 @@ mod tests {
             mods: Mods::default(),
         });
         rt.frame(0.0);
-        assert_eq!(rt.state.rows.len(), n + 1);
+        assert_eq!(rt.state.rows.len(), n + 2);
         assert_eq!(rt.state.rows[n].body, "hello agent");
+        assert_eq!(rt.state.rows[n + 1].key, crate::stream::LIVE_ROW_KEY);
+        assert!(rt.state.rows[n + 1].is_streaming);
         assert!(rt.state.live);
         assert!(rt.state.edit.text.is_empty());
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_instead_of_sending() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.edit = TextEdit::new("hello".to_string());
+        init.edit.focused = true;
+        init.live = false;
+        init.api_port = 1;
+        let n = init.rows.len();
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods {
+                shift: true,
+                ..Mods::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.rows.len(), n);
+        assert!(rt.state.edit.text.contains('\n'));
+        assert!(!rt.state.live);
+    }
+
+    #[test]
+    fn send_while_live_is_a_noop() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.live = true;
+        let n = s.rows.len();
+        crate::rune_transcript::stage_send_prompt(&mut s, "second".to_string());
+        assert_eq!(s.rows.len(), n);
+        assert_eq!(s.pending_saves.len(), 0);
     }
 
     #[test]
@@ -2689,9 +3417,10 @@ mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert_eq!(rt.state.rows.len(), n + 1);
+        assert_eq!(rt.state.rows.len(), n + 2);
         assert_eq!(rt.state.rows[n].role, "user");
         assert_eq!(rt.state.rows[n].body, "hello agent");
+        assert_eq!(rt.state.rows[n + 1].key, crate::stream::LIVE_ROW_KEY);
         assert!(rt.state.live);
         assert!(rt.state.edit.text.is_empty());
         assert!(rt.find(&rt.state.rows[n].key).is_some());

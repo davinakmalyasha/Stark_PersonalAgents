@@ -1,2 +1,4 @@
 # Chat transcripts are user data; re-record them with record_fixtures.py.
 fixtures/
+# Generated capture PNGs/diffs.
+out/

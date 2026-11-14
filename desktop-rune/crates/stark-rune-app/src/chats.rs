@@ -120,6 +120,8 @@ pub struct ChatMsgRow {
     pub key: String,
     pub role: String,
     pub body: String,
+    /// The server's original `content` (before presentation cleanup).
+    pub raw_body: String,
     pub at: String,
     /// `metadata.duration` (`8s`) — trace header label.
     pub duration: String,
@@ -132,12 +134,47 @@ pub struct ChatMsgRow {
     /// `metadata.kind`: `"aborted"` or `"compaction"` renders
     /// `SessionEventDivider` instead of a bubble.
     pub event: String,
+    /// Compaction token metadata for `SessionEventDivider`.
+    pub event_tokens_before: u64,
+    pub event_input: u64,
+    pub event_output: u64,
     /// `metadata.usage` is present: React renders the per-message token/time
     /// footer only then.
     pub has_usage: bool,
     /// `metadata.usage.total_input_tokens` / `total_output_tokens`.
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Live timeline (`metadata.liveTimeline`, or `thinking` fallback).
+    pub timeline: Vec<crate::stream_accum::StreamSegment>,
+    /// `presentStream(...).activitySegments`.
+    pub activity: Vec<crate::stream_accum::StreamSegment>,
+    /// `presentStream(...).finalText` (delegation narration stripped).
+    pub final_text: String,
+    /// Live agent label (`agentName` on legacy payloads).
+    pub agent_name: String,
+    /// `metadata.stopped`.
+    pub stopped: bool,
+    /// `metadata.thinking`.
+    pub thinking: String,
+    /// Legacy `metadata.steps`.
+    pub steps: Vec<crate::stream_accum::TraceStep>,
+    /// Persisted retry notice (legacy live snapshots).
+    pub retry: Option<crate::stream_accum::RetryNotice>,
+    /// Persisted `metadata.liveStatus`.
+    pub live_status: Option<crate::stream_accum::RunStatusNotice>,
+    /// Per-message usage for the footer/persistence.
+    pub run_usage: Option<crate::stream_accum::RunUsage>,
+}
+
+/// One message ready for `POST …/messages` (assistant completion, partial
+/// stop, or inline error). Draining happens on the shell poll thread.
+#[derive(Debug, Clone)]
+pub struct ChatSave {
+    pub workspace_id: String,
+    pub chat_id: String,
+    pub role: String,
+    pub content: String,
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -267,7 +304,7 @@ fn parse_chat(
     }
 }
 
-fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
+pub(crate) fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
     v.get("messages")
         .and_then(|x| x.as_array())
         .map(|rows| {
@@ -284,39 +321,52 @@ fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                         .and_then(|x| x.get("isTrace"))
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false);
-                    let timeline = meta
-                        .and_then(|x| x.get("liveTimeline"))
-                        .and_then(|x| x.as_array());
-                    let timeline_len = timeline.map(|a| a.len()).unwrap_or(0);
-                    let last_is_text = timeline
-                        .and_then(|a| a.last())
-                        .and_then(|x| x.get("type"))
+                    let thinking = meta
+                        .and_then(|x| x.get("thinking"))
                         .and_then(|x| x.as_str())
-                        .map(|t| t == "text")
-                        .unwrap_or(false);
-                    let activity = if timeline_len == 0 {
-                        0
-                    } else if last_is_text {
-                        timeline_len.saturating_sub(1)
-                    } else {
-                        timeline_len
-                    };
-                    let step_activity = meta
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut timeline = meta
+                        .and_then(|x| x.get("liveTimeline"))
+                        .map(crate::stream_accum::parse_segments)
+                        .unwrap_or_default();
+                    // Old messages only carry the flattened thinking string.
+                    if timeline.is_empty() && !thinking.trim().is_empty() {
+                        timeline.push(crate::stream_accum::StreamSegment::Reasoning {
+                            text: thinking.clone(),
+                            agent: None,
+                        });
+                    }
+                    let steps = meta
                         .and_then(|x| x.get("steps"))
-                        .and_then(|x| x.as_array())
-                        .map(|steps| {
-                            steps.iter().any(|s| {
-                                s.get("childId").and_then(|x| x.as_str()).is_some()
-                                    || matches!(
-                                        s.get("type").and_then(|x| x.as_str()),
-                                        Some("tool") | Some("command")
-                                    )
-                                    || s.get("content")
-                                        .and_then(|x| x.as_str())
-                                        .is_some_and(|c| !c.trim().is_empty())
-                            })
-                        })
-                        .unwrap_or(false);
+                        .map(crate::stream_accum::parse_steps)
+                        .unwrap_or_default();
+                    let role = match str_of(m, "role").as_str() {
+                        "assistant" => "agent".to_string(),
+                        other => other.to_string(),
+                    };
+                    let raw_body = str_of(m, "content");
+                    // Only agent rows own a timeline; user/error/system text
+                    // is rendered as written (MessageBubble never calls
+                    // `presentStream` for them).
+                    let (final_text, activity, show_trace) = if role == "agent" {
+                        let presentation = crate::stream_presentation::present_stream(
+                            &timeline, &raw_body, false, &steps,
+                        );
+                        let show_trace = is_trace
+                            && (!presentation.activity.is_empty()
+                                || steps.iter().any(|step| step.renderable()));
+                        (presentation.final_text, presentation.activity, show_trace)
+                    } else if role == "user" {
+                        (
+                            crate::stream_presentation::strip_mailbox_envelope(&raw_body),
+                            Vec::new(),
+                            false,
+                        )
+                    } else {
+                        (raw_body.clone(), Vec::new(), false)
+                    };
+                    let hide_body = role == "agent" && final_text.trim().is_empty();
                     let event = meta
                         .and_then(|x| x.get("kind"))
                         .and_then(|x| x.as_str())
@@ -327,26 +377,75 @@ fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                     let usage = meta.and_then(|x| x.get("usage"));
                     let tokens_in = usage.map(|u| u64_of(u, "total_input_tokens")).unwrap_or(0);
                     let tokens_out = usage.map(|u| u64_of(u, "total_output_tokens")).unwrap_or(0);
+                    let retry = meta.and_then(|x| x.get("retry")).and_then(parse_retry);
+                    let live_status = meta
+                        .and_then(|x| x.get("liveStatus"))
+                        .and_then(crate::stream_accum::parse_status);
+                    let agent_name = m
+                        .get("agentName")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| {
+                            meta.and_then(|x| x.get("agentName"))
+                                .and_then(|x| x.as_str())
+                        })
+                        .unwrap_or_default()
+                        .to_string();
                     ChatMsgRow {
                         key: opt_str_of(m, "id").unwrap_or_else(|| format!("msg-{i}")),
-                        role: match str_of(m, "role").as_str() {
-                            "assistant" => "agent".to_string(),
-                            other => other.to_string(),
-                        },
-                        body: str_of(m, "content"),
+                        role,
+                        body: final_text.clone(),
+                        raw_body,
                         at: str_of(m, "timestamp"),
                         duration,
-                        show_trace: is_trace && (activity > 0 || step_activity),
-                        hide_body: timeline_len > 0 && !last_is_text,
+                        show_trace,
+                        hide_body,
                         event,
+                        event_tokens_before: meta
+                            .and_then(|x| x.get("tokens_before"))
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        event_input: meta
+                            .and_then(|x| x.get("input_tokens"))
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        event_output: meta
+                            .and_then(|x| x.get("output_tokens"))
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
                         has_usage,
                         tokens_in,
                         tokens_out,
+                        timeline,
+                        activity,
+                        final_text,
+                        agent_name,
+                        stopped: meta
+                            .and_then(|x| x.get("stopped"))
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        thinking,
+                        steps,
+                        retry,
+                        live_status,
+                        run_usage: usage.map(crate::stream_accum::RunUsage::from_json),
                     }
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_retry(v: &serde_json::Value) -> Option<crate::stream_accum::RetryNotice> {
+    let attempt = v.get("attempt").and_then(|x| x.as_u64()).unwrap_or(0);
+    let max = v.get("max").and_then(|x| x.as_u64()).unwrap_or(0);
+    if attempt == 0 && max == 0 {
+        return None;
+    }
+    Some(crate::stream_accum::RetryNotice {
+        attempt,
+        max,
+        at: v.get("at").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
 }
 
 /// Shared assembly: UI state + workspace list + per-workspace chat pages +
@@ -482,10 +581,10 @@ pub fn refresh_messages(chats: &mut ChatsState, workspace_id: &str, chat_id: &st
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
         let path = format!("/api/workspaces/{ws}/chats/{chat}");
-        let rows = match crate::transport::fetch_json(&path).await {
-            Ok(v) => parse_messages(&v),
-            Err(_) => Vec::new(),
+        let Ok(value) = crate::transport::fetch_json(&path).await else {
+            return;
         };
+        let rows = parse_messages(&value);
         let _ = tx.send(ChatsMsg::Messages { key, rows });
     });
     #[cfg(not(target_arch = "wasm32"))]
@@ -498,6 +597,99 @@ pub fn refresh_messages(chats: &mut ChatsState, workspace_id: &str, chat_id: &st
                 .unwrap_or_default();
         let _ = tx.send(ChatsMsg::Messages { key, rows });
     });
+}
+
+/// Write a batch of finished messages, then fetch the chat once. React does
+/// the same (`finishHouseMessage` posts, then `fetchChat`), so the transcript
+/// settles on the server's canonical ids/timestamps.
+pub fn persist_messages(chats: &mut ChatsState, saves: Vec<ChatSave>) {
+    if saves.is_empty() {
+        return;
+    }
+    let key = format!("{}:{}", saves[0].workspace_id, saves[0].chat_id);
+    let ws = saves[0].workspace_id.clone();
+    let chat = saves[0].chat_id.clone();
+    let tx = ensure_channel(chats);
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        for save in &saves {
+            let path = format!(
+                "/api/workspaces/{}/chats/{}/messages",
+                save.workspace_id, save.chat_id
+            );
+            if crate::transport::fetch_send("POST", &path, Some(&message_body(save)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let path = format!("/api/workspaces/{ws}/chats/{chat}");
+        let Ok(value) = crate::transport::fetch_json(&path).await else {
+            return;
+        };
+        let rows = parse_messages(&value);
+        let _ = tx.send(ChatsMsg::Messages { key, rows });
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let host = crate::rune_transcript::DEFAULT_API_HOST;
+        let port = crate::rune_transcript::api_port();
+        for save in &saves {
+            let path = format!(
+                "/api/workspaces/{}/chats/{}/messages",
+                save.workspace_id, save.chat_id
+            );
+            if crate::transport::send_json(host, port, "POST", &path, &message_body(save)).is_err()
+            {
+                // Keep the finalized row visible; a transient write failure
+                // must not blank the transcript.
+                return;
+            }
+        }
+        let path = format!("/api/workspaces/{ws}/chats/{chat}");
+        let Ok(value) = crate::transport::get_json(host, port, &path) else {
+            return;
+        };
+        let rows = parse_messages(&value);
+        let _ = tx.send(ChatsMsg::Messages { key, rows });
+    });
+}
+
+fn message_body(save: &ChatSave) -> serde_json::Value {
+    let mut body = serde_json::json!({"role": save.role, "content": save.content});
+    if !save.metadata.is_null() {
+        body["metadata"] = save.metadata.clone();
+    }
+    body
+}
+
+/// Drain a transcript's queued writes into one POST+GET batch.
+pub fn drain_pending_saves(
+    chats: &mut ChatsState,
+    thread: &mut crate::rune_transcript::RuneTranscriptState,
+) -> bool {
+    if thread.pending_saves.is_empty() {
+        return false;
+    }
+    let saves = std::mem::take(&mut thread.pending_saves);
+    persist_messages(chats, saves);
+    true
+}
+
+/// Refresh a chat after an aborted turn's terminal frame settles.
+pub fn drain_refresh(
+    chats: &mut ChatsState,
+    thread: &mut crate::rune_transcript::RuneTranscriptState,
+) -> bool {
+    let Some((workspace_id, chat_id)) = thread.refresh_chat.take() else {
+        return false;
+    };
+    if workspace_id.trim().is_empty() || chat_id.trim().is_empty() {
+        return false;
+    }
+    refresh_messages(chats, &workspace_id, &chat_id);
+    true
 }
 
 // ── Browser fetch ─────────────────────────────────────────────────────────
@@ -885,6 +1077,89 @@ mod tests {
         assert_eq!(cards[0].x, -162.0);
         assert_eq!(cards[0].y, 64.0);
         assert!(!cards[0].compact);
+    }
+
+    #[test]
+    fn persisted_timeline_drives_trace_and_answer() {
+        let payload = serde_json::json!({"messages": [{
+            "id": "m1",
+            "role": "assistant",
+            "content": "The answer.",
+            "timestamp": "2026-11-12T12:00:00Z",
+            "metadata": {
+                "isTrace": true,
+                "duration": "8s",
+                "liveTimeline": [
+                    {"type": "reasoning", "text": "thinking"},
+                    {"type": "tool", "ev": {"id": "1", "name": "grep", "status": "done", "ok": false, "ms": 9, "preview": "Error: no target"}},
+                    {"type": "text", "text": "The answer."}
+                ],
+                "usage": {"total_input_tokens": 12, "total_output_tokens": 3}
+            }
+        }]});
+        let rows = parse_messages(&payload);
+        let row = &rows[0];
+        assert_eq!(row.role, "agent");
+        assert_eq!(row.body, "The answer.");
+        assert_eq!(row.final_text, "The answer.");
+        assert_eq!(row.activity.len(), 2);
+        assert!(row.show_trace);
+        assert!(!row.hide_body);
+        assert_eq!(row.tokens_in, 12);
+        assert_eq!(row.tokens_out, 3);
+        assert_eq!(row.timeline.len(), 3);
+    }
+
+    #[test]
+    fn thinking_fallback_and_stopped_parse() {
+        let payload = serde_json::json!({"messages": [{
+            "id": "m2",
+            "role": "agent",
+            "content": "partial",
+            "metadata": {
+                "isTrace": true,
+                "thinking": "why",
+                "stopped": true,
+                "kind": "aborted"
+            }
+        }]});
+        let rows = parse_messages(&payload);
+        let row = &rows[0];
+        assert_eq!(row.thinking, "why");
+        assert!(row.stopped);
+        assert_eq!(row.event, "aborted");
+        assert_eq!(row.timeline.len(), 1);
+        assert_eq!(row.activity.len(), 1);
+        // React's timeline is authoritative: a thinking-only timeline has no
+        // trailing text run, so the flattened content is not shown.
+        assert_eq!(row.final_text, "");
+        assert!(row.hide_body);
+        assert!(row.show_trace);
+    }
+
+    #[test]
+    fn user_content_is_not_run_through_the_stream_cleanups() {
+        let payload = serde_json::json!({"messages": [{
+            "id": "u1",
+            "role": "user",
+            "content": "Asked.✓ Done — keep my prompt verbatim"
+        }]});
+        let rows = parse_messages(&payload);
+        assert_eq!(rows[0].body, "Asked.✓ Done — keep my prompt verbatim");
+        assert!(!rows[0].hide_body);
+        assert!(!rows[0].show_trace);
+        assert!(rows[0].activity.is_empty());
+    }
+
+    #[test]
+    fn internal_transport_rows_are_filtered_by_the_home_view() {
+        let payload = serde_json::json!({"messages": [{
+            "id": "m3",
+            "role": "user",
+            "content": "[DELEGATION RESULT] hidden"
+        }]});
+        let rows = parse_messages(&payload);
+        assert_eq!(rows[0].body, "[DELEGATION RESULT] hidden");
     }
 
     #[test]

@@ -250,7 +250,10 @@ pub fn create_project(s: &mut ProjectsState) {
     s.error = None;
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
     let (host, port, ws) = (s.host.clone(), s.port, s.workspace_id.clone());
+    #[cfg(target_arch = "wasm32")]
+    let ws = s.workspace_id.clone();
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
         let body = serde_json::json!({ "goal": goal, "workspace_id": ws });

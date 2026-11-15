@@ -20,9 +20,23 @@ use std::borrow::Cow;
 use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
 use stark_kit::transcript::{TranscriptRow, ESTIMATED_ROW_H};
 
+use crate::chats::{ChatAttachment, ChatMsgRow};
 use crate::stream_accum::{
     RetryNotice, RunStatusNotice, RunUsage, StreamAccum, StreamSegment, TraceStep,
 };
+
+/// Result of the blocking `/rewind` + `GET chat` work: the restored prompt
+/// and the canonical truncated history. The clicked id is kept so the UI can
+/// apply React's defensive slice even though the server already truncated.
+#[derive(Debug, Clone)]
+pub struct RewindOk {
+    pub row_id: String,
+    pub prompt: String,
+    /// The clicked user message's `metadata.attachments`; React restores the
+    /// draft deck from the clicked message, not from the rewind response.
+    pub attachments: Vec<ChatAttachment>,
+    pub rows: Vec<ChatMsgRow>,
+}
 
 #[path = "rune_transcript/activity.rs"]
 mod activity;
@@ -41,6 +55,9 @@ pub struct RowData {
     /// ISO-8601 creation stamp (`CanvasChatBubble clock()` renders it as
     /// `hh:MM AM/PM` in the bubble foot). Empty for scene fixtures.
     pub at: String,
+    /// `metadata.attachments` for user rows: image previews + file chips
+    /// inside the bubble (`MessageBubble`'s `.message-attachments`).
+    pub attachments: Vec<ChatAttachment>,
     /// `metadata.duration` for the "Worked for …" trace divider.
     pub duration: String,
     pub show_trace: bool,
@@ -682,6 +699,25 @@ pub struct RuneTranscriptState {
     pub copied_at: Option<std::time::Instant>,
     /// Diff blocks whose "Show all N lines" button has been pressed.
     pub expanded_diffs: std::collections::HashSet<String>,
+    /// Row keys whose copy button is showing React's 1.5s Check state.
+    pub copied_messages: std::collections::HashMap<String, std::time::Instant>,
+    /// User rows armed for the two-step rewind (3.2s, like `rewindArmed`).
+    pub rewind_armed: std::collections::HashMap<String, std::time::Instant>,
+    /// Blocking `/rewind` + history fetch running for this thread.
+    pub rewind_inbox: Option<std::sync::mpsc::Receiver<Result<RewindOk, String>>>,
+    /// Composer deck: local picks (`id` empty) and restored uploads.
+    pub draft_attachments: Vec<ChatAttachment>,
+    /// Amber line under the input (`20 MB`/`8 files`/picker failures).
+    pub attachments_error: Option<String>,
+    /// A file drag hovers the dock (`.prompt-dock.is-dragging`).
+    pub attachments_dragging: bool,
+    /// Full-viewport image preview (`message-lightbox`).
+    pub attachment_preview: Option<ChatAttachment>,
+    /// Ask the shell to refresh the sidebar after create/rewind.
+    pub refresh_list: bool,
+    /// `chat` SSE frame landed: the shell rekeys a `chat:local:*` card to the
+    /// server id (`workspace`, `chat`).
+    pub pending_rekey: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for RuneTranscriptState {
@@ -707,6 +743,11 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("inbox", &self.inbox.is_some())
             .field("copied_code", &self.copied_code)
             .field("expanded_diffs", &self.expanded_diffs.len())
+            .field("copied_messages", &self.copied_messages.len())
+            .field("rewind_armed", &self.rewind_armed.len())
+            .field("rewind_inbox", &self.rewind_inbox.is_some())
+            .field("draft_attachments", &self.draft_attachments.len())
+            .field("attachment_preview", &self.attachment_preview.is_some())
             .finish()
     }
 }
@@ -756,6 +797,15 @@ impl Clone for RuneTranscriptState {
             copied_code: self.copied_code.clone(),
             copied_at: self.copied_at,
             expanded_diffs: self.expanded_diffs.clone(),
+            copied_messages: self.copied_messages.clone(),
+            rewind_armed: self.rewind_armed.clone(),
+            rewind_inbox: None,
+            draft_attachments: self.draft_attachments.clone(),
+            attachments_error: self.attachments_error.clone(),
+            attachments_dragging: false,
+            attachment_preview: None,
+            refresh_list: self.refresh_list,
+            pending_rekey: self.pending_rekey.clone(),
         }
     }
 }
@@ -826,6 +876,15 @@ impl RuneTranscriptState {
             copied_code: None,
             copied_at: None,
             expanded_diffs: std::collections::HashSet::new(),
+            copied_messages: std::collections::HashMap::new(),
+            rewind_armed: std::collections::HashMap::new(),
+            rewind_inbox: None,
+            draft_attachments: Vec::new(),
+            attachments_error: None,
+            attachments_dragging: false,
+            attachment_preview: None,
+            refresh_list: false,
+            pending_rekey: None,
         }
     }
 
@@ -888,6 +947,15 @@ impl RuneTranscriptState {
             copied_code: None,
             copied_at: None,
             expanded_diffs: std::collections::HashSet::new(),
+            copied_messages: std::collections::HashMap::new(),
+            rewind_armed: std::collections::HashMap::new(),
+            rewind_inbox: None,
+            draft_attachments: Vec::new(),
+            attachments_error: None,
+            attachments_dragging: false,
+            attachment_preview: None,
+            refresh_list: false,
+            pending_rekey: None,
         }
     }
 
@@ -1050,6 +1118,16 @@ fn bg() -> rune::Color {
     rune::color::hex("#0a0a0a").unwrap_or(rune::Color::BLACK)
 }
 
+/// Standalone window size (the shell has its own static): keeps the
+/// full-viewport lightbox at React's 92vw/86vh without threading dimensions
+/// through every transcript builder.
+static mut TRANSCRIPT_WINDOW: (f32, f32) = (468.0, 720.0);
+
+fn transcript_window() -> (f32, f32) {
+    // SAFETY: views run single-threaded on the UI thread.
+    unsafe { TRANSCRIPT_WINDOW }
+}
+
 /// Markdown block rendering lives in `md_render` (a direct `Markdown.tsx` port).
 fn render_body<S: TranscriptHost + 'static>(
     s: &S,
@@ -1074,17 +1152,133 @@ fn render_body_styled<S: TranscriptHost + 'static>(
     md_render::render_body_styled(s, which, key, body, body_ink, body_style)
 }
 
+/// PromptDock's file limits (`MAX_FILES` / `MAX_FILE_SIZE`).
+pub const MAX_ATTACHMENTS: usize = 8;
+pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Shared send path (button + Enter): stage the field as a user row, mark the
 /// run live, and spawn the blocking `POST /api/run` thread into `inbox`.
+/// Attachments count as content, so an attachment-only send is allowed; the
+/// text is only cleared once staging succeeded (React's guard keeps a live
+/// run's draft in place).
 pub fn stage_send(s: &mut RuneTranscriptState) {
     let prompt = s.edit.text.trim().to_string();
-    if prompt.is_empty() {
+    if (prompt.is_empty() && s.draft_attachments.is_empty()) || s.live || s.aborting {
         return;
     }
-    s.edit.text.clear();
-    s.edit.anchor = 0;
-    s.edit.focus = 0;
-    stage_send_prompt(s, prompt);
+    let attachments = s.draft_attachments.clone();
+    if stage_send_prompt_with_attachments(s, prompt, attachments) {
+        s.edit.text.clear();
+        s.edit.anchor = 0;
+        s.edit.focus = 0;
+        // React's PromptDock clears both dock lists after `handleSend`.
+        s.draft_attachments.clear();
+        s.attachments_error = None;
+    }
+}
+
+/// One picked path becomes a local draft card (`id` empty until upload).
+/// React's `addFiles`: drop >20 MB files, dedupe by name+size, cap at eight,
+/// and report the matching amber line.
+pub fn add_attachment_paths(s: &mut RuneTranscriptState, paths: &[std::path::PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let mut valid = Vec::new();
+    for path in paths {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size > MAX_ATTACHMENT_BYTES {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let mime = crate::chats::mime_for_path(path);
+        valid.push(ChatAttachment {
+            id: String::new(),
+            name: name.to_string(),
+            file_type: mime.to_string(),
+            size,
+            path: path.to_string_lossy().into_owned(),
+            is_image: mime.starts_with("image/"),
+            url: None,
+        });
+    }
+    let size_rejected = valid.len() != paths.len();
+    let mut dropped = false;
+    for file in valid {
+        if s.draft_attachments
+            .iter()
+            .any(|item| item.id.is_empty() && item.name == file.name && item.size == file.size)
+        {
+            dropped = true;
+            continue;
+        }
+        s.draft_attachments.push(file);
+    }
+    if s.draft_attachments.len() > MAX_ATTACHMENTS {
+        let extra = s.draft_attachments.len() - MAX_ATTACHMENTS;
+        s.draft_attachments.truncate(MAX_ATTACHMENTS);
+        dropped |= extra > 0;
+    }
+    if size_rejected {
+        s.attachments_error = Some("Files must be 20 MB or smaller.".to_string());
+    } else if dropped {
+        s.attachments_error = Some(format!(
+            "You can attach up to {MAX_ATTACHMENTS} files at once."
+        ));
+    } else if !s.draft_attachments.is_empty() {
+        s.attachments_error = None;
+    }
+}
+
+/// Remove one deck card. Local picks have no id yet (the composer passes
+/// `local:<index>`); restored uploads pass their id. Clearing back under the
+/// cap also drops React's "up to 8" line.
+pub fn remove_draft_attachment(s: &mut RuneTranscriptState, target: &str) {
+    if let Some(index) = target
+        .strip_prefix("local:")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if index < s.draft_attachments.len() {
+            s.draft_attachments.remove(index);
+        }
+    } else {
+        s.draft_attachments.retain(|file| file.id != target);
+    }
+    if s.draft_attachments.len() < MAX_ATTACHMENTS
+        && s.attachments_error
+            .as_deref()
+            .is_some_and(|error| error.contains("up to 8"))
+    {
+        s.attachments_error = None;
+    }
+}
+
+/// The dock's attach button / dashed tile: one native file dialog per pick
+/// (Rune selects a single path; drag-and-drop is the multi-file path).
+pub fn open_attachment_picker<S: TranscriptHost + 'static>(
+    _s: &mut S,
+    which: Thread,
+    tx: &mut rune::Tx,
+) {
+    let options = rune::FileDialogOptions {
+        title: "Attach files".to_string(),
+        ..Default::default()
+    };
+    tx.open_file(options, move |s: &mut S, result, _tx| match result {
+        Ok(Some(path)) => add_attachment_paths(s.thread_mut(which), &[path]),
+        Ok(None) => {}
+        Err(error) => {
+            s.thread_mut(which).attachments_error = Some(error.to_string());
+        }
+    });
+}
+
+/// Drop files anywhere on the composer card (multi-file, unlike the picker).
+pub fn drop_attachment_files(s: &mut RuneTranscriptState, files: &[std::path::PathBuf]) {
+    add_attachment_paths(s, files);
+    s.attachments_dragging = false;
 }
 
 /// React `chat.title` for a fresh conversation: first 32 chars + ellipsis.
@@ -1116,16 +1310,106 @@ impl RuneTranscriptState {
 
 /// Stage an explicit prompt (map dock sends land here with the dock's text).
 pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
+    let _ = stage_send_prompt_with_attachments(s, prompt, Vec::new());
+}
+
+/// Stage a send with its dock attachments. Restored files already have ids;
+/// local picks are uploaded synchronously first (after creating the chat, so
+/// the upload has somewhere to land). A failure leaves the draft intact and
+/// reports through the dock's amber line, exactly where the send came from.
+pub fn stage_send_prompt_with_attachments(
+    s: &mut RuneTranscriptState,
+    prompt: String,
+    attachments: Vec<ChatAttachment>,
+) -> bool {
     let prompt = prompt.trim().to_string();
-    if prompt.is_empty() || s.live || s.aborting {
-        return;
+    if (prompt.is_empty() && attachments.is_empty()) || s.live || s.aborting {
+        return false;
     }
+    // React keeps the two dock lists separate: restored files are sent
+    // as-is, picked files upload now, and the wire order is restored first.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut send_attachments: Vec<ChatAttachment> = attachments
+        .iter()
+        .filter(|file| !file.id.is_empty())
+        .cloned()
+        .collect();
+    let locals: Vec<std::path::PathBuf> = attachments
+        .iter()
+        .filter(|file| file.id.is_empty())
+        .map(|file| std::path::PathBuf::from(&file.path))
+        .collect();
+    if !locals.is_empty() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // `handleSend` creates the conversation before uploading.
+            if !s.chat_ready || s.chat_id.trim().is_empty() {
+                match crate::transport::create_chat(
+                    &s.api_host,
+                    s.api_port,
+                    &s.workspace_id,
+                    &chat_title(&prompt),
+                ) {
+                    Ok(id) => {
+                        s.chat_id = id.clone();
+                        s.chat_ready = true;
+                        s.pending_rekey = Some((s.workspace_id.clone(), id));
+                        s.refresh_list = true;
+                    }
+                    Err(_) => {
+                        s.attachments_error = Some("Could not create a conversation.".to_string());
+                        return false;
+                    }
+                }
+            }
+            match crate::transport::upload_attachments(
+                &s.api_host,
+                s.api_port,
+                &s.workspace_id,
+                &s.chat_id,
+                &locals,
+            ) {
+                Ok(value) => {
+                    let uploaded: Vec<ChatAttachment> = value
+                        .get("attachments")
+                        .and_then(|v| v.as_array())
+                        .map(|files| files.iter().map(ChatAttachment::from_json).collect())
+                        .unwrap_or_default();
+                    if uploaded.is_empty() {
+                        s.attachments_error = Some("Your files could not be uploaded.".to_string());
+                        return false;
+                    }
+                    send_attachments.extend(uploaded);
+                }
+                Err(_) => {
+                    s.attachments_error = Some("Your files could not be uploaded.".to_string());
+                    return false;
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            s.attachments_error = Some("File uploads need the desktop app.".to_string());
+            return false;
+        }
+    }
+    let file_count = send_attachments.len();
+    let content = if prompt.is_empty() {
+        format!(
+            "Attached {file_count} file{}",
+            if file_count > 1 { "s" } else { "" }
+        )
+    } else {
+        prompt.clone()
+    };
     let n = s.rows.len();
     s.rows.push(RowData {
         key: format!("user-{n}"),
         role: "user",
-        body: prompt.clone(),
+        body: content.clone(),
+        raw_body: content,
         at: now_iso(),
+        attachments: send_attachments.clone(),
         ..RowData::default()
     });
     // Show the live bubble immediately (React appends `house-live` on send,
@@ -1156,6 +1440,7 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
         workspace_id: s.workspace_id.clone(),
         chat_id: s.chat_id.clone(),
         workspace_kind: s.workspace_kind(),
+        attachments: send_attachments,
     };
     let workspace_id = s.workspace_id.clone();
     let title = chat_title(&req.prompt);
@@ -1249,6 +1534,7 @@ pub fn stage_send_prompt(s: &mut RuneTranscriptState, prompt: String) {
             _ => {}
         }
     });
+    true
 }
 
 fn push_error_row(s: &mut RuneTranscriptState, message: &str) -> String {
@@ -1459,7 +1745,16 @@ impl TranscriptHost for RuneTranscriptState {
     }
 }
 
-pub fn transcript_view(s: &RuneTranscriptState, _: &mut Cx<RuneTranscriptState>) -> El {
+pub fn transcript_view(s: &RuneTranscriptState, cx: &mut Cx<RuneTranscriptState>) -> El {
+    let (w, h) = cx
+        .window_layout("stark-transcript")
+        .map(|r| (r[2], r[3]))
+        .filter(|(w, h)| *w > 1.0 && *h > 1.0)
+        .unwrap_or((468.0, 720.0));
+    // SAFETY: views run single-threaded on the UI thread.
+    unsafe {
+        TRANSCRIPT_WINDOW = (w, h);
+    }
     transcript_body::<RuneTranscriptState>(s, Thread::Main)
 }
 
@@ -1493,6 +1788,10 @@ pub fn transcript_view_body<S: TranscriptHost + 'static>(
 struct HomeRows {
     visible: Vec<bool>,
     dividers: Vec<Option<String>>,
+    /// `retryMap`: the last user prompt at or before each row. React builds it
+    /// over the deduped list, so hidden internal/duplicate rows never leak a
+    /// prompt. Empty prompt is a valid value (the retry button is still shown).
+    retry_prompts: Vec<String>,
 }
 
 fn raw_of(row: &RowData) -> &str {
@@ -1501,6 +1800,430 @@ fn raw_of(row: &RowData) -> &str {
     } else {
         &row.raw_body
     }
+}
+
+/// `MessageBubble`'s `src`: the persisted URL or the chat attachment endpoint.
+/// The native image cache can also decode the upload's local path.
+fn attachment_has_src(s: &RuneTranscriptState, file: &ChatAttachment) -> bool {
+    file.url.as_deref().is_some_and(|url| !url.is_empty())
+        || (!s.workspace_id.is_empty() && !s.chat_id.is_empty() && !file.id.is_empty())
+        || (!file.path.is_empty() && std::path::Path::new(&file.path).exists())
+}
+
+/// Open a message attachment the way React's anchor does: the explicit URL,
+/// or the local upload path as a `file:` URL. Server-only attachments have
+/// no native download endpoint, so they keep the anchor's visual but no press.
+fn attachment_open_url(s: &RuneTranscriptState, file: &ChatAttachment) -> Option<String> {
+    let _ = s;
+    if let Some(url) = file.url.as_deref().filter(|url| !url.is_empty()) {
+        return Some(url.to_string());
+    }
+    if !file.path.is_empty() && std::path::Path::new(&file.path).exists() {
+        let path = file.path.replace('\\', "/");
+        return Some(format!("file:///{}", path.trim_start_matches('/')));
+    }
+    #[cfg(target_arch = "wasm32")]
+    if !s.workspace_id.is_empty() && !s.chat_id.is_empty() && !file.id.is_empty() {
+        return Some(format!(
+            "/api/workspaces/{}/chats/{}/attachments/{}",
+            s.workspace_id, s.chat_id, file.id
+        ));
+    }
+    None
+}
+
+fn attachment_image(
+    s: &RuneTranscriptState,
+    file: &ChatAttachment,
+    size: f32,
+) -> Option<rune::Image> {
+    crate::image_cache::attachment(file, size, &s.workspace_id, &s.chat_id)
+}
+
+/// `MessageBubble`'s `.message-attachments`: 86×66 image buttons, audio
+/// bars and file chips. Rune has no native audio element, so an audio row
+/// shows the same icon/name instead of playback controls.
+fn home_message_attachments<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    r: &RowData,
+) -> Option<El> {
+    if r.attachments.is_empty() {
+        return None;
+    }
+    let t = s.thread(which);
+    let mut deck = row()
+        .key(format!("{}-attachments", r.key))
+        .flex_wrap()
+        .items_center()
+        .gap(6.0)
+        .mt(9.0);
+    for (index, file) in r.attachments.iter().enumerate() {
+        let id = if file.id.is_empty() {
+            index.to_string()
+        } else {
+            file.id.clone()
+        };
+        let key = format!("{}-file-{}", r.key, id);
+        let has_src = attachment_has_src(t, file);
+        if file.is_image && has_src {
+            let image = attachment_image(t, file, 86.0);
+            let mut button = rune::el()
+                .key(key)
+                .role("button")
+                .label(format!("Open {}", file.name))
+                .size(86.0, 66.0)
+                .radius(9.0)
+                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.11))
+                .border_layout()
+                .fill(home_rgba(0.0, 0.0, 0.0, 0.2))
+                .clip_rounded(9.0);
+            if let Some(image) = image {
+                button = button.child(
+                    rune::el()
+                        .size(84.0, 64.0)
+                        .radius(8.0)
+                        .pixels_fit(image.pixels(), rune::SurfaceFit::Fill)
+                        .inert(),
+                );
+            } else {
+                button = button.center().child(
+                    rune::el()
+                        .size(16.0, 16.0)
+                        .inert()
+                        .shape(crate::lucide_image(16.0, home_ink("#c9c9d1"))),
+                );
+            }
+            let file = file.clone();
+            deck = deck.child(button.on_press(move |s: &mut S| {
+                s.thread_mut(which).attachment_preview = Some(file.clone());
+            }));
+            continue;
+        }
+        if file.is_audio() && has_src {
+            let child = row()
+                .key(key)
+                .role("group")
+                .label(file.name.clone())
+                .items_center()
+                .gap(7.0)
+                .max_w(280.0)
+                .px(7.0)
+                .py(5.0)
+                .radius(9.0)
+                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
+                .border_layout()
+                .fill(home_rgba(0.0, 0.0, 0.0, 0.18))
+                .child(
+                    rune::el()
+                        .size(14.0, 14.0)
+                        .inert()
+                        .shape(crate::lucide_audio_lines(14.0, home_ink("#cfcfd6"))),
+                )
+                .child(
+                    text(file.name.clone())
+                        .min_w(0.0)
+                        .max_w(220.0)
+                        .truncate()
+                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                        .color(home_ink("#cfcfd6")),
+                );
+            deck = deck.child(child);
+            continue;
+        }
+        let src = has_src;
+        let open = attachment_open_url(t, file);
+        let mut chip = row()
+            .key(key)
+            .role("link")
+            .label(format!("Download {}", file.name))
+            .items_center()
+            .gap(5.0)
+            .max_w(220.0)
+            .px(7.0)
+            .py(5.0)
+            .radius(8.0)
+            .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
+            .border_layout()
+            .fill(home_rgba(0.0, 0.0, 0.0, 0.16))
+            .child(rune::el().size(14.0, 14.0).inert().shape(if file.is_image {
+                crate::lucide_image(14.0, home_ink("#cdcdd4"))
+            } else {
+                crate::lucide_file_text(14.0, home_ink("#cdcdd4"))
+            }))
+            .child(
+                text(file.name.clone())
+                    .min_w(0.0)
+                    .grow(1.0)
+                    .truncate()
+                    .font(rune::tok::TextStyle::new(11.0, 400.0))
+                    .color(home_ink("#cdcdd4")),
+            );
+        if src {
+            chip = chip.child(
+                rune::el()
+                    .size(12.0, 12.0)
+                    .opacity(0.6)
+                    .inert()
+                    .shape(crate::lucide_download(12.0, home_ink("#cdcdd4"))),
+            );
+        }
+        if let Some(url) = open {
+            chip = chip.on_press_tx(move |_: &mut S, tx: &mut rune::Tx| {
+                let _ = tx.open_url(&url);
+            });
+        }
+        deck = deck.child(chip);
+    }
+    Some(deck)
+}
+
+/// `message-lightbox`: fixed full-viewport preview, blurred backdrop, and a
+/// close button. Any press dismisses it, matching React's backdrop handler.
+pub fn attachment_lightbox<S: 'static>(
+    file: &ChatAttachment,
+    window_w: f32,
+    window_h: f32,
+    workspace_id: &str,
+    chat_id: &str,
+    close: impl Fn(&mut S) + 'static,
+) -> El {
+    let close = std::rc::Rc::new(close);
+    let max_w = (window_w * 0.92).clamp(280.0, 1200.0);
+    let max_h = (window_h * 0.86).clamp(220.0, 2400.0);
+    let mut content = rune::el()
+        .key("message-lightbox-image")
+        .max_w(max_w)
+        .max_h(max_h)
+        .radius(14.0)
+        .clip_rounded(14.0)
+        .shadow(
+            30.0,
+            90.0,
+            rune::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.7,
+            },
+        );
+    let image = crate::image_cache::attachment(file, max_w, workspace_id, chat_id);
+    match image {
+        Some(image) => {
+            if let Some([w, h]) = image.size() {
+                content = content
+                    .aspect_fit(w as f32 / h.max(1) as f32)
+                    .max_w(max_w)
+                    .max_h(max_h);
+            } else {
+                content = content.size((max_w * 0.62).min(760.0), (max_h * 0.62).min(520.0));
+            }
+            content = content.pixels_fit(image.pixels(), rune::SurfaceFit::Fit);
+        }
+        None => {
+            content = content
+                .w((max_w * 0.5).min(520.0))
+                .px(24.0)
+                .py(22.0)
+                .radius(14.0)
+                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+                .border_layout()
+                .fill(home_rgba(20.0, 20.0, 24.0, 0.96))
+                .child(
+                    text(file.name.clone())
+                        .font(rune::tok::TextStyle::new(13.5, 500.0))
+                        .color(home_ink("#f0f0f2")),
+                );
+        }
+    }
+    rune::el()
+        .key("message-lightbox")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(home_rgba(0.0, 0.0, 0.0, 0.82))
+        .backdrop_blur(10.0)
+        .center()
+        .modal(true, {
+            let close = close.clone();
+            move |s: &mut S| close(s)
+        })
+        .child(
+            rune::el()
+                .key("message-lightbox-close")
+                .pin(None, Some(18.0), Some(18.0), None)
+                .role("button")
+                .label("Close image preview")
+                .size(34.0, 34.0)
+                .radius(10.0)
+                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.14))
+                .border_layout()
+                .fill(home_rgba(20.0, 20.0, 24.0, 0.8))
+                .center()
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.12))
+                .on_press({
+                    let close = close.clone();
+                    move |s: &mut S| close(s)
+                })
+                .child(rune::el().size(16.0, 16.0).inert().shape(crate::lucide_x(
+                    16.0,
+                    2.0,
+                    home_ink("#dddddd"),
+                ))),
+        )
+        .child(content)
+}
+
+/// `MessageBubble.copyMessage`: write the row's raw text and, for user and
+/// error rows only, hold React's 1.5s Check state. Agent copy has no feedback.
+fn copy_message<S: TranscriptHost + 'static>(
+    s: &mut S,
+    which: Thread,
+    key: &str,
+    text: String,
+    feedback: bool,
+    tx: &mut rune::Tx,
+) {
+    tx.copy(text);
+    if feedback {
+        s.thread_mut(which)
+            .copied_messages
+            .insert(key.to_string(), std::time::Instant::now());
+        // Poll again when the 1.5s window ends even if nothing else moves.
+        tx.wake_after(std::time::Duration::from_millis(50));
+    }
+}
+
+/// First press arms the row; the 3.2s poll timeout disarms it. React keeps
+/// this state local to each `MessageBubble`.
+fn arm_rewind<S: TranscriptHost + 'static>(s: &mut S, which: Thread, key: &str, tx: &mut rune::Tx) {
+    s.thread_mut(which)
+        .rewind_armed
+        .insert(key.to_string(), std::time::Instant::now());
+    tx.wake_after(std::time::Duration::from_millis(50));
+}
+
+/// Detach the active stream before `/rewind`: like `abortRef.current.abort()`
+/// followed by `resetStream()`, no partial is finalized or persisted. The
+/// server truncates and the fetched history replaces these rows.
+fn detach_live_run(s: &mut RuneTranscriptState) {
+    s.inbox = None;
+    s.live = false;
+    s.aborting = false;
+    s.run_started_ms = None;
+    s.pending_saves.clear();
+    s.refresh_chat = None;
+    s.rows
+        .retain(|row| !(row.is_streaming || row.accum.is_some()));
+}
+
+/// Second press: POST `/rewind` and refetch the chat. Results land in
+/// `rewind_inbox` for the poll hook, exactly like a run.
+fn start_rewind(s: &mut RuneTranscriptState, row_id: String, attachments: Vec<ChatAttachment>) {
+    if s.rewind_inbox.is_some() {
+        return;
+    }
+    s.rewind_armed.remove(&row_id);
+    detach_live_run(s);
+    if s.chat_id.trim().is_empty() || s.workspace_id.trim().is_empty() {
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let (host, port) = (s.api_host.clone(), s.api_port);
+    let (workspace, chat) = (s.workspace_id.clone(), s.chat_id.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.rewind_inbox = Some(rx);
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let result = (|| -> Result<RewindOk, String> {
+            let body = serde_json::json!({
+                "message_id": row_id,
+                "restore_files": true,
+                "force": false,
+            });
+            let value = crate::transport::send_json(
+                &host,
+                port,
+                "POST",
+                &format!("/api/workspaces/{workspace}/chats/{chat}/rewind"),
+                &body,
+            )?;
+            let prompt = value
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let page = crate::transport::get_json(
+                &host,
+                port,
+                &format!("/api/workspaces/{workspace}/chats/{chat}"),
+            )?;
+            Ok(RewindOk {
+                row_id: row_id.clone(),
+                prompt,
+                attachments,
+                rows: crate::chats::parse_messages(&page),
+            })
+        })();
+        let _ = tx.send(result);
+    });
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let body = serde_json::json!({
+                "message_id": row_id,
+                "restore_files": true,
+                "force": false,
+            });
+            let value = crate::transport::fetch_send(
+                "POST",
+                &format!("/api/workspaces/{workspace}/chats/{chat}/rewind"),
+                Some(&body),
+            )
+            .await?;
+            let prompt = value
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let page =
+                crate::transport::fetch_json(&format!("/api/workspaces/{workspace}/chats/{chat}"))
+                    .await?;
+            Ok(RewindOk {
+                row_id: row_id.clone(),
+                prompt,
+                attachments,
+                rows: crate::chats::parse_messages(&page),
+            })
+        }
+        .await;
+        let _ = tx.send(result);
+    });
+}
+
+/// Apply React's `handleRewind` result: defensive slice before the clicked
+/// id, restore the prompt and the clicked message's attachments, then refresh
+/// the sidebar. Failures stay silent: `HouseChat` declares `notification` but
+/// never renders it, so the React UI shows nothing either.
+fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
+    let cut = result
+        .rows
+        .iter()
+        .position(|row| row.key == result.row_id)
+        .unwrap_or(result.rows.len());
+    s.rows = result.rows[..cut]
+        .iter()
+        .map(crate::rune_canvas::row_from_chat)
+        .collect();
+    s.edit.replace_text(result.prompt);
+    s.draft_attachments = result.attachments;
+    s.attachments_error = None;
+    s.attachment_preview = None;
+    s.rewind_armed.clear();
+    s.live = false;
+    s.aborting = false;
+    s.run_started_ms = None;
+    s.refresh_list = true;
 }
 
 impl HomeRows {
@@ -1541,18 +2264,28 @@ impl HomeRows {
             }
         }
         let mut dividers = vec![None; rows.len()];
+        let mut retry_prompts = vec![String::new(); rows.len()];
         let mut previous_day = String::new();
+        let mut last_user = String::new();
         for i in 0..rows.len() {
             if !visible[i] {
                 continue;
             }
+            if rows[i].role == "user" && !raw_of(&rows[i]).trim().is_empty() {
+                last_user = raw_of(&rows[i]).to_string();
+            }
+            retry_prompts[i] = last_user.clone();
             let day = day_key(&rows[i].at);
             if !day.is_empty() && day != previous_day {
                 dividers[i] = Some(day_label(&rows[i].at));
             }
             previous_day = day;
         }
-        Self { visible, dividers }
+        Self {
+            visible,
+            dividers,
+            retry_prompts,
+        }
     }
 }
 
@@ -1672,17 +2405,6 @@ fn home_icon_alert(size: f32, color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
-fn home_icon_button(key: String, label: &'static str, size: f32, icon: rune::Shape) -> El {
-    rune::el()
-        .key(key)
-        .role("button")
-        .label(label)
-        .size(size, size)
-        .radius(6.0)
-        .center()
-        .child(rune::el().size(12.0, 12.0).inert().shape(icon))
-}
-
 /// `chat-date-divider`: hairlines fading from the edges + uppercase pill.
 fn home_divider(label: &str) -> El {
     let line = || {
@@ -1724,7 +2446,9 @@ fn home_divider(label: &str) -> El {
 
 fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData, max_w: f32) -> El {
     let stamp = clock(&r.at);
-    let bubble = col()
+    let copied = s.thread(which).copied_messages.contains_key(&r.key);
+    let armed = s.thread(which).rewind_armed.contains_key(&r.key);
+    let mut bubble = col()
         .key(format!("{}-bubble", r.key))
         .radius(14.0)
         .linear_gradient(
@@ -1738,12 +2462,17 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         .border_layout()
         .px(16.0)
         .py(10.0)
-        .max_w(max_w)
-        .child(
+        .max_w(max_w);
+    if !r.body.trim().is_empty() {
+        bubble = bubble.child(
             render_body_styled::<S>(s, which, &r.key, &r.body, "#e4e4e7", home_body_style())
                 .pt(12.0)
                 .pb(12.0),
         );
+    }
+    if let Some(attachments) = home_message_attachments::<S>(s, which, r) {
+        bubble = bubble.child(attachments);
+    }
     let mut actions = row()
         .key(format!("{}-actions", r.key))
         .w_full()
@@ -1764,19 +2493,86 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
                 .color(home_ink("#52525b")),
         );
     }
-    actions = actions
-        .child(home_icon_button(
-            format!("{}-copy", r.key),
-            "Copy message",
-            24.0,
-            home_icon_copy(12.0, home_ink("#52525b")),
-        ))
-        .child(home_icon_button(
-            format!("{}-rewind", r.key),
-            "Rewind to this message",
-            24.0,
-            home_icon_rotate(12.0, home_ink("#52525b")),
-        ));
+    let copy_key = r.key.clone();
+    let copy_text = raw_of(r).to_string();
+    actions = actions.child(
+        rune::el()
+            .key(format!("{}-copy", r.key))
+            .role("button")
+            .label(if copied { "Copied" } else { "Copy message" })
+            .size(24.0, 24.0)
+            .radius(6.0)
+            .center()
+            .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
+            .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+                copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
+            })
+            .child(rune::el().size(12.0, 12.0).inert().shape(if copied {
+                crate::lucide_check(12.0, 2.0, home_ink("#34d399"))
+            } else {
+                home_icon_copy(12.0, home_ink("#52525b"))
+            })),
+    );
+    if armed {
+        let rewind_key = r.key.clone();
+        let rewind_attachments = r.attachments.clone();
+        actions = actions.child(
+            row()
+                .key(format!("{}-rewind", r.key))
+                .role("button")
+                .label("Confirm rewind")
+                .items_center()
+                .gap(4.0)
+                .h(24.0)
+                .px(8.0)
+                .radius(6.0)
+                .fill(home_rgba(239.0, 68.0, 68.0, 0.15))
+                .hover(home_rgba(239.0, 68.0, 68.0, 0.22))
+                .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+                    start_rewind(
+                        s.thread_mut(which),
+                        rewind_key.clone(),
+                        rewind_attachments.clone(),
+                    );
+                })
+                .child(
+                    rune::el()
+                        .size(11.0, 11.0)
+                        .inert()
+                        .shape(home_icon_rotate(11.0, home_ink("#fca5a5"))),
+                )
+                .child(
+                    text("Rewind?".to_string())
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(10.0, 600.0);
+                            style.line_height = 15.0;
+                            style
+                        })
+                        .color(home_ink("#fca5a5")),
+                ),
+        );
+    } else {
+        let rewind_key = r.key.clone();
+        actions = actions.child(
+            rune::el()
+                .key(format!("{}-rewind", r.key))
+                .role("button")
+                .label("Rewind to this message")
+                .size(24.0, 24.0)
+                .radius(6.0)
+                .center()
+                .hover(home_rgba(239.0, 68.0, 68.0, 0.1))
+                .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+                    arm_rewind(s, which, &rewind_key, tx);
+                })
+                .child(
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(home_icon_rotate(12.0, home_ink("#52525b"))),
+                ),
+        );
+    }
     col()
         .key(format!("{}-group", r.key))
         .w_full()
@@ -1790,6 +2586,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
     which: Thread,
     r: &RowData,
     live: bool,
+    retry_prompt: &str,
 ) -> El {
     let streaming = r.is_streaming || (live && r.accum.is_some());
     let presentation = if let Some(acc) = &r.accum {
@@ -1953,7 +2750,14 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         }
         group = group.child(footer);
     }
-    group.child(home_agent_actions(r))
+    group.child(home_agent_actions(
+        s,
+        which,
+        r,
+        &final_text,
+        streaming,
+        retry_prompt,
+    ))
 }
 
 /// `compactTokens` (`SessionEventDivider`): `1240` → `1.2k`, `2M` → `2.0M`.
@@ -1983,8 +2787,17 @@ fn thousands(n: u64) -> String {
 }
 
 /// Hover-revealed agent actions (React reserves the 25pt row at rest).
-fn home_agent_actions(r: &RowData) -> El {
-    row()
+/// Retry hides while the answer streams; copy always stays. Agent copy has
+/// no Check feedback (React writes to the clipboard only).
+fn home_agent_actions<S: TranscriptHost + 'static>(
+    _s: &S,
+    which: Thread,
+    r: &RowData,
+    response: &str,
+    streaming: bool,
+    retry_prompt: &str,
+) -> El {
+    let mut actions = row()
         .key(format!("{}-actions", r.key))
         .w_full()
         .h(25.0)
@@ -1992,19 +2805,50 @@ fn home_agent_actions(r: &RowData) -> El {
         .items_center()
         .gap(2.0)
         .mt(8.0)
-        .group_opacity(0.0, 1.0)
-        .child(home_icon_button(
-            format!("{}-retry", r.key),
-            "Retry — re-run the last request",
-            25.0,
-            home_icon_rotate(12.0, home_ink("#71717a")),
-        ))
-        .child(home_icon_button(
-            format!("{}-copy", r.key),
-            "Copy to clipboard",
-            25.0,
-            home_icon_copy(12.0, home_ink("#71717a")),
-        ))
+        .group_opacity(0.0, 1.0);
+    if !streaming {
+        let prompt = retry_prompt.to_string();
+        actions = actions.child(
+            rune::el()
+                .key(format!("{}-retry", r.key))
+                .role("button")
+                .label("Retry — re-run the last request")
+                .size(25.0, 25.0)
+                .radius(6.0)
+                .center()
+                .hover(home_ink("#27272a"))
+                .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+                    stage_send_prompt(s.thread_mut(which), prompt.clone());
+                })
+                .child(
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(home_icon_rotate(12.0, home_ink("#71717a"))),
+                ),
+        );
+    }
+    let copy_text = response.to_string();
+    let copy_key = r.key.clone();
+    actions.child(
+        rune::el()
+            .key(format!("{}-copy", r.key))
+            .role("button")
+            .label("Copy to clipboard")
+            .size(25.0, 25.0)
+            .radius(6.0)
+            .center()
+            .hover(home_ink("#27272a"))
+            .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+                copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
+            })
+            .child(
+                rune::el()
+                    .size(12.0, 12.0)
+                    .inert()
+                    .shape(home_icon_copy(12.0, home_ink("#71717a"))),
+            ),
+    )
 }
 
 /// `MessageBubble` system note (`.system-message-note`).
@@ -2045,7 +2889,13 @@ fn home_system_row(r: &RowData) -> El {
         )
 }
 
-fn home_error_row(r: &RowData) -> El {
+fn home_error_row<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    r: &RowData,
+    retry_prompt: &str,
+) -> El {
+    let copied = s.thread(which).copied_messages.contains_key(&r.key);
     let mut body_style = rune::tok::TextStyle::new(13.0, 400.0);
     body_style.line_height = 13.0 * 1.625;
     let body = text(r.body.clone())
@@ -2053,6 +2903,7 @@ fn home_error_row(r: &RowData) -> El {
         .font(body_style)
         .wrap_anywhere()
         .color(home_rgba(252.0, 165.0, 165.0, 0.9));
+    let retry_prompt = retry_prompt.to_string();
     let retry = row()
         .key(format!("{}-retry", r.key))
         .role("button")
@@ -2065,6 +2916,9 @@ fn home_error_row(r: &RowData) -> El {
         .border(1.0, home_rgba(248.0, 113.0, 113.0, 0.15))
         .border_layout()
         .fill(home_rgba(248.0, 113.0, 113.0, 0.06))
+        .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+            stage_send_prompt(s.thread_mut(which), retry_prompt.clone());
+        })
         .child(
             rune::el()
                 .size(10.0, 10.0)
@@ -2080,23 +2934,28 @@ fn home_error_row(r: &RowData) -> El {
                 })
                 .color(home_rgba(254.0, 202.0, 202.0, 0.9)),
         );
+    let copy_key = r.key.clone();
+    let copy_text = r.body.clone();
     let copy = row()
         .key(format!("{}-copy", r.key))
         .role("button")
-        .label("Copy")
+        .label(if copied { "Copied" } else { "Copy" })
         .items_center()
         .gap(4.0)
         .px(8.0)
         .py(4.0)
         .radius(6.0)
+        .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
+        .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+            copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
+        })
+        .child(rune::el().size(10.0, 10.0).inert().shape(if copied {
+            crate::lucide_check(10.0, 2.0, home_ink("#34d399"))
+        } else {
+            home_icon_copy(10.0, home_ink("#71717a"))
+        }))
         .child(
-            rune::el()
-                .size(10.0, 10.0)
-                .inert()
-                .shape(home_icon_copy(10.0, home_ink("#71717a"))),
-        )
-        .child(
-            text("Copy".to_string())
+            text(if copied { "Copied" } else { "Copy" }.to_string())
                 .font({
                     let mut style = rune::tok::TextStyle::new(10.0, 400.0);
                     style.line_height = 15.0;
@@ -2175,7 +3034,11 @@ fn home_icon_archive(size: f32, color: rune::Color) -> rune::Shape {
 
 /// `SessionEventDivider` (`MessageBubble.tsx` + `.session-event*` CSS): the
 /// hairline-framed "Session aborted / compacted" status row.
-fn home_session_event(r: &RowData) -> El {
+fn home_session_event<S: TranscriptHost + 'static>(
+    r: &RowData,
+    which: Thread,
+    retry_prompt: &str,
+) -> El {
     let aborted = r.event == "aborted";
     let line = || {
         rune::el().grow(1.0).h(1.0).linear_gradient(
@@ -2276,6 +3139,7 @@ fn home_session_event(r: &RowData) -> El {
         );
     }
     if aborted {
+        let retry_prompt = retry_prompt.to_string();
         main = main.child(
             row()
                 .key(format!("{}-retry", r.key))
@@ -2291,6 +3155,9 @@ fn home_session_event(r: &RowData) -> El {
                 .border_layout()
                 .fill(home_rgba(255.0, 255.0, 255.0, 0.04))
                 .hover(home_rgba(255.0, 255.0, 255.0, 0.1))
+                .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+                    stage_send_prompt(s.thread_mut(which), retry_prompt.clone());
+                })
                 .child(
                     rune::el()
                         .size(10.0, 10.0)
@@ -2344,14 +3211,15 @@ fn home_row<S: TranscriptHost + 'static>(
         return root;
     }
     let live = t.live && i + 1 == t.rows.len() && r.role != "user" && r.role != "error";
+    let retry_prompt = meta.retry_prompts[i].clone();
     let group = if !r.event.is_empty() {
-        home_session_event(r)
+        home_session_event::<S>(r, which, &retry_prompt)
     } else {
         match r.role {
             "user" => home_user_row::<S>(s, which, r, max_w),
-            "error" => home_error_row(r),
+            "error" => home_error_row::<S>(s, which, r, &retry_prompt),
             "system" => home_system_row(r),
-            _ => home_agent_row::<S>(s, which, r, live),
+            _ => home_agent_row::<S>(s, which, r, live, &retry_prompt),
         }
     };
     root.child(group)
@@ -2808,6 +3676,11 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
             // home card has no model dropup (React renders provider only).
             models: if dock_compact { &[] } else { &s.models },
             model_open: s.model_open,
+            attachments: &s.draft_attachments,
+            attachments_error: s.attachments_error.as_deref(),
+            attachments_dragging: s.attachments_dragging,
+            workspace_id: &s.workspace_id,
+            chat_id: &s.chat_id,
         },
         super::composer::ComposerButtons {
             voice: std::rc::Rc::new(move |s: &mut S| {
@@ -2840,6 +3713,18 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
             }),
             config: std::rc::Rc::new(move |s: &mut S| {
                 crate::agent_config::open_agent_config(&mut s.thread_mut(which).agent_config);
+            }),
+            attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
+                open_attachment_picker(s, which, tx);
+            }),
+            remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
+                remove_draft_attachment(s.thread_mut(which), &target);
+            }),
+            drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
+                drop_attachment_files(s.thread_mut(which), files);
+            }),
+            drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
+                s.thread_mut(which).attachments_dragging = over;
             }),
         },
     );
@@ -2882,6 +3767,19 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
             root = root.child(super::agent_config::agent_config_sheet::<S>(
                 &s.agent_config,
                 which,
+            ));
+        }
+        if let Some(file) = s.attachment_preview.clone() {
+            let (w, h) = transcript_window();
+            root = root.child(attachment_lightbox::<S>(
+                &file,
+                w,
+                h,
+                &s.workspace_id,
+                &s.chat_id,
+                move |s: &mut S| {
+                    s.thread_mut(which).attachment_preview = None;
+                },
             ));
         }
     }
@@ -3006,9 +3904,80 @@ fn apply_voice(s: &mut RuneTranscriptState) {
     s.voice.level = 0.6;
 }
 
+fn apply_attachments(s: &mut RuneTranscriptState) {
+    *s = attachments_demo();
+}
+
+/// Composer attachment deck proof: image thumbnail (real PNG asset), file and
+/// audio chips, the count, amber error line and the attachment-only send key;
+/// plus a persisted user turn with message cards.
+pub fn attachments_demo() -> RuneTranscriptState {
+    let mut s = RuneTranscriptState::screenshot();
+    s.live = false;
+    s.draft_attachments = vec![
+        ChatAttachment {
+            id: "demo-plan".to_string(),
+            name: "quarterly-plan.pdf".to_string(),
+            file_type: "application/pdf".to_string(),
+            size: 1_240_000,
+            path: String::new(),
+            is_image: false,
+            url: None,
+        },
+        ChatAttachment {
+            id: String::new(),
+            name: "attachment-sample.png".to_string(),
+            file_type: "image/png".to_string(),
+            size: 667,
+            path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets/attachment-sample.png").to_string(),
+            is_image: true,
+            url: None,
+        },
+        ChatAttachment {
+            id: "demo-voice".to_string(),
+            name: "voice-note.mp3".to_string(),
+            file_type: "audio/mpeg".to_string(),
+            size: 482_000,
+            path: String::new(),
+            is_image: false,
+            url: None,
+        },
+    ];
+    s.attachments_error = Some("Files must be 20 MB or smaller.".to_string());
+    // A persisted user turn exercises the message cards, not just the deck.
+    let mut row = RowData::default();
+    row.key = "demo-user-attachments".to_string();
+    row.role = "user";
+    row.body = "Here are the files for this pass.".to_string();
+    row.raw_body = row.body.clone();
+    row.at = "2026-11-12T12:04:00Z".to_string();
+    row.attachments = vec![
+        ChatAttachment {
+            id: "demo-msg-image".to_string(),
+            name: "attachment-sample.png".to_string(),
+            file_type: "image/png".to_string(),
+            size: 667,
+            path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets/attachment-sample.png").to_string(),
+            is_image: true,
+            url: None,
+        },
+        ChatAttachment {
+            id: "demo-msg-pdf".to_string(),
+            name: "quarterly-plan.pdf".to_string(),
+            file_type: "application/pdf".to_string(),
+            size: 1_240_000,
+            path: String::new(),
+            is_image: false,
+            url: None,
+        },
+    ];
+    s.rows.push(row);
+    s
+}
+
 /// `poll` hook: drain run frames queued by the transport thread into rows.
 /// Returns true when state changed (requests another frame).
-pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune::Tx) -> bool {
+pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = false;
     // `Markdown.tsx`'s copy button shows the Check for 1.8s.
     if s.copied_at
@@ -3017,6 +3986,43 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, _tx: &mut rune:
         s.copied_code = None;
         s.copied_at = None;
         changed = true;
+    }
+    // Message copy (1.5s) and rewind arming (3.2s) are simple expiries.
+    let now = std::time::Instant::now();
+    let copied_before = s.copied_messages.len();
+    s.copied_messages
+        .retain(|_, at| now.duration_since(*at) < std::time::Duration::from_millis(1500));
+    let armed_before = s.rewind_armed.len();
+    s.rewind_armed
+        .retain(|_, at| now.duration_since(*at) < std::time::Duration::from_millis(3200));
+    if s.copied_messages.len() != copied_before || s.rewind_armed.len() != armed_before {
+        changed = true;
+    }
+    if !s.copied_messages.is_empty() || !s.rewind_armed.is_empty() {
+        tx.wake_after(std::time::Duration::from_millis(50));
+    }
+    // Detaching the live run may leave the view at rest, so keep a poll
+    // ticket alive until the blocking `/rewind` result lands.
+    if s.rewind_inbox.is_some() {
+        tx.wake_after(std::time::Duration::from_millis(50));
+    }
+    // `/rewind` result: fetched history replaces the detached live rows.
+    match s.rewind_inbox.as_ref().map(|rx| rx.try_recv()) {
+        Some(Ok(Ok(result))) => {
+            s.rewind_inbox = None;
+            apply_rewind(s, result);
+            changed = true;
+        }
+        Some(Ok(Err(_message))) => {
+            // No visible error banner in React's HouseChat.
+            s.rewind_inbox = None;
+            changed = true;
+        }
+        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+            s.rewind_inbox = None;
+            changed = true;
+        }
+        Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
     }
     while let Some(frame) = s.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
         crate::stream::apply_frame(s, &frame);
@@ -3068,8 +4074,10 @@ pub fn spec() -> AppSpec<RuneTranscriptState> {
             ("stress", apply_stress),
             ("settings", apply_settings),
             ("voice", apply_voice),
+            ("attachments", apply_attachments),
         ],
         poll: Some(drain_run_inbox),
+        setup: Some(crate::image_cache::setup::<RuneTranscriptState>),
         fonts: &[include_bytes!("../assets/InterVariable.ttf")],
         families: ("Inter", "ui-monospace"),
         ..AppSpec::new(
@@ -3563,6 +4571,272 @@ mod tests {
         for key in ["msg-1-b0-p", "msg-1-b1-code", "msg-1-b1-code-body"] {
             assert!(rt.find(key).is_some(), "{key} mounted");
         }
+    }
+
+    #[test]
+    fn attachment_deck_mounts_and_remove_wires() {
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        init.draft_attachments = vec![
+            ChatAttachment {
+                id: "att-1".to_string(),
+                name: "notes.md".to_string(),
+                file_type: "text/markdown".to_string(),
+                size: 2048,
+                path: String::new(),
+                is_image: false,
+                url: None,
+            },
+            ChatAttachment {
+                id: String::new(),
+                name: "photo.png".to_string(),
+                file_type: "image/png".to_string(),
+                size: 4096,
+                path: "no-such-photo.png".to_string(),
+                is_image: true,
+                url: None,
+            },
+            ChatAttachment {
+                id: String::new(),
+                name: "notes.md".to_string(),
+                file_type: "text/plain; charset=utf-8".to_string(),
+                size: 512,
+                path: String::new(),
+                is_image: false,
+                url: None,
+            },
+        ];
+        let mut rt = Runtime::new(init, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        for key in [
+            "composer-attachment-deck",
+            "composer-file-att-1",
+            "composer-file-local-1",
+            "composer-file-local-2",
+            "composer-file-thumb-local-1",
+            "composer-file-thumb-local-2",
+            "composer-attachment-add",
+            "composer-attachment-count",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        // Local draft cards have no upload id yet; the index keeps their
+        // thumbs and copy blocks keyed uniquely.
+        assert!(rt.find("composer-file-thumb-").is_none());
+        // Attachments count as content: the violet send arrow, not Stop.
+        assert!(rt.find("composer-send").is_some());
+        assert!(rt.find("composer-stop").is_none());
+        // Remove the local card (index target) then the restored upload.
+        let (x, y) = rt.find("composer-file-remove-local-1").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.draft_attachments.len(), 2);
+        assert_eq!(rt.state.draft_attachments[0].id, "att-1");
+        assert_eq!(rt.state.draft_attachments[1].name, "notes.md");
+        // The surviving local pick reindexes from 2 to 1.
+        let (x, y) = rt.find("composer-file-remove-local-1").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.draft_attachments.len(), 1);
+        assert_eq!(rt.state.draft_attachments[0].id, "att-1");
+        let (x, y) = rt.find("composer-file-remove-att-1").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(rt.state.draft_attachments.is_empty());
+        assert!(rt.find("composer-attachment-deck").is_none());
+        assert!(rt.find("composer-file-att-1").is_none());
+        // The empty deck drops back to the disabled arrow, never Stop.
+        assert!(rt.find("composer-send").is_some());
+        assert!(rt.find("composer-stop").is_none());
+    }
+
+    /// The home transcript with the shell's root lightbox, for tests that need
+    /// the persisted user-row cards (the standalone sheet body has none).
+    fn home_attachments_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
+        let mut root = col().key("test-home-root").w_full().h_full().fill(bg());
+        root = root.child(home_transcript_body::<RuneTranscriptState>(
+            s,
+            Thread::Main,
+            468.0,
+            720.0,
+        ));
+        if let Some(file) = s.attachment_preview.clone() {
+            root = root.child(attachment_lightbox::<RuneTranscriptState>(
+                &file,
+                468.0,
+                720.0,
+                &s.workspace_id,
+                &s.chat_id,
+                |s: &mut RuneTranscriptState| {
+                    s.attachment_preview = None;
+                },
+            ));
+        }
+        root
+    }
+
+    #[test]
+    fn message_image_opens_and_closes_lightbox() {
+        let env = Env::new(true, 2.0);
+        let mut init = RuneTranscriptState::screenshot();
+        init.live = false;
+        let mut row = RowData::default();
+        row.key = "u-att".to_string();
+        row.role = "user";
+        row.body = "Here are the files.".to_string();
+        row.raw_body = row.body.clone();
+        row.at = "2026-11-12T12:04:00Z".to_string();
+        row.attachments = vec![
+            ChatAttachment {
+                id: "img-1".to_string(),
+                name: "attachment-sample.png".to_string(),
+                file_type: "image/png".to_string(),
+                size: 667,
+                path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets/attachment-sample.png")
+                    .to_string(),
+                is_image: true,
+                url: None,
+            },
+            ChatAttachment {
+                id: "pdf-1".to_string(),
+                name: "quarterly-plan.pdf".to_string(),
+                file_type: "application/pdf".to_string(),
+                size: 1_240_000,
+                path: String::new(),
+                is_image: false,
+                url: None,
+            },
+        ];
+        init.rows.push(row);
+        let mut rt = Runtime::new(init, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        for key in ["u-att-attachments", "u-att-file-img-1", "u-att-file-pdf-1"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        let (x, y) = rt.find("u-att-file-img-1").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.attachment_preview.as_ref().map(|f| f.id.as_str()),
+            Some("img-1")
+        );
+        assert!(rt.find("message-lightbox").is_some());
+        assert!(rt.find("message-lightbox-close").is_some());
+        let (x, y) = rt.find("message-lightbox-close").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(rt.state.attachment_preview.is_none());
+        assert!(rt.find("message-lightbox").is_none());
+    }
+
+    #[test]
+    fn attachment_limits_match_promptdock() {
+        let dir = std::env::temp_dir().join(format!(
+            "stark-attach-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<std::path::PathBuf> = (0..10)
+            .map(|i| {
+                let path = dir.join(format!("f{i}.txt"));
+                std::fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect();
+        let mut s = RuneTranscriptState::screenshot();
+        s.draft_attachments.clear();
+        add_attachment_paths(&mut s, &paths);
+        assert_eq!(s.draft_attachments.len(), MAX_ATTACHMENTS);
+        assert_eq!(
+            s.attachments_error.as_deref(),
+            Some("You can attach up to 8 files at once.")
+        );
+        // Duplicates are dropped and re-report the cap, like React's
+        // `next.length < current.length + valid.length` check.
+        add_attachment_paths(&mut s, &paths[..1]);
+        assert_eq!(s.draft_attachments.len(), MAX_ATTACHMENTS);
+        assert_eq!(
+            s.attachments_error.as_deref(),
+            Some("You can attach up to 8 files at once.")
+        );
+        remove_draft_attachment(&mut s, "local:0");
+        assert_eq!(s.draft_attachments.len(), MAX_ATTACHMENTS - 1);
+        assert!(s.attachments_error.is_none(), "cap note clears");
+        // Unknown ids are a no-op.
+        remove_draft_attachment(&mut s, "att-missing");
+        assert_eq!(s.draft_attachments.len(), MAX_ATTACHMENTS - 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_truncates_before_clicked_and_restores_draft() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.live = true;
+        s.aborting = true;
+        s.run_started_ms = Some(1.0);
+        s.refresh_list = false;
+        s.rewind_armed
+            .insert("u2".to_string(), std::time::Instant::now());
+        s.attachment_preview = Some(ChatAttachment {
+            id: "old".to_string(),
+            name: "old.png".to_string(),
+            file_type: "image/png".to_string(),
+            size: 1,
+            path: String::new(),
+            is_image: true,
+            url: None,
+        });
+        let restored = ChatAttachment {
+            id: "pdf-1".to_string(),
+            name: "quarterly-plan.pdf".to_string(),
+            file_type: "application/pdf".to_string(),
+            size: 1_240_000,
+            path: String::new(),
+            is_image: false,
+            url: None,
+        };
+        let row = |key: &str, role: &str, body: &str| ChatMsgRow {
+            key: key.to_string(),
+            role: role.to_string(),
+            body: body.to_string(),
+            raw_body: body.to_string(),
+            ..ChatMsgRow::default()
+        };
+        apply_rewind(
+            &mut s,
+            RewindOk {
+                row_id: "u2".to_string(),
+                prompt: "edited prompt".to_string(),
+                attachments: vec![restored.clone()],
+                rows: vec![
+                    row("u1", "user", "first"),
+                    row("a1", "agent", "answer"),
+                    row("u2", "user", "clicked"),
+                    row("a2", "agent", "after"),
+                ],
+            },
+        );
+        // Everything from the clicked message on is gone, like React's
+        // defensive slice before `message_id`.
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.rows[0].key, "u1");
+        assert_eq!(s.rows[1].key, "a1");
+        assert_eq!(s.edit.text, "edited prompt");
+        assert_eq!(s.draft_attachments, vec![restored]);
+        assert!(s.attachments_error.is_none());
+        assert!(s.attachment_preview.is_none());
+        assert!(s.rewind_armed.is_empty());
+        assert!(!s.live);
+        assert!(!s.aborting);
+        assert!(s.run_started_ms.is_none());
+        assert!(s.refresh_list);
     }
 
     #[test]

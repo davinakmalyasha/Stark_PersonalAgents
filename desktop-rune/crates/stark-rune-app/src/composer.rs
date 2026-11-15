@@ -12,15 +12,19 @@ fn ink(hex: &'static str) -> rune::Color {
 
 /// Boxed press handler (keeps the card signature small).
 pub type Press<S> = std::rc::Rc<dyn Fn(&mut S)>;
+/// Boxed press handler that needs the transaction (file dialogs).
+pub type PressTx<S> = std::rc::Rc<dyn Fn(&mut S, &mut Tx)>;
 /// Boxed pick handler (model rows carry their id).
 pub type Pick<S> = std::rc::Rc<dyn Fn(&mut S, String)>;
+/// Boxed file-drop handler (OS paths).
+pub type DropFiles<S> = std::rc::Rc<dyn Fn(&mut S, &[std::path::PathBuf])>;
+/// Boxed drag-hover handler (`is-dragging` highlight).
+pub type DropHover<S> = std::rc::Rc<dyn Fn(&mut S, bool)>;
 
 /// Level meter: five bars lit by bucket, plus the capture note (no-device
 /// reason) when present. Mounted beside the voice toggle while live.
-fn attach_button() -> El {
-    // `.tool-button` (Plus 18): React's file picker. Rune has no attachment
-    // pipeline yet, so the control is present but inert — the dock's shape
-    // still matches HouseChat.
+fn attach_button<S: 'static>(attach: PressTx<S>) -> El {
+    // `.tool-button` (Plus 18): React's file picker.
     let color = ink("#b4b4bc");
     let plus = rune::Shape::new()
         .line(
@@ -45,8 +49,151 @@ fn attach_button() -> El {
         .size(30.0, 30.0)
         .radius(10.0)
         .center()
-        .inert()
+        .hover(ink("#ffffff12"))
+        .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
         .child(rune::el().size(18.0, 18.0).inert().shape(plus))
+}
+
+/// Deck thumbnail (`LocalFileThumb`/`RestoredFileThumb`): 30×30 picture chip
+/// or the matching audio/file icon.
+fn attachment_thumb(
+    file: &super::chats::ChatAttachment,
+    id: &str,
+    workspace_id: &str,
+    chat_id: &str,
+) -> El {
+    let icon = if file.is_image {
+        crate::lucide_image(16.0, ink("#c9c9d1"))
+    } else if file.is_audio() {
+        crate::lucide_audio_lines(16.0, ink("#d4d4da"))
+    } else {
+        crate::lucide_file_text(16.0, ink("#c4c4cb"))
+    };
+    let mut chip = rune::el()
+        .key(format!("composer-file-thumb-{id}"))
+        .size(30.0, 30.0)
+        .radius(9.0)
+        .clip_rounded(9.0)
+        .fill(if file.is_image {
+            ink("#ffffff12")
+        } else {
+            ink("#ffffff14")
+        })
+        .center();
+    if file.is_image {
+        if let Some(image) = crate::image_cache::attachment(file, 30.0, workspace_id, chat_id) {
+            return chip.child(
+                rune::el()
+                    .size(30.0, 30.0)
+                    .pixels_fit(image.pixels(), rune::SurfaceFit::Fill)
+                    .inert(),
+            );
+        }
+    }
+    chip = chip.child(rune::el().size(16.0, 16.0).inert().shape(icon));
+    chip
+}
+
+/// `attachment-card`: picture/icon chip, name + kind · size, remove button.
+fn attachment_card<S: 'static>(
+    file: &super::chats::ChatAttachment,
+    index: usize,
+    workspace_id: &str,
+    chat_id: &str,
+    remove: Pick<S>,
+) -> El {
+    let id = if file.id.is_empty() {
+        format!("local-{index}")
+    } else {
+        file.id.clone()
+    };
+    let name_style = rune::tok::TextStyle::new(12.0, 500.0);
+    let meta_style = rune::tok::TextStyle::new(10.0, 400.0);
+    let label = format!("{} · {}", file.kind_label(), file.size_label());
+    let target = if file.id.is_empty() {
+        format!("local:{index}")
+    } else {
+        file.id.clone()
+    };
+    row()
+        .key(format!("composer-file-{id}"))
+        .min_w(178.0)
+        .max_w(236.0)
+        .items_center()
+        .gap(8.0)
+        .px(8.0)
+        .py(8.0)
+        .radius(12.0)
+        .border(1.0, ink("#ffffff17"))
+        .border_layout()
+        .fill(ink("#0a0a0c70"))
+        .child(attachment_thumb(file, &id, workspace_id, chat_id))
+        .child(
+            col()
+                .key(format!("composer-file-copy-{id}"))
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(file.name.clone())
+                        .min_w(0.0)
+                        .truncate()
+                        .font(name_style)
+                        .color(ink("#e4e4e7")),
+                )
+                .child(text(label).font(meta_style).color(ink("#71717a"))),
+        )
+        .child(
+            rune::el()
+                .key(format!("composer-file-remove-{id}"))
+                .role("button")
+                .label(format!("Remove {}", file.name))
+                .size(21.0, 21.0)
+                .radius(8.0)
+                .center()
+                .hover(ink("#ffffff17"))
+                .on_press(move |s: &mut S| remove(s, target.clone()))
+                .child(rune::el().size(13.0, 13.0).inert().shape(crate::lucide_x(
+                    13.0,
+                    2.0,
+                    ink("#777782"),
+                ))),
+        )
+}
+
+/// `.attachment-add`: dashed tile matching a card's height.
+fn attachment_add<S: 'static>(attach: PressTx<S>) -> El {
+    rune::el()
+        .key("composer-attachment-add")
+        .role("button")
+        .label("Add files")
+        .min_w(38.0)
+        .min_h(48.0)
+        .radius(8.0)
+        .border(1.0, ink("#ffffff2b"))
+        .border_dash(4.0, 3.0)
+        .border_layout()
+        .center()
+        .hover(ink("#ffffff10"))
+        .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
+        .child(rune::el().size(17.0, 17.0).inert().shape({
+            let color = ink("#777782");
+            rune::Shape::new()
+                .line(
+                    [12.0, 5.0],
+                    [12.0, 19.0],
+                    crate::lucide_stroke(17.0),
+                    rune::LineCap::Round,
+                    color,
+                )
+                .line(
+                    [5.0, 12.0],
+                    [19.0, 12.0],
+                    crate::lucide_stroke(17.0),
+                    rune::LineCap::Round,
+                    color,
+                )
+                .view_box(24.0, 24.0)
+        }))
 }
 
 /// Lucide `AudioLines` (16pt) inside the voice toggle.
@@ -128,6 +275,15 @@ pub struct ComposerMeta<'a> {
     pub models: &'a [super::rune_transcript::ModelOption],
     /// Model menu open.
     pub model_open: bool,
+    /// Dock attachments (`files` + `restored` in React — one deck here).
+    pub attachments: &'a [super::chats::ChatAttachment],
+    /// Amber validation/upload line under the input.
+    pub attachments_error: Option<&'a str>,
+    /// A file drag hovers the dock (`is-dragging`).
+    pub attachments_dragging: bool,
+    /// Chat identity for attachment thumbnails (API URL on the web).
+    pub workspace_id: &'a str,
+    pub chat_id: &'a str,
 }
 
 /// Run-target toggle (`radiogroup`): Local active is zinc-on-zinc-800,
@@ -579,8 +735,8 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
 /// run-target toggle, spacer, usage orb (+popover), provider pill, voice
 /// toggle + meter, send/stop. `w_full` — callers set the width. `on_send`
 /// runs on send-button press and field submit; each view wires its own state
-/// type through `edit_of`. No attach button / drop overlay: file pickers and
-/// drag-drop have no Rune target (documented, not faked).
+/// type through `edit_of`. The attach control opens the native picker, and
+/// drag/drop lanes feed the same draft list.
 /// Toolbar handlers, boxed so the card takes six params, not ten.
 pub struct ComposerButtons<S: 'static> {
     pub voice: Press<S>,
@@ -595,6 +751,14 @@ pub struct ComposerButtons<S: 'static> {
     pub stats: Press<S>,
     /// Provider pill → agents & providers modal.
     pub config: Press<S>,
+    /// Attach control (opens the native file dialog).
+    pub attach: PressTx<S>,
+    /// Remove one deck card (`local:<index>` or the upload's id).
+    pub remove_attachment: Pick<S>,
+    /// Files dropped on the dock (mapped to the active thread by the view).
+    pub drop_files: DropFiles<S>,
+    /// Drag enters/leaves the dock (`is-dragging` highlight).
+    pub drop_hover: DropHover<S>,
 }
 
 pub fn composer_card<S: 'static>(
@@ -625,6 +789,9 @@ pub fn composer_card<S: 'static>(
     .placeholder(
         if voice_live {
             "Listening…"
+        } else if !meta.attachments.is_empty() {
+            // PromptDock's deck note; the deck clears it after send.
+            "Add a note about these files…"
         } else {
             "Ask anything"
         },
@@ -644,19 +811,21 @@ pub fn composer_card<S: 'static>(
         true
     })
     .on_submit(submit);
-    // Send / Stop (`.send-button`): violet when a prompt is staged, white at
-    // 72% while empty+idle, rose while running an empty prompt.
+    // Send / Stop (`.send-button`): violet when a prompt or attachment is
+    // staged, white at 72% (disabled) while empty+idle, white with a dark
+    // square while running an empty prompt (the later `index.css` block).
     let has_text = !edit.text.trim().is_empty();
+    let has_content = has_text || !meta.attachments.is_empty();
     let mut send_btn = rune::el()
         .role("button")
         .label(if running { "Stop execution" } else { "Send" })
         .size(34.0, 34.0)
         .radius(17.0)
         .center();
-    if running && !has_text {
+    if running && !has_content {
         send_btn = send_btn
             .key("composer-stop")
-            .fill(ink("#5d3544"))
+            .fill(ink("#ffffff"))
             .on_press({
                 let cancel = buttons.cancel.clone();
                 move |s: &mut S| cancel(s)
@@ -666,9 +835,9 @@ pub fn composer_card<S: 'static>(
                     .size(14.0, 14.0)
                     .inert()
                     .center()
-                    .child(crate::lucide_square_filled(14.0, ink("#ffbac9"))),
+                    .child(crate::lucide_square_filled(14.0, ink("#111113"))),
             );
-    } else if has_text {
+    } else if has_content {
         send_btn = send_btn
             .key("composer-send")
             .linear_gradient(
@@ -690,10 +859,7 @@ pub fn composer_card<S: 'static>(
             .key("composer-send")
             .fill(ink("#ffffff"))
             .opacity(0.72)
-            .on_press({
-                let on_send = buttons.send.clone();
-                move |s: &mut S| on_send(s)
-            })
+            .disabled(true)
             .child(
                 rune::el()
                     .size(16.0, 16.0)
@@ -701,7 +867,8 @@ pub fn composer_card<S: 'static>(
                     .shape(crate::lucide_arrow_up(16.0, 2.4, ink("#111113"))),
             );
     }
-    let card = col()
+    let dragging = meta.attachments_dragging;
+    let mut card = col()
         .key("composer-card")
         .w_full()
         .radius(18.0)
@@ -716,11 +883,37 @@ pub fn composer_card<S: 'static>(
                 r: 1.0,
                 g: 1.0,
                 b: 1.0,
-                a: 0.08,
+                a: if dragging { 0.55 } else { 0.08 },
             },
         )
-        .border_layout()
-        .shadow(
+        .border_layout();
+    if dragging {
+        // `.premium-surface.is-dragging`: lifted ring + scale.
+        card = card.scale(1.008).box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 0.0,
+            blur: 0.0,
+            spread: 3.0,
+            color: rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.08,
+            },
+            inset: false,
+        });
+        card = card.shadow(
+            22.0,
+            60.0,
+            rune::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.38,
+            },
+        );
+    } else {
+        card = card.shadow(
             14.0,
             42.0,
             rune::Color {
@@ -729,101 +922,168 @@ pub fn composer_card<S: 'static>(
                 b: 0.0,
                 a: 0.34,
             },
-        )
-        // React's `.prompt-dock` has no padding of its own: the input wrapper
-        // is 54pt (10/4 + 40pt textarea) and the toolbar 54pt (border + 9/10
-        // + 34pt controls), so the bordered dock is exactly 110pt.
-        .child(
-            col()
-                .key("composer-input-wrap")
-                .w_full()
-                .px(12.0)
-                .pt(10.0)
-                .pb(4.0)
-                .child(rune::auto_grow(input, 1, 8).min_h(40.0).max_h(180.0)),
-        )
-        .child(
-            col()
-                .key("composer-toolbar-wrap")
-                .w_full()
-                .px(12.0)
-                // Toolbar top hairline (`.prompt-toolbar border-top` — Rune
-                // draws all-side borders only, so a 1pt rule stands in).
-                .child(
-                    rune::el()
-                        .key("composer-div")
-                        .w_full()
-                        .h(1.0)
-                        .fill(rune::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.07,
-                        }),
-                )
-                .child(
-                    row()
-                        .key("composer-toolbar")
-                        .w_full()
-                        .items_center()
-                        .px(2.0)
-                        .pt(9.0)
-                        .pb(10.0)
-                        .gap(8.0)
-                        .child(
-                            row()
-                                .key("composer-left")
-                                .items_center()
-                                .gap(4.0)
-                                .child(attach_button())
-                                .child(target_toggle::<S>(
-                                    meta.target,
-                                    {
-                                        let local = buttons.local.clone();
-                                        move |s: &mut S| local(s)
-                                    },
-                                    {
-                                        let cloud = buttons.cloud.clone();
-                                        move |s: &mut S| cloud(s)
-                                    },
-                                )),
-                        )
-                        .child(spacer())
-                        .child(usage_orb::<S>(meta.usage, {
-                            let usage = buttons.usage.clone();
-                            move |s: &mut S| usage(s)
-                        }))
-                        .child(provider_pill(
-                            meta.provider_label,
-                            meta.provider_warn,
-                            buttons.config.clone(),
-                        ))
-                        .child(if meta.models.is_empty() {
-                            // Map dock: no model list (HouseChat never passes
-                            // `onModelChange`). The negative margin cancels
-                            // the flex gap so the right cluster still packs
-                            // provider → voice at 8pt like React.
-                            rune::el()
-                                .key("composer-model-empty")
-                                .size(0.0, 0.0)
-                                .ml(-8.0)
-                                .inert()
-                        } else {
-                            model_dropup::<S>(
-                                meta.model,
-                                meta.models,
-                                meta.model_open,
-                                buttons.model_menu.clone(),
-                                buttons.model_pick.clone(),
-                            )
-                        })
-                        .child(voice_button(voice_live, {
-                            let voice = buttons.voice.clone();
-                            move |s: &mut S| voice(s)
-                        }))
-                        .child(send_btn),
-                ),
         );
+    }
+    // React's dock is its own drop target (`onDragEnter/Leave/Over/Drop`).
+    card = card
+        .accepts_files(|_| true)
+        .on_drop_files({
+            let drop_files = buttons.drop_files.clone();
+            move |s: &mut S, files: &[std::path::PathBuf], _tx: &mut Tx| drop_files(s, files)
+        })
+        .on_drop_hover({
+            let drop_hover = buttons.drop_hover.clone();
+            move |s: &mut S, over: bool, _tx: &mut Tx| drop_hover(s, over)
+        });
+    // `.attachment-deck`: horizontal strip, scrollbar hidden.
+    if !meta.attachments.is_empty() {
+        let mut deck = row()
+            .key("composer-attachment-deck")
+            .role("group")
+            .label("Files ready to send")
+            .w_full()
+            .scroll_x()
+            .items_center()
+            .gap(8.0)
+            .px(12.0)
+            .pt(12.0)
+            .pb(2.0);
+        for (index, file) in meta.attachments.iter().enumerate() {
+            deck = deck.child(attachment_card(
+                file,
+                index,
+                meta.workspace_id,
+                meta.chat_id,
+                buttons.remove_attachment.clone(),
+            ));
+        }
+        deck = deck.child(attachment_add(buttons.attach.clone()));
+        card = card.child(deck);
+    }
+    // React's `.prompt-dock` has no padding of its own: the input wrapper
+    // is 54pt (10/4 + 40pt textarea) and the toolbar 54pt (border + 9/10
+    // + 34pt controls), so the bordered dock is exactly 110pt.
+    card = card.child(
+        col()
+            .key("composer-input-wrap")
+            .w_full()
+            .px(12.0)
+            .pt(10.0)
+            .pb(4.0)
+            .child(rune::auto_grow(input, 1, 8).min_h(40.0).max_h(180.0)),
+    );
+    if let Some(error) = meta.attachments_error {
+        // `mx-4 mb-2 text-[11px] text-amber-300/90`.
+        card = card.child(
+            text(error.to_string())
+                .key("composer-attachments-error")
+                .w_full()
+                .px(16.0)
+                .pb(8.0)
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(ink("#fcd34de6")),
+        );
+    }
+    card = card.child(
+        col()
+            .key("composer-toolbar-wrap")
+            .w_full()
+            .px(12.0)
+            // Toolbar top hairline (`.prompt-toolbar border-top` — Rune
+            // draws all-side borders only, so a 1pt rule stands in).
+            .child(
+                rune::el()
+                    .key("composer-div")
+                    .w_full()
+                    .h(1.0)
+                    .fill(rune::Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.07,
+                    }),
+            )
+            .child(
+                row()
+                    .key("composer-toolbar")
+                    .w_full()
+                    .items_center()
+                    .px(2.0)
+                    .pt(9.0)
+                    .pb(10.0)
+                    .gap(8.0)
+                    .child(
+                        row()
+                            .key("composer-left")
+                            .items_center()
+                            .gap(4.0)
+                            .child(attach_button(buttons.attach.clone()))
+                            .child(target_toggle::<S>(
+                                meta.target,
+                                {
+                                    let local = buttons.local.clone();
+                                    move |s: &mut S| local(s)
+                                },
+                                {
+                                    let cloud = buttons.cloud.clone();
+                                    move |s: &mut S| cloud(s)
+                                },
+                            )),
+                    )
+                    .child(spacer())
+                    .child(if meta.attachments.is_empty() {
+                        // `hidden sm:block` count; empty means a zero-width
+                        // flex item, so cancel one of its two gaps.
+                        rune::el()
+                            .key("composer-attachment-count")
+                            .size(0.0, 0.0)
+                            .ml(-8.0)
+                            .inert()
+                    } else {
+                        text(format!(
+                            "{} attachment{}",
+                            meta.attachments.len(),
+                            if meta.attachments.len() > 1 { "s" } else { "" }
+                        ))
+                        .key("composer-attachment-count")
+                        .font(rune::tok::TextStyle::new(10.0, 400.0))
+                        .color(ink("#52525b"))
+                    })
+                    .child(usage_orb::<S>(meta.usage, {
+                        let usage = buttons.usage.clone();
+                        move |s: &mut S| usage(s)
+                    }))
+                    .child(provider_pill(
+                        meta.provider_label,
+                        meta.provider_warn,
+                        buttons.config.clone(),
+                    ))
+                    .child(if meta.models.is_empty() {
+                        // Map dock: no model list (HouseChat never passes
+                        // `onModelChange`). The negative margin cancels
+                        // the flex gap so the right cluster still packs
+                        // provider → voice at 8pt like React.
+                        rune::el()
+                            .key("composer-model-empty")
+                            .size(0.0, 0.0)
+                            .ml(-8.0)
+                            .inert()
+                    } else {
+                        model_dropup::<S>(
+                            meta.model,
+                            meta.models,
+                            meta.model_open,
+                            buttons.model_menu.clone(),
+                            buttons.model_pick.clone(),
+                        )
+                    })
+                    .child(voice_button(voice_live, {
+                        let voice = buttons.voice.clone();
+                        move |s: &mut S| voice(s)
+                    }))
+                    .child(send_btn),
+            ),
+    );
     let mut card = card;
     if meta.usage_open {
         card = card.child(usage_popover::<S>(meta.usage, buttons.stats.clone()));

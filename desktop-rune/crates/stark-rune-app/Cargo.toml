@@ -36,11 +36,14 @@ web-sys = { version = "=0.3.106", features = [
 ] }
 
 [features]
-# Real Rune rendering. Off by default so headless goldens + unit tests stay
+# Native browser app: the attach button opens the real picker. The web crate
+# disables default features (Rune rejects `native-file-dialog` on wasm32).
+default = ["native-file-dialog"]
 # GPU-free and offline. Enable once the pinned `dev` checkout is fetched:
 # `cargo test -p stark-rune-app --features rune-real`
-default = []
 rune-real = ["dep:rune", "dep:rune-kit"]
+# Weak dependency feature: only reaches Rune when `rune-real` is on.
+native-file-dialog = ["rune?/native-file-dialog"]
 
 [dependencies.rune]
 git = "https://github.com/anomalyco/rune"

@@ -8,7 +8,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-stark-rune-app = { path = "../stark-rune-app", features = ["rune-real"] }
+stark-rune-app = { path = "../stark-rune-app", default-features = false, features = ["rune-real"] }
 
 [dependencies.rune]
 git = "https://github.com/anomalyco/rune"

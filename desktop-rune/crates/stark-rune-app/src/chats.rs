@@ -114,6 +114,116 @@ impl ChatSummary {
     }
 }
 
+/// One uploaded (or restored) file (`ChatAttachment` in `types/index.ts`).
+/// `id` is the server's stored filename; a local draft file has no id until
+/// the composer uploads it. `path` is the on-disk path the backend returns,
+/// which is what the native image cache decodes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChatAttachment {
+    pub id: String,
+    pub name: String,
+    /// MIME type (`file.type` in React).
+    pub file_type: String,
+    pub size: u64,
+    pub path: String,
+    pub is_image: bool,
+    pub url: Option<String>,
+}
+
+impl ChatAttachment {
+    /// Parse one `metadata.attachments` entry; unknown fields are ignored,
+    /// exactly like React reading the typed object.
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            id: str_of(v, "id"),
+            name: str_of(v, "name"),
+            file_type: str_of(v, "type"),
+            size: u64_of(v, "size"),
+            path: str_of(v, "path"),
+            is_image: v
+                .get("isImage")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            url: opt_str_of(v, "url"),
+        }
+    }
+
+    /// Wire shape sent inside the user message metadata and `/api/run`
+    /// (`RunRequest.attachments`). Field order follows the React object.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "type": self.file_type,
+            "size": self.size,
+            "path": self.path,
+            "isImage": self.is_image,
+        });
+        if let Some(url) = &self.url {
+            value["url"] = serde_json::Value::String(url.clone());
+        }
+        value
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.file_type.starts_with("audio/")
+    }
+
+    /// `Image` / `Audio` / the MIME subtype / `File`.
+    pub fn kind_label(&self) -> String {
+        if self.is_image {
+            "Image".to_string()
+        } else if self.is_audio() {
+            "Audio".to_string()
+        } else {
+            self.file_type
+                .split_once('/')
+                .map(|(_, sub)| sub.to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "File".to_string())
+        }
+    }
+
+    /// `formatSize`: 1 KB minimum, `x.x MB` past a megabyte.
+    pub fn size_label(&self) -> String {
+        if self.size < 1024 * 1024 {
+            format!("{} KB", (self.size as f64 / 1024.0).round().max(1.0) as u64)
+        } else {
+            format!("{:.1} MB", self.size as f64 / (1024.0 * 1024.0))
+        }
+    }
+}
+
+/// Browser `File.type` stand-in for a picked path; the backend stores this
+/// MIME with the upload and React's card kind reads from it.
+pub fn mime_for_path(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "csv" => "text/csv; charset=utf-8",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
 /// One transcript row from a chat payload.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatMsgRow {
@@ -164,6 +274,8 @@ pub struct ChatMsgRow {
     pub live_status: Option<crate::stream_accum::RunStatusNotice>,
     /// Per-message usage for the footer/persistence.
     pub run_usage: Option<crate::stream_accum::RunUsage>,
+    /// `metadata.attachments` (`MessageBubble`'s user file cards).
+    pub attachments: Vec<ChatAttachment>,
 }
 
 /// One message ready for `POST …/messages` (assistant completion, partial
@@ -428,6 +540,11 @@ pub(crate) fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                         retry,
                         live_status,
                         run_usage: usage.map(crate::stream_accum::RunUsage::from_json),
+                        attachments: meta
+                            .and_then(|x| x.get("attachments"))
+                            .and_then(|x| x.as_array())
+                            .map(|files| files.iter().map(ChatAttachment::from_json).collect())
+                            .unwrap_or_default(),
                     }
                 })
                 .collect()

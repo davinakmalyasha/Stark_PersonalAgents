@@ -620,6 +620,21 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
             Thread::Open,
         ));
     }
+    if let Some(file) = t.attachment_preview.clone() {
+        // The card clips its content, so the message lightbox lives at the
+        // shell root like React's fixed overlay.
+        let (w, h) = unsafe { (WINDOW_W, WINDOW_H) };
+        sheets.push(crate::rune_transcript::attachment_lightbox::<ShellState>(
+            &file,
+            w,
+            h,
+            &t.workspace_id,
+            &t.chat_id,
+            |s: &mut ShellState| {
+                s.thread_mut(Thread::Open).attachment_preview = None;
+            },
+        ));
+    }
     sheets
 }
 
@@ -822,6 +837,18 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             Thread::Main,
         ));
     }
+    if let Some(file) = s.transcript.attachment_preview.clone() {
+        root = root.child(crate::rune_transcript::attachment_lightbox::<ShellState>(
+            &file,
+            w,
+            h,
+            &s.transcript.workspace_id,
+            &s.transcript.chat_id,
+            |s: &mut ShellState| {
+                s.transcript.attachment_preview = None;
+            },
+        ));
+    }
     for sheet in active_chat_sheets(s) {
         root = root.child(sheet);
     }
@@ -863,19 +890,58 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     }
     // Session threads: drain + sync card flags.
     let ids: Vec<String> = s.canvas.sessions.order.clone();
-    for id in ids {
-        if let Some(thread) = s.canvas.sessions.threads.get_mut(&id) {
+    for id in &ids {
+        if let Some(thread) = s.canvas.sessions.threads.get_mut(id) {
             changed |= drain_run_inbox(thread, clock, tx);
             changed |= crate::notes::poll_notes_state(&mut thread.notes);
             changed |= crate::agent_config::poll_agent_config(&mut thread.agent_config);
             let live = thread.live;
-            if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == id) {
+            if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == *id) {
                 if card.running != live {
                     card.running = live;
                     changed = true;
                 }
             }
         }
+    }
+    // A `chat` SSE frame names the real id for a local draft card. Rekey the
+    // card/tab/thread now so history, abort, rewind and the sidebar all use
+    // the server identity. Main/personal threads have no map card.
+    let rekeys: Vec<(String, String, String)> = ids
+        .iter()
+        .filter_map(|id| {
+            let (workspace, chat) = s.canvas.sessions.threads.get(id)?.pending_rekey.clone()?;
+            Some((id.clone(), workspace, chat))
+        })
+        .collect();
+    for (id, workspace, chat) in rekeys {
+        if s.canvas.rekey_local_chat(&id, &workspace, &chat) {
+            changed = true;
+        } else if let Some(thread) = s.canvas.sessions.threads.get_mut(&id) {
+            thread.pending_rekey = None;
+        }
+    }
+    for thread in [&mut s.transcript, &mut s.personal] {
+        if thread.pending_rekey.take().is_some() {
+            changed = true;
+        }
+    }
+    // Creating a chat / rewinding refreshes the sidebar (`refreshList`).
+    let wants_refresh = s.transcript.refresh_list
+        || s.personal.refresh_list
+        || s.canvas
+            .sessions
+            .threads
+            .values()
+            .any(|thread| thread.refresh_list);
+    if wants_refresh && !s.chats.loading {
+        s.transcript.refresh_list = false;
+        s.personal.refresh_list = false;
+        for thread in s.canvas.sessions.threads.values_mut() {
+            thread.refresh_list = false;
+        }
+        crate::chats::refresh(&mut s.chats);
+        changed = true;
     }
     changed |= s.canvas.voice.drain(1.0 / 60.0);
     changed |= poll_house(s, clock);
@@ -1086,6 +1152,36 @@ fn apply_trace(s: &mut ShellState) {
     open_demo_sheet(s, false);
 }
 
+fn apply_shell_attachments(s: &mut ShellState) {
+    s.canvas.rail = RailTab::Chats;
+    let id = s
+        .canvas
+        .cards
+        .iter()
+        .find(|card| card.id.starts_with("chat:"))
+        .map(|card| card.id.clone());
+    let Some(id) = id else { return };
+    *s.canvas.thread_mut(&id) = crate::rune_transcript::attachments_demo();
+    s.canvas.sessions.sheet = Some(id);
+}
+
+fn apply_shell_attachments_lightbox(s: &mut ShellState) {
+    apply_shell_attachments(s);
+    let Some(id) = s.canvas.sessions.sheet.clone() else {
+        return;
+    };
+    let file = s
+        .canvas
+        .thread_mut(&id)
+        .rows
+        .last()
+        .and_then(|row| row.attachments.first())
+        .cloned();
+    if let Some(file) = file {
+        s.canvas.thread_mut(&id).attachment_preview = Some(file);
+    }
+}
+
 fn apply_panel_memory(s: &mut ShellState) {
     s.canvas.rail = RailTab::Memory;
 }
@@ -1100,6 +1196,8 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("home", apply_home),
         ("stream", apply_stream),
         ("trace", apply_trace),
+        ("attachments", apply_shell_attachments),
+        ("attachments-lightbox", apply_shell_attachments_lightbox),
         ("cloud", apply_panel_cloud),
         ("memory", apply_panel_memory),
         // Compatibility aliases: everything lands on the one page.
@@ -1110,6 +1208,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("design", apply_home),
     ];
     spec.poll = Some(shell_poll);
+    spec.setup = Some(crate::image_cache::setup::<ShellState>);
     spec.fonts = SHELL_FONTS;
     // Chromium's Tailwind mono stack resolves `ui-monospace` to Consolas on
     // Windows; Rune's system-mono list prefers Cascadia Mono, so name the

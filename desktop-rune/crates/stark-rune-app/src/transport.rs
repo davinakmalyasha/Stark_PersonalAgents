@@ -177,6 +177,58 @@ pub fn send_json(
     }
     serde_json::from_slice(&buf).map_err(|e| format!("json: {e}"))
 }
+/// Hand-built `multipart/form-data` upload (the backend's `/attachments`
+/// handler), returning the parsed `{attachments:[…]}` body. Native only:
+/// the picker and local paths exist only there. File reads stay synchronous
+/// because the composer's send is synchronous for the same reason.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn upload_attachments(
+    host: &str,
+    port: u16,
+    workspace_id: &str,
+    chat_id: &str,
+    files: &[std::path::PathBuf],
+) -> Result<serde_json::Value, String> {
+    if files.is_empty() {
+        return Err("no files to upload".to_string());
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let boundary = format!("----stark-rune-{stamp:x}");
+    let mut body = Vec::new();
+    for path in files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("invalid file name: {}", path.display()))?
+            .replace(['"', '\r', '\n'], "_");
+        let mime = crate::chats::mime_for_path(path);
+        let bytes = std::fs::read(path).map_err(|e| format!("read {name}: {e}"))?;
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let head = format!(
+        "Content-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nAccept: application/json\r\n",
+        body.len()
+    );
+    let path = format!("/api/workspaces/{workspace_id}/chats/{chat_id}/attachments");
+    let (mut reader, chunked) = request(host, port, "POST", &path, &head, &body)?;
+    let mut raw = Vec::new();
+    for bytes in read_body(&mut reader, chunked)? {
+        raw.extend_from_slice(&bytes);
+    }
+    serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
+}
+
 /// Create a chat in a workspace (`createChat`): POST title/model, return id.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn create_chat(
@@ -579,6 +631,86 @@ mod tests {
         assert_eq!(out[0].data["text"], serde_json::json!("42 …90.4"));
     }
 
+    /// Multipart upload over a real socket: path, boundary, file part, and
+    /// the parsed attachment ids the composer puts back in its draft deck.
+    #[test]
+    fn upload_attachments_posts_multipart_and_reads_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "stark-upload-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_len = 0usize;
+            let mut content_type = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("Content-Length:") {
+                    content_len = v.trim().parse().unwrap();
+                }
+                if let Some(v) = line.strip_prefix("Content-Type:") {
+                    content_type = v.trim().to_string();
+                }
+            }
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+            assert!(
+                request_line.starts_with("POST /api/workspaces/team/chats/c1/attachments "),
+                "{request_line}"
+            );
+            assert!(
+                content_type.starts_with("multipart/form-data; boundary="),
+                "{content_type}"
+            );
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("name=\"files\"; filename=\"note.txt\""),
+                "{body}"
+            );
+            assert!(body.contains("Content-Type: text/plain"), "{body}");
+            assert!(body.contains("hello"), "{body}");
+            assert!(
+                body.ends_with(&format!(
+                    "--{}--\r\n",
+                    content_type.split('=').nth(1).unwrap()
+                )),
+                "closing boundary"
+            );
+            let json = r#"{"attachments":[{"id":"a1","name":"note.txt","type":"text/plain","size":5,"path":"/tmp/note.txt","isImage":false}]}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+
+        let value =
+            upload_attachments("127.0.0.1", port, "team", "c1", std::slice::from_ref(&path))
+                .unwrap();
+        server.join().unwrap();
+        let files = value["attachments"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["id"], "a1");
+        assert_eq!(files[0]["name"], "note.txt");
+        assert_eq!(files[0]["size"], 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Full client↔server round trip over a real socket with chunked SSE.
     #[test]
     fn post_run_streams_chunked_sse() {
@@ -637,6 +769,7 @@ mod tests {
             workspace_id: "_general".to_string(),
             chat_id: "c1".to_string(),
             workspace_kind: "general".to_string(),
+            attachments: Vec::new(),
         };
         let mut got: Vec<SseFrame> = Vec::new();
         let outcome = post_run("127.0.0.1", port, &req, &mut |f| got.push(f)).unwrap();

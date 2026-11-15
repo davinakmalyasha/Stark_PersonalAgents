@@ -212,6 +212,7 @@ pub(crate) fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcr
         retry: r.retry.clone(),
         live_status: r.live_status.clone(),
         run_usage: r.run_usage.clone(),
+        attachments: r.attachments.clone(),
         ..crate::rune_transcript::RowData::default()
     }
 }
@@ -344,6 +345,10 @@ pub struct CanvasState {
     pub pending_chat_fetch: Option<(String, String)>,
     /// True once a real snapshot replaced the seeded scene.
     pub real: bool,
+    /// Cards created locally (a rekeyed `chat:local:*` draft) that server
+    /// `open_tabs` may not list yet. Snapshots keep them open and local UI
+    /// state stays the source of truth until the tab is closed.
+    pub manual_cards: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for CanvasState {
@@ -393,6 +398,7 @@ impl Clone for CanvasState {
             active_tab: self.active_tab.clone(),
             pending_chat_fetch: self.pending_chat_fetch.clone(),
             real: self.real,
+            manual_cards: self.manual_cards.clone(),
             inputs: self.inputs.clone(),
             agents_open: self.agents_open.clone(),
         }
@@ -492,6 +498,7 @@ impl CanvasState {
             active_tab: String::new(),
             pending_chat_fetch: None,
             real: false,
+            manual_cards: std::collections::HashSet::new(),
             inputs: std::collections::HashMap::new(),
             agents_open: None,
         };
@@ -596,8 +603,11 @@ impl CanvasState {
             });
         }
         // Locally-created drafts are not server tabs; keep them on the map.
+        // A rekeyed draft is a real chat id but `open_tabs` still has to catch
+        // up, so `manual_cards` keeps it mounted across snapshots.
         for (id, card) in old {
-            if id.starts_with("chat:local:") && !cards.iter().any(|c| c.id == id) {
+            let keep = id.starts_with("chat:local:") || self.manual_cards.contains(&id);
+            if keep && !cards.iter().any(|c| c.id == id) {
                 cards.push(card);
             }
         }
@@ -616,7 +626,24 @@ impl CanvasState {
         self.real = true;
         self.chat_rows = snapshot.chats.clone();
         self.open_tabs = snapshot.open_tabs.clone();
+        // A chat this client just created may not be in the server's saved
+        // `open_tabs` yet (native never writes UI state). Keep manual cards
+        // open so their live thread survives the refresh.
+        for id in &self.manual_cards {
+            if let Some(key) = id.strip_prefix("chat:") {
+                if !self.open_tabs.iter().any(|open| open == key) {
+                    self.open_tabs.push(key.to_string());
+                }
+            }
+        }
         self.active_tab = snapshot.active_tab.clone();
+        if self.active_tab.is_empty() && !self.open_tabs.is_empty() {
+            if let Some(id) = self.manual_cards.iter().next() {
+                if let Some(key) = id.strip_prefix("chat:") {
+                    self.active_tab = key.to_string();
+                }
+            }
+        }
         self.sync_graph_cards();
         for key in self.open_tabs.clone() {
             let card_id = format!("chat:{key}");
@@ -630,10 +657,14 @@ impl CanvasState {
                 .unwrap_or_default();
             let thread = self.thread_mut(&card_id);
             thread.title = title;
-            thread.live = false;
+            // A snapshot can land while a just-created chat is streaming (the
+            // `chat` frame refreshes the sidebar mid-run). Local rows and the
+            // live flag stay authoritative until the run finishes.
             thread.chat_id = chat_id;
-            if let Some(rows) = snapshot.messages.get(&key) {
-                thread.rows = rows.iter().map(row_from_chat).collect();
+            if !thread.live && !thread.aborting {
+                if let Some(rows) = snapshot.messages.get(&key) {
+                    thread.rows = rows.iter().map(row_from_chat).collect();
+                }
             }
         }
         let want = format!("chat:{}", snapshot.active_tab);
@@ -810,12 +841,18 @@ impl CanvasState {
             thread.live = false;
             thread.chat_id = crate::notes::mint_id("rune-chat");
             if let Some(key) = id.strip_prefix("chat:") {
-                if let Some((ws, chat)) = key.split_once(':') {
+                if key.starts_with("local:") {
+                    // `chat:local:*` is a draft card, not workspace "local".
+                    // It lives in the general workspace and gets a real chat
+                    // id on its first send (`HouseChat`'s activeChatId).
+                    thread.workspace_id = "_general".to_string();
+                    thread.chat_id.clear();
+                    thread.chat_ready = false;
+                } else if let Some((ws, chat)) = key.split_once(':') {
                     thread.workspace_id = ws.to_string();
                     thread.chat_id = chat.to_string();
-                    thread.chat_ready = !(chat.starts_with("local")
-                        || chat.starts_with("rune-chat")
-                        || chat.starts_with("rune"));
+                    thread.chat_ready =
+                        !(chat.starts_with("rune-chat") || chat.starts_with("rune"));
                 }
             }
             self.sessions.threads.insert(id.to_string(), thread);
@@ -827,6 +864,60 @@ impl CanvasState {
             .threads
             .get_mut(id)
             .expect("thread ensured above")
+    }
+
+    /// Rename a local draft card/tab/thread to the server's real chat key
+    /// immediately after the internal `chat` frame. The thread keeps its
+    /// rows and inbox, so the stream continues on the renamed card.
+    pub fn rekey_local_chat(&mut self, old_id: &str, workspace_id: &str, chat_id: &str) -> bool {
+        if !old_id.starts_with("chat:local:")
+            || workspace_id.trim().is_empty()
+            || chat_id.trim().is_empty()
+        {
+            return false;
+        }
+        let new_id = format!("chat:{workspace_id}:{chat_id}");
+        let key = format!("{workspace_id}:{chat_id}");
+        if old_id == new_id {
+            return false;
+        }
+        let Some(mut thread) = self.sessions.threads.remove(old_id) else {
+            return false;
+        };
+        thread.workspace_id = workspace_id.to_string();
+        thread.chat_id = chat_id.to_string();
+        thread.chat_ready = true;
+        thread.pending_rekey = None;
+        self.sessions.threads.insert(new_id.clone(), thread);
+        for id in &mut self.sessions.order {
+            if id == old_id {
+                *id = new_id.clone();
+            }
+        }
+        if self.sessions.sheet.as_deref() == Some(old_id) {
+            self.sessions.sheet = Some(new_id.clone());
+        }
+        if self.active_id == old_id {
+            self.active_id = new_id.clone();
+        }
+        if let Some(edit) = self.inputs.remove(old_id) {
+            self.inputs.insert(new_id.clone(), edit);
+        }
+        if let Some(card) = self.cards.iter_mut().find(|c| c.id == old_id) {
+            card.id = new_id.clone();
+        }
+        if let Some(meta) = self.layout_meta.remove(old_id) {
+            self.layout_meta.insert(new_id.clone(), meta);
+        }
+        if let Some(closed) = self.closed.iter_mut().find(|(id, _)| id == old_id) {
+            closed.0 = new_id.clone();
+        }
+        if !self.open_tabs.iter().any(|open| open == &key) {
+            self.open_tabs.push(key.clone());
+        }
+        self.active_tab = key;
+        self.manual_cards.insert(new_id);
+        true
     }
 
     /// Get-or-create the message draft for a card.
@@ -904,6 +995,7 @@ impl CanvasState {
             }
         }
         self.cards.retain(|c| c.id != id);
+        self.manual_cards.remove(id);
         self.sessions.order.retain(|o| o != id);
         if self.sessions.sheet.as_deref() == Some(id) {
             self.sessions.sheet = None;
@@ -3336,6 +3428,7 @@ pub fn canvas_spec() -> AppSpec<CanvasState> {
     AppSpec {
         fonts: &[include_bytes!("../assets/InterVariable.ttf")],
         families: ("Inter", "ui-monospace"),
+        setup: Some(crate::image_cache::setup::<CanvasState>),
         ..AppSpec::new("Stark Canvas", (MAP_W, MAP_H), init_map, canvas_view)
     }
 }
@@ -3348,6 +3441,101 @@ pub fn run_canvas_headless(extra_args: Vec<String>) {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+
+    #[test]
+    fn local_chat_rekey_moves_every_reference() {
+        let mut s = CanvasState::map();
+        s.real = true;
+        let old = s.new_session();
+        assert!(old.starts_with("chat:local:"));
+        s.inputs.get_mut(&old).unwrap().replace_text("keep me");
+        s.closed.push((old.clone(), "New Chat".to_string()));
+        s.layout_meta.insert(
+            old.clone(),
+            CardLayoutMeta {
+                is_tab: true,
+                depth: 2,
+                parent_item_id: Some("chat:ws-general:chat-1".to_string()),
+            },
+        );
+        {
+            let thread = s.sessions.threads.get_mut(&old).unwrap();
+            thread.pending_rekey = Some(("team".to_string(), "real-9".to_string()));
+            assert_eq!(thread.workspace_id, "_general");
+            assert!(thread.chat_id.is_empty());
+            assert!(!thread.chat_ready);
+        }
+
+        assert!(s.rekey_local_chat(&old, "team", "real-9"));
+        let new = "chat:team:real-9";
+        assert!(s.card(&old).is_none());
+        assert!(s.card(new).is_some());
+        assert!(s.sessions.threads.contains_key(new));
+        assert!(!s.sessions.threads.contains_key(&old));
+        assert!(s.sessions.order.contains(&new.to_string()));
+        assert!(!s.sessions.order.contains(&old));
+        assert_eq!(s.sessions.sheet.as_deref(), Some(new));
+        assert_eq!(s.active_id, new);
+        assert_eq!(s.inputs.get(new).unwrap().text, "keep me");
+        assert!(!s.inputs.contains_key(&old));
+        assert!(s.closed.iter().any(|(id, _)| id == new));
+        assert!(s.layout_meta.contains_key(new));
+        assert!(s.manual_cards.contains(new));
+        assert_eq!(s.active_tab, "team:real-9");
+        assert!(s.open_tabs.iter().any(|key| key == "team:real-9"));
+        let thread = &s.sessions.threads[new];
+        assert_eq!(thread.workspace_id, "team");
+        assert_eq!(thread.chat_id, "real-9");
+        assert!(thread.chat_ready);
+        assert!(thread.pending_rekey.is_none());
+        // Once rekeyed, the old id is no longer a local draft.
+        assert!(!s.rekey_local_chat(&old, "team", "other"));
+    }
+
+    #[test]
+    fn snapshot_keeps_rekeyed_live_card_and_open_tab() {
+        let mut s = CanvasState::map();
+        s.real = true;
+        let old = s.new_session();
+        assert!(s.rekey_local_chat(&old, "team", "real-9"));
+        let new = "chat:team:real-9".to_string();
+        {
+            let thread = s.sessions.threads.get_mut(&new).unwrap();
+            thread.live = true;
+            thread.rows = vec![crate::rune_transcript::RowData {
+                key: "live-user".to_string(),
+                role: "user",
+                body: "draft".to_string(),
+                ..Default::default()
+            }];
+        }
+        let mut messages = std::collections::HashMap::new();
+        messages.insert("ws-general:chat-1".to_string(), Vec::new());
+        let snapshot = crate::chats::ChatSnapshot {
+            open_tabs: vec!["ws-general:chat-1".to_string()],
+            active_tab: String::new(),
+            messages,
+            chats: vec![crate::chats::ChatSummary {
+                id: "chat-1".to_string(),
+                workspace_id: "ws-general".to_string(),
+                workspace_name: "General".to_string(),
+                workspace_kind: "general".to_string(),
+                title: "New Conversation".to_string(),
+                ..Default::default()
+            }],
+        };
+        s.apply_chat_snapshot(&snapshot);
+        // The server does not know about this tab yet; the native client keeps
+        // it mounted and open.
+        assert!(s.card(&new).is_some());
+        assert!(s.open_tabs.iter().any(|key| key == "team:real-9"));
+        assert_eq!(s.active_tab, "team:real-9");
+        // And the in-flight run keeps its local rows.
+        let thread = &s.sessions.threads[&new];
+        assert!(thread.live);
+        assert_eq!(thread.rows.len(), 1);
+        assert_eq!(thread.rows[0].key, "live-user");
+    }
 
     #[test]
     fn map_commits_with_cards_edges_and_grid() {

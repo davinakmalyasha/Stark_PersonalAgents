@@ -11,6 +11,7 @@
 
 use serde_json::Value;
 
+use crate::chats::ChatAttachment;
 use crate::rune_transcript::{RowData, RuneTranscriptState};
 use crate::stream_accum::{Delta, StreamAccum};
 
@@ -24,6 +25,8 @@ pub struct RunRequest {
     pub workspace_id: String,
     pub chat_id: String,
     pub workspace_kind: String,
+    /// Uploaded/restored files (`attachments` in `streamPipeline`).
+    pub attachments: Vec<ChatAttachment>,
 }
 
 impl RunRequest {
@@ -35,7 +38,7 @@ impl RunRequest {
             "workspace_path": self.workspace_path,
             "workspace_id": self.workspace_id,
             "chat_id": self.chat_id,
-            "attachments": [],
+            "attachments": self.attachments.iter().map(ChatAttachment::to_json).collect::<Vec<_>>(),
             "workspace_kind": self.workspace_kind,
         })
     }
@@ -134,6 +137,19 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
             if !id.is_empty() {
                 state.chat_id = id.to_string();
                 state.chat_ready = true;
+                // A draft card created from the map rides a `local:*` key;
+                // the shell renames it once this real id exists. Harmless for
+                // already-real chats (the rekey checks the key prefix).
+                let workspace = frame
+                    .data
+                    .get("workspace_id")
+                    .and_then(Value::as_str)
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or(&state.workspace_id)
+                    .to_string();
+                state.pending_rekey = Some((workspace, id.to_string()));
+                // React refreshes the sidebar right after creating a chat.
+                state.refresh_list = true;
             }
             if let Some(workspace) = frame.data.get("workspace_id").and_then(Value::as_str) {
                 if !workspace.is_empty() {
@@ -322,6 +338,7 @@ mod tests {
             workspace_id: "_general".to_string(),
             chat_id: "c1".to_string(),
             workspace_kind: "general".to_string(),
+            attachments: Vec::new(),
         };
         let body = req.to_json();
         for key in [

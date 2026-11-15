@@ -34,6 +34,9 @@ mod cloud;
 #[cfg(feature = "rune-real")]
 mod composer;
 #[cfg(feature = "rune-real")]
+#[path = "image_cache.rs"]
+mod image_cache;
+#[cfg(feature = "rune-real")]
 mod notes;
 #[cfg(feature = "rune-real")]
 mod projects;
@@ -129,6 +132,98 @@ pub(crate) fn lucide_square_filled(size: f32, color: rune::Color) -> rune::El {
         .size(size * (18.0 / 24.0), size * (18.0 / 24.0))
         .radius(size * (2.0 / 24.0))
         .fill(color)
+}
+
+/// Lucide `FileText` (document outline + three rule lines).
+pub(crate) fn lucide_file_text(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([15.0, 2.0])
+        .line_to([6.0, 2.0])
+        .cubic_to([4.9, 2.0], [4.0, 2.9], [4.0, 4.0])
+        .line_to([4.0, 20.0])
+        .cubic_to([4.0, 21.1], [4.9, 22.0], [6.0, 22.0])
+        .line_to([18.0, 22.0])
+        .cubic_to([19.1, 22.0], [20.0, 21.1], [20.0, 20.0])
+        .line_to([20.0, 7.0])
+        .close()
+        .move_to([14.0, 2.0])
+        .line_to([14.0, 6.0])
+        .cubic_to([14.0, 7.1], [14.9, 8.0], [16.0, 8.0])
+        .line_to([20.0, 8.0])
+        .move_to([16.0, 13.0])
+        .line_to([8.0, 13.0])
+        .move_to([16.0, 17.0])
+        .line_to([8.0, 17.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `Image` (rounded frame, sun, mountain).
+pub(crate) fn lucide_image(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([5.0, 3.0])
+        .line_to([19.0, 3.0])
+        .cubic_to([20.1, 3.0], [21.0, 3.9], [21.0, 5.0])
+        .line_to([21.0, 19.0])
+        .cubic_to([21.0, 20.1], [20.1, 21.0], [19.0, 21.0])
+        .line_to([5.0, 21.0])
+        .cubic_to([3.9, 21.0], [3.0, 20.1], [3.0, 19.0])
+        .line_to([3.0, 5.0])
+        .cubic_to([3.0, 3.9], [3.9, 3.0], [5.0, 3.0])
+        .close()
+        .move_to([11.0, 9.0])
+        .cubic_to([11.0, 10.1], [10.1, 11.0], [9.0, 11.0])
+        .cubic_to([7.9, 11.0], [7.0, 10.1], [7.0, 9.0])
+        .cubic_to([7.0, 7.9], [7.9, 7.0], [9.0, 7.0])
+        .cubic_to([10.1, 7.0], [11.0, 7.9], [11.0, 9.0])
+        .close()
+        .move_to([21.0, 15.0])
+        .line_to([17.9, 11.9])
+        .cubic_to([17.1, 11.1], [15.8, 11.1], [15.0, 11.9])
+        .line_to([6.0, 21.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `AudioLines` (the dock's voice glyph, reused by file chips).
+pub(crate) fn lucide_audio_lines(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([2.0, 10.0])
+        .line_to([2.0, 13.0])
+        .move_to([6.0, 6.0])
+        .line_to([6.0, 17.0])
+        .move_to([10.0, 3.0])
+        .line_to([10.0, 21.0])
+        .move_to([14.0, 8.0])
+        .line_to([14.0, 15.0])
+        .move_to([18.0, 5.0])
+        .line_to([18.0, 18.0])
+        .move_to([22.0, 10.0])
+        .line_to([22.0, 13.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Lucide `Download` (tray + arrow).
+pub(crate) fn lucide_download(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([21.0, 15.0])
+        .line_to([21.0, 19.0])
+        .cubic_to([21.0, 20.1], [20.1, 21.0], [19.0, 21.0])
+        .line_to([5.0, 21.0])
+        .cubic_to([3.9, 21.0], [3.0, 20.1], [3.0, 19.0])
+        .line_to([3.0, 15.0])
+        .move_to([7.0, 10.0])
+        .line_to([12.0, 15.0])
+        .line_to([17.0, 10.0])
+        .move_to([12.0, 15.0])
+        .line_to([12.0, 3.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
 }
 
 /// Base path. Desktop talks to `127.0.0.1:8124`; Vite PWA proxies `/api`.
@@ -516,9 +611,9 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
-    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
+    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings|voice|attachments>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
     eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
-    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|cloud|memory>]  (single-page shell PNG; all scenes land on the one page)");
+    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|stream|trace|cloud|memory|attachments|attachments-lightbox>]  (single-page shell PNG; all scenes land on the one page)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
     eprintln!("stark-rune --api-get <path> [--api-port <n>]  (live GET against stark-server)");
     eprintln!("stark-rune --version  (app version + pinned Rune revision)");
@@ -614,6 +709,7 @@ fn run_cli() {
                 workspace_id: "_general".to_string(),
                 chat_id: String::new(),
                 workspace_kind: "general".to_string(),
+                attachments: Vec::new(),
             };
             println!("request: {}", req.to_json());
             let mut state = rune_transcript::RuneTranscriptState::screenshot();

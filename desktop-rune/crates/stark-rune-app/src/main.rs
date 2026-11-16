@@ -26,6 +26,8 @@ mod agent_config;
 #[cfg(feature = "rune-real")]
 mod agents;
 #[cfg(feature = "rune-real")]
+mod ask;
+#[cfg(feature = "rune-real")]
 mod chats;
 #[cfg(feature = "rune-real")]
 mod clock;
@@ -610,10 +612,13 @@ pub const RUNE_REV: &str = "a7f276c3630f85a06a0230295da4d2bd172d8d3b";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_usage() {
+    eprintln!(
+        "stark-rune  (no arguments: opens the native shell window; requires --features rune-real)"
+    );
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
-    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings|voice|attachments>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
+    eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings|voice|attachments|ask>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
     eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
-    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|stream|trace|cloud|memory|attachments|attachments-lightbox>]  (single-page shell PNG; all scenes land on the one page)");
+    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|stream|trace|cloud|memory|attachments|attachments-lightbox|ask>]  (single-page shell PNG; all scenes land on the one page)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
     eprintln!("stark-rune --api-get <path> [--api-port <n>]  (live GET against stark-server)");
     eprintln!("stark-rune --version  (app version + pinned Rune revision)");
@@ -833,9 +838,24 @@ fn run_cli() {
             return;
         }
     }
+    // Double-click / plain invocation: open the native shell directly, the
+    // same entry the browser build uses. A recognized CLI flag still runs
+    // its command; unknown arguments fall through to the usage text.
+    if args.len() == 1 {
+        #[cfg(feature = "rune-real")]
+        {
+            shell::run_shell_headless(vec![]);
+            return;
+        }
+        #[cfg(not(feature = "rune-real"))]
+        {
+            eprintln!("Opening the shell needs --features rune-real (pinned rune checkout + GPU).");
+            std::process::exit(2);
+        }
+    }
     if !args.iter().any(|a| a == "--headless") {
         eprintln!("Stark Rune rewrite (branch `rune-rewrite`). Byte-identical UI lives here; `main` keeps Tauri+React.");
-        eprintln!("Run headless: stark-rune --headless --dump-tree tree.txt --golden golden.svg");
+        print_usage();
         std::process::exit(2);
     }
     let mut state = AppState::default();

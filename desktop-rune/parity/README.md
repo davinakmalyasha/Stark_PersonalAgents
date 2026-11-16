@@ -178,8 +178,25 @@ and a 9pt collapsed slot (23pt when open). Like React, a timeline whose last
 segment is a tool leaves `finalText` empty; the answer is owned by the trace,
 not duplicated below it.
 
-Native-only demo routes (`--rune-route stream` / `trace`) render the same
-components without a fixture server for quick visual checks.
+`parity/scenarios/ask/` is a synthetic two-question batch (described options,
+multi-select, custom-answer row) for the inline `AskQuestionPanel`. The batch
+is owned by `chat-ask`; the panel replaces the prompt dock and polls
+`/api/ask/pending` every 1.5s:
+
+```bash
+python desktop-rune/parity/mock_server.py --port 8125 --scenario ask
+STARK_RUNE_BIN=D:/cargo-target/stark/release/stark-rune.exe \
+  STARK_API_PORT=8125 bash desktop-rune/parity/capture_native.sh \
+  /tmp/ask-native.png 1280x900 "" 2
+D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/ask-native-route.png --size 1280x900 \
+  --rune-route ask --at 2
+python desktop-rune/parity/capture_react.py /tmp/ask-react.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4
+```
+
+Native-only demo routes (`--rune-route stream` / `trace` / `ask`) render the
+same components without a fixture server for quick visual checks.
 
 ## State scripts
 

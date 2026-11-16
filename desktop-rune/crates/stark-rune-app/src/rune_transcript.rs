@@ -656,6 +656,9 @@ pub struct RuneTranscriptState {
     pub scroll_pill: rune::Live<f32>,
     /// Sticky notes for this thread (chat scope, like `ChatView.tsx`).
     pub notes: crate::notes::NotesState,
+    /// Pending `ask_user_question` batch + inline panel state. While a batch
+    /// for this chat is visible the panel replaces the prompt dock.
+    pub ask: crate::ask::AskState,
     /// Run target (`PromptDock runTarget`, persisted per chat — here per
     /// thread, the session's lifetime). `"local"` default; `"cloud"` only
     /// changes where the NEXT prompt is marked to go — the transfer itself
@@ -735,6 +738,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("chat_ready", &self.chat_ready)
             .field("aborting", &self.aborting)
             .field("notes", &self.notes.notes.len())
+            .field("ask", &self.ask)
             .field("run_target", &self.run_target)
             .field("usage", &self.usage)
             .field("models", &self.models.len())
@@ -771,6 +775,7 @@ impl Clone for RuneTranscriptState {
             refresh_chat: self.refresh_chat.clone(),
             scroll_pill: self.scroll_pill.clone(),
             notes: self.notes.clone(),
+            ask: self.ask.clone(),
             run_target: self.run_target.clone(),
             usage: self.usage.clone(),
             usage_open: self.usage_open,
@@ -857,6 +862,7 @@ impl RuneTranscriptState {
             refresh_chat: None,
             scroll_pill: rune::Live::new(0.0),
             notes: crate::notes::NotesState::default(),
+            ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
             usage_open: false,
@@ -928,6 +934,7 @@ impl RuneTranscriptState {
             refresh_chat: None,
             scroll_pill: rune::Live::new(0.0),
             notes: crate::notes::NotesState::default(),
+            ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
             usage: UsageTotals::default(),
             usage_open: false,
@@ -3656,87 +3663,99 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
                 .color(rune::color::hex("#ededf0").unwrap_or(rune::Color::BLACK)),
         );
     }
+    // A pending question replaces the whole prompt dock (`PromptDock`'s early
+    // return) instead of stacking above it. The composer is not built at all
+    // while the panel is up, so its draft/state stays untouched for later.
+    let ask_batch = s.ask.visible_batch(&s.chat_id).cloned();
     // Composer card: shared `.premium-surface` dock (see `composer.rs`).
     // Send (button or Enter) stages the field as a user row, marks the run
     // live, and spawns the blocking `POST /api/run` thread; frames land in
     // `inbox`, drained by the `poll` hook before every frame.
-    let composer_card = super::composer::composer_card(
-        &s.edit,
-        std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
-        s.voice.meter(),
-        s.live,
-        super::composer::ComposerMeta {
-            target: &s.run_target,
-            usage: &s.usage,
-            usage_open: s.usage_open,
-            provider_label: &s.provider.label,
-            provider_warn: s.provider.warn,
-            model: &s.model,
-            // HouseChat's PromptDock never passes `onModelChange`, so the
-            // home card has no model dropup (React renders provider only).
-            models: if dock_compact { &[] } else { &s.models },
-            model_open: s.model_open,
-            attachments: &s.draft_attachments,
-            attachments_error: s.attachments_error.as_deref(),
-            attachments_dragging: s.attachments_dragging,
-            workspace_id: &s.workspace_id,
-            chat_id: &s.chat_id,
-        },
-        super::composer::ComposerButtons {
-            voice: std::rc::Rc::new(move |s: &mut S| {
-                let on = !s.thread_mut(which).voice.live;
-                s.thread_mut(which).voice.set_live(on);
-            }),
-            cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
-            local: std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).run_target = "local".to_string();
-            }),
-            cloud: std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).run_target = "cloud".to_string();
-            }),
-            usage: std::rc::Rc::new(move |s: &mut S| {
-                let open = s.thread_mut(which).usage_open;
-                s.thread_mut(which).usage_open = !open;
-            }),
-            send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
-            model_menu: std::rc::Rc::new(move |s: &mut S| {
-                let open = s.thread_mut(which).model_open;
-                s.thread_mut(which).model_open = !open;
-            }),
-            model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
-                s.thread_mut(which).model = id;
-                s.thread_mut(which).model_open = false;
-            }),
-            stats: std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).stats_open = true;
-                s.thread_mut(which).usage_open = false;
-            }),
-            config: std::rc::Rc::new(move |s: &mut S| {
-                crate::agent_config::open_agent_config(&mut s.thread_mut(which).agent_config);
-            }),
-            attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
-                open_attachment_picker(s, which, tx);
-            }),
-            remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
-                remove_draft_attachment(s.thread_mut(which), &target);
-            }),
-            drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
-                drop_attachment_files(s.thread_mut(which), files);
-            }),
-            drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
-                s.thread_mut(which).attachments_dragging = over;
-            }),
-        },
-    );
+    let composer_card = if ask_batch.is_some() {
+        None
+    } else {
+        Some(super::composer::composer_card(
+            &s.edit,
+            std::rc::Rc::new(move |s: &mut S| &mut s.thread_mut(which).edit),
+            s.voice.meter(),
+            s.live,
+            super::composer::ComposerMeta {
+                target: &s.run_target,
+                usage: &s.usage,
+                usage_open: s.usage_open,
+                provider_label: &s.provider.label,
+                provider_warn: s.provider.warn,
+                model: &s.model,
+                // HouseChat's PromptDock never passes `onModelChange`, so the
+                // home card has no model dropup (React renders provider only).
+                models: if dock_compact { &[] } else { &s.models },
+                model_open: s.model_open,
+                attachments: &s.draft_attachments,
+                attachments_error: s.attachments_error.as_deref(),
+                attachments_dragging: s.attachments_dragging,
+                workspace_id: &s.workspace_id,
+                chat_id: &s.chat_id,
+            },
+            super::composer::ComposerButtons {
+                voice: std::rc::Rc::new(move |s: &mut S| {
+                    let on = !s.thread_mut(which).voice.live;
+                    s.thread_mut(which).voice.set_live(on);
+                }),
+                cancel: std::rc::Rc::new(move |s: &mut S| stage_abort(s.thread_mut(which))),
+                local: std::rc::Rc::new(move |s: &mut S| {
+                    s.thread_mut(which).run_target = "local".to_string();
+                }),
+                cloud: std::rc::Rc::new(move |s: &mut S| {
+                    s.thread_mut(which).run_target = "cloud".to_string();
+                }),
+                usage: std::rc::Rc::new(move |s: &mut S| {
+                    let open = s.thread_mut(which).usage_open;
+                    s.thread_mut(which).usage_open = !open;
+                }),
+                send: std::rc::Rc::new(move |s: &mut S| stage_send(s.thread_mut(which))),
+                model_menu: std::rc::Rc::new(move |s: &mut S| {
+                    let open = s.thread_mut(which).model_open;
+                    s.thread_mut(which).model_open = !open;
+                }),
+                model_pick: std::rc::Rc::new(move |s: &mut S, id: String| {
+                    s.thread_mut(which).model = id;
+                    s.thread_mut(which).model_open = false;
+                }),
+                stats: std::rc::Rc::new(move |s: &mut S| {
+                    s.thread_mut(which).stats_open = true;
+                    s.thread_mut(which).usage_open = false;
+                }),
+                config: std::rc::Rc::new(move |s: &mut S| {
+                    crate::agent_config::open_agent_config(&mut s.thread_mut(which).agent_config);
+                }),
+                attach: std::rc::Rc::new(move |s: &mut S, tx: &mut rune::Tx| {
+                    open_attachment_picker(s, which, tx);
+                }),
+                remove_attachment: std::rc::Rc::new(move |s: &mut S, target: String| {
+                    remove_draft_attachment(s.thread_mut(which), &target);
+                }),
+                drop_files: std::rc::Rc::new(move |s: &mut S, files: &[std::path::PathBuf]| {
+                    drop_attachment_files(s.thread_mut(which), files);
+                }),
+                drop_hover: std::rc::Rc::new(move |s: &mut S, over: bool| {
+                    s.thread_mut(which).attachments_dragging = over;
+                }),
+            },
+        ))
+    };
     let dock = if dock_compact {
         // Inside the home chat card the outer card owns the 8pt gutter and
         // React nests two wrappers here: HouseChat `pt-1` then PromptDock's
         // `px-2 pt-1.5 pb-1.5` (safe-area inline override = 6pt bottom).
+        // The ask slot has the same 6pt top/bottom (its inline paddingBottom
+        // overrides `md:pb-2`), while the composer dock keeps the tuned 10pt
+        // top the transcript math above already proved out.
+        let ask_up = ask_batch.is_some();
         rune::el()
             .key("composer-dock")
             .w_full()
             .px(8.0)
-            .pt(10.0)
+            .pt(if ask_up { 6.0 } else { 10.0 })
             .pb(6.0)
     } else {
         rune::el()
@@ -3746,7 +3765,16 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
             .pt(6.0)
             .pb(14.0)
     };
-    root = root.child(dock.child(composer_card));
+    let dock_child = match ask_batch {
+        Some(batch) => {
+            // The home card's PromptDock renders the ask panel without the
+            // canvas card's `compact` variant (only `CanvasItemCard` passes
+            // `compact`), so its type scale stays full-size inside the card.
+            super::ask::ask_panel::<S>(&batch, &s.ask, which, false, window_h)
+        }
+        None => composer_card.expect("composer built when no question is pending"),
+    };
+    root = root.child(dock.child(dock_child));
     if show_sheets {
         if s.settings_open {
             root = root.child(settings_sheet::<S>(s, which));
@@ -3908,6 +3936,10 @@ fn apply_attachments(s: &mut RuneTranscriptState) {
     *s = attachments_demo();
 }
 
+fn apply_ask(s: &mut RuneTranscriptState) {
+    *s = ask_demo();
+}
+
 /// Composer attachment deck proof: image thumbnail (real PNG asset), file and
 /// audio chips, the count, amber error line and the attachment-only send key;
 /// plus a persisted user turn with message cards.
@@ -3972,6 +4004,63 @@ pub fn attachments_demo() -> RuneTranscriptState {
         },
     ];
     s.rows.push(row);
+    s
+}
+
+/// Ask-panel proof: a pending batch with a single-select question (described
+/// options) and a multi-select question. Deterministic, no server needed.
+pub fn ask_demo() -> RuneTranscriptState {
+    let mut s = RuneTranscriptState::screenshot();
+    s.title = "Question".to_string();
+    s.live = false;
+    s.chat_id = "ask-demo".to_string();
+    s.ask.batches = vec![crate::ask::AskBatch {
+        batch_id: "ask-demo-batch".to_string(),
+        chat_id: "ask-demo".to_string(),
+        created: 0,
+        questions: vec![
+            crate::ask::AskQuestion {
+                id: "scope".to_string(),
+                question: "Which scope should I change?".to_string(),
+                detail: Some(
+                    "The plan touches the composer and the transcript. Pick the narrower pass if you want a quick review."
+                        .to_string(),
+                ),
+                multi: false,
+                options: vec![
+                    crate::ask::AskOption {
+                        label: "Composer only".to_string(),
+                        description: Some("Shared dock, no transcript edits.".to_string()),
+                    },
+                    crate::ask::AskOption {
+                        label: "Composer + transcript".to_string(),
+                        description: Some("Full chat pass.".to_string()),
+                    },
+                ],
+            },
+            crate::ask::AskQuestion {
+                id: "checks".to_string(),
+                question: "Which checks should run after the edit?".to_string(),
+                detail: None,
+                multi: true,
+                options: vec![
+                    crate::ask::AskOption {
+                        label: "cargo test".to_string(),
+                        description: None,
+                    },
+                    crate::ask::AskOption {
+                        label: "clippy".to_string(),
+                        description: None,
+                    },
+                    crate::ask::AskOption {
+                        label: "wasm32 check".to_string(),
+                        description: None,
+                    },
+                ],
+            },
+        ],
+    }];
+    s.ask.bind_visible("ask-demo");
     s
 }
 
@@ -4075,6 +4164,7 @@ pub fn spec() -> AppSpec<RuneTranscriptState> {
             ("settings", apply_settings),
             ("voice", apply_voice),
             ("attachments", apply_attachments),
+            ("ask", apply_ask),
         ],
         poll: Some(drain_run_inbox),
         setup: Some(crate::image_cache::setup::<RuneTranscriptState>),

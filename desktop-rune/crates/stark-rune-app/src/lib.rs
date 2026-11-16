@@ -9,6 +9,9 @@ pub mod agent_config;
 #[path = "agents.rs"]
 pub mod agents;
 #[cfg(feature = "rune-real")]
+#[path = "ask.rs"]
+pub mod ask;
+#[cfg(feature = "rune-real")]
 #[path = "chats.rs"]
 pub mod chats;
 #[cfg(feature = "rune-real")]

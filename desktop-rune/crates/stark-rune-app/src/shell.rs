@@ -887,6 +887,15 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         }
         changed |= crate::rune_transcript::poll_provider_state(thread, clock);
         changed |= crate::rune_transcript::poll_models_state(thread, clock);
+        // Pending questions poll every 1.5s (`usePendingAsk`), but only for
+        // the chat that is actually on screen. Switching chats starts that
+        // chat's poll within one interval.
+        changed |= crate::ask::poll_ask_state(thread, clock);
+        if crate::ask::ask_busy(thread) {
+            tx.wake_after(std::time::Duration::from_millis(100));
+        } else if let Some(ms) = crate::ask::poll_wait_ms(thread, clock) {
+            tx.wake_after(std::time::Duration::from_millis(ms));
+        }
     }
     // Session threads: drain + sync card flags.
     let ids: Vec<String> = s.canvas.sessions.order.clone();
@@ -1182,6 +1191,21 @@ fn apply_shell_attachments_lightbox(s: &mut ShellState) {
     }
 }
 
+fn apply_ask(s: &mut ShellState) {
+    // Same sheet wiring as the other demo routes; the thread owns a pending
+    // batch so the dock renders the ask panel instead of the composer.
+    s.canvas.rail = RailTab::Chats;
+    let id = s
+        .canvas
+        .cards
+        .iter()
+        .find(|card| card.id.starts_with("chat:"))
+        .map(|card| card.id.clone());
+    let Some(id) = id else { return };
+    *s.canvas.thread_mut(&id) = crate::rune_transcript::ask_demo();
+    s.canvas.sessions.sheet = Some(id);
+}
+
 fn apply_panel_memory(s: &mut ShellState) {
     s.canvas.rail = RailTab::Memory;
 }
@@ -1198,6 +1222,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("trace", apply_trace),
         ("attachments", apply_shell_attachments),
         ("attachments-lightbox", apply_shell_attachments_lightbox),
+        ("ask", apply_ask),
         ("cloud", apply_panel_cloud),
         ("memory", apply_panel_memory),
         // Compatibility aliases: everything lands on the one page.

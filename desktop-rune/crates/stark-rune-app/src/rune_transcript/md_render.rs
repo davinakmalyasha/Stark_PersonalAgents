@@ -452,7 +452,6 @@ fn blocks_inner<S: TranscriptHost + 'static>(
     let _ = depth;
     let mut stack = col().key(format!("{key}-blocks")).w_full();
     let mut prev_mb = 0.0f32;
-    let mut after_heading = false;
     for (i, b) in list.iter().enumerate() {
         let (mt, mb) = if in_item {
             match b {
@@ -479,6 +478,8 @@ fn blocks_inner<S: TranscriptHost + 'static>(
         } else {
             margins_compact(b, compact)
         };
+        // Adjacent vertical margins collapse to the larger one (CSS rule),
+        // whether or not a heading is involved.
         let top = if i == 0 {
             if pad_parent {
                 mt
@@ -488,10 +489,6 @@ fn blocks_inner<S: TranscriptHost + 'static>(
                 // the remainder (para/h4/lists stay 0, h1 keeps 12).
                 (mt - 12.0).max(0.0)
             }
-        } else if matches!(b, stark_kit::markdown::Block::Heading { .. }) {
-            mt.max(prev_mb)
-        } else if after_heading {
-            prev_mb
         } else {
             mt.max(prev_mb)
         };
@@ -507,7 +504,6 @@ fn blocks_inner<S: TranscriptHost + 'static>(
         );
         stack = stack.child(e.mt(top));
         prev_mb = mb;
-        after_heading = matches!(b, stark_kit::markdown::Block::Heading { .. });
     }
     stack
 }

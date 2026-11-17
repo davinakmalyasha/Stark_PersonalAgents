@@ -176,9 +176,9 @@ paragraph (bold/italic/strike/code/link), h3/h4 and a rule. Same rig
 | capture | full mean | right mean | align |
 |---|---|---|---|
 | 1280×900 tasks top | **2.627** | **2.697** | (0, 0) |
-| 1280×900 tasks end (h1-anchored) | **3.781** | **3.481** | (0, 0) |
+| 1280×900 tasks end (h1-anchored) | **2.766** | **3.003** | (0, 0) |
 
-Closing the tasks gap took six implementation fixes (all follow React's
+Closing the tasks gap took seven implementation fixes (all follow React's
 collapsing-margin rules, verified against CDP rects + pixel probes):
 
 - First-block top margin: React's `mt-*` collapses out of the unpadded
@@ -203,6 +203,11 @@ collapsing-margin rules, verified against CDP rects + pixel probes):
   `border-l-2` bar is `[0,0,0,2]`. The old `[2,0,0,0]` painted a *top*
   border that also consumed 2px of layout room and pushed the quote content
   down; the side fix is covered by `quote_well_mounts_content_at_pad`.
+- Non-heading blocks after a heading collapse with `max`, not the heading's
+  bottom margin alone: a para after h3 keeps `max(12,8)=12` and the rule
+  after h4 keeps `max(24,6)=24`. The old `after_heading` shortcut dropped
+  4px + 18px below h3/h4 (native tree vs React rects now match within
+  0.3pt); the end pose fell from 3.781 to 2.766 on this fix alone.
 
 Remaining tasks delta is glyph-level rasterisation (Inter grayscale AA on
 both sides, different rasterisers) plus the native-only Latest pill at the

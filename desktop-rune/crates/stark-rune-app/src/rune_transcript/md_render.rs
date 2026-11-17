@@ -60,17 +60,26 @@ struct Runs {
     /// Byte ranges of inline-code runs: each carries a 6px pad and 1px border
     /// in React, which `content_widths` alone cannot see.
     codes: Vec<(usize, usize)>,
+    /// Paint-only boxes for the inline-code runs (fill + 1px inset ring),
+    /// emitted into `rich` via `text_highlights`.
+    highlights: Vec<rune::TextHighlight>,
 }
 
 const INLINE_CODE_SIZE: f32 = 13.5;
 
-fn inline_code_span(start: usize, end: usize) -> rune::Span {
-    rune::Span::new(start, end)
-        .mono()
-        .size(INLINE_CODE_SIZE)
-        .color(ink("#a5b4fc"))
-        // `bg-zinc-800/80`: rgba(39,39,42,.8).
-        .bg(rgba(39.0, 39.0, 42.0, 0.8), 4.0)
+/// Inline code: 13.5pt mono indigo-300 on a zinc-800/80 well with the
+/// `border-zinc-700/50` 1px ring (React `code` component). The well comes
+/// from a paint-only highlight so the border rides the same rounded rect.
+fn inline_code_span(start: usize, end: usize) -> (rune::Span, rune::TextHighlight) {
+    (
+        rune::Span::new(start, end)
+            .mono()
+            .size(INLINE_CODE_SIZE)
+            .color(ink("#a5b4fc")),
+        rune::TextHighlight::new(start..end, rgba(39.0, 39.0, 42.0, 0.8))
+            .ring(rgba(63.0, 63.0, 70.0, 0.5), 1.0)
+            .pad(6.0),
+    )
 }
 
 fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) {
@@ -89,7 +98,9 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
             Inline::Code(t) => {
                 let start = runs.text.len();
                 runs.text.push_str(t);
-                runs.spans.push(inline_code_span(start, runs.text.len()));
+                let (span, highlight) = inline_code_span(start, runs.text.len());
+                runs.spans.push(span);
+                runs.highlights.push(highlight);
                 runs.codes.push((start, runs.text.len()));
             }
             Inline::Bold(inner) => {
@@ -165,6 +176,9 @@ fn rich<S: TranscriptHost + 'static>(
         .selectable(true);
     for (start, end, c) in runs.strikes {
         e = e.strike(start, end, c);
+    }
+    if !runs.highlights.is_empty() {
+        e = e.text_highlights(runs.highlights);
     }
     let has_links = !runs.links.is_empty();
     for link in runs.links {
@@ -1434,6 +1448,22 @@ fn table<S: TranscriptHost + 'static>(
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    #[test]
+    fn inline_code_carries_bordered_well() {
+        use stark_kit::markdown::Inline;
+        let mut runs = Runs::default();
+        inlines(
+            &mut runs,
+            &[Inline::Code("code".into()), Inline::Text(" and ".into())],
+            false,
+        );
+        assert_eq!(runs.codes, vec![(0, 4)]);
+        // Exactly one paint-only well at the code bytes (fill + 1px ring are
+        // set at construction; the border itself is verified on pixels).
+        assert_eq!(runs.highlights.len(), 1);
+        assert_eq!(runs.highlights[0].range(), 0..4);
+    }
 
     #[test]
     fn short_hunk_without_counts_starts_at_one() {

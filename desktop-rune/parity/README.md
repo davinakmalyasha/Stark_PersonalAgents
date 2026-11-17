@@ -167,7 +167,7 @@ paragraph (bold/italic/strike/code/link), h3/h4 and a rule. Same rig
 | 1280×900 tasks top | **2.854** | **2.866** | (0, 0) |
 | 1280×900 tasks end (h1-anchored) | **3.973** | **3.603** | (0, 0) |
 
-Closing the tasks gap took four implementation fixes (all follow React's
+Closing the tasks gap took five implementation fixes (all follow React's
 collapsing-margin rules, verified against CDP rects):
 
 - First-block top margin: React's `mt-*` collapses out of the unpadded
@@ -184,6 +184,9 @@ collapsing-margin rules, verified against CDP rects):
   tight (no React `<p>` wrapper), so nested `ul` keeps its own `my-2.5`
   (10px) instead of collapsing with phantom paragraph margins — nested
   pitch lands on React's exact 67.3px.
+- Inline code renders the `border-zinc-700/50` 1px ring on the same rounded
+  rect as the zinc-800/80 well, via the framework's paint-only
+  `text_highlights` (`TextHighlight` ring + 6px pad for `px-1.5`).
 
 Remaining tasks delta is glyph-level rasterisation (Inter grayscale AA on
 both sides, different rasterisers) plus the native-only Latest pill at the

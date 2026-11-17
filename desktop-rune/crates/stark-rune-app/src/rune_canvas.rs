@@ -26,6 +26,13 @@ pub const DOT_STEP: f32 = 26.0;
 /// workspace scoping, everything lives in side tabs on one page.
 pub const CHAT_KINDS: [&str; 4] = ["Main", "Coding", "House", "General"];
 
+/// Visible top-level rows in the Main filter before Load more
+/// (`HouseSidebar.GENERAL_PAGE`).
+pub const GENERAL_PAGE: usize = 15;
+/// Visible top-level rows per Coding project before Load more
+/// (`HouseSidebar.PROJECT_PAGE`).
+pub const PROJECT_PAGE: usize = 7;
+
 /// Native mode label → React `ChatsFilter` (persisted in `/api/ui/state`).
 pub fn filter_for_kind(kind: &str) -> &'static str {
     match kind {
@@ -278,6 +285,15 @@ pub struct Sessions {
     /// Nests the user explicitly expanded — auto-collapse seeding never
     /// re-collapses them (`HouseSidebar.userExpanded`).
     pub spawn_expanded: std::collections::HashSet<String>,
+    /// Collapsed Coding project groups (`HouseSidebar.collapsedWs`).
+    /// Groups start expanded; the toggle only ever adds here.
+    pub collapsed_ws: std::collections::HashSet<String>,
+    /// Visible top-level rows per Coding project (`projectLimits`),
+    /// defaulting to `PROJECT_PAGE` (7). Grows by 7 per Load more press.
+    pub project_limits: std::collections::HashMap<String, usize>,
+    /// Visible top-level rows in the Main filter (`generalLimit`),
+    /// defaulting to `GENERAL_PAGE` (15). Grows by 15 per Load more press.
+    pub general_limit: usize,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -293,6 +309,8 @@ impl std::fmt::Debug for Sessions {
             .field("deleting", &self.deleting)
             .field("spawn_collapsed", &self.spawn_collapsed)
             .field("spawn_expanded", &self.spawn_expanded)
+            .field("collapsed_ws", &self.collapsed_ws)
+            .field("general_limit", &self.general_limit)
             .finish()
     }
 }
@@ -312,6 +330,9 @@ impl Clone for Sessions {
             deleting: self.deleting.clone(),
             spawn_collapsed: self.spawn_collapsed.clone(),
             spawn_expanded: self.spawn_expanded.clone(),
+            collapsed_ws: self.collapsed_ws.clone(),
+            project_limits: self.project_limits.clone(),
+            general_limit: self.general_limit,
         }
     }
 }
@@ -331,6 +352,9 @@ impl Default for Sessions {
             deleting: None,
             spawn_collapsed: std::collections::HashSet::new(),
             spawn_expanded: std::collections::HashSet::new(),
+            collapsed_ws: std::collections::HashSet::new(),
+            project_limits: std::collections::HashMap::new(),
+            general_limit: GENERAL_PAGE,
         }
     }
 }
@@ -1234,10 +1258,19 @@ impl CanvasState {
     /// New session: card (current kind, cascaded) + thread + select.
     /// Returns the card id for the tab bar.
     pub fn new_session(&mut self) -> String {
+        let kind = self.sessions.kind.clone();
+        let workspace_id = self.draft_workspace_id(&kind);
+        self.new_session_in(&workspace_id)
+    }
+
+    /// Start a chat inside a specific workspace (the per-project `+`
+    /// buttons in the Coding filter call this; the header `+` uses the
+    /// mode workspace via `new_session`).
+    pub fn new_session_in(&mut self, workspace_id: &str) -> String {
         let n = self.cards.len();
         let id = format!("chat:local:{}", crate::notes::mint_id("s"));
         let kind = self.sessions.kind.clone();
-        let workspace_id = self.draft_workspace_id(&kind);
+        let workspace_id = workspace_id.to_string();
         self.cards.push(MapCard {
             id: id.clone(),
             title: "New Chat".to_string(),
@@ -3297,6 +3330,25 @@ fn search_icon(color: rune::Color) -> Shape {
         .view_box(24.0, 24.0)
 }
 
+/// Sidebar row glyph: Lucide v1.17 `code-xml` (`Code2`, `</>`) for chats
+/// outside the General workspace.
+fn code_row_icon(size: f32, color: rune::Color) -> Shape {
+    // Lucide v1.17 `code-xml`: `m18 16 4-4-4-4` + `m6 8-4 4 4 4` + slash.
+    let p = Path::new()
+        .move_to([18.0, 16.0])
+        .line_to([22.0, 12.0])
+        .line_to([18.0, 8.0])
+        .move_to([6.0, 8.0])
+        .line_to([2.0, 12.0])
+        .line_to([6.0, 16.0])
+        .move_to([14.5, 4.0])
+        .line_to([9.5, 20.0])
+        .close();
+    Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
 /// Sidebar row glyph: Lucide v1.17 `message-square`.
 fn chat_row_icon(size: f32, color: rune::Color) -> Shape {
     // Lucide v1.17 `message-square`.
@@ -3664,6 +3716,559 @@ fn sidebar_rename_row<S: CanvasHost + 'static>(card_id: &str, edit: &rune::TextE
         )
 }
 
+/// Title style for sidebar rows (`renderRow` 12.5pt title).
+fn sidebar_title_style() -> rune::tok::TextStyle {
+    let mut style = rune::tok::TextStyle::new(12.5, 400.0);
+    style.line_height = 18.8;
+    style
+}
+
+/// Timestamp style for sidebar rows (10pt stamp).
+fn sidebar_stamp_style() -> rune::tok::TextStyle {
+    let mut style = rune::tok::TextStyle::new(10.0, 400.0);
+    style.line_height = 15.0;
+    style
+}
+
+/// Plus glyph (Lucide, 11pt) for the per-project `+` buttons.
+fn plus_icon(size: f32, color: rune::Color) -> Shape {
+    Shape::new()
+        .line(
+            [12.0, 5.0],
+            [12.0, 19.0],
+            crate::lucide_stroke(size),
+            LineCap::Round,
+            color,
+        )
+        .line(
+            [5.0, 12.0],
+            [19.0, 12.0],
+            crate::lucide_stroke(size),
+            LineCap::Round,
+            color,
+        )
+        .view_box(24.0, 24.0)
+}
+
+/// `from X` badge under a top-level spawned row (React `renderRow`'s
+/// `auto` pill + `from {parentTitle}`): violet pill, 10pt zinc-600 label.
+fn sidebar_from_badge(card_id: &str, parent_title: Option<&str>) -> El {
+    let mut pill_style = rune::tok::TextStyle::new(9.0, 500.0);
+    pill_style.line_height = 13.5;
+    let mut label_style = rune::tok::TextStyle::new(10.0, 400.0);
+    label_style.line_height = 15.0;
+    row()
+        .key(format!("side-{card_id}-from"))
+        .w_full()
+        .items_center()
+        .gap(4.0)
+        .child(
+            text("auto".to_string())
+                .key(format!("side-{card_id}-from-pill"))
+                .font(pill_style)
+                .color(rgba(196.0, 181.0, 253.0, 0.8))
+                .px(6.0)
+                // Pill text 13.5 + py 4 = 17.5 total, matching React's
+                // 9pt text + `py-px` + 1pt border (`code-xml` badge).
+                .py(2.0)
+                .radius(8.0)
+                .border(1.0, rgba(167.0, 139.0, 250.0, 0.2))
+                .fill(rgba(167.0, 139.0, 250.0, 0.08)),
+        )
+        .child(
+            text(match parent_title {
+                Some(title) => format!("from {title}"),
+                None => "spawned by agent".to_string(),
+            })
+            .key(format!("side-{card_id}-from-label"))
+            .grow(1.0)
+            .min_w(0.0)
+            .truncate()
+            .font(label_style)
+            .color(ink("#52525b")),
+        )
+}
+
+/// One top-level sidebar row plus its nested spawn leaves, in list order
+/// (React `renderRow` + the nest group). `flat` is the search pose: no
+/// nesting, spawned rows indent. `parent_title` is the resolved parent for
+/// a spawned top-level row: `Some` renders `from X`, `None` renders
+/// `spawned by agent` (React always badges spawned tops).
+#[allow(clippy::too_many_lines)]
+fn sidebar_thread<S: CanvasHost + 'static>(
+    s: &CanvasState,
+    chat: &crate::chats::ChatSummary,
+    kids: &[&crate::chats::ChatSummary],
+    flat: bool,
+    parent_title: Option<String>,
+) -> Vec<El> {
+    let card_id = chat.card_id();
+    let chat_key = chat.key();
+    let title = crate::chats::display_title(&chat.title);
+    let spawned = chat.parent_chat_id.is_some();
+    let active = card_id == s.active_id;
+    let sid = chat_key.clone();
+    let pinned = s.is_pinned(&sid);
+    let confirming = s.delete_confirming(&sid);
+    let fade = s.delete_fade(&sid);
+    let deleting = fade.is_some();
+    let running = s.running_tab.as_deref() == Some(sid.as_str())
+        || s.card(&card_id).map(|c| c.running).unwrap_or(false);
+    let editing = s
+        .sessions
+        .editing
+        .as_ref()
+        .is_some_and(|(id, _)| id == &sid);
+    let ws = chat.workspace_id.clone();
+    let chat_id = chat.id.clone();
+    let mut item = if editing {
+        let edit = &s
+            .sessions
+            .editing
+            .as_ref()
+            .expect("editing implies a draft")
+            .1;
+        sidebar_rename_row::<S>(&card_id, edit)
+    } else {
+        let mut item = row()
+            .key(format!("side-{card_id}"))
+            .w_full()
+            .items_center()
+            .gap(8.0)
+            .pl(if spawned && flat { 26.0 } else { 12.0 })
+            .pr(8.0)
+            .py(8.0)
+            .radius(8.0)
+            .hover_group();
+        // React row states: spawned rows carry `is-spawned`
+        // (white/2.5%, hover 5%, active 7.5%); regular rows hover
+        // white/4% and active at 9%.
+        if spawned {
+            item = item.fill(rgba(
+                255.0,
+                255.0,
+                255.0,
+                if active { 0.075 } else { 0.025 },
+            ));
+            if !active && !deleting {
+                item = item.hover(rgba(255.0, 255.0, 255.0, 0.05));
+            }
+        } else {
+            if !active && !deleting {
+                item = item.hover(rgba(255.0, 255.0, 255.0, 0.04));
+            }
+            if active {
+                item = item.fill(rgba(255.0, 255.0, 255.0, 0.09));
+            }
+        }
+        if !deleting {
+            item = item
+                .role("button")
+                .label(format!("Open {title}"))
+                .on_press(move |s: &mut S| {
+                    commit_sidebar_rename(s);
+                    s.canvas_mut().open_chat_row(&ws, &chat_id);
+                });
+        }
+        if running {
+            // `session-run-dot`: 6pt white dot with an 8pt glow and
+            // `house-breathe` (1.6s, opacity 0.55 → 1).
+            item = item.child(
+                rune::el()
+                    .key(format!("side-{card_id}-dot"))
+                    .size(6.0, 6.0)
+                    .radius(3.0)
+                    .fill(ink("#fafafa"))
+                    .shadow(0.0, 8.0, rgba(255.0, 255.0, 255.0, 0.65))
+                    .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.55, 1.0)),
+            );
+        } else {
+            item = item.child(
+                rune::el()
+                    .key(format!("side-{card_id}-icon"))
+                    .size(12.0, 12.0)
+                    .inert()
+                    .shape(if spawned {
+                        bot_icon(12.0, ink("#c4b5fd"))
+                    } else if chat.workspace_kind == "general" {
+                        chat_row_icon(12.0, ink("#52525b"))
+                    } else {
+                        // React `renderRow`: non-spawned rows use the chat
+                        // bubble only on the General workspace, `</>` elsewhere.
+                        code_row_icon(12.0, ink("#52525b"))
+                    }),
+            );
+        }
+        let mut title_col = col()
+            .key(format!("side-{card_id}-titlecol"))
+            .grow(1.0)
+            .min_w(0.0)
+            .child(
+                text(title.clone())
+                    .key(format!("side-{card_id}-title"))
+                    .min_w(0.0)
+                    .truncate()
+                    .font(sidebar_title_style())
+                    .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
+            );
+        if spawned && !deleting {
+            let mut badge = sidebar_from_badge(&card_id, parent_title.as_deref());
+            // React `mt-0.5` (2pt) between the title and the badge.
+            badge = badge.mt(2.0);
+            title_col = title_col.child(badge);
+        }
+        item = item.child(title_col);
+        if pinned {
+            item = item.child(
+                rune::el()
+                    .key(format!("side-{card_id}-pinmark"))
+                    .size(10.0, 10.0)
+                    .inert()
+                    .rotate(std::f32::consts::FRAC_PI_4)
+                    .shape(crate::icons::pin(10.0, ink("#71717a"))),
+            );
+        }
+        let stamp = crate::chats::relative_time_short(&chat.updated_at);
+        if !stamp.is_empty() {
+            item = item.child(
+                text(stamp)
+                    .key(format!("side-{card_id}-time"))
+                    .font(sidebar_stamp_style())
+                    .color(ink("#52525b")),
+            );
+        }
+        if !deleting {
+            item = item.child(sidebar_actions::<S>(
+                &card_id, &sid, pinned, confirming, running,
+            ));
+        }
+        item
+    };
+    // An inline input's own press must edit the field, not open the
+    // chat; the row wrapper carries only layout.
+    if editing {
+        item = item.on_press(|_: &mut S| {});
+    }
+    // React seeds every parent with spawned children as collapsed;
+    // an explicit expand keeps it open across polls.
+    let expanded = !kids.is_empty() && !s.sessions.spawn_collapsed.contains(&chat_key);
+    // `flex items-center gap-0.5` + 20pt leading slot (`w-5`): the
+    // role/expand gutter. Root rows leave it empty, so the row box
+    // starts at x=81 and spans 205pt (React `house-sidebar-row`).
+    let lead = if kids.is_empty() {
+        rune::el()
+            .key(format!("side-{card_id}-lead"))
+            .w(20.0)
+            .h(20.0)
+    } else {
+        let toggle = chat_key.clone();
+        let open = expanded;
+        rune::el()
+            .key(format!("side-{card_id}-lead"))
+            .role("button")
+            .label(if open {
+                "Collapse nested chats"
+            } else {
+                "Expand spawned chats"
+            })
+            .size(20.0, 20.0)
+            .radius(6.0)
+            .center()
+            .on_press(move |s: &mut S| {
+                commit_sidebar_rename(s);
+                let sessions = &mut s.canvas_mut().sessions;
+                if sessions.spawn_collapsed.remove(&toggle) {
+                    sessions.spawn_expanded.insert(toggle.clone());
+                } else {
+                    sessions.spawn_collapsed.insert(toggle.clone());
+                    sessions.spawn_expanded.remove(&toggle);
+                }
+            })
+            .child(rune::el().size(11.0, 11.0).inert().shape(if open {
+                chevron_down(11.0, ink("#52525b"))
+            } else {
+                chevron_right(11.0, ink("#52525b"))
+            }))
+    };
+    let cell = col()
+        .key(format!("side-{card_id}-cell"))
+        .grow(1.0)
+        .min_w(0.0)
+        .child(item);
+    let mut wrap = row()
+        .key(format!("side-wrap-{card_id}"))
+        .w_full()
+        .items_center()
+        .gap(2.0)
+        .child(lead)
+        .child(cell);
+    if let Some(opacity) = fade {
+        // React `.is-deleting` (`house-row-out`): 220ms fade and
+        // `translateX(-8px)`, then the row leaves the list. Rune
+        // cannot collapse a painted row in the same window without
+        // leaving its last layer under the row below, so the slot
+        // keeps its height until the 220ms timer drops it.
+        wrap = wrap.opacity(opacity).offset(-8.0 * (1.0 - opacity), 0.0);
+    }
+    let mut out = vec![wrap];
+    if expanded {
+        // React nests kids in a `flex flex-col gap-0.5` group directly under
+        // the parent row: no gap to the first kid, 2pt between kids, and the
+        // parent's own `mb-0.5` (2pt) after the last one. The flat list gap
+        // (6) would triple-space the nest, so the group pulls its bottom
+        // back up. (When an expanded nest ends a project group the group
+        // tail reads 6 instead of 12; expanded nests are interactive states,
+        // and the rest/collapsed/Load-more poses stay exact.)
+        let mut nest = col().key(format!("side-nest-{card_id}")).w_full().gap(0.0);
+        for (i, kid) in kids.iter().enumerate() {
+            let mut kid_wrap = row()
+                .key(format!("side-kid-wrap-{}", kid.card_id()))
+                .w_full()
+                .items_center()
+                .gap(2.0)
+                .child(
+                    rune::el()
+                        .key(format!("side-kid-{}-lead", kid.card_id()))
+                        .w(20.0)
+                        .h(20.0),
+                )
+                .child(
+                    col()
+                        .key(format!("side-kid-{}-cell", kid.card_id()))
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(sidebar_spawn_row::<S>(kid)),
+                );
+            if i > 0 {
+                kid_wrap = kid_wrap.mt(2.0);
+            }
+            nest = nest.child(kid_wrap);
+        }
+        nest = nest.mb(-4.0);
+        out.push(nest);
+    }
+    out
+}
+
+/// Split one project workspace's chats into top-level rows + same-workspace
+/// kid nests (React `groupWorkspaceChats`). Only parents inside the group
+/// nest; cross-workspace children stay top-level with a `from X` badge.
+/// Kids sort oldest-first (React `childrenByParent` sort).
+fn coding_group<'a>(
+    chats: &'a [crate::chats::ChatSummary],
+    ws_id: &str,
+) -> (
+    Vec<&'a crate::chats::ChatSummary>,
+    std::collections::HashMap<&'a str, Vec<&'a crate::chats::ChatSummary>>,
+) {
+    let group_ids: std::collections::HashSet<&str> = chats
+        .iter()
+        .filter(|c| c.workspace_id == ws_id)
+        .map(|c| c.id.as_str())
+        .collect();
+    let mut kids: std::collections::HashMap<&str, Vec<&crate::chats::ChatSummary>> =
+        std::collections::HashMap::new();
+    for chat in chats.iter().filter(|c| c.workspace_id == ws_id) {
+        if let Some(parent) = chat.parent_chat_id.as_deref() {
+            if parent != chat.id && group_ids.contains(parent) {
+                kids.entry(parent).or_default().push(chat);
+            }
+        }
+    }
+    for arr in kids.values_mut() {
+        arr.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    }
+    let tops: Vec<&crate::chats::ChatSummary> = chats
+        .iter()
+        .filter(|c| {
+            c.workspace_id == ws_id
+                && c.parent_chat_id
+                    .as_deref()
+                    .is_none_or(|pid| pid == c.id || !group_ids.contains(pid))
+        })
+        .collect();
+    (tops, kids)
+}
+
+/// Coding project group header (React `codingGroups` heading): chevron
+/// collapse toggle with the 10pt uppercase project name + loaded chat
+/// count, and a 20pt `+` button starting a chat in that project. Missing
+/// project folders render the name amber (`text-amber-500/70`).
+fn sidebar_group_header<S: CanvasHost + 'static>(
+    s: &CanvasState,
+    ws: &crate::chats::ChatWorkspace,
+    total: usize,
+) -> El {
+    let ws_id = ws.id.clone();
+    let ws_name = ws.name.clone();
+    let collapsed = s.sessions.collapsed_ws.contains(&ws_id);
+    let mut name_style = rune::tok::TextStyle::new(10.0, 600.0);
+    name_style.line_height = 15.0;
+    name_style.tracking = 1.0;
+    let mut count_style = rune::tok::TextStyle::new(9.5, 400.0);
+    count_style.line_height = 14.25;
+    let name_color = if ws.exists {
+        ink("#52525b")
+    } else {
+        rgba(245.0, 158.0, 11.0, 0.7)
+    };
+    let toggle_id = ws_id.clone();
+    let plus_id = ws_id.clone();
+    row()
+        .key(format!("side-group-{ws_id}"))
+        .w_full()
+        .items_center()
+        .gap(6.0)
+        .px(4.0)
+        .pb(4.0)
+        .child(
+            row()
+                .key(format!("side-group-{ws_id}-toggle"))
+                .grow(1.0)
+                .min_w(0.0)
+                .items_center()
+                .gap(6.0)
+                .role("button")
+                .label(if collapsed {
+                    format!("Expand {ws_name}")
+                } else {
+                    format!("Collapse {ws_name}")
+                })
+                .on_press(move |s: &mut S| {
+                    commit_sidebar_rename(s);
+                    let sessions = &mut s.canvas_mut().sessions;
+                    if !sessions.collapsed_ws.remove(&toggle_id) {
+                        sessions.collapsed_ws.insert(toggle_id.clone());
+                    }
+                })
+                .child(
+                    rune::el()
+                        .key(format!("side-group-{ws_id}-chevron"))
+                        .size(11.0, 11.0)
+                        .inert()
+                        .shape(if collapsed {
+                            chevron_right(11.0, ink("#52525b"))
+                        } else {
+                            chevron_down(11.0, ink("#52525b"))
+                        }),
+                )
+                .child(
+                    text(ws_name.to_uppercase())
+                        .key(format!("side-group-{ws_id}-name"))
+                        .min_w(0.0)
+                        .truncate()
+                        .font(name_style)
+                        .color(name_color),
+                )
+                .child(
+                    text(total.to_string())
+                        .key(format!("side-group-{ws_id}-count"))
+                        .font(count_style)
+                        .color(ink("#3f3f46")),
+                ),
+        )
+        .child(
+            rune::el()
+                .key(format!("side-group-{ws_id}-plus"))
+                .role("button")
+                .label(format!("New chat in {ws_name}"))
+                .size(20.0, 20.0)
+                .radius(6.0)
+                .center()
+                .hover_group()
+                .hover(rgba(255.0, 255.0, 255.0, 0.08))
+                .on_press(move |s: &mut S| {
+                    commit_sidebar_rename(s);
+                    s.canvas_mut().new_session_in(&plus_id);
+                })
+                .child(
+                    rune::el()
+                        .key(format!("side-group-{ws_id}-plus-icon"))
+                        .size(11.0, 11.0)
+                        .inert()
+                        .child(
+                            rune::el()
+                                .size(11.0, 11.0)
+                                .shape(plus_icon(11.0, ink("#52525b"))),
+                        )
+                        .child(
+                            rune::el()
+                                .size(11.0, 11.0)
+                                .absolute(0.0, 0.0)
+                                .group_opacity(0.0, 1.0)
+                                .shape(plus_icon(11.0, ink("#ffffff"))),
+                        ),
+                ),
+        )
+}
+
+/// Load more button closing a paged sidebar section
+/// (`LoadMoreButton`: 11pt/500 zinc-500, zinc-200 + white wash on hover).
+fn sidebar_load_more<S: CanvasHost + 'static>(
+    remaining: usize,
+    project: Option<String>,
+    general: bool,
+) -> El {
+    let mut style = rune::tok::TextStyle::new(11.0, 500.0);
+    style.line_height = 16.5;
+    let mut item = row()
+        .key(format!(
+            "side-loadmore-{}",
+            project.as_deref().unwrap_or("general")
+        ))
+        .w_full()
+        .center()
+        .py(6.0)
+        .mb(6.0)
+        // The list gap already separates the button from the rows above
+        // (React: row `mb-1` + wrapper `mb-0.5` = 6).
+        .radius(8.0)
+        .role("button")
+        .label(format!("Load {remaining} more chats"))
+        .hover_group()
+        .hover(rgba(255.0, 255.0, 255.0, 0.04))
+        .child(
+            rune::el()
+                .key(format!(
+                    "side-loadmore-{}-label",
+                    project.as_deref().unwrap_or("general")
+                ))
+                .inert()
+                .child(
+                    text(format!("Load more ({remaining})"))
+                        .font(style)
+                        .color(ink("#71717a")),
+                )
+                .child(
+                    text(format!("Load more ({remaining})"))
+                        .absolute(0.0, 0.0)
+                        .font(style)
+                        .color(ink("#e4e4e7"))
+                        .group_opacity(0.0, 1.0),
+                ),
+        );
+    if general {
+        item = item.on_press(|s: &mut S| {
+            commit_sidebar_rename(s);
+            s.canvas_mut().sessions.general_limit += GENERAL_PAGE;
+        });
+    } else if let Some(ws_id) = project {
+        item = item.on_press(move |s: &mut S| {
+            commit_sidebar_rename(s);
+            let sessions = &mut s.canvas_mut().sessions;
+            let limit = sessions
+                .project_limits
+                .get(&ws_id)
+                .copied()
+                .unwrap_or(PROJECT_PAGE);
+            sessions
+                .project_limits
+                .insert(ws_id.clone(), limit + PROJECT_PAGE);
+        });
+    }
+    item
+}
+
 /// Chats panel: kind dropdown + new chat, live search, and one row per chat
 /// filtered by kind + query. A row press selects and focuses the card.
 pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
@@ -3845,16 +4450,6 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .on_edit(move |s: &mut S| &mut s.canvas_mut().sessions.search),
                 ),
         );
-    let title_style = || {
-        let mut style = rune::tok::TextStyle::new(12.5, 400.0);
-        style.line_height = 18.8;
-        style
-    };
-    let stamp_style = || {
-        let mut style = rune::tok::TextStyle::new(10.0, 400.0);
-        style.line_height = 15.0;
-        style
-    };
     // List: one row per chat (`px-2.5 pb-3.5`, rows `pl-3 pr-2 py-2 mb-1`).
     // The horizontal inset lives on a wrapper outside the scroll view: a
     // Rune scroll's content width ignores its own right padding, which let
@@ -3897,255 +4492,165 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         // newest-first order (Rust's sort is stable).
         let mut ordered: Vec<&crate::chats::ChatSummary> = s.chat_rows.iter().collect();
         ordered.sort_by_key(|chat| !s.is_pinned(&chat.key()));
-        for chat in ordered {
-            let card_id = chat.card_id();
-            let chat_key = chat.key();
-            let title = crate::chats::display_title(&chat.title);
-            let spawned = chat.parent_chat_id.is_some();
-            let kind = CanvasState::kind_for(&chat.workspace_kind);
-            if kind != s.sessions.kind {
-                continue;
-            }
-            if !query.is_empty() && !title.to_lowercase().contains(&query) {
-                continue;
-            }
-            let parent_key = chat.parent_chat_id.as_ref().map(|parent| {
-                let pws = chat
-                    .parent_workspace_id
-                    .as_deref()
-                    .unwrap_or(&chat.workspace_id);
-                format!("{pws}:{parent}")
-            });
-            if !flat && parent_key.is_some_and(|pk| all_keys.contains(&pk)) {
-                continue;
-            }
-            let kids: Vec<&&crate::chats::ChatSummary> = if flat {
-                Vec::new()
-            } else {
-                spawn_kids
-                    .get(&chat_key)
-                    .map(|kids| {
-                        kids.iter()
-                            .filter(|kid| {
-                                CanvasState::kind_for(&kid.workspace_kind) == s.sessions.kind
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            // React seeds every parent with spawned children as collapsed;
-            // an explicit expand keeps it open across polls.
-            let expanded = !kids.is_empty() && !s.sessions.spawn_collapsed.contains(&chat_key);
-            let active = card_id == s.active_id;
-            let sid = chat_key.clone();
-            let pinned = s.is_pinned(&sid);
-            let confirming = s.delete_confirming(&sid);
-            let fade = s.delete_fade(&sid);
-            let deleting = fade.is_some();
-            let running = s.running_tab.as_deref() == Some(sid.as_str())
-                || s.card(&card_id).map(|c| c.running).unwrap_or(false);
-            let editing = s
-                .sessions
-                .editing
-                .as_ref()
-                .is_some_and(|(id, _)| id == &sid);
-            let ws = chat.workspace_id.clone();
-            let chat_id = chat.id.clone();
-            let mut item = if editing {
-                let edit = &s
-                    .sessions
-                    .editing
-                    .as_ref()
-                    .expect("editing implies a draft")
-                    .1;
-                sidebar_rename_row::<S>(&card_id, edit)
-            } else {
-                let mut item = row()
-                    .key(format!("side-{card_id}"))
-                    .w_full()
-                    .items_center()
-                    .gap(8.0)
-                    .pl(if spawned && flat { 26.0 } else { 12.0 })
-                    .pr(8.0)
-                    .py(8.0)
-                    .radius(8.0)
-                    .hover_group();
-                // React row states: spawned rows carry `is-spawned`
-                // (white/2.5%, hover 5%, active 7.5%); regular rows hover
-                // white/4% and active at 9%.
-                if spawned {
-                    item = item.fill(rgba(
-                        255.0,
-                        255.0,
-                        255.0,
-                        if active { 0.075 } else { 0.025 },
-                    ));
-                    if !active && !deleting {
-                        item = item.hover(rgba(255.0, 255.0, 255.0, 0.05));
-                    }
-                } else {
-                    if !active && !deleting {
-                        item = item.hover(rgba(255.0, 255.0, 255.0, 0.04));
-                    }
-                    if active {
-                        item = item.fill(rgba(255.0, 255.0, 255.0, 0.09));
-                    }
-                }
-                if !deleting {
-                    item = item.role("button").label(format!("Open {title}")).on_press(
-                        move |s: &mut S| {
-                            commit_sidebar_rename(s);
-                            s.canvas_mut().open_chat_row(&ws, &chat_id);
-                        },
-                    );
-                }
-                if running {
-                    // `session-run-dot`: 6pt white dot with an 8pt glow and
-                    // `house-breathe` (1.6s, opacity 0.55 → 1).
-                    item = item.child(
-                        rune::el()
-                            .key(format!("side-{card_id}-dot"))
-                            .size(6.0, 6.0)
-                            .radius(3.0)
-                            .fill(ink("#fafafa"))
-                            .shadow(0.0, 8.0, rgba(255.0, 255.0, 255.0, 0.65))
-                            .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.55, 1.0)),
-                    );
-                } else {
-                    item = item.child(
-                        rune::el()
-                            .key(format!("side-{card_id}-icon"))
-                            .size(12.0, 12.0)
-                            .inert()
-                            .shape(if spawned {
-                                bot_icon(12.0, ink("#c4b5fd"))
-                            } else {
-                                chat_row_icon(12.0, ink("#52525b"))
-                            }),
-                    );
-                }
-                item = item.child(
-                    text(title)
-                        .key(format!("side-{card_id}-title"))
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate()
-                        .font(title_style())
-                        .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
+        let lookup = crate::chats::parent_lookup(&s.chat_rows);
+        if s.sessions.kind == "Coding" && !flat {
+            // Coding filter: collapsible per-project groups (React
+            // `codingGroups`), each with its own 7-row page. Same-workspace
+            // spawns nest under their parent; cross-workspace children stay
+            // top-level with a `from X` badge. Search stays flat above.
+            let groups: Vec<&crate::chats::ChatWorkspace> =
+                s.workspaces.iter().filter(|w| w.is_project()).collect();
+            if groups.is_empty() {
+                let mut empty_style = rune::tok::TextStyle::new(11.5, 400.0);
+                empty_style.line_height = 17.25;
+                list = list.child(
+                    text("No projects yet - use + to add one.".to_string())
+                        .key("map-no-projects")
+                        .px(12.0)
+                        .py(12.0)
+                        .font(empty_style)
+                        .color(ink("#52525b")),
                 );
-                if pinned {
-                    item = item.child(
-                        rune::el()
-                            .key(format!("side-{card_id}-pinmark"))
-                            .size(10.0, 10.0)
-                            .inert()
-                            .rotate(std::f32::consts::FRAC_PI_4)
-                            .shape(crate::icons::pin(10.0, ink("#71717a"))),
-                    );
+            }
+            for (gi, ws) in groups.iter().enumerate() {
+                let total = s
+                    .chat_rows
+                    .iter()
+                    .filter(|c| c.workspace_id == ws.id)
+                    .count();
+                let mut header = sidebar_group_header::<S>(s, ws, total);
+                if gi > 0 {
+                    // List gap (6) + header margin (4) = React `mb-2.5` (10).
+                    header = header.mt(4.0);
                 }
-                let stamp = crate::chats::relative_time_short(&chat.updated_at);
-                if !stamp.is_empty() {
-                    item = item.child(
-                        text(stamp)
-                            .key(format!("side-{card_id}-time"))
-                            .font(stamp_style())
-                            .color(ink("#52525b")),
-                    );
+                if !s.sessions.collapsed_ws.contains(&ws.id) {
+                    // The expanded header's own bottom margin cancels the
+                    // list gap: header `pb-1` (4) then the first row, with
+                    // no extra gap (React stacks them in a plain div).
+                    // Collapsed headers keep the margin for the 10pt group
+                    // rhythm.
+                    header = header.mb(-6.0);
                 }
-                if !deleting {
-                    item = item.child(sidebar_actions::<S>(
-                        &card_id, &sid, pinned, confirming, running,
+                list = list.child(header);
+                if s.sessions.collapsed_ws.contains(&ws.id) {
+                    continue;
+                }
+                let (mut tops, group_kids) = coding_group(&s.chat_rows, &ws.id);
+                // React `pinnedSort`: pinned first, else the server's
+                // newest-first order (Rust's sort is stable).
+                tops.sort_by_key(|chat| !s.is_pinned(&chat.key()));
+                if tops.is_empty() {
+                    let mut empty_style = rune::tok::TextStyle::new(11.0, 400.0);
+                    empty_style.line_height = 16.5;
+                    list = list.child(
+                        text("No chats yet".to_string())
+                            .key(format!("side-group-{}-empty", ws.id))
+                            .px(12.0)
+                            .py(6.0)
+                            .font(empty_style)
+                            .color(ink("#3f3f46")),
+                    );
+                    continue;
+                }
+                let limit = s
+                    .sessions
+                    .project_limits
+                    .get(&ws.id)
+                    .copied()
+                    .unwrap_or(PROJECT_PAGE);
+                let shown = tops.len().min(limit);
+                for chat in &tops[..shown] {
+                    let kids: Vec<&crate::chats::ChatSummary> = group_kids
+                        .get(chat.id.as_str())
+                        .map(|kids| {
+                            kids.iter()
+                                .filter(|kid| {
+                                    CanvasState::kind_for(&kid.workspace_kind) == s.sessions.kind
+                                })
+                                .copied()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let parent_title = chat
+                        .parent_chat_id
+                        .as_ref()
+                        .and_then(|pid| lookup.get(pid))
+                        .map(|(title, _)| title.clone());
+                    for el in sidebar_thread::<S>(s, chat, &kids, flat, parent_title) {
+                        list = list.child(el);
+                    }
+                }
+                if tops.len() > shown {
+                    list = list.child(sidebar_load_more::<S>(
+                        tops.len() - shown,
+                        Some(ws.id.clone()),
+                        false,
                     ));
                 }
-                item
-            };
-            // An inline input's own press must edit the field, not open the
-            // chat; the row wrapper carries only layout.
-            if editing {
-                item = item.on_press(|_: &mut S| {});
             }
-            // `flex items-center gap-0.5` + 20pt leading slot (`w-5`): the
-            // role/expand gutter. Root rows leave it empty, so the row box
-            // starts at x=81 and spans 205pt (React `house-sidebar-row`).
-            let lead = if kids.is_empty() {
-                rune::el()
-                    .key(format!("side-{card_id}-lead"))
-                    .w(20.0)
-                    .h(20.0)
-            } else {
-                let toggle = chat_key.clone();
-                let open = expanded;
-                rune::el()
-                    .key(format!("side-{card_id}-lead"))
-                    .role("button")
-                    .label(if open {
-                        "Collapse nested chats"
-                    } else {
-                        "Expand spawned chats"
-                    })
-                    .size(20.0, 20.0)
-                    .radius(6.0)
-                    .center()
-                    .on_press(move |s: &mut S| {
-                        commit_sidebar_rename(s);
-                        let sessions = &mut s.canvas_mut().sessions;
-                        if sessions.spawn_collapsed.remove(&toggle) {
-                            sessions.spawn_expanded.insert(toggle.clone());
-                        } else {
-                            sessions.spawn_collapsed.insert(toggle.clone());
-                            sessions.spawn_expanded.remove(&toggle);
-                        }
-                    })
-                    .child(rune::el().size(11.0, 11.0).inert().shape(if open {
-                        chevron_down(11.0, ink("#52525b"))
-                    } else {
-                        chevron_right(11.0, ink("#52525b"))
-                    }))
-            };
-            let cell = col()
-                .key(format!("side-{card_id}-cell"))
-                .grow(1.0)
-                .min_w(0.0)
-                .child(item);
-            let mut wrap = row()
-                .key(format!("side-wrap-{card_id}"))
-                .w_full()
-                .items_center()
-                .gap(2.0)
-                .child(lead)
-                .child(cell);
-            if let Some(opacity) = fade {
-                // React `.is-deleting` (`house-row-out`): 220ms fade and
-                // `translateX(-8px)`, then the row leaves the list. Rune
-                // cannot collapse a painted row in the same window without
-                // leaving its last layer under the row below, so the slot
-                // keeps its height until the 220ms timer drops it.
-                wrap = wrap.opacity(opacity).offset(-8.0 * (1.0 - opacity), 0.0);
-            }
-            list = list.child(wrap);
-            if expanded {
-                for kid in kids {
-                    list = list.child(
-                        row()
-                            .key(format!("side-kid-wrap-{}", kid.card_id()))
-                            .w_full()
-                            .items_center()
-                            .gap(2.0)
-                            .child(
-                                rune::el()
-                                    .key(format!("side-kid-{}-lead", kid.card_id()))
-                                    .w(20.0)
-                                    .h(20.0),
-                            )
-                            .child(
-                                col()
-                                    .key(format!("side-kid-{}-cell", kid.card_id()))
-                                    .grow(1.0)
-                                    .min_w(0.0)
-                                    .child(sidebar_spawn_row::<S>(kid)),
-                            ),
-                    );
+        } else {
+            // Flat list (React `pinnedSort` + per-section paging): pinned
+            // chats first, otherwise the server's newest-first order (Rust's
+            // sort is stable). The Main filter pages at 15 rows.
+            let mut filt: Vec<&crate::chats::ChatSummary> = s.chat_rows.iter().collect();
+            filt.sort_by_key(|chat| !s.is_pinned(&chat.key()));
+            let mut tops: Vec<&crate::chats::ChatSummary> = Vec::new();
+            for chat in filt {
+                let title = crate::chats::display_title(&chat.title);
+                let kind = CanvasState::kind_for(&chat.workspace_kind);
+                if kind != s.sessions.kind {
+                    continue;
                 }
+                if !query.is_empty() && !title.to_lowercase().contains(&query) {
+                    continue;
+                }
+                let parent_key = chat.parent_chat_id.as_ref().map(|parent| {
+                    let pws = chat
+                        .parent_workspace_id
+                        .as_deref()
+                        .unwrap_or(&chat.workspace_id);
+                    format!("{pws}:{parent}")
+                });
+                if !flat && parent_key.is_some_and(|pk| all_keys.contains(&pk)) {
+                    continue;
+                }
+                tops.push(chat);
+            }
+            let total = tops.len();
+            let shown = if flat || s.sessions.kind != "Main" {
+                total
+            } else {
+                total.min(s.sessions.general_limit)
+            };
+            for chat in &tops[..shown] {
+                let chat_key = chat.key();
+                let mut kids: Vec<&crate::chats::ChatSummary> = if flat {
+                    Vec::new()
+                } else {
+                    spawn_kids
+                        .get(&chat_key)
+                        .map(|kids| {
+                            kids.iter()
+                                .filter(|kid| {
+                                    CanvasState::kind_for(&kid.workspace_kind) == s.sessions.kind
+                                })
+                                .copied()
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                kids.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                let parent_title = chat
+                    .parent_chat_id
+                    .as_ref()
+                    .and_then(|pid| lookup.get(pid))
+                    .map(|(title, _)| title.clone());
+                for el in sidebar_thread::<S>(s, chat, &kids, flat, parent_title) {
+                    list = list.child(el);
+                }
+            }
+            if !flat && total > shown {
+                list = list.child(sidebar_load_more::<S>(total - shown, None, true));
             }
         }
         panel = panel.child(
@@ -5049,6 +5554,158 @@ mod tests {
         assert!(rt.find(actions).is_none(), "deleting row drops the cluster");
         let (rect, opacity) = rt.presented("side-wrap-chat:_general:b").unwrap();
         assert!(opacity < 1.0, "row is fading: {opacity} at {rect:?}");
+    }
+
+    #[test]
+    fn coding_group_nests_same_workspace_oldest_first() {
+        use crate::chats::ChatSummary;
+        let chat = |ws: &str, id: &str, parent: Option<&str>, created: &str| ChatSummary {
+            id: id.to_string(),
+            workspace_id: ws.to_string(),
+            workspace_name: ws.to_string(),
+            workspace_kind: "project".to_string(),
+            title: id.to_string(),
+            updated_at: created.to_string(),
+            created_at: created.to_string(),
+            parent_chat_id: parent.map(|p| p.to_string()),
+            ..Default::default()
+        };
+        let rows = vec![
+            chat("ws-a", "top", None, "2026-11-11T09:00:00Z"),
+            chat("ws-a", "new-kid", Some("top"), "2026-11-11T10:00:00Z"),
+            chat("ws-a", "old-kid", Some("top"), "2026-11-11T08:00:00Z"),
+            chat("ws-a", "xws", Some("elsewhere"), "2026-11-11T07:00:00Z"),
+            chat("ws-b", "elsewhere", None, "2026-11-11T06:00:00Z"),
+        ];
+        let (tops, kids) = coding_group(&rows, "ws-a");
+        let top_ids: Vec<&str> = tops.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            top_ids,
+            vec!["top", "xws"],
+            "same-ws kids nest, cross-ws stay top"
+        );
+        let nest: Vec<&str> = kids["top"].iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(nest, vec!["old-kid", "new-kid"], "oldest first");
+    }
+
+    fn coding_state() -> CanvasState {
+        use crate::chats::{ChatSummary, ChatWorkspace};
+        let chat = |ws: &str, id: &str, parent: Option<&str>, at: &str| ChatSummary {
+            id: id.to_string(),
+            workspace_id: ws.to_string(),
+            workspace_name: ws.to_string(),
+            workspace_kind: "project".to_string(),
+            title: id.to_string(),
+            updated_at: at.to_string(),
+            created_at: at.to_string(),
+            parent_chat_id: parent.map(|p| p.to_string()),
+            ..Default::default()
+        };
+        let ws = |id: &str, name: &str, exists: bool| ChatWorkspace {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: "project".to_string(),
+            exists,
+            ..Default::default()
+        };
+        let mut s = CanvasState::map();
+        s.real = true;
+        s.workspaces = vec![ws("ws-a", "Alpha", true), ws("ws-b", "Beta", false)];
+        s.chat_rows = vec![
+            chat("ws-a", "top", None, "2026-11-11T09:00:00Z"),
+            chat("ws-a", "kid", Some("top"), "2026-11-11T10:00:00Z"),
+            chat("ws-a", "xws", Some("gone"), "2026-11-11T07:00:00Z"),
+        ];
+        s.sessions.kind = "Coding".to_string();
+        s
+    }
+
+    #[test]
+    fn coding_filter_groups_projects_with_counts_and_badges() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(coding_state(), sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        // Both project headers render with their loaded chat counts; the
+        // missing folder's name is present for its amber wash.
+        assert!(rt.find("side-group-ws-a").is_some(), "Alpha group header");
+        assert!(rt.find("side-group-ws-b").is_some(), "Beta group header");
+        // Cross-workspace child stays top-level with a `from` badge whose
+        // lookup misses (parent is not in any workspace).
+        assert!(
+            rt.find("side-chat:ws-a:xws-from-label").is_some(),
+            "from badge"
+        );
+        // Beta has no chats.
+        assert!(rt.find("side-group-ws-b-empty").is_some(), "empty group");
+    }
+
+    #[test]
+    fn coding_filter_pages_each_project_at_seven() {
+        use crate::chats::ChatSummary;
+        let mut s = coding_state();
+        for i in 0..8 {
+            s.chat_rows.push(ChatSummary {
+                id: format!("extra-{i}"),
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                workspace_kind: "project".to_string(),
+                title: format!("extra-{i}"),
+                updated_at: format!("2026-11-01T00:00:{i:02}Z"),
+                created_at: format!("2026-11-01T00:00:{i:02}Z"),
+                ..Default::default()
+            });
+        }
+        // 10 tops in ws-a (top, xws + 8 extras): 7 visible + Load more (3).
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(
+            rt.find("side-loadmore-ws-a").is_some(),
+            "Load more pages ws-a"
+        );
+        // Press Load more: the limit grows past the total and the button leaves.
+        let (lx, ly) = rt.find("side-loadmore-ws-a").expect("load more placed");
+        rt.pointer_down(lx, ly);
+        rt.pointer_up(lx, ly);
+        rt.frame(1.0 / 60.0);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.find("side-loadmore-ws-a").is_none() && rt.find("side-chat:ws-a:extra-7").is_some(),
+            "Load more reveals the rest"
+        );
+    }
+
+    #[test]
+    fn general_filter_pages_at_fifteen() {
+        let mut s = sidebar_state();
+        for i in 0..16 {
+            s.chat_rows.push(crate::chats::ChatSummary {
+                id: format!("g{i}"),
+                workspace_id: "_general".to_string(),
+                workspace_name: "General".to_string(),
+                workspace_kind: "general".to_string(),
+                title: format!("g{i}"),
+                updated_at: format!("2026-11-01T00:00:{i:02}Z"),
+                created_at: format!("2026-11-01T00:00:{i:02}Z"),
+                ..Default::default()
+            });
+        }
+        // 18 tops: 15 visible + Load more (3).
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(
+            rt.find("side-loadmore-general").is_some(),
+            "general pages at 15"
+        );
+    }
+
+    #[test]
+    fn plus_button_starts_a_chat_in_that_project() {
+        let mut s = coding_state();
+        let id = s.new_session_in("ws-b");
+        let thread = s.sessions.threads.get(&id).expect("thread created");
+        assert_eq!(thread.workspace_id, "ws-b", "plus targets its own project");
     }
 
     #[test]

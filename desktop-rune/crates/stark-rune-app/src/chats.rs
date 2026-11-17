@@ -15,6 +15,20 @@
 
 use std::collections::HashMap;
 
+/// Global parent lookup across every workspace (React `buildGlobalLookup`):
+/// chat id → (title, workspace name), first workspace wins. Powers the
+/// coding groups' `from X` badges for cross-workspace spawned children.
+pub fn parent_lookup(chats: &[ChatSummary]) -> HashMap<String, (String, String)> {
+    let mut map = HashMap::new();
+    for chat in chats {
+        map.entry(chat.id.clone()).or_insert_with(|| {
+            let title = display_title(&chat.title);
+            (title, chat.workspace_name.clone())
+        });
+    }
+    map
+}
+
 /// Display title (`cleanChatTitle`): strip stacked ` · Agent` suffixes.
 pub fn display_title(title: &str) -> String {
     let mut out = title.trim().to_string();
@@ -112,6 +126,7 @@ pub struct ChatSummary {
     pub workspace_kind: String,
     pub title: String,
     pub updated_at: String,
+    pub created_at: String,
     pub message_count: i64,
     pub parent_chat_id: Option<String>,
     pub parent_workspace_id: Option<String>,
@@ -503,6 +518,7 @@ fn parse_chat(
         workspace_kind: workspace_kind.to_string(),
         title: str_of(v, "title"),
         updated_at: str_of(v, "updatedAt"),
+        created_at: str_of(v, "createdAt"),
         message_count: v.get("messageCount").and_then(|x| x.as_i64()).unwrap_or(0),
         parent_chat_id: opt_str_of(v, "parentChatId"),
         parent_workspace_id: opt_str_of(v, "parentWorkspaceId"),
@@ -1503,6 +1519,31 @@ mod tests {
         }]});
         let rows = parse_messages(&payload);
         assert_eq!(rows[0].body, "[DELEGATION RESULT] hidden");
+    }
+
+    #[test]
+    fn created_at_parses_and_lookup_prefers_first_workspace() {
+        let page = serde_json::json!({"chats": [
+            {"id": "p", "title": "Parent", "createdAt": "2026-11-10T00:00:00Z",
+             "updatedAt": "2026-11-11T00:00:00Z"},
+            {"id": "c", "title": "Kid", "createdAt": "2026-11-09T00:00:00Z",
+             "updatedAt": "2026-11-09T00:00:00Z", "parentChatId": "p"},
+        ]});
+        let mut all = Vec::new();
+        for c in page["chats"].as_array().expect("chats") {
+            all.push(parse_chat(c, "ws-a", "Alpha", "project"));
+        }
+        assert_eq!(all[0].created_at, "2026-11-10T00:00:00Z");
+        assert_eq!(all[1].parent_chat_id.as_deref(), Some("p"));
+        // A duplicate id in a later workspace never overwrites the first.
+        all.push(parse_chat(
+            &serde_json::json!({"id": "p", "title": "Shadow"}),
+            "ws-b",
+            "Beta",
+            "project",
+        ));
+        let lookup = parent_lookup(&all);
+        assert_eq!(lookup["p"], ("Parent".to_string(), "Alpha".to_string()));
     }
 
     #[test]

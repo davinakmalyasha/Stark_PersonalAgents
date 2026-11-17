@@ -271,6 +271,66 @@ delta; the gone pose above compares the post-removal list and is clean. The
 static poses (rest/hover/confirm) match with no ghost at rest, hover or
 confirm.
 
+## Coding filter parity (2026-11-18)
+
+`parity/scenarios/coding/` is a committed synthetic workspace set: project
+Alpha (10 chats, exists on disk) with a spawn nest (`Orchestrator` →
+`worker-a`/`worker-b`), a cross-workspace child (`Remote child` spawned from
+`General Plan`), and six filler chats so the group pages; project Beta is
+missing on disk (amber name, `No chats yet`). The mock serves it with
+`--scenario coding`. The Coding filter renders collapsible per-project groups
+(chevron header + uppercase name + count + per-project `+`), 7 rows per page
+with Load more, same-workspace nests oldest-first, and the `auto`/`from X`
+badge on cross-workspace tops. Non-General rows use the `</>` icon, matching
+`renderRow`. The Main filter pages at 15 rows with its own Load more.
+
+```bash
+# React (Vite on :5200 with STARK_PORT=8126)
+python desktop-rune/parity/capture_react.py /tmp/coding-react-rest.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now ""
+python desktop-rune/parity/capture_react.py /tmp/coding-react-expanded.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --click 71,189
+python desktop-rune/parity/capture_react.py /tmp/coding-react-collapsed.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --click 69,160
+python desktop-rune/parity/capture_react.py /tmp/coding-react-loadmore.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --click 172,490
+
+# native (release; scripts tap the same controls)
+python desktop-rune/parity/mock_server.py --port 8126 --scenario coding
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/coding-native-rest.png --size 1280x900 --at 3.0
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/coding-native-expanded.png --size 1280x900 --at 3.0 \
+  --script parity/scripts/coding_expand_nest.json
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/coding-native-collapsed.png --size 1280x900 --at 3.0 \
+  --script parity/scripts/coding_collapse_group.json
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/coding-native-loadmore.png --size 1280x900 --at 3.0 \
+  --script parity/scripts/coding_load_more.json
+```
+
+At 1280×900 (`band` = sidebar 40–320 × 100–620; the full frame includes the
+canvas, where the native map and React's coding IDE view legitimately differ —
+workspace canvas work is out of scope, so parity is read on the band):
+
+| pose | full mean | band mean | align |
+| --- | ---: | ---: | --- |
+| rest | **4.247** | **1.004** | (0, 0) |
+| expanded nest | **4.373** | **1.898** | (0, 0) |
+| collapsed Alpha | **4.201** | **0.558** | (0, 0) |
+| load more pressed | **4.288** | **1.242** | (0, 0) |
+
+Group geometry comes from exact CDP rects: header `227×24` at 0-gap to the
+first row, top rows `205×34.75` on a 40.75 pitch, the from-badge block 17.5
+tall (9pt pill + `py-px` + border), nests gapless under the parent with 2pt
+between leaves. The Main poses are unchanged by the page limit and badges
+(rest 1.745/1.235, hover 1.756/1.561, confirm 1.758/1.608, fade band 12.849,
+gone 1.747/1.539, all align (0, 0)).
+
 ## State scripts
 
 `parity/scripts/*.json` are Rune headless input scripts (`tap`, `wheel`,

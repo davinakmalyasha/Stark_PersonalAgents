@@ -1,0 +1,80 @@
+{
+  "chats": [
+    {
+      "id": "orch",
+      "title": "Orchestrator",
+      "createdAt": "2026-11-11T09:00:00.000Z",
+      "updatedAt": "2026-11-11T12:00:00.000Z",
+      "messageCount": 5
+    },
+    {
+      "id": "worker-b",
+      "title": "worker-b",
+      "createdAt": "2026-11-11T10:00:00.000Z",
+      "updatedAt": "2026-11-11T11:00:00.000Z",
+      "messageCount": 2,
+      "parentChatId": "orch",
+      "parentWorkspaceId": "ws-alpha"
+    },
+    {
+      "id": "worker-a",
+      "title": "worker-a",
+      "createdAt": "2026-11-11T09:30:00.000Z",
+      "updatedAt": "2026-11-11T10:30:00.000Z",
+      "messageCount": 2,
+      "parentChatId": "orch",
+      "parentWorkspaceId": "ws-alpha"
+    },
+    {
+      "id": "xws",
+      "title": "Remote child",
+      "createdAt": "2026-11-11T08:00:00.000Z",
+      "updatedAt": "2026-11-11T08:30:00.000Z",
+      "messageCount": 1,
+      "parentChatId": "gen-plan",
+      "parentWorkspaceId": "_general"
+    },
+    {
+      "id": "o1",
+      "title": "Task one",
+      "createdAt": "2026-11-09T09:00:00.000Z",
+      "updatedAt": "2026-11-09T09:00:00.000Z",
+      "messageCount": 1
+    },
+    {
+      "id": "o2",
+      "title": "Task two",
+      "createdAt": "2026-11-08T09:00:00.000Z",
+      "updatedAt": "2026-11-08T09:00:00.000Z",
+      "messageCount": 1
+    },
+    {
+      "id": "o3",
+      "title": "Task three",
+      "createdAt": "2026-11-07T09:00:00.000Z",
+      "updatedAt": "2026-11-07T09:00:00.000Z",
+      "messageCount": 1
+    },
+    {
+      "id": "o4",
+      "title": "Task four",
+      "createdAt": "2026-11-06T09:00:00.000Z",
+      "updatedAt": "2026-11-06T09:00:00.000Z",
+      "messageCount": 1
+    },
+    {
+      "id": "o5",
+      "title": "Task five",
+      "createdAt": "2026-11-05T09:00:00.000Z",
+      "updatedAt": "2026-11-05T09:00:00.000Z",
+      "messageCount": 1
+    },
+    {
+      "id": "o6",
+      "title": "Task six",
+      "createdAt": "2026-11-04T09:00:00.000Z",
+      "updatedAt": "2026-11-04T09:00:00.000Z",
+      "messageCount": 1
+    }
+  ]
+}

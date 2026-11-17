@@ -6953,4 +6953,30 @@ mod tests {
         assert!(rt.find("t1-b0-tr-0").is_some(), "first row placed");
         assert!(rt.find("t1-b0-tr-1").is_some(), "second row placed");
     }
+
+    #[test]
+    fn quote_well_mounts_content_at_its_top_pad() {
+        let body = "> quoted words here\n";
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![RowData {
+            key: "t1".to_string(),
+            role: "agent",
+            body: body.to_string(),
+            raw_body: body.to_string(),
+            final_text: body.to_string(),
+            ..RowData::default()
+        }];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        let row = rt.presented("t1-b0-quote").expect("quote placed");
+        let inner = rt.presented("t1-b0-quote-blocks").expect("inner placed");
+        // py-8: the content block starts exactly 8pt below the well top.
+        assert!(
+            (inner.0[1] - row.0[1] - 8.0).abs() < 0.6,
+            "inner at pad, got row {:?} inner {:?}",
+            row,
+            inner
+        );
+    }
 }

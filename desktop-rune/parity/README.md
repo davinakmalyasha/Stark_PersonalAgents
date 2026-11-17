@@ -175,11 +175,11 @@ paragraph (bold/italic/strike/code/link), h3/h4 and a rule. Same rig
 
 | capture | full mean | right mean | align |
 |---|---|---|---|
-| 1280×900 tasks top | **2.854** | **2.866** | (0, 0) |
-| 1280×900 tasks end (h1-anchored) | **3.973** | **3.603** | (0, 0) |
+| 1280×900 tasks top | **2.627** | **2.697** | (0, 0) |
+| 1280×900 tasks end (h1-anchored) | **3.781** | **3.481** | (0, 0) |
 
-Closing the tasks gap took five implementation fixes (all follow React's
-collapsing-margin rules, verified against CDP rects):
+Closing the tasks gap took six implementation fixes (all follow React's
+collapsing-margin rules, verified against CDP rects + pixel probes):
 
 - First-block top margin: React's `mt-*` collapses out of the unpadded
   response, so the first child keeps `mt` (h1 `mt-6` = 24px); the native
@@ -198,6 +198,11 @@ collapsing-margin rules, verified against CDP rects):
 - Inline code renders the `border-zinc-700/50` 1px ring on the same rounded
   rect as the zinc-800/80 well, via the framework's paint-only
   `text_highlights` (`TextHighlight` ring + 6px pad for `px-1.5`).
+- Quote border side: `border_sides` is CSS-ordered `[top,right,bottom,left]`
+  (confirmed in the Rune shader + `set_border` + pixel probes), so the
+  `border-l-2` bar is `[0,0,0,2]`. The old `[2,0,0,0]` painted a *top*
+  border that also consumed 2px of layout room and pushed the quote content
+  down; the side fix is covered by `quote_well_mounts_content_at_pad`.
 
 Remaining tasks delta is glyph-level rasterisation (Inter grayscale AA on
 both sides, different rasterisers) plus the native-only Latest pill at the

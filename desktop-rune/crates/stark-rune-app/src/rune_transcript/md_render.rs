@@ -385,7 +385,9 @@ fn block<S: TranscriptHost + 'static>(
                         .py(8.0)
                         .radius(8.0)
                         .fill(rgba(99.0, 102.0, 241.0, 0.05))
-                        .border_sides([2.0, 0.0, 0.0, 0.0], rgba(99.0, 102.0, 241.0, 0.5))
+                        // `border-l-2`: Rune's sides are CSS-ordered
+                        // [top, right, bottom, left].
+                        .border_sides([0.0, 0.0, 0.0, 2.0], rgba(99.0, 102.0, 241.0, 0.5))
                         .border_layout()
                         .child(inner.grow(1.0).min_w(0.0)),
                 )

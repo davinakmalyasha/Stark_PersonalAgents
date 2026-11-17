@@ -18,6 +18,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceMsg {
     Level(f32),
+    /// Interim (`is_final: false`) or final (`true`) dictation text from the
+    /// speech thread. React's overlay protocol is the reference: `transcript`
+    /// events refresh the live bubble in place, `pipeline-start` swaps it for
+    /// the single canonical user message. The streaming-en STT producer binds
+    /// next — tests exercise the protocol today.
+    #[allow(dead_code)]
+    Transcript {
+        text: String,
+        is_final: bool,
+    },
     Error(String),
 }
 
@@ -28,6 +38,12 @@ pub struct VoiceBus {
     pub live: bool,
     pub level: f32,
     pub note: Option<String>,
+    /// Latest interim dictation (`transcript` events overwrite it in place,
+    /// like React's `voice-live-input` bubble content).
+    pub live_text: String,
+    /// A finished utterance waiting for the poll hook to stage it into the
+    /// composer draft (`take_final` consumes it once).
+    pending_final: Option<String>,
     pub stop: Option<Arc<AtomicBool>>,
     pub rx: Option<std::sync::mpsc::Receiver<VoiceMsg>>,
 }
@@ -38,6 +54,8 @@ impl std::fmt::Debug for VoiceBus {
             .field("live", &self.live)
             .field("level", &self.level)
             .field("note", &self.note)
+            .field("live_text", &self.live_text)
+            .field("pending_final", &self.pending_final.is_some())
             .field("capturing", &self.stop.is_some())
             .finish()
     }
@@ -49,6 +67,8 @@ impl Clone for VoiceBus {
             live: self.live,
             level: self.level,
             note: self.note.clone(),
+            live_text: self.live_text.clone(),
+            pending_final: self.pending_final.clone(),
             stop: None,
             rx: None,
         }
@@ -61,6 +81,8 @@ impl Default for VoiceBus {
             live: false,
             level: 0.0,
             note: None,
+            live_text: String::new(),
+            pending_final: None,
             stop: None,
             rx: None,
         }
@@ -79,10 +101,13 @@ impl VoiceBus {
             self.rx = None;
             self.live = false;
             self.level = 0.0;
+            self.live_text.clear();
             return false;
         }
         self.note = None;
         self.level = 0.0;
+        self.live_text.clear();
+        self.pending_final = None;
         #[cfg(target_arch = "wasm32")]
         {
             // getUserMedia binds here next; the affordance is live today.
@@ -116,6 +141,24 @@ impl VoiceBus {
                     self.level = decay_level(self.level, peak, dt);
                     changed = true;
                 }
+                VoiceMsg::Transcript { text, is_final } => {
+                    if is_final {
+                        // Session end (`pipeline-start`): drop the live bubble,
+                        // stop capture, and hand the canonical prompt to the
+                        // poll hook for draft staging.
+                        self.pending_final = Some(text);
+                        self.live_text.clear();
+                        self.live = false;
+                        self.level = 0.0;
+                        if let Some(stop) = self.stop.take() {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        self.rx = None;
+                    } else {
+                        self.live_text = text;
+                    }
+                    changed = true;
+                }
                 VoiceMsg::Error(note) => {
                     self.note = Some(note);
                     self.live = false;
@@ -133,6 +176,12 @@ impl VoiceBus {
             }
         }
         changed
+    }
+
+    /// Consume a finished utterance once (the poll hook stages it into the
+    /// composer draft, like React's `voiceInputText` dock effect).
+    pub fn take_final(&mut self) -> Option<String> {
+        self.pending_final.take()
     }
 
     /// Meter snapshot for the composer bars: (live, level, note).
@@ -160,7 +209,6 @@ pub fn decay_level(current: f32, peak: f32, dt: f32) -> f32 {
 }
 
 /// How many of the 5 meter bars a level lights.
-#[cfg(test)]
 pub fn lit_bars(level: f32) -> usize {
     if level <= 0.0 {
         return 0;
@@ -309,5 +357,39 @@ mod tests {
         if let Some(name) = probe_input() {
             assert!(!name.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn interim_overwrites_and_final_stages_once() {
+        let mut bus = VoiceBus::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        bus.rx = Some(rx);
+        bus.live = true;
+        tx.send(VoiceMsg::Transcript {
+            text: "hello".to_string(),
+            is_final: false,
+        })
+        .expect("send interim");
+        tx.send(VoiceMsg::Transcript {
+            text: "hello world".to_string(),
+            is_final: false,
+        })
+        .expect("send interim");
+        assert!(bus.drain(1.0 / 60.0));
+        // Interim events overwrite in place (React's `voice-live-input`).
+        assert_eq!(bus.live_text, "hello world");
+        assert!(bus.live);
+        tx.send(VoiceMsg::Transcript {
+            text: "hello world".to_string(),
+            is_final: true,
+        })
+        .expect("send final");
+        assert!(bus.drain(1.0 / 60.0));
+        // Final drops the bubble, ends the session, and hands the canonical
+        // prompt over exactly once (`pipeline-start`).
+        assert!(bus.live_text.is_empty());
+        assert!(!bus.live);
+        assert_eq!(bus.take_final().as_deref(), Some("hello world"));
+        assert!(bus.take_final().is_none());
     }
 }

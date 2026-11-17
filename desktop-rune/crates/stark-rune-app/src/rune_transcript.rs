@@ -3845,8 +3845,11 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     // Empty home thread (`MessageStream` isEmpty): a 60vh drop surface with
     // the centered "What to do Boss?" prompt. It lives inside the scroll
     // area, so the card caps at 74vh and the prompt sits at the bottom
-    // (stick-to-bottom), exactly like React.
-    let stack = if home && s.rows.is_empty() {
+    // (stick-to-bottom), exactly like React. A live voice bubble counts as
+    // content: speaking into an empty chat shows the interim bubble, not the
+    // empty surface (React's `voice-live-input` is a real message).
+    let voice_extra = usize::from(home && s.voice.live && !s.voice.live_text.trim().is_empty());
+    let stack = if home && s.rows.is_empty() && voice_extra == 0 {
         stack.child(
             col()
                 .key("transcript-empty")
@@ -3866,13 +3869,26 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
         )
     } else {
         stack.virtual_rows(
-            s.rows.len(),
+            s.rows.len() + voice_extra,
             ESTIMATED_ROW_H,
             // Typed to the window state `S` (Rune checks the registration):
             // read rows through the host, never by closing over `s`.
-            move |s: &S, i| Cow::Borrowed(s.thread(which).rows[i].key.as_str()),
+            move |s: &S, i| {
+                if i < s.thread(which).rows.len() {
+                    Cow::Borrowed(s.thread(which).rows[i].key.as_str())
+                } else {
+                    // React's stable `voice-live-input` id for the interim
+                    // bubble (overwritten in place per `transcript` event).
+                    Cow::Owned("voice-live-input".to_string())
+                }
+            },
             move |s: &S, i| {
                 let t = s.thread(which);
+                if i >= t.rows.len() {
+                    // Trailing interim dictation bubble (no meta entry, no
+                    // actions — like React's plain live bubble).
+                    return voice_live_bubble::<S>(s, which, &t.voice.live_text, home_max_w);
+                }
                 if let Some(meta) = &home_rows {
                     return home_row::<S>(s, which, i, meta, home_max_w);
                 }
@@ -4301,7 +4317,196 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
             ));
         }
     }
+    // Voice overlay floats above every sheet (own `dialog`-style layer):
+    // live meter while capturing, or the mic note when capture failed.
+    if s.voice.live || s.voice.note.is_some() {
+        root = root.child(voice_overlay::<S>(s, which));
+    }
     root
+}
+
+/// Interim dictation bubble (`voice-live-input`): the trailing user bubble
+/// while the mic is live. Same Stark user-bubble visuals, no actions — React
+/// renders the interim words as a plain bubble, overwritten per event.
+fn voice_live_bubble<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    text: &str,
+    max_w: f32,
+) -> El {
+    let body = if text.trim().is_empty() {
+        "Listening…".to_string()
+    } else {
+        text.to_string()
+    };
+    let bubble = col()
+        .key("voice-live-input-bubble")
+        .radius(14.0)
+        .linear_gradient(
+            145.0_f32.to_radians(),
+            [
+                (0.0, home_rgba(48.0, 48.0, 51.0, 0.92)),
+                (1.0, home_rgba(35.0, 35.0, 38.0, 0.95)),
+            ],
+        )
+        .border(1.0, home_ink("#ffffff17"))
+        .border_layout()
+        .px(16.0)
+        .py(10.0)
+        .max_w(max_w)
+        .child(
+            render_body_styled::<S>(
+                s,
+                which,
+                "voice-live-input",
+                &body,
+                "#e4e4e7",
+                home_body_style(),
+            )
+            .pt(12.0)
+            .pb(12.0),
+        );
+    row()
+        .key("voice-live-input")
+        .role("bubble")
+        .label("Voice input")
+        .w_full()
+        .justify_end()
+        .child(bubble)
+}
+
+/// Voice overlay: dim backdrop + centred card while the mic is live (or a
+/// mic note needs acknowledging). Rune `dialog` layer rule — scrim plus a
+/// centered panel, backdrop/Esc dismiss via `modal`, no height animation.
+/// The card carries the live meter (5 bars from `lit_bars`), the interim
+/// words or the note, and Stop/Close.
+pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
+    let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
+    let live = s.voice.live;
+    let lit = crate::voice::lit_bars(s.voice.level);
+    let mut bars = row()
+        .key("voice-bars")
+        .items_end()
+        .justify_center()
+        .gap(4.0)
+        .h(28.0);
+    for n in 0..5 {
+        let on = n < lit;
+        bars = bars.child(
+            rune::el()
+                .key(format!("voice-bar-{n}"))
+                .w(6.0)
+                .h(if on { 26.0 } else { 10.0 })
+                .radius(3.0)
+                .fill(if on {
+                    ink("#aa8dff")
+                } else {
+                    home_rgba(255.0, 255.0, 255.0, 0.10)
+                }),
+        );
+    }
+    let copy = if live {
+        if s.voice.live_text.trim().is_empty() {
+            "Speak now…".to_string()
+        } else {
+            s.voice.live_text.clone()
+        }
+    } else {
+        s.voice.note.clone().unwrap_or_default()
+    };
+    rune::el()
+        .key("voice-overlay")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(rune::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.6,
+        })
+        .center()
+        .modal(true, move |s: &mut S| {
+            let t = s.thread_mut(which);
+            t.voice.set_live(false);
+            t.voice.note = None;
+        })
+        .child(
+            col()
+                .key("voice-card")
+                .w(320.0)
+                .radius(16.0)
+                .fill(ink("#141417"))
+                .border(1.0, ink("#ffffff14"))
+                .px(20.0)
+                .pt(16.0)
+                .pb(16.0)
+                .gap(10.0)
+                .child(
+                    row()
+                        .key("voice-head")
+                        .w_full()
+                        .items_center()
+                        .child(
+                            text(if live {
+                                "Listening…".to_string()
+                            } else {
+                                "Microphone".to_string()
+                            })
+                            .key("voice-title")
+                            .grow(1.0)
+                            .font(rune::tok::TextStyle::new(13.0, 700.0))
+                            .color(ink("#f4f4f5")),
+                        )
+                        .child(
+                            rune::el()
+                                .key("voice-close")
+                                .size(16.0, 16.0)
+                                .role("button")
+                                .label("Close voice input")
+                                .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
+                                .on_press(move |s: &mut S| {
+                                    let t = s.thread_mut(which);
+                                    t.voice.set_live(false);
+                                    t.voice.note = None;
+                                }),
+                        ),
+                )
+                .child(bars)
+                .child(
+                    text(copy)
+                        .key("voice-text")
+                        .w_full()
+                        .font(rune::tok::TextStyle::new(12.5, 400.0))
+                        .color(if live { ink("#e4e4e7") } else { ink("#d39ba4") }),
+                )
+                .child(
+                    text(if live {
+                        "Stop voice input".to_string()
+                    } else {
+                        "Close".to_string()
+                    })
+                    .key("voice-stop")
+                    .role("button")
+                    .label(if live {
+                        "Stop voice input"
+                    } else {
+                        "Close voice input"
+                    })
+                    .w_full()
+                    .center()
+                    .py(9.0)
+                    .radius(10.0)
+                    .font(rune::tok::TextStyle::new(12.0, 600.0))
+                    .color(ink("#0a0a0d"))
+                    .fill(ink("#ffffff"))
+                    .on_press(move |s: &mut S| {
+                        let t = s.thread_mut(which);
+                        t.voice.set_live(false);
+                        t.voice.note = None;
+                    }),
+                ),
+        )
 }
 
 /// Settings sheet: dim backdrop + centred card, focus-trapped while mounted.
@@ -4384,6 +4589,44 @@ pub fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whic
                 )
                 .child(setting_row("model", "Model", s.model.clone()))
                 .child(setting_row("theme", "Theme", "Dark".to_string()))
+                .child({
+                    // Microphone row is live: it toggles capture (opening the
+                    // voice overlay) and reports the bus state, so a missing
+                    // device reads honestly instead of faking a toggle.
+                    let mic_value = if s.voice.live {
+                        "Listening…".to_string()
+                    } else if let Some(note) = s.voice.note.as_deref() {
+                        note.to_string()
+                    } else {
+                        "Ready".to_string()
+                    };
+                    row()
+                        .key("settings-row-mic")
+                        .w_full()
+                        .items_center()
+                        .py(9.0)
+                        .role("button")
+                        .label("Toggle voice input")
+                        .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
+                        .on_press(move |s: &mut S| {
+                            let t = s.thread_mut(which);
+                            let on = !t.voice.live;
+                            t.voice.set_live(on);
+                        })
+                        .child(
+                            text("Microphone".to_string())
+                                .key("settings-mic-label")
+                                .grow(1.0)
+                                .font(label)
+                                .color(ink("#a1a1aa")),
+                        )
+                        .child(
+                            text(mic_value)
+                                .key("settings-mic-value")
+                                .font(value)
+                                .color(ink("#e4e4e7")),
+                        )
+                })
                 .child(setting_row(
                     "version",
                     "Version",
@@ -4592,6 +4835,8 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::
     if poll_subagent(s) {
         changed = true;
     }
+    // Voice levels ride the same poll at 60fps steps.
+    changed |= s.voice.drain(1.0 / 60.0);
     // `/rewind` result: fetched history replaces the detached live rows.
     match s.rewind_inbox.as_ref().map(|rx| rx.try_recv()) {
         Some(Ok(Ok(result))) => {
@@ -4640,6 +4885,15 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::
     }
     // Voice levels ride the same poll at 60fps steps.
     changed |= s.voice.drain(1.0 / 60.0);
+    // Finished utterance (`pipeline-start`): stage the canonical prompt into
+    // the composer draft, like React's `voiceInputText` dock effect. Runs
+    // after `drain` so this frame's final is staged immediately.
+    if let Some(prompt) = s.voice.take_final() {
+        if !prompt.trim().is_empty() {
+            s.edit.replace_text(prompt);
+        }
+        changed = true;
+    }
     changed
 }
 
@@ -5609,6 +5863,100 @@ mod tests {
         assert!(
             rt.state.active_subagent.is_none(),
             "back closes drill, like SubagentSessionView onBack"
+        );
+    }
+
+    #[test]
+    fn voice_overlay_stops_capture() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.voice.live = true;
+        s.voice.level = 0.6;
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("voice-overlay").is_some(), "overlay mounted");
+        assert!(rt.find("voice-bars").is_some(), "meter renders");
+        assert!(rt.find("voice-stop").is_some(), "stop placed");
+        let (x, y) = rt.find("voice-stop").expect("stop placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.voice.live, "stop ends capture");
+        assert!(rt.find("voice-overlay").is_none(), "overlay leaves");
+    }
+
+    #[test]
+    fn voice_note_overlay_closes_and_clears() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.voice.note = Some("no microphone found".to_string());
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("voice-overlay").is_some(), "note surfaces");
+        assert!(rt.find("voice-text").is_some(), "note copy placed");
+        let (x, y) = rt.find("voice-stop").expect("close placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.voice.note.is_none(), "close clears note");
+        assert!(rt.find("voice-overlay").is_none(), "overlay leaves");
+    }
+
+    #[test]
+    fn voice_live_bubble_shows_in_home_view() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows.clear();
+        s.voice.live = true;
+        s.voice.live_text = "hello world".to_string();
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Interim words render as the trailing bubble (React id kept).
+        assert!(rt.find("voice-live-input").is_some(), "bubble placed");
+        assert!(
+            rt.find("transcript-empty").is_none(),
+            "bubble counts as content"
+        );
+    }
+
+    #[test]
+    fn voice_final_stages_composer_draft() {
+        use crate::voice::VoiceMsg;
+        let mut s = RuneTranscriptState::screenshot();
+        s.voice.live = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.voice.rx = Some(rx);
+        tx.send(VoiceMsg::Transcript {
+            text: "remind me at five".to_string(),
+            is_final: true,
+        })
+        .expect("send final");
+        let mut run_tx = rune::Tx::default();
+        assert!(drain_run_inbox(&mut s, 0.0, &mut run_tx));
+        // Canonical prompt lands in the draft; the bubble is gone.
+        assert_eq!(s.edit.text, "remind me at five");
+        assert!(s.voice.live_text.is_empty());
+        assert!(!s.voice.live);
+    }
+
+    #[test]
+    fn settings_mic_row_reports_and_toggles() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.settings_open = true;
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("settings-row-mic").is_some(), "mic row placed");
+        assert!(rt.find("settings-mic-value").is_some(), "mic value placed");
+        let (x, y) = rt.find("settings-row-mic").expect("mic row placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        // Headless rigs have no mic: either live capture or an honest note.
+        assert!(
+            rt.state.voice.live || rt.state.voice.note.is_some(),
+            "voice state: {:?}",
+            rt.state.voice
         );
     }
 }

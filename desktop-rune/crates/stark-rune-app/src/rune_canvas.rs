@@ -250,6 +250,7 @@ pub(crate) fn row_from_chat(r: &crate::chats::ChatMsgRow) -> crate::rune_transcr
         retry: r.retry.clone(),
         live_status: r.live_status.clone(),
         run_usage: r.run_usage.clone(),
+        artifacts: r.artifacts.clone(),
         attachments: r.attachments.clone(),
         ..crate::rune_transcript::RowData::default()
     }

@@ -274,6 +274,136 @@ pub fn mime_for_path(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// File status inside `metadata.artifacts` (`MessageBubble.ArtifactFile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArtifactStatus {
+    Added,
+    #[default]
+    Modified,
+    Deleted,
+}
+
+/// One file inside `metadata.artifacts` (`MessageBubble.ArtifactFile`):
+/// structured `files` entries win, else the legacy `files_created` /
+/// `files_modified` / `files_deleted` path lists (zero stats, no diffs).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ArtifactFile {
+    pub path: String,
+    pub status: ArtifactStatus,
+    pub additions: u64,
+    pub deletions: u64,
+    /// Unified diff for the Review modal (`DiffView diff={file.diff}`).
+    pub diff: String,
+}
+
+/// Run file summary inside `metadata.artifacts`
+/// (`MessageBubble.ArtifactSummary`): header counts, per-file stats, the
+/// undo run id and the tests flag.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RunArtifacts {
+    pub run_id: String,
+    pub files: Vec<ArtifactFile>,
+    /// Explicit totals; `None` falls back to the per-file sum (React's `??`).
+    pub total_additions: Option<u64>,
+    pub total_deletions: Option<u64>,
+    pub tests_passing: bool,
+}
+
+impl RunArtifacts {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub fn additions(&self) -> u64 {
+        self.total_additions
+            .unwrap_or_else(|| self.files.iter().map(|f| f.additions).sum())
+    }
+
+    pub fn deletions(&self) -> u64 {
+        self.total_deletions
+            .unwrap_or_else(|| self.files.iter().map(|f| f.deletions).sum())
+    }
+
+    /// Parse `metadata.artifacts`; `None` when no files are listed (React
+    /// renders nothing then).
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let status_of = |s: &str| match s {
+            "added" | "created" => ArtifactStatus::Added,
+            "deleted" | "removed" => ArtifactStatus::Deleted,
+            _ => ArtifactStatus::Modified,
+        };
+        let u64_of = |f: &serde_json::Map<String, serde_json::Value>, k: &str| {
+            f.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+        };
+        let mut files = Vec::new();
+        if let Some(list) = v.get("files").and_then(|x| x.as_array()) {
+            for f in list.iter().filter_map(|x| x.as_object()) {
+                let path = f
+                    .get("path")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if path.is_empty() {
+                    continue;
+                }
+                files.push(ArtifactFile {
+                    path,
+                    status: f
+                        .get("status")
+                        .and_then(|x| x.as_str())
+                        .map(status_of)
+                        .unwrap_or_default(),
+                    additions: u64_of(f, "additions"),
+                    deletions: u64_of(f, "deletions"),
+                    diff: f
+                        .get("diff")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        } else {
+            // Legacy path lists (`files_created` / `files_modified` /
+            // `files_deleted`): zero stats, no diffs.
+            for (key, status) in [
+                ("files_created", ArtifactStatus::Added),
+                ("files_modified", ArtifactStatus::Modified),
+                ("files_deleted", ArtifactStatus::Deleted),
+            ] {
+                if let Some(list) = v.get(key).and_then(|x| x.as_array()) {
+                    for path in list.iter().filter_map(|x| x.as_str()) {
+                        if path.is_empty() {
+                            continue;
+                        }
+                        files.push(ArtifactFile {
+                            path: path.to_string(),
+                            status,
+                            ..ArtifactFile::default()
+                        });
+                    }
+                }
+            }
+        }
+        if files.is_empty() {
+            return None;
+        }
+        Some(Self {
+            run_id: v
+                .get("run_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            files,
+            total_additions: v.get("total_additions").and_then(|x| x.as_u64()),
+            total_deletions: v.get("total_deletions").and_then(|x| x.as_u64()),
+            tests_passing: v
+                .get("tests_passing")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+        })
+    }
+}
+
 /// One transcript row from a chat payload.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatMsgRow {
@@ -324,6 +454,9 @@ pub struct ChatMsgRow {
     pub live_status: Option<crate::stream_accum::RunStatusNotice>,
     /// Per-message usage for the footer/persistence.
     pub run_usage: Option<crate::stream_accum::RunUsage>,
+    /// `metadata.artifacts` (`MessageBubble.ArtifactSummary`): file summary
+    /// for the run that produced this row. `None` renders no panel.
+    pub artifacts: Option<RunArtifacts>,
     /// `metadata.attachments` (`MessageBubble`'s user file cards).
     pub attachments: Vec<ChatAttachment>,
 }
@@ -651,6 +784,9 @@ pub(crate) fn parse_messages(v: &serde_json::Value) -> Vec<ChatMsgRow> {
                         retry,
                         live_status,
                         run_usage: usage.map(crate::stream_accum::RunUsage::from_json),
+                        artifacts: meta
+                            .and_then(|x| x.get("artifacts"))
+                            .and_then(RunArtifacts::from_json),
                         attachments: meta
                             .and_then(|x| x.get("attachments"))
                             .and_then(|x| x.as_array())
@@ -1544,6 +1680,46 @@ mod tests {
         ));
         let lookup = parent_lookup(&all);
         assert_eq!(lookup["p"], ("Parent".to_string(), "Alpha".to_string()));
+    }
+
+    #[test]
+    fn artifacts_parse_structured_and_legacy() {
+        // Structured `files` win with stats, diffs, explicit totals.
+        let page = serde_json::json!({"messages": [
+            {"id": "a1", "role": "assistant", "content": "done",
+             "metadata": {"artifacts": {
+                 "run_id": "run-7",
+                 "total_additions": 10, "total_deletions": 3,
+                 "tests_passing": true,
+                 "files": [
+                     {"path": "src/main.rs", "status": "modified",
+                      "additions": 8, "deletions": 2, "diff": "@@ -1 +1 @@\n-a\n+b\n"},
+                     {"path": "new.txt", "status": "added", "additions": 2},
+                 ]}}},
+            {"id": "a2", "role": "assistant", "content": "done",
+             "metadata": {"artifacts": {
+                 "files_created": ["b.txt"], "files_deleted": ["old.txt"]}}},
+            {"id": "a3", "role": "assistant", "content": "plain",
+             "metadata": {"artifacts": {"files": []}}},
+        ]});
+        let rows = parse_messages(&page);
+        assert_eq!(rows.len(), 3);
+        let art = rows[0].artifacts.as_ref().expect("structured parsed");
+        assert_eq!(art.run_id, "run-7");
+        assert_eq!(art.files.len(), 2);
+        assert_eq!(art.files[0].status, ArtifactStatus::Modified);
+        assert_eq!(art.files[1].status, ArtifactStatus::Added);
+        assert_eq!(art.additions(), 10, "explicit totals win");
+        assert_eq!(art.deletions(), 3);
+        assert!(art.tests_passing);
+        assert!(art.files[0].diff.contains("@@"));
+        // Legacy path lists: zero stats, no diffs, summed totals.
+        let legacy = rows[1].artifacts.as_ref().expect("legacy parsed");
+        assert_eq!(legacy.files.len(), 2);
+        assert_eq!(legacy.files[0].status, ArtifactStatus::Added);
+        assert_eq!(legacy.files[1].status, ArtifactStatus::Deleted);
+        assert_eq!(legacy.additions(), 0, "sums the per-file stats");
+        assert!(rows[2].artifacts.is_none(), "empty files render nothing");
     }
 
     #[test]

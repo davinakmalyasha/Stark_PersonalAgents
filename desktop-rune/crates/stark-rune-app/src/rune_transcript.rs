@@ -101,6 +101,9 @@ pub struct RowData {
     pub live_status: Option<RunStatusNotice>,
     /// Current run's tokens, persisted into `metadata.usage`.
     pub run_usage: Option<RunUsage>,
+    /// Persisted file summary (`metadata.artifacts`); live rows read the
+    /// accumulator's copy instead. `None` renders no panel.
+    pub artifacts: Option<crate::chats::RunArtifacts>,
 }
 
 /// Accumulated usage for one thread (`combinedTokenUsage` in `useChat.ts`):
@@ -653,6 +656,17 @@ impl SubagentDrill {
     }
 }
 
+/// Undo state for one artifact panel (`ArtifactSummary` undo pill):
+/// React's `undoState` (`idle` is the map's absence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArtifactUndo {
+    #[default]
+    Working,
+    Undone,
+    Conflict,
+    Failed,
+}
+
 pub struct RuneTranscriptState {
     pub title: String,
     pub rows: Vec<RowData>,
@@ -728,6 +742,18 @@ pub struct RuneTranscriptState {
     pub copied_at: Option<std::time::Instant>,
     /// Diff blocks whose "Show all N lines" button has been pressed.
     pub expanded_diffs: std::collections::HashSet<String>,
+    /// Artifact panels whose file list is expanded past the first three
+    /// (`Show N more files`, Rune `collapsible` rule: conditional content,
+    /// no height animation).
+    pub expanded_artifacts: std::collections::HashSet<String>,
+    /// Row key whose Review modal is open (`artifact-review-*` layer).
+    pub artifact_review: Option<String>,
+    /// Undo pill per artifact row (`run_id` runs only; React disables the
+    /// pill otherwise). Absence is `idle`.
+    pub artifact_undo: std::collections::HashMap<String, ArtifactUndo>,
+    /// In-flight `POST /runs/{id}/undo` (`(row_key, Ok(status)|Err)`).
+    /// `None` on clone: a copied state never inherits a live request.
+    pub artifact_undo_inbox: Option<std::sync::mpsc::Receiver<(String, Result<String, String>)>>,
     /// Row keys whose copy button is showing React's 1.5s Check state.
     pub copied_messages: std::collections::HashMap<String, std::time::Instant>,
     /// User rows armed for the two-step rewind (3.2s, like `rewindArmed`).
@@ -782,6 +808,10 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("inbox", &self.inbox.is_some())
             .field("copied_code", &self.copied_code)
             .field("expanded_diffs", &self.expanded_diffs.len())
+            .field("expanded_artifacts", &self.expanded_artifacts.len())
+            .field("artifact_review", &self.artifact_review)
+            .field("artifact_undo", &self.artifact_undo.len())
+            .field("artifact_undo_inbox", &self.artifact_undo_inbox.is_some())
             .field("copied_messages", &self.copied_messages.len())
             .field("rewind_armed", &self.rewind_armed.len())
             .field("rewind_inbox", &self.rewind_inbox.is_some())
@@ -839,6 +869,10 @@ impl Clone for RuneTranscriptState {
             copied_code: self.copied_code.clone(),
             copied_at: self.copied_at,
             expanded_diffs: self.expanded_diffs.clone(),
+            expanded_artifacts: self.expanded_artifacts.clone(),
+            artifact_review: self.artifact_review.clone(),
+            artifact_undo: self.artifact_undo.clone(),
+            artifact_undo_inbox: None,
             copied_messages: self.copied_messages.clone(),
             rewind_armed: self.rewind_armed.clone(),
             rewind_inbox: None,
@@ -922,6 +956,10 @@ impl RuneTranscriptState {
             copied_code: None,
             copied_at: None,
             expanded_diffs: std::collections::HashSet::new(),
+            expanded_artifacts: std::collections::HashSet::new(),
+            artifact_review: None,
+            artifact_undo: std::collections::HashMap::new(),
+            artifact_undo_inbox: None,
             copied_messages: std::collections::HashMap::new(),
             rewind_armed: std::collections::HashMap::new(),
             rewind_inbox: None,
@@ -997,6 +1035,10 @@ impl RuneTranscriptState {
             copied_code: None,
             copied_at: None,
             expanded_diffs: std::collections::HashSet::new(),
+            expanded_artifacts: std::collections::HashSet::new(),
+            artifact_review: None,
+            artifact_undo: std::collections::HashMap::new(),
+            artifact_undo_inbox: None,
             copied_messages: std::collections::HashMap::new(),
             rewind_armed: std::collections::HashMap::new(),
             rewind_inbox: None,
@@ -2395,6 +2437,7 @@ fn drill_row_from_msg(r: &ChatMsgRow) -> RowData {
         retry: r.retry.clone(),
         live_status: r.live_status.clone(),
         run_usage: r.run_usage.clone(),
+        artifacts: r.artifacts.clone(),
         attachments: r.attachments.clone(),
         ..RowData::default()
     }
@@ -2904,6 +2947,20 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         }
     }
 
+    // File summary panel (`MessageBubble.ArtifactSummary`): live rows read
+    // the accumulator's copy, completed rows the persisted metadata.
+    let artifacts = r
+        .accum
+        .as_ref()
+        .and_then(|acc| acc.artifacts.as_ref())
+        .and_then(crate::chats::RunArtifacts::from_json)
+        .or_else(|| r.artifacts.clone());
+    if let Some(art) = artifacts {
+        if !art.is_empty() {
+            group = group.child(artifact_panel::<S>(s, which, &r.key, &art));
+        }
+    }
+
     if live && r.accum.is_none() {
         // Legacy/demo live row (no accumulator): keep the 3-dot typing
         // bounce under the visible body, as `canvas-bubble-typing` does.
@@ -2968,6 +3025,670 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         streaming,
         retry_prompt,
     ))
+}
+
+/// Undo pill state per artifact row is `ArtifactUndo` (`idle` = absent).
+/// Starts `POST /runs/{id}/undo` on a worker thread; the result lands in
+/// `artifact_undo_inbox` for the poll hook (rewind pattern: explicit press,
+/// async result, no faked latency).
+pub fn start_artifact_undo(s: &mut RuneTranscriptState, row_key: &str, run_id: &str) {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return;
+    }
+    if s.artifact_undo
+        .get(row_key)
+        .is_some_and(|st| matches!(st, ArtifactUndo::Working | ArtifactUndo::Undone))
+    {
+        return;
+    }
+    s.artifact_undo
+        .insert(row_key.to_string(), ArtifactUndo::Working);
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.artifact_undo_inbox = Some(rx);
+    let key = row_key.to_string();
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = crate::transport::fetch_send(
+            "POST",
+            &format!("/runs/{run_id}/undo"),
+            Some(&serde_json::json!({})),
+        )
+        .await
+        .map(|v| {
+            v.get("status")
+                .and_then(|x| x.as_str())
+                .unwrap_or("undone")
+                .to_string()
+        })
+        .map_err(|e| e.to_string());
+        let _ = tx.send((key, result));
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let host = s.api_host.clone();
+        let port = s.api_port;
+        std::thread::spawn(move || {
+            let result = crate::transport::send_json(
+                &host,
+                port,
+                "POST",
+                &format!("/runs/{run_id}/undo"),
+                &serde_json::json!({}),
+            )
+            .map(|v| {
+                v.get("status")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("undone")
+                    .to_string()
+            })
+            .map_err(|e| e.to_string());
+            let _ = tx.send((key, result));
+        });
+    }
+}
+
+/// Drain the undo inbox: `conflict` stays visible, anything else marks the
+/// run undone; transport failures re-arm the pill (`Failed` → label back to
+/// `Undo`, like React's `error` fallthrough).
+pub fn poll_artifact_undo(s: &mut RuneTranscriptState) -> bool {
+    let Some(rx) = s.artifact_undo_inbox.as_ref() else {
+        return false;
+    };
+    let mut changed = false;
+    while let Ok((key, result)) = rx.try_recv() {
+        match result {
+            Ok(status) => {
+                s.artifact_undo.insert(
+                    key,
+                    if status == "conflict" {
+                        ArtifactUndo::Conflict
+                    } else {
+                        ArtifactUndo::Undone
+                    },
+                );
+            }
+            Err(_) => {
+                s.artifact_undo.insert(key, ArtifactUndo::Failed);
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        s.artifact_undo_inbox = None;
+    }
+    changed
+}
+
+/// Status glyph for one artifact file row (React `statusIcon`): plus for
+/// added, minus for deleted, pencil for modified — Lucide strokes in the
+/// summary's status colors.
+fn artifact_status_icon(status: crate::chats::ArtifactStatus, size: f32) -> El {
+    match status {
+        crate::chats::ArtifactStatus::Added => {
+            let p = rune::Path::new()
+                .move_to([12.0, 5.0])
+                .line_to([12.0, 19.0])
+                .move_to([5.0, 12.0])
+                .line_to([19.0, 12.0]);
+            rune::el().size(size, size).inert().shape(
+                rune::Shape::new()
+                    .stroke_path(
+                        &p,
+                        crate::lucide_stroke(size),
+                        rune::LineCap::Round,
+                        home_ink("#86b99b"),
+                    )
+                    .view_box(24.0, 24.0),
+            )
+        }
+        crate::chats::ArtifactStatus::Deleted => {
+            let p = rune::Path::new().move_to([5.0, 12.0]).line_to([19.0, 12.0]);
+            rune::el().size(size, size).inert().shape(
+                rune::Shape::new()
+                    .stroke_path(
+                        &p,
+                        crate::lucide_stroke(size),
+                        rune::LineCap::Round,
+                        home_ink("#c68f96"),
+                    )
+                    .view_box(24.0, 24.0),
+            )
+        }
+        crate::chats::ArtifactStatus::Modified => rune::el()
+            .size(size, size)
+            .inert()
+            .shape(crate::icons::pencil(size, home_ink("#c4ad78"))),
+    }
+}
+
+/// Disclosure chevron for "Show N more files" (rotates when expanded).
+fn artifact_chevron(size: f32, down: bool, color: rune::Color) -> rune::Shape {
+    let p = if down {
+        rune::Path::new()
+            .move_to([6.0, 9.0])
+            .line_to([12.0, 15.0])
+            .line_to([18.0, 9.0])
+    } else {
+        rune::Path::new()
+            .move_to([9.0, 18.0])
+            .line_to([15.0, 12.0])
+            .line_to([9.0, 6.0])
+    };
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// File summary panel (`MessageBubble.ArtifactSummary`): header card with the
+/// edited count, +/- totals and tests flag, Undo + Review actions, the file
+/// list (first three + expander), and stats colors per status. Rune builds it
+/// like `collapsible`: the expander swaps conditional content, no height
+/// animation.
+fn artifact_panel<S: TranscriptHost + 'static>(
+    s: &S,
+    which: Thread,
+    row_key: &str,
+    art: &crate::chats::RunArtifacts,
+) -> El {
+    let t = s.thread(which);
+    let expanded = t.expanded_artifacts.contains(row_key);
+    let undo = t
+        .artifact_undo
+        .get(row_key)
+        .copied()
+        .unwrap_or(ArtifactUndo::Working);
+    let undo_idle = !t.artifact_undo.contains_key(row_key);
+    let undo_label = match (undo_idle, undo) {
+        (true, _) => "Undo",
+        (false, ArtifactUndo::Working) => "Undoing…",
+        (false, ArtifactUndo::Undone) => "Undone",
+        (false, ArtifactUndo::Conflict) => "Conflict",
+        (false, ArtifactUndo::Failed) => "Undo",
+    };
+    // The pill is disabled without a run id or while working/undone (React
+    // mirrors `disabled` onto the same conditions).
+    let undo_enabled = !art.run_id.is_empty()
+        && !matches!(
+            (undo_idle, undo),
+            (false, ArtifactUndo::Working | ArtifactUndo::Undone)
+        );
+    let undo_run = art.run_id.clone();
+    let undo_key = row_key.to_string();
+    let mut undo_btn = row()
+        .key(format!("{row_key}-artifact-undo"))
+        .role("button")
+        .label(format!("{undo_label} this run"))
+        .items_center()
+        .gap(6.0)
+        .px(12.0)
+        .py(6.0)
+        .radius(999.0)
+        .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.12))
+        .border_layout()
+        .font(rune::tok::TextStyle::new(11.5, 600.0))
+        .color(if undo_enabled {
+            home_ink("#e4e4e7")
+        } else {
+            home_ink("#5b5b63")
+        })
+        .child(
+            text(undo_label)
+                .font(rune::tok::TextStyle::new(11.5, 600.0))
+                .color(if undo_enabled {
+                    home_ink("#e4e4e7")
+                } else {
+                    home_ink("#5b5b63")
+                }),
+        )
+        .child(rune::el().size(15.0, 15.0).inert().shape(home_icon_rotate(
+            15.0,
+            if undo_enabled {
+                home_ink("#e4e4e7")
+            } else {
+                home_ink("#5b5b63")
+            },
+        )));
+    if undo_enabled {
+        undo_btn = undo_btn
+            .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
+            .on_press(move |s: &mut S| {
+                start_artifact_undo(s.thread_mut(which), &undo_key, &undo_run);
+            });
+    }
+    let review_key = row_key.to_string();
+    let visible: Vec<(usize, &crate::chats::ArtifactFile)> = art
+        .files
+        .iter()
+        .enumerate()
+        .take(if expanded { art.files.len() } else { 3 })
+        .collect();
+    let hidden = art.files.len().saturating_sub(visible.len());
+    let mut list = col()
+        .key(format!("{row_key}-artifact-files"))
+        .gap(2.0)
+        .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.08))
+        .border_layout()
+        .px(10.0)
+        .pt(7.0)
+        .pb(8.0);
+    for (i, file) in visible {
+        list = list.child(
+            row()
+                .key(format!("{row_key}-artifact-file-{i}"))
+                .w_full()
+                .items_center()
+                .gap(7.0)
+                .child(artifact_status_icon(file.status, 14.0))
+                .child(
+                    text(file.path.clone())
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(10.0, 400.0).mono();
+                            style.line_height = 15.0;
+                            style
+                        })
+                        .color(home_ink("#9ea1aa")),
+                )
+                .child(
+                    row()
+                        .items_center()
+                        .gap(3.0)
+                        .child(
+                            text(format!("+{}", file.additions))
+                                .font({
+                                    let mut style = rune::tok::TextStyle::new(10.0, 400.0).mono();
+                                    style.line_height = 15.0;
+                                    style
+                                })
+                                .color(home_ink("#48d58b")),
+                        )
+                        .child(
+                            text(format!("-{}", file.deletions))
+                                .font({
+                                    let mut style = rune::tok::TextStyle::new(10.0, 400.0).mono();
+                                    style.line_height = 15.0;
+                                    style
+                                })
+                                .color(home_ink("#ff6268")),
+                        ),
+                ),
+        );
+    }
+    let mut card = col()
+        .key(format!("{row_key}-artifacts"))
+        .w_full()
+        .max_w(620.0)
+        .mt(14.0)
+        .radius(13.0)
+        .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.13))
+        .border_layout()
+        .fill(home_ink("#1d1e20"))
+        .child(
+            row()
+                .key(format!("{row_key}-artifact-top"))
+                .w_full()
+                .items_center()
+                .gap(14.0)
+                .px(17.0)
+                .py(15.0)
+                .min_h(88.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.1))
+                .border_layout()
+                .child(
+                    rune::el()
+                        .key(format!("{row_key}-artifact-icon"))
+                        .size(59.0, 59.0)
+                        .radius(14.0)
+                        .fill(home_ink("#111214"))
+                        .center()
+                        .child(
+                            rune::el()
+                                .size(22.0, 22.0)
+                                .inert()
+                                .shape(crate::lucide_file_text(22.0, home_ink("#aeb0b4"))),
+                        ),
+                )
+                .child(
+                    col()
+                        .key(format!("{row_key}-artifact-heading"))
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(6.0)
+                        .child(
+                            text(format!(
+                                "Edited {} file{}",
+                                art.files.len(),
+                                if art.files.len() == 1 { "" } else { "s" }
+                            ))
+                            .font(rune::tok::TextStyle::new(17.0, 600.0))
+                            .color(home_ink("#f1f1f2")),
+                        )
+                        .child({
+                            let mut totals = row().items_center().gap(7.0);
+                            totals = totals
+                                .child(
+                                    text(format!("+{}", art.additions()))
+                                        .font(rune::tok::TextStyle::new(16.0, 500.0))
+                                        .color(home_ink("#48d58b")),
+                                )
+                                .child(
+                                    text(format!("-{}", art.deletions()))
+                                        .font(rune::tok::TextStyle::new(16.0, 500.0))
+                                        .color(home_ink("#ff6268")),
+                                );
+                            if art.tests_passing {
+                                totals = totals.child(
+                                    row()
+                                        .items_center()
+                                        .gap(4.0)
+                                        .ml(5.0)
+                                        .child(rune::el().size(11.0, 11.0).inert().shape(
+                                            crate::lucide_check(11.0, 2.0, home_ink("#92959a")),
+                                        ))
+                                        .child(
+                                            text("Tests passed".to_string())
+                                                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                                                .color(home_ink("#92959a")),
+                                        ),
+                                );
+                            }
+                            totals
+                        }),
+                )
+                .child(
+                    row()
+                        .key(format!("{row_key}-artifact-actions"))
+                        .items_center()
+                        .gap(8.0)
+                        .child(undo_btn)
+                        .child(
+                            text("Review".to_string())
+                                .key(format!("{row_key}-artifact-review"))
+                                .role("button")
+                                .label("Review changed files")
+                                .px(12.0)
+                                .py(6.0)
+                                .radius(8.0)
+                                .font(rune::tok::TextStyle::new(11.5, 500.0))
+                                .color(home_ink("#c7c8ce"))
+                                .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
+                                .on_press(move |s: &mut S| {
+                                    s.thread_mut(which).artifact_review = Some(review_key.clone());
+                                }),
+                        ),
+                ),
+        )
+        .child(list);
+    if !art.files.is_empty() && art.files.len() > 3 {
+        let more_key = row_key.to_string();
+        card = card.child(
+            row()
+                .key(format!("{row_key}-artifact-more"))
+                .role("button")
+                .label(if expanded {
+                    "Show fewer files"
+                } else {
+                    "Show more files"
+                })
+                .w_full()
+                .justify_center()
+                .items_center()
+                .gap(4.0)
+                .py(8.0)
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
+                .on_press(move |s: &mut S| {
+                    let t = s.thread_mut(which);
+                    if !t.expanded_artifacts.remove(&more_key) {
+                        t.expanded_artifacts.insert(more_key.clone());
+                    }
+                })
+                .child(
+                    text(if expanded {
+                        "Show less".to_string()
+                    } else {
+                        format!(
+                            "Show {hidden} more file{}",
+                            if hidden == 1 { "" } else { "s" }
+                        )
+                    })
+                    .font(rune::tok::TextStyle::new(11.5, 500.0))
+                    .color(home_ink("#8a8a93")),
+                )
+                .child(rune::el().size(15.0, 15.0).inert().shape(artifact_chevron(
+                    15.0,
+                    !expanded,
+                    home_ink("#777983"),
+                ))),
+        );
+    }
+    card
+}
+
+/// Review modal for one artifact panel (`artifact-review-*`): header plus a
+/// per-file section with status, stats and the unified diff (`DiffView`
+/// port). Mounted at the transcript root like the voice overlay — Rune
+/// `dialog` layer rule, backdrop/Esc dismiss via `modal`.
+fn artifact_review_overlay<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+) -> El {
+    let Some(key) = s.artifact_review.clone() else {
+        return col().key("artifact-review-empty");
+    };
+    // Title/count come from the data snapshot; file sections render through
+    // the host (diff copy buttons resolve there), so the scroll body is a
+    // `virtual_rows` stack — direct child of the viewport, Rune `collapsible`
+    // rule for conditional content.
+    let file_total = s
+        .rows
+        .iter()
+        .find(|r| r.key == key)
+        .and_then(|r| r.artifacts.as_ref())
+        .map(|art| art.files.len())
+        .or_else(|| {
+            s.active_subagent.as_ref().and_then(|d| {
+                d.rows
+                    .iter()
+                    .find(|r| r.key == key)
+                    .and_then(|r| r.artifacts.as_ref())
+                    .map(|art| art.files.len())
+            })
+        })
+        .unwrap_or(0);
+    let body: El = if file_total == 0 {
+        col()
+            .key("artifact-review-body")
+            .w_full()
+            .center()
+            .py(24.0)
+            .child(
+                text("No changed files to review.".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#71717a")),
+            )
+    } else {
+        col()
+            .key("artifact-review-body")
+            .w_full()
+            .growth(GrowthSpec::default())
+            .virtual_rows(
+                file_total,
+                240.0,
+                move |s: &S, i| {
+                    let path = s
+                        .thread(which)
+                        .rows
+                        .iter()
+                        .find(|r| {
+                            s.thread(which).artifact_review.as_deref() == Some(r.key.as_str())
+                        })
+                        .and_then(|r| r.artifacts.as_ref())
+                        .and_then(|art| art.files.get(i))
+                        .map(|f| f.path.clone())
+                        .or_else(|| {
+                            s.thread(which).active_subagent.as_ref().and_then(|d| {
+                                d.rows
+                                    .iter()
+                                    .find(|r| {
+                                        s.thread(which).artifact_review.as_deref()
+                                            == Some(r.key.as_str())
+                                    })
+                                    .and_then(|r| r.artifacts.as_ref())
+                                    .and_then(|art| art.files.get(i))
+                                    .map(|f| f.path.clone())
+                            })
+                        })
+                        .unwrap_or_default();
+                    Cow::Owned(format!("artifact-review-file-{i}-{path}"))
+                },
+                move |s: &S, i| {
+                    let t = s.thread(which);
+                    let file = t
+                        .rows
+                        .iter()
+                        .find(|r| t.artifact_review.as_deref() == Some(r.key.as_str()))
+                        .and_then(|r| r.artifacts.as_ref())
+                        .and_then(|art| art.files.get(i).cloned())
+                        .or_else(|| {
+                            t.active_subagent.as_ref().and_then(|d| {
+                                d.rows
+                                    .iter()
+                                    .find(|r| t.artifact_review.as_deref() == Some(r.key.as_str()))
+                                    .and_then(|r| r.artifacts.as_ref())
+                                    .and_then(|art| art.files.get(i).cloned())
+                            })
+                        });
+                    let Some(file) = file else {
+                        return col().key(format!("artifact-review-file-missing-{i}"));
+                    };
+                    col()
+                        .key(format!("artifact-review-file-{i}"))
+                        .w_full()
+                        .gap(6.0)
+                        .child(
+                            row()
+                                .items_center()
+                                .gap(7.0)
+                                .child(artifact_status_icon(file.status, 14.0))
+                                .child(
+                                    text(file.path.clone())
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .truncate()
+                                        .font({
+                                            let mut style =
+                                                rune::tok::TextStyle::new(12.0, 600.0).mono();
+                                            style.line_height = 18.0;
+                                            style
+                                        })
+                                        .color(home_ink("#e4e4e7")),
+                                )
+                                .child(
+                                    text(format!("+{}", file.additions))
+                                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                                        .color(home_ink("#48d58b")),
+                                )
+                                .child(
+                                    text(format!("-{}", file.deletions))
+                                        .font(rune::tok::TextStyle::new(11.0, 400.0))
+                                        .color(home_ink("#ff6268")),
+                                ),
+                        )
+                        .child(md_render::render_diff::<S>(
+                            s,
+                            which,
+                            &format!("artifact-review-diff-{i}"),
+                            &file.diff,
+                        ))
+                },
+            )
+    };
+    rune::el()
+        .key("artifact-review-overlay")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(rune::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.7,
+        })
+        .center()
+        .modal(true, move |s: &mut S| {
+            s.thread_mut(which).artifact_review = None;
+        })
+        .child(
+            col()
+                .key("artifact-review-card")
+                .w_full()
+                .max_w(640.0)
+                .radius(16.0)
+                .fill(home_ink("#141417"))
+                .border(1.0, home_ink("#ffffff14"))
+                .px(20.0)
+                .pt(16.0)
+                .pb(16.0)
+                .gap(12.0)
+                .child(
+                    row()
+                        .key("artifact-review-head")
+                        .w_full()
+                        .items_center()
+                        .gap(10.0)
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .gap(2.0)
+                                .child(
+                                    text("RUN REVIEW".to_string())
+                                        .font({
+                                            let mut style = rune::tok::TextStyle::new(10.0, 600.0);
+                                            style.tracking = 1.4;
+                                            style
+                                        })
+                                        .color(home_ink("#71717a")),
+                                )
+                                .child(
+                                    text(format!(
+                                        "Edited {} file{}",
+                                        file_total,
+                                        if file_total == 1 { "" } else { "s" }
+                                    ))
+                                    .key("artifact-review-title")
+                                    .font(rune::tok::TextStyle::new(15.0, 600.0))
+                                    .color(home_ink("#f1f1f2")),
+                                ),
+                        )
+                        .child(
+                            rune::el()
+                                .key("artifact-review-close")
+                                .size(16.0, 16.0)
+                                .role("button")
+                                .label("Close review")
+                                .shape(crate::lucide_x(16.0, 2.0, home_ink("#8a8a93")))
+                                .on_press(move |s: &mut S| {
+                                    s.thread_mut(which).artifact_review = None;
+                                }),
+                        ),
+                )
+                .child(
+                    col()
+                        .key("artifact-review-scroll")
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .max_h(480.0)
+                        .scroll(ScrollSpec {
+                            stick_bottom: false,
+                        })
+                        .child(body),
+                ),
+        )
 }
 
 /// `compactTokens` (`SessionEventDivider`): `1240` → `1.2k`, `2M` → `2.0M`.
@@ -4322,6 +5043,10 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     if s.voice.live || s.voice.note.is_some() {
         root = root.child(voice_overlay::<S>(s, which));
     }
+    // Artifact Review modal floats above content like the voice overlay.
+    if s.artifact_review.is_some() {
+        root = root.child(artifact_review_overlay::<S>(s, which));
+    }
     root
 }
 
@@ -4587,8 +5312,41 @@ pub fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whic
                                 }),
                         ),
                 )
-                .child(setting_row("model", "Model", s.model.clone()))
                 .child(setting_row("theme", "Theme", "Dark".to_string()))
+                .child(if s.models.is_empty() {
+                    // No model list fetched: static value, like the backend
+                    // row. The picker lives in the composer dock.
+                    setting_row("model", "Model", s.model.clone())
+                } else {
+                    // Model list is loaded: jump straight into the picker
+                    // instead of showing a dead value row.
+                    row()
+                        .key("settings-row-model")
+                        .w_full()
+                        .items_center()
+                        .py(9.0)
+                        .role("button")
+                        .label("Change model")
+                        .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
+                        .on_press(move |s: &mut S| {
+                            let t = s.thread_mut(which);
+                            t.settings_open = false;
+                            t.model_open = true;
+                        })
+                        .child(
+                            text("Model".to_string())
+                                .key("settings-model-label")
+                                .grow(1.0)
+                                .font(label)
+                                .color(ink("#a1a1aa")),
+                        )
+                        .child(
+                            text(s.model.clone())
+                                .key("settings-model-value")
+                                .font(value)
+                                .color(ink("#e4e4e7")),
+                        )
+                })
                 .child({
                     // Microphone row is live: it toggles capture (opening the
                     // voice overlay) and reports the bus state, so a missing
@@ -4833,6 +5591,13 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::
         tx.wake_after(std::time::Duration::from_millis(50));
     }
     if poll_subagent(s) {
+        changed = true;
+    }
+    // Undo request in flight: keep polling until its status lands.
+    if s.artifact_undo_inbox.is_some() {
+        tx.wake_after(std::time::Duration::from_millis(50));
+    }
+    if poll_artifact_undo(s) {
         changed = true;
     }
     // Voice levels ride the same poll at 60fps steps.
@@ -5958,5 +6723,183 @@ mod tests {
             "voice state: {:?}",
             rt.state.voice
         );
+    }
+
+    fn artifact_row(key: &str, run_id: &str) -> RowData {
+        use crate::chats::{ArtifactFile, ArtifactStatus, RunArtifacts};
+        let mut files = Vec::new();
+        for (i, (path, status)) in [
+            ("src/main.rs", ArtifactStatus::Modified),
+            ("new.txt", ArtifactStatus::Added),
+            ("old.txt", ArtifactStatus::Deleted),
+            ("docs.md", ArtifactStatus::Modified),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            files.push(ArtifactFile {
+                path: path.to_string(),
+                status,
+                additions: (i as u64) + 1,
+                deletions: i as u64,
+                diff: format!("@@ -1 +1 @@\n-{path}\n+{path}\n"),
+            });
+        }
+        RowData {
+            key: key.to_string(),
+            role: "agent",
+            body: "edited files".to_string(),
+            raw_body: "edited files".to_string(),
+            final_text: "edited files".to_string(),
+            artifacts: Some(RunArtifacts {
+                run_id: run_id.to_string(),
+                files,
+                total_additions: Some(10),
+                total_deletions: Some(6),
+                tests_passing: true,
+            }),
+            ..RowData::default()
+        }
+    }
+
+    #[test]
+    fn artifact_panel_renders_counts_and_expands() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![artifact_row("a1", "run-7")];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Header card with undo + review actions renders.
+        assert!(rt.find("a1-artifacts").is_some(), "panel placed");
+        assert!(rt.find("a1-artifact-undo").is_some(), "undo placed");
+        assert!(rt.find("a1-artifact-review").is_some(), "review placed");
+        // First three files visible, the fourth behind the expander.
+        assert!(rt.find("a1-artifact-file-0").is_some());
+        assert!(rt.find("a1-artifact-file-2").is_some());
+        assert!(rt.find("a1-artifact-file-3").is_none(), "paged");
+        assert!(rt.find("a1-artifact-more").is_some(), "expander placed");
+        let (x, y) = rt.find("a1-artifact-more").expect("expander placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("a1-artifact-file-3").is_some(), "expands");
+        // Second press collapses back (conditional content, no animation).
+        let (x, y) = rt.find("a1-artifact-more").expect("expander placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("a1-artifact-file-3").is_none(), "collapses");
+    }
+
+    #[test]
+    fn artifact_review_opens_modal_with_diffs_and_closes() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![artifact_row("a1", "run-7")];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("a1-artifact-review").expect("review placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.find("artifact-review-overlay").is_some(),
+            "modal mounted"
+        );
+        assert!(rt.find("artifact-review-title").is_some(), "title placed");
+        assert!(rt.find("artifact-review-close").is_some(), "close placed");
+        let (x, y) = rt.find("artifact-review-close").expect("close placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.artifact_review.is_none(), "modal dismissed");
+        assert!(rt.find("artifact-review-overlay").is_none(), "layer leaves");
+    }
+
+    #[test]
+    fn artifact_undo_disabled_without_run_id() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![artifact_row("a1", "")];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Pill renders but carries no press (React `disabled`).
+        assert!(rt.find("a1-artifact-undo").is_some(), "pill placed");
+        let (x, y) = rt.find("a1-artifact-undo").expect("pill placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.artifact_undo.is_empty(),
+            "disabled pill never fires"
+        );
+    }
+
+    #[test]
+    fn artifact_undo_poll_applies_status() {
+        use crate::rune_transcript::ArtifactUndo;
+        let mut s = RuneTranscriptState::screenshot();
+        s.artifact_undo
+            .insert("a1".to_string(), ArtifactUndo::Working);
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.artifact_undo_inbox = Some(rx);
+        tx.send(("a1".to_string(), Ok("undone".to_string())))
+            .expect("send");
+        assert!(poll_artifact_undo(&mut s));
+        assert_eq!(s.artifact_undo["a1"], ArtifactUndo::Undone);
+        // Conflict stays visible; transport errors re-arm the pill.
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.artifact_undo_inbox = Some(rx);
+        tx.send(("a1".to_string(), Ok("conflict".to_string())))
+            .expect("send");
+        assert!(poll_artifact_undo(&mut s));
+        assert_eq!(s.artifact_undo["a1"], ArtifactUndo::Conflict);
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.artifact_undo_inbox = Some(rx);
+        tx.send(("a1".to_string(), Err("down".to_string())))
+            .expect("send");
+        assert!(poll_artifact_undo(&mut s));
+        assert_eq!(s.artifact_undo["a1"], ArtifactUndo::Failed);
+        assert!(s.artifact_undo_inbox.is_none(), "fetch settled");
+    }
+
+    #[test]
+    fn artifact_undo_press_starts_working() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![artifact_row("a1", "run-7")];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("a1-artifact-undo").expect("undo placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        // The pill arms immediately; the localhost POST resolves on poll
+        // (failed or not, state leaves Working exactly once).
+        assert_eq!(
+            rt.state.artifact_undo.get("a1"),
+            Some(&crate::rune_transcript::ArtifactUndo::Working)
+        );
+    }
+
+    #[test]
+    fn settings_model_row_opens_picker() {
+        use crate::rune_transcript::ModelOption;
+        let mut s = RuneTranscriptState::screenshot();
+        s.settings_open = true;
+        s.models = vec![ModelOption {
+            id: "m1".to_string(),
+            name: "Model One".to_string(),
+        }];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("settings-row-model").is_some(), "model row placed");
+        let (x, y) = rt.find("settings-row-model").expect("model row placed");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.settings_open, "settings closes");
+        assert!(rt.state.model_open, "picker opens");
     }
 }

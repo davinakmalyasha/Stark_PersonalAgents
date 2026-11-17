@@ -627,6 +627,32 @@ fn local_parts(iso: &str) -> Option<(i32, u32, u32, u32, u32)> {
     local_parts_from_secs(iso_epoch_secs(iso)?)
 }
 
+/// Session-keyed subagent drill (`SubagentSessionView`): the child chat a
+/// delegation step spawned. Rune builds it like `collapsible`: a trigger row
+/// (the delegation card, role=button) opens conditional content below — the
+/// drill surface replaces the transcript body, no height animation.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubagentDrill {
+    pub child_id: String,
+    pub label: String,
+    /// Workspace the child lives in (hint resolved at open; falls back to the
+    /// parent thread's workspace, like `workspaceFallback`).
+    pub workspace_id: String,
+    /// Parent chat title for the breadcrumb (`parentTitle`).
+    pub parent_title: String,
+    /// Child history as transcript rows (same `RowData` as the main body, so
+    /// bubbles/timelines render with identical visuals).
+    pub rows: Vec<RowData>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl SubagentDrill {
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.workspace_id, self.child_id)
+    }
+}
+
 pub struct RuneTranscriptState {
     pub title: String,
     pub rows: Vec<RowData>,
@@ -716,6 +742,15 @@ pub struct RuneTranscriptState {
     pub attachments_dragging: bool,
     /// Full-viewport image preview (`message-lightbox`).
     pub attachment_preview: Option<ChatAttachment>,
+    /// Session-keyed drill view (`SubagentSessionView`): `Some` replaces the
+    /// transcript body with the child chat + back header.
+    pub active_subagent: Option<SubagentDrill>,
+    /// In-flight child history fetch (`GET …/chats/{child}`).
+    /// `None` on clone: a copied state never inherits a live fetch.
+    pub drill_inbox: Option<std::sync::mpsc::Receiver<Result<Vec<ChatMsgRow>, String>>>,
+    /// Key the in-flight drill fetch was started for (`workspace:chat`).
+    /// Stale arrivals are dropped, like the rewind race guard.
+    pub drill_key: Option<String>,
     /// Ask the shell to refresh the sidebar after create/rewind.
     pub refresh_list: bool,
     /// `chat` SSE frame landed: the shell rekeys a `chat:local:*` card to the
@@ -750,6 +785,8 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("copied_messages", &self.copied_messages.len())
             .field("rewind_armed", &self.rewind_armed.len())
             .field("rewind_inbox", &self.rewind_inbox.is_some())
+            .field("active_subagent", &self.active_subagent)
+            .field("drill_inbox", &self.drill_inbox.is_some())
             .field("draft_attachments", &self.draft_attachments.len())
             .field("attachment_preview", &self.attachment_preview.is_some())
             .finish()
@@ -805,6 +842,9 @@ impl Clone for RuneTranscriptState {
             copied_messages: self.copied_messages.clone(),
             rewind_armed: self.rewind_armed.clone(),
             rewind_inbox: None,
+            active_subagent: self.active_subagent.clone(),
+            drill_inbox: None,
+            drill_key: self.drill_key.clone(),
             draft_attachments: self.draft_attachments.clone(),
             attachments_error: self.attachments_error.clone(),
             attachments_dragging: false,
@@ -885,6 +925,9 @@ impl RuneTranscriptState {
             copied_messages: std::collections::HashMap::new(),
             rewind_armed: std::collections::HashMap::new(),
             rewind_inbox: None,
+            active_subagent: None,
+            drill_inbox: None,
+            drill_key: None,
             draft_attachments: Vec::new(),
             attachments_error: None,
             attachments_dragging: false,
@@ -957,6 +1000,9 @@ impl RuneTranscriptState {
             copied_messages: std::collections::HashMap::new(),
             rewind_armed: std::collections::HashMap::new(),
             rewind_inbox: None,
+            active_subagent: None,
+            drill_inbox: None,
+            drill_key: None,
             draft_attachments: Vec::new(),
             attachments_error: None,
             attachments_dragging: false,
@@ -2233,6 +2279,163 @@ fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
     s.refresh_list = true;
 }
 
+/// Open the session-keyed drill (`SubagentSessionView`): replace the body
+/// with the child chat. The workspace hint resolves like React's
+/// `workspaceMatches` fallback — an explicit hint wins, else the parent
+/// thread's workspace.
+pub fn open_subagent(
+    s: &mut RuneTranscriptState,
+    child_id: &str,
+    label: &str,
+    child_workspace: Option<&str>,
+) {
+    let child_id = child_id.trim().to_string();
+    if child_id.is_empty() {
+        return;
+    }
+    let hint = child_workspace.unwrap_or("").trim();
+    let workspace_id = if hint.is_empty() {
+        s.workspace_id.clone()
+    } else {
+        hint.to_string()
+    };
+    let key = format!("{workspace_id}:{child_id}");
+    // Same child: just ensure it is open, don't restart the fetch.
+    if s.active_subagent.as_ref().is_some_and(|d| d.key() == key) {
+        return;
+    }
+    let parent_title = if s.title.trim().is_empty() {
+        "Subagent".to_string()
+    } else {
+        s.title.clone()
+    };
+    let label = if label.trim().is_empty() {
+        "Subagent".to_string()
+    } else {
+        label.to_string()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.drill_inbox = Some(rx);
+    s.drill_key = Some(key.clone());
+    s.active_subagent = Some(SubagentDrill {
+        child_id: child_id.clone(),
+        label,
+        workspace_id: workspace_id.clone(),
+        parent_title,
+        rows: Vec::new(),
+        loading: true,
+        error: None,
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        let path = format!("/api/workspaces/{workspace_id}/chats/{child_id}");
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::transport::fetch_json(&path)
+                .await
+                .map(|v| crate::chats::parse_messages(&v))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let host = s.api_host.clone();
+        let port = s.api_port;
+        std::thread::spawn(move || {
+            let result = crate::transport::get_json(
+                &host,
+                port,
+                &format!("/api/workspaces/{workspace_id}/chats/{child_id}"),
+            )
+            .map(|v| crate::chats::parse_messages(&v))
+            .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+}
+
+/// Close the drill and drop any in-flight child fetch.
+pub fn close_subagent(s: &mut RuneTranscriptState) {
+    s.active_subagent = None;
+    s.drill_inbox = None;
+    s.drill_key = None;
+}
+
+/// Convert a fetched child message into a transcript row. Mirrors
+/// `rune_canvas::row_from_chat` without the canvas dependency (transcript
+/// cannot depend on the canvas; the canvas depends on the transcript).
+fn drill_row_from_msg(r: &ChatMsgRow) -> RowData {
+    RowData {
+        key: r.key.clone(),
+        role: match r.role.as_str() {
+            "user" => "user",
+            "error" => "error",
+            _ => "agent",
+        },
+        body: r.body.clone(),
+        raw_body: r.raw_body.clone(),
+        at: r.at.clone(),
+        duration: r.duration.clone(),
+        show_trace: r.show_trace,
+        hide_body: r.hide_body,
+        event: r.event.clone(),
+        event_tokens_before: r.event_tokens_before,
+        event_input: r.event_input,
+        event_output: r.event_output,
+        has_usage: r.has_usage,
+        tokens_in: r.tokens_in,
+        tokens_out: r.tokens_out,
+        agent_name: r.agent_name.clone(),
+        timeline: r.timeline.clone(),
+        activity: r.activity.clone(),
+        final_text: r.final_text.clone(),
+        thinking: r.thinking.clone(),
+        steps: r.steps.clone(),
+        stopped: r.stopped,
+        retry: r.retry.clone(),
+        live_status: r.live_status.clone(),
+        run_usage: r.run_usage.clone(),
+        attachments: r.attachments.clone(),
+        ..RowData::default()
+    }
+}
+
+/// Drain the drill inbox (called from the shell poll, like rewind).
+/// Stale arrivals (key mismatch) are dropped.
+pub fn poll_subagent(s: &mut RuneTranscriptState) -> bool {
+    let Some(rx) = s.drill_inbox.as_ref() else {
+        return false;
+    };
+    let mut changed = false;
+    while let Ok(result) = rx.try_recv() {
+        let key = s.drill_key.clone().unwrap_or_default();
+        let Some(drill) = s.active_subagent.as_mut() else {
+            continue;
+        };
+        if drill.key() != key {
+            continue;
+        }
+        match result {
+            Ok(msgs) => {
+                drill.rows = msgs.iter().map(drill_row_from_msg).collect();
+                drill.loading = false;
+                drill.error = None;
+            }
+            Err(e) => {
+                drill.loading = false;
+                drill.error = Some(e);
+            }
+        }
+        changed = true;
+    }
+    // Fetch settled: drop the channel but keep the key for staleness checks
+    // until the next open.
+    if changed {
+        s.drill_inbox = None;
+    }
+    changed
+}
+
 impl HomeRows {
     fn new(rows: &[RowData]) -> Self {
         // `normalizeError`: trim, collapse whitespace, lowercase.
@@ -2646,7 +2849,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         } else if final_text.trim().is_empty() && retry.is_none() {
             group = group.child(activity::thinking_placeholder(&r.key));
         }
-        if let Some(cards) = activity::live_delegation_cards(r, &activity) {
+        if let Some(cards) = activity::live_delegation_cards::<S>(which, r, &activity) {
             group = group.child(cards);
         }
     } else if r.show_trace {
@@ -3324,6 +3527,288 @@ pub fn home_transcript_body<S: TranscriptHost + 'static>(
     transcript_body_with::<S>(s, which, false, true, false, max_w, window_h)
 }
 
+/// Lucide `ArrowLeft` (15pt) for the drill back button.
+fn drill_back_icon(size: f32, color: rune::Color) -> rune::Shape {
+    let p = rune::Path::new()
+        .move_to([19.0, 12.0])
+        .line_to([5.0, 12.0])
+        .move_to([12.0, 19.0])
+        .line_to([5.0, 12.0])
+        .line_to([12.0, 5.0]);
+    rune::Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), rune::LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+/// Session-keyed drill view (`SubagentSessionView`): header with back +
+/// breadcrumb + running status, body with the child history, read-only dock
+/// notice. Stark visuals (same bubbles as the parent); Rune builds it like
+/// `collapsible`/`dialog` conditional content — open state mounts the layer,
+/// no height animation.
+fn subagent_drill_view<S: TranscriptHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+    max_w: f32,
+) -> El {
+    let Some(drill) = s.active_subagent.as_ref() else {
+        return col().key("subagent-view-empty");
+    };
+    let parent_title = drill.parent_title.clone();
+    let child_label = if drill.label.is_empty() {
+        "Subagent".to_string()
+    } else {
+        drill.label.clone()
+    };
+    let retry_child = drill.child_id.clone();
+    let retry_label = drill.label.clone();
+    let retry_ws = drill.workspace_id.clone();
+    let loading = drill.loading;
+    let row_count = drill.rows.len();
+    let has_error = drill.error.is_some();
+    // Header (`.subagent-session-view-header`): 52pt, 14px sides, hairline.
+    let mut header = row()
+        .key("subagent-view-header")
+        .w_full()
+        .min_h(52.0)
+        .items_center()
+        .gap(9.0)
+        .px(14.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.075))
+        .border_layout()
+        .fill(home_ink("#0b0b0b"))
+        .child(
+            rune::el()
+                .key("subagent-view-back")
+                .role("button")
+                .label("Back to main session")
+                .size(30.0, 30.0)
+                .radius(8.0)
+                .center()
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
+                .on_press(move |s: &mut S| close_subagent(s.thread_mut(which)))
+                .child(
+                    rune::el()
+                        .size(15.0, 15.0)
+                        .inert()
+                        .shape(drill_back_icon(15.0, home_ink("#8e9098"))),
+                ),
+        )
+        .child(
+            row()
+                .key("subagent-view-crumb")
+                .grow(1.0)
+                .min_w(0.0)
+                .items_center()
+                .gap(7.0)
+                .child(
+                    text(parent_title)
+                        .key("subagent-view-parent")
+                        .role("button")
+                        .label("Back to main session")
+                        .font(rune::tok::TextStyle::new(12.0, 400.0))
+                        .color(home_ink("#777982"))
+                        .truncate()
+                        .max_w(132.0)
+                        .on_press(move |s: &mut S| close_subagent(s.thread_mut(which))),
+                )
+                .child(
+                    text("/".to_string())
+                        .font(rune::tok::TextStyle::new(12.0, 400.0))
+                        .color(home_ink("#62646d")),
+                )
+                .child(
+                    text(child_label)
+                        .key("subagent-view-child")
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .font(rune::tok::TextStyle::new(12.5, 600.0))
+                        .color(home_ink("#e1e1e5")),
+                ),
+        );
+    if loading {
+        header = header.child(
+            row()
+                .key("subagent-view-status")
+                .items_center()
+                .gap(5.0)
+                .child(
+                    rune::el()
+                        .size(6.0, 6.0)
+                        .radius(3.0)
+                        .fill(home_ink("#fafafa"))
+                        .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.55, 1.0)),
+                )
+                .child(
+                    text("running".to_string())
+                        .font(rune::tok::TextStyle::new(10.0, 400.0))
+                        .color(home_ink("#858790")),
+                ),
+        );
+    }
+    // Body (`.subagent-session-view-body`): loading / error / empty / rows.
+    // Rows reuse the parent's bubbles via host closures (same builders, same
+    // Stark visuals); the drill mounts them with `virtual_rows` so handlers
+    // resolve through the host like the main body. Conditional content only,
+    // no height animation (Rune `collapsible` rule).
+    let body: El = if loading && row_count == 0 {
+        col()
+            .key("subagent-view-loading")
+            .w_full()
+            .grow(1.0)
+            .min_h(180.0)
+            .center()
+            .gap(9.0)
+            .child(
+                rune::el()
+                    .size(18.0, 18.0)
+                    .inert()
+                    .shape({
+                        const K: f32 = 4.971;
+                        let p = rune::Path::new()
+                            .move_to([12.0, 3.0])
+                            .cubic_to([12.0 + K, 3.0], [21.0, 12.0 - K], [21.0, 12.0])
+                            .cubic_to([21.0, 12.0 + K], [12.0 + K, 21.0], [12.0, 21.0])
+                            .cubic_to([12.0 - K, 21.0], [3.0, 12.0 + K], [3.0, 12.0]);
+                        rune::Shape::new()
+                            .stroke_path(
+                                &p,
+                                crate::lucide_stroke(18.0),
+                                rune::LineCap::Round,
+                                home_ink("#8e9098"),
+                            )
+                            .view_box(24.0, 24.0)
+                    })
+                    .looping(rune::LoopSpec::rotation(0.9)),
+            )
+            .child(
+                text("Opening child chat…".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#70727b")),
+            )
+    } else if has_error {
+        col()
+            .key("subagent-view-error")
+            .w_full()
+            .grow(1.0)
+            .min_h(180.0)
+            .center()
+            .gap(9.0)
+            .child(
+                text("That child chat is no longer available.".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#70727b")),
+            )
+            .child(
+                text("Try again".to_string())
+                    .key("subagent-view-retry")
+                    .role("button")
+                    .label("Retry opening child chat")
+                    .font(rune::tok::TextStyle::new(11.5, 400.0))
+                    .color(home_ink("#c7c8ce"))
+                    .on_press(move |s: &mut S| {
+                        let t = s.thread_mut(which);
+                        // Re-open drops the error and restarts the fetch.
+                        t.active_subagent = None;
+                        t.drill_inbox = None;
+                        t.drill_key = None;
+                        open_subagent(t, &retry_child, &retry_label, Some(&retry_ws));
+                    }),
+            )
+    } else if row_count == 0 {
+        col()
+            .key("subagent-view-empty-rows")
+            .w_full()
+            .grow(1.0)
+            .min_h(180.0)
+            .center()
+            .child(
+                text("No transcript recorded yet.".to_string())
+                    .font(rune::tok::TextStyle::new(12.0, 400.0))
+                    .color(home_ink("#70727b")),
+            )
+    } else {
+        col()
+            .key("subagent-view-rows")
+            .w_full()
+            .pl(32.0)
+            .pr(16.0)
+            .pt(12.0)
+            .pb(12.0)
+            .growth(GrowthSpec::default())
+            .virtual_rows(
+                row_count,
+                ESTIMATED_ROW_H,
+                move |s: &S, i| {
+                    let key = s
+                        .thread(which)
+                        .active_subagent
+                        .as_ref()
+                        .and_then(|d| d.rows.get(i))
+                        .map(|r| r.key.clone())
+                        .unwrap_or_default();
+                    Cow::Owned(key)
+                },
+                move |s: &S, i| {
+                    let t = s.thread(which);
+                    let Some(drill) = t.active_subagent.as_ref() else {
+                        return col().key(format!("subagent-row-missing-{i}"));
+                    };
+                    let Some(r) = drill.rows.get(i) else {
+                        return col().key(format!("subagent-row-missing-{i}"));
+                    };
+                    // Same builders as the parent body (Stark bubbles); drill
+                    // tool toggles resolve through `toggle_tool`'s drill-row
+                    // search (see `activity.rs`).
+                    let group = match r.role {
+                        "user" => home_user_row::<S>(s, which, r, max_w),
+                        "error" => {
+                            let retry = String::new();
+                            home_error_row::<S>(s, which, r, &retry)
+                        }
+                        "system" => home_system_row(r),
+                        _ => home_agent_row::<S>(s, which, r, false, ""),
+                    };
+                    col()
+                        .key(format!("subagent-row-{}", r.key))
+                        .w_full()
+                        .child(group)
+                },
+            )
+    };
+    let dock = col()
+        .key("subagent-view-dock")
+        .w_full()
+        .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.07))
+        .border_layout()
+        .fill(home_ink("#0b0b0b"))
+        .child(
+            text("This child session is read-only in the native view.".to_string())
+                .key("subagent-view-readonly")
+                .px(16.0)
+                .py(12.0)
+                .font(rune::tok::TextStyle::new(11.0, 400.0))
+                .color(home_ink("#777982")),
+        );
+    col()
+        .key("subagent-view")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .fill(home_ink("#0b0b0b"))
+        .child(header)
+        .child(
+            col()
+                .key("subagent-view-body")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec { stick_bottom: true })
+                .child(body),
+        )
+        .child(dock)
+}
+
 fn transcript_body_with<S: TranscriptHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
@@ -3333,6 +3818,11 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     home_max_w: f32,
     window_h: f32,
 ) -> El {
+    // Session-keyed drill (`SubagentSessionView`): conditional content replaces
+    // the body, Rune `collapsible` style — no height animation, just open content.
+    if s.active_subagent.is_some() {
+        return subagent_drill_view::<S>(s, which, home_max_w);
+    }
     // Index-built rows: layout builds only the mounted window (viewport + up to
     // two viewports either side), so a 10k transcript commits in window time.
     // Handlers must find items by key, never by index (see `RowSource` docs).
@@ -4094,6 +4584,13 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::
     // ticket alive until the blocking `/rewind` result lands.
     if s.rewind_inbox.is_some() {
         tx.wake_after(std::time::Duration::from_millis(50));
+    }
+    // Drill fetch in flight: keep polling until the child history lands.
+    if s.drill_inbox.is_some() {
+        tx.wake_after(std::time::Duration::from_millis(50));
+    }
+    if poll_subagent(s) {
+        changed = true;
     }
     // `/rewind` result: fetched history replaces the detached live rows.
     match s.rewind_inbox.as_ref().map(|rx| rx.try_recv()) {
@@ -4947,5 +5444,171 @@ mod tests {
         assert!(rt.find("msg-9999").is_some(), "tail row mounted");
         assert!(rt.find("msg-0").is_none(), "head row virtualized out");
         assert!(rt.find("composer-send").is_some());
+    }
+
+    #[test]
+    fn drill_open_uses_hint_or_parent_workspace() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.workspace_id = "_general".to_string();
+        s.title = "Parent".to_string();
+        open_subagent(&mut s, "child-1", "Worker", Some("ws-alpha"));
+        let drill = s.active_subagent.as_ref().expect("drill open");
+        assert_eq!(drill.child_id, "child-1");
+        assert_eq!(drill.workspace_id, "ws-alpha");
+        assert_eq!(drill.parent_title, "Parent");
+        assert!(drill.loading);
+        assert_eq!(s.drill_key.as_deref(), Some("ws-alpha:child-1"));
+        // Empty hint falls back to the parent thread's workspace (React
+        // `workspaceFallback`).
+        open_subagent(&mut s, "child-2", "", None);
+        assert_eq!(
+            s.active_subagent
+                .as_ref()
+                .expect("drill reopen")
+                .workspace_id,
+            "_general"
+        );
+        // Empty child id never opens.
+        open_subagent(&mut s, "  ", "x", None);
+        assert_eq!(
+            s.active_subagent.as_ref().expect("drill kept").child_id,
+            "child-2"
+        );
+        close_subagent(&mut s);
+        assert!(s.active_subagent.is_none());
+        assert!(s.drill_inbox.is_none());
+        assert!(s.drill_key.is_none());
+    }
+
+    #[test]
+    fn drill_poll_applies_child_history() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.workspace_id = "_general".to_string();
+        open_subagent(&mut s, "child-1", "Worker", None);
+        // Simulate the fetch thread delivering one user + one agent row.
+        let rows = vec![
+            ChatMsgRow {
+                key: "c-u1".to_string(),
+                role: "user".to_string(),
+                body: "do it".to_string(),
+                raw_body: "do it".to_string(),
+                ..ChatMsgRow::default()
+            },
+            ChatMsgRow {
+                key: "c-a1".to_string(),
+                role: "agent".to_string(),
+                body: "done".to_string(),
+                raw_body: "done".to_string(),
+                ..ChatMsgRow::default()
+            },
+        ];
+        // Replace the real fetch with a deterministic send on the same channel.
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        tx2.send(Ok(rows)).expect("send");
+        s.drill_inbox = Some(rx2);
+        assert!(poll_subagent(&mut s));
+        let drill = s.active_subagent.as_ref().expect("drill kept");
+        assert!(!drill.loading);
+        assert!(drill.error.is_none());
+        assert_eq!(drill.rows.len(), 2);
+        assert_eq!(drill.rows[0].role, "user");
+        assert_eq!(drill.rows[1].role, "agent");
+        assert!(s.drill_inbox.is_none(), "fetch settled");
+    }
+
+    #[test]
+    fn tapping_delegation_card_opens_drill() {
+        use crate::stream_accum::{ChildRef, LiveToolEvent, StreamSegment, ToolStatus};
+        fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
+            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0)
+        }
+        let mut s = RuneTranscriptState::screenshot();
+        s.workspace_id = "_general".to_string();
+        s.title = "Parent".to_string();
+        s.live = false;
+        let delegation = StreamSegment::Tool {
+            ev: LiveToolEvent {
+                id: "ev-1".to_string(),
+                name: "delegate".to_string(),
+                args: Some(r#"{"task":"help out"}"#.to_string()),
+                status: ToolStatus::Done,
+                ok: Some(true),
+                ms: None,
+                preview: None,
+                agent: None,
+                children: vec![ChildRef {
+                    chat_id: "child-9".to_string(),
+                    job_id: None,
+                    agent_name: Some("Worker".to_string()),
+                    label: Some("help out".to_string()),
+                    workspace_id: None,
+                }],
+            },
+        };
+        s.rows = vec![RowData {
+            key: "a1".to_string(),
+            role: "agent",
+            body: String::new(),
+            raw_body: String::new(),
+            is_streaming: true,
+            activity: vec![delegation.clone()],
+            timeline: vec![delegation],
+            ..RowData::default()
+        }];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Delegation card renders pressable with the Open affordance.
+        assert!(rt.find("ev-1-delegation-0").is_some(), "card placed");
+        let (cx, cy) = rt.find("ev-1-delegation-0").expect("card placed");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        let drill = rt.state.active_subagent.as_ref().expect("drill opened");
+        assert_eq!(drill.child_id, "child-9");
+        assert_eq!(drill.workspace_id, "_general", "hint falls back");
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("subagent-view").is_some(), "drill mounted");
+    }
+
+    #[test]
+    fn drill_view_shows_header_body_and_back() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.workspace_id = "_general".to_string();
+        s.title = "Parent".to_string();
+        open_subagent(&mut s, "child-1", "Worker", None);
+        // Deterministic rows (no network in the view test).
+        s.drill_inbox = None;
+        s.active_subagent.as_mut().expect("drill").loading = false;
+        s.active_subagent.as_mut().expect("drill").rows = vec![RowData {
+            key: "c-a1".to_string(),
+            role: "agent",
+            body: "hello from child".to_string(),
+            raw_body: "hello from child".to_string(),
+            ..RowData::default()
+        }];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("subagent-view").is_some(), "drill mounted");
+        assert!(rt.find("subagent-view-back").is_some(), "back button");
+        assert!(
+            rt.find("subagent-view-parent").is_some(),
+            "breadcrumb parent"
+        );
+        assert!(rt.find("subagent-view-child").is_some(), "breadcrumb child");
+        assert!(
+            rt.find("subagent-view-readonly").is_some(),
+            "read-only dock"
+        );
+        // Back closes the drill.
+        let (bx, by) = rt.find("subagent-view-back").expect("back placed");
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.active_subagent.is_none(),
+            "back closes drill, like SubagentSessionView onBack"
+        );
     }
 }

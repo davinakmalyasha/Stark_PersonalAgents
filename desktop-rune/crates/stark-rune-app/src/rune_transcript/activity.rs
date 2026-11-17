@@ -185,6 +185,15 @@ fn toggle_tool<S: TranscriptHost + 'static>(
     if let Some(row) = thread.rows.iter_mut().find(|row| row.key == row_key) {
         let open = row.tool_open.get(item_key).copied().unwrap_or(default_open);
         row.tool_open.insert(item_key.to_string(), !open);
+        return;
+    }
+    // Drill rows own the same per-group open map (the drill renders through
+    // the host, so its toggles resolve here too).
+    if let Some(drill) = thread.active_subagent.as_mut() {
+        if let Some(row) = drill.rows.iter_mut().find(|row| row.key == row_key) {
+            let open = row.tool_open.get(item_key).copied().unwrap_or(default_open);
+            row.tool_open.insert(item_key.to_string(), !open);
+        }
     }
 }
 
@@ -367,14 +376,20 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
 ) -> El {
     if tool_labels::is_delegation(&event.name) {
         if event.children.is_empty() {
-            return delegation_card(event, None, is_active, 0);
+            return delegation_card::<S>(which, event, None, is_active, 0);
         }
         let mut cards = col()
             .key(format!("{row_key}-{}", event.id))
             .gap(6.0)
             .w_full();
         for (index, child) in event.children.iter().enumerate() {
-            cards = cards.child(delegation_card(event, Some(child), is_active, index));
+            cards = cards.child(delegation_card::<S>(
+                which,
+                event,
+                Some(child),
+                is_active,
+                index,
+            ));
         }
         return cards;
     }
@@ -845,7 +860,8 @@ fn tool_output(key: &str, output: &str, running: bool) -> El {
         )
 }
 
-fn delegation_card(
+fn delegation_card<S: TranscriptHost + 'static>(
+    which: Thread,
     event: &LiveToolEvent,
     step: Option<&crate::stream_accum::ChildRef>,
     is_active: bool,
@@ -879,6 +895,19 @@ fn delegation_card(
         };
         (name, task)
     };
+    // Session-keyed drill (`structuredDelegationSteps`): a live child with a
+    // chat id opens the child session. Static cards keep the current visual
+    // with no press (React `is-static`).
+    let drill = step.filter(|c| !c.chat_id.trim().is_empty()).map(|c| {
+        (
+            c.chat_id.clone(),
+            c.label
+                .clone()
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| task.clone()),
+            c.workspace_id.clone(),
+        )
+    });
     let running = is_active || event.status.is_running();
     let failed = event.ok == Some(false);
     let status = if running {
@@ -903,60 +932,81 @@ fn delegation_card(
             home_ink("#989da5")
         },
     ));
+    if drill.is_some() {
+        // React `activity-delegation-open`: 650-weight zinc prompt.
+        status_row = status_row.child(
+            text("Open".to_string())
+                .font(style(10.0, 650.0))
+                .color(home_ink("#d6d8de")),
+        );
+    }
+    let mut card = row()
+        .w_full()
+        .min_h(54.0)
+        .items_center()
+        .gap(11.0)
+        .px(13.0)
+        .py(11.0)
+        .radius(11.0)
+        .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.09))
+        .border_layout()
+        .fill(home_rgba(255.0, 255.0, 255.0, 0.028))
+        .child(
+            rune::el()
+                .size(29.0, 29.0)
+                .radius(9.0)
+                .fill(home_rgba(255.0, 255.0, 255.0, 0.07))
+                .center()
+                .child(icon_box(15.0, bot(15.0, home_ink("#c9cbd2")))),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(
+                    row()
+                        .items_center()
+                        .gap(4.0)
+                        .child(
+                            text(name.clone())
+                                .font(style(12.5, 650.0))
+                                .color(home_ink("#e4e5e8")),
+                        )
+                        .child(
+                            text("subagent".to_string())
+                                .font(style(10.0, 500.0))
+                                .color(home_ink("#888b95")),
+                        ),
+                )
+                .child(
+                    text(task.clone())
+                        .font(style(11.5, 400.0))
+                        .color(home_ink("#a7a9b0"))
+                        .truncate(),
+                ),
+        )
+        .child(status_row);
+    // Rune `collapsible` trigger rule: the pressable card is a button with a
+    // label; the static card carries no press. Hover matches React's
+    // border/fill lift (no translate animation in Rune).
+    if let Some((child_id, label, workspace)) = drill {
+        card = card
+            .role("button")
+            .label(format!("Open {name} subagent session"))
+            .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
+            .on_press(move |s: &mut S| {
+                // Workspace hint resolves inside `open_subagent` (explicit
+                // hint wins, else the parent thread's workspace).
+                super::open_subagent(s.thread_mut(which), &child_id, &label, workspace.as_deref());
+            });
+    }
     row()
         .key(format!("{}-delegation-{index}", event.id))
         .w_full()
         .max_w(620.0)
         .my(4.0)
-        .child(
-            row()
-                .w_full()
-                .min_h(54.0)
-                .items_center()
-                .gap(11.0)
-                .px(13.0)
-                .py(11.0)
-                .radius(11.0)
-                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.09))
-                .border_layout()
-                .fill(home_rgba(255.0, 255.0, 255.0, 0.028))
-                .child(
-                    rune::el()
-                        .size(29.0, 29.0)
-                        .radius(9.0)
-                        .fill(home_rgba(255.0, 255.0, 255.0, 0.07))
-                        .center()
-                        .child(icon_box(15.0, bot(15.0, home_ink("#c9cbd2")))),
-                )
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .gap(2.0)
-                        .child(
-                            row()
-                                .items_center()
-                                .gap(4.0)
-                                .child(
-                                    text(name)
-                                        .font(style(12.5, 650.0))
-                                        .color(home_ink("#e4e5e8")),
-                                )
-                                .child(
-                                    text("subagent".to_string())
-                                        .font(style(10.0, 500.0))
-                                        .color(home_ink("#888b95")),
-                                ),
-                        )
-                        .child(
-                            text(task)
-                                .font(style(11.5, 400.0))
-                                .color(home_ink("#a7a9b0"))
-                                .truncate(),
-                        ),
-                )
-                .child(status_row),
-        )
+        .child(card)
 }
 
 /// Completed trace accordion. Live rows render no completed shell.
@@ -1030,7 +1080,7 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
                 .max_w(620.0)
                 .my(4.0);
             for step in cards {
-                list = list.child(delegation_step_card(step));
+                list = list.child(delegation_step_card::<S>(which, step));
             }
             shell = shell.child(list);
         }
@@ -1098,7 +1148,7 @@ fn delegation_fallback<'a>(
         .collect()
 }
 
-fn delegation_step_card(step: &TraceStep) -> El {
+fn delegation_step_card<S: TranscriptHost + 'static>(which: Thread, step: &TraceStep) -> El {
     let name = step
         .child_name
         .clone()
@@ -1109,59 +1159,94 @@ fn delegation_step_card(step: &TraceStep) -> El {
         .or_else(|| Some(step.title.clone()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Delegated task".to_string());
+    let drill = step
+        .child_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            (
+                id.to_string(),
+                step.label
+                    .clone()
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| task.clone()),
+                step.child_workspace.clone(),
+            )
+        });
+    let mut status_row = row().items_center().gap(4.0).child(
+        text("Completed".to_string())
+            .font(style(10.0, 400.0))
+            .color(home_ink("#989da5")),
+    );
+    if drill.is_some() {
+        status_row = status_row.child(
+            text("Open".to_string())
+                .font(style(10.0, 650.0))
+                .color(home_ink("#d6d8de")),
+        );
+    }
+    let mut card = row()
+        .w_full()
+        .min_h(54.0)
+        .items_center()
+        .gap(11.0)
+        .px(13.0)
+        .py(11.0)
+        .radius(11.0)
+        .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.09))
+        .border_layout()
+        .fill(home_rgba(255.0, 255.0, 255.0, 0.028))
+        .child(
+            rune::el()
+                .size(29.0, 29.0)
+                .radius(9.0)
+                .fill(home_rgba(255.0, 255.0, 255.0, 0.07))
+                .center()
+                .child(icon_box(15.0, bot(15.0, home_ink("#c9cbd2")))),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(
+                    text(name.clone())
+                        .font(style(12.5, 650.0))
+                        .color(home_ink("#e4e5e8")),
+                )
+                .child(
+                    text(task.clone())
+                        .font(style(11.5, 400.0))
+                        .color(home_ink("#a7a9b0"))
+                        .truncate(),
+                ),
+        )
+        .child(status_row);
+    if let Some((child_id, label, workspace)) = drill {
+        card = card
+            .role("button")
+            .label(format!("Open {name} subagent session"))
+            .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
+            .on_press(move |s: &mut S| {
+                super::open_subagent(s.thread_mut(which), &child_id, &label, workspace.as_deref());
+            });
+    }
     row()
         .key(format!("{}-delegation-step", step.id))
         .w_full()
         .max_w(620.0)
-        .child(
-            row()
-                .w_full()
-                .min_h(54.0)
-                .items_center()
-                .gap(11.0)
-                .px(13.0)
-                .py(11.0)
-                .radius(11.0)
-                .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.09))
-                .border_layout()
-                .fill(home_rgba(255.0, 255.0, 255.0, 0.028))
-                .child(
-                    rune::el()
-                        .size(29.0, 29.0)
-                        .radius(9.0)
-                        .fill(home_rgba(255.0, 255.0, 255.0, 0.07))
-                        .center()
-                        .child(icon_box(15.0, bot(15.0, home_ink("#c9cbd2")))),
-                )
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .gap(2.0)
-                        .child(
-                            text(name)
-                                .font(style(12.5, 650.0))
-                                .color(home_ink("#e4e5e8")),
-                        )
-                        .child(
-                            text(task)
-                                .font(style(11.5, 400.0))
-                                .color(home_ink("#a7a9b0"))
-                                .truncate(),
-                        ),
-                )
-                .child(
-                    text("Completed".to_string())
-                        .font(style(10.0, 400.0))
-                        .color(home_ink("#989da5")),
-                ),
-        )
+        .child(card)
 }
 
 /// Live `TraceAccordion` fallback: only unclaimed child sessions, rendered
 /// after the chronological activity feed. Returns `None` when the stream
 /// already has an inline delegation tool event.
-pub(super) fn live_delegation_cards(r: &RowData, timeline: &[StreamSegment]) -> Option<El> {
+pub(super) fn live_delegation_cards<S: TranscriptHost + 'static>(
+    which: Thread,
+    r: &RowData,
+    timeline: &[StreamSegment],
+) -> Option<El> {
     if timeline.iter().any(|segment| {
         matches!(segment, StreamSegment::Tool { ev } if tool_labels::is_delegation(&ev.name))
     }) {
@@ -1177,7 +1262,7 @@ pub(super) fn live_delegation_cards(r: &RowData, timeline: &[StreamSegment]) -> 
         .max_w(620.0)
         .my(4.0);
     for step in cards {
-        list = list.child(delegation_step_card(step));
+        list = list.child(delegation_step_card::<S>(which, step));
     }
     Some(list)
 }

@@ -155,6 +155,41 @@ the opaque card (Rune draws grayscale) plus a one-device-pixel baseline
 difference, corrected with Rune's non-layout `.offset(0, 1)` on diff glyphs.
 Code/table bands are dominated by Consolas-vs-Consolas rasterisation at 12–13.5pt.
 
+## Tasks showcase parity (2026-11-18)
+
+`parity/scenarios/md/` also serves `chat-md-tasks`: h1/h2, a checked +
+unchecked task list with a nested follow-up, a blockquote, an inline-styles
+paragraph (bold/italic/strike/code/link), h3/h4 and a rule. Same rig
+(`--active-chat chat-md-tasks`, `md1280_top.json` wheel-up to top):
+
+| capture | full mean | right mean | align |
+|---|---|---|---|
+| 1280×900 tasks top | **2.854** | **2.866** | (0, 0) |
+| 1280×900 tasks end (h1-anchored) | **3.973** | **3.603** | (0, 0) |
+
+Closing the tasks gap took four implementation fixes (all follow React's
+collapsing-margin rules, verified against CDP rects):
+
+- First-block top margin: React's `mt-*` collapses out of the unpadded
+  response, so the first child keeps `mt` (h1 `mt-6` = 24px); the native
+  12pt response pad covers the first 12, first blocks keep `max(mt-12, 0)`.
+- Blockquotes are fully italic with padded-well margins: full first/last
+  margins plus an unbordered bottom spacer (React `p` stays `my-3` inside
+  `py-2`, margins never collapse through padding).
+- Task checkboxes follow `align-middle` (centered in the 28.675pt line box)
+  and render the disabled look React actually paints: gray `#9a9a9b` fill
+  with a 2px white check when checked, `#a9a9aa` 1px border when not
+  (the `accent-indigo-500` class is overridden by the disabled graying).
+- Tight/loose lists: the parser marks items without a `Paragraph` event as
+  tight (no React `<p>` wrapper), so nested `ul` keeps its own `my-2.5`
+  (10px) instead of collapsing with phantom paragraph margins — nested
+  pitch lands on React's exact 67.3px.
+
+Remaining tasks delta is glyph-level rasterisation (Inter grayscale AA on
+both sides, different rasterisers) plus the native-only Latest pill at the
+top pose (React hides its pill); the end pose is pill-free on both sides.
+`align (0, 0)` throughout: no layout shifts remain.
+
 ## Activity trace parity (2026-11-14)
 
 `parity/scenarios/trace/` is a committed, synthetic chat whose assistant row

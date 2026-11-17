@@ -41,6 +41,26 @@ TABLE = """The frozen parity numbers:
 | `Code block` | 2.064 | 2.064 | 0.000 |
 | Diff view | 2.254 | 2.254 | 0.000 |"""
 
+TASKS = """# Release notes
+
+## Ship checklist
+
+- [x] Freeze the parity numbers
+- [ ] Re-run the table capture
+- [x] Confirm the diff expander label
+  - [ ] Nested follow-up
+
+> Grayscale pins vs LCD fringes: those pixels never match.
+
+### Inline styles
+
+Bold **total**, italic *rate*, ~~stale~~ label, `inline code`, and a [spec link](https://example.com/spec).
+
+#### Footnote
+
+---
+"""
+
 
 def make_diff(total: int = 820) -> str:
     """A unified diff whose parsed line count is exactly `total`."""
@@ -128,6 +148,7 @@ def main() -> None:
     # Newest first: React renders this array in order while the native shell
     # sorts by `updated_at` descending, so both must agree on the listing.
     chats = [
+        ("chat-md-tasks", "Markdown · tasks", "2026-11-12T11:26:00Z", "Show the ship checklist.", TASKS),
         ("chat-md-diff", "Markdown · diff", "2026-11-12T11:24:00Z", "Show the parity diff.", DIFF),
         ("chat-md-table", "Markdown · table", "2026-11-12T11:22:00Z", "Render the parity table.", TABLE),
         ("chat-md-code", "Markdown · code", "2026-11-12T11:20:00Z", "Show the replay loop.", CODE),

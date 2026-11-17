@@ -300,6 +300,8 @@ fn block<S: TranscriptHost + 'static>(
                     true,
                     compact,
                     body_color,
+                    false,
+                    item.tight,
                 )
                 .grow(1.0)
                 .min_w(0.0);
@@ -313,7 +315,7 @@ fn block<S: TranscriptHost + 'static>(
                     let boxed = rune::row()
                         .items_start()
                         .gap(6.0)
-                        .child(checkbox(checked))
+                        .child(checkbox(checked, body.line_height))
                         .child(content);
                     row = row.gap(10.0).child(marker).child(boxed);
                 } else {
@@ -333,28 +335,52 @@ fn block<S: TranscriptHost + 'static>(
             align: _,
         } => table::<S>(key, headers, rows, body),
         Block::Quote(list) => {
+            // React's blockquote is fully italic (`italic` class on the
+            // container); the base style carries it so nested spans inherit.
+            // Padded well (`py-8`): child margins cannot collapse out, so
+            // the first block keeps its full top and the last block's bottom
+            // margin lands as an explicit spacer (like `last_margin`).
             let inner = blocks_inner::<S>(
                 s,
                 which,
                 &format!("{key}-quote"),
                 list,
-                body,
+                body.italic(),
                 depth + 1,
                 false,
                 compact,
                 body_color,
+                true,
+                false,
             );
-            row()
-                .key(format!("{key}-quote"))
+            let bottom = list
+                .last()
+                .map(|b| margins_compact(b, compact).1)
+                .unwrap_or(0.0);
+            // The trailing margin hangs below the border (it collapses out
+            // of the unpadded blockquote), so it sits outside the fill.
+            col()
+                .key(format!("{key}-quote-wrap"))
                 .w_full()
-                .items_start()
-                .pl(16.0)
-                .py(8.0)
-                .radius(8.0)
-                .fill(rgba(99.0, 102.0, 241.0, 0.05))
-                .border_sides([2.0, 0.0, 0.0, 0.0], rgba(99.0, 102.0, 241.0, 0.5))
-                .border_layout()
-                .child(inner.grow(1.0).min_w(0.0))
+                .child(
+                    row()
+                        .key(format!("{key}-quote"))
+                        .w_full()
+                        .items_start()
+                        .pl(16.0)
+                        .py(8.0)
+                        .radius(8.0)
+                        .fill(rgba(99.0, 102.0, 241.0, 0.05))
+                        .border_sides([2.0, 0.0, 0.0, 0.0], rgba(99.0, 102.0, 241.0, 0.5))
+                        .border_layout()
+                        .child(inner.grow(1.0).min_w(0.0)),
+                )
+                .child(
+                    rune::el()
+                        .key(format!("{key}-quote-pad"))
+                        .h(bottom)
+                        .w_full(),
+                )
         }
         Block::Rule => rune::el()
             .key(format!("{key}-rule"))
@@ -383,6 +409,16 @@ fn block<S: TranscriptHost + 'static>(
 }
 
 /// A block sequence with CSS-style collapsed margins.
+///
+/// `pad_parent` is set when the parent carries its own vertical padding
+/// (the quote well's `py-8`): child margins cannot collapse out through
+/// padding, so the first block keeps its full top margin and the caller
+/// appends the last block's bottom margin (see the Quote arm). The
+/// unpadded response instead relies on its own 12pt top pad, keeping only
+/// the remainder above the first block.
+/// `tight_item` marks a tight list item: React renders no `<p>` wrapper,
+/// so phantom paragraphs carry no margins and a nested list keeps its own
+/// `my-2.5` instead of collapsing with paragraph margins.
 #[allow(clippy::too_many_arguments)]
 fn blocks_inner<S: TranscriptHost + 'static>(
     s: &S,
@@ -394,6 +430,8 @@ fn blocks_inner<S: TranscriptHost + 'static>(
     in_item: bool,
     compact: bool,
     body_color: rune::Color,
+    pad_parent: bool,
+    tight_item: bool,
 ) -> El {
     let _ = depth;
     let mut stack = col().key(format!("{key}-blocks")).w_full();
@@ -403,20 +441,37 @@ fn blocks_inner<S: TranscriptHost + 'static>(
         let (mt, mb) = if in_item {
             match b {
                 stark_kit::markdown::Block::Para(_) => {
-                    if compact {
+                    if tight_item && !compact {
+                        (0.0, 0.0)
+                    } else if compact {
                         (if i == 0 { 0.0 } else { 4.0 }, 4.0)
                     } else {
                         (if i == 0 { 0.0 } else { 12.0 }, 12.0)
                     }
                 }
-                stark_kit::markdown::Block::List { .. } => (4.0, 4.0),
+                stark_kit::markdown::Block::List { .. } => {
+                    if compact {
+                        (4.0, 4.0)
+                    } else {
+                        // Nested `ul` keeps `my-2.5`; with a tight item there
+                        // is no paragraph margin to collapse with.
+                        margins_compact(b, compact)
+                    }
+                }
                 other => margins_compact(other, compact),
             }
         } else {
             margins_compact(b, compact)
         };
         let top = if i == 0 {
-            0.0
+            if pad_parent {
+                mt
+            } else {
+                // First block under the unpadded response: its margin
+                // collapses out, and the response's own 12pt top pad covers
+                // the remainder (para/h4/lists stay 0, h1 keeps 12).
+                (mt - 12.0).max(0.0)
+            }
         } else if matches!(b, stark_kit::markdown::Block::Heading { .. }) {
             mt.max(prev_mb)
         } else if after_heading {
@@ -468,7 +523,7 @@ pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
     }
     let body_color = ink(_body_ink);
     blocks_inner::<S>(
-        s, which, key, &blocks, body_style, 0, false, false, body_color,
+        s, which, key, &blocks, body_style, 0, false, false, body_color, false, false,
     )
 }
 
@@ -488,7 +543,9 @@ pub(super) fn render_body_compact<S: TranscriptHost + 'static>(
     let mut style = TextStyle::new(size, 400.0);
     style.line_height = size * 1.7;
     let body_color = ink(_body_ink);
-    blocks_inner::<S>(s, which, key, &blocks, style, 0, false, true, body_color)
+    blocks_inner::<S>(
+        s, which, key, &blocks, style, 0, false, true, body_color, false, false,
+    )
 }
 
 /// `StreamingMarkdown` from `MessageBubble.tsx`: parse the stable prefix,
@@ -667,21 +724,26 @@ fn list_marker(
 }
 
 /// GFM task checkbox (`input[type=checkbox]`, 13pt, indigo accent).
-fn checkbox(checked: bool) -> El {
+/// GFM task checkbox (`input[type=checkbox]`, 13pt). The Markdown renderer
+/// hardcodes `disabled`, and disabled controls render grayed out: the
+/// checked fill reads neutral gray (the `accent-indigo-500` class is
+/// overridden by the disabled graying) with a white check. Vertical
+/// centering follows `align-middle`.
+fn checkbox(checked: bool, line_height: f32) -> El {
     let mut e = rune::el()
         .size(13.0, 13.0)
-        .mt(3.0)
+        .mt(((line_height - 13.0) / 2.0).max(0.0))
         .radius(2.0)
         .border(
             1.0,
             if checked {
-                ink("#6366f1")
+                ink("#9a9a9b")
             } else {
-                ink("#52525b")
+                ink("#a9a9aa")
             },
         )
         .fill(if checked {
-            ink("#6366f1")
+            ink("#9a9a9b")
         } else {
             rune::Color::TRANSPARENT
         });
@@ -693,7 +755,7 @@ fn checkbox(checked: bool) -> El {
         e = e.child(
             rune::el().size(13.0, 13.0).inert().shape(
                 rune::Shape::new()
-                    .stroke_path(&p, 1.4, rune::LineCap::Round, ink("#ffffff"))
+                    .stroke_path(&p, 2.0, rune::LineCap::Round, ink("#ffffff"))
                     .view_box(13.0, 13.0),
             ),
         );
@@ -940,7 +1002,7 @@ fn code_block<S: TranscriptHost + 'static>(
 }
 
 /// Port of `DiffView.tsx`'s `parseDiff`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DiffKind {
     Add,
     Del,
@@ -1372,6 +1434,21 @@ fn table<S: TranscriptHost + 'static>(
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    #[test]
+    fn short_hunk_without_counts_starts_at_one() {
+        // React's hunk regex makes the `,count` optional; the native split
+        // on `,`/space parses the same short form.
+        let (lines, _, add, del) = parse_diff("@@ -1 +1 @@\n-old\n+new\n");
+        assert_eq!(add, 1);
+        assert_eq!(del, 1);
+        assert_eq!(lines.len(), 4, "hunk + del + add + trailing ctx");
+        assert_eq!(lines[0].kind, DiffKind::Hunk);
+        assert_eq!(lines[1].old, Some(1));
+        assert_eq!(lines[1].new, None);
+        assert_eq!(lines[2].old, None);
+        assert_eq!(lines[2].new, Some(1));
+    }
 
     #[test]
     fn unclosed_fence_splits_at_its_line_start() {

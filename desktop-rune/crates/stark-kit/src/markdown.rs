@@ -30,10 +30,13 @@ pub enum Inline {
 }
 
 /// One list item: its blocks and a GFM task checkbox when the source marks it.
-#[derive(Debug, Clone, PartialEq)]
+/// `tight` mirrors remark: no blank lines around the item content, so React
+/// renders no `<p>` wrapper and no paragraph margins apply.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ListItem {
     pub checked: Option<bool>,
     pub blocks: Vec<Block>,
+    pub tight: bool,
 }
 
 /// Table column alignment (`:---`, `:---:`, `---:`).
@@ -115,6 +118,9 @@ enum Frame {
         /// Tight list items have no `Paragraph` event; their inline text collects here
         /// and flushes to a `Para` before the next block (or when the item ends).
         inline: Vec<Inline>,
+        /// False once a real `Paragraph` event lands inside the item (loose
+        /// items render `<p>` wrappers with margins; tight ones do not).
+        tight: bool,
     },
     Para(Vec<Inline>),
     Heading {
@@ -299,7 +305,20 @@ pub fn parse(text: &str) -> Vec<Block> {
     for event in Parser::new_ext(text, options()) {
         match event {
             Event::Start(tag) => match tag {
-                Tag::Paragraph => frames.push(Frame::Para(Vec::new())),
+                Tag::Paragraph => {
+                    // A real paragraph inside an item makes it loose (React
+                    // wraps loose content in `<p>`); the nearest item owns it.
+                    for frame in frames.iter_mut().rev() {
+                        if let Frame::Item { tight, .. } = frame {
+                            *tight = false;
+                            break;
+                        }
+                        if matches!(frame, Frame::Root(_) | Frame::Quote(_)) {
+                            break;
+                        }
+                    }
+                    frames.push(Frame::Para(Vec::new()))
+                }
                 Tag::Heading { level, .. } => frames.push(Frame::Heading {
                     level: heading_level(level),
                     text: Vec::new(),
@@ -329,6 +348,7 @@ pub fn parse(text: &str) -> Vec<Block> {
                     checked: None,
                     blocks: Vec::new(),
                     inline: Vec::new(),
+                    tight: true,
                 }),
                 Tag::Emphasis => frames.push(Frame::Emphasis(Vec::new())),
                 Tag::Strong => frames.push(Frame::Strong(Vec::new())),
@@ -400,11 +420,18 @@ pub fn parse(text: &str) -> Vec<Block> {
                 TagEnd::Item => {
                     flush_item_inline(&mut frames);
                     if let Some(Frame::Item {
-                        checked, blocks, ..
+                        checked,
+                        blocks,
+                        tight,
+                        ..
                     }) = frames.pop()
                     {
                         if let Some(Frame::List { items, .. }) = frames.last_mut() {
-                            items.push(ListItem { checked, blocks });
+                            items.push(ListItem {
+                                checked,
+                                blocks,
+                                tight,
+                            });
                         }
                     }
                 }
@@ -605,6 +632,20 @@ mod tests {
         };
         assert_eq!(items[1].checked, Some(true));
         assert_eq!(items[2].checked, Some(false));
+    }
+
+    #[test]
+    fn tight_items_skip_paragraph_margins_loose_ones_do_not() {
+        let tight = parse("- one\n- two\n  - nested\n");
+        let Block::List { items, .. } = &tight[0] else {
+            panic!("{tight:?}");
+        };
+        assert!(items.iter().all(|item| item.tight));
+        let loose = parse("- one\n\n- two\n");
+        let Block::List { items, .. } = &loose[0] else {
+            panic!("{loose:?}");
+        };
+        assert!(items.iter().all(|item| !item.tight));
     }
 
     #[test]

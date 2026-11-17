@@ -6902,4 +6902,55 @@ mod tests {
         assert!(!rt.state.settings_open, "settings closes");
         assert!(rt.state.model_open, "picker opens");
     }
+
+    #[test]
+    fn task_list_renders_nested_checkboxes() {
+        let body = "- [x] Freeze the numbers\n- [ ] Re-run the capture\n  - [ ] Nested follow-up\n";
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![RowData {
+            key: "t1".to_string(),
+            role: "agent",
+            body: body.to_string(),
+            raw_body: body.to_string(),
+            final_text: body.to_string(),
+            ..RowData::default()
+        }];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Top-level items plus the nested leaf all lay out (checked and
+        // unchecked share the same row shape; only the box fill differs).
+        // Block-index namespacing: the list is block 0 of the body.
+        assert!(rt.find("t1-b0-li-0").is_some(), "first item placed");
+        assert!(rt.find("t1-b0-li-1").is_some(), "second item placed");
+        // The nested list is the item's second block (b1): para is b0.
+        assert!(
+            rt.find("t1-b0-li-1-b1-li-0").is_some(),
+            "nested item placed"
+        );
+    }
+
+    #[test]
+    fn table_renders_measured_wrap_with_header_and_rows() {
+        let body =
+            "| Surface | Delta |\n| --- | ---: |\n| **Paragraph** | 0.000 |\n| `Code` | 0.000 |\n";
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows = vec![RowData {
+            key: "t1".to_string(),
+            role: "agent",
+            body: body.to_string(),
+            raw_body: body.to_string(),
+            final_text: body.to_string(),
+            ..RowData::default()
+        }];
+        let env = Env::new(true, 2.0);
+        let mut rt = Runtime::new(s, home_attachments_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Right-aligned columns stay left-aligned (React `text-left` carries
+        // no alignment override either); the well, header and rows mount.
+        assert!(rt.find("t1-b0-table-wrap").is_some(), "well placed");
+        assert!(rt.find("t1-b0-thead").is_some(), "header placed");
+        assert!(rt.find("t1-b0-tr-0").is_some(), "first row placed");
+        assert!(rt.find("t1-b0-tr-1").is_some(), "second row placed");
+    }
 }

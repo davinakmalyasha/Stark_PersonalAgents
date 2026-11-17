@@ -1,6 +1,30 @@
 {
   "chats": [
     {
+      "createdAt": "2026-11-12T11:26:00Z",
+      "id": "chat-md-tasks",
+      "lastAgent": {
+        "content": "# Release notes",
+        "id": "chat-md-tasks-agent",
+        "role": "agent",
+        "timestamp": "2026-11-12T11:26:05Z"
+      },
+      "lastKind": "",
+      "lastMessage": "# Release notes",
+      "lastRole": "agent",
+      "lastUser": {
+        "content": "Show the ship checklist.",
+        "id": "chat-md-tasks-user",
+        "role": "user",
+        "timestamp": "2026-11-12T11:26:00Z"
+      },
+      "messageCount": 2,
+      "model": "deepseek-v4.1-flash",
+      "status": "done",
+      "title": "Markdown \u00b7 tasks",
+      "updatedAt": "2026-11-12T11:26:00Z"
+    },
+    {
       "createdAt": "2026-11-12T11:24:00Z",
       "id": "chat-md-diff",
       "lastAgent": {

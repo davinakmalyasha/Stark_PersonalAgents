@@ -67,6 +67,16 @@ struct Runs {
 
 const INLINE_CODE_SIZE: f32 = 13.5;
 
+/// Leading space for task items: react-markdown renders `<input> text`,
+/// keeping the source space in the DOM, so the first glyph starts one
+/// space width right of the content box. Plain items have no space.
+fn prepend_space(blocks: &[stark_kit::markdown::Block]) -> Vec<stark_kit::markdown::Block> {
+    let mut out = blocks.to_vec();
+    if let Some(stark_kit::markdown::Block::Para(first)) = out.first_mut() {
+        first.insert(0, stark_kit::markdown::Inline::Text(" ".to_string()));
+    }
+    out
+}
 /// Inline code: 13.5pt mono indigo-300 on a zinc-800/80 well with the
 /// `border-zinc-700/50` 1px ring (React `code` component). The well comes
 /// from a paint-only highlight so the border rides the same rounded rect.
@@ -304,11 +314,22 @@ fn block<S: TranscriptHost + 'static>(
                     .w_full()
                     .gap(if *ordered { 6.0 } else { 4.0 });
             for (i, item) in items.iter().enumerate() {
+                // Task items render `<input> text` with a real space between
+                // (react-markdown keeps the source space in the DOM); plain
+                // items have none. Without it every task glyph sits ~4px
+                // left of React's.
+                let owned;
+                let blocks: &[stark_kit::markdown::Block] = if item.checked.is_some() {
+                    owned = prepend_space(&item.blocks);
+                    &owned
+                } else {
+                    &item.blocks
+                };
                 let content = blocks_inner::<S>(
                     s,
                     which,
                     &format!("{key}-li-{i}"),
-                    &item.blocks,
+                    blocks,
                     body,
                     depth + 1,
                     true,
@@ -326,8 +347,11 @@ fn block<S: TranscriptHost + 'static>(
                     .items_start()
                     .pl(8.0);
                 if let Some(checked) = item.checked {
+                    // `li` carries `pl-0.5` (2px) inside the marker margin;
+                    // it sits before the checkbox, so both box and text move.
                     let boxed = rune::row()
                         .items_start()
+                        .pl(2.0)
                         .gap(6.0)
                         .child(checkbox(checked, body.line_height))
                         .child(content);
@@ -336,7 +360,8 @@ fn block<S: TranscriptHost + 'static>(
                     row = row
                         .gap(if *ordered { 8.0 } else { 10.0 })
                         .child(marker)
-                        .child(content);
+                        // Same `li` pad for plain items (before the text).
+                        .child(content.pl(2.0));
                 }
                 list = list.child(row);
             }
@@ -383,7 +408,9 @@ fn block<S: TranscriptHost + 'static>(
                         .items_start()
                         .pl(16.0)
                         .py(8.0)
-                        .radius(8.0)
+                        // `rounded-r-lg`: right corners only; the bar side
+                        // stays square like React's.
+                        .corners([0.0, 8.0, 8.0, 0.0])
                         .fill(rgba(99.0, 102.0, 241.0, 0.05))
                         // `border-l-2`: Rune's sides are CSS-ordered
                         // [top, right, bottom, left].
@@ -737,27 +764,21 @@ fn list_marker(
 
 /// GFM task checkbox (`input[type=checkbox]`, 13pt, indigo accent).
 /// GFM task checkbox (`input[type=checkbox]`, 13pt). The Markdown renderer
-/// hardcodes `disabled`, and disabled controls render grayed out: the
-/// checked fill reads neutral gray (the `accent-indigo-500` class is
-/// overridden by the disabled graying) with a white check. Vertical
-/// centering follows `align-middle`.
+/// hardcodes `disabled`, and disabled controls render fully grayed out:
+/// checked is a gray `#9a9a9b` fill with a white 2px check, and unchecked
+/// is NOT hollow — Chrome paints the same gray `#a9a9aa` fill with a
+/// darker `#868687` 1px border (verified pixel-by-pixel against captures).
+/// Vertical centering follows `align-middle`.
 fn checkbox(checked: bool, line_height: f32) -> El {
     let mut e = rune::el()
         .size(13.0, 13.0)
         .mt(((line_height - 13.0) / 2.0).max(0.0))
         .radius(2.0)
-        .border(
-            1.0,
-            if checked {
-                ink("#9a9a9b")
-            } else {
-                ink("#a9a9aa")
-            },
-        )
+        .border(1.0, ink("#868687"))
         .fill(if checked {
             ink("#9a9a9b")
         } else {
-            rune::Color::TRANSPARENT
+            ink("#a9a9aa")
         });
     if checked {
         let p = rune::Path::new()
@@ -1446,6 +1467,22 @@ fn table<S: TranscriptHost + 'static>(
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    #[test]
+    fn task_items_keep_the_source_space_plain_ones_do_not() {
+        use stark_kit::markdown::{Block, Inline};
+        let blocks = vec![Block::Para(vec![Inline::Text("hi".into())])];
+        let spaced = prepend_space(&blocks);
+        assert_eq!(
+            spaced,
+            vec![Block::Para(vec![
+                Inline::Text(" ".into()),
+                Inline::Text("hi".into())
+            ])]
+        );
+        // Empty items and non-para first blocks pass through untouched.
+        assert!(prepend_space(&[]).is_empty());
+    }
 
     #[test]
     fn inline_code_carries_bordered_well() {

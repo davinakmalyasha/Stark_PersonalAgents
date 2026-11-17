@@ -1,4 +1,6 @@
-//! Mic capture + level metering behind the voice toggle.
+//! Mic capture + level metering behind the voice toggle. When the `stt`
+//! producer is up (16 kHz mono mode + Moonshine model), the same thread
+//! forwards PCM into it and dictation arrives as [`VoiceMsg::Transcript`].
 //!
 //! Native: cpal default input streams RMS blocks into an `mpsc` channel the
 //! poll hook drains into `voice_level`. Web: `getUserMedia` binds later —
@@ -21,13 +23,16 @@ pub enum VoiceMsg {
     /// Interim (`is_final: false`) or final (`true`) dictation text from the
     /// speech thread. React's overlay protocol is the reference: `transcript`
     /// events refresh the live bubble in place, `pipeline-start` swaps it for
-    /// the single canonical user message. The streaming-en STT producer binds
-    /// next — tests exercise the protocol today.
+    /// the single canonical user message. Produced by the `stt` worker on
+    /// MSVC + `voice-stt`; elsewhere the variant is exercised by tests.
     #[allow(dead_code)]
     Transcript {
         text: String,
         is_final: bool,
     },
+    /// Non-fatal note (missing 16 kHz mode, STT build limits): reported
+    /// without stopping a live meter, unlike [`VoiceMsg::Error`].
+    Note(String),
     Error(String),
 }
 
@@ -129,7 +134,22 @@ impl VoiceBus {
             self.stop = Some(stop);
             self.rx = Some(rx);
             self.live = true;
-            std::thread::spawn(move || capture_loop(flag, tx));
+            // Dictation runs on its own worker fed with 16 kHz mono frames.
+            // Anything missing (MSVC-only runtime, model dir, 16 kHz mode)
+            // degrades to meter-only levels with an honest note.
+            let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel(crate::stt::MAX_AUDIO_QUEUE);
+            match crate::stt::spawn_producer(pcm_rx, tx.clone(), flag.clone()) {
+                Ok(()) => {
+                    self.note = None;
+                    std::thread::spawn(move || {
+                        capture_loop(flag, tx, Some(pcm_tx));
+                    });
+                }
+                Err(note) => {
+                    self.note = Some(note);
+                    std::thread::spawn(move || capture_loop(flag, tx, None));
+                }
+            }
             true
         }
     }
@@ -157,6 +177,11 @@ impl VoiceBus {
                     } else {
                         self.live_text = text;
                     }
+                    changed = true;
+                }
+                VoiceMsg::Note(note) => {
+                    // Advisory only: the meter keeps running.
+                    self.note = Some(note);
                     changed = true;
                 }
                 VoiceMsg::Error(note) => {
@@ -226,11 +251,61 @@ pub fn probe_input() -> Option<String> {
         .filter(|n| !n.trim().is_empty())
 }
 
-/// Capture loop: streams [`VoiceMsg::Level`] until `stop` flips, then exits.
-/// Owns the cpal `Stream` (dropping it stops the device). Never panics: all
-/// failures arrive as [`VoiceMsg::Error`].
+/// 16 kHz capture mode for the STT frontend: the config plus whether the
+/// mono mixdown applies (stereo fallback). Mono F32/I16/U16 first, then
+/// stereo with downmix — the first exact 16 kHz mode wins, so no resampler
+/// ships in the shell (WASAPI/CoreAudio resample in the OS).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn capture_loop(stop: Arc<AtomicBool>, tx: std::sync::mpsc::Sender<VoiceMsg>) {
+fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, bool)> {
+    let mut best: Option<(u8, cpal::SupportedStreamConfig, bool)> = None;
+    let Ok(ranges) = device.supported_input_configs() else {
+        return None;
+    };
+    for range in ranges {
+        let channels = range.channels();
+        if channels != 1 && channels != 2 {
+            continue;
+        }
+        if range.min_sample_rate() > crate::stt::SAMPLE_RATE
+            || range.max_sample_rate() < crate::stt::SAMPLE_RATE
+        {
+            continue;
+        }
+        let rank = match (range.sample_format(), channels) {
+            (cpal::SampleFormat::F32, 1) => 0,
+            (cpal::SampleFormat::I16, 1) => 1,
+            (cpal::SampleFormat::U16, 1) => 2,
+            (cpal::SampleFormat::F32, _) => 3,
+            (cpal::SampleFormat::I16, _) => 4,
+            (cpal::SampleFormat::U16, _) => 5,
+            _ => continue,
+        };
+        let better = best
+            .as_ref()
+            .is_none_or(|(best_rank, _, _)| rank < *best_rank);
+        if better {
+            best = Some((
+                rank,
+                range.with_sample_rate(crate::stt::SAMPLE_RATE),
+                channels == 2,
+            ));
+        }
+    }
+    best.map(|(_, config, stereo)| (config, stereo))
+}
+
+/// Capture loop: streams [`VoiceMsg::Level`] until `stop` flips, then exits.
+/// When `pcm` is `Some`, the stream runs at 16 kHz mono and every block is
+/// also forwarded to the STT worker (dropped on overflow, like the backend).
+/// Owns the cpal `Stream` (dropping it stops the device). Never panics: all
+/// failures arrive as [`VoiceMsg::Error`], a missing 16 kHz mode as
+/// [`VoiceMsg::Note`] with meter-only levels continuing.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn capture_loop(
+    stop: Arc<AtomicBool>,
+    tx: std::sync::mpsc::Sender<VoiceMsg>,
+    pcm: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+) {
     // Each callback owns a cloned sender: everything handed to cpal must be
     // `'static` (the stream outlives this frame).
     let emit = |tx: &std::sync::mpsc::Sender<VoiceMsg>| tx.clone();
@@ -242,20 +317,54 @@ pub fn capture_loop(stop: Arc<AtomicBool>, tx: std::sync::mpsc::Sender<VoiceMsg>
         fail(&tx, "no microphone found".to_string());
         return;
     };
-    let config = match device.default_input_config() {
-        Ok(c) => c,
-        Err(e) => {
-            fail(&tx, format!("mic config: {e}"));
-            return;
+    // 16 kHz mono is the STT frontend's native rate: prefer an exact mode so
+    // no resampler ships in the shell. Anything else degrades to meter-only.
+    let mut forward = pcm;
+    let mut stereo = false;
+    let config = if forward.is_none() {
+        match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => {
+                fail(&tx, format!("mic config: {e}"));
+                return;
+            }
+        }
+    } else {
+        match prefer_16k(&device) {
+            Some((picked, downmix)) => {
+                stereo = downmix;
+                picked
+            }
+            None => {
+                let _ = tx.send(VoiceMsg::Note(
+                    "mic has no 16 kHz mode; on-device dictation is off".to_string(),
+                ));
+                forward = None;
+                match device.default_input_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        fail(&tx, format!("mic config: {e}"));
+                        return;
+                    }
+                }
+            }
         }
     };
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
-            let (dtx, etx) = (emit(&tx), emit(&tx));
+            let (dtx, etx, ptx) = (emit(&tx), emit(&tx), forward);
             device.build_input_stream(
                 config.into(),
                 move |data: &[f32], _| {
-                    let _ = dtx.send(VoiceMsg::Level(rms_f32(data)));
+                    let mono = if stereo {
+                        crate::stt::mono_mix(data, 2)
+                    } else {
+                        data.to_vec()
+                    };
+                    let _ = dtx.send(VoiceMsg::Level(rms_f32(&mono)));
+                    if let Some(tx) = ptx.as_ref() {
+                        let _ = tx.try_send(mono);
+                    }
                 },
                 move |e| {
                     let _ = etx.send(VoiceMsg::Error(format!("mic: {e}")));
@@ -264,16 +373,27 @@ pub fn capture_loop(stop: Arc<AtomicBool>, tx: std::sync::mpsc::Sender<VoiceMsg>
             )
         }
         cpal::SampleFormat::I16 => {
-            let (dtx, etx) = (emit(&tx), emit(&tx));
+            let (dtx, etx, ptx) = (emit(&tx), emit(&tx), forward);
             device.build_input_stream(
                 config.into(),
                 move |data: &[i16], _| {
-                    let _ = dtx.send(VoiceMsg::Level(rms_f32(
-                        &data
-                            .iter()
+                    let mono = if stereo {
+                        crate::stt::mono_mix(
+                            &data
+                                .iter()
+                                .map(|s| *s as f32 / i16::MAX as f32)
+                                .collect::<Vec<_>>(),
+                            2,
+                        )
+                    } else {
+                        data.iter()
                             .map(|s| *s as f32 / i16::MAX as f32)
-                            .collect::<Vec<_>>(),
-                    )));
+                            .collect::<Vec<_>>()
+                    };
+                    let _ = dtx.send(VoiceMsg::Level(rms_f32(&mono)));
+                    if let Some(tx) = ptx.as_ref() {
+                        let _ = tx.try_send(mono);
+                    }
                 },
                 move |e| {
                     let _ = etx.send(VoiceMsg::Error(format!("mic: {e}")));
@@ -282,16 +402,27 @@ pub fn capture_loop(stop: Arc<AtomicBool>, tx: std::sync::mpsc::Sender<VoiceMsg>
             )
         }
         cpal::SampleFormat::U16 => {
-            let (dtx, etx) = (emit(&tx), emit(&tx));
+            let (dtx, etx, ptx) = (emit(&tx), emit(&tx), forward);
             device.build_input_stream(
                 config.into(),
                 move |data: &[u16], _| {
-                    let _ = dtx.send(VoiceMsg::Level(rms_f32(
-                        &data
-                            .iter()
+                    let mono = if stereo {
+                        crate::stt::mono_mix(
+                            &data
+                                .iter()
+                                .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                                .collect::<Vec<_>>(),
+                            2,
+                        )
+                    } else {
+                        data.iter()
                             .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
-                            .collect::<Vec<_>>(),
-                    )));
+                            .collect::<Vec<_>>()
+                    };
+                    let _ = dtx.send(VoiceMsg::Level(rms_f32(&mono)));
+                    if let Some(tx) = ptx.as_ref() {
+                        let _ = tx.try_send(mono);
+                    }
                 },
                 move |e| {
                     let _ = etx.send(VoiceMsg::Error(format!("mic: {e}")));
@@ -347,6 +478,21 @@ mod tests {
         assert_eq!(lit_bars(0.5), 3);
         assert_eq!(lit_bars(1.0), 5);
         assert_eq!(lit_bars(2.0), 5);
+    }
+
+    #[test]
+    fn note_reports_without_killing_live() {
+        let mut bus = VoiceBus::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        bus.rx = Some(rx);
+        bus.live = true;
+        bus.level = 0.4;
+        tx.send(VoiceMsg::Note("mic has no 16 kHz mode".to_string()))
+            .expect("send note");
+        assert!(bus.drain(1.0 / 60.0));
+        assert_eq!(bus.note.as_deref(), Some("mic has no 16 kHz mode"));
+        assert!(bus.live, "advisory only");
+        assert!(bus.level > 0.0, "meter keeps running");
     }
 
     /// Hardware-dependent by nature: asserts only that probing never panics

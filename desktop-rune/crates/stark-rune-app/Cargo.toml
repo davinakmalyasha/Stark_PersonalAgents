@@ -44,6 +44,8 @@ default = ["native-file-dialog"]
 rune-real = ["dep:rune", "dep:rune-kit"]
 # Weak dependency feature: only reaches Rune when `rune-real` is on.
 native-file-dialog = ["rune?/native-file-dialog"]
+# Streaming speech-to-text (Moonshine ONNX, MSVC-only prebuilt on Windows).
+voice-stt = ["dep:moonshine-rs"]
 
 [dependencies.rune]
 git = "https://github.com/anomalyco/rune"
@@ -62,4 +64,11 @@ git = "https://github.com/anomalyco/rune"
 rev = "a7f276c3630f85a06a0230295da4d2bd172d8d3b"
 package = "rune-kit"
 default-features = false
+optional = true
+
+# Streaming speech-to-text over the Moonshine ONNX runtime. The native
+# libmoonshine prebuilt is MSVC-only on Windows (same gate as the backend's
+# stark-voice `stt` feature); other targets keep an honest stub.
+[dependencies.moonshine-rs]
+version = "0.2.6"
 optional = true

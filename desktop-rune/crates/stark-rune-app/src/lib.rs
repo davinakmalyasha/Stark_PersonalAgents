@@ -57,6 +57,9 @@ pub mod stream_accum;
 #[path = "stream_presentation.rs"]
 pub mod stream_presentation;
 #[cfg(feature = "rune-real")]
+#[path = "stt.rs"]
+pub mod stt;
+#[cfg(feature = "rune-real")]
 #[path = "token_stats.rs"]
 pub mod token_stats;
 #[cfg(feature = "rune-real")]

@@ -60,6 +60,8 @@ mod stream_accum;
 #[cfg(feature = "rune-real")]
 mod stream_presentation;
 #[cfg(feature = "rune-real")]
+mod stt;
+#[cfg(feature = "rune-real")]
 mod token_stats;
 #[cfg(feature = "rune-real")]
 mod tool_labels;

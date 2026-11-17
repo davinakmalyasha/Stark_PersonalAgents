@@ -148,6 +148,17 @@ message is not streaming, exactly as `MessageBubble.tsx` does.
 | 1280×900 diff top | **1.885** | **2.359** | (0, 0) |
 | 1280×900 diff @210 | **1.887** | **2.254** | (0, 0) |
 
+Re-verified 2026-11-18 on the release binary with the bordered inline
+code (`chat-md-table` carries one): table top/end reproduce the recorded
+right means exactly (2.184/2.192), as do code end and diff @210
+(2.409/2.254); all align (0, 0). The remaining top-pose deltas
+(+0.06–0.11 full-frame, background bands only) sit inside session raster
+variance: the changed render paths (first-block margin, quotes,
+checkboxes, tight lists, inline-code wells) do not execute on fixture
+bodies that start with a plain paragraph and contain no lists, quotes,
+code spans or checkboxes — except the table's inline span, whose new
+border is verified present and pixel-faithful on zoom.
+
 Geometry matches exactly: code card 385.5 vs 385.406, diff wrapper 463.2 vs
 463.1875, table wrapper 210.19 vs 210.1875; diff rows 18.59 and header 39.2
 match. The diff's remaining delta is Chrome's LCD subpixel antialiasing on

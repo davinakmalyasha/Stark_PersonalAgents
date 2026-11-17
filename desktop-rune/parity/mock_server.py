@@ -62,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -104,6 +104,14 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
     def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self._json(200, {"ok": True})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        # The real server deletes the chat; a failure would make both sides
+        # refetch the static list and resurrect the row.
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)

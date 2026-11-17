@@ -292,37 +292,11 @@ pub struct ComposerMeta<'a> {
 /// behave identically either way, same as React).
 /// Lucide `CloudOff` / `Cloud` at a 12pt box for the run-target toggle.
 fn cloud_icon(off: bool, color: rune::Color) -> rune::Shape {
-    // Lucide v1.17 `cloud-off` / `cloud`.
-    let mut p = if off {
-        rune::Path::new()
-            .move_to([10.94, 5.27])
-            .cubic_to([13.23, 5.93], [15.03, 7.72], [15.71, 10.0])
-            .line_to([17.5, 10.0])
-            .cubic_to([18.97, 10.0], [20.35, 10.72], [21.19, 11.93])
-            .cubic_to([22.03, 13.13], [22.23, 14.68], [21.72, 16.06])
-            .move_to([18.8, 18.81])
-            .cubic_to([18.38, 18.94], [17.94, 19.0], [17.5, 19.0])
-            .line_to([9.0, 19.0])
-            .cubic_to([5.77, 19.0], [2.96, 16.79], [2.2, 13.65])
-            .cubic_to([1.44, 10.51], [2.92, 7.26], [5.79, 5.78])
-    } else {
-        rune::Path::new()
-            .move_to([17.5, 19.0])
-            .line_to([9.0, 19.0])
-            .cubic_to([5.4, 19.0], [2.38, 16.26], [2.03, 12.67])
-            .cubic_to([1.69, 9.09], [4.12, 5.82], [7.66, 5.13])
-            .cubic_to([11.2, 4.44], [14.68, 6.55], [15.71, 10.0])
-            .line_to([17.5, 10.0])
-            .cubic_to([19.99, 10.0], [22.0, 12.01], [22.0, 14.5])
-            .cubic_to([22.0, 16.99], [19.99, 19.0], [17.5, 19.0])
-            .close()
-    };
     if off {
-        p = p.move_to([2.0, 2.0]).line_to([22.0, 22.0]);
+        crate::icons::cloud_off(12.0, color)
+    } else {
+        crate::icons::cloud(12.0, color)
     }
-    rune::Shape::new()
-        .stroke_path(&p, crate::lucide_stroke(12.0), rune::LineCap::Round, color)
-        .view_box(24.0, 24.0)
 }
 
 fn target_toggle<S: 'static>(

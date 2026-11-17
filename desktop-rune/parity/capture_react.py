@@ -347,9 +347,78 @@ async def capture(args) -> None:
                 print("probe:", json.dumps(probe.get("result", {}).get("value"), indent=1))
                 if probe.get("result", {}).get("value") is None:
                     print("probe error:", json.dumps(probe.get("result", {}).get("exceptionDetails", probe), indent=1)[:3000])
+            # A hover pose (sidebar action cluster) is transient: move the
+            # pointer, let the CSS hover settle, then capture.
+            if args.hover:
+                hx, hy = (float(v) for v in args.hover.split(","))
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseMoved", "x": hx, "y": hy, "button": "none"},
+                )
+                time.sleep(0.15)
+
+            async def click_at(raw: str) -> None:
+                cx, cy = (float(v) for v in raw.split(","))
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseMoved", "x": cx, "y": cy, "button": "none"},
+                )
+                # The action cluster is `hidden group-hover:flex`; let the
+                # browser recalc/paint it before pressing, or the press lands
+                # on the row underneath.
+                if args.debug:
+                    hit = await cdp.call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": f"""(() => {{
+                                const el = document.elementFromPoint({cx}, {cy});
+                                const btn = el && el.closest('button');
+                                return {{ tag: el && el.tagName, cls: el && el.className,
+                                          title: btn && btn.title }};
+                            }})()""",
+                            "returnByValue": True,
+                        },
+                    )
+                    print("hit:", json.dumps(hit.get("result", {}).get("value")))
+                time.sleep(0.2)
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mousePressed",
+                        "x": cx,
+                        "y": cy,
+                        "button": "left",
+                        "buttons": 1,
+                        "clickCount": 1,
+                    },
+                )
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseReleased",
+                        "x": cx,
+                        "y": cy,
+                        "button": "left",
+                        "buttons": 0,
+                        "clickCount": 1,
+                    },
+                )
+
+            # Sidebar delete poses: one click arms the confirm state, a second
+            # starts the 220ms fade-out.
+            if args.click:
+                await click_at(args.click)
+                time.sleep(args.click_delay)
+            if args.click2:
+                await click_at(args.click2)
+                time.sleep(args.click2_delay)
             # An explicit scroll is a frozen mid-transcript pose: the app's own
             # auto-scroll can fire a beat later, so shoot right away.
-            time.sleep(0.05 if args.scroll_top >= 0 else 0.6)
+            time.sleep(
+                0.02
+                if args.click or args.click2
+                else (0.05 if args.scroll_top >= 0 else 0.6)
+            )
             if args.debug:
                 post = await cdp.call(
                     "Runtime.evaluate",
@@ -399,6 +468,33 @@ def main() -> int:
         type=int,
         default=-1,
         help="set the transcript scrollTop to this absolute CSS px (overrides --scroll-by)",
+    )
+    ap.add_argument(
+        "--hover",
+        default="",
+        help="move the mouse to X,Y (CSS px) before capturing, for hover states",
+    )
+    ap.add_argument(
+        "--click",
+        default="",
+        help="click X,Y before capturing (sidebar delete confirm)",
+    )
+    ap.add_argument(
+        "--click2",
+        default="",
+        help="click X,Y a second time before capturing (start the delete fade)",
+    )
+    ap.add_argument(
+        "--click-delay",
+        type=float,
+        default=0.25,
+        help="seconds to wait after --click",
+    )
+    ap.add_argument(
+        "--click2-delay",
+        type=float,
+        default=0.05,
+        help="seconds to wait after --click2, inside the 220ms fade",
     )
     ap.add_argument("--chrome", default="C:/Program Files/Google/Chrome/Application/chrome.exe")
     ap.add_argument("--profile", default="C:/Users/MY LENOVO/AppData/Local/Temp/opencode/chrome-parity")

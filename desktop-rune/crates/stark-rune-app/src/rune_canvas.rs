@@ -26,6 +26,37 @@ pub const DOT_STEP: f32 = 26.0;
 /// workspace scoping, everything lives in side tabs on one page.
 pub const CHAT_KINDS: [&str; 4] = ["Main", "Coding", "House", "General"];
 
+/// Native mode label → React `ChatsFilter` (persisted in `/api/ui/state`).
+pub fn filter_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "Coding" => "coding",
+        "House" => "house",
+        "General" => "personal",
+        _ => "general",
+    }
+}
+
+/// React `ChatsFilter` → native mode label. Unknown/empty values keep the
+/// current mode (the server may predate a filter name).
+pub fn kind_for_filter(filter: &str) -> Option<&'static str> {
+    match filter {
+        "general" => Some("Main"),
+        "coding" => Some("Coding"),
+        "house" => Some("House"),
+        "personal" => Some("General"),
+        _ => None,
+    }
+}
+
+/// Split `workspace:chat` into the pair the history fetch expects.
+fn split_chat_key(key: &str) -> Option<(String, String)> {
+    let (ws, chat) = key.split_once(':')?;
+    if ws.is_empty() || chat.is_empty() {
+        return None;
+    }
+    Some((ws.to_string(), chat.to_string()))
+}
+
 /// Side panel tab (the icon rail). One page: the panel switches, the canvas
 /// stays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -226,9 +257,27 @@ pub struct Sessions {
     pub sheet: Option<String>,
     pub search: rune::TextEdit,
     pub kind: String,
-    /// Expanded spawn nests (`HouseSidebar.collapsedSpawns` inverted): spawn
-    /// children stay nested under their parent until the chevron opens them.
-    pub spawn_open: std::collections::HashSet<String>,
+    /// Pinned chats (`workspace:chat`), persisted via `/api/ui/state` and
+    /// sorted first inside the active sidebar filter (React `pinnedChats`).
+    pub pinned: Vec<String>,
+    /// Inputs for inline rename: session id + draft. `None` renders rows.
+    pub editing: Option<(String, rune::TextEdit)>,
+    /// Fallback model for a rename input whose draft closed earlier in the
+    /// frame: Rune syncs focus into the old node before the tree drops it,
+    /// and the accessor must still return a field.
+    pub rename_spare: rune::TextEdit,
+    /// First click on Delete: session id + expiry (React 2.5s confirm).
+    pub confirm_delete: Option<(String, u64)>,
+    /// Confirmed delete in its 220ms fade-out: session id, start ms, remove-at
+    /// ms (React `.is-deleting`).
+    pub deleting: Option<(String, u64, u64)>,
+    /// Collapsed spawn nests (`HouseSidebar.collapsedSpawns`): parents with
+    /// spawned children start collapsed, so lower agents live inside their
+    /// parent instead of reading as flat siblings.
+    pub spawn_collapsed: std::collections::HashSet<String>,
+    /// Nests the user explicitly expanded — auto-collapse seeding never
+    /// re-collapses them (`HouseSidebar.userExpanded`).
+    pub spawn_expanded: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -238,7 +287,12 @@ impl std::fmt::Debug for Sessions {
             .field("order", &self.order)
             .field("sheet", &self.sheet)
             .field("kind", &self.kind)
-            .field("spawn_open", &self.spawn_open)
+            .field("pinned", &self.pinned)
+            .field("editing", &self.editing.as_ref().map(|(id, _)| id))
+            .field("confirm_delete", &self.confirm_delete)
+            .field("deleting", &self.deleting)
+            .field("spawn_collapsed", &self.spawn_collapsed)
+            .field("spawn_expanded", &self.spawn_expanded)
             .finish()
     }
 }
@@ -251,7 +305,13 @@ impl Clone for Sessions {
             sheet: self.sheet.clone(),
             search: self.search.clone(),
             kind: self.kind.clone(),
-            spawn_open: self.spawn_open.clone(),
+            pinned: self.pinned.clone(),
+            editing: self.editing.clone(),
+            rename_spare: self.rename_spare.clone(),
+            confirm_delete: self.confirm_delete.clone(),
+            deleting: self.deleting.clone(),
+            spawn_collapsed: self.spawn_collapsed.clone(),
+            spawn_expanded: self.spawn_expanded.clone(),
         }
     }
 }
@@ -264,8 +324,28 @@ impl Default for Sessions {
             sheet: None,
             search: rune::TextEdit::new(""),
             kind: "Main".to_string(),
-            spawn_open: std::collections::HashSet::new(),
+            pinned: Vec::new(),
+            editing: None,
+            rename_spare: rune::TextEdit::new(""),
+            confirm_delete: None,
+            deleting: None,
+            spawn_collapsed: std::collections::HashSet::new(),
+            spawn_expanded: std::collections::HashSet::new(),
         }
+    }
+}
+
+impl Sessions {
+    /// Earliest wall-clock deadline that needs a repaint (delete confirm
+    /// timeout or the fade-out removal).
+    pub fn next_deadline(&self) -> Option<u64> {
+        [
+            self.confirm_delete.as_ref().map(|(_, at)| *at),
+            self.deleting.as_ref().map(|(_, _, at)| *at),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -338,11 +418,21 @@ pub struct CanvasState {
     /// Every chat on the server (sidebar rows), newest first. Empty until the
     /// first real snapshot lands (or when the server is unreachable).
     pub chat_rows: Vec<crate::chats::ChatSummary>,
+    /// Every workspace on the server (paths + flags; sidebar filters and the
+    /// active-run → tab mapping).
+    pub workspaces: Vec<crate::chats::ChatWorkspace>,
     /// Open tab keys (`workspace:chat`, React `open_tabs`) and the active one.
     pub open_tabs: Vec<String>,
     pub active_tab: String,
-    /// A sidebar/tab click wants this chat's history loaded by the shell.
-    pub pending_chat_fetch: Option<(String, String)>,
+    /// Keys the server knew at the previous snapshot (`knownChatIdsRef`):
+    /// chats added since then auto-open as project tabs.
+    pub known_chats: std::collections::HashSet<String>,
+    /// Tabs whose history the shell still has to fetch (boot fallback +
+    /// auto-opened project chats).
+    pub pending_chat_fetches: Vec<(String, String)>,
+    /// The chat with a live backend run (`workspace:chat`, React
+    /// `runningTabId`); drives the dot on sidebar rows and tabs.
+    pub running_tab: Option<String>,
     /// True once a real snapshot replaced the seeded scene.
     pub real: bool,
     /// Cards created locally (a rekeyed `chat:local:*` draft) that server
@@ -394,9 +484,12 @@ impl Clone for CanvasState {
             add_search: self.add_search.clone(),
             closed: self.closed.clone(),
             chat_rows: self.chat_rows.clone(),
+            workspaces: self.workspaces.clone(),
             open_tabs: self.open_tabs.clone(),
             active_tab: self.active_tab.clone(),
-            pending_chat_fetch: self.pending_chat_fetch.clone(),
+            known_chats: self.known_chats.clone(),
+            pending_chat_fetches: self.pending_chat_fetches.clone(),
+            running_tab: self.running_tab.clone(),
             real: self.real,
             manual_cards: self.manual_cards.clone(),
             inputs: self.inputs.clone(),
@@ -494,9 +587,12 @@ impl CanvasState {
             add_search: rune::TextEdit::new(""),
             closed: Vec::new(),
             chat_rows: Vec::new(),
+            workspaces: Vec::new(),
             open_tabs: Vec::new(),
             active_tab: String::new(),
-            pending_chat_fetch: None,
+            known_chats: std::collections::HashSet::new(),
+            pending_chat_fetches: Vec::new(),
+            running_tab: None,
             real: false,
             manual_cards: std::collections::HashSet::new(),
             inputs: std::collections::HashMap::new(),
@@ -549,6 +645,9 @@ impl CanvasState {
         let snapshot = crate::chats::ChatSnapshot {
             open_tabs: self.open_tabs.clone(),
             active_tab: self.active_tab.clone(),
+            pinned_chats: self.sessions.pinned.clone(),
+            chats_filter: filter_for_kind(&self.sessions.kind).to_string(),
+            workspaces: self.workspaces.clone(),
             messages: std::collections::HashMap::new(),
             chats: self.chat_rows.clone(),
         };
@@ -617,18 +716,107 @@ impl CanvasState {
         self.sessions.order = self.cards.iter().map(|c| c.id.clone()).collect();
     }
 
-    /// Adopt the live server snapshot: real cards at React's coordinates,
-    /// real sidebar rows, and real message history for every open tab.
+    /// Adopt the boot snapshot: server layout wins once (open tabs, active
+    /// tab, pins, filter), like `useSessions.boot`. Later polls keep local UI
+    /// state and only reconcile the data.
+    pub fn adopt_boot_snapshot(&mut self, snapshot: &crate::chats::ChatSnapshot) {
+        if snapshot.open_tabs.is_empty() && snapshot.chats.is_empty() {
+            return;
+        }
+        self.real = true;
+        self.workspaces = snapshot.workspaces.clone();
+        self.chat_rows = snapshot.chats.clone();
+        self.seed_spawn_collapsed();
+        let known: std::collections::HashSet<String> =
+            self.chat_rows.iter().map(|c| c.key()).collect();
+        self.known_chats = known.clone();
+        // Restore open tabs — drop any that no longer resolve to a real chat.
+        let mut restored: Vec<String> = snapshot
+            .open_tabs
+            .iter()
+            .filter(|key| known.contains(*key))
+            .cloned()
+            .collect();
+        if restored.is_empty() {
+            if let Some(ws) = self.workspaces.iter().find(|w| w.is_general()) {
+                if let Some(chat) = self.chat_rows.iter().find(|c| c.workspace_id == ws.id) {
+                    restored.push(chat.key());
+                }
+            }
+        }
+        for id in &self.manual_cards {
+            if let Some(key) = id.strip_prefix("chat:") {
+                if !restored.iter().any(|open| open == key) {
+                    restored.push(key.to_string());
+                }
+            }
+        }
+        self.open_tabs = restored;
+        self.active_tab = if self.open_tabs.iter().any(|key| key == &snapshot.active_tab) {
+            snapshot.active_tab.clone()
+        } else {
+            self.open_tabs.first().cloned().unwrap_or_default()
+        };
+        self.sessions.pinned = snapshot.pinned_chats.clone();
+        if let Some(kind) = kind_for_filter(&snapshot.chats_filter) {
+            self.sessions.kind = kind.to_string();
+        }
+        self.sync_graph_cards();
+        self.hydrate_open_threads(snapshot);
+        // A restored tab with no payload (first-general fallback, failed GET)
+        // needs its history fetched once the snapshot channel is free.
+        for key in &self.open_tabs {
+            if !snapshot.messages.contains_key(key) {
+                if let Some(pair) = split_chat_key(key) {
+                    if !self.pending_chat_fetches.contains(&pair) {
+                        self.pending_chat_fetches.push(pair);
+                    }
+                }
+            }
+        }
+        self.sync_active_card(false);
+        self.fit_once();
+    }
+
+    /// Adopt a later sessions poll: server chats are authoritative, local UI
+    /// layout is not. Prunes dead tabs/pins, auto-opens new project chats,
+    /// and keeps the selected local draft (React's 30s poll semantics).
     pub fn apply_chat_snapshot(&mut self, snapshot: &crate::chats::ChatSnapshot) {
         if snapshot.open_tabs.is_empty() && snapshot.chats.is_empty() {
             return;
         }
         self.real = true;
+        self.workspaces = snapshot.workspaces.clone();
         self.chat_rows = snapshot.chats.clone();
-        self.open_tabs = snapshot.open_tabs.clone();
-        // A chat this client just created may not be in the server's saved
-        // `open_tabs` yet (native never writes UI state). Keep manual cards
-        // open so their live thread survives the refresh.
+        self.seed_spawn_collapsed();
+        let known: std::collections::HashSet<String> =
+            self.chat_rows.iter().map(|c| c.key()).collect();
+        // Auto-open new project chats (coding tasks); General/House/Personal
+        // chats only open when the user creates them explicitly. Spawned
+        // children never auto-open as flat tabs (React `useSessions` poll).
+        let mut fresh = Vec::new();
+        for chat in &self.chat_rows {
+            let key = chat.key();
+            if self.known_chats.contains(&key) {
+                continue;
+            }
+            let special = self
+                .workspaces
+                .iter()
+                .find(|w| w.id == chat.workspace_id)
+                .map(|w| w.is_general() || w.is_house() || w.is_personal())
+                .unwrap_or(false);
+            if !special && chat.parent_chat_id.is_none() {
+                fresh.push(key);
+            }
+        }
+        self.known_chats = known.clone();
+        // Prune tabs pointing at chats deleted elsewhere; manual cards (a
+        // locally rekeyed draft the server list has not caught up with yet)
+        // stay mounted.
+        self.open_tabs.retain(|key| {
+            known.contains(key) || self.manual_cards.contains(&format!("chat:{key}"))
+        });
         for id in &self.manual_cards {
             if let Some(key) = id.strip_prefix("chat:") {
                 if !self.open_tabs.iter().any(|open| open == key) {
@@ -636,15 +824,56 @@ impl CanvasState {
                 }
             }
         }
-        self.active_tab = snapshot.active_tab.clone();
-        if self.active_tab.is_empty() && !self.open_tabs.is_empty() {
-            if let Some(id) = self.manual_cards.iter().next() {
-                if let Some(key) = id.strip_prefix("chat:") {
-                    self.active_tab = key.to_string();
+        for key in fresh {
+            if !self.open_tabs.contains(&key) {
+                self.open_tabs.push(key.clone());
+                if let Some(pair) = split_chat_key(&key) {
+                    self.pending_chat_fetches.push(pair);
                 }
             }
         }
+        // Drop pins for deleted chats too.
+        self.sessions.pinned.retain(|key| known.contains(key));
         self.sync_graph_cards();
+        if !self.open_tabs.iter().any(|key| key == &self.active_tab) {
+            self.active_tab = self.open_tabs.first().cloned().unwrap_or_default();
+        }
+        self.hydrate_open_threads(snapshot);
+        self.sync_active_card(true);
+        self.fit_once();
+    }
+
+    /// Seed every parent with spawned children as collapsed on first sight
+    /// (React's default-collapse effect). User expansions are never touched.
+    fn seed_spawn_collapsed(&mut self) {
+        let known: std::collections::HashSet<String> =
+            self.chat_rows.iter().map(|chat| chat.key()).collect();
+        let mut parents = std::collections::HashSet::new();
+        for chat in &self.chat_rows {
+            let Some(parent) = &chat.parent_chat_id else {
+                continue;
+            };
+            let workspace = chat
+                .parent_workspace_id
+                .as_deref()
+                .unwrap_or(&chat.workspace_id);
+            let key = format!("{workspace}:{parent}");
+            if key != chat.key() && known.contains(&key) {
+                parents.insert(key);
+            }
+        }
+        for key in parents {
+            if !self.sessions.spawn_collapsed.contains(&key)
+                && !self.sessions.spawn_expanded.contains(&key)
+            {
+                self.sessions.spawn_collapsed.insert(key);
+            }
+        }
+    }
+
+    /// Titles + persisted message payloads for every open tab. A live or
+    /// aborting thread keeps its local rows until the run settles.
+    fn hydrate_open_threads(&mut self, snapshot: &crate::chats::ChatSnapshot) {
         for key in self.open_tabs.clone() {
             let card_id = format!("chat:{key}");
             let Some(card) = self.card(&card_id) else {
@@ -657,9 +886,6 @@ impl CanvasState {
                 .unwrap_or_default();
             let thread = self.thread_mut(&card_id);
             thread.title = title;
-            // A snapshot can land while a just-created chat is streaming (the
-            // `chat` frame refreshes the sidebar mid-run). Local rows and the
-            // live flag stay authoritative until the run finishes.
             thread.chat_id = chat_id;
             if !thread.live && !thread.aborting {
                 if let Some(rows) = snapshot.messages.get(&key) {
@@ -667,26 +893,79 @@ impl CanvasState {
                 }
             }
         }
-        let want = format!("chat:{}", snapshot.active_tab);
-        self.active_id = if self.card(&want).is_some() {
+    }
+
+    /// Keep the selected card coherent with `active_tab`. `preserve_local`
+    /// keeps a locally opened draft selected across polls; boot always takes
+    /// the persisted layout.
+    fn sync_active_card(&mut self, preserve_local: bool) {
+        let want = format!("chat:{}", self.active_tab);
+        let keep = preserve_local && self.card(&self.active_id).is_some();
+        self.active_id = if keep {
+            self.active_id.clone()
+        } else if self.card(&want).is_some() {
             want
         } else {
             self.sessions.order.first().cloned().unwrap_or_default()
         };
-        if let Some(card) = self.cards.iter().find(|c| c.id == self.active_id) {
-            self.sessions.kind = card.kind.clone();
-        }
         self.sessions.sheet = if self.active_id.is_empty() {
             None
         } else {
             Some(self.active_id.clone())
         };
+    }
+
+    fn fit_once(&mut self) {
         if self.cam_auto && !self.cam_fitted {
             let (vw, vh) = (self.view_w, self.view_h);
             self.cam.fit_in(&self.cards, vw, vh);
             self.sync_cam_live();
             self.cam_fitted = true;
         }
+    }
+
+    /// The persisted layout payload (`PUT /api/ui/state`), filtered to chats
+    /// the server knows (React prunes before saving). Never writes local
+    /// draft keys.
+    pub fn ui_state_json(&self) -> serde_json::Value {
+        let known: std::collections::HashSet<String> =
+            self.chat_rows.iter().map(|c| c.key()).collect();
+        let open_tabs: Vec<&String> = self
+            .open_tabs
+            .iter()
+            .filter(|key| known.contains(*key))
+            .collect();
+        let active = if open_tabs.iter().any(|key| **key == self.active_tab) {
+            serde_json::Value::String(self.active_tab.clone())
+        } else {
+            serde_json::Value::Null
+        };
+        let pinned: Vec<&String> = self
+            .sessions
+            .pinned
+            .iter()
+            .filter(|key| known.contains(*key))
+            .collect();
+        serde_json::json!({
+            "open_tabs": open_tabs,
+            "active_tab": active,
+            "pinned_chats": pinned,
+            "chats_filter": filter_for_kind(&self.sessions.kind),
+        })
+    }
+
+    /// React `runningTabId`: map the backend's active run to its open tab.
+    /// A path-less run belongs to the general workspace.
+    pub fn running_tab_for(&self, run: Option<&crate::cloud::CloudActive>) -> Option<String> {
+        let run = run.filter(|run| run.running)?;
+        let ws = if run.workspace_path.trim().is_empty() {
+            self.workspaces.iter().find(|w| w.is_general())
+        } else {
+            self.workspaces.iter().find(|w| {
+                !w.path.is_empty() && w.path.eq_ignore_ascii_case(run.workspace_path.trim())
+            })
+        }?;
+        Some(format!("{}:{}", ws.id, run.chat_id))
     }
 
     /// Fill one card's transcript from a per-chat history fetch.
@@ -730,7 +1009,8 @@ impl CanvasState {
             thread.rows.clear();
             thread.live = false;
         }
-        self.pending_chat_fetch = Some((workspace_id.to_string(), chat_id.to_string()));
+        self.pending_chat_fetches
+            .push((workspace_id.to_string(), chat_id.to_string()));
         self.select_card(&card_id);
     }
 
@@ -770,6 +1050,7 @@ impl CanvasState {
             active_tab: self.active_tab.clone(),
             messages: std::collections::HashMap::new(),
             chats: self.chat_rows.clone(),
+            ..Default::default()
         };
         let (graph, _) = crate::chats::layout(&snapshot);
         let positions: std::collections::HashMap<&str, (f32, f32)> =
@@ -956,6 +1237,7 @@ impl CanvasState {
         let n = self.cards.len();
         let id = format!("chat:local:{}", crate::notes::mint_id("s"));
         let kind = self.sessions.kind.clone();
+        let workspace_id = self.draft_workspace_id(&kind);
         self.cards.push(MapCard {
             id: id.clone(),
             title: "New Chat".to_string(),
@@ -968,12 +1250,38 @@ impl CanvasState {
             compact: false,
             running: false,
         });
-        let _ = self.thread_mut(&id);
+        {
+            let thread = self.thread_mut(&id);
+            thread.workspace_id = workspace_id;
+        }
         self.inputs
             .entry(id.clone())
             .or_insert_with(|| rune::TextEdit::new(""));
         self.select_card(&id);
         id
+    }
+
+    /// Workspace a "+ New chat" lands in for the active mode (React's
+    /// adaptive +): projects for Coding, the personal room for General.
+    fn draft_workspace_id(&self, kind: &str) -> String {
+        let by_kind = |pick: &dyn Fn(&crate::chats::ChatWorkspace) -> bool| {
+            self.workspaces
+                .iter()
+                .find(|w| pick(w))
+                .map(|w| w.id.clone())
+        };
+        match kind {
+            "Coding" => self
+                .workspaces
+                .iter()
+                .filter(|w| w.is_project())
+                .min_by(|a, b| a.name.cmp(&b.name))
+                .map(|w| w.id.clone())
+                .unwrap_or_else(|| "_general".to_string()),
+            "House" => by_kind(&|w| w.is_house()).unwrap_or_else(|| "_house".to_string()),
+            "General" => by_kind(&|w| w.is_personal()).unwrap_or_else(|| "_personal".to_string()),
+            _ => by_kind(&|w| w.is_general()).unwrap_or_else(|| "_general".to_string()),
+        }
     }
 
     /// Close a session: the card and tab go, but the thread stays — reopening
@@ -1020,6 +1328,155 @@ impl CanvasState {
         if !fallback.is_empty() {
             let _ = self.thread_mut(&fallback);
         }
+        // Keep the persisted active tab in step with the selection React's
+        // `closeTab` would make (`next[min(index, len-1)]`).
+        if let Some(key) = self
+            .active_id
+            .strip_prefix("chat:")
+            .filter(|key| !key.starts_with("local:"))
+        {
+            self.active_tab = key.to_string();
+        } else if !self.open_tabs.contains(&self.active_tab) {
+            self.active_tab = self.open_tabs.first().cloned().unwrap_or_default();
+        }
+    }
+
+    /// Is this `workspace:chat` pinned in the active filter's list?
+    pub fn is_pinned(&self, key: &str) -> bool {
+        self.sessions.pinned.iter().any(|pin| pin == key)
+    }
+
+    /// React `togglePin`: append new pins, remove existing ones.
+    pub fn toggle_pin(&mut self, key: &str) {
+        if let Some(index) = self.sessions.pinned.iter().position(|pin| pin == key) {
+            self.sessions.pinned.remove(index);
+        } else {
+            self.sessions.pinned.push(key.to_string());
+        }
+    }
+
+    /// Start inline rename (React `startRename`): seed the field with the
+    /// current title and clear any armed delete.
+    pub fn start_rename(&mut self, sid: &str) {
+        let title = self
+            .chat_rows
+            .iter()
+            .find(|chat| chat.key() == sid)
+            .map(|chat| chat.title.clone())
+            .or_else(|| {
+                self.card(&format!("chat:{sid}"))
+                    .map(|card| card.title.clone())
+            })
+            .unwrap_or_default();
+        self.sessions.confirm_delete = None;
+        // React focuses the input and selects the title. Rune has no
+        // programmatic focus call; a model field marked focused takes focus
+        // when it first mounts (and blur writes `focused = false` back here,
+        // which the shell tick commits).
+        let mut edit = rune::TextEdit::new(title);
+        edit.anchor = 0;
+        edit.focus = edit.text.len();
+        edit.focused = true;
+        self.sessions.editing = Some((sid.to_string(), edit));
+    }
+
+    /// Commit the inline rename: a trimmed non-empty title that differs from
+    /// the row's current one becomes an optimistic rename. Returns the write
+    /// the shell still has to send (`PUT …/title`).
+    pub fn commit_editing(&mut self) -> Option<(String, String, String)> {
+        let (sid, edit) = self.sessions.editing.take()?;
+        let title = edit.text.trim().to_string();
+        if title.is_empty() {
+            return None;
+        }
+        let (workspace_id, chat_id) = sid.split_once(':')?;
+        if workspace_id.is_empty() || chat_id.is_empty() {
+            return None;
+        }
+        let previous = self
+            .chat_rows
+            .iter()
+            .find(|chat| chat.key() == sid)
+            .map(|chat| chat.title.clone())
+            .or_else(|| {
+                self.card(&format!("chat:{sid}"))
+                    .map(|card| card.title.clone())
+            });
+        if previous.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        self.rename_chat_local(workspace_id, chat_id, &title);
+        Some((workspace_id.to_string(), chat_id.to_string(), title))
+    }
+
+    /// First/second Delete press (React `handleDelete`): arm the 2.5s confirm,
+    /// then start the 220ms fade-out.
+    pub fn press_delete(&mut self, sid: &str) {
+        if self.sessions.deleting.is_some() {
+            return;
+        }
+        let now = crate::clock::now_millis();
+        let confirming = self
+            .sessions
+            .confirm_delete
+            .as_ref()
+            .is_some_and(|(id, at)| id == sid && now < *at);
+        if confirming {
+            self.sessions.confirm_delete = None;
+            self.sessions.deleting = Some((sid.to_string(), now, now + 220));
+        } else {
+            self.sessions.confirm_delete = Some((sid.to_string(), now + 2500));
+        }
+    }
+
+    /// Is this row showing the red confirm state (`Click again to confirm`)?
+    pub fn delete_confirming(&self, sid: &str) -> bool {
+        self.sessions
+            .confirm_delete
+            .as_ref()
+            .is_some_and(|(id, at)| id == sid && crate::clock::now_millis() < *at)
+    }
+
+    /// Opacity of a row in its 220ms delete fade, `None` when it is not
+    /// deleting. The shell wakes every frame while this is `Some`.
+    pub fn delete_fade(&self, sid: &str) -> Option<f32> {
+        let (id, start, end) = self.sessions.deleting.as_ref()?;
+        if id != sid {
+            return None;
+        }
+        let span = end.saturating_sub(*start).max(1) as f32;
+        let elapsed = crate::clock::now_millis().saturating_sub(*start) as f32;
+        Some((1.0 - elapsed / span).clamp(0.0, 1.0))
+    }
+
+    /// Optimistic rename (React `renameChatLocal`): title + timestamp update
+    /// everywhere before the `PUT …/title` lands.
+    pub fn rename_chat_local(&mut self, workspace_id: &str, chat_id: &str, title: &str) {
+        let now = crate::rune_transcript::now_iso();
+        let key = format!("{workspace_id}:{chat_id}");
+        if let Some(chat) = self.chat_rows.iter_mut().find(|c| c.key() == key) {
+            chat.title = title.to_string();
+            chat.updated_at = now;
+        }
+        let card_id = format!("chat:{key}");
+        if let Some(card) = self.cards.iter_mut().find(|c| c.id == card_id) {
+            card.title = title.to_string();
+        }
+        if let Some(thread) = self.sessions.threads.get_mut(&card_id) {
+            thread.title = title.to_string();
+        }
+    }
+
+    /// Optimistic delete (React `removeChatLocal` + `closeTab`): drop the row,
+    /// pin, tab and card; the `DELETE` runs in the background.
+    pub fn remove_chat_local(&mut self, workspace_id: &str, chat_id: &str) {
+        let key = format!("{workspace_id}:{chat_id}");
+        let card_id = format!("chat:{key}");
+        self.chat_rows.retain(|chat| chat.key() != key);
+        self.sessions.pinned.retain(|pin| pin != &key);
+        self.known_chats.remove(&key);
+        self.close_session(&card_id);
+        self.closed.retain(|(id, _)| id != &card_id);
     }
 
     /// Re-add a closed chat to the canvas (Add menu → Chats). History is
@@ -1101,6 +1558,15 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
+    rune::Color {
+        r: r / 255.0,
+        g: g / 255.0,
+        b: b / 255.0,
+        a,
+    }
+}
+
 /// Cubic edge path in canvas points (mirrors `stark-kit::edge_path`).
 pub fn edge_cubic(parent: &MapCard, child: &MapCard) -> Path {
     let (pw, ph) = parent.size();
@@ -1118,11 +1584,42 @@ pub fn edge_cubic(parent: &MapCard, child: &MapCard) -> Path {
 /// Host access for views composed into a larger shell.
 pub trait CanvasHost {
     fn canvas_mut(&mut self) -> &mut CanvasState;
+    /// Live chat state for sidebar mutations (rename/delete). Standalone
+    /// canvas scenes have none.
+    fn chats_mut(&mut self) -> Option<&mut crate::chats::ChatsState> {
+        None
+    }
 }
 
 impl CanvasHost for CanvasState {
     fn canvas_mut(&mut self) -> &mut CanvasState {
         self
+    }
+}
+
+/// Commit (or drop) an inline rename once the field lost focus, React's
+/// `onBlur`. The shell calls this from its poll, so the input's old node is
+/// gone before the draft is dropped.
+pub fn settle_sidebar_editing<S: CanvasHost + 'static>(s: &mut S) -> bool {
+    let Some((_, edit)) = s.canvas_mut().sessions.editing.as_ref() else {
+        return false;
+    };
+    if edit.focused {
+        return false;
+    }
+    commit_sidebar_rename(s);
+    true
+}
+
+/// Commit an open inline rename and fire its `PUT …/title` (`HouseSidebar`'s
+/// `onBlur`/Enter). Standalone canvas scenes have no chat state to write to;
+/// they still commit the optimistic local title.
+pub fn commit_sidebar_rename<S: CanvasHost + 'static>(s: &mut S) {
+    let Some((workspace_id, chat_id, title)) = s.canvas_mut().commit_editing() else {
+        return;
+    };
+    if let Some(chats) = s.chats_mut() {
+        crate::chats::rename_chat(chats, &workspace_id, &chat_id, &title);
     }
 }
 
@@ -2893,9 +3390,11 @@ fn sidebar_spawn_row<S: CanvasHost + 'static>(chat: &crate::chats::ChatSummary) 
         .pr(8.0)
         .py(6.0)
         .radius(8.0)
+        .hover(rgba(255.0, 255.0, 255.0, 0.04))
         .role("button")
         .label(format!("Open {title}"))
         .on_press(move |s: &mut S| {
+            commit_sidebar_rename(s);
             s.canvas_mut().open_chat_row(&ws, &chat_id);
         })
         .child(
@@ -2920,6 +3419,248 @@ fn sidebar_spawn_row<S: CanvasHost + 'static>(chat: &crate::chats::ChatSummary) 
                 .truncate()
                 .font(style)
                 .color(ink("#71717a")),
+        )
+}
+
+/// One action glyph with its hover tint stacked on top: `El::group_color`
+/// only tints text/icons, not shapes, so the hover colour is a second shape
+/// that fades in through the button's own hover group.
+fn action_icon(
+    size: f32,
+    base: rune::Shape,
+    hover: Option<rune::Shape>,
+    shadow: Option<(f32, f32, rune::Color)>,
+) -> El {
+    let mut base_el = rune::el().size(size, size).shape(base);
+    if let Some((y, blur, color)) = shadow {
+        base_el = base_el.shadow(y, blur, color);
+    }
+    let mut stack = rune::el().size(size, size).inert().child(base_el);
+    if let Some(hover) = hover {
+        stack = stack.child(
+            rune::el()
+                .size(size, size)
+                .absolute(0.0, 0.0)
+                .group_opacity(0.0, 1.0)
+                .shape(hover),
+        );
+    }
+    stack
+}
+
+/// The hover action cluster (`HouseSidebar` `absolute right-1`): cloud status,
+/// pin, two-step delete (check on the confirming click), rename. It fades in
+/// with the row's hover group and floats over the time stamp.
+fn sidebar_actions<S: CanvasHost + 'static>(
+    card_id: &str,
+    sid: &str,
+    pinned: bool,
+    confirming: bool,
+    running: bool,
+) -> El {
+    let mut cluster = row()
+        .key(format!("side-{card_id}-actions"))
+        .pin(None, Some(2.0), Some(4.0), None)
+        .w(108.0)
+        .h(30.0)
+        .items_center()
+        .gap(2.0)
+        .px(2.0)
+        .radius(6.0)
+        .fill(ink("#181818"))
+        .border(1.0, rgba(255.0, 255.0, 255.0, 0.06))
+        .border_layout()
+        .group_opacity(0.0, 1.0);
+    // `CloudBadge`: live runs carry the sky cloud (pulse + glow, sky-100 on
+    // hover); idle shows zinc CloudOff, zinc-200 on hover. The badge is its
+    // own hover group so its icon lights up only under the pointer, not when
+    // the row's action cluster merely appears.
+    let mut cloud_icon = action_icon(
+        12.0,
+        if running {
+            crate::icons::cloud(12.0, ink("#7dd3fc"))
+        } else {
+            crate::icons::cloud_off(12.0, ink("#71717a"))
+        },
+        Some(if running {
+            crate::icons::cloud(12.0, ink("#e0f2fe"))
+        } else {
+            crate::icons::cloud_off(12.0, ink("#e4e4e7"))
+        }),
+        running.then(|| (6.0, 6.0, rgba(125.0, 211.0, 252.0, 0.7))),
+    );
+    if running {
+        cloud_icon = cloud_icon.looping(rune::LoopSpec::opacity(2.0, 0.0, 0.5, 1.0));
+    }
+    cluster = cluster.child(
+        rune::el()
+            .key(format!("side-{card_id}-cloud"))
+            .role("button")
+            .label(if running {
+                "Running — cloud run details"
+            } else {
+                "Cloud run details"
+            })
+            .size(24.0, 24.0)
+            .radius(6.0)
+            .center()
+            .hover_group()
+            .hover(if running {
+                rgba(14.0, 165.0, 233.0, 0.20)
+            } else {
+                ink("#3f3f46")
+            })
+            // Cloud pages are out of scope for the chats-only shell; the
+            // button still takes the press so it never opens the row.
+            .on_press(|_: &mut S| {})
+            .child(cloud_icon),
+    );
+    let pin_sid = sid.to_string();
+    let pin_icon = if pinned {
+        action_icon(
+            11.0,
+            crate::icons::pin_off(11.0, ink("#e4e4e7")),
+            None,
+            None,
+        )
+    } else {
+        action_icon(
+            11.0,
+            crate::icons::pin(11.0, ink("#71717a")),
+            Some(crate::icons::pin(11.0, ink("#ffffff"))),
+            None,
+        )
+    };
+    cluster = cluster.child(
+        rune::el()
+            .key(format!("side-{card_id}-pin"))
+            .role("button")
+            .label(if pinned { "Unpin" } else { "Pin" })
+            .size(24.0, 24.0)
+            .radius(6.0)
+            .center()
+            .hover_group()
+            .hover(if pinned {
+                rgba(255.0, 255.0, 255.0, 0.0)
+            } else {
+                rgba(255.0, 255.0, 255.0, 0.07)
+            })
+            .on_press(move |s: &mut S| {
+                commit_sidebar_rename(s);
+                s.canvas_mut().toggle_pin(&pin_sid);
+            })
+            .child(pin_icon),
+    );
+    let delete_sid = sid.to_string();
+    let delete_icon = if confirming {
+        action_icon(
+            11.0,
+            crate::lucide_check(11.0, 2.0, ink("#f87171")),
+            None,
+            None,
+        )
+    } else {
+        action_icon(
+            11.0,
+            crate::icons::trash(11.0, ink("#71717a")),
+            Some(crate::icons::trash(11.0, ink("#ffffff"))),
+            None,
+        )
+    };
+    let mut delete = rune::el()
+        .key(format!("side-{card_id}-delete"))
+        .role("button")
+        .label(if confirming {
+            "Click again to confirm"
+        } else {
+            "Delete"
+        })
+        .size(24.0, 24.0)
+        .radius(6.0)
+        .center()
+        .hover_group()
+        .hover(if confirming {
+            rgba(239.0, 68.0, 68.0, 0.0)
+        } else {
+            rgba(255.0, 255.0, 255.0, 0.07)
+        })
+        .on_press(move |s: &mut S| {
+            commit_sidebar_rename(s);
+            s.canvas_mut().press_delete(&delete_sid);
+        });
+    if confirming {
+        delete = delete.fill(rgba(239.0, 68.0, 68.0, 0.15));
+    }
+    cluster = cluster.child(delete.child(delete_icon));
+    let rename_sid = sid.to_string();
+    cluster = cluster.child(
+        rune::el()
+            .key(format!("side-{card_id}-rename"))
+            .role("button")
+            .label("Rename")
+            .size(24.0, 24.0)
+            .radius(6.0)
+            .center()
+            .hover_group()
+            .hover(rgba(255.0, 255.0, 255.0, 0.07))
+            .on_press(move |s: &mut S| {
+                commit_sidebar_rename(s);
+                s.canvas_mut().start_rename(&rename_sid);
+            })
+            .child(action_icon(
+                11.0,
+                crate::icons::pencil(11.0, ink("#71717a")),
+                Some(crate::icons::pencil(11.0, ink("#ffffff"))),
+                None,
+            )),
+    );
+    cluster
+}
+
+/// The inline rename field (`HouseSidebar` row input): `rounded-md border
+/// border-white/25 bg-black/40 px-2 py-1 text-[12px]`.
+fn sidebar_rename_row<S: CanvasHost + 'static>(card_id: &str, edit: &rune::TextEdit) -> El {
+    let mut style = rune::tok::TextStyle::new(12.0, 400.0);
+    style.line_height = 18.0;
+    row()
+        .key(format!("side-{card_id}"))
+        .w_full()
+        .items_center()
+        .pl(12.0)
+        .pr(8.0)
+        .py(8.0)
+        .child(
+            text_input(edit, style)
+                .key(format!("side-{card_id}-rename-input"))
+                .grow(1.0)
+                .min_w(0.0)
+                .h(28.0)
+                .px(8.0)
+                .py(4.0)
+                .radius(6.0)
+                .border(1.0, rgba(255.0, 255.0, 255.0, 0.25))
+                .border_layout()
+                .fill(rgba(0.0, 0.0, 0.0, 0.4))
+                .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                .on_edit(move |s: &mut S| {
+                    let canvas = s.canvas_mut();
+                    match canvas.sessions.editing.as_mut() {
+                        Some((_, edit)) => edit,
+                        None => &mut canvas.sessions.rename_spare,
+                    }
+                })
+                .on_submit(|s: &mut S, tx: &mut rune::Tx| {
+                    commit_sidebar_rename(s);
+                    tx.blur();
+                })
+                .on_input_key(|s: &mut S, key: &rune::KeyEvent, tx: &mut rune::Tx| {
+                    if key.key != rune::Key::Escape {
+                        return false;
+                    }
+                    s.canvas_mut().sessions.editing = None;
+                    tx.blur();
+                    true
+                }),
         )
 }
 
@@ -3152,10 +3893,15 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             }
         }
         let flat = !query.is_empty();
-        for chat in &s.chat_rows {
+        // React `pinnedSort`: pinned chats first, otherwise the server's
+        // newest-first order (Rust's sort is stable).
+        let mut ordered: Vec<&crate::chats::ChatSummary> = s.chat_rows.iter().collect();
+        ordered.sort_by_key(|chat| !s.is_pinned(&chat.key()));
+        for chat in ordered {
             let card_id = chat.card_id();
             let chat_key = chat.key();
             let title = crate::chats::display_title(&chat.title);
+            let spawned = chat.parent_chat_id.is_some();
             let kind = CanvasState::kind_for(&chat.workspace_kind);
             if kind != s.sessions.kind {
                 continue;
@@ -3187,68 +3933,136 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     })
                     .unwrap_or_default()
             };
-            let expanded = !kids.is_empty() && s.sessions.spawn_open.contains(&card_id);
+            // React seeds every parent with spawned children as collapsed;
+            // an explicit expand keeps it open across polls.
+            let expanded = !kids.is_empty() && !s.sessions.spawn_collapsed.contains(&chat_key);
             let active = card_id == s.active_id;
-            let running = s.card(&card_id).map(|c| c.running).unwrap_or(false);
-            let row_id = format!("side-{card_id}");
+            let sid = chat_key.clone();
+            let pinned = s.is_pinned(&sid);
+            let confirming = s.delete_confirming(&sid);
+            let fade = s.delete_fade(&sid);
+            let deleting = fade.is_some();
+            let running = s.running_tab.as_deref() == Some(sid.as_str())
+                || s.card(&card_id).map(|c| c.running).unwrap_or(false);
+            let editing = s
+                .sessions
+                .editing
+                .as_ref()
+                .is_some_and(|(id, _)| id == &sid);
             let ws = chat.workspace_id.clone();
             let chat_id = chat.id.clone();
-            let mut item = row()
-                .key(row_id)
-                .w_full()
-                .items_center()
-                .gap(8.0)
-                .pl(12.0)
-                .pr(8.0)
-                .py(8.0)
-                .radius(8.0)
-                .role("button")
-                .label(format!("Open {title}"))
-                .on_press(move |s: &mut S| {
-                    s.canvas_mut().open_chat_row(&ws, &chat_id);
-                });
-            if active {
-                item = item.fill(rune::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.09,
-                });
-            }
-            if running {
-                item = item.child(
-                    rune::el()
-                        .key(format!("side-{card_id}-dot"))
-                        .size(6.0, 6.0)
-                        .radius(3.0)
-                        .fill(ink("#fafafa")),
-                );
+            let mut item = if editing {
+                let edit = &s
+                    .sessions
+                    .editing
+                    .as_ref()
+                    .expect("editing implies a draft")
+                    .1;
+                sidebar_rename_row::<S>(&card_id, edit)
             } else {
+                let mut item = row()
+                    .key(format!("side-{card_id}"))
+                    .w_full()
+                    .items_center()
+                    .gap(8.0)
+                    .pl(if spawned && flat { 26.0 } else { 12.0 })
+                    .pr(8.0)
+                    .py(8.0)
+                    .radius(8.0)
+                    .hover_group();
+                // React row states: spawned rows carry `is-spawned`
+                // (white/2.5%, hover 5%, active 7.5%); regular rows hover
+                // white/4% and active at 9%.
+                if spawned {
+                    item = item.fill(rgba(
+                        255.0,
+                        255.0,
+                        255.0,
+                        if active { 0.075 } else { 0.025 },
+                    ));
+                    if !active && !deleting {
+                        item = item.hover(rgba(255.0, 255.0, 255.0, 0.05));
+                    }
+                } else {
+                    if !active && !deleting {
+                        item = item.hover(rgba(255.0, 255.0, 255.0, 0.04));
+                    }
+                    if active {
+                        item = item.fill(rgba(255.0, 255.0, 255.0, 0.09));
+                    }
+                }
+                if !deleting {
+                    item = item.role("button").label(format!("Open {title}")).on_press(
+                        move |s: &mut S| {
+                            commit_sidebar_rename(s);
+                            s.canvas_mut().open_chat_row(&ws, &chat_id);
+                        },
+                    );
+                }
+                if running {
+                    // `session-run-dot`: 6pt white dot with an 8pt glow and
+                    // `house-breathe` (1.6s, opacity 0.55 → 1).
+                    item = item.child(
+                        rune::el()
+                            .key(format!("side-{card_id}-dot"))
+                            .size(6.0, 6.0)
+                            .radius(3.0)
+                            .fill(ink("#fafafa"))
+                            .shadow(0.0, 8.0, rgba(255.0, 255.0, 255.0, 0.65))
+                            .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.55, 1.0)),
+                    );
+                } else {
+                    item = item.child(
+                        rune::el()
+                            .key(format!("side-{card_id}-icon"))
+                            .size(12.0, 12.0)
+                            .inert()
+                            .shape(if spawned {
+                                bot_icon(12.0, ink("#c4b5fd"))
+                            } else {
+                                chat_row_icon(12.0, ink("#52525b"))
+                            }),
+                    );
+                }
                 item = item.child(
-                    rune::el()
-                        .key(format!("side-{card_id}-icon"))
-                        .size(12.0, 12.0)
-                        .inert()
-                        .shape(chat_row_icon(12.0, ink("#52525b"))),
+                    text(title)
+                        .key(format!("side-{card_id}-title"))
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate()
+                        .font(title_style())
+                        .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
                 );
-            }
-            item = item.child(
-                text(title)
-                    .key(format!("side-{card_id}-title"))
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .truncate()
-                    .font(title_style())
-                    .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
-            );
-            let stamp = crate::chats::relative_time_short(&chat.updated_at);
-            if !stamp.is_empty() {
-                item = item.child(
-                    text(stamp)
-                        .key(format!("side-{card_id}-time"))
-                        .font(stamp_style())
-                        .color(ink("#52525b")),
-                );
+                if pinned {
+                    item = item.child(
+                        rune::el()
+                            .key(format!("side-{card_id}-pinmark"))
+                            .size(10.0, 10.0)
+                            .inert()
+                            .rotate(std::f32::consts::FRAC_PI_4)
+                            .shape(crate::icons::pin(10.0, ink("#71717a"))),
+                    );
+                }
+                let stamp = crate::chats::relative_time_short(&chat.updated_at);
+                if !stamp.is_empty() {
+                    item = item.child(
+                        text(stamp)
+                            .key(format!("side-{card_id}-time"))
+                            .font(stamp_style())
+                            .color(ink("#52525b")),
+                    );
+                }
+                if !deleting {
+                    item = item.child(sidebar_actions::<S>(
+                        &card_id, &sid, pinned, confirming, running,
+                    ));
+                }
+                item
+            };
+            // An inline input's own press must edit the field, not open the
+            // chat; the row wrapper carries only layout.
+            if editing {
+                item = item.on_press(|_: &mut S| {});
             }
             // `flex items-center gap-0.5` + 20pt leading slot (`w-5`): the
             // role/expand gutter. Root rows leave it empty, so the row box
@@ -3259,7 +4073,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .w(20.0)
                     .h(20.0)
             } else {
-                let toggle = card_id.clone();
+                let toggle = chat_key.clone();
                 let open = expanded;
                 rune::el()
                     .key(format!("side-{card_id}-lead"))
@@ -3273,9 +4087,13 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .radius(6.0)
                     .center()
                     .on_press(move |s: &mut S| {
-                        let set = &mut s.canvas_mut().sessions.spawn_open;
-                        if !set.remove(&toggle) {
-                            set.insert(toggle.clone());
+                        commit_sidebar_rename(s);
+                        let sessions = &mut s.canvas_mut().sessions;
+                        if sessions.spawn_collapsed.remove(&toggle) {
+                            sessions.spawn_expanded.insert(toggle.clone());
+                        } else {
+                            sessions.spawn_collapsed.insert(toggle.clone());
+                            sessions.spawn_expanded.remove(&toggle);
                         }
                     })
                     .child(rune::el().size(11.0, 11.0).inert().shape(if open {
@@ -3284,21 +4102,27 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         chevron_right(11.0, ink("#52525b"))
                     }))
             };
-            list = list.child(
-                row()
-                    .key(format!("side-wrap-{card_id}"))
-                    .w_full()
-                    .items_center()
-                    .gap(2.0)
-                    .child(lead)
-                    .child(
-                        col()
-                            .key(format!("side-{card_id}-cell"))
-                            .grow(1.0)
-                            .min_w(0.0)
-                            .child(item),
-                    ),
-            );
+            let cell = col()
+                .key(format!("side-{card_id}-cell"))
+                .grow(1.0)
+                .min_w(0.0)
+                .child(item);
+            let mut wrap = row()
+                .key(format!("side-wrap-{card_id}"))
+                .w_full()
+                .items_center()
+                .gap(2.0)
+                .child(lead)
+                .child(cell);
+            if let Some(opacity) = fade {
+                // React `.is-deleting` (`house-row-out`): 220ms fade and
+                // `translateX(-8px)`, then the row leaves the list. Rune
+                // cannot collapse a painted row in the same window without
+                // leaving its last layer under the row below, so the slot
+                // keeps its height until the 220ms timer drops it.
+                wrap = wrap.opacity(opacity).offset(-8.0 * (1.0 - opacity), 0.0);
+            }
+            list = list.child(wrap);
             if expanded {
                 for kid in kids {
                     list = list.child(
@@ -3523,6 +4347,7 @@ mod tests {
                 title: "New Conversation".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         s.apply_chat_snapshot(&snapshot);
         // The server does not know about this tab yet; the native client keeps
@@ -3796,8 +4621,9 @@ mod tests {
                 chat("a", "2026-01-01T00:00:00Z"),
                 chat("b", "2026-01-02T00:00:00Z"),
             ],
+            ..Default::default()
         };
-        state.apply_chat_snapshot(&snapshot);
+        state.adopt_boot_snapshot(&snapshot);
         assert!(state.cam_fitted, "the first snapshot fits the map");
         let fitted = state.cam;
         let a = "chat:_general:a";
@@ -4021,5 +4847,284 @@ mod tests {
         // Card-1 bottom (36+420=456) vs card-3 top (480): 24pt gap, bend floor 34.
         assert!(d.starts_with("M 270 456 C 270 490,"), "kit path: {d}");
         let _ = edge_cubic(&s.cards[0], &s.cards[2]);
+    }
+
+    fn sidebar_state() -> CanvasState {
+        let chat = |id: &str, title: &str, at: &str| crate::chats::ChatSummary {
+            id: id.to_string(),
+            workspace_id: "_general".to_string(),
+            workspace_name: "General".to_string(),
+            workspace_kind: "general".to_string(),
+            title: title.to_string(),
+            updated_at: at.to_string(),
+            ..Default::default()
+        };
+        let mut s = CanvasState::map();
+        s.real = true;
+        s.workspaces = vec![crate::chats::ChatWorkspace {
+            id: "_general".to_string(),
+            name: "General".to_string(),
+            kind: "general".to_string(),
+            exists: true,
+            ..Default::default()
+        }];
+        s.chat_rows = vec![
+            chat("a", "alpha", "2026-11-11T09:00:00Z"),
+            chat("b", "bravo", "2026-11-10T09:00:00Z"),
+        ];
+        s.sessions.pinned = vec!["_general:b".to_string()];
+        s
+    }
+
+    fn sidebar_only(s: &CanvasState, _: &mut rune::Cx<CanvasState>) -> El {
+        col()
+            .key("sidebar-test-root")
+            .w_full()
+            .h_full()
+            .child(chats_panel::<CanvasState>(s))
+    }
+
+    #[test]
+    fn rename_field_takes_focus_and_selects_the_title() {
+        use rune::{Key, KeyEvent, Mods};
+        let mut s = sidebar_state();
+        s.start_rename("_general:b");
+        {
+            let (_, edit) = s.sessions.editing.as_ref().expect("rename started");
+            assert!(edit.focused, "the shell tick must not see an instant blur");
+            assert_eq!((edit.anchor, edit.focus), (0, 5), "title is selected");
+        }
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        for ch in ["G", "o"] {
+            rt.key(KeyEvent {
+                key: Key::Text(ch.to_string()),
+                mods: Mods::default(),
+            });
+            rt.frame(0.0);
+        }
+        let (_, edit) = rt.state.sessions.editing.as_ref().expect("still editing");
+        assert_eq!(edit.text, "Go", "typing replaces the selection");
+        assert!(edit.focused, "the mounted field keeps focus");
+        // Enter commits the trimmed title and closes the field.
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.state.sessions.editing.is_none(),
+            "submit closes the field"
+        );
+        assert_eq!(rt.state.chat_rows[1].title, "Go");
+    }
+
+    #[test]
+    fn rename_commits_when_the_field_loses_focus() {
+        use rune::{Key, KeyEvent, Mods};
+        let mut s = sidebar_state();
+        s.start_rename("_general:b");
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        rt.key(KeyEvent {
+            key: Key::Text("Z".to_string()),
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.sessions.editing.as_ref().unwrap().1.text,
+            "Z",
+            "typing replaces the selected title"
+        );
+        let (sx, sy) = rt.find("map-search").unwrap();
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            !rt.state.sessions.editing.as_ref().unwrap().1.focused,
+            "clicking the search field blurs the rename"
+        );
+        assert!(crate::rune_canvas::settle_sidebar_editing(&mut rt.state));
+        assert!(rt.state.sessions.editing.is_none(), "blur closes the field");
+        assert_eq!(rt.state.chat_rows[1].title, "Z", "blur commits the title");
+    }
+
+    #[test]
+    fn escape_cancels_inline_rename_without_writing() {
+        use rune::{Key, KeyEvent, Mods};
+        let mut s = sidebar_state();
+        s.start_rename("_general:b");
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        rt.key(KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert!(
+            rt.state.sessions.editing.is_none(),
+            "escape closes the field"
+        );
+        assert_eq!(
+            rt.state.chat_rows[1].title, "bravo",
+            "escape keeps the title"
+        );
+    }
+
+    #[test]
+    fn sidebar_pins_sort_first_and_hover_reveals_the_action_cluster() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(sidebar_state(), sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        let b = "side-chat:_general:b";
+        let a = "side-chat:_general:a";
+        let (rb, _) = rt.presented(b).unwrap();
+        let (ra, _) = rt.presented(a).unwrap();
+        assert!(rb[1] < ra[1], "pinned bravo sorts above alpha");
+        assert!(
+            rt.find("side-chat:_general:b-pinmark").is_some(),
+            "pinned rows carry the rotated pin"
+        );
+        let actions = "side-chat:_general:b-actions";
+        let (rect, opacity) = rt.presented(actions).unwrap();
+        assert!(opacity < 0.01, "cluster rests hidden: {opacity}");
+        assert!(
+            (rect[0] + rect[2] - 234.0).abs() < 1.5,
+            "right-1 to the row: {rect:?}"
+        );
+        // Hovering the row fades the cluster in.
+        rt.pointer_move(120.0, rb[1] + rb[3] * 0.5);
+        for _ in 0..6 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (_, opacity) = rt.presented(actions).unwrap();
+        assert!(opacity > 0.5, "hover reveals the actions: {opacity}");
+    }
+
+    #[test]
+    fn two_presses_on_the_row_delete_button_start_the_fade() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(sidebar_state(), sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        let (bx, by) = rt.find("side-chat:_general:b").unwrap();
+        rt.pointer_move(bx, by);
+        for _ in 0..4 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (dx, dy) = rt.find("side-chat:_general:b-delete").unwrap();
+        rt.pointer_down(dx, dy);
+        rt.pointer_up(dx, dy);
+        for _ in 0..2 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.delete_confirming("_general:b"), "first press arms");
+        rt.pointer_down(dx, dy);
+        rt.pointer_up(dx, dy);
+        for _ in 0..2 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.state.sessions.deleting.is_some(),
+            "second press starts the fade: {:?}",
+            rt.state.sessions.deleting
+        );
+    }
+
+    #[test]
+    fn deleting_row_fades_without_the_action_cluster() {
+        let mut s = sidebar_state();
+        let now = crate::clock::now_millis();
+        s.sessions.deleting = Some(("_general:b".to_string(), now, now + 220));
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
+        rt.frame(0.0);
+        let actions = "side-chat:_general:b-actions";
+        assert!(rt.find(actions).is_none(), "deleting row drops the cluster");
+        let (rect, opacity) = rt.presented("side-wrap-chat:_general:b").unwrap();
+        assert!(opacity < 1.0, "row is fading: {opacity} at {rect:?}");
+    }
+
+    #[test]
+    fn inline_rename_commits_and_delete_is_two_step() {
+        let mut s = sidebar_state();
+        s.start_rename("_general:b");
+        assert!(s.sessions.confirm_delete.is_none());
+        s.sessions.editing.as_mut().expect("rename started").1 = rune::TextEdit::new("  Renamed  ");
+        let write = s.commit_editing().expect("changed title writes");
+        assert_eq!(write.0, "_general");
+        assert_eq!(write.1, "b");
+        assert_eq!(write.2, "Renamed");
+        assert_eq!(s.chat_rows[1].title, "Renamed");
+        assert!(s.sessions.editing.is_none());
+        // A blank or unchanged title only closes the field.
+        s.start_rename("_general:b");
+        s.sessions.editing.as_mut().expect("rename started").1 = rune::TextEdit::new("   ");
+        assert!(s.commit_editing().is_none());
+        // First press arms the 2.5s confirm; the second starts the 220ms fade.
+        s.press_delete("_general:b");
+        assert!(s.delete_confirming("_general:b"));
+        assert!(s.sessions.deleting.is_none());
+        s.press_delete("_general:b");
+        assert!(s.sessions.confirm_delete.is_none());
+        assert!(s
+            .sessions
+            .deleting
+            .as_ref()
+            .is_some_and(|(id, _, _)| id == "_general:b"));
+        assert!(s.delete_fade("_general:b").is_some());
+    }
+
+    #[test]
+    fn new_chat_lands_in_the_mode_workspace() {
+        let mut s = CanvasState::map();
+        s.workspaces = vec![
+            crate::chats::ChatWorkspace {
+                id: "_general".to_string(),
+                kind: "general".to_string(),
+                ..Default::default()
+            },
+            crate::chats::ChatWorkspace {
+                id: "_house".to_string(),
+                kind: "house".to_string(),
+                ..Default::default()
+            },
+            crate::chats::ChatWorkspace {
+                id: "_personal".to_string(),
+                kind: "personal".to_string(),
+                ..Default::default()
+            },
+            crate::chats::ChatWorkspace {
+                id: "proj-zeta".to_string(),
+                name: "Zeta".to_string(),
+                kind: "project".to_string(),
+                ..Default::default()
+            },
+            crate::chats::ChatWorkspace {
+                id: "proj-alpha".to_string(),
+                name: "Alpha".to_string(),
+                kind: "project".to_string(),
+                ..Default::default()
+            },
+        ];
+        for (kind, expected) in [
+            ("Main", "_general"),
+            ("Coding", "proj-alpha"),
+            ("House", "_house"),
+            ("General", "_personal"),
+        ] {
+            s.sessions.kind = kind.to_string();
+            let id = s.new_session();
+            assert_eq!(
+                s.sessions.threads[&id].workspace_id, expected,
+                "{kind} drafts in {expected}"
+            );
+        }
     }
 }

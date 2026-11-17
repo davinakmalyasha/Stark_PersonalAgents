@@ -68,6 +68,41 @@ pub fn relative_time_short(value: &str) -> String {
     }
 }
 
+/// One workspace in `GET /api/workspaces` (React `WorkspaceInfo`). Kept
+/// alongside the chats so the session layer can map an active run's
+/// `workspace_path` back to its workspace id and pick the workspace behind
+/// each sidebar filter (Coding → projects, General → personal, …).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChatWorkspace {
+    pub id: String,
+    pub name: String,
+    /// `workspaceKind`: `general` / `house` / `personal` / `project` / `dfd`.
+    pub kind: String,
+    pub path: String,
+    pub chat_count: i64,
+    pub exists: bool,
+}
+
+impl ChatWorkspace {
+    pub fn is_general(&self) -> bool {
+        self.kind == "general"
+    }
+
+    pub fn is_house(&self) -> bool {
+        self.kind == "house"
+    }
+
+    pub fn is_personal(&self) -> bool {
+        self.kind == "personal"
+    }
+
+    /// React `projects`: real project folders only (never general/house/
+    /// personal/dfd). The Coding sidebar filter lists these.
+    pub fn is_project(&self) -> bool {
+        !self.is_general() && !self.is_house() && !self.is_personal() && self.kind != "dfd"
+    }
+}
+
 /// One chat page in `GET /api/workspaces/{id}/chats`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatSummary {
@@ -293,6 +328,13 @@ pub struct ChatSave {
 pub struct ChatSnapshot {
     pub open_tabs: Vec<String>,
     pub active_tab: String,
+    /// Persisted pinned session ids (`workspace:chat`), in toggle order.
+    pub pinned_chats: Vec<String>,
+    /// Persisted sidebar filter (`general` / `coding` / `house` /
+    /// `personal`); empty when the server has none.
+    pub chats_filter: String,
+    /// Every workspace the server reports (paths + flags for run mapping).
+    pub workspaces: Vec<ChatWorkspace>,
     /// Open-tab payloads keyed by `workspace:chat` (insertion order = tabs).
     pub messages: HashMap<String, Vec<ChatMsgRow>>,
     pub chats: Vec<ChatSummary>,
@@ -301,7 +343,18 @@ pub struct ChatSnapshot {
 /// Async result carried from the fetch thread into the UI poll.
 pub enum ChatsMsg {
     Snapshot(Result<ChatSnapshot, String>),
-    Messages { key: String, rows: Vec<ChatMsgRow> },
+    Messages {
+        key: String,
+        rows: Vec<ChatMsgRow>,
+    },
+    /// A fire-and-forget mutation failed; the server's list is authoritative
+    /// again (`forceRefresh` after an optimistic rename/delete).
+    RefreshNeeded,
+    /// `/api/runs/active` result for the session running dot.
+    ActiveRun(Result<crate::cloud::CloudActive, String>),
+    /// Deferred layout write finished. Failures are non-fatal (React's
+    /// `saveUiState` swallows them); the next change retries.
+    Saved(Result<(), String>),
 }
 
 #[derive(Debug, Default)]
@@ -311,12 +364,25 @@ pub struct ChatsState {
     pub tx: Option<std::sync::mpsc::Sender<ChatsMsg>>,
     pub loading: bool,
     pub loaded: bool,
+    /// The boot snapshot has been adopted (server layout honoured once).
+    /// Later snapshots keep local tabs/pins/filter.
+    pub booted: bool,
     pub error: Option<String>,
     /// Latest snapshot (sidebar rows + open tabs).
     pub snapshot: ChatSnapshot,
     /// Boot auto-load is enabled by the real app entry, never by unit tests.
     pub auto: bool,
     pub last_try: f64,
+    /// Last 30s sessions poll (`SESSIONS_POLL_MS`).
+    pub last_poll: f64,
+    /// `/api/runs/active` (2.5s), used for the running dot on rows/tabs.
+    pub active_run: Option<crate::cloud::CloudActive>,
+    pub last_run_poll: f64,
+    pub run_loading: bool,
+    /// Last layout payload written to `PUT /api/ui/state` (debounced 400ms).
+    pub ui_saved: String,
+    pub ui_dirty_at: Option<f64>,
+    pub ui_saving: bool,
 }
 
 /// One shared result stream for snapshots and per-chat history.
@@ -336,10 +402,18 @@ impl Clone for ChatsState {
             tx: None,
             loading: false,
             loaded: self.loaded,
+            booted: self.booted,
             error: self.error.clone(),
             snapshot: self.snapshot.clone(),
             auto: self.auto,
             last_try: self.last_try,
+            last_poll: self.last_poll,
+            active_run: self.active_run.clone(),
+            last_run_poll: self.last_run_poll,
+            run_loading: self.run_loading,
+            ui_saved: self.ui_saved.clone(),
+            ui_dirty_at: self.ui_dirty_at,
+            ui_saving: self.ui_saving,
         }
     }
 }
@@ -393,6 +467,27 @@ fn parse_workspace(v: &serde_json::Value) -> (String, String, String, i64) {
         workspace_kind(v),
         v.get("chatCount").and_then(|x| x.as_i64()).unwrap_or(0),
     )
+}
+
+fn parse_workspace_info(v: &serde_json::Value) -> ChatWorkspace {
+    let (id, name, kind, chat_count) = parse_workspace(v);
+    ChatWorkspace {
+        id,
+        name,
+        kind,
+        path: str_of(v, "path"),
+        chat_count,
+        exists: v.get("exists").and_then(|x| x.as_bool()).unwrap_or(true),
+    }
+}
+
+/// Persisted sidebar filters (`ChatsFilter`); unknown values are ignored so a
+/// newer client's value never blanks the native list.
+pub fn normalize_filter(value: &str) -> String {
+    match value.trim() {
+        "general" | "coding" | "house" | "personal" => value.trim().to_string(),
+        _ => String::new(),
+    }
 }
 
 fn parse_chat(
@@ -583,11 +678,26 @@ fn build_snapshot(
         })
         .unwrap_or_default();
     let active_tab = str_of(ui, "active_tab");
+    let pinned_chats: Vec<String> = ui
+        .get("pinned_chats")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let chats_filter = normalize_filter(&str_of(ui, "chats_filter"));
+    let mut workspaces_out = Vec::new();
     let mut meta: HashMap<String, (String, String, String)> = HashMap::new();
     if let Some(list) = workspaces.get("workspaces").and_then(|x| x.as_array()) {
         for w in list {
-            let (id, name, kind, _) = parse_workspace(w);
-            meta.insert(id, (name, kind, String::new()));
+            let info = parse_workspace_info(w);
+            meta.insert(
+                info.id.clone(),
+                (info.name.clone(), info.kind.clone(), String::new()),
+            );
+            workspaces_out.push(info);
         }
     }
     let mut chats = Vec::new();
@@ -611,6 +721,9 @@ fn build_snapshot(
     ChatSnapshot {
         open_tabs,
         active_tab,
+        pinned_chats,
+        chats_filter,
+        workspaces: workspaces_out,
         messages: message_map,
         chats,
     }
@@ -688,7 +801,7 @@ pub fn refresh(chats: &mut ChatsState) {
     });
 }
 
-/// Fetch one chat's history (sidebar/tab open on a chat that was not an open
+/// Refresh one chat's history (sidebar/tab open on a chat that was not an open
 /// tab at boot).
 pub fn refresh_messages(chats: &mut ChatsState, workspace_id: &str, chat_id: &str) {
     let key = format!("{workspace_id}:{chat_id}");
@@ -713,6 +826,118 @@ pub fn refresh_messages(chats: &mut ChatsState, workspace_id: &str, chat_id: &st
                 .map(|v| parse_messages(&v))
                 .unwrap_or_default();
         let _ = tx.send(ChatsMsg::Messages { key, rows });
+    });
+}
+
+/// Poll `/api/runs/active` (React `RUN_POLL_MS = 2500`). One request at a
+/// time; a failure leaves the last known dot in place (`fetchActiveRun` is
+/// caught in React too).
+pub fn refresh_active_run(chats: &mut ChatsState) {
+    if chats.run_loading {
+        return;
+    }
+    chats.run_loading = true;
+    let tx = ensure_channel(chats);
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = match crate::transport::fetch_json("/api/runs/active").await {
+            Ok(v) => Ok(crate::cloud::CloudActive::from_json(&v)),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(ChatsMsg::ActiveRun(result));
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let host = crate::rune_transcript::DEFAULT_API_HOST;
+        let port = crate::rune_transcript::api_port();
+        let result = crate::cloud::CloudActive::fetch(host, port);
+        let _ = tx.send(ChatsMsg::ActiveRun(result));
+    });
+}
+
+/// Persist the session layout (`PUT /api/ui/state`), React's 400ms debounce
+/// handled by the caller (`ui_dirty_at`). Fire-and-forget: a failure clears
+/// `ui_saved` so the next poll retries.
+pub fn save_ui_state(chats: &mut ChatsState, payload: serde_json::Value) {
+    if chats.ui_saving {
+        return;
+    }
+    chats.ui_saving = true;
+    chats.ui_saved = payload.to_string();
+    let tx = ensure_channel(chats);
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = crate::transport::fetch_send("PUT", "/api/ui/state", Some(&payload))
+            .await
+            .map(|_| ());
+        let _ = tx.send(ChatsMsg::Saved(result));
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let host = crate::rune_transcript::DEFAULT_API_HOST;
+        let port = crate::rune_transcript::api_port();
+        let result =
+            crate::transport::send_json(host, port, "PUT", "/api/ui/state", &payload).map(|_| ());
+        let _ = tx.send(ChatsMsg::Saved(result));
+    });
+}
+
+/// Optimistic rename's write (`PUT …/title`). A failure asks the UI to refetch
+/// the server list, which restores the old title (React `.catch(forceRefresh)`).
+pub fn rename_chat(chats: &mut ChatsState, workspace_id: &str, chat_id: &str, title: &str) {
+    let body = serde_json::json!({ "title": title });
+    write_chat(chats, workspace_id, chat_id, "PUT", "title", body);
+}
+
+/// Optimistic delete's write (`DELETE …/chats/{id}`).
+pub fn delete_chat(chats: &mut ChatsState, workspace_id: &str, chat_id: &str) {
+    write_chat(
+        chats,
+        workspace_id,
+        chat_id,
+        "DELETE",
+        "",
+        serde_json::json!({}),
+    );
+}
+
+fn write_chat(
+    chats: &mut ChatsState,
+    workspace_id: &str,
+    chat_id: &str,
+    method: &'static str,
+    suffix: &'static str,
+    body: serde_json::Value,
+) {
+    let ws = workspace_id.to_string();
+    let chat = chat_id.to_string();
+    let tx = ensure_channel(chats);
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut path = format!("/api/workspaces/{ws}/chats/{chat}");
+        if !suffix.is_empty() {
+            path.push('/');
+            path.push_str(suffix);
+        }
+        if crate::transport::fetch_send(method, &path, Some(&body))
+            .await
+            .is_err()
+        {
+            let _ = tx.send(ChatsMsg::RefreshNeeded);
+        }
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(move || {
+        let host = crate::rune_transcript::DEFAULT_API_HOST;
+        let port = crate::rune_transcript::api_port();
+        let mut path = format!("/api/workspaces/{ws}/chats/{chat}");
+        if !suffix.is_empty() {
+            path.push('/');
+            path.push_str(suffix);
+        }
+        if crate::transport::send_json(host, port, method, &path, &body).is_err() {
+            let _ = tx.send(ChatsMsg::RefreshNeeded);
+        }
     });
 }
 
@@ -1185,6 +1410,7 @@ mod tests {
             active_tab: "_general:a".to_string(),
             messages: HashMap::new(),
             chats: vec![chat],
+            ..Default::default()
         };
         let (cards, edges) = layout(&snapshot);
         assert_eq!(cards.len(), 1);
@@ -1290,6 +1516,7 @@ mod tests {
             active_tab: "_general:p".to_string(),
             messages: HashMap::new(),
             chats: vec![parent, child],
+            ..Default::default()
         };
         let (cards, edges) = layout(&snapshot);
         assert_eq!(cards.len(), 2);

@@ -236,6 +236,10 @@ impl CanvasHost for ShellState {
     fn canvas_mut(&mut self) -> &mut CanvasState {
         &mut self.canvas
     }
+
+    fn chats_mut(&mut self) -> Option<&mut crate::chats::ChatsState> {
+        Some(&mut self.chats)
+    }
 }
 
 impl HouseHost for ShellState {
@@ -354,7 +358,8 @@ fn session_tab(s: &ShellState, id: &str) -> El {
                 .size(6.0, 6.0)
                 .radius(3.0)
                 .fill(ink("#fafafa"))
-                .shadow(0.0, 8.0, home_glow()),
+                .shadow(0.0, 8.0, home_glow())
+                .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.55, 1.0)),
         );
     }
     el = el.child(
@@ -982,11 +987,34 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     if busy {
         tx.wake_after(std::time::Duration::from_millis(100));
     }
+    if s.chats.auto {
+        // Keep the 2.5s run poll (and the 30s sessions poll) ticking on an
+        // otherwise idle screen, exactly like React's intervals.
+        let run_left = (2.5 - (clock - s.chats.last_run_poll)).max(0.01);
+        tx.wake_after(std::time::Duration::from_secs_f64(run_left));
+        if s.chats.loaded {
+            let sessions_left = (30.0 - (clock - s.chats.last_poll)).max(0.01);
+            tx.wake_after(std::time::Duration::from_secs_f64(sessions_left));
+        }
+    }
+    if let Some(deadline) = s.canvas.sessions.next_deadline() {
+        let ms = deadline.saturating_sub(crate::clock::now_millis()).max(1);
+        tx.wake_after(std::time::Duration::from_millis(ms));
+    }
+    if s.canvas.sessions.deleting.is_some() {
+        // ~60 fps while the row fades out.
+        tx.wake_after(std::time::Duration::from_millis(16));
+    }
+    if let Some(at) = s.chats.ui_dirty_at {
+        let left = (0.4 - (clock - at)).max(0.01);
+        tx.wake_after(std::time::Duration::from_secs_f64(left));
+    }
     changed
 }
 
 /// Drain the real-chat stream: adopt snapshots, apply per-chat history, and
-/// auto-load once on the real app entry.
+/// auto-load once on the real app entry. Mirrors `useSessions`' two cadences:
+/// a 30s sessions diff and a 2.5s active-run poll.
 fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
     use crate::chats::ChatsMsg;
     let mut changed = false;
@@ -1005,11 +1033,20 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
     while let Some(msg) = s.chats.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
         match msg {
             ChatsMsg::Snapshot(Ok(snapshot)) => {
-                s.chats.snapshot = snapshot.clone();
-                s.canvas.apply_chat_snapshot(&snapshot);
+                if s.chats.booted {
+                    // Later polls keep local tabs/active/pins/filter and only
+                    // reconcile server data (React `useSessions` poll).
+                    s.canvas.apply_chat_snapshot(&snapshot);
+                } else {
+                    // Boot: the persisted layout wins once.
+                    s.canvas.adopt_boot_snapshot(&snapshot);
+                    s.chats.booted = true;
+                }
+                s.chats.snapshot = snapshot;
                 s.chats.loaded = true;
                 s.chats.loading = false;
                 s.chats.error = None;
+                s.chats.last_poll = clock;
                 changed = true;
             }
             ChatsMsg::Snapshot(Err(message)) => {
@@ -1033,15 +1070,40 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
                 }
                 changed = true;
             }
+            ChatsMsg::RefreshNeeded => {
+                // Optimistic rename/delete failed: let the server's list win.
+                if !s.chats.loading {
+                    crate::chats::refresh(&mut s.chats);
+                }
+                changed = true;
+            }
+            ChatsMsg::ActiveRun(Ok(run)) => {
+                s.chats.active_run = Some(run);
+                s.chats.run_loading = false;
+                changed |= sync_running_tab(s);
+            }
+            ChatsMsg::ActiveRun(Err(_)) => {
+                // React catches the poll and keeps the last known dot.
+                s.chats.run_loading = false;
+            }
+            ChatsMsg::Saved(result) => {
+                s.chats.ui_saving = false;
+                if result.is_err() {
+                    // `saveUiState` swallows failures; the next change retries.
+                    s.chats.ui_saved.clear();
+                    s.chats.ui_dirty_at = None;
+                }
+                changed = true;
+            }
         }
     }
-    // Only start a history fetch when the boot snapshot is not in flight:
-    // both share one result stream.
-    if !s.chats.loading {
-        if let Some((ws, chat)) = s.canvas.pending_chat_fetch.take() {
+    // Only start history fetches when the boot snapshot is not in flight:
+    // all fetches share one result stream.
+    if !s.chats.loading && !s.canvas.pending_chat_fetches.is_empty() {
+        for (ws, chat) in std::mem::take(&mut s.canvas.pending_chat_fetches) {
             crate::chats::refresh_messages(&mut s.chats, &ws, &chat);
-            changed = true;
         }
+        changed = true;
     }
     if s.chats.auto
         && !s.chats.loaded
@@ -1052,7 +1114,96 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
         crate::chats::refresh(&mut s.chats);
         changed = true;
     }
+    // 30s sessions poll (`SESSIONS_POLL_MS`); the snapshot handler prunes and
+    // auto-opens only when the list changed.
+    if s.chats.auto && s.chats.loaded && !s.chats.loading && clock - s.chats.last_poll > 30.0 {
+        s.chats.last_poll = clock;
+        crate::chats::refresh(&mut s.chats);
+        changed = true;
+    }
+    // 2.5s active-run poll (`RUN_POLL_MS`) — one pipeline at a time.
+    if s.chats.auto && !s.chats.run_loading && clock - s.chats.last_run_poll > 2.5 {
+        s.chats.last_run_poll = clock;
+        crate::chats::refresh_active_run(&mut s.chats);
+        changed = true;
+    }
+    changed |= tick_sidebar_editing(s);
+    changed |= tick_chat_deletes(s, clock);
+    changed |= poll_ui_state(s, clock);
     changed
+}
+
+/// Map `/api/runs/active` to the open tab carrying the dot.
+fn sync_running_tab(s: &mut ShellState) -> bool {
+    let running = s.canvas.running_tab_for(s.chats.active_run.as_ref());
+    if s.canvas.running_tab == running {
+        return false;
+    }
+    s.canvas.running_tab = running;
+    true
+}
+
+/// Inline rename blur commit (`HouseSidebar` input `onBlur`): Rune mirrors the
+/// field's focus into the model, so losing it signals the commit.
+fn tick_sidebar_editing(s: &mut ShellState) -> bool {
+    crate::rune_canvas::settle_sidebar_editing(s)
+}
+
+/// Two-step delete: first press arms a 2.5s confirm, the second fades the row
+/// for 220ms before the optimistic removal + DELETE (React `HouseSidebar`).
+fn tick_chat_deletes(s: &mut ShellState, _clock: f64) -> bool {
+    let now = crate::clock::now_millis();
+    // The 220ms fade recomputes opacity from the wall clock, so keep the
+    // sidebar rebuilding while it runs.
+    let mut changed = s.canvas.sessions.deleting.is_some();
+    if let Some((_, at)) = &s.canvas.sessions.confirm_delete {
+        if now >= *at {
+            s.canvas.sessions.confirm_delete = None;
+            changed = true;
+        }
+    }
+    let due = s
+        .canvas
+        .sessions
+        .deleting
+        .as_ref()
+        .filter(|(_, _, at)| now >= *at)
+        .map(|(key, _, _)| key.clone());
+    if let Some(key) = due {
+        s.canvas.sessions.deleting = None;
+        if let Some((ws, chat)) = key.split_once(':') {
+            s.canvas.remove_chat_local(ws, chat);
+            crate::chats::delete_chat(&mut s.chats, ws, chat);
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// React's 400ms debounced `saveUiState`: write only when the layout payload
+/// actually changed.
+fn poll_ui_state(s: &mut ShellState, clock: f64) -> bool {
+    if !s.chats.booted || !s.chats.loaded || s.chats.ui_saving {
+        return false;
+    }
+    let payload = s.canvas.ui_state_json();
+    let text = payload.to_string();
+    if text == s.chats.ui_saved {
+        s.chats.ui_dirty_at = None;
+        return false;
+    }
+    match s.chats.ui_dirty_at {
+        None => {
+            s.chats.ui_dirty_at = Some(clock);
+            false
+        }
+        Some(at) if clock - at >= 0.4 => {
+            s.chats.ui_dirty_at = None;
+            crate::chats::save_ui_state(&mut s.chats, payload);
+            true
+        }
+        Some(_) => false,
+    }
 }
 
 /// Drain the house inbox; auto-refresh at most every 15s.

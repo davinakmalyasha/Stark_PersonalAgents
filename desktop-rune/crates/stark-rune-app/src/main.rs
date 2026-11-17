@@ -36,6 +36,9 @@ mod cloud;
 #[cfg(feature = "rune-real")]
 mod composer;
 #[cfg(feature = "rune-real")]
+#[path = "icons.rs"]
+mod icons;
+#[cfg(feature = "rune-real")]
 #[path = "image_cache.rs"]
 mod image_cache;
 #[cfg(feature = "rune-real")]

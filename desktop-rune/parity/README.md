@@ -198,6 +198,79 @@ python desktop-rune/parity/capture_react.py /tmp/ask-react.png \
 Native-only demo routes (`--rune-route stream` / `trace` / `ask`) render the
 same components without a fixture server for quick visual checks.
 
+## Sidebar parity (2026-11-17)
+
+`parity/scenarios/sidebar/api_ui_state.json` overlays the recorded chat lists
+with a pinned chat, one open tab and the `general` filter. Deletion uses the
+wall clock, so these captures must run with `--parity-now ""` (React) and no
+`STARK_PARITY_NOW` (native); the live clock only shifts the relative stamps.
+
+```bash
+# React (Vite on :5200 with STARK_PORT=8126)
+python desktop-rune/parity/capture_react.py /tmp/sidebar-react-rest.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now ""
+python desktop-rune/parity/capture_react.py /tmp/sidebar-react-hover.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --hover 200,166
+python desktop-rune/parity/capture_react.py /tmp/sidebar-react-confirm.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --click 243,166
+python desktop-rune/parity/capture_react.py /tmp/sidebar-react-fade.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --click 243,166 --click2 243,166 --click2-delay 0.05
+python desktop-rune/parity/capture_react.py /tmp/sidebar-react-gone.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 4 --parity-now "" \
+  --click 243,166 --click2 243,166 --click2-delay 0.35
+
+# native (release; the delete taps use wall time)
+python desktop-rune/parity/mock_server.py --port 8126 --scenario sidebar
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/sidebar-native-rest.png --size 1280x900 --at 3.0
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/sidebar-native-hover.png --size 1280x900 --at 3.0 \
+  --script parity/scripts/sidebar_hover_pin.json
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/sidebar-native-confirm.png --size 1280x900 --at 3.0 \
+  --script parity/scripts/sidebar_delete_confirm.json
+for at in 3.50 3.56 3.62 3.80; do
+  STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+    --rune-shell-snap /tmp/sidebar-native-fade-$at.png --size 1280x900 \
+    --at $at --script parity/scripts/sidebar_delete_fade.json
+done
+```
+
+The delete tap in both scripts lands on the row's trash button at `243,166`
+(the hover cluster is `hidden group-hover:flex`, so the pointer settles over
+the row first). The hover pose parks on the cloud button at `200,166`
+(`parity/scripts/sidebar_hover_pin.json`). At 1280×900 (`full` = whole frame,
+`band` = sidebar 60–300 × 130–300):
+
+| pose | full mean | band mean | align |
+| --- | ---: | ---: | --- |
+| rest | **1.763** | **1.235** | (0, 0) |
+| hover (`--hover 200,166`, over the cloud button) | **1.757** | **1.561** | (0, 0) |
+| delete confirm (first tap) | **1.758** | **1.608** | (0, 0) |
+| fade (~50ms in, `--click2-delay 0.05` vs `--at 3.50`) | **2.656** | **12.849** | (0, 0) |
+| after the 220ms removal (`--click2-delay 0.35` vs `--at 5.0`) | **1.747** | **1.539** | (0, 0) |
+
+The mock server answers `DELETE /api/workspaces/*/chats/*` with
+`{"ok": true}` like the real server. Without it the native `DELETE` fails,
+sends `RefreshNeeded`, and the static fixture list resurrects the just-deleted
+row (unpinned) on refetch — the gone pose would show it back in second place.
+
+The fade is React's `house-row-out`: 220ms, opacity 1→0, `translateX(0→-8px)`
+and `max-height 40px→0` (padding/margin to 0), so the rows below slide up as
+the row fades. The fade band (12.849) is that structural slot collapse, not a
+shift — `compare.py --align` still reports (0, 0). Rune applies the same
+opacity and offset but keeps the row's slot until its existing 220ms removal
+timer. Every attempt to shrink or clip a painted row mid-fade — `max_h`/`h` on
+the wrapper or the inner cell, rounded or rectangular, with or without its
+hover group — left the fading row's last paint (title and action cluster)
+under the next row. The slot collapse is therefore a documented transient
+delta; the gone pose above compares the post-removal list and is clean. The
+static poses (rest/hover/confirm) match with no ghost at rest, hover or
+confirm.
+
 ## State scripts
 
 `parity/scripts/*.json` are Rune headless input scripts (`tap`, `wheel`,

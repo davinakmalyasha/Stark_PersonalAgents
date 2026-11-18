@@ -198,10 +198,12 @@ collapsing-margin rules, verified against CDP rects + pixel probes):
 - Inline code renders the `border-zinc-700/50` 1px ring on the same rounded
   rect as the zinc-800/80 well, via the framework's paint-only
   `text_highlights` (`TextHighlight` ring + 6px pad for `px-1.5`).
-  Vertical chrome is framework-controlled: Rune paints `base - asc - 1px`
-  to `base + desc + 1px` with no `pad_y` API, so React's `py-0.5` (2px
-  top/bottom) has no native equivalent without forking the pinned rev —
-  the well stays horizontally exact and vertically short by design.
+  Vertical chrome is framework-controlled and measured, not inferred:
+  React CDP reports the `code` box at 21px tall around 15px text
+  (`py-0.5` 2px + 1px border per side); native pixels show the same text
+  rows under a 15px well (asc/descent + 1px, no `pad_y` API in
+  `decorations.rs`). The 6px delta needs a pinned-Rune fork, so the well
+  stays horizontally exact and vertically short by design.
 - Quote border side: `border_sides` is CSS-ordered `[top,right,bottom,left]`
   (confirmed in the Rune shader + `set_border` + pixel probes), so the
   `border-l-2` bar is `[0,0,0,2]`; the well uses `rounded-r-lg` (right

@@ -745,4 +745,26 @@ mod tests {
         assert_eq!(frame_ms_for(16_000), 1000);
         assert_eq!(frame_ms_for(0), 1);
     }
+
+    /// Non-MSVC (or non-`voice-stt`) builds keep the honest stub: no worker
+    /// is spawned and the error names the MSVC requirement instead of
+    /// failing obscurely. This is what the manifest's
+    /// `target.'cfg(target_env = "msvc")'` gate guarantees on GNU.
+    #[cfg(not(all(target_env = "msvc", feature = "voice-stt")))]
+    #[test]
+    fn stub_names_the_msvc_requirement() {
+        let err = match ensure_engine() {
+            Err(e) => e,
+            Ok(_) => panic!("no prebuilt on this target"),
+        };
+        assert!(err.contains("MSVC"), "honest message, got: {err}");
+        let (_pcm_tx, pcm_rx) = std::sync::mpsc::channel();
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = match spawn_producer(pcm_rx, msg_tx, stop) {
+            Err(e) => e,
+            Ok(_) => panic!("stub must not spawn"),
+        };
+        assert!(err.contains("MSVC"), "honest message, got: {err}");
+    }
 }

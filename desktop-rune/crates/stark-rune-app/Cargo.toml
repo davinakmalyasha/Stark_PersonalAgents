@@ -68,7 +68,7 @@ optional = true
 
 # Streaming speech-to-text over the Moonshine ONNX runtime. The native
 # libmoonshine prebuilt is MSVC-only on Windows (same gate as the backend's
-# stark-voice `stt` feature); other targets keep an honest stub.
-[dependencies.moonshine-rs]
-version = "0.2.6"
-optional = true
+# stark-voice `stt` feature); other targets keep an honest stub and the
+# feature compiles to meter-only instead of failing on bindgen/link.
+[target.'cfg(target_env = "msvc")'.dependencies]
+moonshine-rs = { version = "0.2.6", optional = true }

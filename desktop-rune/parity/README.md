@@ -198,6 +198,10 @@ collapsing-margin rules, verified against CDP rects + pixel probes):
 - Inline code renders the `border-zinc-700/50` 1px ring on the same rounded
   rect as the zinc-800/80 well, via the framework's paint-only
   `text_highlights` (`TextHighlight` ring + 6px pad for `px-1.5`).
+  Vertical chrome is framework-controlled: Rune paints `base - asc - 1px`
+  to `base + desc + 1px` with no `pad_y` API, so React's `py-0.5` (2px
+  top/bottom) has no native equivalent without forking the pinned rev —
+  the well stays horizontally exact and vertically short by design.
 - Quote border side: `border_sides` is CSS-ordered `[top,right,bottom,left]`
   (confirmed in the Rune shader + `set_border` + pixel probes), so the
   `border-l-2` bar is `[0,0,0,2]`; the well uses `rounded-r-lg` (right
@@ -220,6 +224,15 @@ collapsing-margin rules, verified against CDP rects + pixel probes):
   was the largest single checkbox-col contributor).
 - Quote wells use `rounded-r-lg` (right corners only); the bar side stays
   square like React's.
+- `voice-stt` follows the backend's MSVC gate at the manifest level:
+  `moonshine-rs` is a `target.'cfg(target_env = "msvc")'` optional dep, so
+  GNU `--features voice-stt` compiles to the honest meter-only stub instead
+  of failing in `bindgen`/MSVC link. On-device transcription still needs an
+  MSVC host; models are reused in place from `D:\Stark\resources\models`.
+- Artifact review is viewport-aware like the lightbox: the card caps at
+  `min(860px, vw-48)` / `min(760px, vh-48)` (React's modal caps) with the
+  scroll body taking the remainder. Still a centered modal over the
+  chats-only transcript — no map/coding workspace takeover.
 
 Remaining tasks delta is glyph-level rasterisation: positions are exact
 (best integer shift is (0, 0), background pixels match at 1.8), but the two

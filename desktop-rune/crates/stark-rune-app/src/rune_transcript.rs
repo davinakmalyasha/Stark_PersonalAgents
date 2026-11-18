@@ -3606,6 +3606,17 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
                 },
             )
     };
+    // Viewport-aware card: React's review modal is `min(860px,100%)` /
+    // `min(760px,100vh-48px)`; the native card was a fixed 640px / 480px
+    // scroll. Expand to the same caps (still a centered modal over the
+    // chats-only transcript — no map/coding workspace takeover) so large
+    // diffs use the viewport instead of a cramped box. Same Stark fill,
+    // border, backdrop + Esc dismiss as before.
+    let (win_w, win_h) = transcript_window();
+    let card_max_w = (win_w - 48.0).clamp(280.0, 860.0);
+    let card_max_h = (win_h - 48.0).clamp(320.0, 760.0);
+    // Head (~60pt) + card padding (32pt) + gap (12pt) reserve before scroll.
+    let scroll_max_h = (card_max_h - 110.0).max(200.0);
     rune::el()
         .key("artifact-review-overlay")
         .absolute(0.0, 0.0)
@@ -3625,7 +3636,8 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
             col()
                 .key("artifact-review-card")
                 .w_full()
-                .max_w(640.0)
+                .max_w(card_max_w)
+                .max_h(card_max_h)
                 .radius(16.0)
                 .fill(home_ink("#141417"))
                 .border(1.0, home_ink("#ffffff14"))
@@ -3682,7 +3694,7 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
                         .w_full()
                         .grow(1.0)
                         .min_h(0.0)
-                        .max_h(480.0)
+                        .max_h(scroll_max_h)
                         .scroll(ScrollSpec {
                             stick_bottom: false,
                         })

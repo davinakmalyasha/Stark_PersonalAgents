@@ -78,8 +78,17 @@ fn prepend_space(blocks: &[stark_kit::markdown::Block]) -> Vec<stark_kit::markdo
     out
 }
 /// Inline code: 13.5pt mono indigo-300 on a zinc-800/80 well with the
-/// `border-zinc-700/50` 1px ring (React `code` component). The well comes
-/// from a paint-only highlight so the border rides the same rounded rect.
+/// `border-zinc-700/50` 1px ring (React `code` component:
+/// `frontend/src/components/Workspace/Markdown.tsx:99`
+/// `bg-zinc-800/80 px-1.5 py-0.5 ... border border-zinc-700/50`).
+/// Horizontal chrome is exact: `pad(6.0)` == `px-1.5`, plus the 1px ring
+/// (table width fudge `+14.0` per code span). Vertical chrome is
+/// framework-controlled: `TextHighlight` paints `base - asc - 1px` to
+/// `base + desc + 1px` (`decorations.rs:226-227`), with no `pad_y` API —
+/// React's `py-0.5` (2px top/bottom) has no native equivalent without forking
+/// the pinned Rune rev, so the well stays horizontally exact and vertically
+/// short. The well comes from a paint-only highlight so the border rides
+/// the same rounded rect.
 fn inline_code_span(start: usize, end: usize) -> (rune::Span, rune::TextHighlight) {
     (
         rune::Span::new(start, end)

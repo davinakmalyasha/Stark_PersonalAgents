@@ -1,4 +1,4 @@
-# Tool contract v4 (Codex-aligned agent surfaces)
+# Tool contract v6 (Codex-aligned agent surfaces)
 
 `tool-specs.json` is the single model-facing tool contract for the Rust server.
 It now contains two surfaces:
@@ -61,6 +61,6 @@ unified inventory in `stark-tools/src/inventory.rs` and implementing a
 dispatch arm, then regenerating labels with
 `node backend-rs/specs/generate-labels.mjs`.
 
-`docs/tools/README.md` points at the contract and the v2 parity doc; the old
-per-tool pages were deleted. The Developer surface is documented by the
-contract itself and `docs/rust-rewrite/18-deepseek-parity.md`.
+The Developer surface is documented by the contract itself and the
+`stark-tools` inventory. The old per-tool pages and design docs were deleted;
+the code is the source of truth.

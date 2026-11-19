@@ -32,9 +32,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Fail if any tracked Python remains
         run: |
-          if git ls-files '*.py' | grep -q .; then
+          # desktop-rune/parity is dev-only capture tooling (React CDP
+          # screenshots, mock API, diffing) and is intentionally Python; the
+          # zero-Python rule covers shipped runtime code.
+          if git ls-files '*.py' ':!desktop-rune/parity' | grep -q .; then
             echo "tracked Python files remain:"
-            git ls-files '*.py'
+            git ls-files '*.py' ':!desktop-rune/parity'
             exit 1
           fi
-          echo "no tracked Python — clean"
+          echo "no tracked Python outside the parity harness — clean"

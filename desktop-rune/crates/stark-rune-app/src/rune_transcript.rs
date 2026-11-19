@@ -738,8 +738,9 @@ pub struct RuneTranscriptState {
     pub inbox: Option<std::sync::mpsc::Receiver<crate::stream::SseFrame>>,
     /// The key of the code block whose copy button shows the Check state.
     pub copied_code: Option<String>,
-    /// When that copy happened; cleared after React's 1.8s.
-    pub copied_at: Option<std::time::Instant>,
+    /// When that copy happened (`clock::now_millis`), cleared after React's
+    /// 1.8s. Milliseconds, not `Instant`: wasm has no clock behind `Instant`.
+    pub copied_at: Option<u64>,
     /// Diff blocks whose "Show all N lines" button has been pressed.
     pub expanded_diffs: std::collections::HashSet<String>,
     /// Artifact panels whose file list is expanded past the first three
@@ -754,10 +755,11 @@ pub struct RuneTranscriptState {
     /// In-flight `POST /runs/{id}/undo` (`(row_key, Ok(status)|Err)`).
     /// `None` on clone: a copied state never inherits a live request.
     pub artifact_undo_inbox: Option<std::sync::mpsc::Receiver<(String, Result<String, String>)>>,
-    /// Row keys whose copy button is showing React's 1.5s Check state.
-    pub copied_messages: std::collections::HashMap<String, std::time::Instant>,
+    /// Row keys whose copy button is showing React's 1.5s Check state
+    /// (`clock::now_millis` timestamps).
+    pub copied_messages: std::collections::HashMap<String, u64>,
     /// User rows armed for the two-step rewind (3.2s, like `rewindArmed`).
-    pub rewind_armed: std::collections::HashMap<String, std::time::Instant>,
+    pub rewind_armed: std::collections::HashMap<String, u64>,
     /// Blocking `/rewind` + history fetch running for this thread.
     pub rewind_inbox: Option<std::sync::mpsc::Receiver<Result<RewindOk, String>>>,
     /// Composer deck: local picks (`id` empty) and restored uploads.
@@ -2183,7 +2185,7 @@ fn copy_message<S: TranscriptHost + 'static>(
     if feedback {
         s.thread_mut(which)
             .copied_messages
-            .insert(key.to_string(), std::time::Instant::now());
+            .insert(key.to_string(), crate::clock::now_millis());
         // Poll again when the 1.5s window ends even if nothing else moves.
         tx.wake_after(std::time::Duration::from_millis(50));
     }
@@ -2194,7 +2196,7 @@ fn copy_message<S: TranscriptHost + 'static>(
 fn arm_rewind<S: TranscriptHost + 'static>(s: &mut S, which: Thread, key: &str, tx: &mut rune::Tx) {
     s.thread_mut(which)
         .rewind_armed
-        .insert(key.to_string(), std::time::Instant::now());
+        .insert(key.to_string(), crate::clock::now_millis());
     tx.wake_after(std::time::Duration::from_millis(50));
 }
 
@@ -5572,21 +5574,22 @@ pub fn ask_demo() -> RuneTranscriptState {
 pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = false;
     // `Markdown.tsx`'s copy button shows the Check for 1.8s.
+    // Millis from `clock` (wasm-safe): `Instant::now` panics in the browser.
+    let now = crate::clock::now_millis();
     if s.copied_at
-        .is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(1800))
+        .is_some_and(|at| now.saturating_sub(at) >= 1_800)
     {
         s.copied_code = None;
         s.copied_at = None;
         changed = true;
     }
     // Message copy (1.5s) and rewind arming (3.2s) are simple expiries.
-    let now = std::time::Instant::now();
     let copied_before = s.copied_messages.len();
     s.copied_messages
-        .retain(|_, at| now.duration_since(*at) < std::time::Duration::from_millis(1500));
+        .retain(|_, at| now.saturating_sub(*at) < 1_500);
     let armed_before = s.rewind_armed.len();
     s.rewind_armed
-        .retain(|_, at| now.duration_since(*at) < std::time::Duration::from_millis(3200));
+        .retain(|_, at| now.saturating_sub(*at) < 3_200);
     if s.copied_messages.len() != copied_before || s.rewind_armed.len() != armed_before {
         changed = true;
     }
@@ -6401,7 +6404,7 @@ mod tests {
         s.run_started_ms = Some(1.0);
         s.refresh_list = false;
         s.rewind_armed
-            .insert("u2".to_string(), std::time::Instant::now());
+            .insert("u2".to_string(), crate::clock::now_millis());
         s.attachment_preview = Some(ChatAttachment {
             id: "old".to_string(),
             name: "old.png".to_string(),

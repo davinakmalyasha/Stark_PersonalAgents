@@ -1031,7 +1031,7 @@ fn code_block<S: TranscriptHost + 'static>(
         .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
             let t = s.thread_mut(which);
             t.copied_code = Some(copy_key.clone());
-            t.copied_at = Some(std::time::Instant::now());
+            t.copied_at = Some(crate::clock::now_millis());
             tx.copy(code_owned.clone());
             tx.wake_after(std::time::Duration::from_millis(1800));
         });

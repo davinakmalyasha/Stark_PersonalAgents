@@ -343,22 +343,6 @@ pub const INVENTORY: &[ToolMeta] = &[
         summary: "loaded a skill",
     },
     ToolMeta {
-        name: "web_search",
-        plan_write: false,
-        read_blocked: false,
-        program: true,
-        verb: "Searched web",
-        summary: "searched the web",
-    },
-    ToolMeta {
-        name: "web_fetch",
-        plan_write: false,
-        read_blocked: false,
-        program: true,
-        verb: "Fetched",
-        summary: "fetched pages",
-    },
-    ToolMeta {
         name: "spawn_agent",
         plan_write: true,
         read_blocked: true,
@@ -432,12 +416,8 @@ pub fn is_implemented(name: &str) -> bool {
     find(name).is_some()
 }
 
-/// Names that are plan-blocked but have no implemented handler (defensive:
-/// `github_apply_gate` is intentionally unexposed and returns 404 by design).
-const PLAN_WRITE_EXTRA: &[&str] = &["github_apply_gate"];
-
 pub fn is_plan_write(name: &str) -> bool {
-    find(name).is_some_and(|tool| tool.plan_write) || PLAN_WRITE_EXTRA.contains(&name)
+    find(name).is_some_and(|tool| tool.plan_write)
 }
 
 pub fn is_read_blocked(name: &str) -> bool {
@@ -504,8 +484,8 @@ mod tests {
         // read-only specs; create/remove are gated at dispatch by action.
         assert!(!is_plan_write("workspace") && !is_read_blocked("workspace"));
         assert!(is_implemented("workspace"));
-        // Defensive plan blocks for names with no handler.
-        assert!(is_plan_write("github_apply_gate") && !is_implemented("github_apply_gate"));
+        // Removed tools stay removed: no handler, no guard entry.
+        assert!(!is_plan_write("github_apply_gate") && !is_implemented("github_apply_gate"));
         // Apply-patch is the mutating tool; read is non-mutating.
         assert!(is_plan_write("apply_patch") && is_read_blocked("apply_patch"));
         assert!(!is_plan_write("read") && !is_read_blocked("read"));

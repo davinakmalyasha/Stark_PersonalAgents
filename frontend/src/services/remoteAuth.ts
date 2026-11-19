@@ -3,14 +3,22 @@
 // The phone saves its pairing token once (via ?token= link or manual entry);
 // every subsequent /api request carries it automatically.
 
-const TOKEN_KEY = 'vincode.pairingToken';
+const TOKEN_KEY = 'stark.pairingToken';
+const LEGACY_TOKEN_KEY = 'vincode.pairingToken';
 
 type RejectListener = () => void;
 const rejectListeners = new Set<RejectListener>();
 
 export function getPairingToken(): string {
   try {
-    return localStorage.getItem(TOKEN_KEY) ?? '';
+    const current = localStorage.getItem(TOKEN_KEY);
+    if (current !== null) return current;
+    // One-time move from the pre-Stark key so already-paired phones stay paired.
+    const legacy = localStorage.getItem(LEGACY_TOKEN_KEY);
+    if (legacy === null) return '';
+    localStorage.setItem(TOKEN_KEY, legacy);
+    localStorage.removeItem(LEGACY_TOKEN_KEY);
+    return legacy;
   } catch {
     return '';
   }
@@ -19,12 +27,14 @@ export function getPairingToken(): string {
 export function setPairingToken(token: string): void {
   try {
     localStorage.setItem(TOKEN_KEY, token.trim());
+    localStorage.removeItem(LEGACY_TOKEN_KEY);
   } catch { /* storage unavailable — session-only usage */ }
 }
 
 export function clearPairingToken(): void {
   try {
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(LEGACY_TOKEN_KEY);
   } catch { /* ignore */ }
 }
 

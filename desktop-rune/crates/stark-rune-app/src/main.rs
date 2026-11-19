@@ -85,6 +85,7 @@ pub(crate) fn lucide_stroke(size: f32) -> f32 {
 }
 
 /// Lucide `ArrowUp` (`m5 12 7-7 7 7` + `M12 19V5`) at `size` points.
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_arrow_up(size: f32, stroke_units: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([5.0, 12.0])
@@ -103,6 +104,7 @@ pub(crate) fn lucide_arrow_up(size: f32, stroke_units: f32, color: rune::Color) 
 }
 
 /// Lucide `X` (`M18 6 6 18` + `m6 6 12 12`) at `size` points.
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_x(size: f32, stroke_units: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([18.0, 6.0])
@@ -120,6 +122,7 @@ pub(crate) fn lucide_x(size: f32, stroke_units: f32, color: rune::Color) -> rune
 }
 
 /// Lucide `Check` (`M20 6 9 17l-5-5`) at `size` points.
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_check(size: f32, stroke_units: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([20.0, 6.0])
@@ -136,6 +139,7 @@ pub(crate) fn lucide_check(size: f32, stroke_units: f32, color: rune::Color) -> 
 }
 
 /// Lucide `Square` as a filled shape (18-unit rounded rect in a 24-unit box).
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_square_filled(size: f32, color: rune::Color) -> rune::El {
     rune::el()
         .size(size * (18.0 / 24.0), size * (18.0 / 24.0))
@@ -144,6 +148,7 @@ pub(crate) fn lucide_square_filled(size: f32, color: rune::Color) -> rune::El {
 }
 
 /// Lucide `FileText` (document outline + three rule lines).
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_file_text(size: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([15.0, 2.0])
@@ -169,6 +174,7 @@ pub(crate) fn lucide_file_text(size: f32, color: rune::Color) -> rune::Shape {
 }
 
 /// Lucide `Image` (rounded frame, sun, mountain).
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_image(size: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([5.0, 3.0])
@@ -197,6 +203,7 @@ pub(crate) fn lucide_image(size: f32, color: rune::Color) -> rune::Shape {
 }
 
 /// Lucide `AudioLines` (the dock's voice glyph, reused by file chips).
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_audio_lines(size: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([2.0, 10.0])
@@ -217,6 +224,7 @@ pub(crate) fn lucide_audio_lines(size: f32, color: rune::Color) -> rune::Shape {
 }
 
 /// Lucide `Download` (tray + arrow).
+#[cfg(feature = "rune-real")]
 pub(crate) fn lucide_download(size: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([21.0, 15.0])

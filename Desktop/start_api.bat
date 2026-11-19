@@ -1,6 +1,9 @@
 @echo off
+setlocal
 title Stark - API Server (Rust)
-set "STARK_PORT=8123"
+for %%I in ("%~dp0..") do set "ROOT=%%~fI"
+set "STARK_PORT=8124"
+if not defined STARK_HARNESS_ROOT set "STARK_HARNESS_ROOT=%ROOT%"
 echo =============================================
 echo   Restarting Stark API server (port %STARK_PORT%)
 echo =============================================
@@ -11,8 +14,9 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%STARK_PORT%" ^| findstr "L
 )
 timeout /t 2 /nobreak >nul
 
-type nul > "D:\MyProject\LangChain\.deep_agents\api_out.log"
-type nul > "D:\MyProject\LangChain\.deep_agents\api_err.log"
+if not exist "%ROOT%\.deep_agents" mkdir "%ROOT%\.deep_agents"
+type nul > "%ROOT%\.deep_agents\api_out.log"
+type nul > "%ROOT%\.deep_agents\api_err.log"
 
 set "SERVER_BIN="
 if defined STARK_BACKEND_BIN (
@@ -22,7 +26,7 @@ if not defined SERVER_BIN (
   if exist "D:\cargo-target\stark\debug\stark-server.exe" set "SERVER_BIN=D:\cargo-target\stark\debug\stark-server.exe"
 )
 if not defined SERVER_BIN (
-  if exist "D:\MyProject\LangChain\backend-rs\target\debug\stark-server.exe" set "SERVER_BIN=D:\MyProject\LangChain\backend-rs\target\debug\stark-server.exe"
+  if exist "%ROOT%\backend-rs\target\debug\stark-server.exe" set "SERVER_BIN=%ROOT%\backend-rs\target\debug\stark-server.exe"
 )
 
 if not defined SERVER_BIN (
@@ -31,7 +35,7 @@ if not defined SERVER_BIN (
 )
 
 echo   Starting stark-server (logs in .deep_agents\api_out.log) ...
-start "Stark-API" cmd /c "cd /d D:\MyProject\LangChain && set STARK_PORT=%STARK_PORT% && ""%SERVER_BIN%"" >> D:\MyProject\LangChain\.deep_agents\api_out.log 2>> D:\MyProject\LangChain\.deep_agents\api_err.log"
+start "Stark-API" /D "%ROOT%" cmd /c "set STARK_PORT=%STARK_PORT% && ""%SERVER_BIN%"" >> ""%ROOT%\.deep_agents\api_out.log"" 2>> ""%ROOT%\.deep_agents\api_err.log"""
 
 echo   Done. Check http://127.0.0.1:%STARK_PORT%/api/health for engine status.
 echo   (Frontend changes: just refresh the browser / reopen the voice overlay)

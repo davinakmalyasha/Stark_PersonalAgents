@@ -33,7 +33,7 @@ pub enum VoiceMsg {
         text: String,
         is_final: bool,
     },
-    /// Non-fatal note (missing 16 kHz mode, STT build limits): reported
+    /// Non-fatal note (STT build limits, link problems): reported
     /// without stopping a live meter, unlike [`VoiceMsg::Error`].
     Note(String),
     Error(String),
@@ -271,8 +271,8 @@ pub fn probe_input() -> Option<String> {
 
 /// 16 kHz capture mode for the STT frontend: the config plus whether the
 /// mono mixdown applies (stereo fallback). Mono F32/I16/U16 first, then
-/// stereo with downmix — the first exact 16 kHz mode wins, so no resampler
-/// ships in the shell (WASAPI/CoreAudio resample in the OS).
+/// stereo with downmix. When no exact mode exists the caller falls back to
+/// the device default rate and [`LinearResampler`] converts to 16 kHz.
 #[cfg(not(target_arch = "wasm32"))]
 fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, bool)> {
     let mut best: Option<(u8, cpal::SupportedStreamConfig, bool)> = None;

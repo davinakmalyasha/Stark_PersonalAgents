@@ -231,6 +231,20 @@ collapsing-margin rules, verified against CDP rects + pixel probes):
   GNU `--features voice-stt` compiles to the honest meter-only stub instead
   of failing in `bindgen`/MSVC link. On-device transcription still needs an
   MSVC host; models are reused in place from `D:\Stark\resources\models`.
+- Dictation prefers the **backend bridge** (`voice_ws.rs`), restoring the
+  pre-rewrite split (`7b5810b`: client PCM, server VAD/STT, turn commit):
+  captured 16 kHz mono frames stream as `i16` LE over `/api/voice/ws`, and
+  the server's `transcript` / `turn_final` events map onto
+  `VoiceMsg::Transcript` — the same overlay/live-bubble/draft path with no
+  speech model (and no MSVC prebuilt) in the app. Verified against a real
+  tungstenite server: handshake, one 160-sample frame = 320 bytes, interim
+  then final text. A refused/unreachable server falls back to the on-device
+  producer (MSVC builds), then to meter-only with an honest note; a GNU
+  server answers `session.error`, which surfaces as a note while the meter
+  keeps running. Capture no longer requires a device 16 kHz mode: an exact
+  mode is preferred, otherwise the stream is linearly resampled to 16 kHz
+  with phase continuity across blocks (this box's mic is 48 kHz-only, as is
+  WASAPI shared mode generally), so dictation works on stock Windows audio.
 - Artifact review is viewport-aware like the lightbox: the card caps at
   `min(860px, vw-48)` / `min(760px, vh-48)` (React's modal caps) with the
   scroll body taking the remainder. Still a centered modal over the

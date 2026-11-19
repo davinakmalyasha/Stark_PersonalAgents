@@ -1,6 +1,9 @@
-//! Mic capture + level metering behind the voice toggle. When the `stt`
-//! producer is up (16 kHz mono mode + Moonshine model), the same thread
-//! forwards PCM into it and dictation arrives as [`VoiceMsg::Transcript`].
+//! Mic capture + level metering behind the voice toggle. Dictation prefers
+//! the backend bridge ([`crate::voice_ws`]): captured 16 kHz mono PCM is
+//! streamed to `stark-server`, whose VAD/STT answers with
+//! [`VoiceMsg::Transcript`]. When no server is reachable the on-device
+//! producer (`stt`, MSVC builds) takes over, else capture degrades to
+//! meter-only levels with an honest note.
 //!
 //! Native: cpal default input streams RMS blocks into an `mpsc` channel the
 //! poll hook drains into `voice_level`. Web: `getUserMedia` binds later —
@@ -134,11 +137,26 @@ impl VoiceBus {
             self.stop = Some(stop);
             self.rx = Some(rx);
             self.live = true;
-            // Dictation runs on its own worker fed with 16 kHz mono frames.
-            // Anything missing (MSVC-only runtime, model dir, 16 kHz mode)
-            // degrades to meter-only levels with an honest note.
+            // Dictation prefers the backend bridge: the app streams PCM to
+            // `stark-server` (`/api/voice/ws`), which owns VAD/STT — the
+            // pre-rewrite split, and the only path that needs no speech model
+            // in the app. Without a reachable server it falls back to the
+            // on-device model (MSVC builds only), then to meter-only levels
+            // with an honest note.
             let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel(crate::stt::MAX_AUDIO_QUEUE);
-            match crate::stt::spawn_producer(pcm_rx, tx.clone(), flag.clone()) {
+            let host = crate::rune_transcript::DEFAULT_API_HOST;
+            let port = crate::rune_transcript::api_port();
+            let started = match crate::voice_ws::try_open(host, port) {
+                Ok(socket) => crate::voice_ws::spawn_with(socket, pcm_rx, tx.clone(), flag.clone())
+                    .map_err(Some),
+                Err(server) => match crate::stt::spawn_producer(pcm_rx, tx.clone(), flag.clone()) {
+                    Ok(()) => Ok(()),
+                    Err(local) => Err(Some(format!(
+                        "dictation unavailable — server: {server}; local: {local}"
+                    ))),
+                },
+            };
+            match started {
                 Ok(()) => {
                     self.note = None;
                     std::thread::spawn(move || {
@@ -146,7 +164,7 @@ impl VoiceBus {
                     });
                 }
                 Err(note) => {
-                    self.note = Some(note);
+                    self.note = note;
                     std::thread::spawn(move || capture_loop(flag, tx, None));
                 }
             }
@@ -294,12 +312,114 @@ fn prefer_16k(device: &cpal::Device) -> Option<(cpal::SupportedStreamConfig, boo
     best.map(|(_, config, stereo)| (config, stereo))
 }
 
-/// Capture loop: streams [`VoiceMsg::Level`] until `stop` flips, then exits.
-/// When `pcm` is `Some`, the stream runs at 16 kHz mono and every block is
-/// also forwarded to the STT worker (dropped on overflow, like the backend).
-/// Owns the cpal `Stream` (dropping it stops the device). Never panics: all
-/// failures arrive as [`VoiceMsg::Error`], a missing 16 kHz mode as
-/// [`VoiceMsg::Note`] with meter-only levels continuing.
+/// Streaming linear resampler: WASAPI shared mode usually exposes only
+/// 48 kHz while the STT frontend expects 16 kHz. Linear interpolation keeps
+/// phase continuity across capture blocks (fractional position + the last
+/// sample of the previous block), so block boundaries never click.
+#[cfg(not(target_arch = "wasm32"))]
+struct LinearResampler {
+    /// Input samples per output sample (`from / to`).
+    step: f64,
+    /// Next output position inside the current block, in input samples.
+    pos: f64,
+    /// Last input sample of the previous block (interpolation carry).
+    prev: f32,
+    primed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LinearResampler {
+    fn new(from: u32, to: u32) -> Self {
+        Self {
+            step: from as f64 / to as f64,
+            pos: 0.0,
+            prev: 0.0,
+            primed: false,
+        }
+    }
+
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let n = input.len();
+        if n == 0 {
+            return;
+        }
+        let mut pos = self.pos;
+        while pos < n as f64 {
+            let index = pos.floor() as isize;
+            let frac = (pos - index as f64) as f32;
+            // An interpolating partner lives in the next block, except when
+            // the position lands exactly on the last sample (nothing to
+            // interpolate): keep the fractional position for the next call
+            // so the join is seamless.
+            if frac > 0.0 && index + 1 >= n as isize {
+                break;
+            }
+            let a = if index < 0 {
+                if self.primed {
+                    self.prev
+                } else {
+                    input[0]
+                }
+            } else {
+                input[index as usize]
+            };
+            let b = if index + 1 < n as isize {
+                input[(index + 1) as usize]
+            } else {
+                a
+            };
+            out.push(a + (b - a) * frac);
+            pos += self.step;
+        }
+        self.pos = pos - n as f64;
+        self.prev = input[n - 1];
+        self.primed = true;
+    }
+}
+
+/// One capture block on its way to the STT worker: pass-through when the
+/// device already runs at 16 kHz, resampled otherwise.
+#[cfg(not(target_arch = "wasm32"))]
+struct PcmForward {
+    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    resampler: Option<LinearResampler>,
+    out: Vec<f32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PcmForward {
+    fn new(tx: std::sync::mpsc::SyncSender<Vec<f32>>, rate: u32) -> Self {
+        Self {
+            tx,
+            resampler: (rate != crate::stt::SAMPLE_RATE)
+                .then(|| LinearResampler::new(rate, crate::stt::SAMPLE_RATE)),
+            out: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, mono: Vec<f32>) {
+        match self.resampler.as_mut() {
+            Some(resampler) => {
+                self.out.clear();
+                resampler.process(&mono, &mut self.out);
+                if !self.out.is_empty() {
+                    let out = std::mem::take(&mut self.out);
+                    let _ = self.tx.try_send(out);
+                }
+            }
+            None => {
+                let _ = self.tx.try_send(mono);
+            }
+        }
+    }
+}
+
+/// When `pcm` is `Some`, every block is downmixed to mono and forwarded to
+/// the STT worker at 16 kHz (dropped on overflow, like the backend): an
+/// exact 16 kHz device mode is used when offered, otherwise the captured
+/// rate is resampled ([`LinearResampler`]) — WASAPI shared mode usually
+/// exposes only 48 kHz. Owns the cpal `Stream` (dropping it stops the
+/// device). Never panics: failures arrive as [`VoiceMsg::Error`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn capture_loop(
     stop: Arc<AtomicBool>,
@@ -318,8 +438,10 @@ pub fn capture_loop(
         return;
     };
     // 16 kHz mono is the STT frontend's native rate: prefer an exact mode so
-    // no resampler ships in the shell. Anything else degrades to meter-only.
-    let mut forward = pcm;
+    // the common case ships no resampling. Any other rate still works — the
+    // bridge resamples rather than disabling dictation (48 kHz-only mics are
+    // the norm on Windows shared mode).
+    let forward = pcm;
     let mut stereo = false;
     let config = if forward.is_none() {
         match device.default_input_config() {
@@ -335,24 +457,23 @@ pub fn capture_loop(
                 stereo = downmix;
                 picked
             }
-            None => {
-                let _ = tx.send(VoiceMsg::Note(
-                    "mic has no 16 kHz mode; on-device dictation is off".to_string(),
-                ));
-                forward = None;
-                match device.default_input_config() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        fail(&tx, format!("mic config: {e}"));
-                        return;
-                    }
+            None => match device.default_input_config() {
+                Ok(c) => {
+                    stereo = c.channels() >= 2;
+                    c
                 }
-            }
+                Err(e) => {
+                    fail(&tx, format!("mic config: {e}"));
+                    return;
+                }
+            },
         }
     };
+    let rate = config.sample_rate();
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
-            let (dtx, etx, ptx) = (emit(&tx), emit(&tx), forward);
+            let (dtx, etx) = (emit(&tx), emit(&tx));
+            let mut ptx = forward.map(|tx| PcmForward::new(tx, rate));
             device.build_input_stream(
                 config.into(),
                 move |data: &[f32], _| {
@@ -362,8 +483,8 @@ pub fn capture_loop(
                         data.to_vec()
                     };
                     let _ = dtx.send(VoiceMsg::Level(rms_f32(&mono)));
-                    if let Some(tx) = ptx.as_ref() {
-                        let _ = tx.try_send(mono);
+                    if let Some(fwd) = ptx.as_mut() {
+                        fwd.push(mono);
                     }
                 },
                 move |e| {
@@ -373,7 +494,8 @@ pub fn capture_loop(
             )
         }
         cpal::SampleFormat::I16 => {
-            let (dtx, etx, ptx) = (emit(&tx), emit(&tx), forward);
+            let (dtx, etx) = (emit(&tx), emit(&tx));
+            let mut ptx = forward.map(|tx| PcmForward::new(tx, rate));
             device.build_input_stream(
                 config.into(),
                 move |data: &[i16], _| {
@@ -391,8 +513,8 @@ pub fn capture_loop(
                             .collect::<Vec<_>>()
                     };
                     let _ = dtx.send(VoiceMsg::Level(rms_f32(&mono)));
-                    if let Some(tx) = ptx.as_ref() {
-                        let _ = tx.try_send(mono);
+                    if let Some(fwd) = ptx.as_mut() {
+                        fwd.push(mono);
                     }
                 },
                 move |e| {
@@ -402,7 +524,8 @@ pub fn capture_loop(
             )
         }
         cpal::SampleFormat::U16 => {
-            let (dtx, etx, ptx) = (emit(&tx), emit(&tx), forward);
+            let (dtx, etx) = (emit(&tx), emit(&tx));
+            let mut ptx = forward.map(|tx| PcmForward::new(tx, rate));
             device.build_input_stream(
                 config.into(),
                 move |data: &[u16], _| {
@@ -420,8 +543,8 @@ pub fn capture_loop(
                             .collect::<Vec<_>>()
                     };
                     let _ = dtx.send(VoiceMsg::Level(rms_f32(&mono)));
-                    if let Some(tx) = ptx.as_ref() {
-                        let _ = tx.try_send(mono);
+                    if let Some(fwd) = ptx.as_mut() {
+                        fwd.push(mono);
                     }
                 },
                 move |e| {
@@ -480,6 +603,52 @@ mod tests {
         assert_eq!(lit_bars(2.0), 5);
     }
 
+    /// WASAPI shared mode is usually 48 kHz-only; decimation must keep the
+    /// 3:1 phase across capture blocks (no duplicate or skipped sample).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resampler_downsamples_48k_to_16k_across_blocks() {
+        let mut resampler = LinearResampler::new(48_000, 16_000);
+        let mut out = Vec::new();
+        resampler.process(&[0.0, 3.0, 6.0], &mut out);
+        assert_eq!(out, vec![0.0]);
+        out.clear();
+        resampler.process(&[9.0, 12.0, 15.0], &mut out);
+        assert_eq!(out, vec![9.0], "next decimated sample keeps the 3:1 phase");
+    }
+
+    /// Upsampling interpolates across the block boundary instead of
+    /// repeating or dropping the join sample.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resampler_upsamples_8k_to_16k_continuously() {
+        let mut resampler = LinearResampler::new(8_000, 16_000);
+        let mut out = Vec::new();
+        resampler.process(&[0.0, 2.0], &mut out);
+        assert_eq!(out, vec![0.0, 1.0, 2.0]);
+        out.clear();
+        resampler.process(&[4.0, 6.0], &mut out);
+        assert_eq!(
+            out,
+            vec![3.0, 4.0, 5.0, 6.0],
+            "carry interpolates 2..4 across the boundary"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn forward_passes_16k_through_and_resamples_48k() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let mut direct = PcmForward::new(tx, 16_000);
+        direct.push(vec![0.5, 0.5]);
+        assert_eq!(rx.try_recv().expect("passthrough"), vec![0.5, 0.5]);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let mut resampled = PcmForward::new(tx, 48_000);
+        resampled.push(vec![0.0, 0.3, 0.6]);
+        assert_eq!(rx.try_recv().expect("resampled").len(), 1);
+    }
+
     #[test]
     fn note_reports_without_killing_live() {
         let mut bus = VoiceBus::default();
@@ -487,10 +656,15 @@ mod tests {
         bus.rx = Some(rx);
         bus.live = true;
         bus.level = 0.4;
-        tx.send(VoiceMsg::Note("mic has no 16 kHz mode".to_string()))
-            .expect("send note");
+        tx.send(VoiceMsg::Note(
+            "dictation: Moonshine STT is not available in this build".to_string(),
+        ))
+        .expect("send note");
         assert!(bus.drain(1.0 / 60.0));
-        assert_eq!(bus.note.as_deref(), Some("mic has no 16 kHz mode"));
+        assert_eq!(
+            bus.note.as_deref(),
+            Some("dictation: Moonshine STT is not available in this build")
+        );
         assert!(bus.live, "advisory only");
         assert!(bus.level > 0.0, "meter keeps running");
     }

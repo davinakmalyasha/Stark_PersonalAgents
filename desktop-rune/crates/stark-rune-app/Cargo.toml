@@ -19,6 +19,9 @@ serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.18"
+# Backend-assisted dictation: stream captured PCM to `stark-server`'s
+# `/api/voice/ws` (the pre-rewrite split). Pure Rust, works on GNU + MSVC.
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.129"

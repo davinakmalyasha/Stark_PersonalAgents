@@ -69,6 +69,8 @@ mod tool_labels;
 mod transport;
 #[cfg(feature = "rune-real")]
 mod voice;
+#[cfg(feature = "rune-real")]
+mod voice_ws;
 
 // ---------------------------------------------------------------------------
 // Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)

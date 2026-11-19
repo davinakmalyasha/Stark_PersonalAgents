@@ -71,6 +71,9 @@ pub mod transport;
 #[cfg(feature = "rune-real")]
 #[path = "voice.rs"]
 pub mod voice;
+#[cfg(feature = "rune-real")]
+#[path = "voice_ws.rs"]
+pub mod voice_ws;
 
 /// Lucide draws its 2-unit stroke at a 24-unit viewBox and scales it with the
 /// icon. Rune's `view_box` leaves stroke widths in points, so callers pass the

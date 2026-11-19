@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use rquickjs::{Context, Function, Runtime};
 use serde_json::{Value, json};
 
-use crate::{ToolContext, ToolOutcome};
+use crate::{ToolContext, ToolErrorClass, ToolOutcome};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -205,13 +205,21 @@ fn error_envelope(message: String) -> String {
 pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let code = match args.get("code").and_then(Value::as_str) {
         Some(code) if !code.trim().is_empty() => code.to_string(),
-        _ => return ToolOutcome::err("Error: run_code requires a non-empty 'code' string"),
+        _ => {
+            return ToolOutcome::err_class(
+                ToolErrorClass::Args,
+                "Error: run_code requires a non-empty 'code' string",
+            );
+        }
     };
     if code.len() > MAX_CODE_BYTES {
-        return ToolOutcome::err(format!(
-            "Error: code is too large ({} bytes, max {MAX_CODE_BYTES})",
-            code.len()
-        ));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            format!(
+                "Error: code is too large ({} bytes, max {MAX_CODE_BYTES})",
+                code.len()
+            ),
+        );
     }
     let timeout_ms = args
         .get("timeout_ms")
@@ -272,11 +280,17 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
     let logs = log_bridge.logs();
     let raw = match result {
         Ok(Ok(raw)) => raw,
-        Ok(Err(error)) => return ToolOutcome::err(format!("[CODE MODE ERROR]\n{error}")),
+        Ok(Err(error)) => {
+            return ToolOutcome::err_class(
+                ToolErrorClass::Args,
+                format!("[CODE MODE ERROR]\n{error}"),
+            );
+        }
         Err(error) => {
-            return ToolOutcome::err(format!(
-                "[CODE MODE ERROR]\ncode mode worker failed: {error}"
-            ));
+            return ToolOutcome::err_class(
+                ToolErrorClass::Tool,
+                format!("[CODE MODE ERROR]\ncode mode worker failed: {error}"),
+            );
         }
     };
 
@@ -288,7 +302,10 @@ pub async fn handle(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         } else {
             format!("{error}\n{stack}")
         };
-        return ToolOutcome::err(format!("[CODE MODE ERROR]\n{message}"));
+        return ToolOutcome::err_class(
+            ToolErrorClass::Args,
+            format!("[CODE MODE ERROR]\n{message}"),
+        );
     }
 
     let mut content = String::from("[CODE MODE RESULT]\n");

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::paths::resolve_workspace_path;
 use crate::processes::ProcessStatus;
-use crate::{ToolContext, ToolOutcome};
+use crate::{ToolContext, ToolErrorClass, ToolOutcome};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -216,6 +216,9 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             workdir.display()
         ));
     }
+    if ctx.cancel.is_cancelled() {
+        return crate::cancelled_outcome("bash");
+    }
     if args
         .get("run_in_background")
         .and_then(Value::as_bool)
@@ -253,7 +256,20 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
         Err(error) => return ToolOutcome::err(format!("Error: {error}")),
     };
     let job = spawned.id.to_string();
-    let (status, output) = match ctx.processes.wait_status(&job, timeout_ms).await {
+    // Dropping `wait_status` does not stop the child. On cancel, kill the
+    // foreground job explicitly (Codex kills the whole process group on
+    // cancellation, `core/src/exec.rs`) and report a cancelled result.
+    let waited = tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => None,
+        result = ctx.processes.wait_status(&job, timeout_ms) => Some(result),
+    };
+    let Some(waited) = waited else {
+        let _ = ctx.processes.kill(&job);
+        ctx.processes.remove(&job);
+        return crate::cancelled_outcome("bash");
+    };
+    let (status, output) = match waited {
         Ok(value) => value,
         Err(error) => {
             ctx.processes.remove(&job);
@@ -268,15 +284,16 @@ pub async fn bash(ctx: &ToolContext, args: &Value) -> ToolOutcome {
             if code == 0 {
                 ToolOutcome::ok(format!("{text}\n[exit code: 0]"))
             } else {
-                ToolOutcome::err(format!("{text}\n[exit code: {code}]"))
+                ToolOutcome::with_code(format!("{text}\n[exit code: {code}]"), true, Some(code))
+                    .with_class(ToolErrorClass::Exec)
             }
         }
         ProcessStatus::Killed => {
             ctx.processes.remove(&job);
-            ToolOutcome::err(format!(
-                "[killed]\n{}",
-                with_spill(ctx, &output, output_limit)
-            ))
+            ToolOutcome::err_class(
+                ToolErrorClass::Exec,
+                format!("[killed]\n{}", with_spill(ctx, &output, output_limit)),
+            )
         }
         ProcessStatus::Running => ToolOutcome::ok(
             json!({
@@ -323,7 +340,14 @@ pub async fn job(ctx: &ToolContext, args: &Value) -> ToolOutcome {
                     .and_then(Value::as_u64)
                     .unwrap_or(30_000)
                     .min(3_600_000);
-                let _ = ctx.processes.wait_status(job_id, timeout).await;
+                let cancelled = tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => true,
+                    _ = ctx.processes.wait_status(job_id, timeout) => false,
+                };
+                if cancelled {
+                    return crate::cancelled_outcome("job output");
+                }
             }
             match ctx.processes.read_output(job_id) {
                 Ok(text) => ToolOutcome::ok(text),
@@ -449,5 +473,80 @@ mod tests {
         let missing = job(&ctx, &json!({"action": "kill"})).await;
         assert!(missing.is_error);
         assert!(missing.content.contains("job_id"));
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_kills_the_foreground_job() {
+        use tokio_util::sync::CancellationToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = context(dir.path()).with_cancel(cancel.clone());
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bash(
+                &ctx,
+                &json!({"description": "Sleep until cancelled", "command": "sleep 30"}),
+            )
+            .await
+        });
+        // Let the child spawn, then stop the run. Codex returns a
+        // non-timeout exec result promptly on cancellation.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled bash must return promptly")
+            .expect("bash task");
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert_eq!(outcome.class, Some(ToolErrorClass::Cancelled));
+        assert!(outcome.content.contains("cancelled"), "{}", outcome.content);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn job_output_wait_is_cancel_safe() {
+        use tokio_util::sync::CancellationToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = context(dir.path()).with_cancel(cancel.clone());
+        let started = bash(
+            &ctx,
+            &json!({
+                "description": "Sleep in the background",
+                "command": "sleep 30",
+                "run_in_background": true
+            }),
+        )
+        .await;
+        assert!(!started.is_error, "{}", started.content);
+        let value: Value = serde_json::from_str(&started.content).unwrap();
+        let job_id = value["jobId"].as_str().unwrap().to_string();
+        let waiting = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                job(
+                    &ctx,
+                    &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 30_000}),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("cancelled wait must return promptly")
+            .expect("wait task");
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert_eq!(outcome.class, Some(ToolErrorClass::Cancelled));
+        // The wait was cancelled, not the job: clean up the sleeper so the
+        // test does not leave a 30s child behind.
+        let _ = ctx.processes.kill_all();
     }
 }

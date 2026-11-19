@@ -24,15 +24,23 @@ anyhow = "1"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
 dashmap = "6"
 dotenvy = "0.15"
 eventsource-stream = "0.2.3"
 futures-util = "0.3"
 globset = "0.4"
-ignore = "0.4"
+http = "1"
+httpdate = "1"
+ignore = "=0.4.30"
+notify = "8"
+nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
 regex = "1"
-rquickjs = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "rustls", "http2", "stream"] }
+rmcp = { version = "3.10", default-features = false, features = ["client", "macros", "transport-child-process", "transport-streamable-http-client-reqwest", "auth"] }
+rquickjs = "0.14"
 schemars = "0.8.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

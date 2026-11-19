@@ -6,18 +6,26 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
 shlex = "1.3"
 stark-sandbox = { path = "../stark-sandbox" }
 rquickjs.workspace = true
 base64 = "0.22"
 chrono.workspace = true
+crossbeam-channel.workspace = true
 dashmap.workspace = true
 globset.workspace = true
+http.workspace = true
 ignore.workspace = true
+notify.workspace = true
+nucleo.workspace = true
 pdf-extract = "0.12"
 portable-pty = "0.9"
 regex.workspace = true
 reqwest.workspace = true
+reqwest013.workspace = true
+rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,9 +34,11 @@ stark-policy = { path = "../stark-policy" }
 stark-store = { path = "../stark-store" }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+pretty_assertions = "1.4.1"
 tempfile = "3"

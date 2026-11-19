@@ -47,8 +47,6 @@ export const TOOL_VERBS: Record<string, string> = {
   tool_search: 'Searched tools',
   update_plan: 'Updated plan',
   wait_agent: 'Waited for agent',
-  web_fetch: 'Fetched',
-  web_search: 'Searched web',
   workspace: 'Managed workspace',
 };
 export const TOOL_SUMMARIES: Record<string, string> = {
@@ -98,7 +96,5 @@ export const TOOL_SUMMARIES: Record<string, string> = {
   tool_search: 'searched tools',
   update_plan: 'updated the plan',
   wait_agent: 'waited for an agent',
-  web_fetch: 'fetched pages',
-  web_search: 'searched the web',
   workspace: 'managed workspaces',
 };

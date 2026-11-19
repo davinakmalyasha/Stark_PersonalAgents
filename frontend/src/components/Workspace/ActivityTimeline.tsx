@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Copy, FileText, Loader2, Search, Terminal, Wrench, X } from 'lucide-react';
+import { Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Copy, FileText, Globe, Loader2, Search, Terminal, Wrench, X } from 'lucide-react';
 import { delegationTarget, isDelegationToolName, type TraceStep } from '../../utils/logParser';
 import { buildEntries, resolveDelegations, type ToolGroupEntry } from '../../utils/delegationMatch';
 import { TOOL_SUMMARIES, TOOL_VERBS } from '../../utils/toolLabels.generated';
@@ -65,13 +65,22 @@ const LEGACY_SUMMARIES: Record<string, string> = {
   working_directory: 'changed directory',
 };
 
+// MCP servers are dynamic (never in the generated labels), so each server
+// gets one prefix rule here instead of a generated entry per tool.
+function displayToolName(name: string): string {
+  if (name.startsWith('mcp__browse__')) return 'Browse';
+  return name;
+}
+
 function toolLabel(event: LiveToolEvent): { verb: string; subject: string } {
   const subject = primaryArg(event.args);
+  if (event.name.startsWith('mcp__browse__')) return { verb: 'Browsed', subject };
   const verb = TOOL_VERBS[event.name] || LEGACY_VERBS[event.name] || event.name;
   return { verb, subject };
 }
 
 function toolSummaryPart(event: LiveToolEvent): string {
+  if (event.name.startsWith('mcp__browse__')) return 'browsed the web';
   return TOOL_SUMMARIES[event.name] || LEGACY_SUMMARIES[event.name] || 'used tools';
 }
 
@@ -83,7 +92,8 @@ function toolGroupTitle(events: LiveToolEvent[]): string {
 
 function ToolIcon({ name }: { name: string }) {
   if (name === 'bash' || name === 'run_command' || name === 'job') return <Terminal size={13} />;
-  if (name === 'grep' || name === 'glob' || name === 'search_code' || name === 'web_search') return <Search size={13} />;
+  if (name === 'grep' || name === 'glob' || name === 'search_code') return <Search size={13} />;
+  if (name.startsWith('mcp__browse__')) return <Globe size={13} />;
   if (name === 'read' || name === 'read_image' || name === 'read_file' || name === 'write' || name === 'write_file' || name === 'edit' || name === 'edit_file' || name === 'list_files') return <FileText size={13} />;
   return <Wrench size={13} />;
 }
@@ -317,7 +327,7 @@ function ToolPanel({ event }: { event: LiveToolEvent }) {
   return (
     <div className="activity-tool-panel">
       <div className="activity-tool-panel-head">
-        <span className="activity-tool-panel-name">{event.name}</span>
+        <span className="activity-tool-panel-name">{displayToolName(event.name)}</span>
         <span className={`activity-tool-panel-status ${event.ok === false ? 'is-error' : ''}`}>
           {running ? 'Running' : event.ok === false ? 'Failed' : 'Completed'}
         </span>

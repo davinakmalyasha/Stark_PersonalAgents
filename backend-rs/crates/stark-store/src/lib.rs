@@ -125,6 +125,53 @@ pub struct ChatStore {
     jobs: JobStore,
 }
 
+/// True when `path` is a structurally sound SQLite database. A crashed
+/// `VACUUM INTO` can leave a file with a valid header but missing pages;
+/// `PRAGMA quick_check(1)` catches that before the snapshot is trusted.
+async fn sqlite_snapshot_is_intact(path: &Path) -> bool {
+    use sqlx::Connection;
+
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false);
+    let Ok(mut connection) = sqlx::SqliteConnection::connect_with(&options).await else {
+        return false;
+    };
+    let result: Result<String, _> = sqlx::query_scalar("PRAGMA quick_check(1)")
+        .fetch_one(&mut connection)
+        .await;
+    let _ = connection.close().await;
+    result.is_ok_and(|value| value.eq_ignore_ascii_case("ok"))
+}
+
+/// Keep the newest 7 `chats-YYYYMMDD.db` snapshots. Runs after a fresh backup
+/// and after a same-day skip, so a long-lived install never accumulates.
+async fn prune_backups(dir: &Path) -> Result<(), StoreError> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    let mut snaps: Vec<PathBuf> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("chats-") && name.ends_with(".db"))
+        {
+            snaps.push(path);
+        }
+    }
+    snaps.sort();
+    while snaps.len() > 7 {
+        if let Some(oldest) = snaps.first().cloned() {
+            let _ = tokio::fs::remove_file(&oldest).await;
+            snaps.remove(0);
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl ChatStore {
     pub async fn open(harness_root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let harness_root = harness_root.into();
@@ -423,8 +470,15 @@ impl ChatStore {
         tokio::fs::create_dir_all(&dir).await?;
         let date = chrono::Utc::now().format("%Y%m%d").to_string();
         let dest = dir.join(format!("chats-{date}.db"));
-        // VACUUM INTO fails if the destination exists; remove yesterday's
-        // partial file first so the backup is always fresh.
+        // A restart must not delete and re-VACUUM a good snapshot from
+        // earlier today. `quick_check` validates structure, so a truncated
+        // file with a valid header is replaced instead of trusted.
+        if sqlite_snapshot_is_intact(&dest).await {
+            prune_backups(&dir).await?;
+            return Ok(dest);
+        }
+        // VACUUM INTO fails if the destination exists; remove a partial file
+        // first so the backup is always complete.
         let _ = tokio::fs::remove_file(&dest).await;
         let dest_text = dest.to_string_lossy().replace('\'', "''");
         // The path is generated, not user input (date-stamped filename under
@@ -434,28 +488,7 @@ impl ChatStore {
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(&self.pool)
             .await?;
-        // Prune to the newest 7 snapshots.
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        let mut snaps: Vec<PathBuf> = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("chats-") && name.ends_with(".db"))
-            {
-                snaps.push(path);
-            }
-        }
-        snaps.sort();
-        while snaps.len() > 7 {
-            if let Some(oldest) = snaps.first().cloned() {
-                let _ = tokio::fs::remove_file(&oldest).await;
-                snaps.remove(0);
-            } else {
-                break;
-            }
-        }
+        prune_backups(&dir).await?;
         Ok(dest)
     }
 
@@ -2376,5 +2409,40 @@ mod tests {
         let info = store.rollout_info("chat-roll").await.unwrap().unwrap();
         assert_eq!(info["last_ordinal"], 7);
         assert!(info["path"].as_str().unwrap().contains("chat-roll.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn backup_database_is_idempotent_for_the_same_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChatStore::open(dir.path()).await.unwrap();
+        let workspace = dir.path().to_string_lossy().to_string();
+        let chat = store
+            .create_chat("_general", &workspace, "Backup", "model")
+            .await
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap().to_string();
+        store
+            .append_message(&chat_id, "user", "hello", false)
+            .await
+            .unwrap();
+        let first = store.backup_database().await.unwrap();
+        let before = tokio::fs::read(&first).await.unwrap();
+        assert!(!before.is_empty());
+        // A restart restarts this loop; it must not delete and re-VACUUM a
+        // good snapshot from earlier today.
+        let second = store.backup_database().await.unwrap();
+        assert_eq!(first, second);
+        let after = tokio::fs::read(&second).await.unwrap();
+        assert_eq!(before, after);
+
+        // A valid header does not make a complete database: truncating the
+        // snapshot must cause a fresh backup instead of trusting it.
+        let mut truncated = after.clone();
+        truncated.truncate(32);
+        tokio::fs::write(&second, &truncated).await.unwrap();
+        let repaired = store.backup_database().await.unwrap();
+        assert_eq!(second, repaired);
+        let repaired_bytes = tokio::fs::read(&repaired).await.unwrap();
+        assert!(repaired_bytes.len() > 32);
     }
 }

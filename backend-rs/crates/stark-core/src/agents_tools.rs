@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use stark_store::{AgentRecord, AgentStore};
 use stark_tools::ToolOutcome;
+use tokio_util::sync::CancellationToken;
 
 use crate::{RunContext, agent_for_scope};
 
@@ -330,14 +331,19 @@ async fn spawn(ctx: &RunContext, store: &AgentStore, args: &Value) -> Result<Str
         return Err("worktree isolation required but unavailable for this workspace".to_string());
     }
     if wait_seconds > 0 {
-        let detail = wait_for(store, &fresh.id, wait_seconds).await?;
+        let detail = wait_for(store, &fresh.id, wait_seconds, &ctx.cancel).await?;
         text.push('\n');
         text.push_str(&detail);
     }
     Ok(text)
 }
 
-pub(crate) async fn wait_for(store: &AgentStore, id: &str, seconds: u64) -> Result<String, String> {
+pub(crate) async fn wait_for(
+    store: &AgentStore,
+    id: &str,
+    seconds: u64,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let Some(agent) = store.get(id).await.map_err(|error| error.to_string())? else {
@@ -350,7 +356,11 @@ pub(crate) async fn wait_for(store: &AgentStore, id: &str, seconds: u64) -> Resu
         {
             return Ok(format_agent(&agent));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("cancelled by the user".to_string()),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     }
 }
 
@@ -798,7 +808,7 @@ pub async fn handle(ctx: &RunContext, args: &Value) -> ToolOutcome {
                         Err(error) => Err(error.to_string()),
                     }
                 } else {
-                    wait_for(&store, id, wait).await
+                    wait_for(&store, id, wait, &ctx.cancel).await
                 }
             }
         }

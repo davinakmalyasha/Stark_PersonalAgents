@@ -189,12 +189,15 @@ pub fn should_compact_with(
 
 pub fn message_to_entry(message: &ChatMessage) -> Value {
     if message.role == "tool" {
-        return json!({
-            "type": "message",
-            "role": "toolResult",
-            "tool_call_id": message.tool_call_id,
-            "content": message.content.clone().unwrap_or_default(),
-        });
+        return attach_images(
+            json!({
+                "type": "message",
+                "role": "toolResult",
+                "tool_call_id": message.tool_call_id,
+                "content": message.content.clone().unwrap_or_default(),
+            }),
+            message,
+        );
     }
     if message.role == "assistant"
         && let Some(calls) = &message.tool_calls
@@ -213,17 +216,140 @@ pub fn message_to_entry(message: &ChatMessage) -> Value {
                 "arguments": arguments,
             }));
         }
-        return json!({
-            "type": "message",
-            "role": "assistant",
-            "content": blocks,
-        });
+        return attach_images(
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": blocks,
+            }),
+            message,
+        );
     }
-    json!({
-        "type": "message",
-        "role": message.role,
-        "content": message.content.clone().unwrap_or_default(),
-    })
+    attach_images(
+        json!({
+            "type": "message",
+            "role": message.role,
+            "content": message.content.clone().unwrap_or_default(),
+        }),
+        message,
+    )
+}
+
+/// Images ride on the entry beside the text so a retained tail survives
+/// compaction with its visuals intact (Codex parity: image budget). Entries
+/// without images are unchanged, keeping old readers compatible.
+fn attach_images(mut entry: Value, message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return entry;
+    }
+    if let Some(object) = entry.as_object_mut() {
+        object.insert(
+            "images".to_string(),
+            Value::Array(
+                message
+                    .images
+                    .iter()
+                    .map(|image| json!({"url": image.url, "note": image.note}))
+                    .collect(),
+            ),
+        );
+    }
+    entry
+}
+
+/// Cap on the retained tail so one compaction cannot blow the next window.
+/// Newest entries win; pairs are never split: a kept output pulls its call
+/// (plus the adjacent outputs of that call) back in.
+const MAX_RETAINED_TAIL_CHARS: usize = 60_000;
+
+fn cap_retained_tail(entries: Vec<Value>) -> Vec<Value> {
+    if entries.is_empty() {
+        return entries;
+    }
+    let sizes: Vec<usize> = entries
+        .iter()
+        .map(|entry| entry.to_string().len())
+        .collect();
+    let mut keep = vec![false; entries.len()];
+    let mut used = 0usize;
+    // Newest entry is always kept: an empty tail would discard the turn the
+    // model needs to continue.
+    for index in (0..entries.len()).rev() {
+        if used + sizes[index] > MAX_RETAINED_TAIL_CHARS && used > 0 {
+            break;
+        }
+        keep[index] = true;
+        used += sizes[index];
+    }
+    // Pair completion: a kept output without its call pulls the call (and
+    // the call's adjacent outputs) back in. Call entries are small; the
+    // budget is a soft cap here.
+    let mut call_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        for (id, _) in tool_calls_in(entry) {
+            call_index.entry(id).or_insert(index);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for index in 0..entries.len() {
+            if !keep[index] || entry_role(&entries[index]) != "toolResult" {
+                continue;
+            }
+            let Some(call_id) = entries[index].get("tool_call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(&defining) = call_index.get(call_id) else {
+                continue;
+            };
+            if keep[defining] {
+                continue;
+            }
+            keep[defining] = true;
+            changed = true;
+            // The call's other outputs sit right behind it; keep them too
+            // so the group replays whole.
+            let mut next = defining + 1;
+            while next < entries.len() && entry_role(&entries[next]) == "toolResult" {
+                keep[next] = true;
+                next += 1;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| keep[index].then_some(entry))
+        .collect()
+}
+
+fn entry_role(entry: &Value) -> &str {
+    entry.get("role").and_then(Value::as_str).unwrap_or("")
+}
+
+/// `(call_id, name)` pairs defined by an assistant entry.
+fn tool_calls_in(entry: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if entry_role(entry) != "assistant" {
+        return out;
+    }
+    if let Some(blocks) = entry.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            if let (Some(id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) {
+                out.push((id.to_string(), name.to_string()));
+            }
+        }
+    }
+    out
 }
 
 pub async fn compact_history(
@@ -242,11 +368,22 @@ pub async fn compact_history(
         reasoning_effort: None,
     };
     let (summary, usage) = summarize(provider, cancel, &messages[1..cut], policy, session).await?;
+    // Codex keeps content-filter guidance as a developer fragment across
+    // compaction. Re-attach the newest blocks to the retained context so a
+    // retry after compaction still knows why the previous sample was blocked.
+    let guidance = retained_guidance(&messages[1..cut]);
     let tail = &messages[cut..];
-    let tail_text = tail_transcript(tail);
+    let mut tail_text = String::new();
+    for fragment in &guidance {
+        tail_text.push_str(fragment.content.as_deref().unwrap_or(""));
+        tail_text.push('\n');
+    }
+    tail_text.push_str(&tail_transcript(tail));
     let checkpoint = format_checkpoint(&summary, &tail_text);
     let compacted = vec![messages[0].clone(), ChatMessage::user(checkpoint)];
-    let retained_tail = tail.iter().map(message_to_entry).collect::<Vec<_>>();
+    let mut retained_entries: Vec<Value> = guidance.iter().map(message_to_entry).collect();
+    retained_entries.extend(tail.iter().map(message_to_entry));
+    let retained_tail = cap_retained_tail(retained_entries);
     let tokens_after = estimate_tokens(&compacted);
     Some(CompactionOutcome {
         messages: compacted,
@@ -272,6 +409,32 @@ pub fn is_checkpoint(message: &ChatMessage) -> bool {
                 .trim_start()
                 .starts_with("<conversation-checkpoint>")
         })
+}
+
+/// Marker shared with `content_filter_guidance` in the turn loop.
+const CONTENT_FILTER_GUIDANCE_MARKER: &str = "<content_filter_guidance>";
+
+fn is_content_filter_guidance(message: &ChatMessage) -> bool {
+    message.content.as_deref().is_some_and(|content| {
+        content
+            .trim_start()
+            .starts_with(CONTENT_FILTER_GUIDANCE_MARKER)
+    })
+}
+
+/// Newest guidance blocks kept across compaction (bounded like Codex's
+/// contextual fragments).
+fn retained_guidance(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    const MAX_FRAGMENTS: usize = 4;
+    let mut fragments: Vec<ChatMessage> = messages
+        .iter()
+        .filter(|message| is_content_filter_guidance(message))
+        .cloned()
+        .collect();
+    if fragments.len() > MAX_FRAGMENTS {
+        fragments.drain(..fragments.len() - MAX_FRAGMENTS);
+    }
+    fragments
 }
 
 fn split_index(messages: &[ChatMessage], tail_tokens: usize) -> Option<usize> {
@@ -530,6 +693,16 @@ fn render_message(message: &ChatMessage, level: usize, clip: usize) -> String {
             }
         }
     }
+    // Images never survive as bytes in a text transcript; keep their notes
+    // so the summary still knows what the model saw.
+    for image in &message.images {
+        let note = if image.note.trim().is_empty() {
+            "(image)".to_string()
+        } else {
+            clip_text(image.note.trim(), clip.min(500))
+        };
+        parts.push(format!("[Attached image]: {note}"));
+    }
     parts.join("\n")
 }
 
@@ -622,6 +795,82 @@ mod tests {
         assert_eq!(tool["tool_call_id"], "call-0");
     }
 
+    fn pair_entries(call_id: &str, output_len: usize) -> Vec<Value> {
+        let call = ChatMessage::assistant_tool_calls(
+            None,
+            vec![ToolCall::function(
+                call_id,
+                "read",
+                json!({"file_path": "a.txt"}).to_string(),
+            )],
+        );
+        let output = ChatMessage::tool(call_id, "x".repeat(output_len));
+        vec![message_to_entry(&call), message_to_entry(&output)]
+    }
+
+    #[test]
+    fn retained_tail_never_splits_a_pair() {
+        // One pair (~30KB output) exceeds the 60KB cap only when combined
+        // with two more pairs: the newest pair wins, and if its output is
+        // kept its call is pulled back in.
+        let mut entries = Vec::new();
+        for id in ["old-1", "old-2", "new"] {
+            entries.extend(pair_entries(id, 30_000));
+        }
+        let capped = cap_retained_tail(entries);
+        let ids: Vec<String> = capped
+            .iter()
+            .filter_map(|entry| {
+                if entry_role(entry) == "toolResult" {
+                    entry
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(ids.contains(&"new".to_string()), "{ids:?}");
+        // Every kept output still has its call entry.
+        for id in &ids {
+            assert!(
+                capped.iter().any(|entry| tool_calls_in(entry)
+                    .iter()
+                    .any(|(call_id, _)| call_id == id)),
+                "output {id} lost its call"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_tail_keeps_newest_entry_over_budget() {
+        let entries = pair_entries("only", 100_000);
+        let capped = cap_retained_tail(entries);
+        assert!(!capped.is_empty());
+    }
+
+    #[test]
+    fn retained_tail_empty_stays_empty() {
+        assert!(cap_retained_tail(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn images_survive_entry_round_trip() {
+        use stark_providers::ImagePart;
+        let message = ChatMessage::user_with_images(
+            "look",
+            vec![ImagePart {
+                url: "data:image/png;base64,abc".to_string(),
+                note: "screen".to_string(),
+            }],
+        );
+        let entry = message_to_entry(&message);
+        assert_eq!(entry["images"][0]["note"], "screen");
+        let rendered = render_message(&message, 0, 500);
+        assert!(rendered.contains("[Attached image]: screen"), "{rendered}");
+    }
+
     #[test]
     fn checkpoint_is_one_user_message() {
         let checkpoint = format_checkpoint("summary", "recent");
@@ -682,7 +931,13 @@ mod tests {
             summary_output_tokens: 128,
             tail_tokens: 12,
         };
-        let messages = conversation(20);
+        let mut messages = conversation(20);
+        messages.insert(
+            1,
+            ChatMessage::user(
+                "<content_filter_guidance>\nblocked once\n</content_filter_guidance>",
+            ),
+        );
         let outcome = compact_history(
             &provider,
             &CancellationToken::new(),
@@ -704,5 +959,34 @@ mod tests {
                 .contains("<conversation-checkpoint>")
         );
         assert!(outcome.retained_tail.len() < messages.len());
+        let checkpoint = outcome.messages[1].content.as_deref().unwrap();
+        assert!(
+            checkpoint.contains("<content_filter_guidance>"),
+            "{checkpoint}"
+        );
+        assert!(checkpoint.contains("blocked once"), "{checkpoint}");
+        assert!(
+            outcome
+                .retained_tail
+                .iter()
+                .any(|entry| entry.to_string().contains("content_filter_guidance")),
+            "{:?}",
+            outcome.retained_tail
+        );
+    }
+
+    #[test]
+    fn retained_guidance_is_bounded_to_the_newest_four() {
+        let mut messages = vec![ChatMessage::system("system")];
+        for index in 0..6 {
+            messages.push(ChatMessage::user(format!(
+                "<content_filter_guidance>\nblock {index}\n</content_filter_guidance>"
+            )));
+            messages.push(ChatMessage::assistant("ok"));
+        }
+        let guidance = retained_guidance(&messages);
+        assert_eq!(guidance.len(), 4);
+        assert!(guidance[0].content.as_deref().unwrap().contains("block 2"));
+        assert!(guidance[3].content.as_deref().unwrap().contains("block 5"));
     }
 }

@@ -72,8 +72,138 @@ fn gateway_message(body: &str) -> String {
     message.chars().take(400).collect()
 }
 
-fn friendly_status(status: u16, body: &str, attempts: usize) -> String {
+/// Codes providers use for a hard account limit, not a transient 429. Codex
+/// maps the same family to terminal `UsageLimitReached` / `QuotaExceeded`
+/// (`codex-api/src/api_bridge.rs`).
+const USAGE_LIMIT_CODES: [&str; 8] = [
+    "usage_limit_reached",
+    "usage_not_included",
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+    "billing_hard_limit_reached",
+];
+
+fn is_usage_limit_body(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        let lower = body.to_ascii_lowercase();
+        return USAGE_LIMIT_CODES.iter().any(|code| lower.contains(*code));
+    };
+    let mut candidates = Vec::new();
+    if let Some(error) = value.get("error") {
+        candidates.push(error);
+        if let Some(first) = error.as_array().and_then(|items| items.first()) {
+            candidates.push(first);
+        }
+    }
+    candidates.push(&value);
+    candidates.iter().any(|candidate| {
+        ["type", "code"].iter().any(|key| {
+            candidate
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|code| {
+                    USAGE_LIMIT_CODES
+                        .iter()
+                        .any(|known| code.eq_ignore_ascii_case(known))
+                })
+        })
+    })
+}
+
+fn usage_limit_message(status: u16, body: &str, retry_after: Option<RetryAfter>) -> String {
+    let detail = gateway_message(body);
+    let detail = if detail.is_empty() {
+        "the provider reports no remaining quota".to_string()
+    } else {
+        detail
+    };
+    // Codex prints the reset time in local time (`protocol/src/error.rs`);
+    // gateways advertise it as `resets_at` (epoch/RFC 3339) or `resets_in`.
+    let reset = usage_reset_at(body).or_else(|| {
+        retry_after.map(|advice| {
+            chrono::Utc::now() + chrono::Duration::from_std(advice.remaining()).unwrap_or_default()
+        })
+    });
+    let advice = match reset {
+        Some(reset) => format!(" Try again at {}.", format_retry_time(reset)),
+        None => " Try again later.".to_string(),
+    };
+    format!(
+        "Usage limit reached (HTTP {status}). {detail}. Retrying will not help; check your plan/billing or switch providers.{advice}"
+    )
+}
+
+/// Reset time advertised by a usage-limit response. Providers differ: some
+/// send epoch seconds or an RFC 3339 string in `resets_at`, others a
+/// `resets_in` second count.
+fn usage_reset_at(body: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let mut candidates: Vec<&Value> = vec![&value];
+    if let Some(error) = value.get("error") {
+        candidates.push(error);
+        if let Some(first) = error.as_array().and_then(|items| items.first()) {
+            candidates.push(first);
+        }
+    }
+    for candidate in candidates {
+        if let Some(reset) = candidate.get("resets_at").and_then(parse_reset_value) {
+            return Some(reset);
+        }
+        if let Some(secs) = candidate.get("resets_in").and_then(Value::as_i64) {
+            return Some(chrono::Utc::now() + chrono::Duration::seconds(secs.max(0)));
+        }
+        if let Some(reset) = candidate.get("reset_at").and_then(parse_reset_value) {
+            return Some(reset);
+        }
+    }
+    None
+}
+
+fn parse_reset_value(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(secs) = value.as_i64() {
+        return chrono::DateTime::from_timestamp(secs, 0);
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(secs) = text.parse::<i64>() {
+        return chrono::DateTime::from_timestamp(secs, 0);
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+/// Codex's `format_retry_timestamp`: same-day resets show only the time,
+/// later resets include the date.
+fn format_retry_time(reset: chrono::DateTime<chrono::Utc>) -> String {
+    let local = reset.with_timezone(&chrono::Local);
+    let now = chrono::Local::now();
+    if local.date_naive() == now.date_naive() {
+        local.format("%-I:%M %p").to_string()
+    } else {
+        local.format("%b %-d, %Y %-I:%M %p").to_string()
+    }
+}
+
+fn friendly_status(
+    status: u16,
+    body: &str,
+    attempts: usize,
+    retry_after: Option<RetryAfter>,
+) -> String {
     let message = gateway_message(body);
+    // Codex surfaces the server's advice instead of hiding it behind the
+    // retry budget. Applies to the terminal 429 once retries are exhausted.
+    let advice = retry_after
+        .map(|advice| {
+            format!(
+                " The server asked to retry in {}s.",
+                advice.remaining().as_secs().max(1)
+            )
+        })
+        .unwrap_or_default();
     match status {
         401 | 403 => format!(
             "Authentication failed (HTTP {status}). Check the provider's key_env variable (OPENCODE_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY). {message}"
@@ -81,7 +211,7 @@ fn friendly_status(status: u16, body: &str, attempts: usize) -> String {
         404 => format!("Model or endpoint not found (HTTP 404). Check the model id. {message}"),
         402 => format!("Insufficient credits (HTTP 402). {message}"),
         408 => format!("Provider timed out (HTTP 408) after {attempts} attempt(s). {message}"),
-        429 => format!("Rate limited (HTTP 429) after {attempts} attempt(s). {message}"),
+        429 => format!("Rate limited (HTTP 429) after {attempts} attempt(s). {message}{advice}"),
         500..=599 => {
             format!("Provider unavailable (HTTP {status}) after {attempts} attempt(s). {message}")
         }
@@ -427,25 +557,55 @@ pub enum ProviderError {
     )]
     MissingApiKey,
     #[error("{body}")]
-    HttpStatus { status: u16, body: String },
+    HttpStatus {
+        status: u16,
+        body: String,
+        /// Server retry advice captured when the response arrived.
+        retry_after: Option<RetryAfter>,
+    },
+    #[error("{0}")]
+    UsageLimit(String),
     #[error("provider request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("{0}")]
     Transport(String),
-    #[error("provider stream failed: {0}")]
-    Stream(String),
+    #[error("provider stream failed: {message}")]
+    Stream {
+        message: String,
+        /// Server retry advice captured from the streamed error frame.
+        retry_after: Option<RetryAfter>,
+    },
+    /// A response stopped by the provider's content filter. Codex models this
+    /// as its own typed error so the turn can record guidance before retrying.
+    #[error("stream disconnected before completion: {0}")]
+    ContentFilter(String),
     #[error("provider returned invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
 }
 
 impl ProviderError {
+    /// A stream failure with no server advice. Call sites that have an SSE
+    /// error frame attach `retry_after` directly.
+    fn stream(message: impl Into<String>) -> Self {
+        Self::Stream {
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
     /// Terminal errors never retry: auth, not-found, bad request, quota,
     /// invalid payload. Everything else (transport, stream, 408/425/429/5xx)
     /// is transient.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::MissingApiKey | Self::Json(_) => false,
-            Self::Request(_) | Self::Transport(_) | Self::Stream(_) => true,
+            Self::MissingApiKey | Self::UsageLimit(_) => false,
+            // A malformed stream chunk is a transport failure, not a terminal
+            // request error. Codex classifies `Json` as retryable too.
+            Self::Json(_)
+            | Self::Request(_)
+            | Self::Transport(_)
+            | Self::Stream { .. }
+            | Self::ContentFilter(_) => true,
             Self::HttpStatus { status, .. } => {
                 matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
             }
@@ -456,17 +616,45 @@ impl ProviderError {
         !self.is_retryable()
     }
 
-    /// Server-advised delay is read from the HTTP body when the gateway
-    /// embeds `retry_after_ms` / `retry-after`; otherwise exponential backoff
-    /// with jitter applies. Returns `None` for terminal errors.
+    /// True when the provider's content filter stopped the response. The turn
+    /// loop records Codex's `<content_filter_guidance>` fragment before it
+    /// retries.
+    pub fn is_content_filter(&self) -> bool {
+        matches!(self, Self::ContentFilter(_))
+    }
+
+    /// Server-advised delay wins over local backoff: the captured deadline is
+    /// honored as-is (Codex parity), and elapsed time is not restarted when the
+    /// error is passed between callers. Otherwise exponential backoff with
+    /// jitter applies. Returns `None` for terminal errors.
     pub fn retry_delay(&self, attempt: u64) -> Option<std::time::Duration> {
         if !self.is_retryable() {
             return None;
         }
-        if let Self::HttpStatus { body, .. } = self
-            && let Some(delay) = parse_retry_after_ms(body)
-        {
-            return Some(delay);
+        match self {
+            Self::HttpStatus {
+                body, retry_after, ..
+            } => {
+                if let Some(retry_after) = retry_after {
+                    return Some(retry_after.remaining());
+                }
+                if let Some(retry_after) = RetryAfter::from_body(body) {
+                    return Some(retry_after.remaining());
+                }
+            }
+            Self::Stream {
+                message,
+                retry_after,
+            } => {
+                if let Some(retry_after) = retry_after {
+                    return Some(retry_after.remaining());
+                }
+                // SSE error frames carry the advice in the frame body.
+                if let Some(retry_after) = RetryAfter::from_body(message) {
+                    return Some(retry_after.remaining());
+                }
+            }
+            _ => {}
         }
         Some(backoff_delay(attempt))
     }
@@ -511,56 +699,87 @@ pub fn backoff_delay(attempt: u64) -> std::time::Duration {
     std::time::Duration::from_millis((base * jitter) as u64)
 }
 
-fn first_run_ms(text: &str) -> Result<u64, std::num::ParseIntError> {
-    let mut run = String::new();
-    let mut in_run = false;
-    for c in text.chars() {
-        if c.is_ascii_digit() {
-            run.push(c);
-            in_run = true;
-        } else if in_run {
-            break;
-        }
-    }
-    run.parse::<u64>()
-}
+/// Server retry advice captured once as an absolute deadline. Codex keeps the
+/// same shape (`RetryAfter(Instant)`), so passing the error between callers
+/// cannot restart the clock and no clamp shortens the server's ask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryAfter(std::time::Instant);
 
-fn parse_retry_after_ms(body: &str) -> Option<std::time::Duration> {
-    let lower = body.to_ascii_lowercase();
-    for marker in [
-        "retry_after_ms",
-        "retry-after-ms",
-        "retry_after",
-        "retry-after",
-    ] {
-        if let Some(start) = lower.find(marker)
-            && let Ok(ms) = first_run_ms(&lower[start + marker.len()..])
-            && ms > 0
-            && ms < 300_000
-        {
-            // Heuristic: values under 1000 without a unit are seconds.
-            if marker.contains("ms") || ms >= 1000 {
-                return Some(std::time::Duration::from_millis(ms.min(60_000)));
+impl RetryAfter {
+    /// Captures an interval measured from receipt of the server's advice.
+    pub fn from_delay(delay: std::time::Duration) -> Option<Self> {
+        std::time::Instant::now().checked_add(delay).map(Self)
+    }
+
+    /// Reads either nonnegative delay seconds or an HTTP date, exactly like
+    /// Codex's `RetryAfter::from_header`. No local clamp.
+    pub fn from_header(value: &str) -> Option<Self> {
+        // Sample the clock first so a scheduling pause cannot shorten the
+        // server's deadline.
+        let received_at = std::time::Instant::now();
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let delay = if value.bytes().all(|byte| byte.is_ascii_digit()) {
+            std::time::Duration::from_secs(value.parse().ok()?)
+        } else {
+            let date = httpdate::parse_http_date(value).ok()?;
+            date.duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+        };
+        received_at.checked_add(delay).map(Self)
+    }
+
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+        Self::from_header(value)
+    }
+
+    /// Reads gateways that embed the advice in the response body. Explicit
+    /// units only — `retry_after_ms` (milliseconds), `retry_after_seconds`
+    /// (seconds), and `retry_after` (seconds, the OpenAI convention). No
+    /// value heuristic and no cap.
+    pub fn from_body(body: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(body).ok()?;
+        Self::from_value(&value)
+    }
+
+    /// Same as `from_body` for an already-parsed chunk (SSE error frames).
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let mut candidates: Vec<&Value> = vec![value];
+        if let Some(error) = value.get("error") {
+            candidates.push(error);
+            if let Some(first) = error.as_array().and_then(|items| items.first()) {
+                candidates.push(first);
             }
-            return Some(std::time::Duration::from_secs(ms.min(60)));
         }
+        candidates
+            .into_iter()
+            .find_map(delay_in_value)
+            .and_then(Self::from_delay)
     }
-    // Bare `Retry-After: N` header value embedded in the body.
-    None
+
+    pub fn deadline(self) -> std::time::Instant {
+        self.0
+    }
+
+    pub fn remaining(self) -> std::time::Duration {
+        self.0.saturating_duration_since(std::time::Instant::now())
+    }
 }
 
-/// Parses an HTTP `Retry-After` header value (seconds or HTTP date).
-pub fn parse_retry_after_header(value: &str) -> Option<std::time::Duration> {
-    let value = value.trim();
-    if let Ok(secs) = value.parse::<u64>() {
-        return Some(std::time::Duration::from_secs(secs.min(60)));
+fn delay_in_value(value: &Value) -> Option<std::time::Duration> {
+    if let Some(ms) = value.get("retry_after_ms").and_then(Value::as_u64) {
+        return Some(std::time::Duration::from_millis(ms));
     }
-    // HTTP date form: fall back to a short delay; the server deadline is
-    // enforced by the retry budget, not the clock.
-    if value.contains("GMT") {
-        return Some(std::time::Duration::from_secs(5));
+    if let Some(seconds) = value.get("retry_after_seconds").and_then(Value::as_u64) {
+        return Some(std::time::Duration::from_secs(seconds));
     }
-    None
+    value
+        .get("retry_after")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_secs)
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
@@ -726,6 +945,7 @@ impl Provider {
             return Err(ProviderError::HttpStatus {
                 status,
                 body: format!("HTTP {status}: {}", gateway_message(&body)),
+                retry_after: None,
             });
         }
         let value: Value = response.json().await?;
@@ -984,15 +1204,22 @@ impl Provider {
                 break response;
             }
             let status = response.status().as_u16();
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_retry_after_header);
+            let retry_after = RetryAfter::from_headers(response.headers());
             let body_text = response.text().await.unwrap_or_default();
+            if status == 429 && is_usage_limit_body(&body_text) {
+                return Err(ProviderError::UsageLimit(usage_limit_message(
+                    status,
+                    &body_text,
+                    retry_after,
+                )));
+            }
             if matches!(status, 429 | 500 | 502 | 503 | 504 | 408 | 425) && attempt < max_attempts {
                 attempt += 1;
-                let delay = retry_after.unwrap_or_else(|| backoff_delay(attempt));
+                // Honor the server's deadline exactly; the retry budget, not a
+                // local clamp, bounds how long the run waits.
+                let delay = retry_after
+                    .map(RetryAfter::remaining)
+                    .unwrap_or_else(|| backoff_delay(attempt));
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -1013,11 +1240,13 @@ impl Provider {
                 return Err(ProviderError::HttpStatus {
                     status,
                     body: credit_error(&body_text, affordable),
+                    retry_after: None,
                 });
             }
             return Err(ProviderError::HttpStatus {
                 status,
-                body: friendly_status(status, &body_text, (attempt + 1) as usize),
+                body: friendly_status(status, &body_text, (attempt + 1) as usize, retry_after),
+                retry_after,
             });
         };
 
@@ -1025,22 +1254,41 @@ impl Provider {
         let events = response.bytes_stream().eventsource();
         let stream = async_stream::try_stream! {
             let mut events = Box::pin(events);
+            let mut saw_done = false;
             loop {
                 // A stalled connection must surface as an error, not a hang.
                 let next = match tokio::time::timeout(idle, events.next()).await
                 {
-                    Err(_) => Err(ProviderError::Stream(
+                    Err(_) if saw_done => break,
+                    Err(_) => Err(ProviderError::stream(
                         format!("no data from the provider for {}s (stream stalled or connection lagging)", idle.as_secs()),
                     ))?,
                     Ok(None) => break,
-                    Ok(Some(Err(error))) => Err(ProviderError::Stream(format!(
+                    Ok(Some(Err(_))) if saw_done => break,
+                    Ok(Some(Err(error))) => Err(ProviderError::stream(format!(
                         "connection lost mid-stream: {error}"
                     )))?,
                     Ok(Some(Ok(event))) => event,
                 };
-                for parsed in parse_sse_data(&next.data)? {
-                    yield parsed;
+                let parsed = match parse_sse_data(&next.data) {
+                    Ok(parsed) => parsed,
+                    Err(_) if saw_done => break,
+                    Err(error) => Err(error)?,
+                };
+                for event in parsed {
+                    if matches!(&event, ProviderEvent::Done { .. }) {
+                        saw_done = true;
+                    }
+                    yield event;
                 }
+            }
+            if !saw_done {
+                // Codex's `CodexErrorDetails::Stream`: a stream that ends
+                // before the response is complete is transient, not a
+                // successful empty answer. The turn loop retries it.
+                Err(ProviderError::stream(
+                    "stream disconnected before completion: provider closed the stream without a finish_reason or [DONE]",
+                ))?;
             }
         };
 
@@ -1080,7 +1328,12 @@ pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
 
     let value: Value = serde_json::from_str(data)?;
     if let Some(error) = value.get("error") {
-        return Err(ProviderError::Stream(error.to_string()));
+        // SSE error frames often carry the server's retry advice; keep it so
+        // the turn waits for the advised deadline instead of local backoff.
+        return Err(ProviderError::Stream {
+            message: error.to_string(),
+            retry_after: RetryAfter::from_value(&value),
+        });
     }
 
     let mut out = Vec::new();
@@ -1143,6 +1396,21 @@ pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
     }
 
     if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        if reason == "content_filter" {
+            // Codex treats a content-filter stop as a retryable stream
+            // failure, not as a successful empty answer.
+            return Err(ProviderError::ContentFilter(
+                "content filter blocked the response".to_string(),
+            ));
+        }
+        if reason == "error" {
+            // Gateways report an internal failure through finish_reason
+            // instead of an HTTP status. Codex never records that as a
+            // completed answer; surface it so the turn retries.
+            return Err(ProviderError::stream(
+                "stream disconnected before completion: provider reported finish_reason=error",
+            ));
+        }
         out.push(ProviderEvent::Done {
             finish_reason: Some(reason.to_string()),
         });
@@ -1460,14 +1728,20 @@ mod tests {
     fn retryable_errors_retry_and_terminal_errors_do_not() {
         let retryable = vec![
             ProviderError::Transport("down".to_string()),
-            ProviderError::Stream("lost".to_string()),
+            ProviderError::Stream {
+                message: "lost".to_string(),
+                retry_after: None,
+            },
+            ProviderError::Json(serde_json::from_str::<Value>("{").unwrap_err()),
             ProviderError::HttpStatus {
                 status: 429,
                 body: "rate limited".to_string(),
+                retry_after: None,
             },
             ProviderError::HttpStatus {
                 status: 503,
                 body: "unavailable".to_string(),
+                retry_after: None,
             },
         ];
         for error in retryable {
@@ -1476,17 +1750,21 @@ mod tests {
         }
         let terminal = vec![
             ProviderError::MissingApiKey,
+            ProviderError::UsageLimit("out of credits".to_string()),
             ProviderError::HttpStatus {
                 status: 401,
                 body: "auth".to_string(),
+                retry_after: None,
             },
             ProviderError::HttpStatus {
                 status: 400,
                 body: "bad".to_string(),
+                retry_after: None,
             },
             ProviderError::HttpStatus {
                 status: 402,
                 body: "credits".to_string(),
+                retry_after: None,
             },
         ];
         for error in terminal {
@@ -1496,15 +1774,127 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_header_parses_seconds() {
-        assert_eq!(
-            parse_retry_after_header("3"),
-            Some(std::time::Duration::from_secs(3))
+    fn malformed_sse_chunks_are_retryable() {
+        let error = parse_sse_data("{not json").unwrap_err();
+        assert!(error.is_retryable(), "{error:?}");
+    }
+
+    #[test]
+    fn content_filter_is_a_retryable_stream_failure() {
+        let error =
+            parse_sse_data(r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#)
+                .unwrap_err();
+        assert!(error.is_content_filter(), "{error:?}");
+        assert!(error.is_retryable());
+        // The message keeps the Codex classification prefix.
+        assert!(
+            error
+                .to_string()
+                .contains("stream disconnected before completion"),
+            "{error}"
         );
-        assert_eq!(
-            parse_retry_after_header("120"),
-            Some(std::time::Duration::from_secs(60))
+    }
+
+    #[test]
+    fn usage_limit_bodies_are_terminal() {
+        assert!(is_usage_limit_body(
+            r#"{"error":{"type":"usage_limit_reached","message":"You have no credits"}}"#
+        ));
+        assert!(is_usage_limit_body(
+            r#"{"error":{"code":"insufficient_quota","message":"quota"}}"#
+        ));
+        assert!(is_usage_limit_body(
+            r#"{"error":[{"code":"insufficient_quota"}]}"#
+        ));
+        assert!(is_usage_limit_body("credit_balance_exhausted"));
+        assert!(!is_usage_limit_body(
+            r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#
+        ));
+        let message = usage_limit_message(429, r#"{"error":{"message":"out of credits"}}"#, None);
+        assert!(message.contains("out of credits"), "{message}");
+        assert!(message.contains("Retrying will not help"), "{message}");
+        assert!(message.contains("Try again later"), "{message}");
+    }
+
+    #[test]
+    fn usage_limit_message_prints_the_advertised_reset() {
+        // `resets_in` is relative; the printed time is still local and the
+        // Codex-style suffix is present.
+        let message = usage_limit_message(
+            429,
+            r#"{"error":{"message":"quota","resets_in":3600}}"#,
+            None,
         );
+        assert!(message.contains("Try again at "), "{message}");
+        // Epoch seconds and RFC 3339 both parse.
+        assert!(usage_reset_at(r#"{"resets_at":4102444800}"#).is_some());
+        assert!(usage_reset_at(r#"{"error":{"resets_at":"2099-01-01T00:00:00Z"}}"#).is_some());
+        assert!(usage_reset_at(r#"{"error":{"message":"none"}}"#).is_none());
+    }
+
+    #[test]
+    fn retry_after_header_parses_seconds_without_clamping() {
+        let three = RetryAfter::from_header("3").expect("3s advice");
+        assert!((2..=3).contains(&three.remaining().as_secs()));
+        // Codex honors long server deadlines; the old 60s clamp is gone.
+        let long = RetryAfter::from_header("120").expect("120s advice");
+        assert!((115..=120).contains(&long.remaining().as_secs()));
+        let five_minutes = RetryAfter::from_header("300").expect("advice");
+        let remaining = five_minutes.remaining().as_secs();
+        assert!((290..=300).contains(&remaining), "{remaining}");
+    }
+
+    #[test]
+    fn retry_after_http_date_is_honored() {
+        let when = std::time::SystemTime::now() + std::time::Duration::from_secs(45);
+        let header = httpdate::fmt_http_date(when);
+        let advice = RetryAfter::from_header(&header).expect("http date");
+        assert!(
+            (40..=45).contains(&advice.remaining().as_secs()),
+            "expected ~45s, got {:?}",
+            advice.remaining()
+        );
+    }
+
+    #[test]
+    fn retry_after_body_uses_explicit_units_without_caps() {
+        // Milliseconds are explicit; a long ask is preserved.
+        let body = r#"{"error":{"message":"slow down","retry_after_ms":900000}}"#;
+        let advice = RetryAfter::from_body(body).expect("ms advice");
+        assert!(advice.remaining().as_secs() >= 890);
+        // Bare `retry_after` follows the OpenAI seconds convention.
+        let advice = RetryAfter::from_body(r#"{"retry_after":300}"#).expect("seconds advice");
+        assert!((295..=300).contains(&advice.remaining().as_secs()));
+        // Ambiguous strings are not guessed.
+        assert!(RetryAfter::from_body(r#"{"retry_after":"5"}"#).is_none());
+    }
+
+    #[test]
+    fn stream_error_frame_carries_retry_advice() {
+        let error = parse_sse_data(r#"{"error":{"message":"overloaded","retry_after_ms":120000}}"#)
+            .unwrap_err();
+        let delay = error.retry_delay(1).expect("advised delay");
+        assert!(delay.as_secs() >= 110, "{delay:?}");
+    }
+
+    #[test]
+    fn retry_after_deadline_survives_error_construction() {
+        let advice = RetryAfter::from_delay(std::time::Duration::from_secs(90));
+        let error = ProviderError::HttpStatus {
+            status: 429,
+            body: "rate limited".to_string(),
+            retry_after: advice,
+        };
+        let delay = error.retry_delay(1).expect("retry delay");
+        assert!(delay.as_secs() >= 85, "{delay:?}");
+    }
+
+    #[test]
+    fn finish_reason_error_is_a_retryable_stream_failure() {
+        let error =
+            parse_sse_data(r#"{"choices":[{"delta":{},"finish_reason":"error"}]}"#).unwrap_err();
+        assert!(matches!(error, ProviderError::Stream { .. }), "{error:?}");
+        assert!(error.is_retryable());
     }
 
     #[test]

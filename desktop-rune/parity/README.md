@@ -245,6 +245,14 @@ collapsing-margin rules, verified against CDP rects + pixel probes):
   mode is preferred, otherwise the stream is linearly resampled to 16 kHz
   with phase continuity across blocks (this box's mic is 48 kHz-only, as is
   WASAPI shared mode generally), so dictation works on stock Windows audio.
+- Real-model verification (2026-11-19, this machine): the MSVC backend was
+  built without Visual Studio via `cargo-xwin` + LLVM 23.1.6 (`clang-cl`,
+  `lld-link`, `libclang`) and ONNX Runtime 1.26; `stark-server` logged
+  `Moonshine STT model: medium` from `D:\Stark\resources\models`. Streaming
+  `scratch/pure_test_capture.wav` (16 kHz mono) through
+  `voice_ws::{try_open, spawn_with}` — the app's actual bridge — produced
+  partials and a `turn_final` transcript, proving client → ws → server
+  VAD/STT → `VoiceMsg::Transcript` end to end. No model was downloaded.
 - Artifact review is viewport-aware like the lightbox: the card caps at
   `min(860px, vw-48)` / `min(760px, vh-48)` (React's modal caps) with the
   scroll body taking the remainder. Still a centered modal over the

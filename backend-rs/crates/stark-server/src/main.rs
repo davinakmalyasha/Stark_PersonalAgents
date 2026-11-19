@@ -16,7 +16,6 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -58,10 +57,56 @@ struct RunHandle {
     workspace_path: String,
 }
 
-#[derive(Default)]
 struct RunManager {
     runs: DashMap<String, RunHandle>,
     last_state: DashMap<String, Value>,
+    /// FIFO insertion order for `last_state` eviction. DashMap has no
+    /// ordering, so the oldest chat is dropped once the cap is reached.
+    state_order: Mutex<VecDeque<String>>,
+    /// Process-wide admission cap. Codex rejects with `AgentLimitReached`
+    /// instead of over-subscribing the machine; 0 disables the cap.
+    max_runs: usize,
+    /// Serializes the length check and insertion so two chats cannot both
+    /// take the last slot.
+    admission: Mutex<()>,
+}
+
+impl Default for RunManager {
+    fn default() -> Self {
+        Self {
+            runs: DashMap::new(),
+            last_state: DashMap::new(),
+            state_order: Mutex::new(VecDeque::new()),
+            max_runs: std::env::var("STARK_MAX_CONCURRENT_RUNS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(8),
+            admission: Mutex::new(()),
+        }
+    }
+}
+
+/// One cached `AppState` JSON per finished chat. 128 entries cover a long
+/// session without growing for the life of the server.
+const MAX_CACHED_STATES: usize = 128;
+
+/// Why `RunManager::claim` refused. `AlreadyRunning` is per chat; `Limit` is
+/// the machine-wide cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimError {
+    AlreadyRunning,
+    Limit { max: usize },
+}
+
+impl ClaimError {
+    fn message(self) -> String {
+        match self {
+            Self::AlreadyRunning => "This chat already has a running agent.".to_string(),
+            Self::Limit { max } => format!(
+                "Server run limit reached ({max} concurrent runs, STARK_MAX_CONCURRENT_RUNS). Wait for a run to finish and retry."
+            ),
+        }
+    }
 }
 
 impl RunManager {
@@ -73,21 +118,29 @@ impl RunManager {
         steering: Arc<Mutex<VecDeque<String>>>,
         follow_up: Arc<Mutex<VecDeque<String>>>,
         workspace_path: &str,
-    ) -> bool {
-        match self.runs.entry(chat_id.to_string()) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(entry) => {
-                entry.insert(RunHandle {
-                    cancel,
-                    tx,
-                    steering,
-                    follow_up,
-                    started_at: Utc::now().to_rfc3339(),
-                    workspace_path: workspace_path.to_string(),
-                });
-                true
-            }
+    ) -> Result<(), ClaimError> {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.runs.contains_key(chat_id) {
+            return Err(ClaimError::AlreadyRunning);
         }
+        if self.max_runs > 0 && self.runs.len() >= self.max_runs {
+            return Err(ClaimError::Limit { max: self.max_runs });
+        }
+        self.runs.insert(
+            chat_id.to_string(),
+            RunHandle {
+                cancel,
+                tx,
+                steering,
+                follow_up,
+                started_at: Utc::now().to_rfc3339(),
+                workspace_path: workspace_path.to_string(),
+            },
+        );
+        Ok(())
     }
 
     fn finish(&self, chat_id: &str, state: Option<AppState>) {
@@ -96,6 +149,22 @@ impl RunManager {
             && let Ok(value) = serde_json::to_value(&state)
         {
             self.last_state.insert(chat_id.to_string(), value);
+            if let Ok(mut order) = self.state_order.lock() {
+                order.retain(|id| id != chat_id);
+                order.push_back(chat_id.to_string());
+                while order.len() > MAX_CACHED_STATES {
+                    if let Some(oldest) = order.pop_front() {
+                        self.last_state.remove(&oldest);
+                    }
+                }
+            }
+        }
+    }
+
+    fn forget(&self, chat_id: &str) {
+        self.last_state.remove(chat_id);
+        if let Ok(mut order) = self.state_order.lock() {
+            order.retain(|id| id != chat_id);
         }
     }
 
@@ -566,6 +635,74 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("no voice models directory found; voice/TTS endpoints will return 503");
     }
     let mcp_manager = stark_tools::init_mcp(&harness_root);
+    // Bounded, silent cleanup of harness-generated files (spilled tool output,
+    // rewind snapshots in every workspace, orphan import staging). Runs off
+    // the boot path and repeats hourly. Nothing model-visible.
+    {
+        let sweeper_root = harness_root.clone();
+        tokio::spawn(async move {
+            let policy = stark_tools::RetentionPolicy::from_env();
+            let mut low_disk = false;
+            loop {
+                let root = sweeper_root.clone();
+                let (report, free) = tokio::task::spawn_blocking(move || {
+                    let registry = WorkspaceRegistry::new(&root);
+                    let mut workspaces: Vec<PathBuf> = registry
+                        .list()
+                        .into_iter()
+                        .map(|record| PathBuf::from(record.path))
+                        .filter(|path| path.is_dir())
+                        .collect();
+                    // Worktree agents checkpoint into the worktree, which is
+                    // not a registered workspace. Sweep live worktrees too;
+                    // settled ones are removed by worktree GC.
+                    let worktrees = root.join(".deep_agents").join("worktrees");
+                    if let Ok(entries) = std::fs::read_dir(worktrees) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                workspaces.push(path);
+                            }
+                        }
+                    }
+                    let report = stark_tools::sweep_harness(&root, &workspaces, &policy);
+                    (report, stark_tools::free_bytes(&root))
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("retention sweep failed: {error}");
+                    (stark_tools::RetentionReport::default(), None)
+                });
+                if !report.is_empty() {
+                    tracing::info!(
+                        "retention: removed {} scratch files ({:.1} MB), {} snapshot runs ({:.1} MB), {} imports",
+                        report.scratch_removed,
+                        report.scratch_bytes as f64 / (1024.0 * 1024.0),
+                        report.snapshot_runs_removed,
+                        report.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        report.imports_removed
+                    );
+                }
+                match free {
+                    Some(bytes) if bytes < 2 * 1024 * 1024 * 1024 => {
+                        if !low_disk {
+                            tracing::warn!(
+                                "harness drive has only {:.1} GB free; builds and runs may fail",
+                                bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                            );
+                            low_disk = true;
+                        }
+                    }
+                    Some(_) if low_disk => {
+                        tracing::info!("harness drive free space recovered");
+                        low_disk = false;
+                    }
+                    _ => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
     let state = ServerState {
         store,
         provider,
@@ -1263,7 +1400,7 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    if !state.runs.claim(
+    if let Err(error) = state.runs.claim(
         &chat_id,
         cancel.clone(),
         tx.clone(),
@@ -1271,12 +1408,13 @@ async fn run_group_item(state: ServerState, groups: GroupStore, project_id: Stri
         follow_up.clone(),
         workspace.to_string_lossy().as_ref(),
     ) {
+        let message = error.message();
         let _ = groups
             .finish_item(
                 &project_id,
                 item["id"].as_str().unwrap_or(""),
                 false,
-                "Worker chat already has an active run.",
+                &message,
             )
             .await;
         return;
@@ -1575,7 +1713,7 @@ Attached files:
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
     let checkpoint = Checkpoint::begin(&chat_id, &workspace);
-    if !state.runs.claim(
+    if let Err(error) = state.runs.claim(
         &chat_id,
         cancel.clone(),
         tx.clone(),
@@ -1585,16 +1723,18 @@ Attached files:
     ) {
         // Mid-run message: deliver it as steering and attach this request to
         // the existing run's event stream instead of returning HTTP 409.
-        if state.runs.steer(&chat_id, &prompt)
+        if error == ClaimError::AlreadyRunning
+            && state.runs.steer(&chat_id, &prompt)
             && let Some(receiver) = state.runs.subscribe(&chat_id)
         {
             let stream: SseStream = Box::pin(sse_stream(receiver));
             return Ok(Sse::new(stream));
         }
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": "This chat already has a running agent."})),
-        ));
+        let status = match error {
+            ClaimError::AlreadyRunning => StatusCode::CONFLICT,
+            ClaimError::Limit { .. } => StatusCode::TOO_MANY_REQUESTS,
+        };
+        return Err((status, Json(json!({"error": error.message()}))));
     }
 
     if workspace != state.harness_root {
@@ -1712,7 +1852,20 @@ fn job_hook(state: ServerState, target: RunTarget) -> stark_core::JobDoneHook {
     })
 }
 
-fn spawn_follow_up_run(state: ServerState, mut target: RunTarget, message: String) {
+fn spawn_follow_up_run(state: ServerState, target: RunTarget, message: String) {
+    spawn_follow_up_run_attempt(state, target, message, 0);
+}
+
+/// A follow-up was triggered by a finished run, so a global slot is usually
+/// free immediately. If another chat took it, retry with capped backoff
+/// instead of dropping the message. Per-chat conflicts attach to the existing
+/// run's steering queue.
+fn spawn_follow_up_run_attempt(
+    state: ServerState,
+    mut target: RunTarget,
+    message: String,
+    attempt: u32,
+) {
     // Re-resolve on every follow-up so config edits apply without waiting for
     // a new chat.
     let tier = agent_for_scope(&target.scope)
@@ -1725,7 +1878,7 @@ fn spawn_follow_up_run(state: ServerState, mut target: RunTarget, message: Strin
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    if !state.runs.claim(
+    if let Err(error) = state.runs.claim(
         &target.chat_id,
         cancel.clone(),
         tx.clone(),
@@ -1733,7 +1886,45 @@ fn spawn_follow_up_run(state: ServerState, mut target: RunTarget, message: Strin
         follow_up.clone(),
         target.workspace.to_string_lossy().as_ref(),
     ) {
-        let _ = state.runs.follow_up(&target.chat_id, &message);
+        match error {
+            ClaimError::AlreadyRunning => {
+                let _ = state.runs.follow_up(&target.chat_id, &message);
+            }
+            ClaimError::Limit { max } => {
+                const MAX_ADMISSION_RETRIES: u32 = 6;
+                if attempt >= MAX_ADMISSION_RETRIES {
+                    tracing::warn!(
+                        chat_id = %target.chat_id,
+                        max,
+                        message_chars = message.chars().count(),
+                        "dropping follow-up: run limit stayed saturated"
+                    );
+                    // Make the drop visible in history instead of losing the
+                    // message silently. Same role the turn loop uses for
+                    // failures, so the UI renders it as an error.
+                    let store = state.store.clone();
+                    let chat_id = target.chat_id.clone();
+                    tokio::spawn(async move {
+                        let _ = store
+                            .append_message(
+                                &chat_id,
+                                "error",
+                                &format!(
+                                    "Follow-up not started: the server stayed at its {max}-run limit. Send the message again once a run finishes."
+                                ),
+                                false,
+                            )
+                            .await;
+                    });
+                    return;
+                }
+                let delay = std::time::Duration::from_secs(1 << attempt.min(4));
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    spawn_follow_up_run_attempt(state, target, message, attempt + 1);
+                });
+            }
+        }
         return;
     }
 
@@ -1988,14 +2179,18 @@ async fn spawn_agent_run(state: ServerState, store: AgentStore, agent: AgentReco
     let cancel = CancellationToken::new();
     let steering = Arc::new(Mutex::new(VecDeque::new()));
     let follow_up = Arc::new(Mutex::new(VecDeque::new()));
-    if !state.runs.claim(
-        &target.chat_id,
-        cancel.clone(),
-        tx.clone(),
-        steering.clone(),
-        follow_up.clone(),
-        target.workspace.to_string_lossy().as_ref(),
-    ) {
+    if state
+        .runs
+        .claim(
+            &target.chat_id,
+            cancel.clone(),
+            tx.clone(),
+            steering.clone(),
+            follow_up.clone(),
+            target.workspace.to_string_lossy().as_ref(),
+        )
+        .is_err()
+    {
         return false;
     }
     let messages = match store.take_messages(&agent.id, 20).await {
@@ -3947,6 +4142,7 @@ async fn delete_chat_handler(
     Path((_workspace_id, chat_id)): Path<(String, String)>,
 ) -> Json<Value> {
     let ok = state.store.delete_chat(&chat_id).await.unwrap_or(false);
+    state.runs.forget(&chat_id);
     Json(json!({"status": if ok { "ok" } else { "not found" }}))
 }
 
@@ -6406,5 +6602,58 @@ mod tests {
 
         let missing = read_file(root.to_string_lossy().as_ref(), "missing.txt").unwrap_err();
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn last_state_is_capped_and_forgettable() {
+        let runs = RunManager::default();
+        for index in 0..(MAX_CACHED_STATES + 10) {
+            let chat = format!("chat-{index}");
+            let state = stark_contract::AppState {
+                client_request: chat.clone(),
+                ..Default::default()
+            };
+            runs.finish(&chat, Some(state));
+        }
+        assert_eq!(runs.last_state.len(), MAX_CACHED_STATES);
+        assert!(runs.last_state.get("chat-0").is_none());
+        assert!(
+            runs.last_state
+                .get(&format!("chat-{}", MAX_CACHED_STATES + 9))
+                .is_some()
+        );
+        runs.forget(&format!("chat-{}", MAX_CACHED_STATES + 9));
+        assert!(
+            runs.last_state
+                .get(&format!("chat-{}", MAX_CACHED_STATES + 9))
+                .is_none()
+        );
+        assert_eq!(runs.last_state.len(), MAX_CACHED_STATES - 1);
+    }
+
+    #[test]
+    fn run_admission_enforces_the_global_cap_and_releases_on_finish() {
+        let runs = RunManager {
+            max_runs: 1,
+            ..RunManager::default()
+        };
+        let claim = |chat: &str| {
+            let (tx, _rx) = broadcast::channel(4);
+            runs.claim(
+                chat,
+                CancellationToken::new(),
+                tx,
+                Arc::new(Mutex::new(VecDeque::new())),
+                Arc::new(Mutex::new(VecDeque::new())),
+                "C:/workspace",
+            )
+        };
+        assert_eq!(claim("chat-a"), Ok(()));
+        // Same chat is rejected first, even when the machine cap is free.
+        assert_eq!(claim("chat-a"), Err(ClaimError::AlreadyRunning));
+        // A second chat hits the machine-wide cap (Codex's AgentLimitReached).
+        assert_eq!(claim("chat-b"), Err(ClaimError::Limit { max: 1 }));
+        runs.finish("chat-a", None);
+        assert_eq!(claim("chat-b"), Ok(()));
     }
 }

@@ -105,7 +105,7 @@ const licenses = [
     'POCKET_TTS_LICENSE',
   ],
   [
-    path.resolve(frontend, '..', 'docs', 'rust-rewrite', 'THIRD_PARTY_VOICE.md'),
+    path.resolve(frontend, '..', 'backend-rs', 'crates', 'stark-voice', 'THIRD_PARTY_VOICE.md'),
     'THIRD_PARTY_VOICE.md',
   ],
 ];

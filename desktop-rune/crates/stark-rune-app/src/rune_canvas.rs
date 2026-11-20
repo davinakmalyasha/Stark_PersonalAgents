@@ -4082,10 +4082,10 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         .child(cell);
     if let Some(opacity) = fade {
         // React `.is-deleting` (`house-row-out`): 220ms fade and
-        // `translateX(-8px)`, then the row leaves the list. Rune
-        // cannot collapse a painted row in the same window without
-        // leaving its last layer under the row below, so the slot
-        // keeps its height until the 220ms timer drops it.
+        // `translateX(-8px)`, then the row leaves the list. Rune's flex
+        // min-content floors a partial height at the 20pt lead, so the slot
+        // keeps its height until the 220ms timer drops it; a forced height
+        // was measured and regressed to an inconsistent mid-fade box.
         wrap = wrap.opacity(opacity).offset(-8.0 * (1.0 - opacity), 0.0);
     }
     let mut out = vec![wrap];

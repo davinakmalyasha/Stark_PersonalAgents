@@ -567,7 +567,7 @@ remaining deltas are structural or one-to-many:
 
 | React | Rune | Why |
 | --- | --- | --- |
-| `.chat-row.is-deleting` collapses `max-height` | 220 ms opacity fade + `-8 px`, slot holds until the timer drops it | the sidebar list is not a growth stack; collapsing it safely is a separate list-layout refactor |
+| `.chat-row.is-deleting` collapses `max-height` | 220 ms opacity fade + `-8 px`, slot holds until the timer drops it | the 20 pt lead floors Rune's flex min-content; a forced-height spike measured an inconsistent mid-fade box, so this stays a separate list-layout refactor |
 | `.trace-collapsible` closes with `.28 s` height + `.18 s` opacity | the body fades in 180 ms; closing unmounts it at once while the growth stack settles the height | Rune's conditional body has no retained closing layer |
 | `voice-breathe` scales `.88`→`1.08` | 1.2 s opacity-only pulse | Rune has no infinite scale loop; the live dot is 5 px and top-right |
 | `.canvas-empty-add:hover > span { scale(1.04) }` | fill hover only | the icon is a text glyph with no separate presentation box |

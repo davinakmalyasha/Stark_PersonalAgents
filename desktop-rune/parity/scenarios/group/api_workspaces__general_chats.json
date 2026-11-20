@@ -1,0 +1,15 @@
+{
+  "chats": [
+    {
+      "createdAt": "2026-11-12T11:00:00Z",
+      "id": "chat-group",
+      "lastMessage": "Welcome to the group project.",
+      "lastRole": "agent",
+      "title": "Group project",
+      "updatedAt": "2026-11-12T11:40:00Z",
+      "workspaceId": "_general",
+      "workspaceKind": "general",
+      "workspaceName": "General"
+    }
+  ]
+}

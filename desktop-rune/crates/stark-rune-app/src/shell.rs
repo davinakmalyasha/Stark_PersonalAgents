@@ -1000,6 +1000,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             h,
         ));
     }
+    if s.canvas.projects.group.is_open() {
+        root = root.child(crate::group::modal::group_modal::<ShellState>(
+            &s.canvas.projects.group,
+            w,
+            h,
+        ));
+    }
     root
 }
 
@@ -1151,6 +1158,15 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     if s.canvas.sessions.deleting.is_some() {
         // ~60 fps while the row fades out.
         tx.wake_after(std::time::Duration::from_millis(16));
+    }
+    if s.canvas.projects.group.is_open() {
+        let g = &s.canvas.projects.group;
+        let wait = if g.loading || g.sending || g.busy_item.is_some() || g.op_busy.is_some() {
+            100
+        } else {
+            1000
+        };
+        tx.wake_after(std::time::Duration::from_millis(wait));
     }
     if tick_voice_breathe(s) {
         // `voice-breathe` is a 1.2 s scale/opacity keyframe. Rune has no
@@ -1435,13 +1451,20 @@ fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
 /// Drain the projects rail inbox; auto-refresh at most every 15s. Shared
 /// with the board via [`poll_projects_state`] — one drain path everywhere.
 fn poll_projects(s: &mut ShellState, clock: f64) -> bool {
-    poll_projects_state(&mut s.canvas.projects, clock)
+    let mut changed = poll_projects_state(&mut s.canvas.projects, clock);
+    changed |= s.canvas.projects.group.poll(clock);
+    changed |= crate::notes::poll_notes_state(&mut s.canvas.projects.group.notes);
+    changed
 }
 
 fn init_shell() -> ShellState {
     // The real app entry (native window and browser) loads live chats; unit
     // tests construct `ShellState::default()` and stay offline.
     let mut shell = ShellState::default();
+    shell.canvas.projects.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
+    shell.canvas.projects.port = crate::rune_transcript::api_port();
+    shell.canvas.projects.group.host = crate::rune_transcript::DEFAULT_API_HOST.to_string();
+    shell.canvas.projects.group.port = crate::rune_transcript::api_port();
     shell.chats.auto = true;
     // The dock's provider/model pills load on mount (React's PromptDock
     // effect), then refresh on their intervals.
@@ -1523,6 +1546,22 @@ fn apply_settings(s: &mut ShellState) {
     );
 }
 
+fn apply_group(s: &mut ShellState) {
+    s.canvas.rail = RailTab::Group;
+    s.canvas.projects.group.open(
+        crate::rune_transcript::DEFAULT_API_HOST.to_string(),
+        crate::rune_transcript::api_port(),
+        "p1".to_string(),
+    );
+}
+
+fn apply_group_loading(s: &mut ShellState) {
+    s.canvas.rail = RailTab::Group;
+    let g = &mut s.canvas.projects.group;
+    g.open_id = Some("p1".to_string());
+    g.loading = true;
+}
+
 fn apply_ask(s: &mut ShellState) {
     // Same sheet wiring as the other demo routes; the thread owns a pending
     // batch so the dock renders the ask panel instead of the composer.
@@ -1574,6 +1613,8 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("attachments-lightbox", apply_shell_attachments_lightbox),
         ("ask", apply_ask),
         ("voice", apply_voice),
+        ("group", apply_group),
+        ("group-loading", apply_group_loading),
         ("settings", apply_settings),
         ("cloud", apply_panel_cloud),
         ("memory", apply_panel_memory),
@@ -1928,6 +1969,37 @@ mod tests {
         assert_eq!(rt.state.memory.workspaces[0].entries, 7);
         rt.frame(0.0);
         assert!(rt.find("memory-ws-_general-name").is_some());
+    }
+
+    #[test]
+    fn a_project_card_opens_the_group_modal() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.projects = vec![crate::projects::GroupProject {
+            id: "p1".to_string(),
+            title: "Analytics".to_string(),
+            status: "running".to_string(),
+            done: 1,
+            total: 4,
+            waiting: 1,
+        }];
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("side-projects-p1").expect("project card");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.canvas.projects.group.open_id.as_deref(),
+            Some("p1")
+        );
+        assert!(rt.find("gp-modal").is_some(), "modal mounts immediately");
+        assert!(
+            rt.find("gp-skeleton").is_some(),
+            "detail starts as skeleton"
+        );
     }
 
     #[test]

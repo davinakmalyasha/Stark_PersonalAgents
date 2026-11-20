@@ -368,6 +368,18 @@ pub fn now_iso() -> String {
     )
 }
 
+/// Markdown for a surface outside the transcript (group chat, board item
+/// reports). The wrapper keeps `md_render` private while reusing its exact
+/// block, code, table and task-list geometry.
+pub fn render_markdown_standalone(
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    style: rune::tok::TextStyle,
+) -> rune::El {
+    md_render::render_body_standalone(key, body, body_ink, style)
+}
+
 /// `02:44 PM` (`CanvasChatBubble clock()`): the browser's local 12h clock.
 /// Empty in, empty out.
 pub fn clock(iso: &str) -> String {

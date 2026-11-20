@@ -121,6 +121,8 @@ pub struct ProjectsState {
     pub new_open: bool,
     pub goal_edit: rune::TextEdit,
     pub creating: bool,
+    /// Detail modal/chat/rail state (`GroupProjectModal`).
+    pub group: crate::group::GroupState,
 }
 
 impl std::fmt::Debug for ProjectsState {
@@ -149,6 +151,7 @@ impl Clone for ProjectsState {
             new_open: self.new_open,
             goal_edit: self.goal_edit.clone(),
             creating: self.creating,
+            group: self.group.clone(),
         }
     }
 }
@@ -169,6 +172,7 @@ impl Default for ProjectsState {
             new_open: false,
             goal_edit: rune::TextEdit::new(""),
             creating: false,
+            group: crate::group::GroupState::default(),
         }
     }
 }
@@ -332,7 +336,7 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
         );
     }
     for p in &s.projects {
-        body = body.child(project_card("side-projects", p, true));
+        body = body.child(project_card::<S>("side-projects", p, true));
     }
     if p_waiting_note(s) {
         body = body.child(
@@ -410,12 +414,13 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
 
 /// One project card. `prefix` namespaces keys (`projects` board vs
 /// `side-projects` section); `compact` tightens padding/type for the rail.
-fn project_card(prefix: &str, p: &GroupProject, compact: bool) -> El {
+fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compact: bool) -> El {
     let (pad_x, pad_y, title_size) = if compact {
         (10.0, 8.0, 12.0)
     } else {
         (14.0, 12.0, 13.0)
     };
+    let open_id = p.id.clone();
     let mut card = col()
         .key(format!("{prefix}-{id}", id = p.id))
         .w_full()
@@ -425,6 +430,14 @@ fn project_card(prefix: &str, p: &GroupProject, compact: bool) -> El {
         .border(1.0, ink("#ffffff14"))
         .px(pad_x)
         .py(pad_y)
+        .role("button")
+        .label(format!("Open project {}", p.title))
+        .hover(ink("#ffffff0a"))
+        .on_press(move |s: &mut S| {
+            let projects = s.projects_mut();
+            let (host, port) = (projects.host.clone(), projects.port);
+            projects.group.open(host, port, open_id.clone());
+        })
         .child(
             row()
                 .key(format!("{prefix}-{id}-head", id = p.id))

@@ -532,6 +532,34 @@ label, 10 pt copy), the always-mounted empty home card ("What to do Boss?"),
 and `No chats yet.` in the sidebar. The add FAB and the map hint are absent
 while the board is empty, matching `items.length > 0`.
 
+## Group project surface (2026-11-21)
+
+`--scenario group` is the deterministic detail fixture:
+
+```bash
+python desktop-rune/parity/mock_server.py --port 8128 --scenario group
+# Rune
+cd desktop-rune
+STARK_API_PORT=8128 D:/cargo-target/stark/debug/stark-rune.exe \
+  --rune-shell-snap group.png --rune-route group --size 1280x900 --at 1.8
+# React (rail Group → first project)
+python desktop-rune/parity/capture_react.py group-react.png \
+  --url http://localhost:5201/ --size 1280x900 \
+  --click 22,178 --click2 200,110
+```
+
+The fixture carries two milestones, four items (one awaiting approval), three
+members, persisted messages and an event log, so the same capture covers the
+chat, approval card, progress rail, board, team and activity tabs.
+
+Geometry matches React: the modal is `1180×860` at `(50,20)` on 1280×900 and
+`776×553` at `(12,10)` below 900 px; the rail is 350 pt on desktop and hidden
+behind the mobile toggle; the skeleton is 16/12/12 plus 24/36/36/36 blocks on
+the same 24 pt gutters. The 3 s detail poll reloads without replaying the modal
+entrance. Remaining visual differences are the action glyphs above and the
+dark shell behind the backdrop (the route opens the modal before the Group
+list has fetched).
+
 ## Interaction sweep (2026-11-20)
 
 The motion pass is split into shared primitives (`motion.rs`) and per-surface
@@ -548,6 +576,8 @@ These scripted poses exercise the paths against the fixture server:
 | `trace_open.json` | open `msg-0a4560f6`'s trace; groups fade/rise, the body fades 180 ms, the header chevron rotates |
 | `trace_close.json` | open, then close the trace; the row folds over 280 ms |
 | `sidebar_delete.json` | two deletes; the 34.8 pt row fades, slides and collapses |
+| `group_rail_open.json` | below 900 px, open the mobile details rail |
+| `group_details.json` | open the Details tab and the activity log |
 | `canvas_add_menu.json` | tap `canvas-add`; capture 1.06/1.20 for the `.985` menu settle |
 | `agent_config_open.json` | tap `composer-provider`; backdrop 200 ms, panel 240 ms |
 | `canvas_card_hover.json` | hover the right-hand card; 1 pt lift + border track |
@@ -580,7 +610,7 @@ remaining deltas are structural or one-to-many:
 | React | Rune | Why |
 | --- | --- | --- |
 | `.trace-collapsible` closes with `.28 s` height + `.18 s` opacity | the body unmounts at once; the completed row `fold_glide`s its height over 280 ms | Rune draws presence exits outside ancestor clips, so a retained body ghosts below the folded header |
-| `.gp-skeleton` 1.4 s shimmer | not ported yet | this arrives with the group-project modal/chat milestone |
+| Group dialog action icons | text glyphs (`▤`, `✎`, `▱`, `✕`, `✓`) at the same boxes | the port reuses the existing icon vocabulary; Lucide paths for the modal chrome are a later polish pass |
 
 The sidebar delete now collapses its 34.8 pt slot on the CSS bezier (content
 absolute, the list lands layout immediately), the trace body fades in over
@@ -612,7 +642,7 @@ Dead keyframes (`.voice-orb` 1.5 s, `canvas-dot-pulse` 1.4 s) are omitted.
 | trace-live spinner | 1.8 s (`index.css:245`) | `rotation(1.8)` |
 | subagent spinner | 1.6 s (`index.css:317`) | `rotation(1.6)` |
 | tool/retry spinner | 1 s `animate-spin` | `rotation(1.0)` |
-| skeleton | 1.4 s (`house.css:737`) | not ported (group-project surfaces) |
+| group skeleton | 1.4 s (`house.css:737`) | linear gradient slide, 1.4 s |
 
 Rune's canvas status dot is static, matching `.canvas-card-status-dot`; the
 extra 2.2 s badge pulse was removed. Reduce Motion zeroes looping amplitude

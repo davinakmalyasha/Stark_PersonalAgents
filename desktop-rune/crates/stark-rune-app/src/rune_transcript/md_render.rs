@@ -580,6 +580,35 @@ pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
     )
 }
 
+/// Standalone markdown for surfaces outside the transcript (group chat and
+/// board item reports). Code copy still works; its feedback lives on a
+/// throwaway thread because these surfaces have no message row.
+pub(crate) fn render_body_standalone(
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    style: TextStyle,
+) -> El {
+    let host = super::RuneTranscriptState::empty_home();
+    let blocks = parse_cached(body);
+    if blocks.is_empty() {
+        return col().key(format!("{key}-md"));
+    }
+    blocks_inner::<super::RuneTranscriptState>(
+        &host,
+        Thread::Main,
+        key,
+        &blocks,
+        style,
+        0,
+        false,
+        false,
+        ink(body_ink),
+        false,
+        false,
+    )
+}
+
 /// `.markdown-compact`: activity notes (12.5pt / 1.7, 4pt paragraphs).
 pub(super) fn render_body_compact<S: TranscriptHost + 'static>(
     s: &S,

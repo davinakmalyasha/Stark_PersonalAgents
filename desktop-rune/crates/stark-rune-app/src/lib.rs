@@ -24,6 +24,9 @@ pub mod cloud;
 #[path = "composer.rs"]
 pub mod composer;
 #[cfg(feature = "rune-real")]
+#[path = "group/mod.rs"]
+pub mod group;
+#[cfg(feature = "rune-real")]
 #[path = "icons.rs"]
 pub mod icons;
 #[cfg(feature = "rune-real")]

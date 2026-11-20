@@ -107,8 +107,10 @@ periods; the caret uses a near-step `Cycle` for `steps(1)`. Hover and spatial
 transitions respect Reduce Motion through Rune's motion gate (offsets snap,
 opacity still fades).
 
-The remaining delta is the group-project skeleton surface, which arrives with
-the modal/chat milestone; details are in `parity/README.md`.
+The group-project modal, chat, approval cards, 3 s detail poll, progress rail,
+board/team/details tabs and skeleton shimmer are now ported. The remaining
+visual delta is the modal chrome's text glyphs (the layout boxes match the
+Lucide icons); details and the deterministic fixture are in `parity/README.md`.
 
 ## Transcript (MessageStream port)
 

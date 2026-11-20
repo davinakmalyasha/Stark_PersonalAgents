@@ -1102,19 +1102,31 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(rune::Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.7,
-        })
         .center()
         .modal(true, move |s: &mut S| {
             s.thread_mut(which).agent_config.open = false;
         })
+        // React mounts a separate `modal-backdrop-enter` layer; keeping it a
+        // sibling lets the card fade/rise on its own clock.
+        .child(
+            rune::el()
+                .key("agentcfg-backdrop")
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .fill(rune::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.7,
+                })
+                .backdrop_blur(12.0)
+                .transition(crate::motion::backdrop_enter()),
+        )
         .child(
             col()
                 .key("agentcfg-card")
+                .transition(crate::motion::modal_enter())
                 .w(900.0)
                 .radius(16.0)
                 .fill(ink("#09090b"))
@@ -1356,6 +1368,7 @@ mod tests {
         rt.frame(0.0);
         for key in [
             "agentcfg-overlay",
+            "agentcfg-backdrop",
             "agentcfg-card",
             "agentcfg-title",
             "agentcfg-active",

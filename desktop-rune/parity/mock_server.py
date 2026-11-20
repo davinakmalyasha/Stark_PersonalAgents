@@ -105,8 +105,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
+        path = self.path.split("?", 1)[0]
+        if path == "/api/migration/import":
+            source = "appdata"
+            try:
+                source = json.loads(body or b"{}").get("source", source)
+            except ValueError:
+                pass
+            self._json(200, {
+                "ok": True,
+                "copied": ["chats.db", "sessions", "config"],
+                "message": f"Imported {source}.",
+            })
+            return
+        if path == "/api/data/import":
+            self._json(200, {
+                "ok": True,
+                "restart_required": True,
+                "from_root": r"C:\fixture-backup",
+                "to_root": r"C:\Stark\harness",
+            })
+            return
         self._json(200, {"ok": True})
 
     def do_DELETE(self) -> None:  # noqa: N802

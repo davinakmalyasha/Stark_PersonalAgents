@@ -513,6 +513,94 @@ async fn post_run_stream_inner(
     Ok(status)
 }
 
+/// A downloaded file: body bytes plus the server's `Content-Disposition`
+/// filename when one is present.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Download {
+    pub bytes: Vec<u8>,
+    pub filename: String,
+}
+
+/// Blocking `GET` returning raw bytes and the attachment filename. Used by
+/// Settings' backup export; native only (see `post_run`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn download_file(host: &str, port: u16, path: &str) -> Result<Download, String> {
+    let (mut reader, chunked, headers) =
+        request_with_headers(host, port, "GET", path, "Accept: application/zip\r\n", &[])?;
+    let mut bytes = Vec::new();
+    for piece in read_body(&mut reader, chunked)? {
+        bytes.extend_from_slice(&piece);
+    }
+    let filename = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-disposition"))
+        .and_then(|(_, value)| attachment_filename(value))
+        .unwrap_or_else(|| "stark-backup.zip".to_string());
+    Ok(Download { bytes, filename })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn attachment_filename(value: &str) -> Option<String> {
+    let marker = "filename=\"";
+    let start = value.find(marker)? + marker.len();
+    let rest = &value[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Upload one Stark backup zip with the optional projects root
+/// (`POST /api/data/import`), returning the staged-import JSON. Native only:
+/// the picker and local file paths exist only there.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn upload_backup(
+    host: &str,
+    port: u16,
+    file: &std::path::Path,
+    projects_root: &str,
+) -> Result<serde_json::Value, String> {
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("invalid file name: {}", file.display()))?
+        .replace(['"', '\r', '\n'], "_");
+    let bytes = std::fs::read(file).map_err(|e| format!("read {name}: {e}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let boundary = format!("----stark-rune-backup-{stamp:x}");
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/zip\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(b"\r\n");
+    let root = projects_root.trim();
+    if !root.is_empty() {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"projects_root\"\r\n\r\n{root}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let head = format!(
+        "Content-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nAccept: application/json\r\n",
+        body.len()
+    );
+    let (mut reader, chunked) = request(host, port, "POST", "/api/data/import", &head, &body)?;
+    let mut raw = Vec::new();
+    for piece in read_body(&mut reader, chunked)? {
+        raw.extend_from_slice(&piece);
+    }
+    serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
+}
+
 /// Open a connection, send the request, and return a reader past the
 /// response headers plus whether the body is chunked.
 #[cfg(not(target_arch = "wasm32"))]
@@ -524,6 +612,24 @@ fn request(
     headers: &str,
     body: &[u8],
 ) -> Result<(BufReader<TcpStream>, bool), String> {
+    let (reader, chunked, _) = request_with_headers(host, port, method, path, headers, body)?;
+    Ok((reader, chunked))
+}
+
+/// Response headers, lowercased names in wire order.
+#[cfg(not(target_arch = "wasm32"))]
+type ResponseHeaders = Vec<(String, String)>;
+
+/// [`request`] plus the response headers.
+#[cfg(not(target_arch = "wasm32"))]
+fn request_with_headers(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> Result<(BufReader<TcpStream>, bool, ResponseHeaders), String> {
     let addr = format!("{host}:{port}");
     let mut sock = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -544,6 +650,7 @@ fn request(
         return Err(format!("HTTP {}", status.trim()));
     }
     let mut chunked = false;
+    let mut headers_out = Vec::new();
     loop {
         let mut line = String::new();
         reader
@@ -553,11 +660,16 @@ fn request(
         if t.is_empty() {
             break;
         }
-        if t.to_ascii_lowercase().starts_with("transfer-encoding:") && t.contains("chunked") {
-            chunked = true;
+        if let Some((name, value)) = t.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+            headers_out.push((name, value));
         }
     }
-    Ok((reader, chunked))
+    Ok((reader, chunked, headers_out))
 }
 
 /// Read one body as pieces (streaming-friendly): chunk frames when chunked,
@@ -629,6 +741,99 @@ mod tests {
         dec.push("90.4\"}\n\n".as_bytes(), &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].data["text"], serde_json::json!("42 …90.4"));
+    }
+
+    #[test]
+    fn download_reads_the_backup_filename_and_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert!(
+                request_line.starts_with("GET /api/data/export "),
+                "{request_line}"
+            );
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = b"PK\x03\x04zip";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Disposition: attachment; filename=\"stark-backup-20260101-120000.zip\"\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(body).unwrap();
+        });
+        let download = download_file("127.0.0.1", port, "/api/data/export").unwrap();
+        server.join().unwrap();
+        assert_eq!(download.filename, "stark-backup-20260101-120000.zip");
+        assert_eq!(download.bytes, b"PK\x03\x04zip");
+    }
+
+    #[test]
+    fn backup_upload_sends_zip_and_projects_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "stark-backup-upload-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stark-backup.zip");
+        std::fs::write(&path, b"PK\x03\x04zip").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("Content-Length:") {
+                    content_len = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+            assert!(
+                request_line.starts_with("POST /api/data/import "),
+                "{request_line}"
+            );
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("name=\"file\"; filename=\"stark-backup.zip\""),
+                "{body}"
+            );
+            assert!(
+                body.contains("name=\"projects_root\"\r\n\r\nC:\\Projects"),
+                "{body}"
+            );
+            let json =
+                r#"{"ok":true,"restart_required":true,"from_root":"C:\\old","to_root":"C:\\new"}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+        let value = upload_backup("127.0.0.1", port, &path, r"C:\Projects").unwrap();
+        server.join().unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["restart_required"], true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Multipart upload over a real socket: path, boundary, file part, and

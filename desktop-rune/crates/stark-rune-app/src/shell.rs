@@ -35,6 +35,10 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
+    rune::Color { r, g, b, a }
+}
+
 /// One stroked icon from a 24×24 path, Lucide geometry scaled to `size`.
 fn icon_shape(path: Path, size: f32, color: rune::Color) -> Shape {
     Shape::new()
@@ -186,6 +190,8 @@ pub struct ShellState {
     pub memory: MemoryState,
     /// Live chat list + open-tab snapshot (sidebar, cards, history).
     pub chats: crate::chats::ChatsState,
+    /// Global Settings modal (Tauri's modal lives above every chat).
+    pub settings: crate::settings::SettingsState,
 }
 
 impl Default for ShellState {
@@ -206,7 +212,17 @@ impl Default for ShellState {
             house: HouseState::default(),
             memory: MemoryState::default(),
             chats: crate::chats::ChatsState::default(),
+            settings: crate::settings::SettingsState::default(),
         }
+    }
+}
+
+impl crate::settings::SettingsHost for ShellState {
+    fn settings(&self) -> &crate::settings::SettingsState {
+        &self.settings
+    }
+    fn settings_mut(&mut self) -> &mut crate::settings::SettingsState {
+        &mut self.settings
     }
 }
 
@@ -324,7 +340,12 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .hover_group()
         .on_press(move |s: &mut ShellState| {
             s.canvas.select_card(&select);
-        })
+        });
+    if !active {
+        // SessionTabs inactive: hover:bg-white/[0.05] hover:text-zinc-200.
+        el = el.hover(rgba(1.0, 1.0, 1.0, 0.05));
+    }
+    el = el
         .child(
             rune::el()
                 .key(format!("session-{id}-icon"))
@@ -341,15 +362,20 @@ fn session_tab(s: &ShellState, id: &str) -> El {
                     tab_chat_icon(12.0, ink(if active { "#e4e4e7" } else { "#71717a" }))
                 }),
         )
-        .child(
-            text(title_text)
+        .child({
+            let title = text(title_text)
                 .key(format!("session-{id}-title"))
                 .grow(1.0)
                 .min_w(0.0)
                 .truncate()
                 .font(title_style)
-                .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
-        );
+                .color(ink(if active { "#ffffff" } else { "#a1a1aa" }));
+            if active {
+                title
+            } else {
+                title.group_color(ink("#e4e4e7"))
+            }
+        });
     if running {
         // `session-run-dot` (6pt, breathing glow) between title and close.
         el = el.child(
@@ -371,28 +397,48 @@ fn session_tab(s: &ShellState, id: &str) -> El {
             .center()
             .radius(6.0)
             .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
+            .hover(rgba(1.0, 1.0, 1.0, if active { 0.12 } else { 0.10 }))
+            .hover_group()
             .on_press(move |s: &mut ShellState| {
                 s.canvas.close_session(&close);
             })
-            .child(rune::el().size(11.0, 11.0).inert().shape({
-                let color = ink(if active { "#71717a" } else { "#52525b" });
-                Shape::new()
-                    .line(
-                        [6.0, 6.0],
-                        [18.0, 18.0],
-                        crate::lucide_stroke(11.0),
-                        LineCap::Round,
-                        color,
+            .child({
+                let x_icon = |color: rune::Color| {
+                    Shape::new()
+                        .line(
+                            [6.0, 6.0],
+                            [18.0, 18.0],
+                            crate::lucide_stroke(11.0),
+                            LineCap::Round,
+                            color,
+                        )
+                        .line(
+                            [18.0, 6.0],
+                            [6.0, 18.0],
+                            crate::lucide_stroke(11.0),
+                            LineCap::Round,
+                            color,
+                        )
+                        .view_box(24.0, 24.0)
+                };
+                rune::el()
+                    .size(11.0, 11.0)
+                    .inert()
+                    .child(
+                        rune::el()
+                            .size(11.0, 11.0)
+                            .inert()
+                            .shape(x_icon(ink(if active { "#71717a" } else { "#52525b" }))),
                     )
-                    .line(
-                        [18.0, 6.0],
-                        [6.0, 18.0],
-                        crate::lucide_stroke(11.0),
-                        LineCap::Round,
-                        color,
+                    .child(
+                        rune::el()
+                            .size(11.0, 11.0)
+                            .absolute(0.0, 0.0)
+                            .inert()
+                            .group_opacity(0.0, 1.0)
+                            .shape(x_icon(ink("#ffffff"))),
                     )
-                    .view_box(24.0, 24.0)
-            })),
+            }),
     );
     if active {
         el = el
@@ -473,16 +519,35 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
         .size(36.0, 36.0)
         .radius(12.0)
         .center()
+        .hover_group()
         .on_press(move |s: &mut ShellState| {
             s.canvas.rail = tab;
         })
-        .child(
-            rune::el()
+        // `.house-rail-btn:active { transform: scale(.94) }`.
+        .press_scale(0.94)
+        .child({
+            let mut icon = rune::el()
                 .key(format!("rail-{}-icon", tab.label()))
                 .size(17.0, 17.0)
                 .inert()
-                .shape(rail_icon(tab, 17.0, color)),
-        );
+                .child(
+                    rune::el()
+                        .size(17.0, 17.0)
+                        .inert()
+                        .shape(rail_icon(tab, 17.0, color)),
+                );
+            if !active {
+                icon = icon.child(
+                    rune::el()
+                        .size(17.0, 17.0)
+                        .absolute(0.0, 0.0)
+                        .inert()
+                        .group_opacity(0.0, 1.0)
+                        .shape(rail_icon(tab, 17.0, ink("#e4e4e7"))),
+                );
+            }
+            icon
+        });
     if active {
         el = el.fill(rune::Color {
             r: 1.0,
@@ -490,6 +555,9 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
             b: 1.0,
             a: 0.10,
         });
+    } else {
+        // HouseRail inactive: hover:text-zinc-200 hover:bg-white/[0.07].
+        el = el.hover(rgba(1.0, 1.0, 1.0, 0.07));
     }
     el
 }
@@ -598,12 +666,6 @@ fn active_chat_sheets(s: &ShellState) -> Vec<El> {
         return Vec::new();
     };
     let mut sheets = Vec::new();
-    if t.settings_open {
-        sheets.push(crate::rune_transcript::settings_sheet::<ShellState>(
-            t,
-            Thread::Open,
-        ));
-    }
     if t.notes.open {
         sheets.push(crate::notes::notes_sheet::<ShellState>(
             &t.notes,
@@ -688,33 +750,67 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             .radius(8.0)
             .border(1.0, ink("#ffffff1f"))
             .border_dash(3.0, 3.0)
+            .hover(rgba(1.0, 1.0, 1.0, 0.04))
+            .hover_group()
             .on_press(move |s: &mut ShellState| {
                 s.canvas.new_session();
             })
-            .child(rune::el().size(13.0, 13.0).inert().shape({
-                let color = ink("#71717a");
-                Shape::new()
-                    .line(
-                        [12.0, 5.0],
-                        [12.0, 19.0],
-                        crate::lucide_stroke(13.0),
-                        LineCap::Round,
-                        color,
+            .child({
+                let plus = |color: rune::Color| {
+                    Shape::new()
+                        .line(
+                            [12.0, 5.0],
+                            [12.0, 19.0],
+                            crate::lucide_stroke(13.0),
+                            LineCap::Round,
+                            color,
+                        )
+                        .line(
+                            [5.0, 12.0],
+                            [19.0, 12.0],
+                            crate::lucide_stroke(13.0),
+                            LineCap::Round,
+                            color,
+                        )
+                        .view_box(24.0, 24.0)
+                };
+                rune::el()
+                    .size(13.0, 13.0)
+                    .inert()
+                    .child(
+                        rune::el()
+                            .size(13.0, 13.0)
+                            .inert()
+                            .shape(plus(ink("#71717a"))),
                     )
-                    .line(
-                        [5.0, 12.0],
-                        [19.0, 12.0],
-                        crate::lucide_stroke(13.0),
-                        LineCap::Round,
-                        color,
+                    .child(
+                        rune::el()
+                            .size(13.0, 13.0)
+                            .absolute(0.0, 0.0)
+                            .inert()
+                            .group_opacity(0.0, 1.0)
+                            .shape(plus(ink("#e4e4e7"))),
                     )
-                    .view_box(24.0, 24.0)
-            }))
+            })
             .child(
                 text("New session".to_string())
                     .key("session-new-label")
                     .font(new_style)
-                    .color(ink("#71717a")),
+                    .color(ink("#71717a"))
+                    .group_color(ink("#e4e4e7")),
+            )
+            .child(
+                // hover:border-white/[0.28] — borders don't take a hover
+                // colour in Rune, so overlay the brighter dashed edge.
+                rune::el()
+                    .absolute(0.0, 0.0)
+                    .w_full()
+                    .h_full()
+                    .radius(8.0)
+                    .border(1.0, rgba(1.0, 1.0, 1.0, 0.28))
+                    .border_dash(3.0, 3.0)
+                    .group_opacity(0.0, 1.0)
+                    .inert(),
             ),
     );
     let folded = w < PANEL_FOLD_W;
@@ -736,15 +832,31 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .size(36.0, 36.0)
                 .radius(12.0)
                 .center()
+                .hover(rgba(1.0, 1.0, 1.0, 0.07))
+                .hover_group()
                 .on_press(move |s: &mut ShellState| {
                     s.canvas.new_session();
                 })
+                .press_scale(0.94)
                 .child(
                     rune::el()
                         .key("rail-new-icon")
                         .size(17.0, 17.0)
                         .inert()
-                        .shape(icon_new_chat(17.0, ink("#71717a"))),
+                        .child(
+                            rune::el()
+                                .size(17.0, 17.0)
+                                .inert()
+                                .shape(icon_new_chat(17.0, ink("#71717a"))),
+                        )
+                        .child(
+                            rune::el()
+                                .size(17.0, 17.0)
+                                .absolute(0.0, 0.0)
+                                .inert()
+                                .group_opacity(0.0, 1.0)
+                                .shape(icon_new_chat(17.0, ink("#e4e4e7"))),
+                        ),
                 ),
         )
         .child(
@@ -767,18 +879,41 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .size(36.0, 36.0)
                 .radius(12.0)
                 .center()
+                .hover(rgba(1.0, 1.0, 1.0, 0.07))
+                .hover_group()
                 .on_press(move |s: &mut ShellState| {
-                    let id = s.canvas.active_id.clone();
-                    if !id.is_empty() {
-                        s.canvas.thread_mut(&id).settings_open = true;
-                    }
+                    let (host, port) = s
+                        .canvas
+                        .sheet_thread()
+                        .map(|t| (t.api_host.clone(), t.api_port))
+                        .unwrap_or_else(|| {
+                            (
+                                crate::rune_transcript::DEFAULT_API_HOST.to_string(),
+                                crate::rune_transcript::api_port(),
+                            )
+                        });
+                    s.settings.open(host, port);
                 })
+                .press_scale(0.94)
                 .child(
                     rune::el()
                         .key("rail-settings-icon")
                         .size(17.0, 17.0)
                         .inert()
-                        .shape(icon_settings(17.0, ink("#71717a"))),
+                        .child(
+                            rune::el()
+                                .size(17.0, 17.0)
+                                .inert()
+                                .shape(icon_settings(17.0, ink("#71717a"))),
+                        )
+                        .child(
+                            rune::el()
+                                .size(17.0, 17.0)
+                                .absolute(0.0, 0.0)
+                                .inert()
+                                .group_opacity(0.0, 1.0)
+                                .shape(icon_settings(17.0, ink("#e4e4e7"))),
+                        ),
                 ),
         );
     let stage_w = (w - RAIL_W - if folded { 0.0 } else { PANEL_W }).max(320.0);
@@ -821,6 +956,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .w_full()
         .h_full()
         .fill(ink("#0a0a0a"))
+        .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
         .child(tabs)
         .child(main);
     if folded {
@@ -830,17 +966,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .key("side-drawer")
                 .absolute(RAIL_W, TAB_H)
                 .h((h - TAB_H).max(0.0))
+                // `.house-drawer-enter`: 280 ms fade and a 10 pt left push.
+                .transition(crate::motion::drawer_enter())
                 .child(side_panel(s)),
         );
     }
     if s.canvas.agents.selected.is_some() {
         root = root.child(crate::agents::agent_sheet::<ShellState>(&s.canvas.agents));
-    }
-    if s.transcript.settings_open {
-        root = root.child(crate::rune_transcript::settings_sheet::<ShellState>(
-            &s.transcript,
-            Thread::Main,
-        ));
     }
     if let Some(file) = s.transcript.attachment_preview.clone() {
         root = root.child(crate::rune_transcript::attachment_lightbox::<ShellState>(
@@ -856,6 +988,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     }
     for sheet in active_chat_sheets(s) {
         root = root.child(sheet);
+    }
+    if s.settings.open {
+        root = root.child(crate::settings::settings_sheet::<ShellState>(
+            &s.settings,
+            w,
+            h,
+        ));
     }
     root
 }
@@ -962,6 +1101,7 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed |= poll_memory(s, clock);
     changed |= poll_projects(s, clock);
     changed |= crate::agents::poll_agents_state(&mut s.canvas.agents, clock);
+    changed |= crate::settings::poll_settings(&mut s.settings);
     changed |= poll_cloud_state(&mut s.cloud, clock);
     changed |= poll_chats(s, clock);
     // Async results arrive on channels, not on input: keep polling until
@@ -983,7 +1123,10 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         || s.cloud.loading
         || s.cloud.board_loading
         || s.canvas.projects.loading
-        || s.canvas.agents.loading;
+        || s.canvas.agents.loading
+        || s.settings.loading
+        || s.settings.busy
+        || s.settings.backup_busy;
     if busy {
         tx.wake_after(std::time::Duration::from_millis(100));
     }
@@ -1342,6 +1485,13 @@ fn apply_shell_attachments_lightbox(s: &mut ShellState) {
     }
 }
 
+fn apply_settings(s: &mut ShellState) {
+    s.settings.open(
+        crate::rune_transcript::DEFAULT_API_HOST.to_string(),
+        crate::rune_transcript::api_port(),
+    );
+}
+
 fn apply_ask(s: &mut ShellState) {
     // Same sheet wiring as the other demo routes; the thread owns a pending
     // batch so the dock renders the ask panel instead of the composer.
@@ -1374,6 +1524,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("attachments", apply_shell_attachments),
         ("attachments-lightbox", apply_shell_attachments_lightbox),
         ("ask", apply_ask),
+        ("settings", apply_settings),
         ("cloud", apply_panel_cloud),
         ("memory", apply_panel_memory),
         // Compatibility aliases: everything lands on the one page.
@@ -1457,6 +1608,28 @@ mod tests {
         assert_eq!(rt.state.canvas.rail, RailTab::Cloud);
         assert!(rt.find("cloud-board").is_some());
         assert!(rt.find("canvas-world").is_some(), "canvas stays mounted");
+    }
+
+    #[test]
+    fn rail_gear_opens_the_global_settings_modal() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("rail-settings").expect("settings gear");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.settings.open);
+        for key in ["settings-card", "settings-backdrop", "settings-title"] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        // Backdrop press dismisses the global modal, not a chat thread's.
+        rt.pointer_down(100.0, 100.0);
+        rt.pointer_up(100.0, 100.0);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.settings.open);
     }
 
     #[test]

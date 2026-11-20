@@ -159,8 +159,13 @@ fn inlines(runs: &mut Runs, list: &[stark_kit::markdown::Inline], italic: bool) 
                 if runs.text.len() > start {
                     runs.spans[at].start = start as u32;
                     runs.spans[at].end = runs.text.len() as u32;
-                    runs.links
-                        .push(rune::Link::new(start..runs.text.len(), href.clone()));
+                    runs.links.push(
+                        rune::Link::new(start..runs.text.len(), href.clone()).hover(
+                            rune::LinkPaint::new()
+                                .color(ink("#93c5fd"))
+                                .underline(ink("#60a5fa")),
+                        ),
+                    );
                 } else {
                     runs.spans.remove(at);
                 }
@@ -1013,9 +1018,16 @@ fn code_block<S: TranscriptHost + 'static>(
     let copy_key = format!("{key}-copy");
     let copied = s.thread(which).copied_code.as_deref() == Some(copy_key.as_str());
     let icon = if copied {
-        icon_check(13.0, ink("#34d399"))
+        rune::el()
+            .size(13.0, 13.0)
+            .inert()
+            .shape(icon_check(13.0, ink("#34d399")))
     } else {
-        home_icon_copy(13.0, ink("#a1a1aa"))
+        crate::motion::hover_icon(
+            13.0,
+            home_icon_copy(13.0, ink("#a1a1aa")),
+            home_icon_copy(13.0, ink("#e4e4e7")),
+        )
     };
     let copy = rune::el()
         .key(copy_key.clone())
@@ -1026,8 +1038,9 @@ fn code_block<S: TranscriptHost + 'static>(
         .center()
         .fill(rgba(39.0, 39.0, 42.0, 0.8))
         .hover(rgba(63.0, 63.0, 70.0, 0.9))
+        .hover_group()
         .pin(None, Some(8.0), Some(8.0), None)
-        .child(rune::el().size(13.0, 13.0).inert().shape(icon))
+        .child(icon)
         .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
             let t = s.thread_mut(which);
             t.copied_code = Some(copy_key.clone());

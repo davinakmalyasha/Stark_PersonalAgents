@@ -344,7 +344,9 @@ fn arc_to(
         rx *= s;
         ry *= s;
     }
-    let sign = if large != sweep { -1.0 } else { 1.0 };
+    // SVG 2 F.6.5: the centre on the positive side is chosen when the
+    // large-arc and sweep flags differ; `large == sweep` flips the sign.
+    let sign = if large == sweep { -1.0 } else { 1.0 };
     let num = (rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p).max(0.0);
     let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
     let coef = if den <= f32::EPSILON {

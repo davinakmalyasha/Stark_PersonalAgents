@@ -67,6 +67,21 @@ fn check_circle(size: f32, color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
+/// One down chevron, rotated up while open. CSS rotates the same glyph, so
+/// the disclosure keeps its shape and springs instead of swapping bitmaps.
+fn rotating_chevron(size: f32, open: bool, color: rune::Color, hover: rune::Color) -> El {
+    rune::el()
+        .size(size, size)
+        .inert()
+        .rotate(if open { std::f32::consts::PI } else { 0.0 })
+        .rotate_motion(crate::motion::ROTATE)
+        .child(crate::motion::hover_icon(
+            size,
+            chevron(size, true, color),
+            chevron(size, true, hover),
+        ))
+}
+
 fn chevron(size: f32, down: bool, color: rune::Color) -> rune::Shape {
     let p = if down {
         rune::Path::new()
@@ -267,6 +282,7 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                     .py(7.0)
                     .radius(7.0)
                     .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
+                    .hover_group()
                     .on_press({
                         let row_key = row_key.to_string();
                         let item_key = group_key.clone();
@@ -281,6 +297,7 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                             .key(format!("{row_key}-{group_key}-title"))
                             .font(style(15.0, 600.0))
                             .color(home_ink("#d3d4d9"))
+                            .group_color(home_ink("#e2e2e5"))
                             .truncate()
                             .grow(1.0)
                             .min_w(0.0),
@@ -294,10 +311,16 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                 } else {
                     header
                 };
-                let header = header.child(icon_box(14.0, chevron(14.0, open, home_ink("#747781"))));
+                let header = header.child(rotating_chevron(
+                    14.0,
+                    open,
+                    home_ink("#747781"),
+                    home_ink("#c9cbd2"),
+                ));
                 let mut group = col()
                     .key(format!("{row_key}-{group_key}"))
                     .min_w(0.0)
+                    .transition(crate::motion::trace_group_enter())
                     .child(header);
                 if open {
                     let mut body = col()
@@ -330,6 +353,7 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                         .key(format!("{row_key}-reasoning-{index}"))
                         .w_full()
                         .max_w(820.0)
+                        .transition(crate::motion::fade_in(crate::motion::FADE))
                         .py(5.0)
                         .pl(13.0)
                         .border_sides([1.0, 0.0, 0.0, 0.0], home_rgba(171.0, 159.0, 206.0, 0.5))
@@ -350,6 +374,7 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                         .key(format!("{row_key}-status-{index}"))
                         .w_full()
                         .max_w(820.0)
+                        .transition(crate::motion::fade_in(crate::motion::FADE))
                         .my(5.0)
                         .child(md_render::render_body_compact::<S>(
                             s,
@@ -421,6 +446,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
         .min_h(31.0)
         .radius(7.0)
         .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
+        .hover_group()
         .on_press({
             let row_key = row_key.to_string();
             let item_key = item_key.clone();
@@ -437,13 +463,15 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
         .child(
             text(verb.to_string())
                 .font(style(15.0, 500.0))
-                .color(home_ink("#bfc1c8")),
+                .color(home_ink("#bfc1c8"))
+                .group_color(home_ink("#ededf0")),
         );
     if !subject.is_empty() {
         title = title.child(
             text(subject)
                 .font(mono(13.0, 500.0))
                 .color(home_ink("#969aa4"))
+                .group_color(home_ink("#ededf0"))
                 .truncate()
                 .grow(1.0)
                 .min_w(0.0),
@@ -472,7 +500,12 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
         );
     }
     if has_details {
-        title = title.child(icon_box(13.0, chevron(13.0, open, home_ink("#6f727b"))));
+        title = title.child(rotating_chevron(
+            13.0,
+            open,
+            home_ink("#6f727b"),
+            home_ink("#c9cbd2"),
+        ));
     }
     let mut call = col()
         .key(format!("{row_key}-{item_key}"))
@@ -693,6 +726,7 @@ fn tool_panel<S: TranscriptHost + 'static>(
         .ml(19.0)
         .mt(2.0)
         .mb(7.0)
+        .transition(crate::motion::tool_panel_enter())
         .radius(9.0)
         .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.09))
         .border_layout()
@@ -1005,6 +1039,7 @@ fn delegation_card<S: TranscriptHost + 'static>(
         .key(format!("{}-delegation-{index}", event.id))
         .w_full()
         .max_w(620.0)
+        .transition(crate::motion::delegation_enter())
         .my(4.0)
         .child(card)
 }
@@ -1033,6 +1068,8 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         .gap(7.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], home_ink("#ffffff16"))
         .border_layout()
+        .hover(home_rgba(255.0, 255.0, 255.0, 0.04))
+        .hover_group()
         .on_press({
             let key = r.key.clone();
             move |s: &mut S| {
@@ -1050,14 +1087,21 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
                     style.tracking = 0.065;
                     style
                 })
-                .color(home_ink("#a4a4ad")),
+                .color(home_ink("#a4a4ad"))
+                .group_color(home_ink("#d5d5da")),
         )
-        .child(icon_box(14.0, chevron(14.0, open, home_ink("#71717a"))));
+        .child(rotating_chevron(
+            14.0,
+            open,
+            home_ink("#71717a"),
+            home_ink("#d5d5da"),
+        ));
     let mut shell = col()
         .key(format!("{}-trace", r.key))
         .w_full()
         .mt(8.0)
         .mb(22.0)
+        .transition(crate::motion::trace_enter())
         .child(header)
         // Header inline margin (14 open / 0 closed) + collapsible top 9.
         .child(rune::el().h(if open { 23.0 } else { 9.0 }));
@@ -1236,6 +1280,7 @@ fn delegation_step_card<S: TranscriptHost + 'static>(which: Thread, step: &Trace
         .key(format!("{}-delegation-step", step.id))
         .w_full()
         .max_w(620.0)
+        .transition(crate::motion::delegation_enter())
         .child(card)
 }
 
@@ -1284,6 +1329,7 @@ pub(super) fn thinking_placeholder(key: &str) -> El {
         .key(format!("{key}-thinking"))
         .items_center()
         .gap(8.0)
+        .transition(crate::motion::fade_in(crate::motion::FADE))
         .mb(8.0)
         .child(
             rune::el()
@@ -1325,6 +1371,7 @@ pub(super) fn retry_status(key: &str, retry: &RetryNotice) -> El {
         .key(format!("{key}-retry"))
         .w_full()
         .max_w(520.0)
+        .transition(crate::motion::retry_enter())
         .mb(10.0)
         .items_center()
         .gap(10.0)

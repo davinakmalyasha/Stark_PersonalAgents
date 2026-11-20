@@ -62,6 +62,43 @@ cargo run -p stark-rune-app --features rune-real -- \
   --rune-snap target/rune-goldens/transcript.png --rune-scene screenshot  # real wgpu PNG (needs GPU)
 ```
 
+## Motion foundation
+
+Static parity was the first pass; interaction motion is now ported at the
+shell level. `crates/stark-rune-app/src/motion.rs` carries both families Rune
+uses: hover `Curve`s (`150 ms cubic-bezier(.4,0,.2,1)` by default, 140/200/280
+ms Stark eases) and presence `Spring`s matched to the final CSS cascade
+(user message 200 ms, agent 240 ms, generic fade 140 ms, modal 240 ms, menu
+160 ms, trace 340 ms). The shell and transcript roots set
+`hover_motion_within`, so every existing `hover`/`group_color`/
+`group_opacity` fades instead of snapping; rail icons, session tabs, the close
+button, New session, send/stop press and the Settings sheet use them.
+
+Message entrances match `MessageBubble.tsx`: a user row slides in from +14 pt
+over 200 ms, an agent row rises 8 pt over 240 ms, and system or other
+non-agent rows fade with a 2 pt rise over 140 ms. The virtual transcript records each row key in
+`seen_rows` when it first becomes visible, so scrolling a row out and back —
+or refreshing history — never replays its entrance. Rows leave in the frame
+they unmount, like React; the `modal_enter`/`menu_enter` primitives carry the
+same instant-removal spring pair for the surfaces that follow.
+
+Trace shells (340 ms), trace groups (280 ms), tool panels (180 ms), retry
+notices (200 ms) and delegation cards (300 ms) enter on their CSS clocks.
+Disclosure chevrons rotate 180 ms instead of swapping glyphs. Menus and
+popovers (`160`/`180` ms), the canvas add menu (`160` ms with its `.985`
+settle), attachment cards (`260` ms, `8 pt`, `.96`), AgentConfig/TokenStats
+modals (200 ms backdrop, 240 ms panel) and the canvas card hover border all
+use the same primitives. Ask options keep their border box through a wrapper
+so the hover border is not inset by their padding; markdown code-copy and
+inline links brighten on hover. Spinners, pulse dots and sheens keep their
+loop specs. Hover and spatial transitions respect Reduce
+Motion through Rune's motion gate (offsets snap, opacity still fades).
+
+The remaining deltas are recorded in `parity/README.md`: 1 pt hover lifts,
+the 1.08 project-chevron scale, the sidebar delete slot (opacity fades, the
+slot does not collapse), inline-image 1.04 zoom, and the opacity timing of
+open/close bodies that CSS animates with `grid-template-rows`.
+
 ## Transcript (MessageStream port)
 
 - Pure math: `crates/stark-kit/src/transcript.rs` — role-based height
@@ -78,4 +115,7 @@ cargo run -p stark-rune-app --features rune-real -- \
 ```bash
 cargo test -p stark-theme -p stark-kit -p stark-rune-app
 cargo run -p stark-rune-app -- --headless --dump-tree target/rune-goldens/tree.txt --golden target/rune-goldens/stark.svg
+
+# Settings: Tauri `SettingsModal.tsx` port (global sheet, rail gear)
+cargo run -p stark-rune-app --features rune-real -- \n  --rune-shell-snap target/rune-goldens/settings.png --rune-route settings \n  --size 1280x900 --at 2
 ```

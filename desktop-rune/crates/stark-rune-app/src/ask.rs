@@ -642,8 +642,20 @@ fn option_row<S: TranscriptHost + 'static>(
         );
     }
 
-    row()
-        .key(format!("ask-option-{}-{index}", question.id))
+    let index_el = rune::el()
+        .size(index_size, index_size)
+        .radius(if compact { 5.0 } else { 6.0 })
+        .fill(rgba(255.0, 255.0, 255.0, 0.06))
+        .border(1.0, rgba(255.0, 255.0, 255.0, 0.10))
+        .border_layout()
+        .center()
+        .child(
+            text((index + 1).to_string())
+                .font(index_style)
+                .color(ink("#71717a")),
+        );
+    let mut option = row()
+        .key(format!("ask-option-{}-{index}-button", question.id))
         .role("button")
         .label(label.to_string())
         .w_full()
@@ -654,25 +666,40 @@ fn option_row<S: TranscriptHost + 'static>(
         .radius(radius)
         .fill(fill)
         .border(1.0, border)
-        .border_layout()
-        .hover(ink("#ffffff08"))
+        .border_layout();
+    // `.ask-option:hover` replaces the zinc surface and lifts the border to
+    // `#3f3f46`. The fill is opaque, so the overlay replaces it exactly; the
+    // border needs a paint-only sibling because Rune has no hover border.
+    if !selected {
+        option = option.hover(ink("#1c1c20"));
+    }
+    option = option
         .on_press(move |s: &mut S| on_press(s))
         .child(radio_el)
         .child(copy)
-        .child(
+        .child(index_el);
+
+    // The outer stack keeps the public key and the full border box; the
+    // padded button sits inside it, so the overlay border is not inset by
+    // the button's padding.
+    let mut stack = col()
+        .key(format!("ask-option-{}-{index}", question.id))
+        .w_full();
+    if selected {
+        stack = stack.child(option);
+    } else {
+        stack = stack.hover_group().child(option).child(
             rune::el()
-                .size(index_size, index_size)
-                .radius(if compact { 5.0 } else { 6.0 })
-                .fill(rgba(255.0, 255.0, 255.0, 0.06))
-                .border(1.0, rgba(255.0, 255.0, 255.0, 0.10))
-                .border_layout()
-                .center()
-                .child(
-                    text((index + 1).to_string())
-                        .font(index_style)
-                        .color(ink("#71717a")),
-                ),
-        )
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .radius(radius)
+                .border(1.0, ink("#3f3f46"))
+                .group_opacity(0.0, 1.0)
+                .inert(),
+        );
+    }
+    stack
 }
 
 fn question_block<S: TranscriptHost + 'static>(

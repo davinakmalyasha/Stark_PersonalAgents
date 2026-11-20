@@ -25,23 +25,24 @@ pub type DropHover<S> = std::rc::Rc<dyn Fn(&mut S, bool)>;
 /// reason) when present. Mounted beside the voice toggle while live.
 fn attach_button<S: 'static>(attach: PressTx<S>) -> El {
     // `.tool-button` (Plus 18): React's file picker.
-    let color = ink("#b4b4bc");
-    let plus = rune::Shape::new()
-        .line(
-            [12.0, 5.0],
-            [12.0, 19.0],
-            crate::lucide_stroke(18.0),
-            rune::LineCap::Round,
-            color,
-        )
-        .line(
-            [5.0, 12.0],
-            [19.0, 12.0],
-            crate::lucide_stroke(18.0),
-            rune::LineCap::Round,
-            color,
-        )
-        .view_box(24.0, 24.0);
+    let plus = |color: rune::Color| {
+        rune::Shape::new()
+            .line(
+                [12.0, 5.0],
+                [12.0, 19.0],
+                crate::lucide_stroke(18.0),
+                rune::LineCap::Round,
+                color,
+            )
+            .line(
+                [5.0, 12.0],
+                [19.0, 12.0],
+                crate::lucide_stroke(18.0),
+                rune::LineCap::Round,
+                color,
+            )
+            .view_box(24.0, 24.0)
+    };
     rune::el()
         .key("composer-attach")
         .role("button")
@@ -50,8 +51,13 @@ fn attach_button<S: 'static>(attach: PressTx<S>) -> El {
         .radius(10.0)
         .center()
         .hover(ink("#ffffff12"))
+        .hover_group()
         .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
-        .child(rune::el().size(18.0, 18.0).inert().shape(plus))
+        .child(crate::motion::hover_icon(
+            18.0,
+            plus(ink("#b4b4bc")),
+            plus(ink("#ededf1")),
+        ))
 }
 
 /// Deck thumbnail (`LocalFileThumb`/`RestoredFileThumb`): 30×30 picture chip
@@ -117,6 +123,7 @@ fn attachment_card<S: 'static>(
     };
     row()
         .key(format!("composer-file-{id}"))
+        .transition(crate::motion::attachment_enter())
         .min_w(178.0)
         .max_w(236.0)
         .items_center()
@@ -151,12 +158,13 @@ fn attachment_card<S: 'static>(
                 .radius(8.0)
                 .center()
                 .hover(ink("#ffffff17"))
+                .hover_group()
                 .on_press(move |s: &mut S| remove(s, target.clone()))
-                .child(rune::el().size(13.0, 13.0).inert().shape(crate::lucide_x(
+                .child(crate::motion::hover_icon(
                     13.0,
-                    2.0,
-                    ink("#777782"),
-                ))),
+                    crate::lucide_x(13.0, 2.0, ink("#777782")),
+                    crate::lucide_x(13.0, 2.0, ink("#eeeeee")),
+                )),
         )
 }
 
@@ -174,26 +182,29 @@ fn attachment_add<S: 'static>(attach: PressTx<S>) -> El {
         .border_layout()
         .center()
         .hover(ink("#ffffff10"))
+        .hover_group()
         .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
-        .child(rune::el().size(17.0, 17.0).inert().shape({
-            let color = ink("#777782");
-            rune::Shape::new()
-                .line(
-                    [12.0, 5.0],
-                    [12.0, 19.0],
-                    crate::lucide_stroke(17.0),
-                    rune::LineCap::Round,
-                    color,
-                )
-                .line(
-                    [5.0, 12.0],
-                    [19.0, 12.0],
-                    crate::lucide_stroke(17.0),
-                    rune::LineCap::Round,
-                    color,
-                )
-                .view_box(24.0, 24.0)
-        }))
+        .child({
+            let plus = |color: rune::Color| {
+                rune::Shape::new()
+                    .line(
+                        [12.0, 5.0],
+                        [12.0, 19.0],
+                        crate::lucide_stroke(17.0),
+                        rune::LineCap::Round,
+                        color,
+                    )
+                    .line(
+                        [5.0, 12.0],
+                        [19.0, 12.0],
+                        crate::lucide_stroke(17.0),
+                        rune::LineCap::Round,
+                        color,
+                    )
+                    .view_box(24.0, 24.0)
+            };
+            crate::motion::hover_icon(17.0, plus(ink("#777782")), plus(ink("#eeeeee")))
+        })
 }
 
 /// Lucide `AudioLines` (16pt) inside the voice toggle.
@@ -245,13 +256,23 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
                     .looping(rune::LoopSpec::opacity(1.2, 0.0, 0.4, 1.0)),
             );
     } else {
-        button = button.fill(ink("#303035")).child(
-            rune::el()
-                .key("composer-voice-dot")
-                .size(16.0, 16.0)
-                .inert()
-                .shape(voice_icon(ink("#b6b6be"))),
-        );
+        button = button
+            .fill(ink("#303035"))
+            // `.prompt-voice-button:hover` replaces the fill and lifts the
+            // icon; both are opaque, so the overlay replaces them exactly.
+            .hover(ink("#404047"))
+            .hover_group()
+            .child(
+                rune::el()
+                    .key("composer-voice-dot")
+                    .size(16.0, 16.0)
+                    .inert()
+                    .child(crate::motion::hover_icon(
+                        16.0,
+                        voice_icon(ink("#b6b6be")),
+                        voice_icon(ink("#f5f5f6")),
+                    )),
+            );
     }
     button
 }
@@ -357,17 +378,22 @@ fn target_toggle<S: 'static>(
                 } else {
                     "#00000000"
                 }))
+                .hover_group()
                 .on_press(on_cloud)
                 .child(cloud)
-                .child(
-                    text("Cloud".to_string())
+                .child({
+                    let mut label = text("Cloud".to_string())
                         .font({
                             let mut style = rune::tok::TextStyle::new(11.0, 500.0);
                             style.line_height = 16.5;
                             style
                         })
-                        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" })),
-                ),
+                        .color(ink(if cloud_active { "#7dd3fc" } else { "#71717a" }));
+                    if !cloud_active {
+                        label = label.group_color(ink("#d4d4d8"));
+                    }
+                    label
+                }),
         )
 }
 
@@ -451,6 +477,8 @@ fn usage_orb<S: 'static>(
         .size(31.0, 31.0)
         .radius(15.5)
         .center()
+        .hover(ink("#ffffff0e"))
+        .hover_group()
         .on_press(move |s: &mut S| on_usage(s))
         .child(
             text(format!("{:.0}", pct))
@@ -459,7 +487,8 @@ fn usage_orb<S: 'static>(
                     style.features = "'tnum' 1";
                     style
                 })
-                .color(ink(number_ink)),
+                .color(ink(number_ink))
+                .group_color(ink("#ffffff")),
         );
     // Track ring (`.usage-ring-track`): always visible, even at 0%.
     orb = orb.child(
@@ -539,6 +568,7 @@ fn usage_popover<S: 'static>(
         .key("composer-usage-popover")
         .w_full()
         .gap(3.0)
+        .transition(crate::motion::popover_enter())
         .radius(12.0)
         .fill(ink("#252529"))
         .border(1.0, ink("#ffffff1f"))
@@ -574,33 +604,57 @@ fn usage_popover<S: 'static>(
 /// key is missing or the provider reports an error. Opens the agents &
 /// providers modal, like React.
 fn provider_pill<S: 'static>(label: &str, warn: bool, on_config: Press<S>) -> El {
-    text(if label.is_empty() {
-        "Provider".to_string()
-    } else {
-        label.to_string()
-    })
-    .key("composer-provider")
-    .role("button")
-    .label("Configure agents and providers")
-    .font({
-        // `.provider-trigger`: font-size 11px, line-height 1.
-        let mut style = rune::tok::TextStyle::new(11.0, 400.0);
-        style.line_height = 11.0;
-        style
-    })
-    .px(8.0)
-    .py(7.0)
-    .radius(9.0)
-    .fill(rune::Color {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 0.04,
-    })
-    .border(1.0, ink("#ffffff12"))
-    .border_layout()
-    .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
-    .on_press(move |s: &mut S| on_config(s))
+    row()
+        .key("composer-provider")
+        .role("button")
+        .label("Configure agents and providers")
+        .items_center()
+        .px(8.0)
+        .py(7.0)
+        .radius(9.0)
+        .fill(rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.04,
+        })
+        .border(1.0, ink("#ffffff12"))
+        .border_layout()
+        // `.provider-trigger:hover` replaces the 4% wash with 8% over the
+        // dock. Rune's hover overlay composites over the pill's own fill, so
+        // use the opaque result of 8% white over the dock instead.
+        .hover(crate::motion::hover_replace(
+            rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.04,
+            },
+            rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.08,
+            },
+            ink("#101013"),
+        ))
+        .hover_group()
+        .on_press(move |s: &mut S| on_config(s))
+        .child(
+            text(if label.is_empty() {
+                "Provider".to_string()
+            } else {
+                label.to_string()
+            })
+            .font({
+                // `.provider-trigger`: font-size 11px, line-height 1.
+                let mut style = rune::tok::TextStyle::new(11.0, 400.0);
+                style.line_height = 11.0;
+                style
+            })
+            .color(ink(if warn { "#fbbf24" } else { "#c9c9d1" }))
+            .group_color(ink("#ededf1")),
+        )
 }
 
 /// Model dropup (`provider-dropup`): trigger with the current model +
@@ -640,23 +694,50 @@ fn model_dropup<S: 'static>(
                 a: 0.04,
             })
             .border(1.0, ink("#ffffff12"))
+            .hover(crate::motion::hover_replace(
+                rune::Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.04,
+                },
+                rune::Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.08,
+                },
+                ink("#101013"),
+            ))
+            .hover_group()
             .on_press(move |s: &mut S| menu(s))
             .child(
                 text(current)
                     .font(rune::tok::TextStyle::new(11.0, 400.0))
-                    .color(ink("#c9c9d1")),
+                    .color(ink("#c9c9d1"))
+                    .group_color(ink("#ededf1")),
             )
-            .child(
-                text(if open { "▴" } else { "▾" }.to_string())
-                    .font(rune::tok::TextStyle::new(10.0, 400.0))
-                    .color(ink("#71717a")),
-            ),
+            .child({
+                let chevron =
+                    |color: rune::Color| crate::icons::lucide(&["m6 9 6 6 6-6"], 10.0, 2.0, color);
+                rune::el()
+                    .size(10.0, 10.0)
+                    .inert()
+                    .rotate(if open { std::f32::consts::PI } else { 0.0 })
+                    .rotate_motion(crate::motion::ROTATE)
+                    .child(crate::motion::hover_icon(
+                        10.0,
+                        chevron(ink("#71717a")),
+                        chevron(ink("#e4e4e7")),
+                    ))
+            }),
     );
     if open {
         let mut menu_col = col()
             .key("composer-model-menu")
             .w_full()
             .gap(2.0)
+            .transition(crate::motion::menu_enter())
             .radius(9.0)
             .fill(ink("#17171b"))
             .border(1.0, ink("#ffffff14"))
@@ -680,7 +761,7 @@ fn model_dropup<S: 'static>(
 /// One model menu row with a check on the selected (`provider-item`).
 fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) -> El {
     let target = id.to_string();
-    row()
+    let mut el = row()
         .key(format!("composer-model-{target}"))
         .w_full()
         .items_center()
@@ -688,20 +769,29 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
         .px(8.0)
         .py(6.0)
         .radius(6.0)
-        .fill(ink(if selected { "#ffffff14" } else { "#00000000" }))
+        .fill(if selected {
+            ink("#9577ff24")
+        } else {
+            ink("#00000000")
+        })
         .role("button")
-        .label(format!("Use {name}"))
-        .on_press(move |s: &mut S| pick(s, target.clone()))
+        .label(format!("Use {name}"));
+    if !selected {
+        // `.model-menu button:hover` is the same violet wash as `.selected`.
+        el = el.hover(ink("#9577ff24")).hover_group();
+    }
+    el.on_press(move |s: &mut S| pick(s, target.clone()))
         .child(
             text(name.to_string())
                 .grow(1.0)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#d4d4d8")),
+                .color(ink(if selected { "#e5ddff" } else { "#d4d4d8" }))
+                .group_color(ink("#e5ddff")),
         )
         .child(
             text(if selected { "✓" } else { "" }.to_string())
                 .font(rune::tok::TextStyle::new(11.0, 600.0))
-                .color(ink("#e4e4e7")),
+                .color(ink("#e5ddff")),
         )
 }
 
@@ -804,6 +894,9 @@ pub fn composer_card<S: 'static>(
                 let cancel = buttons.cancel.clone();
                 move |s: &mut S| cancel(s)
             })
+            // `.pressable:active { transform: scale(.96) }`; `press_scale`
+            // only records after a press handler exists.
+            .press_scale(0.96)
             .child(
                 rune::el()
                     .size(14.0, 14.0)
@@ -822,11 +915,26 @@ pub fn composer_card<S: 'static>(
                 let on_send = buttons.send.clone();
                 move |s: &mut S| on_send(s)
             })
+            .press_scale(0.96)
+            .hover_group()
             .child(
                 rune::el()
                     .size(16.0, 16.0)
                     .inert()
                     .shape(crate::lucide_arrow_up(16.0, 2.4, ink("#ffffff"))),
+            )
+            // `.send-button:hover:not(:disabled) { filter: brightness(1.12) }`.
+            // The button paints a gradient, which Rune's hover overlay skips;
+            // a white wash over the whole face is the compositing equivalent.
+            .child(
+                rune::el()
+                    .absolute(0.0, 0.0)
+                    .w_full()
+                    .h_full()
+                    .radius(17.0)
+                    .fill(ink("#ffffff1f"))
+                    .group_opacity(0.0, 1.0)
+                    .inert(),
             );
     } else {
         send_btn = send_btn

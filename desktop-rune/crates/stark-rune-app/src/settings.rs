@@ -1,0 +1,1565 @@
+//! Settings — port of `frontend/src/components/Layout/SettingsModal.tsx`.
+//!
+//! Contract:
+//! - `GET /api/migration/status` → `{active, candidates:[{id,path,active,
+//!   has_chats_db,has_sessions,has_config}]}`
+//! - `POST /api/migration/import {source}` → `{ok,copied,message}`
+//! - `GET /api/data/export` → zip (`Content-Disposition` filename)
+//! - `POST /api/data/import` multipart `{file, projects_root?}` →
+//!   `{ok,restart_required,from_root,to_root}`
+//!
+//! The sheet is global like React's modal: one state on the shell, opened by
+//! the rail gear (and by the standalone transcript scene for goldens). The
+//! Tauri updater plugin does not exist in Rune yet, so "Check" reports that
+//! honestly instead of pretending an update ran.
+
+use std::path::PathBuf;
+use std::sync::mpsc;
+
+use rune::{col, row, text, El, TextEdit};
+
+/// Product version shown by Settings (`frontend/src/version.ts`), distinct
+/// from the Rune crate version stamped into the binary.
+pub const STARK_VERSION: &str = "2.6.4";
+
+fn ink(hex: &'static str) -> rune::Color {
+    rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
+}
+
+fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
+    rune::Color { r, g, b, a }
+}
+
+fn icon(paths: &[&str], size: f32, color: rune::Color) -> rune::Shape {
+    crate::icons::lucide(paths, size, 2.0, color)
+}
+
+fn icon_settings(size: f32, color: rune::Color) -> rune::Shape {
+    icon(
+        &[
+            "M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915",
+            "M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
+        ],
+        size,
+        color,
+    )
+}
+
+fn icon_download(size: f32, color: rune::Color) -> rune::Shape {
+    icon(
+        &[
+            "M12 15V3",
+            "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4",
+            "m7 10 5 5 5-5",
+        ],
+        size,
+        color,
+    )
+}
+
+fn icon_folder_open(size: f32, color: rune::Color) -> rune::Shape {
+    icon(
+        &[
+            "m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2",
+        ],
+        size,
+        color,
+    )
+}
+
+fn icon_hard_drive(size: f32, color: rune::Color) -> rune::Shape {
+    icon(
+        &[
+            "M10 16h.01",
+            "M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z",
+            "M21.946 12.013H2.054",
+            "M6 16h.01",
+        ],
+        size,
+        color,
+    )
+}
+
+fn icon_refresh(size: f32, color: rune::Color) -> rune::Shape {
+    icon(
+        &[
+            "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8",
+            "M21 3v5h-5",
+            "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16",
+            "M8 16H3v5",
+        ],
+        size,
+        color,
+    )
+}
+
+fn icon_upload(size: f32, color: rune::Color) -> rune::Shape {
+    icon(
+        &[
+            "M12 3v12",
+            "m17 8-5-5-5 5",
+            "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4",
+        ],
+        size,
+        color,
+    )
+}
+
+/// One migration root from `/api/migration/status`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MigrationCandidate {
+    pub id: String,
+    pub path: String,
+    pub active: bool,
+    pub has_chats_db: bool,
+    pub has_sessions: bool,
+    pub has_config: bool,
+}
+
+impl MigrationCandidate {
+    fn from_json(v: &serde_json::Value) -> Self {
+        let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let bool_of = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+        Self {
+            id: str_of("id"),
+            path: str_of("path"),
+            active: bool_of("active"),
+            has_chats_db: bool_of("has_chats_db"),
+            has_sessions: bool_of("has_sessions"),
+            has_config: bool_of("has_config"),
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.has_chats_db || self.has_sessions || self.has_config
+    }
+
+    fn summary(&self) -> String {
+        let parts = [
+            self.has_chats_db.then_some("chats.db"),
+            self.has_sessions.then_some("sessions"),
+            self.has_config.then_some("config"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if parts.is_empty() {
+            "empty".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MigrationStatus {
+    pub active: String,
+    pub candidates: Vec<MigrationCandidate>,
+}
+
+impl MigrationStatus {
+    fn from_json(v: &serde_json::Value) -> Self {
+        Self {
+            active: v
+                .get("active")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            candidates: v
+                .get("candidates")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().map(MigrationCandidate::from_json).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The updater phases `updateStore.ts` exposes. Rune has no updater yet, so
+/// the UI can reach `Checking`/`Error` from the honest stub but never claims
+/// an update was installed.
+#[allow(dead_code)] // the real updater will construct these later
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Downloading,
+    Ready,
+    Error,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UpdateState {
+    pub phase: UpdatePhase,
+    pub version: String,
+    pub message: String,
+    pub restart_required: bool,
+}
+
+enum OpKind {
+    Migration,
+    Backup,
+}
+
+struct OpResult {
+    kind: OpKind,
+    status: Option<String>,
+    error: Option<String>,
+    clear_file: bool,
+}
+
+struct LoadResult {
+    generation: u64,
+    result: Result<MigrationStatus, String>,
+}
+
+/// One settings modal's data. Global on the shell, and owned by the
+/// standalone transcript state for the headless settings scene.
+pub struct SettingsState {
+    pub open: bool,
+    pub host: String,
+    pub port: u16,
+    pub active: String,
+    pub candidates: Vec<MigrationCandidate>,
+    pub status: String,
+    pub error: Option<String>,
+    /// A migration import is running.
+    pub busy: bool,
+    /// An export or backup import is running.
+    pub backup_busy: bool,
+    pub backup_file: Option<PathBuf>,
+    pub backup_root: TextEdit,
+    pub update: UpdateState,
+    pub loading: bool,
+    generation: u64,
+    load_inbox: Option<mpsc::Receiver<LoadResult>>,
+    op_inbox: Option<mpsc::Receiver<OpResult>>,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            host: crate::rune_transcript::DEFAULT_API_HOST.to_string(),
+            port: crate::rune_transcript::api_port(),
+            active: String::new(),
+            candidates: Vec::new(),
+            status: String::new(),
+            error: None,
+            busy: false,
+            backup_busy: false,
+            backup_file: None,
+            backup_root: TextEdit::new(""),
+            update: UpdateState::default(),
+            loading: false,
+            generation: 0,
+            load_inbox: None,
+            op_inbox: None,
+        }
+    }
+}
+
+impl Clone for SettingsState {
+    fn clone(&self) -> Self {
+        Self {
+            open: self.open,
+            host: self.host.clone(),
+            port: self.port,
+            active: self.active.clone(),
+            candidates: self.candidates.clone(),
+            status: self.status.clone(),
+            error: self.error.clone(),
+            busy: self.busy,
+            backup_busy: self.backup_busy,
+            backup_file: self.backup_file.clone(),
+            backup_root: self.backup_root.clone(),
+            update: self.update.clone(),
+            loading: self.loading,
+            generation: self.generation,
+            load_inbox: None,
+            op_inbox: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for SettingsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsState")
+            .field("open", &self.open)
+            .field("active", &self.active)
+            .field("candidates", &self.candidates.len())
+            .field("status", &self.status)
+            .field("error", &self.error)
+            .field("busy", &self.busy)
+            .field("backup_busy", &self.backup_busy)
+            .field("backup_file", &self.backup_file)
+            .field("update", &self.update.phase)
+            .field("loading", &self.loading)
+            .finish()
+    }
+}
+
+/// Views mutate settings through their host state (shell or standalone
+/// transcript); the sheet renders from the borrowed snapshot.
+pub trait SettingsHost {
+    fn settings(&self) -> &SettingsState;
+    fn settings_mut(&mut self) -> &mut SettingsState;
+}
+
+impl SettingsState {
+    /// Open and reload migration status, like `useEffect(() => load(), [isOpen])`.
+    pub fn open(&mut self, host: String, port: u16) {
+        self.open = true;
+        self.host = host;
+        self.port = port;
+        if !self.loading {
+            self.load();
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    /// Reload `/api/migration/status`; failures stay silent like React's
+    /// `.catch(() => null)` so a cold backend never blocks the modal.
+    pub fn load(&mut self) {
+        if self.loading {
+            return;
+        }
+        self.loading = true;
+        self.error = None;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let (tx, rx) = mpsc::channel();
+        self.load_inbox = Some(rx);
+        let (host, port) = (self.host.clone(), self.port);
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match crate::transport::fetch_json("/api/migration/status").await {
+                Ok(v) => Ok(MigrationStatus::from_json(&v)),
+                Err(e) => Err(e),
+            };
+            let _ = (host, port);
+            let _ = tx.send(LoadResult { generation, result });
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let result = match crate::transport::get_json(&host, port, "/api/migration/status") {
+                Ok(v) => Ok(MigrationStatus::from_json(&v)),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(LoadResult { generation, result });
+        });
+    }
+
+    /// `runImport(candidate.id)` / `importMigration(folder)`.
+    pub fn run_import(&mut self, source: String) {
+        if self.busy || source.trim().is_empty() {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        self.status.clear();
+        let (tx, rx) = mpsc::channel();
+        self.op_inbox = Some(rx);
+        let (host, port) = (self.host.clone(), self.port);
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let body = serde_json::json!({ "source": source });
+            let result =
+                crate::transport::fetch_send("POST", "/api/migration/import", Some(&body)).await;
+            let _ = (host, port);
+            let _ = tx.send(migration_op(result));
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let body = serde_json::json!({ "source": source });
+            let result =
+                crate::transport::send_json(&host, port, "POST", "/api/migration/import", &body);
+            let _ = tx.send(migration_op(result));
+        });
+    }
+
+    /// `runBackupImport()`: stage the picked zip for the next server start.
+    pub fn run_backup_import(&mut self) {
+        if self.backup_busy {
+            return;
+        }
+        let Some(file) = self.backup_file.clone() else {
+            return;
+        };
+        self.backup_busy = true;
+        self.error = None;
+        self.status.clear();
+        let root = self.backup_root.text.clone();
+        let (tx, rx) = mpsc::channel();
+        self.op_inbox = Some(rx);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (file, root);
+            let _ = tx.send(OpResult {
+                kind: OpKind::Backup,
+                status: None,
+                error: Some("Backup import is available in the desktop app.".to_string()),
+                clear_file: false,
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (host, port) = (self.host.clone(), self.port);
+            std::thread::spawn(move || {
+                let result = crate::transport::upload_backup(&host, port, &file, &root);
+                let _ = tx.send(backup_op(result));
+            });
+        }
+    }
+
+    /// `runExport()` on the native app: choose a destination, then download
+    /// the server's consistent zip snapshot into it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn export_to(&mut self, path: PathBuf) {
+        if self.backup_busy {
+            return;
+        }
+        self.backup_busy = true;
+        self.error = None;
+        self.status.clear();
+        let (tx, rx) = mpsc::channel();
+        self.op_inbox = Some(rx);
+        let (host, port) = (self.host.clone(), self.port);
+        std::thread::spawn(move || {
+            let result = crate::transport::download_file(&host, port, "/api/data/export").and_then(
+                |download| {
+                    std::fs::write(&path, &download.bytes)
+                        .map(|_| download.filename)
+                        .map_err(|e| format!("cannot write export: {e}"))
+                },
+            );
+            let _ = tx.send(export_op(result));
+        });
+    }
+
+    /// Web build: let the browser download the endpoint's attachment.
+    #[cfg(target_arch = "wasm32")]
+    pub fn export_web(&mut self) {
+        self.error = None;
+        self.status.clear();
+        let url = format!("http://{}:{}/api/data/export", self.host, self.port);
+        let opened = web_sys::window()
+            .and_then(|w| w.open_with_url_and_target(&url, "_blank").ok())
+            .is_some();
+        if opened {
+            self.status = "Exported stark-backup.zip. Keep it safe — it contains chats and config, never API keys."
+                .to_string();
+        } else {
+            self.error = Some("Export failed: the browser blocked the download.".to_string());
+        }
+    }
+
+    /// `checkForAppUpdate({manual:true})`. Rune has no updater yet; say so.
+    pub fn check_updates(&mut self) {
+        if matches!(
+            self.update.phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading
+        ) {
+            return;
+        }
+        self.update = if cfg!(target_arch = "wasm32") {
+            UpdateState {
+                phase: UpdatePhase::Unsupported,
+                message: "Web build — updates are applied when the server deploys.".to_string(),
+                ..UpdateState::default()
+            }
+        } else {
+            UpdateState {
+                phase: UpdatePhase::Error,
+                message: "Rune update checks are not wired yet.".to_string(),
+                ..UpdateState::default()
+            }
+        };
+    }
+
+    pub fn desktop(&self) -> bool {
+        !cfg!(target_arch = "wasm32")
+    }
+
+    fn inactive_candidates(&self) -> impl Iterator<Item = &MigrationCandidate> {
+        self.candidates.iter().filter(|candidate| !candidate.active)
+    }
+}
+
+fn migration_op(result: Result<serde_json::Value, String>) -> OpResult {
+    match result {
+        Ok(v) => {
+            let message = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("Migration complete.");
+            let copied = v
+                .get("copied")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            OpResult {
+                kind: OpKind::Migration,
+                status: Some(format!("{message} Copied: {copied}.")),
+                error: None,
+                clear_file: false,
+            }
+        }
+        Err(error) => OpResult {
+            kind: OpKind::Migration,
+            status: None,
+            error: Some(error),
+            clear_file: false,
+        },
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn backup_op(result: Result<serde_json::Value, String>) -> OpResult {
+    match result {
+        Ok(v) => {
+            let from = v
+                .get("from_root")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown");
+            let to = v.get("to_root").and_then(|x| x.as_str()).unwrap_or("?");
+            OpResult {
+                kind: OpKind::Backup,
+                status: Some(format!(
+                    "Backup staged ({from} → {to}). Restart the app/server to apply it. A pre-import copy was kept."
+                )),
+                error: None,
+                clear_file: true,
+            }
+        }
+        Err(error) => OpResult {
+            kind: OpKind::Backup,
+            status: None,
+            error: Some(error),
+            clear_file: false,
+        },
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn export_op(result: Result<String, String>) -> OpResult {
+    match result {
+        Ok(name) => OpResult {
+            kind: OpKind::Backup,
+            status: Some(format!(
+                "Exported {name}. Keep it safe — it contains chats and config, never API keys."
+            )),
+            error: None,
+            clear_file: false,
+        },
+        Err(error) => OpResult {
+            kind: OpKind::Backup,
+            status: None,
+            error: Some(format!("Export failed: {error}")),
+            clear_file: false,
+        },
+    }
+}
+
+/// Drain background settings work. Returns whether the view must commit.
+pub fn poll_settings(s: &mut SettingsState) -> bool {
+    let mut changed = false;
+    while let Some(msg) = s.load_inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if msg.generation == s.generation {
+            s.loading = false;
+            if let Ok(status) = msg.result {
+                s.active = status.active;
+                s.candidates = status.candidates;
+            }
+            changed = true;
+        }
+    }
+    while let Some(op) = s.op_inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        match op.kind {
+            OpKind::Migration => {
+                s.busy = false;
+                if op.error.is_none() {
+                    s.load();
+                }
+            }
+            OpKind::Backup => s.backup_busy = false,
+        }
+        if let Some(status) = op.status {
+            s.status = status;
+        }
+        if let Some(error) = op.error {
+            s.error = Some(error);
+        }
+        if op.clear_file {
+            s.backup_file = None;
+        }
+        changed = true;
+    }
+    if s.load_inbox
+        .as_ref()
+        .is_some_and(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)))
+    {
+        s.load_inbox = None;
+    }
+    if s.op_inbox
+        .as_ref()
+        .is_some_and(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)))
+    {
+        s.op_inbox = None;
+    }
+    changed
+}
+
+fn label_style() -> rune::tok::TextStyle {
+    let mut style = text_style(10.0, 600.0);
+    style.tracking = 1.4;
+    style
+}
+
+fn text_style(size: f32, weight: f32) -> rune::tok::TextStyle {
+    // Tailwind's arbitrary text sizes inherit the body's 1.5 line-height:
+    // 12/18, 11/16.5, 10.5/15.75, 11.5/17.25, 10/15.
+    rune::tok::TextStyle::new(size, weight).lh(size * 1.5)
+}
+
+fn section(key: &str) -> El {
+    col()
+        .key(key)
+        .w_full()
+        .gap(10.0)
+        .px(14.0)
+        .py(14.0)
+        .radius(16.0)
+        .fill(rgba(1.0, 1.0, 1.0, 0.015))
+        .border(1.0, rgba(1.0, 1.0, 1.0, 0.06))
+        .border_layout()
+}
+
+fn section_head(label: &str, glyph: rune::Shape) -> El {
+    row()
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .child(rune::el().size(13.0, 13.0).inert().shape(glyph))
+        .child(
+            text(label.to_string())
+                .font(label_style())
+                .text_case(rune::TextCase::Uppercase)
+                .color(ink("#71717a")),
+        )
+}
+
+fn row_card(key: &str) -> El {
+    row()
+        .key(key)
+        .w_full()
+        .items_start()
+        .justify_between()
+        .gap(12.0)
+        .px(14.0)
+        .py(10.0)
+        .radius(12.0)
+        .fill(rgba(1.0, 1.0, 1.0, 0.02))
+        .border(1.0, rgba(1.0, 1.0, 1.0, 0.06))
+        .border_layout()
+}
+
+fn heading(value: &str) -> El {
+    text(value.to_string())
+        .w_full()
+        .wrap()
+        .font(text_style(12.0, 500.0))
+        .color(ink("#e4e4e7"))
+}
+
+fn muted(value: &str) -> El {
+    muted_flat(value).mt(2.0)
+}
+
+fn muted_flat(value: &str) -> El {
+    text(value.to_string())
+        .w_full()
+        .wrap()
+        .font(text_style(10.5, 400.0))
+        .color(ink("#71717a"))
+}
+
+fn paragraph(value: impl Into<String>) -> El {
+    text(value.into())
+        .w_full()
+        .wrap()
+        .font(text_style(11.0, 400.0))
+        .color(ink("#71717a"))
+}
+
+/// Action button (`actionClass`); `primary` is the white export/import CTA.
+fn action_button<S: SettingsHost + 'static>(
+    key: impl Into<String>,
+    label: &'static str,
+    glyph: Option<rune::Shape>,
+    primary: bool,
+    disabled: bool,
+    spin: bool,
+    press: impl Fn(&mut S, &mut rune::Tx) + 'static,
+) -> El {
+    let mut el = row()
+        .key(key.into())
+        .role("button")
+        .label(label)
+        .items_center()
+        .gap(6.0)
+        .px(12.0)
+        .py(6.0)
+        .radius(8.0);
+    if let Some(glyph) = glyph {
+        let mut glyph_el = rune::el().size(14.0, 14.0).inert().shape(glyph);
+        if spin {
+            glyph_el = glyph_el.looping(rune::LoopSpec::rotation(1.0));
+        }
+        el = el.child(glyph_el);
+    }
+    el = el.child(
+        text(label.to_string())
+            .font(text_style(11.5, if primary { 600.0 } else { 500.0 }))
+            .color(ink(if primary { "#0a0a0d" } else { "#d4d4d8" })),
+    );
+    if primary {
+        el = el
+            .fill(ink("#ffffff"))
+            // `hover:bg-zinc-200`: black at 10.6% over white is #e4e4e7.
+            .hover(rgba(0.0, 0.0, 0.0, 0.106));
+    } else {
+        el = el
+            .border(1.0, rgba(1.0, 1.0, 1.0, 0.10))
+            .border_layout()
+            .hover(rgba(1.0, 1.0, 1.0, 0.06));
+    }
+    if disabled {
+        el.disabled(true).opacity(0.5)
+    } else {
+        el.on_press_tx(press)
+    }
+}
+
+/// `file:...` control: Rune has no DOM file input, so the picker row draws
+/// Chrome's two pieces (styled button + filename) with Tailwind's values.
+fn file_row(key: &'static str, file: Option<&PathBuf>) -> El {
+    let name = file
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("No file chosen")
+        .to_string();
+    row()
+        .key(key)
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .role("button")
+        .label("Choose a backup file")
+        .child(
+            text("Choose File".to_string())
+                .font(text_style(11.0, 400.0))
+                .px(8.0)
+                .py(4.0)
+                .radius(6.0)
+                .fill(rgba(1.0, 1.0, 1.0, 0.10))
+                .color(ink("#e4e4e7")),
+        )
+        .child(
+            text(name)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate()
+                .font(text_style(11.0, 400.0))
+                .color(ink("#a1a1aa")),
+        )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn export_dialog<S: SettingsHost + 'static>(tx: &mut rune::Tx) {
+    let options = rune::FileDialogOptions {
+        title: "Export Stark data".to_string(),
+        file_name: Some("stark-backup.zip".to_string()),
+        filters: vec![("Stark backup".to_string(), vec!["zip".to_string()])],
+        ..Default::default()
+    };
+    tx.save_file(options, |s: &mut S, result, _tx| match result {
+        Ok(Some(path)) => s.settings_mut().export_to(path),
+        Ok(None) => {}
+        Err(error) => s.settings_mut().error = Some(error.to_string()),
+    });
+}
+
+fn pick_backup<S: SettingsHost + 'static>(s: &mut S, tx: &mut rune::Tx) {
+    if s.settings().backup_busy {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tx;
+        s.settings_mut().error =
+            Some("Choosing a backup file is available in the desktop app.".to_string());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let options = rune::FileDialogOptions {
+            title: "Import a Stark backup".to_string(),
+            filters: vec![("Stark backup".to_string(), vec!["zip".to_string()])],
+            ..Default::default()
+        };
+        tx.open_file(options, |s: &mut S, result, _tx| match result {
+            Ok(Some(path)) => {
+                let settings = s.settings_mut();
+                settings.backup_file = Some(path);
+                settings.error = None;
+            }
+            Ok(None) => {}
+            Err(error) => s.settings_mut().error = Some(error.to_string()),
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_import_folder<S: SettingsHost + 'static>(tx: &mut rune::Tx) {
+    let options = rune::FileDialogOptions {
+        title: "Import from an old harness root".to_string(),
+        ..Default::default()
+    };
+    tx.open_folder(options, |s: &mut S, result, _tx| match result {
+        Ok(Some(path)) => {
+            let source = path.to_string_lossy().into_owned();
+            s.settings_mut().run_import(source);
+        }
+        Ok(None) => {}
+        Err(error) => s.settings_mut().error = Some(error.to_string()),
+    });
+}
+
+/// Settings sheet. `width`/`height` are the window (or standalone view)
+/// bounds, so the panel uses React's viewport-relative min() caps.
+pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, height: f32) -> El {
+    let card_w = 680.0_f32.min((width - 32.0).max(0.0));
+    let card_h = 640.0_f32.min((height - 40.0).max(0.0));
+    let desktop = s.desktop();
+
+    let head = row()
+        .key("settings-head")
+        .w_full()
+        .items_center()
+        .justify_between()
+        .px(20.0)
+        .py(16.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], rgba(1.0, 1.0, 1.0, 0.08))
+        .border_layout()
+        .child(
+            row()
+                .items_center()
+                .gap(12.0)
+                .child(
+                    rune::el()
+                        .key("settings-head-icon")
+                        .size(36.0, 36.0)
+                        .center()
+                        .radius(8.0)
+                        .fill(rgba(1.0, 1.0, 1.0, 0.04))
+                        .border(1.0, rgba(1.0, 1.0, 1.0, 0.09))
+                        .border_layout()
+                        .child(
+                            rune::el()
+                                .size(18.0, 18.0)
+                                .inert()
+                                .shape(icon_settings(18.0, ink("#d4d4d8"))),
+                        ),
+                )
+                .child(
+                    col()
+                        .child(
+                            text("Settings".to_string())
+                                .key("settings-title")
+                                .font({
+                                    let mut style = text_style(14.0, 600.0);
+                                    style.line_height = 20.0; // text-sm
+                                    style.tracking = -0.35;
+                                    style
+                                })
+                                .color(ink("#f4f4f5")),
+                        )
+                        .child(
+                            text(format!("Stark v{STARK_VERSION}"))
+                                .key("settings-version")
+                                .mt(2.0)
+                                .font(text_style(11.0, 400.0))
+                                .color(ink("#71717a")),
+                        ),
+                ),
+        )
+        .child(
+            rune::el()
+                .key("settings-close")
+                .role("button")
+                .label("Close")
+                .size(28.0, 28.0)
+                .center()
+                .radius(6.0)
+                .hover(rgba(1.0, 1.0, 1.0, 0.05))
+                .hover_group()
+                .on_press(|s: &mut S| s.settings_mut().close())
+                .child({
+                    let mut stack = rune::el().size(16.0, 16.0).inert().child(
+                        rune::el().size(16.0, 16.0).inert().shape(crate::lucide_x(
+                            16.0,
+                            2.0,
+                            ink("#a1a1aa"),
+                        )),
+                    );
+                    stack = stack.child(
+                        rune::el()
+                            .size(16.0, 16.0)
+                            .absolute(0.0, 0.0)
+                            .inert()
+                            .group_opacity(0.0, 1.0)
+                            .shape(crate::lucide_x(16.0, 2.0, ink("#e4e4e7"))),
+                    );
+                    stack
+                }),
+        );
+
+    // App updates.
+    let updates = section("settings-section-updates")
+        .child(section_head(
+            "App updates",
+            icon_refresh(13.0, ink("#71717a")),
+        ))
+        .child(
+            row_card("settings-update-row")
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(heading(&format!("Stark v{STARK_VERSION}")))
+                        .child(muted(if desktop {
+                            "Checked on every launch and applied automatically — no manual step."
+                        } else {
+                            "Web build — updates arrive when the server deploys."
+                        }))
+                        .children(
+                            (s.update.phase != UpdatePhase::Idle
+                                && s.update.phase != UpdatePhase::Unsupported)
+                                .then(|| {
+                                    text(s.update.message.clone())
+                                        .key("settings-update-status")
+                                        .mt(6.0)
+                                        .font(text_style(11.0, 400.0))
+                                        .color(ink(if s.update.phase == UpdatePhase::Error {
+                                            "#fcd34d"
+                                        } else {
+                                            "#a1a1aa"
+                                        }))
+                                        .role("status")
+                                }),
+                        ),
+                )
+                .children(desktop.then(|| {
+                    action_button::<S>(
+                        "settings-check",
+                        "Check",
+                        Some(icon_refresh(14.0, ink("#d4d4d8"))),
+                        false,
+                        matches!(
+                            s.update.phase,
+                            UpdatePhase::Checking | UpdatePhase::Downloading
+                        ),
+                        s.update.phase == UpdatePhase::Checking,
+                        |s: &mut S, _tx: &mut rune::Tx| s.settings_mut().check_updates(),
+                    )
+                })),
+        );
+    // Backup & move.
+    let mut backup = section("settings-section-backup")
+        .child(section_head(
+            "Backup & move",
+            icon_download(13.0, ink("#71717a")),
+        ))
+        .child(paragraph(
+            "One portable zip: chats, sessions, config, memory, workspaces (relative paths) and a consistent database snapshot. API keys are excluded.",
+        ))
+        .child(
+            row_card("settings-export-row")
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(heading("Export this machine"))
+                        .child(muted(
+                            "Downloads a timestamped zip you can import on another machine.",
+                        )),
+                )
+                .child(action_button::<S>(
+                    "settings-export",
+                    "Export",
+                    Some(icon_download(14.0, ink("#0a0a0d"))),
+                    true,
+                    s.backup_busy || s.busy,
+                    false,
+                    |s: &mut S, tx: &mut rune::Tx| {
+                        if s.settings().backup_busy || s.settings().busy {
+                            return;
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let _ = tx;
+                            s.settings_mut().export_web();
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        export_dialog::<S>(tx);
+                    },
+                )),
+        );
+
+    backup = backup.child(
+        row_card("settings-import-row")
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(6.0)
+                    .child(heading("Import a backup"))
+                    .child(muted_flat(
+                        "Applied on the next start, after backing up the current data.",
+                    ))
+                    .child(
+                        file_row("settings-backup-file", s.backup_file.as_ref())
+                            .on_press_tx(|s: &mut S, tx: &mut rune::Tx| pick_backup::<S>(s, tx)),
+                    )
+                    .child(
+                        rune::text_input(&s.backup_root, text_style(11.0, 400.0))
+                            .key("settings-backup-root")
+                            .w_full()
+                            .px(8.0)
+                            .py(4.0)
+                            .radius(6.0)
+                            .fill(rgba(0.0, 0.0, 0.0, 0.30))
+                            .border(1.0, rgba(1.0, 1.0, 1.0, 0.10))
+                            .border_layout()
+                            .placeholder("Projects root here (optional)", ink("#52525b"))
+                            .color(ink("#e4e4e7"))
+                            .focus_within_ring(
+                                1.0,
+                                -1.0,
+                                rgba(99.0 / 255.0, 102.0 / 255.0, 241.0 / 255.0, 0.60),
+                            )
+                            .on_edit(|s: &mut S| &mut s.settings_mut().backup_root),
+                    ),
+            )
+            .child(action_button::<S>(
+                "settings-backup-import",
+                "Import",
+                Some(icon_upload(14.0, ink("#d4d4d8"))),
+                false,
+                s.backup_busy || s.busy || s.backup_file.is_none(),
+                false,
+                |s: &mut S, _tx: &mut rune::Tx| s.settings_mut().run_backup_import(),
+            )),
+    );
+
+    // One-time migration.
+    let inactive: Vec<MigrationCandidate> = s.inactive_candidates().cloned().collect();
+    let mut migration = section("settings-section-migration")
+        .child(
+            section_head(
+                "One-time migration",
+                icon_hard_drive(13.0, ink("#71717a")),
+            )
+            .child(rune::el().grow(1.0))
+            .child(
+                rune::el()
+                    .key("settings-refresh")
+                    .role("button")
+                    .label("Refresh")
+                    .size(21.0, 21.0)
+                    .center()
+                    .hover_group()
+                    .disabled(s.busy)
+                    .opacity(if s.busy { 0.5 } else { 1.0 })
+                    .on_press(|s: &mut S| s.settings_mut().load())
+                    .child(
+                        rune::el()
+                            .size(13.0, 13.0)
+                            .inert()
+                            .child(
+                                rune::el()
+                                    .size(13.0, 13.0)
+                                    .inert()
+                                    .shape(icon_refresh(13.0, ink("#71717a"))),
+                            )
+                            .child(
+                                rune::el()
+                                    .size(13.0, 13.0)
+                                    .absolute(0.0, 0.0)
+                                    .inert()
+                                    .group_opacity(0.0, 1.0)
+                                    .shape(icon_refresh(13.0, ink("#e4e4e7"))),
+                            ),
+                    ),
+            ),
+        )
+        .child({
+            let active = if s.active.is_empty() {
+                "—"
+            } else {
+                s.active.as_str()
+            };
+            let body = format!(
+                "Import chats, sessions, and config from an old harness root into the active one ({active}). Existing files are backed up to .bak first."
+            );
+            let mut p = text(body.clone())
+                .w_full()
+                .wrap()
+                .font({
+                    // The mono `.bak` span adds 2pt to Rune's line box;
+                    // 16.0 keeps the two-line paragraph on React's 34pt.
+                    let mut style = text_style(11.0, 400.0);
+                    style.line_height = 16.0;
+                    style
+                })
+                .color(ink("#71717a"));
+            if let Some(start) = body.find(".bak") {
+                p = p.spans([rune::Span::new(start, start + 4).mono()]);
+            }
+            p
+        });
+
+    for candidate in &inactive {
+        let id = candidate.id.clone();
+        let disabled = s.busy || !candidate.has_data();
+        migration = migration.child(
+            row_card(&format!("settings-candidate-{}", candidate.id))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(heading(&candidate.id))
+                        .child(
+                            text(candidate.path.clone())
+                                .w_full()
+                                .wrap_anywhere()
+                                .font(text_style(11.0, 400.0).mono())
+                                .color(ink("#71717a")),
+                        )
+                        .child(muted(&candidate.summary())),
+                )
+                .child(action_button::<S>(
+                    format!("settings-import-{}", candidate.id),
+                    "Import",
+                    None,
+                    true,
+                    disabled,
+                    false,
+                    move |s: &mut S, _tx: &mut rune::Tx| s.settings_mut().run_import(id.clone()),
+                )),
+        );
+    }
+    if inactive.is_empty() {
+        migration = migration.child(
+            text("No other harness roots with data were found.".to_string())
+                .font(text_style(11.0, 400.0))
+                .color(ink("#71717a")),
+        );
+    }
+    migration = migration.child(
+        action_button::<S>(
+            "settings-import-folder",
+            "Import from a folder…",
+            Some(icon_folder_open(14.0, ink("#d4d4d8"))),
+            false,
+            s.busy,
+            false,
+            |s: &mut S, tx: &mut rune::Tx| {
+                if s.settings().busy {
+                    return;
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = tx;
+                    s.settings_mut().error =
+                        Some("Folder import is available in the desktop app.".to_string());
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                pick_import_folder::<S>(tx);
+            },
+        )
+        // A CSS inline-flex button does not stretch inside the section's
+        // block flow; a Rune column would stretch it to 608pt.
+        .self_start(),
+    );
+
+    let mut body = col()
+        .key("settings-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(14.0)
+        .px(20.0)
+        .pt(16.0)
+        .pb(20.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(updates)
+        .child(backup)
+        .child(migration);
+    if let Some(error) = &s.error {
+        body = body.child(
+            text(error.clone())
+                .key("settings-error")
+                .w_full()
+                .radius(12.0)
+                .border(1.0, rgba(239.0 / 255.0, 68.0 / 255.0, 68.0 / 255.0, 0.25))
+                .border_layout()
+                .fill(rgba(239.0 / 255.0, 68.0 / 255.0, 68.0 / 255.0, 0.07))
+                .px(12.0)
+                .py(8.0)
+                .wrap()
+                .font(text_style(11.5, 400.0))
+                .color(ink("#fca5a5"))
+                .role("alert"),
+        );
+    }
+    if !s.status.is_empty() {
+        body = body.child(
+            text(s.status.clone())
+                .key("settings-status")
+                .w_full()
+                .radius(12.0)
+                .border(1.0, rgba(1.0, 1.0, 1.0, 0.10))
+                .border_layout()
+                .fill(rgba(1.0, 1.0, 1.0, 0.04))
+                .px(12.0)
+                .py(8.0)
+                .wrap()
+                .font(text_style(11.5, 400.0))
+                .color(ink("#d4d4d8"))
+                .role("status"),
+        );
+    }
+
+    let mut card = col()
+        .key("settings-card")
+        .w(card_w)
+        .max_h(card_h)
+        .radius(16.0)
+        .fill(ink("#09090b"))
+        .border(1.0, ink("#262626"))
+        .border_layout()
+        .clip_rounded(16.0)
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 25.0,
+            blur: 50.0,
+            spread: -12.0,
+            color: rgba(0.0, 0.0, 0.0, 0.5),
+            inset: false,
+        })
+        .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
+        .modal(true, |s: &mut S| s.settings_mut().close())
+        .child(head)
+        .child(body);
+    if card_h > 0.0 {
+        // The body scrolls only inside a bounded card; React's max-height
+        // clamps at the same cap once the three sections overflow it.
+        card = card.h(card_h);
+    }
+    // `.modal-panel-enter`: 240 ms fade + 10 pt rise + 0.98 settle. React
+    // unmounts the sheet on close, so the removal is instant.
+    card = card.transition(crate::motion::modal_enter());
+
+    // Backdrop and panel are siblings, like React's two animated elements:
+    // fading the full-screen container would fade the panel twice.
+    let backdrop = rune::el()
+        .key("settings-backdrop")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(rgba(0.0, 0.0, 0.0, 0.70))
+        .backdrop_blur(12.0)
+        // `.modal-backdrop-enter`: 200 ms opacity, instant on close.
+        .transition(crate::motion::backdrop_enter());
+    rune::el()
+        .key("settings-overlay")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .center()
+        .px(16.0)
+        .py(16.0)
+        .child(backdrop)
+        .child(card)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::{Cx, Env, Runtime};
+
+    struct Host {
+        settings: SettingsState,
+        w: f32,
+        h: f32,
+        reduced: bool,
+    }
+
+    impl SettingsHost for Host {
+        fn settings(&self) -> &SettingsState {
+            &self.settings
+        }
+        fn settings_mut(&mut self) -> &mut SettingsState {
+            &mut self.settings
+        }
+    }
+
+    fn view(s: &Host, cx: &mut Cx<Host>) -> El {
+        cx.reduced_motion(s.reduced);
+        // The shell only mounts the sheet while it is open; keeping that here
+        // lets the entrance test exercise a real insertion, not the initial
+        // view (which Rune treats as already present).
+        if s.settings.open {
+            settings_sheet::<Host>(&s.settings, s.w, s.h)
+        } else {
+            col().key("settings-test-root").w_full().h_full()
+        }
+    }
+
+    fn host(w: f32, h: f32) -> Host {
+        let settings = SettingsState {
+            open: true,
+            active: r"C:\Stark\harness".to_string(),
+            candidates: vec![
+                MigrationCandidate {
+                    id: "appdata".to_string(),
+                    path: r"C:\Users\davin\AppData\Roaming\com.stark.workspace".to_string(),
+                    active: false,
+                    has_chats_db: true,
+                    has_sessions: true,
+                    has_config: true,
+                },
+                MigrationCandidate {
+                    id: "repo".to_string(),
+                    path: r"D:\MyProject\LangChain".to_string(),
+                    active: false,
+                    has_chats_db: true,
+                    has_sessions: false,
+                    has_config: true,
+                },
+            ],
+            ..SettingsState::default()
+        };
+        Host {
+            settings,
+            w,
+            h,
+            reduced: false,
+        }
+    }
+
+    #[test]
+    fn panel_uses_reacts_viewport_caps() {
+        for (w, h, expected_w, expected_h) in [
+            (1280.0, 900.0, 680.0, 640.0),
+            (800.0, 573.0, 680.0, 533.0),
+            (468.0, 720.0, 436.0, 640.0),
+        ] {
+            let env = Env::new(true, 1.0);
+            let mut rt = Runtime::new(host(w, h), view, (w, h), env);
+            rt.frame(0.0);
+            let (card, _) = rt.presented("settings-card").expect("settings card");
+            eprintln!("{w}x{h} card {card:?}");
+            assert!((card[2] - expected_w).abs() < 0.51, "{w}x{h}: {}", card[2]);
+            assert!((card[3] - expected_h).abs() < 0.51, "{w}x{h}: {}", card[3]);
+            assert!((card[0] - (w - expected_w) / 2.0).abs() < 0.51);
+            assert!((card[1] - (h - expected_h) / 2.0).abs() < 0.51);
+        }
+    }
+
+    #[test]
+    fn reduced_motion_snaps_the_panel_rise_and_keeps_the_fade() {
+        let env = Env::new(true, 1.0);
+        let mut reduced = host(1280.0, 900.0);
+        reduced.reduced = true;
+        reduced.settings.open = false;
+        let mut rt = Runtime::new(reduced, view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("settings-card").is_none());
+        rt.state.settings.open = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        for _ in 0..5 {
+            rt.frame(1.0 / 60.0);
+        }
+        let card = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("settings-card"))
+            .expect("settings card");
+        assert!(
+            (card.rect[1] - 130.0).abs() < 0.51,
+            "reduced motion removes the 10pt rise, got {:?}",
+            card.rect
+        );
+        assert!(
+            card.opacity > 0.0 && card.opacity < 1.0,
+            "the presence fade still runs under reduced motion, got {}",
+            card.opacity
+        );
+    }
+
+    #[test]
+    fn active_candidate_is_hidden_and_old_placeholder_rows_are_gone() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(host(1280.0, 900.0), view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("settings-section-updates").is_some());
+        assert!(rt.find("settings-section-backup").is_some());
+        assert!(rt.find("settings-section-migration").is_some());
+        assert!(rt.find("settings-candidate-appdata").is_some());
+        assert!(rt.find("settings-candidate-repo").is_some());
+        for stale in [
+            "settings-row-model",
+            "settings-row-mic",
+            "settings-row-theme",
+            "settings-row-backend",
+        ] {
+            assert!(rt.find(stale).is_none(), "{stale} must not render");
+        }
+        // Backdrop press closes.
+        rt.pointer_down(100.0, 100.0);
+        rt.pointer_up(100.0, 100.0);
+        rt.frame(0.0);
+        assert!(!rt.state.settings.open, "backdrop dismisses");
+        assert!(
+            rt.find("settings-card").is_none(),
+            "React unmounts the sheet in the frame it closes"
+        );
+    }
+
+    #[test]
+    fn status_and_error_surfaces_match_react_copy() {
+        let settings = SettingsState {
+            open: true,
+            error: Some("Migration failed.".to_string()),
+            status:
+                "Backup staged (a → b). Restart the app/server to apply it. A pre-import copy was kept."
+                    .to_string(),
+            ..SettingsState::default()
+        };
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(
+            Host {
+                settings,
+                w: 1280.0,
+                h: 900.0,
+                reduced: false,
+            },
+            view,
+            (1280.0, 900.0),
+            env,
+        );
+        rt.frame(0.0);
+        assert!(rt.find("settings-error").is_some());
+        assert!(rt.find("settings-status").is_some());
+    }
+
+    #[test]
+    fn contract_messages_match_settings_modal() {
+        let op = migration_op(Ok(serde_json::json!({
+            "ok": true,
+            "message": "Imported appdata.",
+            "copied": ["chats.db", "sessions"]
+        })));
+        assert_eq!(
+            op.status.as_deref(),
+            Some("Imported appdata. Copied: chats.db, sessions.")
+        );
+        let backup = backup_op(Ok(serde_json::json!({
+            "ok": true,
+            "from_root": r"C:\old",
+            "to_root": r"C:\new"
+        })));
+        assert_eq!(
+            backup.status.as_deref(),
+            Some(
+                r"Backup staged (C:\old → C:\new). Restart the app/server to apply it. A pre-import copy was kept."
+            )
+        );
+        assert!(backup.clear_file);
+        let export = export_op(Ok("stark-backup-20260101-120000.zip".to_string()));
+        assert_eq!(
+            export.status.as_deref(),
+            Some(
+                "Exported stark-backup-20260101-120000.zip. Keep it safe — it contains chats and config, never API keys."
+            )
+        );
+    }
+
+    #[test]
+    fn update_stub_is_honest_on_native_and_web() {
+        let mut s = SettingsState::default();
+        s.check_updates();
+        if cfg!(target_arch = "wasm32") {
+            assert_eq!(s.update.phase, UpdatePhase::Unsupported);
+            assert!(s.update.message.contains("Web build"));
+        } else {
+            assert_eq!(s.update.phase, UpdatePhase::Error);
+            assert_eq!(s.update.message, "Rune update checks are not wired yet.");
+        }
+        assert!(!s.desktop() == cfg!(target_arch = "wasm32"));
+    }
+
+    #[test]
+    fn poll_applies_status_candidates_and_op_messages() {
+        let (ltx, lrx) = mpsc::channel();
+        let (otx, orx) = mpsc::channel();
+        let mut s = SettingsState {
+            loading: true,
+            generation: 7,
+            load_inbox: Some(lrx),
+            op_inbox: Some(orx),
+            ..SettingsState::default()
+        };
+        ltx.send(LoadResult {
+            generation: 7,
+            result: Ok(MigrationStatus {
+                active: r"C:\active".to_string(),
+                candidates: vec![MigrationCandidate {
+                    id: "old".to_string(),
+                    path: r"C:\old".to_string(),
+                    has_chats_db: true,
+                    ..MigrationCandidate::default()
+                }],
+            }),
+        })
+        .unwrap();
+        otx.send(OpResult {
+            kind: OpKind::Backup,
+            status: Some("Exported x.zip. Keep it safe".to_string()),
+            error: None,
+            clear_file: true,
+        })
+        .unwrap();
+        assert!(poll_settings(&mut s));
+        assert_eq!(s.active, r"C:\active");
+        assert_eq!(s.candidates.len(), 1);
+        assert!(!s.loading);
+        assert_eq!(s.status, "Exported x.zip. Keep it safe");
+        assert!(s.backup_file.is_none());
+    }
+}

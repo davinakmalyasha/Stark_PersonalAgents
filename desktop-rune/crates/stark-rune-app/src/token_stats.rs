@@ -442,20 +442,32 @@ pub fn stats_sheet<S: 'static>(
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
-        .fill(rune::Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.7,
-        })
         .center()
         .modal(true, {
             let close = on_close.clone();
             move |s: &mut S| close(s)
         })
+        // Separate backdrop and panel, like `modal-backdrop-enter` +
+        // `modal-panel-enter` in React.
+        .child(
+            rune::el()
+                .key("stats-backdrop")
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .fill(rune::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.7,
+                })
+                .backdrop_blur(12.0)
+                .transition(crate::motion::backdrop_enter()),
+        )
         .child(
             col()
                 .key("stats-card")
+                .transition(crate::motion::modal_enter())
                 .w(860.0)
                 .radius(16.0)
                 .fill(ink("#09090b"))
@@ -581,6 +593,7 @@ mod tests {
         rt.frame(0.0);
         for key in [
             "stats-overlay",
+            "stats-backdrop",
             "stats-card",
             "stats-title",
             "stats-cost",

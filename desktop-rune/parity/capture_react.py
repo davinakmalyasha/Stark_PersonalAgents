@@ -183,9 +183,11 @@ async def capture(args) -> None:
                         const st = document.createElement('style');
                         st.textContent = {json.dumps(HIDE_CSS)};
                         document.head.appendChild(st);
-                        // The web build has no updater; drop its error toast.
+                        // The web build has no updater; hide its error toast.
+                        // Never remove React-owned nodes: React's next commit
+                        // would throw removeChild and blank the page.
                         for (const el of document.querySelectorAll('[role="status"]')) {{
-                            if (/update/i.test(el.textContent || '')) el.remove();
+                            if (/update/i.test(el.textContent || '')) el.style.display = 'none';
                         }}
                         const sc = [...document.querySelectorAll('.overflow-y-auto')]
                             .find(s => s.className.includes('pl-7'));
@@ -347,6 +349,36 @@ async def capture(args) -> None:
                 print("probe:", json.dumps(probe.get("result", {}).get("value"), indent=1))
                 if probe.get("result", {}).get("value") is None:
                     print("probe error:", json.dumps(probe.get("result", {}).get("exceptionDetails", probe), indent=1)[:3000])
+            # Settings' desktop-only branches key off `window.__TAURI__`.
+            # Set it after the app's launch update check has already settled
+            # (web build => unsupported) so the modal renders the native layout
+            # without faking an update state.
+            if args.desktop:
+                await cdp.call(
+                    "Runtime.evaluate",
+                    {"expression": "window.__TAURI__ = window.__TAURI__ || {};", "returnByValue": True},
+                )
+                time.sleep(0.1)
+            if args.open_settings:
+                # Cold Vite boots can take a few seconds; press as soon as the
+                # rail exists instead of capturing a boot screen.
+                for _ in range(50):
+                    opened = await cdp.call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": """(() => {
+                                const b = [...document.querySelectorAll('button')]
+                                    .find((x) => x.getAttribute('aria-label') === 'Open settings');
+                                if (b) b.click();
+                                return Boolean(b);
+                            })()""",
+                            "returnByValue": True,
+                        },
+                    )
+                    if opened.get("result", {}).get("value"):
+                        break
+                    time.sleep(0.2)
+                time.sleep(0.5)
             # A hover pose (sidebar action cluster) is transient: move the
             # pointer, let the CSS hover settle, then capture.
             if args.hover:
@@ -412,6 +444,22 @@ async def capture(args) -> None:
             if args.click2:
                 await click_at(args.click2)
                 time.sleep(args.click2_delay)
+            if args.desktop:
+                # The launch updater check runs before `__TAURI__` is exposed;
+                # its web-build error is not part of the desktop Settings pose.
+                # Hide via CSS (not DOM removal): removing a React-owned node
+                # mid-render leaves the tree inconsistent.
+                await cdp.call(
+                    "Runtime.evaluate",
+                    {
+                        "expression": """(() => {
+                            const s = document.createElement('style');
+                            s.textContent = '.modal-panel-enter [role="status"]{display:none!important}';
+                            document.head.appendChild(s);
+                        })()""",
+                        "returnByValue": True,
+                    },
+                )
             # An explicit scroll is a frozen mid-transcript pose: the app's own
             # auto-scroll can fire a beat later, so shoot right away.
             time.sleep(
@@ -478,6 +526,16 @@ def main() -> int:
         "--click",
         default="",
         help="click X,Y before capturing (sidebar delete confirm)",
+    )
+    ap.add_argument(
+        "--open-settings",
+        action="store_true",
+        help="press the rail's Open settings button before capturing",
+    )
+    ap.add_argument(
+        "--desktop",
+        action="store_true",
+        help="expose a fake __TAURI__ so Settings renders its desktop branches",
     )
     ap.add_argument(
         "--click2",

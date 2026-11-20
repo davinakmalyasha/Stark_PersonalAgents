@@ -999,6 +999,12 @@ impl CanvasState {
         let Some(thread) = self.sessions.threads.get_mut(&card_id) else {
             return false;
         };
+        // History refresh replaces the rows wholesale. Keep the seen set for
+        // keys that survive, and drop the rest so a rewound/recreated row is
+        // treated as a fresh mount again.
+        let live: std::collections::HashSet<String> =
+            rows.iter().map(|row| row.key.clone()).collect();
+        thread.seen_rows.retain(|key| live.contains(key));
         thread.rows = rows.iter().map(row_from_chat).collect();
         thread.live = false;
         thread.aborting = false;
@@ -2081,7 +2087,8 @@ fn card_view<S: CanvasHost + 'static>(
                 a: 0.50,
             },
         )
-        .clip_rounded(radius);
+        .clip_rounded(radius)
+        .hover_group();
     if card.running {
         // One shadow slot: the running glow wins over the drop (the glow is
         // the running signal; `.canvas-card.is-running` keeps both).
@@ -2382,6 +2389,7 @@ fn card_view<S: CanvasHost + 'static>(
             .key(format!("{id}-agents-menu"))
             .w_full()
             .gap(2.0)
+            .transition(crate::motion::menu_enter())
             .px(14.0)
             .child(
                 text("Connected agents".to_string())
@@ -2408,6 +2416,8 @@ fn card_view<S: CanvasHost + 'static>(
                     .py(5.0)
                     .role("button")
                     .label(format!("Open {kid_title}"))
+                    .hover(ink("#ffffff0a"))
+                    .hover_group()
                     .on_press(move |s: &mut S| {
                         let c = s.canvas_mut();
                         c.agents_open = None;
@@ -2416,7 +2426,8 @@ fn card_view<S: CanvasHost + 'static>(
                     .child(
                         text(kid_title.clone())
                             .font(rune::tok::TextStyle::new(11.0, 500.0))
-                            .color(ink("#d4d4d8")),
+                            .color(ink("#d4d4d8"))
+                            .group_color(ink("#ffffff")),
                     ),
             );
         }
@@ -2552,6 +2563,25 @@ fn card_view<S: CanvasHost + 'static>(
                 .border(1.0, ink("#44444c"))
                 .inert(),
         );
+    if !active && !card.running {
+        // `.canvas-card:hover { border-color: rgba(255,255,255,.16) }`.
+        // `.is-active` and `.is-running` are more specific, so the wash is
+        // only mounted on the plain card. Rune has no hover border track.
+        view = view.child(
+            rune::el()
+                .key(format!("{id}-hover-border"))
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .radius(radius)
+                // The base border is white/.086. A white/.082 overlay lands
+                // on React's opaque .16 (`T = a + B(1-a)`), instead of
+                // stacking two white alphas into a brighter edge.
+                .border(1.0, ink("#ffffff15"))
+                .group_opacity(0.0, 1.0)
+                .inert(),
+        );
+    }
     view
 }
 
@@ -2686,6 +2716,7 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         .key("canvas-add-menu")
         .absolute(14.0, 44.0)
         .w(300.0)
+        .transition(crate::motion::canvas_menu_enter())
         .radius(10.0)
         .fill(ink("#121317fa"))
         .border(1.0, ink("#ffffff17"))
@@ -3834,6 +3865,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         let mut item = row()
             .key(format!("side-{card_id}"))
             .w_full()
+            .transition(crate::motion::sidebar_row_enter())
             .items_center()
             .gap(8.0)
             .pl(if spawned && flat { 26.0 } else { 12.0 })
@@ -4147,11 +4179,13 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                         .key(format!("side-group-{ws_id}-chevron"))
                         .size(11.0, 11.0)
                         .inert()
-                        .shape(if collapsed {
-                            chevron_right(11.0, ink("#52525b"))
+                        .rotate(if collapsed {
+                            -std::f32::consts::FRAC_PI_2
                         } else {
-                            chevron_down(11.0, ink("#52525b"))
-                        }),
+                            0.0
+                        })
+                        .rotate_motion(crate::motion::ROTATE)
+                        .shape(chevron_down(11.0, ink("#52525b"))),
                 )
                 .child(
                     text(ws_name.to_uppercase())
@@ -4370,6 +4404,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             .key("map-kind-menu")
             .absolute(14.0, 52.0)
             .w(220.0)
+            .transition(crate::motion::menu_enter())
             .radius(12.0)
             .border(1.0, ink("#ffffff17"))
             .fill(ink("#151515"))
@@ -4393,6 +4428,8 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .fill(ink(if current { "#ffffff0d" } else { "#00000000" }))
                     .role("button")
                     .label(format!("Switch to {kind}"))
+                    .hover(ink("#ffffff0a"))
+                    .hover_group()
                     .on_press(move |s: &mut S| {
                         let c = s.canvas_mut();
                         c.sessions.kind = target.clone();
@@ -4771,6 +4808,33 @@ pub fn run_canvas_headless(extra_args: Vec<String>) {
 mod tests {
     use super::*;
     use rune::{Env, Runtime};
+
+    #[test]
+    fn history_refresh_keeps_seen_rows_and_drops_deleted_keys() {
+        let mut canvas = CanvasState::map();
+        let mut thread = crate::rune_transcript::RuneTranscriptState::screenshot();
+        thread.seen_rows.insert("keep".to_string());
+        thread.seen_rows.insert("gone".to_string());
+        canvas
+            .sessions
+            .threads
+            .insert("chat:ws:chat-1".to_string(), thread);
+        let rows = vec![crate::chats::ChatMsgRow {
+            key: "keep".to_string(),
+            ..Default::default()
+        }];
+        assert!(canvas.apply_chat_messages("ws:chat-1", &rows));
+        let thread = &canvas.sessions.threads["chat:ws:chat-1"];
+        assert!(
+            thread.seen_rows.contains("keep"),
+            "a surviving row keeps its settled entrance"
+        );
+        assert!(
+            !thread.seen_rows.contains("gone"),
+            "a removed row would animate again if it returned"
+        );
+        assert_eq!(thread.rows.len(), 1);
+    }
 
     #[test]
     fn local_chat_rekey_moves_every_reference() {

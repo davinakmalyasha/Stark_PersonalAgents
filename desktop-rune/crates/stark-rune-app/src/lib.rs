@@ -30,6 +30,9 @@ pub mod icons;
 #[path = "image_cache.rs"]
 pub mod image_cache;
 #[cfg(feature = "rune-real")]
+#[path = "motion.rs"]
+pub mod motion;
+#[cfg(feature = "rune-real")]
 #[path = "notes.rs"]
 pub mod notes;
 #[cfg(feature = "rune-real")]
@@ -44,6 +47,9 @@ pub mod rune_canvas;
 #[cfg(feature = "rune-real")]
 #[path = "rune_transcript.rs"]
 pub mod rune_transcript;
+#[cfg(feature = "rune-real")]
+#[path = "settings.rs"]
+pub mod settings;
 #[cfg(feature = "rune-real")]
 #[path = "shell.rs"]
 pub mod shell;

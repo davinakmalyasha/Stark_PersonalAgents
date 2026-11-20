@@ -729,8 +729,9 @@ pub struct RuneTranscriptState {
     /// Background status fetches (`/api/provider`, `/api/models`) run only in
     /// the real app entry; unit tests and headless scenes stay offline.
     pub services_auto: bool,
-    /// Settings sheet visibility.
-    pub settings_open: bool,
+    /// Settings modal data + visibility (global in the shell; this thread
+    /// owns the standalone transcript scene's copy).
+    pub settings: crate::settings::SettingsState,
     /// Mic capture bus (levels, notes, stop flag, inbox).
     pub voice: crate::voice::VoiceBus,
     /// Frames streamed from the run thread, drained by the `poll` hook.
@@ -784,6 +785,11 @@ pub struct RuneTranscriptState {
     /// `chat` SSE frame landed: the shell rekeys a `chat:local:*` card to the
     /// server id (`workspace`, `chat`).
     pub pending_rekey: Option<(String, String)>,
+    /// Row keys that have already appeared on screen. The virtual list unmounts
+    /// rows outside its window, so without this a scroll back would replay the
+    /// CSS entrance on rows the user has already seen. React animates a message
+    /// once, on mount, and never again.
+    pub seen_rows: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for RuneTranscriptState {
@@ -805,7 +811,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("run_target", &self.run_target)
             .field("usage", &self.usage)
             .field("models", &self.models.len())
-            .field("settings_open", &self.settings_open)
+            .field("settings", &self.settings)
             .field("voice", &self.voice)
             .field("inbox", &self.inbox.is_some())
             .field("copied_code", &self.copied_code)
@@ -821,6 +827,7 @@ impl std::fmt::Debug for RuneTranscriptState {
             .field("drill_inbox", &self.drill_inbox.is_some())
             .field("draft_attachments", &self.draft_attachments.len())
             .field("attachment_preview", &self.attachment_preview.is_some())
+            .field("seen_rows", &self.seen_rows.len())
             .finish()
     }
 }
@@ -865,7 +872,7 @@ impl Clone for RuneTranscriptState {
                 inbox: None,
             },
             services_auto: self.services_auto,
-            settings_open: self.settings_open,
+            settings: self.settings.clone(),
             voice: self.voice.clone(),
             inbox: None,
             copied_code: self.copied_code.clone(),
@@ -887,6 +894,7 @@ impl Clone for RuneTranscriptState {
             attachment_preview: None,
             refresh_list: self.refresh_list,
             pending_rekey: self.pending_rekey.clone(),
+            seen_rows: self.seen_rows.clone(),
         }
     }
 }
@@ -952,7 +960,7 @@ impl RuneTranscriptState {
             models_inbox: None,
             provider: ProviderState::default(),
             services_auto: false,
-            settings_open: false,
+            settings: crate::settings::SettingsState::default(),
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
             copied_code: None,
@@ -974,6 +982,7 @@ impl RuneTranscriptState {
             attachment_preview: None,
             refresh_list: false,
             pending_rekey: None,
+            seen_rows: std::collections::HashSet::new(),
         }
     }
 
@@ -1031,7 +1040,7 @@ impl RuneTranscriptState {
             models_inbox: None,
             provider: ProviderState::default(),
             services_auto: false,
-            settings_open: false,
+            settings: crate::settings::SettingsState::default(),
             voice: crate::voice::VoiceBus::default(),
             inbox: None,
             copied_code: None,
@@ -1053,6 +1062,7 @@ impl RuneTranscriptState {
             attachment_preview: None,
             refresh_list: false,
             pending_rekey: None,
+            seen_rows: std::collections::HashSet::new(),
         }
     }
 
@@ -1841,6 +1851,14 @@ impl TranscriptHost for RuneTranscriptState {
         self
     }
 }
+impl crate::settings::SettingsHost for RuneTranscriptState {
+    fn settings(&self) -> &crate::settings::SettingsState {
+        &self.settings
+    }
+    fn settings_mut(&mut self) -> &mut crate::settings::SettingsState {
+        &mut self.settings
+    }
+}
 
 pub fn transcript_view(s: &RuneTranscriptState, cx: &mut Cx<RuneTranscriptState>) -> El {
     let (w, h) = cx
@@ -1857,7 +1875,10 @@ pub fn transcript_view(s: &RuneTranscriptState, cx: &mut Cx<RuneTranscriptState>
 
 /// Transcript body shared by the standalone view and the shell: rows read
 /// `s`, handlers resolve through `S: TranscriptHost` for `which` thread.
-pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
+pub fn transcript_body<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
+    s: &RuneTranscriptState,
+    which: Thread,
+) -> El {
     // Thread-local running banner lives in `transcript_body` (the shell's
     // sheet drops its own when the thread is live — see `sheet_running`).
     if s.live {
@@ -1873,7 +1894,7 @@ pub fn transcript_body<S: TranscriptHost + 'static>(s: &RuneTranscriptState, whi
 }
 
 /// The body without the live banner (sheet uses this + its own banner).
-pub fn transcript_view_body<S: TranscriptHost + 'static>(
+pub fn transcript_view_body<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
 ) -> El {
@@ -2141,6 +2162,8 @@ pub fn attachment_lightbox<S: 'static>(
         .fill(home_rgba(0.0, 0.0, 0.0, 0.82))
         .backdrop_blur(10.0)
         .center()
+        // `.message-lightbox { animation: file-drop-in .16s ease }`.
+        .transition(crate::motion::fade_in(rune::Spring::smooth(0.16, 0.0)))
         .modal(true, {
             let close = close.clone();
             move |s: &mut S| close(s)
@@ -2312,6 +2335,11 @@ fn apply_rewind(s: &mut RuneTranscriptState, result: RewindOk) {
         .iter()
         .map(crate::rune_canvas::row_from_chat)
         .collect();
+    // A rewound row is gone for good; if it ever comes back it is a fresh
+    // mount and should animate again.
+    let live: std::collections::HashSet<String> =
+        s.rows.iter().map(|row| row.key.clone()).collect();
+    s.seen_rows.retain(|key| live.contains(key));
     s.edit.replace_text(result.prompt);
     s.draft_attachments = result.attachments;
     s.attachments_error = None;
@@ -2759,14 +2787,22 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             .radius(6.0)
             .center()
             .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
+            .hover_group()
             .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
                 copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
             })
-            .child(rune::el().size(12.0, 12.0).inert().shape(if copied {
-                crate::lucide_check(12.0, 2.0, home_ink("#34d399"))
+            .child(if copied {
+                rune::el()
+                    .size(12.0, 12.0)
+                    .inert()
+                    .shape(crate::lucide_check(12.0, 2.0, home_ink("#34d399")))
             } else {
-                home_icon_copy(12.0, home_ink("#52525b"))
-            })),
+                crate::motion::hover_icon(
+                    12.0,
+                    home_icon_copy(12.0, home_ink("#52525b")),
+                    home_icon_copy(12.0, home_ink("#d4d4d8")),
+                )
+            }),
     );
     if armed {
         let rewind_key = r.key.clone();
@@ -2782,7 +2818,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
                 .px(8.0)
                 .radius(6.0)
                 .fill(home_rgba(239.0, 68.0, 68.0, 0.15))
-                .hover(home_rgba(239.0, 68.0, 68.0, 0.22))
+                // React's confirm button has no hover state of its own.
                 .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
                     start_rewind(
                         s.thread_mut(which),
@@ -2817,15 +2853,15 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
                 .radius(6.0)
                 .center()
                 .hover(home_rgba(239.0, 68.0, 68.0, 0.1))
+                .hover_group()
                 .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
                     arm_rewind(s, which, &rewind_key, tx);
                 })
-                .child(
-                    rune::el()
-                        .size(12.0, 12.0)
-                        .inert()
-                        .shape(home_icon_rotate(12.0, home_ink("#52525b"))),
-                ),
+                .child(crate::motion::hover_icon(
+                    12.0,
+                    home_icon_rotate(12.0, home_ink("#52525b")),
+                    home_icon_rotate(12.0, home_ink("#fca5a5")),
+                )),
         );
     }
     col()
@@ -3164,6 +3200,16 @@ fn artifact_status_icon(status: crate::chats::ArtifactStatus, size: f32) -> El {
     }
 }
 
+/// A down chevron that springs to up when the file list expands.
+fn rotating_artifact_chevron(size: f32, expanded: bool, color: rune::Color) -> El {
+    rune::el()
+        .size(size, size)
+        .inert()
+        .rotate(if expanded { std::f32::consts::PI } else { 0.0 })
+        .rotate_motion(crate::motion::ROTATE)
+        .shape(artifact_chevron(size, true, color))
+}
+
 /// Disclosure chevron for "Show N more files" (rotates when expanded).
 fn artifact_chevron(size: f32, down: bool, color: rune::Color) -> rune::Shape {
     let p = if down {
@@ -3339,6 +3385,7 @@ fn artifact_panel<S: TranscriptHost + 'static>(
                 .min_h(88.0)
                 .border_sides([0.0, 0.0, 1.0, 0.0], home_rgba(255.0, 255.0, 255.0, 0.1))
                 .border_layout()
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
                 .child(
                     rune::el()
                         .key(format!("{row_key}-artifact-icon"))
@@ -3459,11 +3506,11 @@ fn artifact_panel<S: TranscriptHost + 'static>(
                     .font(rune::tok::TextStyle::new(11.5, 500.0))
                     .color(home_ink("#8a8a93")),
                 )
-                .child(rune::el().size(15.0, 15.0).inert().shape(artifact_chevron(
+                .child(rotating_artifact_chevron(
                     15.0,
-                    !expanded,
+                    expanded,
                     home_ink("#777983"),
-                ))),
+                )),
         );
     }
     card
@@ -3762,15 +3809,18 @@ fn home_agent_actions<S: TranscriptHost + 'static>(
                 .radius(6.0)
                 .center()
                 .hover(home_ink("#27272a"))
+                .hover_group()
                 .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
                     stage_send_prompt(s.thread_mut(which), prompt.clone());
                 })
-                .child(
-                    rune::el()
-                        .size(12.0, 12.0)
-                        .inert()
-                        .shape(home_icon_rotate(12.0, home_ink("#71717a"))),
-                ),
+                // `.pressable:active { transform: scale(.96) }`; after the
+                // press handler, which is when `press_scale` takes.
+                .press_scale(0.96)
+                .child(crate::motion::hover_icon(
+                    12.0,
+                    home_icon_rotate(12.0, home_ink("#71717a")),
+                    home_icon_rotate(12.0, home_ink("#d4d4d8")),
+                )),
         );
     }
     let copy_text = response.to_string();
@@ -3784,15 +3834,16 @@ fn home_agent_actions<S: TranscriptHost + 'static>(
             .radius(6.0)
             .center()
             .hover(home_ink("#27272a"))
+            .hover_group()
             .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
                 copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
             })
-            .child(
-                rune::el()
-                    .size(12.0, 12.0)
-                    .inert()
-                    .shape(home_icon_copy(12.0, home_ink("#71717a"))),
-            ),
+            .press_scale(0.96)
+            .child(crate::motion::hover_icon(
+                12.0,
+                home_icon_copy(12.0, home_ink("#71717a")),
+                home_icon_copy(12.0, home_ink("#d4d4d8")),
+            )),
     )
 }
 
@@ -4132,6 +4183,25 @@ fn home_session_event<S: TranscriptHost + 'static>(
         .child(line())
 }
 
+/// Which entrance a row gets the first time it appears. `None` once the row has
+/// been seen, so a virtual remount or a history refresh cannot replay it.
+fn row_entrance(
+    row: &RowData,
+    seen: &std::collections::HashSet<String>,
+) -> Option<rune::Transition> {
+    if seen.contains(&row.key) {
+        return None;
+    }
+    // `MessageBubble.tsx` keys the class off the role only: a session event
+    // that arrives as an agent message still uses `msg-agent-enter`.
+    let role = match row.role {
+        "user" => "user",
+        "agent" => "agent",
+        _ => "fade",
+    };
+    Some(crate::motion::row_enter(role))
+}
+
 /// One home row (`MessageStream` + `MessageBubble`): local-day divider, then
 /// the role's flat layout — no avatars, no bubble names, 24pt group spacing.
 fn home_row<S: TranscriptHost + 'static>(
@@ -4143,7 +4213,13 @@ fn home_row<S: TranscriptHost + 'static>(
 ) -> El {
     let t = s.thread(which);
     let r = &t.rows[i];
-    let mut root = col().key(r.key.clone()).w_full();
+    let mut root = col()
+        .key(r.key.clone())
+        .w_full()
+        // A row leaving the window or a refreshed history unmounts at once,
+        // like React. The entrance belongs to the message group below, so the
+        // day divider stays put and the row never leaves a fading ghost.
+        .transition(rune::Transition::none());
     if r.role == "user" {
         root = root.arrives_whole();
     } else if r.is_streaming {
@@ -4157,7 +4233,10 @@ fn home_row<S: TranscriptHost + 'static>(
     }
     let live = t.live && i + 1 == t.rows.len() && r.role != "user" && r.role != "error";
     let retry_prompt = meta.retry_prompts[i].clone();
-    let group = if !r.event.is_empty() {
+    // The day divider stays put; the entrance belongs to the message group.
+    let entrance = row_entrance(r, &t.seen_rows);
+    let seen_key = r.key.clone();
+    let mut group = if !r.event.is_empty() {
         home_session_event::<S>(r, which, &retry_prompt)
     } else {
         match r.role {
@@ -4167,6 +4246,15 @@ fn home_row<S: TranscriptHost + 'static>(
             _ => home_agent_row::<S>(s, which, r, live, &retry_prompt),
         }
     };
+    if let Some(entrance) = entrance {
+        group = group
+            .transition(entrance)
+            .on_visible(move |s: &mut S, on, _tx| {
+                if on {
+                    s.thread_mut(which).seen_rows.insert(seen_key.clone());
+                }
+            });
+    }
     root.child(group)
 }
 
@@ -4250,7 +4338,7 @@ fn conversation_rail(rows: &[RowData]) -> Option<El> {
 
 /// Home chat card body (`HouseChat` `variant="home"`): no header row — the
 /// card is the floating conversation panel, just messages + prompt dock.
-pub fn home_transcript_body<S: TranscriptHost + 'static>(
+pub fn home_transcript_body<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
     card_w: f32,
@@ -4544,7 +4632,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         .child(dock)
 }
 
-fn transcript_body_with<S: TranscriptHost + 'static>(
+fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
     show_head: bool,
@@ -4789,7 +4877,8 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
         // `grow`, not `h_full`: fills a standalone window and shares a shell
         // column with the tab bar without overflowing it.
         .grow(1.0)
-        .min_h(0.0);
+        .min_h(0.0)
+        .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER);
     // The home card supplies the surface (rgba 13,13,16/.94); the standalone
     // sheet still paints its own opaque page background.
     if show_head {
@@ -4825,7 +4914,9 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
                         .font(rune::tok::TextStyle::new(11.0, 500.0))
                         .color(rune::color::hex("#8a8a93").unwrap_or(rune::Color::BLACK))
                         .on_press(move |s: &mut S| {
-                            s.thread_mut(which).settings_open = true;
+                            let thread = s.thread_mut(which);
+                            let (host, port) = (thread.api_host.clone(), thread.api_port);
+                            thread.settings.open(host, port);
                         }),
                 ),
         );
@@ -5017,8 +5108,9 @@ fn transcript_body_with<S: TranscriptHost + 'static>(
     };
     root = root.child(dock.child(dock_child));
     if show_sheets {
-        if s.settings_open {
-            root = root.child(settings_sheet::<S>(s, which));
+        if s.settings.open {
+            let (w, h) = transcript_window();
+            root = root.child(crate::settings::settings_sheet::<S>(&s.settings, w, h));
         }
         if s.notes.open {
             root = root.child(super::notes::notes_sheet::<S>(&s.notes, which));
@@ -5248,170 +5340,6 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
         )
 }
 
-/// Settings sheet: dim backdrop + centred card, focus-trapped while mounted.
-/// Backdrop press and Escape both dismiss (Rune `modal` machinery).
-/// Settings sheet (public for the shell's global gear; the transcript dock
-/// uses it too).
-pub fn settings_sheet<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which: Thread) -> El {
-    let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-    let label = rune::tok::TextStyle::new(12.0, 500.0);
-    let value = rune::tok::TextStyle::new(12.0, 400.0);
-    let setting_row = |key: &str, name: &str, val: String| {
-        row()
-            .key(format!("settings-row-{key}"))
-            .w_full()
-            .items_center()
-            .py(9.0)
-            .child(
-                text(name.to_string())
-                    .key(format!("settings-{key}-label"))
-                    .grow(1.0)
-                    .font(label)
-                    .color(ink("#a1a1aa")),
-            )
-            .child(
-                text(val)
-                    .key(format!("settings-{key}-value"))
-                    .font(value)
-                    .color(ink("#e4e4e7")),
-            )
-    };
-    rune::el()
-        .key("settings-overlay")
-        .absolute(0.0, 0.0)
-        .w_full()
-        .h_full()
-        .fill(rune::Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.6,
-        })
-        .center()
-        .modal(true, move |s: &mut S| {
-            s.thread_mut(which).settings_open = false;
-        })
-        .child(
-            col()
-                .key("settings-card")
-                .w(380.0)
-                .radius(16.0)
-                .fill(ink("#141417"))
-                .border(1.0, ink("#ffffff14"))
-                .px(20.0)
-                .pt(16.0)
-                .pb(16.0)
-                .gap(4.0)
-                .child(
-                    row()
-                        .key("settings-head")
-                        .w_full()
-                        .items_center()
-                        .child(
-                            text("Settings".to_string())
-                                .key("settings-title")
-                                .grow(1.0)
-                                .font(rune::tok::TextStyle::new(13.0, 700.0))
-                                .color(ink("#f4f4f5")),
-                        )
-                        .child(
-                            rune::el()
-                                .key("settings-close")
-                                .size(16.0, 16.0)
-                                .role("button")
-                                .label("Close settings")
-                                .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
-                                .on_press(move |s: &mut S| {
-                                    s.thread_mut(which).settings_open = false;
-                                }),
-                        ),
-                )
-                .child(setting_row("theme", "Theme", "Dark".to_string()))
-                .child(if s.models.is_empty() {
-                    // No model list fetched: static value, like the backend
-                    // row. The picker lives in the composer dock.
-                    setting_row("model", "Model", s.model.clone())
-                } else {
-                    // Model list is loaded: jump straight into the picker
-                    // instead of showing a dead value row.
-                    row()
-                        .key("settings-row-model")
-                        .w_full()
-                        .items_center()
-                        .py(9.0)
-                        .role("button")
-                        .label("Change model")
-                        .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
-                        .on_press(move |s: &mut S| {
-                            let t = s.thread_mut(which);
-                            t.settings_open = false;
-                            t.model_open = true;
-                        })
-                        .child(
-                            text("Model".to_string())
-                                .key("settings-model-label")
-                                .grow(1.0)
-                                .font(label)
-                                .color(ink("#a1a1aa")),
-                        )
-                        .child(
-                            text(s.model.clone())
-                                .key("settings-model-value")
-                                .font(value)
-                                .color(ink("#e4e4e7")),
-                        )
-                })
-                .child({
-                    // Microphone row is live: it toggles capture (opening the
-                    // voice overlay) and reports the bus state, so a missing
-                    // device reads honestly instead of faking a toggle.
-                    let mic_value = if s.voice.live {
-                        "Listening…".to_string()
-                    } else if let Some(note) = s.voice.note.as_deref() {
-                        note.to_string()
-                    } else {
-                        "Ready".to_string()
-                    };
-                    row()
-                        .key("settings-row-mic")
-                        .w_full()
-                        .items_center()
-                        .py(9.0)
-                        .role("button")
-                        .label("Toggle voice input")
-                        .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
-                        .on_press(move |s: &mut S| {
-                            let t = s.thread_mut(which);
-                            let on = !t.voice.live;
-                            t.voice.set_live(on);
-                        })
-                        .child(
-                            text("Microphone".to_string())
-                                .key("settings-mic-label")
-                                .grow(1.0)
-                                .font(label)
-                                .color(ink("#a1a1aa")),
-                        )
-                        .child(
-                            text(mic_value)
-                                .key("settings-mic-value")
-                                .font(value)
-                                .color(ink("#e4e4e7")),
-                        )
-                })
-                .child(setting_row(
-                    "version",
-                    "Version",
-                    format!("stark-rune {}", env!("CARGO_PKG_VERSION")),
-                ))
-                .child(setting_row(
-                    "backend",
-                    "Backend",
-                    format!("{}:{}", s.api_host, s.api_port),
-                )),
-        )
-}
-
 fn init_screenshot() -> RuneTranscriptState {
     RuneTranscriptState::screenshot()
 }
@@ -5426,7 +5354,7 @@ fn apply_stress(s: &mut RuneTranscriptState) {
 
 fn apply_settings(s: &mut RuneTranscriptState) {
     *s = RuneTranscriptState::screenshot();
-    s.settings_open = true;
+    s.settings.open(s.api_host.clone(), s.api_port);
 }
 
 fn apply_voice(s: &mut RuneTranscriptState) {
@@ -5573,6 +5501,10 @@ pub fn ask_demo() -> RuneTranscriptState {
 /// Returns true when state changed (requests another frame).
 pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = false;
+    changed |= crate::settings::poll_settings(&mut s.settings);
+    if s.settings.loading || s.settings.busy || s.settings.backup_busy {
+        tx.wake_after(std::time::Duration::from_millis(50));
+    }
     // `Markdown.tsx`'s copy button shows the Check for 1.8s.
     // Millis from `clock` (wasm-safe): `Instant::now` panics in the browser.
     let now = crate::clock::now_millis();
@@ -6099,7 +6031,7 @@ mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert!(rt.state.settings_open);
+        assert!(rt.state.settings.open);
         for key in ["settings-card", "settings-title", "settings-close"] {
             assert!(rt.find(key).is_some(), "{key} mounted");
         }
@@ -6110,20 +6042,20 @@ mod tests {
         rt.pointer_down(sx, sy);
         rt.pointer_up(sx, sy);
         rt.frame(0.0);
-        assert!(!rt.state.settings_open, "backdrop press dismisses");
+        assert!(!rt.state.settings.open, "backdrop press dismisses");
         assert_eq!(rt.state.rows.len(), n, "no row staged behind the modal");
         // Reopen, then Escape dismisses via the modal machinery.
         let (x, y) = rt.find("settings-open").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.0);
-        assert!(rt.state.settings_open);
+        assert!(rt.state.settings.open);
         rt.key(KeyEvent {
             key: Key::Escape,
             mods: Mods::default(),
         });
         rt.frame(0.0);
-        assert!(!rt.state.settings_open, "Escape dismisses");
+        assert!(!rt.state.settings.open, "Escape dismisses");
     }
 
     #[test]
@@ -6720,24 +6652,34 @@ mod tests {
     }
 
     #[test]
-    fn settings_mic_row_reports_and_toggles() {
+    fn settings_matches_tauri_sections() {
         let mut s = RuneTranscriptState::screenshot();
-        s.settings_open = true;
+        s.settings.open = true;
         let env = Env::new(true, 2.0);
         let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
         rt.frame(0.0);
-        assert!(rt.find("settings-row-mic").is_some(), "mic row placed");
-        assert!(rt.find("settings-mic-value").is_some(), "mic value placed");
-        let (x, y) = rt.find("settings-row-mic").expect("mic row placed");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        // Headless rigs have no mic: either live capture or an honest note.
-        assert!(
-            rt.state.voice.live || rt.state.voice.note.is_some(),
-            "voice state: {:?}",
-            rt.state.voice
-        );
+        for key in [
+            "settings-card",
+            "settings-backdrop",
+            "settings-title",
+            "settings-close",
+            "settings-section-updates",
+            "settings-section-backup",
+            "settings-section-migration",
+            "settings-backup-file",
+            "settings-backup-root",
+            "settings-import-folder",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} mounted");
+        }
+        for stale in [
+            "settings-row-model",
+            "settings-row-mic",
+            "settings-row-theme",
+            "settings-row-backend",
+        ] {
+            assert!(rt.find(stale).is_none(), "{stale} is the old placeholder");
+        }
     }
 
     fn artifact_row(key: &str, run_id: &str) -> RowData {
@@ -6898,27 +6840,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_model_row_opens_picker() {
-        use crate::rune_transcript::ModelOption;
-        let mut s = RuneTranscriptState::screenshot();
-        s.settings_open = true;
-        s.models = vec![ModelOption {
-            id: "m1".to_string(),
-            name: "Model One".to_string(),
-        }];
-        let env = Env::new(true, 2.0);
-        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
-        rt.frame(0.0);
-        assert!(rt.find("settings-row-model").is_some(), "model row placed");
-        let (x, y) = rt.find("settings-row-model").expect("model row placed");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert!(!rt.state.settings_open, "settings closes");
-        assert!(rt.state.model_open, "picker opens");
-    }
-
-    #[test]
     fn task_list_renders_nested_checkboxes() {
         let body = "- [x] Freeze the numbers\n- [ ] Re-run the capture\n  - [ ] Nested follow-up\n";
         let mut s = RuneTranscriptState::screenshot();
@@ -6967,6 +6888,181 @@ mod tests {
         assert!(rt.find("t1-b0-thead").is_some(), "header placed");
         assert!(rt.find("t1-b0-tr-0").is_some(), "first row placed");
         assert!(rt.find("t1-b0-tr-1").is_some(), "second row placed");
+    }
+
+    #[test]
+    fn entrance_only_for_a_key_the_list_has_not_shown() {
+        use std::collections::HashSet;
+        let user = RowData {
+            key: "u".to_string(),
+            role: "user",
+            ..RowData::default()
+        };
+        let agent = RowData {
+            key: "a".to_string(),
+            role: "agent",
+            ..RowData::default()
+        };
+        let system = RowData {
+            key: "s".to_string(),
+            role: "system",
+            event: "aborted".to_string(),
+            ..RowData::default()
+        };
+        let agent_event = RowData {
+            key: "ae".to_string(),
+            role: "agent",
+            event: "aborted".to_string(),
+            ..RowData::default()
+        };
+        let mut seen = HashSet::new();
+        let user_enter = row_entrance(&user, &seen).expect("new user row animates");
+        assert_eq!(user_enter.insertion.offset.x, 14.0);
+        assert_eq!(row_entrance(&agent, &seen).unwrap().insertion.offset.y, 8.0);
+        assert_eq!(
+            row_entrance(&system, &seen).unwrap().insertion.offset.y,
+            2.0,
+            "system rows use the generic fade"
+        );
+        assert_eq!(
+            row_entrance(&agent_event, &seen)
+                .unwrap()
+                .insertion
+                .offset
+                .y,
+            8.0,
+            "MessageBubble keys the entrance off the role, not the event kind"
+        );
+        seen.insert("u".to_string());
+        assert!(
+            row_entrance(&user, &seen).is_none(),
+            "a virtual remount must not replay the entrance"
+        );
+    }
+
+    #[test]
+    fn history_reload_keeps_seen_keys_and_treats_them_as_settled() {
+        use std::collections::HashSet;
+        let mut s = RuneTranscriptState::screenshot();
+        let first = s.rows[0].key.clone();
+        s.seen_rows.insert(first.clone());
+        // The same retain `apply_chat_messages` performs after replacing rows.
+        let live: HashSet<String> = s.rows.iter().map(|row| row.key.clone()).collect();
+        s.seen_rows.retain(|key| live.contains(key));
+        assert!(s.seen_rows.contains(&first));
+        assert!(row_entrance(&s.rows[0], &s.seen_rows).is_none());
+    }
+
+    fn home_test_view(s: &RuneTranscriptState, _: &mut rune::Cx<RuneTranscriptState>) -> El {
+        home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0)
+    }
+
+    #[test]
+    fn a_new_user_row_slides_in_once_and_never_replays_on_remount() {
+        let env = Env::new(true, 1.0);
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows.clear();
+        s.live = false;
+        let mut rt = Runtime::new(s, home_test_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        let row = || RowData {
+            key: "enter-u".to_string(),
+            role: "user",
+            body: "hello".to_string(),
+            raw_body: "hello".to_string(),
+            at: "2026-11-12T12:00:00Z".to_string(),
+            ..RowData::default()
+        };
+        rt.state.rows = vec![row()];
+        rt.invalidate();
+        rt.frame(0.0);
+        for _ in 0..4 {
+            rt.frame(1.0 / 60.0);
+        }
+        let entering = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("enter-u-group"))
+            .expect("user group mounted");
+        let entering_x = entering.rect[0];
+        assert!(
+            entering.opacity > 0.0 && entering.opacity < 1.0,
+            "the first appearance fades in, got {}",
+            entering.opacity
+        );
+        for _ in 0..40 {
+            rt.frame(1.0 / 60.0);
+        }
+        let settled = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("enter-u-group"))
+            .expect("user group settled");
+        let rest_x = settled.rect[0];
+        assert!(
+            entering_x - rest_x > 3.0,
+            "the row starts to the right and slides in (entering {entering_x}, rest {rest_x})"
+        );
+        assert!(
+            rt.state.seen_rows.contains("enter-u"),
+            "the visible row is marked seen"
+        );
+
+        // Virtual remount: same key, after the first appearance.
+        rt.state.rows.clear();
+        rt.invalidate();
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.elements()
+                .iter()
+                .all(|element| element.key.as_deref() != Some("enter-u-group")),
+            "a removed row unmounts in its frame, without a fading ghost"
+        );
+        rt.state.rows = vec![row()];
+        rt.invalidate();
+        rt.frame(0.0);
+        let remount = rt
+            .elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some("enter-u-group"))
+            .expect("user group remounted");
+        assert!(
+            (remount.rect[0] - rest_x).abs() < 0.51,
+            "a seen row must not replay its slide (remount {}, rest {rest_x})",
+            remount.rect[0]
+        );
+        assert!(
+            remount.opacity >= 1.0,
+            "a seen row must not replay its fade, got {}",
+            remount.opacity
+        );
+    }
+
+    fn ask_test_view(s: &RuneTranscriptState, _: &mut rune::Cx<RuneTranscriptState>) -> El {
+        let batch = s.ask.batches.first().expect("ask demo batch").clone();
+        crate::ask::ask_panel::<RuneTranscriptState>(&batch, &s.ask, Thread::Main, false, 720.0)
+    }
+
+    #[test]
+    fn ask_option_wrapper_keeps_the_button_box() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ask_demo(), ask_test_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        let outer = rt
+            .presented("ask-option-scope-0")
+            .expect("option wrapper")
+            .0;
+        let inner = rt
+            .presented("ask-option-scope-0-button")
+            .expect("option button")
+            .0;
+        for (index, (a, b)) in outer.iter().zip(inner.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.51,
+                "wrapper inset at lane {index}: outer {outer:?}, inner {inner:?}"
+            );
+        }
+        assert!(rt.find("ask-option-scope-1").is_some());
     }
 
     #[test]

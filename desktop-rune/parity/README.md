@@ -448,3 +448,136 @@ gone 1.747/1.539, all align (0, 0)).
 `drag`, `type`, …). Add one per visual state so both sides capture the same
 scene. The React side may need a matching DOM scroll (`scrollTop`) or a click;
 keep those instructions next to the script.
+
+## Settings parity (2026-11-19)
+
+`parity/scenarios/settings/api_migration_status.json` is a committed,
+deterministic migration status (one active path, two import candidates) so
+both sides render the same rows without touching a real harness. The sheet is
+the Tauri `SettingsModal.tsx` port: App updates, Backup & move, One-time
+migration, the styled file control and exact status copy. Rune has no updater
+yet, so the desktop Check action reports that honestly; the row itself matches
+Tauri at rest.
+
+```bash
+# fixture server + React (Vite on :5200 with STARK_PORT=8126)
+python desktop-rune/parity/mock_server.py --port 8126 --scenario settings
+cd frontend && STARK_PORT=8126 npm run dev -- --port 5200 --strictPort
+
+# React desktop pose (rail gear, no launch-update error)
+python desktop-rune/parity/capture_react.py /tmp/settings-react.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 6 \
+  --desktop --open-settings
+
+# native
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/settings-native.png --rune-route settings \
+  --size 1280x900 --at 2
+
+# hover pose over Check
+python desktop-rune/parity/capture_react.py /tmp/settings-react-hover.png \
+  --url http://localhost:5200/ --size 1280x900 --settle 6 \
+  --desktop --open-settings --hover 888,285
+STARK_API_PORT=8126 D:/cargo-target/stark/release/stark-rune.exe \
+  --rune-shell-snap /tmp/settings-native-hover.png --rune-route settings \
+  --size 1280x900 --at 2 --script parity/scripts/settings_hover_check.json
+
+python desktop-rune/parity/compare.py \
+  --native /tmp/settings-native.png --react /tmp/settings-react.png --align \
+  --out /tmp/settings-diff
+```
+
+`parity/scripts/settings_open.json` taps the rail gear at 0.6s, so
+`--at 0.70`/`0.80` catch the panel's fade-and-rise entrance.
+`settings_import_appdata.json` opens the sheet and imports the `appdata`
+candidate; the mock answers with the same `{message, copied}` shape as the
+real server, and the status line lands at the bottom of the scroll body.
+
+`parity/scripts/message_entrance.json` focuses `composer-input`, types
+`motion probe`, and presses `composer-send` at 1.0s. Capture `--at 1.05` or
+`1.07` for the user row's +14 pt slide and fade; at 1.05 the group is
++12.6 pt with opacity 0.10, at 1.07 it is +10.1 pt with opacity 0.28. The
+fixture's `/api/run` answers without an SSE stream, so the shell refreshes
+the chat a few frames later and the staged rows disappear. The remount rule
+is covered by
+`rune_transcript::tests::a_new_user_row_slides_in_once_and_never_replays_on_remount`,
+which also asserts that a removed row unmounts without a fading ghost.
+
+`--desktop` sets `window.__TAURI__` after the launch update check has settled
+and hides the modal's `[role="status"]` line via a stylesheet, so the web
+React capture shows the desktop-only Check row without faking an update
+result. It does not alter the app; it only reaches the same branch a Tauri
+window renders.
+
+| capture | full mean | right mean | panel mean | align |
+| --- | ---: | ---: | ---: | --- |
+| 1280×900 rest | **1.183** | **1.109** | **1.748** | (0, 0) |
+| 1280×900 hover Check | **1.183** | **1.109** | **1.748** | (0, 0) |
+| 800×573 rest | **1.596** | **1.407** | **1.740** | (0, 0) |
+
+`panel mean` is the modal rectangle (680×640 at 1280, 680×533 at 800). The
+full-frame means include the app behind the modal, where Rune's map/coding
+canvas legitimately differs from React's route; the modal is the parity
+surface here. Geometry is exact: panel/header/body, the 57.75pt update and
+export rows, the 124.75pt import row, the 74.25pt candidate rows, the 24.5pt
+file control and the 26.5pt root input all land on React's CDP rects. Remaining
+panel delta is glyph rasterisation plus the two Tailwind `tracking`
+approximations (Rune rounds the label and button advances to whole points).
+
+## Interaction sweep (2026-11-20)
+
+The motion pass is split into shared primitives (`motion.rs`) and per-surface
+entrances. These scripted poses exercise the new paths against the fixture
+server:
+
+| script | pose |
+| --- | --- |
+| `message_entrance.json` | focus composer, type, send; capture 1.05/1.07 for the user slide |
+| `trace_open.json` | open `msg-0a4560f6`'s trace; groups fade/rise, the header chevron rotates |
+| `canvas_add_menu.json` | tap `canvas-add`; capture 1.06/1.20 for the `.985` menu settle |
+| `agent_config_open.json` | tap `composer-provider`; backdrop 200 ms, panel 240 ms |
+| `canvas_card_hover.json` | hover the right-hand card; its `-hover-border` overlay reaches opacity 1 |
+| `new_session_entrance.json` | create a tab; the new tab mounts (sidebar rows use the 260 ms entrance when a chat is created) |
+| `settings_open.json` | rail gear; panel 240 ms |
+
+Measured checkpoints:
+
+| pose | frame | observation |
+| --- | --- | --- |
+| user message | 1.05 | group +12.6 pt, opacity 0.10 |
+| user message | 1.07 | group +10.1 pt, opacity 0.28 |
+| trace group | 1.06 / 1.12 / 1.40 | opacity 0.17 / 0.56 / 1.00 |
+| canvas add menu | 1.06 / 1.20 | scale 0.9906 / 0.9998, opacity 0.38 / 0.99 |
+| AgentConfig | 1.12 / 1.30 | opacity 0.52 / 0.975, backdrop and card on separate tracks |
+
+### Accepted deltas
+
+These are deliberate: Rune has no hover transform track, and a few CSS
+transitions do not map one-to-one.
+
+| React | Rune | Why |
+| --- | --- | --- |
+| `hover: translateY(-1px)` (cards, send) | no lift; send gets a white `.12` wash | a 1 pt lift needs per-element `Live` state; the wash matches `brightness(1.12)` |
+| `project-heading:hover svg { scale(1.08) }` | no scale | below 1 px at 11 pt; stacking a second glyph is worse than the delta |
+| `.chat-row.is-deleting` collapses `max-height` | 220 ms opacity fade, slot pops | the sidebar list is not a growth stack; collapsing it safely is a separate refactor |
+| `.message-image:hover img { scale(1.04) }` | no zoom | same per-element `Live` cost as the lift |
+| `grid-template-rows` opacity on open/close bodies | height glides on the growth stack, child opacity lands immediately | Rune animates the measured height, not an interpolated fraction |
+| `animate-pulse` on status dots | `LoopSpec::opacity` | same period/range; Reduce Motion cools the loop |
+| `hover:border-*` on the provider pill, model trigger and attachment-add tile | fill/text hover only | Rune has no hover border track; an inset overlay would double the 1 px edge |
+
+### Loop audit
+
+| loop | period / delay | status |
+| --- | --- | --- |
+| thinking dots | 1.1 s / 0.14 s stagger | present |
+| retry segments | 1.4 s | present |
+| sidebar run dot | 1.6 s | present |
+| running card sheen | 2.6 s linear | present |
+| voice orb | 1.5 s (1.2 s live dot) | present |
+| canvas cloud/target pulse | 1.4 s | present |
+| caret | 0.9 s opacity | present |
+| skeleton | 1.4 s | not ported (no skeleton surface yet) |
+| canvas dot pulse | 1.4 s | not ported (no live project-card dot yet) |
+
+Reduce Motion zeroes looping amplitude through Rune's motion gate; finite
+sequences still land.

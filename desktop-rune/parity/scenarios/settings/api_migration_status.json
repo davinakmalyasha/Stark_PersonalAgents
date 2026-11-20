@@ -1,0 +1,21 @@
+{
+  "active": "C:\\Stark\\harness",
+  "candidates": [
+    {
+      "id": "appdata",
+      "path": "C:\\Users\\davin\\AppData\\Roaming\\com.stark.workspace",
+      "active": false,
+      "has_chats_db": true,
+      "has_sessions": true,
+      "has_config": true
+    },
+    {
+      "id": "repo",
+      "path": "D:\\MyProject\\LangChain",
+      "active": false,
+      "has_chats_db": true,
+      "has_sessions": false,
+      "has_config": true
+    }
+  ]
+}

@@ -93,20 +93,22 @@ keep their border box through a wrapper so the hover border is not inset by
 their padding; markdown code-copy and inline links brighten on hover.
 
 Hover properties that CSS transitions but Rune has no binding for use
-`HoverSet` + `Live`: `live_scale`/`live_offset`/`live_border` carry the 150 ms
-track while `on_hover_change` publishes the target and `tx.live_only()` avoids
-a rebuild. That covers the canvas-card 1 pt lift, the white send button's
-`scale(1.04)`, message-image `scale(1.04)`, the project chevron `scale(1.08)`,
-chat-row/subagent 1 px slides, provider/model/attachment hover borders, and
-message attachment chips. Spinners, pulse dots and sheens use their React
+`HoverSet` + `Live`: `live_scale`/`live_offset`/`live_border`/`live_fill`
+carry the 150 ms track while `on_hover_change` publishes the target and
+`tx.live_only()` avoids a rebuild. That covers the canvas-card 1 pt lift, the
+white send button's `scale(1.04)`, message-image `scale(1.04)`, the project
+chevron `scale(1.08)`, chat-row/subagent 1 px slides, provider/model/attachment
+hover borders, message attachment chips, and the empty-canvas 27 pt circle
+(`scale(1.04)`, `#fff → #e8e8ea`). The sidebar delete row collapses its slot on
+the CSS bezier while its content goes absolute; the trace row folds over
+280 ms on close; the voice dot samples the full `voice-breathe` scale/opacity
+keyframe at 60 Hz while live. Spinners, pulse dots and sheens use their React
 periods; the caret uses a near-step `Cycle` for `steps(1)`. Hover and spatial
 transitions respect Reduce Motion through Rune's motion gate (offsets snap,
 opacity still fades).
 
-The remaining deltas are recorded in `parity/README.md`: the sidebar delete
-slot still holds its height (fade then drop), the trace body fades on open but
-unmounts on close, the voice live dot is opacity-only, the canvas empty-add
-glyph does not scale, and the group-project skeleton surface is unported.
+The remaining delta is the group-project skeleton surface, which arrives with
+the modal/chat milestone; details are in `parity/README.md`.
 
 ## Transcript (MessageStream port)
 

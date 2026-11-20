@@ -1,0 +1,18 @@
+{
+  "workspaces": [
+    {
+      "addedAt": "",
+      "chatCount": 0,
+      "exists": true,
+      "id": "_general",
+      "isDfd": false,
+      "isGeneral": true,
+      "isHouse": false,
+      "isPersonal": false,
+      "name": "General",
+      "path": "",
+      "updatedAt": "2026-11-11T09:23:14.678Z",
+      "workspaceKind": "general"
+    }
+  ]
+}

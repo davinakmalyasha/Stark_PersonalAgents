@@ -45,6 +45,13 @@ pub enum VoiceMsg {
 pub struct VoiceBus {
     pub live: bool,
     pub level: f32,
+    /// `voice-breathe` tracks: scale `.88 -> 1.08` and opacity `.65 -> 1`
+    /// over 1.2 s. Rune has no infinite scale loop, so the shell samples the
+    /// keyframe clock into these `Live` values while the dot is mounted.
+    pub breathe_scale: rune::Live<f32>,
+    pub breathe_opacity: rune::Live<f32>,
+    /// Wall-clock start of the current live session (ms).
+    pub breathe_start_ms: u64,
     pub note: Option<String>,
     /// Latest interim dictation (`transcript` events overwrite it in place,
     /// like React's `voice-live-input` bubble content).
@@ -74,6 +81,9 @@ impl Clone for VoiceBus {
         Self {
             live: self.live,
             level: self.level,
+            breathe_scale: self.breathe_scale.clone(),
+            breathe_opacity: self.breathe_opacity.clone(),
+            breathe_start_ms: self.breathe_start_ms,
             note: self.note.clone(),
             live_text: self.live_text.clone(),
             pending_final: self.pending_final.clone(),
@@ -88,6 +98,9 @@ impl Default for VoiceBus {
         Self {
             live: false,
             level: 0.0,
+            breathe_scale: rune::Live::new(1.0),
+            breathe_opacity: rune::Live::new(1.0),
+            breathe_start_ms: 0,
             note: None,
             live_text: String::new(),
             pending_final: None,
@@ -109,11 +122,16 @@ impl VoiceBus {
             self.rx = None;
             self.live = false;
             self.level = 0.0;
+            self.breathe_scale.set(1.0);
+            self.breathe_opacity.set(1.0);
             self.live_text.clear();
             return false;
         }
         self.note = None;
         self.level = 0.0;
+        self.breathe_start_ms = crate::clock::now_millis();
+        self.breathe_scale.set(0.88);
+        self.breathe_opacity.set(0.65);
         self.live_text.clear();
         self.pending_final = None;
         #[cfg(target_arch = "wasm32")]
@@ -188,6 +206,8 @@ impl VoiceBus {
                         self.live_text.clear();
                         self.live = false;
                         self.level = 0.0;
+                        self.breathe_scale.set(1.0);
+                        self.breathe_opacity.set(1.0);
                         if let Some(stop) = self.stop.take() {
                             stop.store(true, Ordering::Relaxed);
                         }
@@ -206,6 +226,8 @@ impl VoiceBus {
                     self.note = Some(note);
                     self.live = false;
                     self.level = 0.0;
+                    self.breathe_scale.set(1.0);
+                    self.breathe_opacity.set(1.0);
                     changed = true;
                 }
             }
@@ -227,10 +249,46 @@ impl VoiceBus {
         self.pending_final.take()
     }
 
-    /// Meter snapshot for the composer bars: (live, level, note).
-    pub fn meter(&self) -> (bool, f32, Option<&str>) {
-        (self.live, self.level, self.note.as_deref())
+    /// Meter plus the live breathing tracks, for the composer's voice dot.
+    pub fn meter(&self) -> VoiceMeter<'_> {
+        VoiceMeter {
+            live: self.live,
+            breathe_scale: &self.breathe_scale,
+            breathe_opacity: &self.breathe_opacity,
+        }
     }
+
+    /// Publish one frame of the 1.2 s `voice-breathe` keyframe. The shell
+    /// calls this from its poll, which wakes at ~60 Hz while the mic is live.
+    pub fn tick_breathe(&self, now_ms: u64) -> bool {
+        if !self.live {
+            return false;
+        }
+        let (scale, opacity) = breathe_pose(now_ms.saturating_sub(self.breathe_start_ms));
+        self.breathe_scale.set(scale);
+        self.breathe_opacity.set(opacity);
+        true
+    }
+}
+
+/// Read-only composer view of the voice bus.
+pub struct VoiceMeter<'a> {
+    pub live: bool,
+    pub breathe_scale: &'a rune::Live<f32>,
+    pub breathe_opacity: &'a rune::Live<f32>,
+}
+
+/// `voice-breathe`: scale `.88 -> 1.08` and opacity `.65 -> 1` over 1.2 s,
+/// `ease-in-out` on each half. The keyframe repeats from the session start.
+pub fn breathe_pose(elapsed_ms: u64) -> (f32, f32) {
+    let phase = (elapsed_ms % 1200) as f32 / 1200.0;
+    let half = if phase < 0.5 {
+        phase * 2.0
+    } else {
+        (1.0 - phase) * 2.0
+    };
+    let eased = rune::Easing::EASE_IN_OUT.eval(half);
+    (0.88 + 0.20 * eased, 0.65 + 0.35 * eased)
 }
 
 /// RMS loudness in 0..1 of an f32 sample block.
@@ -677,6 +735,32 @@ mod tests {
         if let Some(name) = probe_input() {
             assert!(!name.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn breathe_matches_the_1200ms_keyframe() {
+        let (s0, o0) = breathe_pose(0);
+        assert!((s0 - 0.88).abs() < 1e-6 && (o0 - 0.65).abs() < 1e-6);
+        let (sh, oh) = breathe_pose(300);
+        assert!((sh - 0.98).abs() < 1e-4, "halfway up: {sh}");
+        assert!((oh - 0.825).abs() < 1e-4, "halfway up: {oh}");
+        let (s1, o1) = breathe_pose(600);
+        assert!((s1 - 1.08).abs() < 1e-4 && (o1 - 1.0).abs() < 1e-4);
+        let (sh2, _) = breathe_pose(900);
+        assert!((sh2 - 0.98).abs() < 1e-4, "halfway down: {sh2}");
+        let (s2, o2) = breathe_pose(1200);
+        assert!((s2 - 0.88).abs() < 1e-6 && (o2 - 0.65).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tick_breathe_publishes_only_while_live() {
+        let mut bus = VoiceBus::default();
+        assert!(!bus.tick_breathe(600), "idle bus does not publish");
+        bus.live = true;
+        bus.breathe_start_ms = 0;
+        assert!(bus.tick_breathe(600));
+        assert!((bus.breathe_scale.get() - 1.08).abs() < 1e-4);
+        assert!((bus.breathe_opacity.get() - 1.0).abs() < 1e-4);
     }
 
     #[test]

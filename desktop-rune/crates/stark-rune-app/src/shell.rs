@@ -609,7 +609,14 @@ fn side_panel(s: &ShellState) -> El {
 /// conversation, bottom-anchored over the map, prompt dock always visible.
 /// Width hugs React's `md:max-w-[740px]`, height caps at 74vh.
 fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) -> Option<El> {
-    let thread = s.canvas.sheet_thread()?;
+    // React's `HouseChat` is mounted even with no open chats: a fresh
+    // account sees the empty "What to do Boss?" card and prompt dock over the
+    // empty canvas. With no sheet, reuse the always-present main thread.
+    let (thread, which) = match s.canvas.sheet_thread() {
+        Some(thread) => (thread, Thread::Open),
+        None if s.canvas.cards.is_empty() => (&s.transcript, Thread::Main),
+        None => return None,
+    };
     // React caps the wrapper (`md:max-w-[740px]`) and the wrapper's own
     // `px-2` gutters sit inside that cap: the card is at most 724 wide.
     // At 800 the stage is narrower than the cap, so this matches the old
@@ -642,10 +649,7 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
     let h = (window_h * 0.74).clamp(220.0, (stage_h - 8.0).max(220.0));
     card = card.h(h);
     card = card.child(home_transcript_body::<ShellState>(
-        thread,
-        Thread::Open,
-        card_w,
-        window_h,
+        thread, which, card_w, window_h,
     ));
     Some(
         col()
@@ -1148,11 +1152,31 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         // ~60 fps while the row fades out.
         tx.wake_after(std::time::Duration::from_millis(16));
     }
+    if tick_voice_breathe(s) {
+        // `voice-breathe` is a 1.2 s scale/opacity keyframe. Rune has no
+        // infinite scale loop; publish it into the Live tracks at 60 Hz while
+        // a mic is live, then stop waking when the session ends.
+        tx.wake_after(std::time::Duration::from_millis(16));
+    }
     if let Some(at) = s.chats.ui_dirty_at {
         let left = (0.4 - (clock - at)).max(0.01);
         tx.wake_after(std::time::Duration::from_secs_f64(left));
     }
     changed
+}
+
+/// Publish the `voice-breathe` pose for every live voice bus. Clones share
+/// their `Live` sources, so ticking the transcript, personal, canvas and
+/// card-thread buses is cheap and consistent.
+fn tick_voice_breathe(s: &ShellState) -> bool {
+    let now = crate::clock::now_millis();
+    let mut live = s.transcript.voice.tick_breathe(now);
+    live |= s.personal.voice.tick_breathe(now);
+    live |= s.canvas.voice.tick_breathe(now);
+    for thread in s.canvas.sessions.threads.values() {
+        live |= thread.voice.tick_breathe(now);
+    }
+    live
 }
 
 /// Drain the real-chat stream: adopt snapshots, apply per-chat history, and
@@ -1181,8 +1205,15 @@ fn poll_chats(s: &mut ShellState, clock: f64) -> bool {
                     // reconcile server data (React `useSessions` poll).
                     s.canvas.apply_chat_snapshot(&snapshot);
                 } else {
-                    // Boot: the persisted layout wins once.
+                    // Boot: the persisted layout wins once. A genuinely empty
+                    // account also clears the demo transcript, so the always-
+                    // mounted home card shows its empty state, not the sample
+                    // conversation.
                     s.canvas.adopt_boot_snapshot(&snapshot);
+                    if snapshot.open_tabs.is_empty() && snapshot.chats.is_empty() {
+                        s.transcript = RuneTranscriptState::empty_home();
+                        s.personal = RuneTranscriptState::empty_home();
+                    }
                     s.chats.booted = true;
                 }
                 s.chats.snapshot = snapshot;
@@ -1511,6 +1542,24 @@ fn apply_panel_memory(s: &mut ShellState) {
     s.canvas.rail = RailTab::Memory;
 }
 
+/// Parity pose for the composer's live voice dot: the mic is reported live
+/// and the breathing tracks are seeded at the keyframe's peak.
+fn apply_voice(s: &mut ShellState) {
+    let id = s.canvas.sessions.sheet.clone().or_else(|| {
+        s.canvas
+            .cards
+            .iter()
+            .find(|c| c.id.starts_with("chat:"))
+            .map(|c| c.id.clone())
+    });
+    let Some(id) = id else { return };
+    let thread = s.canvas.thread_mut(&id);
+    thread.voice.live = true;
+    thread.voice.level = 0.6;
+    thread.voice.breathe_start_ms = crate::clock::now_millis().saturating_sub(600);
+    let _ = thread.voice.tick_breathe(crate::clock::now_millis());
+}
+
 /// The exact Inter variable face the browser loads from Google Fonts.
 /// The built-in static Inter is close but not the same instance.
 const SHELL_FONTS: &[&[u8]] = &[include_bytes!("../assets/InterVariable.ttf")];
@@ -1524,6 +1573,7 @@ pub fn shell_spec() -> AppSpec<ShellState> {
         ("attachments", apply_shell_attachments),
         ("attachments-lightbox", apply_shell_attachments_lightbox),
         ("ask", apply_ask),
+        ("voice", apply_voice),
         ("settings", apply_settings),
         ("cloud", apply_panel_cloud),
         ("memory", apply_panel_memory),

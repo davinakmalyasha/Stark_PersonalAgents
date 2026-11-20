@@ -916,6 +916,19 @@ pub fn api_port() -> u16 {
 }
 
 impl RuneTranscriptState {
+    /// A fresh, empty home thread: the always-mounted `HouseChat` card for an
+    /// account with no chats. Same chrome as `screenshot`, no rows and no run.
+    pub fn empty_home() -> Self {
+        let mut state = Self::screenshot();
+        state.rows.clear();
+        state.title = "New Chat".to_string();
+        state.live = false;
+        state.voice.live = false;
+        state.voice.level = 0.0;
+        state.voice.live_text.clear();
+        state
+    }
+
     /// Screenshot scene: mirrors `AppState::default` card-4 (the running chat).
     pub fn screenshot() -> Self {
         Self {
@@ -4280,6 +4293,12 @@ fn home_row<S: TranscriptHost + 'static>(
         root = root.arrives_whole();
     } else if r.is_streaming {
         root = root.streaming(true);
+    }
+    if r.show_trace && !r.is_streaming {
+        // `.trace-collapsible` collapses its grid row over 280 ms. A
+        // completed trace row is a growth-stack row, so `fold_glide` gives
+        // the row the same disclosure curve while the body fades.
+        root = root.fold_glide(crate::motion::TRACE_FOLD);
     }
     if let Some(label) = &meta.dividers[i] {
         root = root.child(home_divider(label));

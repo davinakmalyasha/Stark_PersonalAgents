@@ -76,6 +76,8 @@ pub const TRACE: Spring = Spring::smooth(0.34, 0.0);
 pub const TRACE_GROUP: Spring = Spring::smooth(0.28, 0.0);
 /// `.trace-collapsible` opacity — 180 ms.
 pub const TRACE_BODY: Spring = Spring::smooth(0.18, 0.0);
+/// `.trace-collapsible` grid-row height — 280 ms.
+pub const TRACE_FOLD: Spring = Spring::smooth(0.28, 0.0);
 /// `.activity-tool-panel` — 180 ms.
 pub const TOOL_PANEL: Spring = Spring::smooth(0.18, 0.0);
 /// `.retry-status` — 200 ms.
@@ -239,6 +241,14 @@ pub fn fade_in(spring: Spring) -> Transition {
     enter(spring, Transition::opacity())
 }
 
+/// `.trace-collapsible` opening fade. Rune draws presence exits outside every
+/// ancestor clip, so a retained close would paint the body below the folded
+/// header. The body therefore unmounts at once; the row's `fold_glide`
+/// carries the 280 ms height collapse.
+pub fn trace_body_enter() -> Transition {
+    enter(TRACE_BODY, Transition::opacity())
+}
+
 /// CSS replaces the whole background on `hover:bg-*`; Rune paints `hover` as an
 /// overlay *over* the element's own fill. For a transparent rest fill the two
 /// are identical, so this returns `target` unchanged. For a filled row it
@@ -300,6 +310,7 @@ struct HoverInner {
     scale: HashMap<String, Live<f32>>,
     offset: HashMap<String, Live<[f32; 2]>>,
     border: HashMap<String, Live<Color>>,
+    fill: HashMap<String, Live<Color>>,
 }
 
 impl HoverSet {
@@ -335,6 +346,17 @@ impl HoverSet {
             .clone()
     }
 
+    /// Stable fill-colour track for `key`. CSS replaces an opaque surface
+    /// colour on hover; `live_fill` does the same without an overlay.
+    pub fn fill(&self, key: impl Into<String>, rest: Color) -> Live<Color> {
+        let mut inner = self.inner.lock().expect("hover set poisoned");
+        inner
+            .fill
+            .entry(key.into())
+            .or_insert_with(|| Live::new(rest))
+            .clone()
+    }
+
     /// Drop tracks whose element is gone. Call after a history/card refresh so
     /// a long-lived thread does not accumulate handles for deleted chats.
     pub fn retain(&self, keep: impl Fn(&str) -> bool) {
@@ -342,12 +364,13 @@ impl HoverSet {
         inner.scale.retain(|key, _| keep(key));
         inner.offset.retain(|key, _| keep(key));
         inner.border.retain(|key, _| keep(key));
+        inner.fill.retain(|key, _| keep(key));
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         let inner = self.inner.lock().expect("hover set poisoned");
-        inner.scale.len() + inner.offset.len() + inner.border.len()
+        inner.scale.len() + inner.offset.len() + inner.border.len() + inner.fill.len()
     }
 }
 
@@ -495,6 +518,12 @@ mod tests {
         assert_eq!(CARET.stops[2], (0.5001, 0.0));
         assert_eq!(HOVER_SPRING, Spring::smooth(0.15, 0.0));
         assert_eq!(TRACE_BODY, Spring::smooth(0.18, 0.0));
+        assert_eq!(TRACE_FOLD, Spring::smooth(0.28, 0.0));
+
+        let body = trace_body_enter();
+        assert_eq!(body.insertion.opacity, 0.0);
+        assert_eq!(body.removal, rune::Effect::IDENTITY);
+        assert_eq!(body.springs, SpringPair::new(TRACE_BODY, Spring::NONE));
     }
 
     #[test]
@@ -514,9 +543,13 @@ mod tests {
         border.set(ink("#ffffff29"));
         assert_eq!(set.border("pill", Color::BLACK).get(), ink("#ffffff29"));
 
-        assert_eq!(set.len(), 3);
+        let fill = set.fill("circle", ink("#ffffff"));
+        fill.set(ink("#e8e8ea"));
+        assert_eq!(set.fill("circle", Color::BLACK).get(), ink("#e8e8ea"));
+
+        assert_eq!(set.len(), 4);
         set.retain(|key| key == "card-a");
-        assert_eq!(set.len(), 2, "the pill's border track is pruned");
+        assert_eq!(set.len(), 2, "the pill/circle tracks are pruned");
         let fresh = set.border("pill", ink("#ffffff12"));
         assert_eq!(fresh.get(), ink("#ffffff12"), "a pruned key starts over");
     }

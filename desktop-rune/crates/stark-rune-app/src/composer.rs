@@ -239,7 +239,11 @@ fn voice_icon(color: rune::Color) -> rune::Shape {
 }
 
 /// Voice toggle button. `S` is the owning view's state type.
-fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> El {
+fn voice_button<S: 'static>(
+    voice: &crate::voice::VoiceMeter<'_>,
+    on_voice: impl Fn(&mut S) + 'static,
+) -> El {
+    let live = voice.live;
     let mut button = rune::el()
         .key("composer-voice")
         .role("button")
@@ -253,6 +257,11 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
         .center()
         .on_press(on_voice);
     if live {
+        // `.voice-live-dot`: a 5 pt white dot with a 2 pt `#8a6fe9` ring,
+        // top-right. `voice-breathe` scales and fades both over 1.2 s; the
+        // shell publishes the two Live tracks from the keyframe clock.
+        let scale = voice.breathe_scale;
+        let opacity = voice.breathe_opacity;
         button = button
             .linear_gradient(
                 135.0 * std::f32::consts::PI / 180.0,
@@ -261,14 +270,21 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
             .child(
                 rune::el()
                     .key("composer-voice-dot")
-                    .pin(None, Some(4.0), Some(4.0), None)
-                    .size(5.0, 5.0)
-                    .radius(2.5)
-                    .fill(ink("#ffffff"))
-                    // `.voice-live-dot`: 1.2s `voice-breathe` (scale .88→1.08,
-                    // opacity .65→1). Rune's loop is opacity-only; the scale
-                    // term is recorded as an accepted delta.
-                    .looping(rune::LoopSpec::opacity(1.2, 0.0, 0.65, 1.0)),
+                    .pin(None, Some(2.0), Some(2.0), None)
+                    .size(9.0, 9.0)
+                    .radius(4.5)
+                    .fill(ink("#8a6fe9"))
+                    .live_scale(scale)
+                    .live_opacity(opacity)
+                    .center()
+                    .inert()
+                    .child(
+                        rune::el()
+                            .size(5.0, 5.0)
+                            .radius(2.5)
+                            .fill(ink("#ffffff"))
+                            .inert(),
+                    ),
             );
     } else {
         button = button
@@ -873,12 +889,12 @@ pub struct ComposerButtons<S: 'static> {
 pub fn composer_card<S: 'static>(
     edit: &TextEdit,
     edit_of: std::rc::Rc<dyn for<'a> Fn(&'a mut S) -> &'a mut TextEdit>,
-    voice: (bool, f32, Option<&str>),
+    voice: crate::voice::VoiceMeter<'_>,
     running: bool,
     meta: ComposerMeta<'_>,
     buttons: ComposerButtons<S>,
 ) -> El {
-    let (voice_live, _voice_level, _voice_note) = voice;
+    let voice_live = voice.live;
     let submit = {
         let on_send = buttons.send.clone();
         move |s: &mut S, _tx: &mut Tx| on_send(s)
@@ -1202,7 +1218,7 @@ pub fn composer_card<S: 'static>(
                             meta.hover,
                         )
                     })
-                    .child(voice_button(voice_live, {
+                    .child(voice_button(&voice, {
                         let voice = buttons.voice.clone();
                         move |s: &mut S| voice(s)
                     }))

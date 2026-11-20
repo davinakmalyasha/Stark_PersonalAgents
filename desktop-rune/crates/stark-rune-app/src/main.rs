@@ -637,7 +637,7 @@ fn print_usage() {
     eprintln!("stark-rune --headless [--dump-tree <file>] [--golden <file>] [--script <type:<text>|mode:<Local|Cloud>|toggle:<chat_id>>]");
     eprintln!("stark-rune --rune-snap <png> [--rune-scene <screenshot|stress|settings|voice|attachments|ask>] [--rune-scale <n>]  (requires --features rune-real; real wgpu PNG)");
     eprintln!("stark-rune --rune-canvas-snap <png>  (1280x900 canvas map PNG)");
-    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|stream|trace|cloud|memory|attachments|attachments-lightbox|ask|settings>]  (single-page shell PNG; all scenes land on the one page)");
+    eprintln!("stark-rune --rune-shell-snap <png> [--rune-route <home|stream|trace|cloud|memory|attachments|attachments-lightbox|ask|voice|settings>]  (single-page shell PNG; all scenes land on the one page)");
     eprintln!("stark-rune --replay-sse <file> [--prompt <text>]  (replay recorded SSE into transcript rows)");
     eprintln!("stark-rune --api-get <path> [--api-port <n>]  (live GET against stark-server)");
     eprintln!("stark-rune --version  (app version + pinned Rune revision)");

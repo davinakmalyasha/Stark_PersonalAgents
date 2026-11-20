@@ -524,6 +524,14 @@ file control and the 26.5pt root input all land on React's CDP rects. Remaining
 panel delta is glyph rasterisation plus the two Tailwind `tracking`
 approximations (Rune rounds the label and button advances to whole points).
 
+## Empty board (2026-11-21)
+
+`--scenario empty` serves a successful boot with no tabs and no chats. Both
+sides now render the 24/16 `canvas-empty` stack (27 pt white circle, 11.5/500
+label, 10 pt copy), the always-mounted empty home card ("What to do Boss?"),
+and `No chats yet.` in the sidebar. The add FAB and the map hint are absent
+while the board is empty, matching `items.length > 0`.
+
 ## Interaction sweep (2026-11-20)
 
 The motion pass is split into shared primitives (`motion.rs`) and per-surface
@@ -538,6 +546,8 @@ These scripted poses exercise the paths against the fixture server:
 | `composer_send_hover.json` | type, then hover Send; capture 1.04/1.30 for the 1.04 scale |
 | `provider_hover.json` | hover the provider pill; its border rides a `Live` track |
 | `trace_open.json` | open `msg-0a4560f6`'s trace; groups fade/rise, the body fades 180 ms, the header chevron rotates |
+| `trace_close.json` | open, then close the trace; the row folds over 280 ms |
+| `sidebar_delete.json` | two deletes; the 34.8 pt row fades, slides and collapses |
 | `canvas_add_menu.json` | tap `canvas-add`; capture 1.06/1.20 for the `.985` menu settle |
 | `agent_config_open.json` | tap `composer-provider`; backdrop 200 ms, panel 240 ms |
 | `canvas_card_hover.json` | hover the right-hand card; 1 pt lift + border track |
@@ -553,6 +563,8 @@ Measured checkpoints:
 | user message | 1.07 | group +10.1 pt, opacity 0.28 |
 | trace group | 1.06 / 1.12 / 1.40 | opacity 0.17 / 0.56 / 1.00 |
 | trace body | 1.06 / 1.12 / 1.40 | opacity 0.324 / 0.787 / 1.000 |
+| trace close | 1.66 / 1.82 | row 51 pt closed; body unmounted, no ghost |
+| sidebar delete | unit probe | 34.8 pt slot → 7.8 pt with opacity 0.22 on the same frame |
 | send hover | 1.30 | scale 1.0382 (settles at 1.04), white face |
 | provider border | 1.6 | edge RGB 42→62 over the dock |
 | group chevron | 1.9 | scale 1.0800 under the pointer |
@@ -567,11 +579,15 @@ remaining deltas are structural or one-to-many:
 
 | React | Rune | Why |
 | --- | --- | --- |
-| `.chat-row.is-deleting` collapses `max-height` | 220 ms opacity fade + `-8 px`, slot holds until the timer drops it | the 20 pt lead floors Rune's flex min-content; a forced-height spike measured an inconsistent mid-fade box, so this stays a separate list-layout refactor |
-| `.trace-collapsible` closes with `.28 s` height + `.18 s` opacity | the body fades in 180 ms; closing unmounts it at once while the growth stack settles the height | Rune's conditional body has no retained closing layer |
-| `voice-breathe` scales `.88`→`1.08` | 1.2 s opacity-only pulse | Rune has no infinite scale loop; the live dot is 5 px and top-right |
-| `.canvas-empty-add:hover > span { scale(1.04) }` | fill hover only | the icon is a text glyph with no separate presentation box |
-| `.gp-skeleton` 1.4 s shimmer | not ported | the group-project chat/modal surfaces are not ported |
+| `.trace-collapsible` closes with `.28 s` height + `.18 s` opacity | the body unmounts at once; the completed row `fold_glide`s its height over 280 ms | Rune draws presence exits outside ancestor clips, so a retained body ghosts below the folded header |
+| `.gp-skeleton` 1.4 s shimmer | not ported yet | this arrives with the group-project modal/chat milestone |
+
+The sidebar delete now collapses its 34.8 pt slot on the CSS bezier (content
+absolute, the list lands layout immediately), the trace body fades in over
+180 ms, and the voice dot carries the full 1.2 s scale/opacity keyframe.
+`.canvas-empty` is the React 24/16 stack with the 27 pt white circle; its
+`scale(1.04)` and `#fff → #e8e8ea` fill are real hover tracks. A successful
+empty boot snapshot now clears the demo cards and shows the empty home card.
 
 Hover transforms, borders, image zoom, the project chevron, the project-header
 wash and the chat-row/subagent 1 px slides are now implemented. The later
@@ -590,7 +606,7 @@ Dead keyframes (`.voice-orb` 1.5 s, `canvas-dot-pulse` 1.4 s) are omitted.
 | retry glow | 1.4 s (`index.css:411`) | `opacity(1.4)` |
 | session run dot | 1.6 s (`house.css:128`) | `opacity(1.6)` |
 | running card sheen | 2.6 s linear (`canvas.css:138`) | `slide(2.6, …, LINEAR)` |
-| voice live dot | 1.2 s, 5 px (`index.css:223`) | 5 px, opacity-only 1.2 s |
+| voice live dot | 1.2 s, 5 px + 2 px ring (`index.css:223`) | 5 px white + 9 px ring, `Live` scale/opacity at 60 Hz |
 | cloud pulse | 2 s `animate-pulse` (PromptDock/CloudBadge) | `opacity(2.0)` |
 | caret | 0.9 s `steps(1)` (`index.css:555`) | near-step `Cycle`, 0.9 s |
 | trace-live spinner | 1.8 s (`index.css:245`) | `rotation(1.8)` |

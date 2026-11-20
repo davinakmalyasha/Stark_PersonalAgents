@@ -750,6 +750,24 @@ impl CanvasState {
     /// state and only reconcile the data.
     pub fn adopt_boot_snapshot(&mut self, snapshot: &crate::chats::ChatSnapshot) {
         if snapshot.open_tabs.is_empty() && snapshot.chats.is_empty() {
+            // A successful empty boot is authoritative. Keeping the demo map
+            // here left a fresh account showing four fake cards (and the add
+            // FAB) instead of `canvas-empty`.
+            self.real = true;
+            self.workspaces = snapshot.workspaces.clone();
+            self.chat_rows.clear();
+            self.open_tabs.clear();
+            self.active_tab.clear();
+            self.active_id.clear();
+            self.cards.clear();
+            self.edges.clear();
+            self.layout_meta.clear();
+            self.sessions.order.clear();
+            self.sessions.threads.clear();
+            self.sessions.sheet = None;
+            self.inputs.clear();
+            self.known_chats.clear();
+            self.running_tab = None;
             return;
         }
         self.real = true;
@@ -1481,16 +1499,29 @@ impl CanvasState {
             .is_some_and(|(id, at)| id == sid && crate::clock::now_millis() < *at)
     }
 
-    /// Opacity of a row in its 220ms delete fade, `None` when it is not
-    /// deleting. The shell wakes every frame while this is `Some`.
-    pub fn delete_fade(&self, sid: &str) -> Option<f32> {
+    /// Eased progress (0 at the first frame, 1 at removal) of a row in its
+    /// 220 ms `house-row-out` animation. The shell wakes every frame while
+    /// this is `Some`, and the view drives opacity, slide and slot height
+    /// from this one number so they cannot drift apart.
+    pub fn delete_progress(&self, sid: &str) -> Option<f32> {
         let (id, start, end) = self.sessions.deleting.as_ref()?;
         if id != sid {
             return None;
         }
         let span = end.saturating_sub(*start).max(1) as f32;
         let elapsed = crate::clock::now_millis().saturating_sub(*start) as f32;
-        Some((1.0 - elapsed / span).clamp(0.0, 1.0))
+        let t = (elapsed / span).clamp(0.0, 1.0);
+        // `house-row-out` and `sidebar-row-out` both use
+        // `cubic-bezier(0.4, 0, 0.2, 1)` for every animated property.
+        Some(rune::Easing::cubic(0.4, 0.0, 0.2, 1.0).eval(t))
+    }
+
+    /// Opacity of a row in its 220ms delete fade, `None` when it is not
+    /// deleting. Used by the mounted-row test; the view drives both opacity
+    /// and height from [`CanvasState::delete_progress`].
+    #[cfg(test)]
+    pub fn delete_fade(&self, sid: &str) -> Option<f32> {
+        self.delete_progress(sid).map(|t| 1.0 - t)
     }
 
     /// Optimistic rename (React `renameChatLocal`): title + timestamp update
@@ -2984,102 +3015,153 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         .child(pan)
         .child(grid);
     if s.cards.is_empty() {
-        // Empty canvas (`canvas-empty`, map variant): Add button + copy.
-        // Chrome (HUD, dock, fab) still mounts around it.
+        // Empty canvas (`canvas-empty`, map variant): a transparent button
+        // with a 27pt white circle and the copy under it, pinned top-left at
+        // `left:24; top:16` (`.canvas-stage.is-map .canvas-empty`). The add
+        // FAB is not mounted in this state (React `items.length > 0`).
+        let scale = s.hover.scale("canvas-empty-add-scale", 1.0);
+        let fill = s.hover.fill("canvas-empty-add-fill", ink("#ffffff"));
+        let set_scale = scale.clone();
+        let set_fill = fill.clone();
         canvas = canvas.child(
             col()
                 .key("canvas-empty")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .center()
-                .gap(10.0)
+                .absolute(24.0, 16.0)
+                .items_start()
+                .gap(9.0)
+                .max_w(320.0)
                 .child(
                     row()
                         .key("canvas-empty-add")
                         .items_center()
-                        .gap(6.0)
-                        .px(14.0)
-                        .py(8.0)
-                        .radius(9.0)
-                        .fill(ink("#ffffff0d"))
-                        .border(1.0, ink("#ffffff14"))
+                        .gap(8.0)
                         .role("button")
                         .label("Add to canvas")
+                        .on_hover_change(move |_s: &mut S, inside, tx| {
+                            set_scale.set(if inside { 1.04 } else { 1.0 });
+                            set_fill.set(if inside {
+                                ink("#e8e8ea")
+                            } else {
+                                ink("#ffffff")
+                            });
+                            tx.live_only();
+                        })
                         .on_press(move |s: &mut S| {
                             s.canvas_mut().add_open = true;
                         })
                         .child(
-                            text("+".to_string())
-                                .font(rune::tok::TextStyle::new(14.0, 600.0))
-                                .color(ink("#e4e4e7")),
+                            rune::el()
+                                .key("canvas-empty-add-circle")
+                                .size(27.0, 27.0)
+                                .radius(13.5)
+                                .fill(ink("#ffffff"))
+                                .live_fill(fill.smooth(crate::motion::HOVER_SPRING))
+                                .live_scale(scale.smooth(crate::motion::HOVER_SPRING))
+                                .center()
+                                .inert()
+                                .child(
+                                    rune::el()
+                                        .key("canvas-empty-add-plus")
+                                        .size(14.0, 14.0)
+                                        .inert()
+                                        .shape({
+                                            let color = ink("#0a0a0d");
+                                            rune::Shape::new()
+                                                .line(
+                                                    [12.0, 5.0],
+                                                    [12.0, 19.0],
+                                                    crate::lucide_stroke(14.0),
+                                                    LineCap::Round,
+                                                    color,
+                                                )
+                                                .line(
+                                                    [5.0, 12.0],
+                                                    [19.0, 12.0],
+                                                    crate::lucide_stroke(14.0),
+                                                    LineCap::Round,
+                                                    color,
+                                                )
+                                                .view_box(24.0, 24.0)
+                                        }),
+                                ),
                         )
                         .child(
                             text("Add to Canvas".to_string())
-                                .font(rune::tok::TextStyle::new(12.0, 600.0))
-                                .color(ink("#e4e4e7")),
+                                .font({
+                                    let mut style = rune::tok::TextStyle::new(11.5, 500.0);
+                                    style.line_height = 17.25;
+                                    style
+                                })
+                                .color(ink("#b8bac2")),
                         ),
                 )
                 .child(
                     text("Open a chat and it will appear here automatically.".to_string())
                         .key("canvas-empty-copy")
-                        .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(ink("#71717a")),
+                        .max_w(320.0)
+                        .font({
+                            let mut style = rune::tok::TextStyle::new(10.0, 400.0);
+                            style.line_height = 15.0;
+                            style
+                        })
+                        .color(ink("#5e626b")),
                 ),
         );
     } else {
         canvas = canvas.child(world);
     }
-    // Add button (`.canvas-add-fab`): Plus + "Add", top-left fixed chrome.
-    canvas = canvas.child(
-        row()
-            .key("canvas-add")
-            .absolute(14.0, 12.0)
-            .items_center()
-            .gap(5.0)
-            .h(26.0)
-            .radius(7.0)
-            .fill(ink("#0f0f12b8"))
-            .border(1.0, ink("#ffffff14"))
-            .pl(7.0)
-            .pr(9.0)
-            .backdrop_blur(12.0)
-            .role("button")
-            .label("Add to canvas")
-            .on_press(move |s: &mut S| {
-                s.canvas_mut().add_open = true;
-            })
-            .child(
-                rune::el()
-                    .key("canvas-add-plus")
-                    .size(13.0, 13.0)
-                    .inert()
-                    .shape({
-                        let color = ink("#a9abb3");
-                        rune::Shape::new()
-                            .line(
-                                [12.0, 5.0],
-                                [12.0, 19.0],
-                                crate::lucide_stroke(13.0),
-                                LineCap::Round,
-                                color,
-                            )
-                            .line(
-                                [5.0, 12.0],
-                                [19.0, 12.0],
-                                crate::lucide_stroke(13.0),
-                                LineCap::Round,
-                                color,
-                            )
-                            .view_box(24.0, 24.0)
-                    }),
-            )
-            .child(
-                text("Add".to_string())
-                    .font(rune::tok::TextStyle::new(9.5, 600.0))
-                    .color(ink("#a9abb3")),
-            ),
-    );
+    if !s.cards.is_empty() {
+        // Add button (`.canvas-add-fab`): Plus + "Add", top-left fixed chrome.
+        canvas = canvas.child(
+            row()
+                .key("canvas-add")
+                .absolute(14.0, 12.0)
+                .items_center()
+                .gap(5.0)
+                .h(26.0)
+                .radius(7.0)
+                .fill(ink("#0f0f12b8"))
+                .border(1.0, ink("#ffffff14"))
+                .pl(7.0)
+                .pr(9.0)
+                .backdrop_blur(12.0)
+                .role("button")
+                .label("Add to canvas")
+                .on_press(move |s: &mut S| {
+                    s.canvas_mut().add_open = true;
+                })
+                .child(
+                    rune::el()
+                        .key("canvas-add-plus")
+                        .size(13.0, 13.0)
+                        .inert()
+                        .shape({
+                            let color = ink("#a9abb3");
+                            rune::Shape::new()
+                                .line(
+                                    [12.0, 5.0],
+                                    [12.0, 19.0],
+                                    crate::lucide_stroke(13.0),
+                                    LineCap::Round,
+                                    color,
+                                )
+                                .line(
+                                    [5.0, 12.0],
+                                    [19.0, 12.0],
+                                    crate::lucide_stroke(13.0),
+                                    LineCap::Round,
+                                    color,
+                                )
+                                .view_box(24.0, 24.0)
+                        }),
+                )
+                .child(
+                    text("Add".to_string())
+                        .font(rune::tok::TextStyle::new(9.5, 600.0))
+                        .color(ink("#a9abb3")),
+                ),
+        );
+    }
     if s.add_open {
         // Backdrop catcher (React's window pointerdown): anything outside
         // the menu closes it. Transparent, below the menu.
@@ -3174,15 +3256,18 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     ),
                 ),
         )
-        .child(
+        .child(if !s.cards.is_empty() {
             // `.canvas-map-hint`: bottom-left, 9pt dim copy (hidden behind the
-            // home chat card when it is open, exactly like React).
+            // home chat card when it is open, and absent when the canvas is
+            // empty, exactly like React).
             text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
                 .key("cam-hint")
                 .absolute(18.0, vh - 26.0)
                 .font(rune::tok::TextStyle::new(9.0, 400.0))
-                .color(ink("#4f525a")),
-        );
+                .color(ink("#4f525a"))
+        } else {
+            rune::el().key("cam-hint-empty").size(0.0, 0.0).inert()
+        });
     // Sidebar rows mirror the cards: the active chat carries the white-9%
     // wash (`.house-sidebar-row.is-active`); a press switches selection.
     // Rows key off card ids so the board and the list can never disagree.
@@ -3876,8 +3961,8 @@ fn sidebar_thread<S: CanvasHost + 'static>(
     let sid = chat_key.clone();
     let pinned = s.is_pinned(&sid);
     let confirming = s.delete_confirming(&sid);
-    let fade = s.delete_fade(&sid);
-    let deleting = fade.is_some();
+    let progress = s.delete_progress(&sid);
+    let deleting = progress.is_some();
     let running = s.running_tab.as_deref() == Some(sid.as_str())
         || s.card(&card_id).map(|c| c.running).unwrap_or(false);
     let editing = s
@@ -4077,16 +4162,38 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         .key(format!("side-wrap-{card_id}"))
         .w_full()
         .items_center()
-        .gap(2.0)
-        .child(lead)
-        .child(cell);
-    if let Some(opacity) = fade {
-        // React `.is-deleting` (`house-row-out`): 220ms fade and
-        // `translateX(-8px)`, then the row leaves the list. Rune's flex
-        // min-content floors a partial height at the 20pt lead, so the slot
-        // keeps its height until the 220ms timer drops it; a forced height
-        // was measured and regressed to an inconsistent mid-fade box.
-        wrap = wrap.opacity(opacity).offset(-8.0 * (1.0 - opacity), 0.0);
+        .gap(2.0);
+    if let Some(t) = progress {
+        // React `.is-deleting` (`house-row-out`): 220 ms, eased with
+        // `cubic-bezier(.4,0,.2,1)`, `max-height:40px -> 0` with the margin
+        // gone, opacity to 0 and `translateX(-8px)`. The row is 34.8 pt
+        // (spawned tops cap at 40), so the slot shrinks on the same clock.
+        // The content is absolute during the animation: its 20 pt lead is a
+        // flex min-content floor, and moving it out of flow lets the wrapper
+        // reach zero. `motion(NONE)` lands each frame's height with the
+        // paint instead of lagging behind on a layout spring.
+        let base = if spawned { 40.0 } else { 34.8 };
+        let target_h = (base * (1.0 - t)).max(0.0);
+        let body = row()
+            .w_full()
+            .items_center()
+            .gap(2.0)
+            .child(lead)
+            .child(cell)
+            .absolute(0.0, 0.0)
+            .inert();
+        wrap = wrap
+            .h(target_h)
+            .max_h(target_h)
+            .min_h(0.0)
+            .clip_rounded(8.0)
+            .mb(-6.0 * t)
+            .opacity(1.0 - t)
+            .offset(-8.0 * t, 0.0)
+            .motion(rune::Spring::NONE)
+            .child(body);
+    } else {
+        wrap = wrap.child(lead).child(cell);
     }
     let mut out = vec![wrap];
     if expanded {
@@ -4565,6 +4672,12 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         })
         .pb(14.0)
         .gap(6.0);
+    if s.sessions.deleting.is_some() {
+        // The deleting row's own height lands per frame; the rows below it
+        // must land on the same frame. The list's layout spring would
+        // otherwise chase the collapse and leave a growing gap.
+        list = list.motion(rune::Spring::NONE);
+    }
     let query = s.sessions.search.text.trim().to_lowercase();
     if !s.chat_rows.is_empty() {
         // Live sidebar (`HouseSidebar`): every chat on the server, newest
@@ -4842,6 +4955,20 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             );
         }
         list = list.child(item);
+    }
+    if s.real && s.chat_rows.is_empty() && s.cards.is_empty() {
+        // React `HouseSidebar`: the empty list says so instead of leaving a
+        // blank panel under the search field.
+        let mut style = rune::tok::TextStyle::new(11.0, 400.0);
+        style.line_height = 16.5;
+        list = list.child(
+            text("No chats yet.".to_string())
+                .key("map-no-chats")
+                .px(12.0)
+                .py(6.0)
+                .font(style)
+                .color(ink("#52525b")),
+        );
     }
     panel = panel.child(list);
     if let Some(menu) = kind_menu {
@@ -5518,6 +5645,20 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_boot_snapshot_clears_the_demo_cards() {
+        let mut s = CanvasState::map();
+        assert!(!s.cards.is_empty(), "the demo scene starts with cards");
+        let snapshot = crate::chats::ChatSnapshot::default();
+        s.adopt_boot_snapshot(&snapshot);
+        assert!(s.cards.is_empty(), "a fresh account has no canvas cards");
+        assert!(s.sessions.order.is_empty());
+        assert!(s.sessions.threads.is_empty());
+        assert!(s.sessions.sheet.is_none());
+        assert!(s.active_id.is_empty());
+        assert!(s.open_tabs.is_empty());
+    }
+
+    #[test]
     fn rename_field_takes_focus_and_selects_the_title() {
         use rune::{Key, KeyEvent, Mods};
         let mut s = sidebar_state();
@@ -5671,17 +5812,27 @@ mod tests {
     }
 
     #[test]
-    fn deleting_row_fades_without_the_action_cluster() {
+    fn deleting_row_fades_and_collapses_without_the_action_cluster() {
         let mut s = sidebar_state();
         let now = crate::clock::now_millis();
-        s.sessions.deleting = Some(("_general:b".to_string(), now, now + 220));
+        // Mid-animation: a long window keeps the test's own startup time from
+        // moving off the midpoint. Eased progress is ~0.5, so the 34.8 pt slot
+        // should be near 17.4 pt with the opacity near 0.5.
+        s.sessions.deleting = Some(("_general:b".to_string(), now - 100_000, now + 100_000));
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(s, sidebar_only, (248.0, 900.0), env);
         rt.frame(0.0);
         let actions = "side-chat:_general:b-actions";
         assert!(rt.find(actions).is_none(), "deleting row drops the cluster");
         let (rect, opacity) = rt.presented("side-wrap-chat:_general:b").unwrap();
-        assert!(opacity < 1.0, "row is fading: {opacity} at {rect:?}");
+        assert!(
+            rect[3] < 12.0 && rect[3] > 2.0,
+            "the slot collapses with the fade: {rect:?}"
+        );
+        assert!(
+            opacity > 0.05 && opacity < 0.4,
+            "row is fading with the slot: {opacity} at {rect:?}"
+        );
     }
 
     #[test]

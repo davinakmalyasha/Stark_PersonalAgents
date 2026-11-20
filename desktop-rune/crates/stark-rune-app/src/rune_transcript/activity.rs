@@ -1116,10 +1116,19 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         .w_full()
         .mt(8.0)
         .mb(22.0)
+        // `.trace-collapsible > div { overflow:hidden }`: while the row
+        // folds, the exiting body must not paint below the closed header.
+        .clip_rounded(0.0)
         .transition(crate::motion::trace_enter())
         .child(header)
         // Header inline margin (14 open / 0 closed) + collapsible top 9.
-        .child(rune::el().h(if open { 23.0 } else { 9.0 }));
+        // React's `.18s` transition covers the header's margin change, so the
+        // spacer glides with the body fade rather than snapping 14 pt.
+        .child(
+            rune::el()
+                .h(if open { 23.0 } else { 9.0 })
+                .motion(crate::motion::TRACE_BODY),
+        );
     if open {
         let timeline: Vec<StreamSegment> = if !r.activity.is_empty() {
             r.activity.clone()
@@ -1132,7 +1141,7 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         let mut body = col()
             .key(format!("{}-trace-body", r.key))
             .w_full()
-            .transition(crate::motion::fade_in(crate::motion::TRACE_BODY));
+            .transition(crate::motion::trace_body_enter());
         if !timeline.is_empty() {
             body = body.child(activity_timeline::<S>(
                 s, which, &r.key, &timeline, false, r,

@@ -67,6 +67,7 @@ pub struct GroupState {
     pub send_error: Option<String>,
     pub notes: crate::notes::NotesState,
     last_ok: f64,
+    last_try: f64,
     inbox: Option<Receiver<GroupMsg>>,
 }
 
@@ -108,6 +109,7 @@ impl Clone for GroupState {
             send_error: self.send_error.clone(),
             notes: self.notes.clone(),
             last_ok: self.last_ok,
+            last_try: self.last_try,
             inbox: None,
         }
     }
@@ -140,6 +142,7 @@ impl Default for GroupState {
             send_error: None,
             notes: crate::notes::NotesState::default(),
             last_ok: 0.0,
+            last_try: 0.0,
             inbox: None,
         }
     }
@@ -196,6 +199,7 @@ impl GroupState {
     }
 
     fn spawn_detail(&mut self, id: String, action: bool) {
+        self.last_try = crate::clock::now_millis() as f64 / 1000.0;
         let (tx, rx) = std::sync::mpsc::channel();
         self.inbox = Some(rx);
         #[cfg(not(target_arch = "wasm32"))]
@@ -221,7 +225,11 @@ impl GroupState {
     /// Drain one snapshotted request and keep the 3 s detail poll alive.
     pub fn poll(&mut self, clock: f64) -> bool {
         let Some(rx) = self.inbox.take() else {
-            if self.open_id.is_some() && clock - self.last_ok >= 3.0 && !self.loading {
+            if self.open_id.is_some()
+                && clock - self.last_ok >= 3.0
+                && clock - self.last_try >= 3.0
+                && !self.loading
+            {
                 let id = self.open_id.clone().unwrap_or_default();
                 self.spawn_detail(id, false);
             }
@@ -273,6 +281,7 @@ impl GroupState {
         }
         if self.open_id.is_some()
             && clock - self.last_ok >= 3.0
+            && clock - self.last_try >= 3.0
             && !self.loading
             && self.inbox.is_none()
         {

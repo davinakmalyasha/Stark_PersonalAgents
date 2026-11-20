@@ -522,6 +522,12 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
         .hover_group()
         .on_press(move |s: &mut ShellState| {
             s.canvas.rail = tab;
+            if tab == RailTab::Group
+                && !s.canvas.projects.loading
+                && s.canvas.projects.projects.is_empty()
+            {
+                crate::projects::refresh_projects(&mut s.canvas.projects);
+            }
         })
         // `.house-rail-btn:active { transform: scale(.94) }`.
         .press_scale(0.94)

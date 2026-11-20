@@ -66,10 +66,11 @@ cargo run -p stark-rune-app --features rune-real -- \
 
 Static parity was the first pass; interaction motion is now ported at the
 shell level. `crates/stark-rune-app/src/motion.rs` carries both families Rune
-uses: hover `Curve`s (`150 ms cubic-bezier(.4,0,.2,1)` by default, 140/200/280
-ms Stark eases) and presence `Spring`s matched to the final CSS cascade
-(user message 200 ms, agent 240 ms, generic fade 140 ms, modal 240 ms, menu
-160 ms, trace 340 ms). The shell and transcript roots set
+uses: paint-only hover `Curve`s (`150 ms cubic-bezier(.4,0,.2,1)` by default,
+140/200/280 ms Stark eases) and presence/`Live` `Spring`s matched to the final
+CSS cascade (user message 200 ms, agent 240 ms, generic fade 140 ms, modal
+240 ms, menu 160 ms, trace 340 ms; `HOVER_SPRING` is the 150 ms hover track).
+The shell and transcript roots set
 `hover_motion_within`, so every existing `hover`/`group_color`/
 `group_opacity` fades instead of snapping; rail icons, session tabs, the close
 button, New session, send/stop press and the Settings sheet use them.
@@ -87,17 +88,25 @@ notices (200 ms) and delegation cards (300 ms) enter on their CSS clocks.
 Disclosure chevrons rotate 180 ms instead of swapping glyphs. Menus and
 popovers (`160`/`180` ms), the canvas add menu (`160` ms with its `.985`
 settle), attachment cards (`260` ms, `8 pt`, `.96`), AgentConfig/TokenStats
-modals (200 ms backdrop, 240 ms panel) and the canvas card hover border all
-use the same primitives. Ask options keep their border box through a wrapper
-so the hover border is not inset by their padding; markdown code-copy and
-inline links brighten on hover. Spinners, pulse dots and sheens keep their
-loop specs. Hover and spatial transitions respect Reduce
-Motion through Rune's motion gate (offsets snap, opacity still fades).
+modals (200 ms backdrop, 240 ms panel) use the same primitives. Ask options
+keep their border box through a wrapper so the hover border is not inset by
+their padding; markdown code-copy and inline links brighten on hover.
 
-The remaining deltas are recorded in `parity/README.md`: 1 pt hover lifts,
-the 1.08 project-chevron scale, the sidebar delete slot (opacity fades, the
-slot does not collapse), inline-image 1.04 zoom, and the opacity timing of
-open/close bodies that CSS animates with `grid-template-rows`.
+Hover properties that CSS transitions but Rune has no binding for use
+`HoverSet` + `Live`: `live_scale`/`live_offset`/`live_border` carry the 150 ms
+track while `on_hover_change` publishes the target and `tx.live_only()` avoids
+a rebuild. That covers the canvas-card 1 pt lift, the white send button's
+`scale(1.04)`, message-image `scale(1.04)`, the project chevron `scale(1.08)`,
+chat-row/subagent 1 px slides, provider/model/attachment hover borders, and
+message attachment chips. Spinners, pulse dots and sheens use their React
+periods; the caret uses a near-step `Cycle` for `steps(1)`. Hover and spatial
+transitions respect Reduce Motion through Rune's motion gate (offsets snap,
+opacity still fades).
+
+The remaining deltas are recorded in `parity/README.md`: the sidebar delete
+slot still holds its height (fade then drop), the trace body fades on open but
+unmounts on close, the voice live dot is opacity-only, the canvas empty-add
+glyph does not scale, and the group-project skeleton surface is unported.
 
 ## Transcript (MessageStream port)
 

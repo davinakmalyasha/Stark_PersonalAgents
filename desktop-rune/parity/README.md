@@ -527,16 +527,21 @@ approximations (Rune rounds the label and button advances to whole points).
 ## Interaction sweep (2026-11-20)
 
 The motion pass is split into shared primitives (`motion.rs`) and per-surface
-entrances. These scripted poses exercise the new paths against the fixture
-server:
+entrances. CSS transitions that Rune has no direct hover binding for — scale,
+offset and border colour — use `HoverSet` + `Live` tracks; `on_hover_change`
+publishes the target and `tx.live_only()` keeps pointer moves out of rebuilds.
+These scripted poses exercise the paths against the fixture server:
 
 | script | pose |
 | --- | --- |
 | `message_entrance.json` | focus composer, type, send; capture 1.05/1.07 for the user slide |
-| `trace_open.json` | open `msg-0a4560f6`'s trace; groups fade/rise, the header chevron rotates |
+| `composer_send_hover.json` | type, then hover Send; capture 1.04/1.30 for the 1.04 scale |
+| `provider_hover.json` | hover the provider pill; its border rides a `Live` track |
+| `trace_open.json` | open `msg-0a4560f6`'s trace; groups fade/rise, the body fades 180 ms, the header chevron rotates |
 | `canvas_add_menu.json` | tap `canvas-add`; capture 1.06/1.20 for the `.985` menu settle |
 | `agent_config_open.json` | tap `composer-provider`; backdrop 200 ms, panel 240 ms |
-| `canvas_card_hover.json` | hover the right-hand card; its `-hover-border` overlay reaches opacity 1 |
+| `canvas_card_hover.json` | hover the right-hand card; 1 pt lift + border track |
+| `group_header_hover.json` | switch to Coding, hover a project header; wash + 1.08 chevron |
 | `new_session_entrance.json` | create a tab; the new tab mounts (sidebar rows use the 260 ms entrance when a chat is created) |
 | `settings_open.json` | rail gear; panel 240 ms |
 
@@ -547,37 +552,52 @@ Measured checkpoints:
 | user message | 1.05 | group +12.6 pt, opacity 0.10 |
 | user message | 1.07 | group +10.1 pt, opacity 0.28 |
 | trace group | 1.06 / 1.12 / 1.40 | opacity 0.17 / 0.56 / 1.00 |
+| trace body | 1.06 / 1.12 / 1.40 | opacity 0.324 / 0.787 / 1.000 |
+| send hover | 1.30 | scale 1.0382 (settles at 1.04), white face |
+| provider border | 1.6 | edge RGB 42→62 over the dock |
+| group chevron | 1.9 | scale 1.0800 under the pointer |
+| canvas card | 1.6 | 1 pt lift (0.45 pt at 0.45 camera zoom), border on the Live track |
 | canvas add menu | 1.06 / 1.20 | scale 0.9906 / 0.9998, opacity 0.38 / 0.99 |
 | AgentConfig | 1.12 / 1.30 | opacity 0.52 / 0.975, backdrop and card on separate tracks |
 
 ### Accepted deltas
 
-These are deliberate: Rune has no hover transform track, and a few CSS
-transitions do not map one-to-one.
+Rune now supports hover scale, offset and border colour through `Live`. The
+remaining deltas are structural or one-to-many:
 
 | React | Rune | Why |
 | --- | --- | --- |
-| `hover: translateY(-1px)` (cards, send) | no lift; send gets a white `.12` wash | a 1 pt lift needs per-element `Live` state; the wash matches `brightness(1.12)` |
-| `project-heading:hover svg { scale(1.08) }` | no scale | below 1 px at 11 pt; stacking a second glyph is worse than the delta |
-| `.chat-row.is-deleting` collapses `max-height` | 220 ms opacity fade, slot pops | the sidebar list is not a growth stack; collapsing it safely is a separate refactor |
-| `.message-image:hover img { scale(1.04) }` | no zoom | same per-element `Live` cost as the lift |
-| `grid-template-rows` opacity on open/close bodies | height glides on the growth stack, child opacity lands immediately | Rune animates the measured height, not an interpolated fraction |
-| `animate-pulse` on status dots | `LoopSpec::opacity` | same period/range; Reduce Motion cools the loop |
-| `hover:border-*` on the provider pill, model trigger and attachment-add tile | fill/text hover only | Rune has no hover border track; an inset overlay would double the 1 px edge |
+| `.chat-row.is-deleting` collapses `max-height` | 220 ms opacity fade + `-8 px`, slot holds until the timer drops it | the sidebar list is not a growth stack; collapsing it safely is a separate list-layout refactor |
+| `.trace-collapsible` closes with `.28 s` height + `.18 s` opacity | the body fades in 180 ms; closing unmounts it at once while the growth stack settles the height | Rune's conditional body has no retained closing layer |
+| `voice-breathe` scales `.88`→`1.08` | 1.2 s opacity-only pulse | Rune has no infinite scale loop; the live dot is 5 px and top-right |
+| `.canvas-empty-add:hover > span { scale(1.04) }` | fill hover only | the icon is a text glyph with no separate presentation box |
+| `.gp-skeleton` 1.4 s shimmer | not ported | the group-project chat/modal surfaces are not ported |
+
+Hover transforms, borders, image zoom, the project chevron, the project-header
+wash and the chat-row/subagent 1 px slides are now implemented. The later
+`index.css` send-button rule is the target: white 34 pt circle, hover
+`scale(1.04)`, disabled at 72%, running square. The earlier gradient/brightness
+block is overridden in the current cascade.
 
 ### Loop audit
 
-| loop | period / delay | status |
-| --- | --- | --- |
-| thinking dots | 1.1 s / 0.14 s stagger | present |
-| retry segments | 1.4 s | present |
-| sidebar run dot | 1.6 s | present |
-| running card sheen | 2.6 s linear | present |
-| voice orb | 1.5 s (1.2 s live dot) | present |
-| canvas cloud/target pulse | 1.4 s | present |
-| caret | 0.9 s opacity | present |
-| skeleton | 1.4 s | not ported (no skeleton surface yet) |
-| canvas dot pulse | 1.4 s | not ported (no live project-card dot yet) |
+This table is built from actual React usage, not every keyframe in the CSS.
+Dead keyframes (`.voice-orb` 1.5 s, `canvas-dot-pulse` 1.4 s) are omitted.
 
-Reduce Motion zeroes looping amplitude through Rune's motion gate; finite
-sequences still land.
+| loop | React period / usage | Rune |
+| --- | --- | --- |
+| thinking dots | 1.1 s, 0.14/0.28 stagger (`house.css:73-76`) | `opacity(1.1, 0/0.14/0.28)` |
+| retry glow | 1.4 s (`index.css:411`) | `opacity(1.4)` |
+| session run dot | 1.6 s (`house.css:128`) | `opacity(1.6)` |
+| running card sheen | 2.6 s linear (`canvas.css:138`) | `slide(2.6, …, LINEAR)` |
+| voice live dot | 1.2 s, 5 px (`index.css:223`) | 5 px, opacity-only 1.2 s |
+| cloud pulse | 2 s `animate-pulse` (PromptDock/CloudBadge) | `opacity(2.0)` |
+| caret | 0.9 s `steps(1)` (`index.css:555`) | near-step `Cycle`, 0.9 s |
+| trace-live spinner | 1.8 s (`index.css:245`) | `rotation(1.8)` |
+| subagent spinner | 1.6 s (`index.css:317`) | `rotation(1.6)` |
+| tool/retry spinner | 1 s `animate-spin` | `rotation(1.0)` |
+| skeleton | 1.4 s (`house.css:737`) | not ported (group-project surfaces) |
+
+Rune's canvas status dot is static, matching `.canvas-card-status-dot`; the
+extra 2.2 s badge pulse was removed. Reduce Motion zeroes looping amplitude
+through Rune's motion gate; finite sequences still land.

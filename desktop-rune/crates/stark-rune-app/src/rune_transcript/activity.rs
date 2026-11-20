@@ -41,8 +41,8 @@ fn loader(size: f32, color: rune::Color) -> rune::Shape {
         .view_box(24.0, 24.0)
 }
 
-fn spinner(size: f32, color: rune::Color) -> El {
-    icon_box(size, loader(size, color)).looping(rune::LoopSpec::rotation(0.9))
+fn spinner(size: f32, color: rune::Color, period: f64) -> El {
+    icon_box(size, loader(size, color)).looping(rune::LoopSpec::rotation(period))
 }
 
 fn check_circle(size: f32, color: rune::Color) -> rune::Shape {
@@ -401,7 +401,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
 ) -> El {
     if tool_labels::is_delegation(&event.name) {
         if event.children.is_empty() {
-            return delegation_card::<S>(which, event, None, is_active, 0);
+            return delegation_card::<S>(which, event, None, is_active, 0, &s.thread(which).hover);
         }
         let mut cards = col()
             .key(format!("{row_key}-{}", event.id))
@@ -414,6 +414,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
                 Some(child),
                 is_active,
                 index,
+                &s.thread(which).hover,
             ));
         }
         return cards;
@@ -480,7 +481,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
         title = title.child(rune::spacer());
     }
     let status_icon = if event.status.is_running() {
-        icon_box(13.0, loader(13.0, home_ink("#b8bdc4"))).looping(rune::LoopSpec::rotation(0.9))
+        icon_box(13.0, loader(13.0, home_ink("#b8bdc4"))).looping(rune::LoopSpec::rotation(1.0))
     } else if event.ok == Some(false) {
         icon_box(13.0, crate::lucide_x(13.0, 2.0, home_ink("#d39ba4")))
     } else {
@@ -865,7 +866,7 @@ fn tool_output(key: &str, output: &str, running: bool) -> El {
             .px(10.0)
             .py(9.0)
             .child(if running {
-                spinner(12.0, home_ink("#747781"))
+                spinner(12.0, home_ink("#747781"), 1.6)
             } else {
                 rune::el()
             })
@@ -894,12 +895,26 @@ fn tool_output(key: &str, output: &str, running: bool) -> El {
         )
 }
 
+fn open_label<S: 'static>(key: String, hover: &crate::motion::HoverSet) -> El {
+    let offset = hover.offset(key, [0.0, 0.0]);
+    let set_offset = offset.clone();
+    text("Open".to_string())
+        .font(style(10.0, 650.0))
+        .color(home_ink("#d6d8de"))
+        .live_offset(offset.smooth(crate::motion::HOVER_SPRING))
+        .on_hover_change(move |_s: &mut S, inside, tx| {
+            set_offset.set(if inside { [1.0, 0.0] } else { [0.0, 0.0] });
+            tx.live_only();
+        })
+}
+
 fn delegation_card<S: TranscriptHost + 'static>(
     which: Thread,
     event: &LiveToolEvent,
     step: Option<&crate::stream_accum::ChildRef>,
     is_active: bool,
     index: usize,
+    hover: &crate::motion::HoverSet,
 ) -> El {
     let (name, task) = if let Some(step) = step {
         (
@@ -953,7 +968,7 @@ fn delegation_card<S: TranscriptHost + 'static>(
     };
     let mut status_row = row().items_center().gap(4.0);
     status_row = status_row.child(if running {
-        spinner(12.0, home_ink("#989da5"))
+        spinner(12.0, home_ink("#989da5"), 1.6)
     } else if failed {
         icon_box(12.0, crate::lucide_x(12.0, 2.0, home_ink("#d39ba4")))
     } else {
@@ -967,12 +982,12 @@ fn delegation_card<S: TranscriptHost + 'static>(
         },
     ));
     if drill.is_some() {
-        // React `activity-delegation-open`: 650-weight zinc prompt.
-        status_row = status_row.child(
-            text("Open".to_string())
-                .font(style(10.0, 650.0))
-                .color(home_ink("#d6d8de")),
-        );
+        // React `activity-delegation-open`: 650-weight zinc prompt, and a
+        // 1 pt hover slide (`.subagent-open:hover`).
+        status_row = status_row.child(open_label::<S>(
+            format!("{}-delegation-open-{index}", event.id),
+            hover,
+        ));
     }
     let mut card = row()
         .w_full()
@@ -1111,8 +1126,15 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         } else {
             project_steps(&r.steps)
         };
+        // `.trace-collapsible { opacity:0; transition: opacity .18s }`.
+        // The parent growth stack supplies the height glide; this wrapper
+        // supplies the child fade so the body does not pop in at full ink.
+        let mut body = col()
+            .key(format!("{}-trace-body", r.key))
+            .w_full()
+            .transition(crate::motion::fade_in(crate::motion::TRACE_BODY));
         if !timeline.is_empty() {
-            shell = shell.child(activity_timeline::<S>(
+            body = body.child(activity_timeline::<S>(
                 s, which, &r.key, &timeline, false, r,
             ));
         }
@@ -1124,10 +1146,15 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
                 .max_w(620.0)
                 .my(4.0);
             for step in cards {
-                list = list.child(delegation_step_card::<S>(which, step));
+                list = list.child(delegation_step_card::<S>(
+                    which,
+                    step,
+                    &s.thread(which).hover,
+                ));
             }
-            shell = shell.child(list);
+            body = body.child(list);
         }
+        shell = shell.child(body);
     }
     shell
 }
@@ -1192,7 +1219,11 @@ fn delegation_fallback<'a>(
         .collect()
 }
 
-fn delegation_step_card<S: TranscriptHost + 'static>(which: Thread, step: &TraceStep) -> El {
+fn delegation_step_card<S: TranscriptHost + 'static>(
+    which: Thread,
+    step: &TraceStep,
+    hover: &crate::motion::HoverSet,
+) -> El {
     let name = step
         .child_name
         .clone()
@@ -1224,11 +1255,10 @@ fn delegation_step_card<S: TranscriptHost + 'static>(which: Thread, step: &Trace
             .color(home_ink("#989da5")),
     );
     if drill.is_some() {
-        status_row = status_row.child(
-            text("Open".to_string())
-                .font(style(10.0, 650.0))
-                .color(home_ink("#d6d8de")),
-        );
+        status_row = status_row.child(open_label::<S>(
+            format!("{}-delegation-step-open", step.id),
+            hover,
+        ));
     }
     let mut card = row()
         .w_full()
@@ -1291,6 +1321,7 @@ pub(super) fn live_delegation_cards<S: TranscriptHost + 'static>(
     which: Thread,
     r: &RowData,
     timeline: &[StreamSegment],
+    hover: &crate::motion::HoverSet,
 ) -> Option<El> {
     if timeline.iter().any(|segment| {
         matches!(segment, StreamSegment::Tool { ev } if tool_labels::is_delegation(&ev.name))
@@ -1307,7 +1338,7 @@ pub(super) fn live_delegation_cards<S: TranscriptHost + 'static>(
         .max_w(620.0)
         .my(4.0);
     for step in cards {
-        list = list.child(delegation_step_card::<S>(which, step));
+        list = list.child(delegation_step_card::<S>(which, step, hover));
     }
     Some(list)
 }
@@ -1315,7 +1346,7 @@ pub(super) fn live_delegation_cards<S: TranscriptHost + 'static>(
 /// React `ThinkingPlaceholder`.
 pub(super) fn thinking_placeholder(key: &str) -> El {
     let mut dots = row().items_center().gap(2.0).ml(2.0);
-    for (n, delay) in [0.0, 0.16, 0.32].into_iter().enumerate() {
+    for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
         dots = dots.child(
             rune::el()
                 .key(format!("{key}-think-dot-{n}"))
@@ -1395,7 +1426,7 @@ pub(super) fn retry_status(key: &str, retry: &RetryNotice) -> El {
                 .border_layout()
                 .fill(home_rgba(255.0, 255.0, 255.0, 0.045))
                 .center()
-                .child(spinner(12.0, home_ink("#c7c9d0"))),
+                .child(spinner(12.0, home_ink("#c7c9d0"), 1.6)),
         )
         .child(
             col()
@@ -1470,7 +1501,7 @@ pub(super) fn live_compaction_status(key: &str, status: &RunStatusNotice) -> El 
             } else if failed {
                 icon_box(11.0, home_ink_alert(11.0))
             } else {
-                spinner(11.0, home_ink("#d6d6dc"))
+                spinner(11.0, home_ink("#d6d6dc"), 1.0)
             }),
     );
     main = main.child(

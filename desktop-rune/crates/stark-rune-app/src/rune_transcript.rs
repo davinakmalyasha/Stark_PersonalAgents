@@ -694,6 +694,9 @@ pub struct RuneTranscriptState {
     pub refresh_chat: Option<(String, String)>,
     /// Jump-to-latest pill opacity (`on_scroll_offset` writes it live).
     pub scroll_pill: rune::Live<f32>,
+    /// Per-element hover tracks for this thread (image zoom, send scale,
+    /// provider/model borders). `Live` binding keeps hover out of rebuilds.
+    pub hover: crate::motion::HoverSet,
     /// Sticky notes for this thread (chat scope, like `ChatView.tsx`).
     pub notes: crate::notes::NotesState,
     /// Pending `ask_user_question` batch + inline panel state. While a batch
@@ -850,6 +853,7 @@ impl Clone for RuneTranscriptState {
             pending_saves: Vec::new(),
             refresh_chat: self.refresh_chat.clone(),
             scroll_pill: self.scroll_pill.clone(),
+            hover: crate::motion::HoverSet::default(),
             notes: self.notes.clone(),
             ask: self.ask.clone(),
             run_target: self.run_target.clone(),
@@ -945,6 +949,7 @@ impl RuneTranscriptState {
             pending_saves: Vec::new(),
             refresh_chat: None,
             scroll_pill: rune::Live::new(0.0),
+            hover: crate::motion::HoverSet::default(),
             notes: crate::notes::NotesState::default(),
             ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
@@ -1025,6 +1030,7 @@ impl RuneTranscriptState {
             pending_saves: Vec::new(),
             refresh_chat: None,
             scroll_pill: rune::Live::new(0.0),
+            hover: crate::motion::HoverSet::default(),
             notes: crate::notes::NotesState::default(),
             ask: crate::ask::AskState::default(),
             run_target: "local".to_string(),
@@ -1987,7 +1993,7 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
         if file.is_image && has_src {
             let image = attachment_image(t, file, 86.0);
             let mut button = rune::el()
-                .key(key)
+                .key(key.clone())
                 .role("button")
                 .label(format!("Open {}", file.name))
                 .size(86.0, 66.0)
@@ -1997,13 +2003,24 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
                 .fill(home_rgba(0.0, 0.0, 0.0, 0.2))
                 .clip_rounded(9.0);
             if let Some(image) = image {
-                button = button.child(
-                    rune::el()
-                        .size(84.0, 64.0)
-                        .radius(8.0)
-                        .pixels_fit(image.pixels(), rune::SurfaceFit::Fill)
-                        .inert(),
-                );
+                // `.message-image:hover img { transform: scale(1.04) }`.
+                // The button clips; only the image scales, so the 1 px frame
+                // and the deck geometry stay put.
+                let scale = t.hover.scale(format!("{key}-zoom"), 1.0);
+                let on_hover = scale.clone();
+                button = button
+                    .on_hover_change(move |_s: &mut S, inside, tx| {
+                        on_hover.set(if inside { 1.04 } else { 1.0 });
+                        tx.live_only();
+                    })
+                    .child(
+                        rune::el()
+                            .size(84.0, 64.0)
+                            .radius(8.0)
+                            .live_scale(scale.smooth(crate::motion::HOVER_SPRING))
+                            .pixels_fit(image.pixels(), rune::SurfaceFit::Fill)
+                            .inert(),
+                    );
             } else {
                 button = button.center().child(
                     rune::el()
@@ -2019,6 +2036,11 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
             continue;
         }
         if file.is_audio() && has_src {
+            let border = t.hover.border(
+                format!("{key}-hover-border"),
+                home_rgba(255.0, 255.0, 255.0, 0.1),
+            );
+            let set_border = border.clone();
             let child = row()
                 .key(key)
                 .role("group")
@@ -2032,6 +2054,20 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
                 .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
                 .border_layout()
                 .fill(home_rgba(0.0, 0.0, 0.0, 0.18))
+                // `.message-attachment:hover`: border .22, white text and a
+                // 5.5% white wash. The border rides a Live track; the rest
+                // fill and text keep their measured colours.
+                .hover(home_rgba(255.0, 255.0, 255.0, 0.055))
+                .live_border(border.smooth(crate::motion::HOVER_SPRING))
+                .hover_group()
+                .on_hover_change(move |_s: &mut S, inside, tx| {
+                    set_border.set(if inside {
+                        home_rgba(255.0, 255.0, 255.0, 0.22)
+                    } else {
+                        home_rgba(255.0, 255.0, 255.0, 0.1)
+                    });
+                    tx.live_only();
+                })
                 .child(
                     rune::el()
                         .size(14.0, 14.0)
@@ -2044,13 +2080,19 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
                         .max_w(220.0)
                         .truncate()
                         .font(rune::tok::TextStyle::new(11.0, 400.0))
-                        .color(home_ink("#cfcfd6")),
+                        .color(home_ink("#cfcfd6"))
+                        .group_color(home_ink("#ffffff")),
                 );
             deck = deck.child(child);
             continue;
         }
         let src = has_src;
         let open = attachment_open_url(t, file);
+        let border = t.hover.border(
+            format!("{key}-hover-border"),
+            home_rgba(255.0, 255.0, 255.0, 0.1),
+        );
+        let set_border = border.clone();
         let mut chip = row()
             .key(key)
             .role("link")
@@ -2064,6 +2106,17 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
             .border(1.0, home_rgba(255.0, 255.0, 255.0, 0.1))
             .border_layout()
             .fill(home_rgba(0.0, 0.0, 0.0, 0.16))
+            .hover(home_rgba(255.0, 255.0, 255.0, 0.055))
+            .live_border(border.smooth(crate::motion::HOVER_SPRING))
+            .hover_group()
+            .on_hover_change(move |_s: &mut S, inside, tx| {
+                set_border.set(if inside {
+                    home_rgba(255.0, 255.0, 255.0, 0.22)
+                } else {
+                    home_rgba(255.0, 255.0, 255.0, 0.1)
+                });
+                tx.live_only();
+            })
             .child(rune::el().size(14.0, 14.0).inert().shape(if file.is_image {
                 crate::lucide_image(14.0, home_ink("#cdcdd4"))
             } else {
@@ -2075,7 +2128,8 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
                     .grow(1.0)
                     .truncate()
                     .font(rune::tok::TextStyle::new(11.0, 400.0))
-                    .color(home_ink("#cdcdd4")),
+                    .color(home_ink("#cdcdd4"))
+                    .group_color(home_ink("#ffffff")),
             );
         if src {
             chip = chip.child(
@@ -2930,7 +2984,9 @@ fn home_agent_row<S: TranscriptHost + 'static>(
         } else if final_text.trim().is_empty() && retry.is_none() {
             group = group.child(activity::thinking_placeholder(&r.key));
         }
-        if let Some(cards) = activity::live_delegation_cards::<S>(which, r, &activity) {
+        if let Some(cards) =
+            activity::live_delegation_cards::<S>(which, r, &activity, &s.thread(which).hover)
+        {
             group = group.child(cards);
         }
     } else if r.show_trace {
@@ -2980,7 +3036,7 @@ fn home_agent_row<S: TranscriptHost + 'static>(
                     .font(home_body_style())
                     .color(home_ink("#a78bfa"))
                     .ml(1.0)
-                    .looping(rune::LoopSpec::opacity(0.9, 0.0, 0.0, 1.0)),
+                    .looping(rune::LoopSpec::cycle(crate::motion::CARET)),
             );
         }
     }
@@ -4502,7 +4558,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                             )
                             .view_box(24.0, 24.0)
                     })
-                    .looping(rune::LoopSpec::rotation(0.9)),
+                    .looping(rune::LoopSpec::rotation(1.0)),
             )
             .child(
                 text("Opening child chat…".to_string())
@@ -5027,6 +5083,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                 attachments_dragging: s.attachments_dragging,
                 workspace_id: &s.workspace_id,
                 chat_id: &s.chat_id,
+                hover: &s.hover,
             },
             super::composer::ComposerButtons {
                 voice: std::rc::Rc::new(move |s: &mut S| {

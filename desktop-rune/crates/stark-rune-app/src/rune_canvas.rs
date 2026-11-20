@@ -401,6 +401,8 @@ pub struct CanvasState {
     /// Dot grid offset: camera pan modulo the 26pt tile. The field is one
     /// tile larger than the viewport, so wrapping by a tile is invisible.
     pub grid_live: rune::Live<[f32; 2]>,
+    /// Hover tracks for sidebar rows, project headers and canvas cards.
+    pub hover: crate::motion::HoverSet,
     /// Camera follows the content (React `fitView`) until the first manual
     /// pan/zoom; the shell refits when the window resizes.
     pub cam_auto: bool,
@@ -495,6 +497,7 @@ impl Clone for CanvasState {
             cam_live: self.cam_live.clone(),
             cam_scale_live: self.cam_scale_live.clone(),
             grid_live: self.grid_live.clone(),
+            hover: crate::motion::HoverSet::default(),
             cam_auto: self.cam_auto,
             cam_fitted: self.cam_fitted,
             layout_meta: self.layout_meta.clone(),
@@ -598,6 +601,7 @@ impl CanvasState {
             cam_live: rune::Live::new([0.0, 0.0]),
             cam_scale_live: rune::Live::new(1.0),
             grid_live: rune::Live::new([0.0, 0.0]),
+            hover: crate::motion::HoverSet::default(),
             cam_auto: true,
             cam_fitted: false,
             layout_meta: std::collections::HashMap::new(),
@@ -2041,6 +2045,7 @@ fn card_view<S: CanvasHost + 'static>(
     input: &rune::TextEdit,
     kids: &[(String, String)],
     menu_open: bool,
+    hover: &crate::motion::HoverSet,
 ) -> El {
     if card.item == MapCardItem::Project {
         return project_card_view::<S>(card, active);
@@ -2060,6 +2065,8 @@ fn card_view<S: CanvasHost + 'static>(
     } else {
         ink("#ffffff16")
     };
+    let hover_border = hover.border(format!("{id}-border"), border);
+    let hover_offset = hover.offset(format!("{id}-offset"), [0.0, 0.0]);
     let mut view = col()
         .key(card.id.clone())
         .absolute(card.x, card.y)
@@ -2089,6 +2096,25 @@ fn card_view<S: CanvasHost + 'static>(
         )
         .clip_rounded(radius)
         .hover_group();
+    // `.canvas-card:hover`: a 1 pt lift on every card; the white/.16 border
+    // only on the plain card because `.is-active`/`.is-running` keep their
+    // stronger border colours. `Live` tracks avoid a rebuild per pointer move.
+    let set_border = hover_border.clone();
+    let set_offset = hover_offset.clone();
+    view = view
+        .live_offset(hover_offset.smooth(crate::motion::HOVER_SPRING))
+        .on_hover_change(move |_s: &mut S, inside, tx| {
+            set_border.set(if inside {
+                ink("#ffffff29")
+            } else {
+                ink("#ffffff16")
+            });
+            set_offset.set(if inside { [0.0, -1.0] } else { [0.0, 0.0] });
+            tx.live_only();
+        });
+    if !active && !card.running {
+        view = view.live_border(hover_border.smooth(crate::motion::HOVER_SPRING));
+    }
     if card.running {
         // One shadow slot: the running glow wins over the drop (the glow is
         // the running signal; `.canvas-card.is-running` keeps both).
@@ -2134,8 +2160,9 @@ fn card_view<S: CanvasHost + 'static>(
         Some(t) if !t.rows.is_empty() => (false, "done"),
         _ => (false, "idle"),
     };
-    // Status badge (`StatusBadge`): pulse while running, ✓ done, ✕ failed,
-    // quiet dot idle. Rune has no icon font — glyphs, same geometry.
+    // Status badge (`StatusBadge`): static running dot (React's
+    // `.canvas-card-status-dot` has no animation), ✓ done, ✕ failed, quiet
+    // dot idle. Rune has no icon font — glyphs, same geometry.
     let badge: El = {
         let (border, fill, tone) = match status {
             "running" => ("#ffffff21", "#ffffff0e", "#ededf0"),
@@ -2156,8 +2183,7 @@ fn card_view<S: CanvasHost + 'static>(
                 .key(format!("{id}-badge-dot"))
                 .size(5.0, 5.0)
                 .radius(2.5)
-                .fill(ink(tone))
-                .looping(rune::LoopSpec::opacity(2.2, 0.0, 0.35, 1.0)),
+                .fill(ink(tone)),
             "done" => rune::el()
                 .key(format!("{id}-badge-mark"))
                 .size(12.0, 12.0)
@@ -2441,6 +2467,8 @@ fn card_view<S: CanvasHost + 'static>(
     let send_id = id.clone();
     let edit_id = id.clone();
     let send_disabled = live || draft_empty;
+    let send_offset = hover.offset(format!("{id}-send-offset"), [0.0, 0.0]);
+    let set_send_offset = send_offset.clone();
     let attach = rune::el()
         .key(format!("{id}-attach"))
         .size(22.0, 22.0)
@@ -2500,6 +2528,20 @@ fn card_view<S: CanvasHost + 'static>(
                     ink("#f2f2f4")
                 })
                 .center()
+                // `.gp-composer-send:hover`: white face and a 1 pt lift.
+                .hover(if send_disabled {
+                    ink("#00000000")
+                } else {
+                    ink("#ffffff")
+                })
+                .live_offset(send_offset.smooth(crate::motion::HOVER_SPRING))
+                .on_hover_change(move |_s: &mut S, inside, tx| {
+                    if send_disabled {
+                        return;
+                    }
+                    set_send_offset.set(if inside { [0.0, -1.0] } else { [0.0, 0.0] });
+                    tx.live_only();
+                })
                 .on_press(move |s: &mut S| {
                     let c = s.canvas_mut();
                     let prompt = c
@@ -2563,25 +2605,6 @@ fn card_view<S: CanvasHost + 'static>(
                 .border(1.0, ink("#44444c"))
                 .inert(),
         );
-    if !active && !card.running {
-        // `.canvas-card:hover { border-color: rgba(255,255,255,.16) }`.
-        // `.is-active` and `.is-running` are more specific, so the wash is
-        // only mounted on the plain card. Rune has no hover border track.
-        view = view.child(
-            rune::el()
-                .key(format!("{id}-hover-border"))
-                .absolute(0.0, 0.0)
-                .w_full()
-                .h_full()
-                .radius(radius)
-                // The base border is white/.086. A white/.082 overlay lands
-                // on React's opaque .16 (`T = a + B(1-a)`), instead of
-                // stacking two white alphas into a brighter edge.
-                .border(1.0, ink("#ffffff15"))
-                .group_opacity(0.0, 1.0)
-                .inert(),
-        );
-    }
     view
 }
 
@@ -2945,6 +2968,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             input,
             &kids,
             s.agents_open.as_deref() == Some(card.id.as_str()),
+            &s.hover,
         ));
     }
     // Fixed-chrome area: clips the scaled world, holds composer + HUD.
@@ -3458,15 +3482,25 @@ pub(crate) fn bot_icon(size: f32, color: rune::Color) -> Shape {
 
 /// One nested spawned chat (`renderKidLeaves`): quiet 11.5pt row with the
 /// corner connector + bot glyph, indented under its expanded parent.
-fn sidebar_spawn_row<S: CanvasHost + 'static>(chat: &crate::chats::ChatSummary) -> El {
+fn sidebar_spawn_row<S: CanvasHost + 'static>(
+    chat: &crate::chats::ChatSummary,
+    hover: &crate::motion::HoverSet,
+) -> El {
     let title = crate::chats::display_title(&chat.title);
     let ws = chat.workspace_id.clone();
     let chat_id = chat.id.clone();
     let card_id = chat.card_id();
     let mut style = rune::tok::TextStyle::new(11.5, 400.0);
     style.line_height = 17.25;
+    let offset = hover.offset(format!("side-kid-{card_id}-offset"), [0.0, 0.0]);
+    let set_offset = offset.clone();
     row()
         .key(format!("side-kid-{card_id}"))
+        .live_offset(offset.smooth(crate::motion::HOVER_SPRING))
+        .on_hover_change(move |_s: &mut S, inside, tx| {
+            set_offset.set(if inside { [1.0, 0.0] } else { [0.0, 0.0] });
+            tx.live_only();
+        })
         .w_full()
         .items_center()
         .gap(6.0)
@@ -3853,6 +3887,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         .is_some_and(|(id, _)| id == &sid);
     let ws = chat.workspace_id.clone();
     let chat_id = chat.id.clone();
+    let hover_offset = s.hover.offset(format!("side-{card_id}-offset"), [0.0, 0.0]);
     let mut item = if editing {
         let edit = &s
             .sessions
@@ -3873,6 +3908,16 @@ fn sidebar_thread<S: CanvasHost + 'static>(
             .py(8.0)
             .radius(8.0)
             .hover_group();
+        if !deleting {
+            // `.chat-row:hover { transform: translateX(1px) }`.
+            let set_offset = hover_offset.clone();
+            item = item
+                .live_offset(hover_offset.smooth(crate::motion::HOVER_SPRING))
+                .on_hover_change(move |_s: &mut S, inside, tx| {
+                    set_offset.set(if inside { [1.0, 0.0] } else { [0.0, 0.0] });
+                    tx.live_only();
+                });
+        }
         // React row states: spawned rows carry `is-spawned`
         // (white/2.5%, hover 5%, active 7.5%); regular rows hover
         // white/4% and active at 9%.
@@ -4070,7 +4115,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                         .key(format!("side-kid-{}-cell", kid.card_id()))
                         .grow(1.0)
                         .min_w(0.0)
-                        .child(sidebar_spawn_row::<S>(kid)),
+                        .child(sidebar_spawn_row::<S>(kid, &s.hover)),
                 );
             if i > 0 {
                 kid_wrap = kid_wrap.mt(2.0);
@@ -4147,6 +4192,7 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
     };
     let toggle_id = ws_id.clone();
     let plus_id = ws_id.clone();
+    let chevron_scale = s.hover.scale(format!("side-group-{ws_id}-chevron"), 1.0);
     row()
         .key(format!("side-group-{ws_id}"))
         .w_full()
@@ -4167,6 +4213,18 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                 } else {
                     format!("Collapse {ws_name}")
                 })
+                // React `hover:bg-zinc-800/50` + `hover:text-zinc-200`.
+                // The rest fill is transparent, so the hover overlay is the
+                // exact CSS wash; `group_color` lifts the label.
+                .hover(rgba(39.0, 39.0, 42.0, 0.5))
+                .hover_group()
+                .on_hover_change({
+                    let scale = chevron_scale.clone();
+                    move |_s: &mut S, inside, tx| {
+                        scale.set(if inside { 1.08 } else { 1.0 });
+                        tx.live_only();
+                    }
+                })
                 .on_press(move |s: &mut S| {
                     commit_sidebar_rename(s);
                     let sessions = &mut s.canvas_mut().sessions;
@@ -4185,16 +4243,21 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                             0.0
                         })
                         .rotate_motion(crate::motion::ROTATE)
+                        .live_scale(chevron_scale.smooth(crate::motion::HOVER_SPRING))
                         .shape(chevron_down(11.0, ink("#52525b"))),
                 )
-                .child(
-                    text(ws_name.to_uppercase())
+                .child({
+                    let mut name = text(ws_name.to_uppercase())
                         .key(format!("side-group-{ws_id}-name"))
                         .min_w(0.0)
                         .truncate()
                         .font(name_style)
-                        .color(name_color),
-                )
+                        .color(name_color);
+                    if ws.exists {
+                        name = name.group_color(ink("#e4e4e7"));
+                    }
+                    name
+                })
                 .child(
                     text(total.to_string())
                         .key(format!("side-group-{ws_id}-count"))

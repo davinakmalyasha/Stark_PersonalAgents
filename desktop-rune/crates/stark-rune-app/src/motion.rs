@@ -2,13 +2,18 @@
 //!
 //! Two families live here, because Rune splits what CSS calls a "transition":
 //!
-//! - [`Curve`]s drive **hover tracks** (`hover`, `group_color`, `group_opacity`)
-//!   and `Live` smoothing. Tailwind's default is 150 ms
+//! - [`Curve`]s drive the paint-only **hover tracks** (`hover`, `group_color`,
+//!   `group_opacity`). Tailwind's default is 150 ms
 //!   `cubic-bezier(.4,0,.2,1)`.
 //! - [`Spring`]s drive **presence transitions** (message entrances, menus,
-//!   panels). CSS keyframes are time-based, so a spring is matched by duration
-//!   and verified at settle; under Reduce Motion its spatial offset snaps while
-//!   the opacity still fades.
+//!   panels) and [`Live`] hover smoothing. CSS keyframes are time-based, so a
+//!   spring is matched by duration and verified at settle; under Reduce Motion
+//!   its spatial offset snaps while the opacity still fades.
+//!
+//! [`HoverSet`] owns the per-element `Live` tracks for properties CSS can
+//! transition but Rune has no hover binding for: scale, offset and border
+//! colour. `on_hover_change` publishes the target; `tx.live_only()` keeps the
+//! pointer from rebuilding the view.
 //!
 //! The later `index.css` cascade wins over the earlier base rules: user
 //! messages are 200 ms, agent messages 240 ms, generic fades 140 ms, modal
@@ -21,10 +26,27 @@
 
 #![allow(dead_code)] // later motion passes consume the unused tokens
 
-use rune::{color, Color, Curve, Easing, El, Spring, SpringPair, Transition};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use rune::{color, Color, Curve, Easing, El, Live, Spring, SpringPair, Transition};
 
 /// `transition-colors` / `transition-all` on interactive controls.
 pub const HOVER: Curve = Curve::tween(0.15, Easing::cubic(0.4, 0.0, 0.2, 1.0));
+/// The same 150 ms transition for `Live` bindings. Rune's `Live::smooth`
+/// takes a spring, so this lands on the CSS duration rather than a curve.
+pub const HOVER_SPRING: Spring = Spring::smooth(0.15, 0.0);
+
+/// `caret-blink 0.9s steps(1)`: a near-step opacity cycle. The two stops at
+/// 50% make the transition land in one frame while keeping `Cycle`'s
+/// wall-clock sampling, unlike `LoopSpec::opacity`'s smooth fade.
+pub const CARET: rune::Cycle = rune::Cycle {
+    period: 0.9,
+    phase: 0.0,
+    stops: &[(0.0, 1.0), (0.5, 1.0), (0.5001, 0.0), (1.0, 0.0)],
+    still: 1.0,
+    fps: 60.0,
+};
 /// `--stark-dur-1` (140 ms) with `--stark-ease-standard`.
 pub const FAST: Curve = Curve::tween(0.14, Easing::cubic(0.2, 0.8, 0.2, 1.0));
 /// `--stark-dur-2` (200 ms) `--stark-ease-out`, for short reveals.
@@ -52,6 +74,8 @@ pub const POPOVER: Spring = Spring::smooth(0.18, 0.0);
 pub const TRACE: Spring = Spring::smooth(0.34, 0.0);
 /// `.trace-group` — 280 ms.
 pub const TRACE_GROUP: Spring = Spring::smooth(0.28, 0.0);
+/// `.trace-collapsible` opacity — 180 ms.
+pub const TRACE_BODY: Spring = Spring::smooth(0.18, 0.0);
 /// `.activity-tool-panel` — 180 ms.
 pub const TOOL_PANEL: Spring = Spring::smooth(0.18, 0.0);
 /// `.retry-status` — 200 ms.
@@ -258,6 +282,75 @@ pub fn hover_icon(size: f32, base: rune::Shape, hovered: rune::Shape) -> El {
         )
 }
 
+/// Registry of per-element hover tracks.
+///
+/// Rune has no built-in hover transform or border track, but `Live` values
+/// provide the same thing: a stable handle per key that `live_scale`,
+/// `live_offset` and `live_border` bind to, with [`Live::smooth`] supplying
+/// the CSS transition curve. The registry is behind an `Arc<Mutex<_>>` so a
+/// view (which only sees `&State`) can obtain or reuse a handle without
+/// rebuilding, and `on_hover_change` can publish into it with `tx.live_only()`.
+#[derive(Clone, Default)]
+pub struct HoverSet {
+    inner: Arc<Mutex<HoverInner>>,
+}
+
+#[derive(Default)]
+struct HoverInner {
+    scale: HashMap<String, Live<f32>>,
+    offset: HashMap<String, Live<[f32; 2]>>,
+    border: HashMap<String, Live<Color>>,
+}
+
+impl HoverSet {
+    /// Stable scale track for `key`, starting at `rest` the first time it is
+    /// requested. Later calls with a different `rest` keep the original track
+    /// so an element rebuilt mid-hover does not reset.
+    pub fn scale(&self, key: impl Into<String>, rest: f32) -> Live<f32> {
+        let mut inner = self.inner.lock().expect("hover set poisoned");
+        inner
+            .scale
+            .entry(key.into())
+            .or_insert_with(|| Live::new(rest))
+            .clone()
+    }
+
+    /// Stable offset track for `key` (parent-space points).
+    pub fn offset(&self, key: impl Into<String>, rest: [f32; 2]) -> Live<[f32; 2]> {
+        let mut inner = self.inner.lock().expect("hover set poisoned");
+        inner
+            .offset
+            .entry(key.into())
+            .or_insert_with(|| Live::new(rest))
+            .clone()
+    }
+
+    /// Stable border-colour track for `key`.
+    pub fn border(&self, key: impl Into<String>, rest: Color) -> Live<Color> {
+        let mut inner = self.inner.lock().expect("hover set poisoned");
+        inner
+            .border
+            .entry(key.into())
+            .or_insert_with(|| Live::new(rest))
+            .clone()
+    }
+
+    /// Drop tracks whose element is gone. Call after a history/card refresh so
+    /// a long-lived thread does not accumulate handles for deleted chats.
+    pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        let mut inner = self.inner.lock().expect("hover set poisoned");
+        inner.scale.retain(|key, _| keep(key));
+        inner.offset.retain(|key, _| keep(key));
+        inner.border.retain(|key, _| keep(key));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        let inner = self.inner.lock().expect("hover set poisoned");
+        inner.scale.len() + inner.offset.len() + inner.border.len()
+    }
+}
+
 /// Parse a token colour. Test-only convenience; runtime code passes `Color`s.
 pub fn ink(hex: &str) -> Color {
     color::hex(hex).unwrap_or(Color::BLACK)
@@ -393,5 +486,38 @@ mod tests {
             target,
             "a transparent row lets the real surface show through"
         );
+    }
+
+    #[test]
+    fn caret_and_hover_tracks_match_their_css_clocks() {
+        assert_eq!(CARET.period, 0.9);
+        assert_eq!(CARET.stops[1], (0.5, 1.0));
+        assert_eq!(CARET.stops[2], (0.5001, 0.0));
+        assert_eq!(HOVER_SPRING, Spring::smooth(0.15, 0.0));
+        assert_eq!(TRACE_BODY, Spring::smooth(0.18, 0.0));
+    }
+
+    #[test]
+    fn hover_set_reuses_one_track_per_key_and_prunes() {
+        let set = HoverSet::default();
+        let a = set.scale("card-a", 1.0);
+        let again = set.scale("card-a", 2.0);
+        assert_eq!(again.get(), 1.0, "the first rest value wins");
+        a.set(1.08);
+        assert_eq!(again.get(), 1.08, "handles share one Live source");
+
+        let off = set.offset("card-a", [0.0, 0.0]);
+        off.set([0.0, -1.0]);
+        assert_eq!(set.offset("card-a", [9.0, 9.0]).get(), [0.0, -1.0]);
+
+        let border = set.border("pill", ink("#ffffff12"));
+        border.set(ink("#ffffff29"));
+        assert_eq!(set.border("pill", Color::BLACK).get(), ink("#ffffff29"));
+
+        assert_eq!(set.len(), 3);
+        set.retain(|key| key == "card-a");
+        assert_eq!(set.len(), 2, "the pill's border track is pruned");
+        let fresh = set.border("pill", ink("#ffffff12"));
+        assert_eq!(fresh.get(), ink("#ffffff12"), "a pruned key starts over");
     }
 }

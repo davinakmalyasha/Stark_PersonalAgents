@@ -169,7 +169,9 @@ fn attachment_card<S: 'static>(
 }
 
 /// `.attachment-add`: dashed tile matching a card's height.
-fn attachment_add<S: 'static>(attach: PressTx<S>) -> El {
+fn attachment_add<S: 'static>(attach: PressTx<S>, hover: &crate::motion::HoverSet) -> El {
+    let border = hover.border("composer-attachment-add-border", ink("#ffffff2b"));
+    let set_border = border.clone();
     rune::el()
         .key("composer-attachment-add")
         .role("button")
@@ -182,7 +184,16 @@ fn attachment_add<S: 'static>(attach: PressTx<S>) -> El {
         .border_layout()
         .center()
         .hover(ink("#ffffff10"))
+        .live_border(border.smooth(crate::motion::HOVER_SPRING))
         .hover_group()
+        .on_hover_change(move |_s: &mut S, inside, tx| {
+            set_border.set(if inside {
+                ink("#ffffff52")
+            } else {
+                ink("#ffffff2b")
+            });
+            tx.live_only();
+        })
         .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
         .child({
             let plus = |color: rune::Color| {
@@ -250,10 +261,14 @@ fn voice_button<S: 'static>(live: bool, on_voice: impl Fn(&mut S) + 'static) -> 
             .child(
                 rune::el()
                     .key("composer-voice-dot")
-                    .size(8.0, 8.0)
-                    .radius(4.0)
+                    .pin(None, Some(4.0), Some(4.0), None)
+                    .size(5.0, 5.0)
+                    .radius(2.5)
                     .fill(ink("#ffffff"))
-                    .looping(rune::LoopSpec::opacity(1.2, 0.0, 0.4, 1.0)),
+                    // `.voice-live-dot`: 1.2s `voice-breathe` (scale .88→1.08,
+                    // opacity .65→1). Rune's loop is opacity-only; the scale
+                    // term is recorded as an accepted delta.
+                    .looping(rune::LoopSpec::opacity(1.2, 0.0, 0.65, 1.0)),
             );
     } else {
         button = button
@@ -305,6 +320,8 @@ pub struct ComposerMeta<'a> {
     /// Chat identity for attachment thumbnails (API URL on the web).
     pub workspace_id: &'a str,
     pub chat_id: &'a str,
+    /// Stable hover tracks (send scale, border transitions).
+    pub hover: &'a crate::motion::HoverSet,
 }
 
 /// Run-target toggle (`radiogroup`): Local active is zinc-on-zinc-800,
@@ -336,7 +353,7 @@ fn target_toggle<S: 'static>(
         ));
     if cloud_active {
         // React pulses the cloud icon (`animate-pulse`); same rhythm here.
-        cloud = cloud.looping(rune::LoopSpec::opacity(1.4, 0.0, 0.4, 1.0));
+        cloud = cloud.looping(rune::LoopSpec::opacity(2.0, 0.0, 0.4, 1.0));
     }
     row()
         .key("composer-target")
@@ -603,7 +620,14 @@ fn usage_popover<S: 'static>(
 /// Provider pill (`provider-trigger`): live gateway label, amber when the
 /// key is missing or the provider reports an error. Opens the agents &
 /// providers modal, like React.
-fn provider_pill<S: 'static>(label: &str, warn: bool, on_config: Press<S>) -> El {
+fn provider_pill<S: 'static>(
+    label: &str,
+    warn: bool,
+    on_config: Press<S>,
+    hover: &crate::motion::HoverSet,
+) -> El {
+    let border = hover.border("composer-provider-border", ink("#ffffff12"));
+    let set_border = border.clone();
     row()
         .key("composer-provider")
         .role("button")
@@ -638,7 +662,16 @@ fn provider_pill<S: 'static>(label: &str, warn: bool, on_config: Press<S>) -> El
             },
             ink("#101013"),
         ))
+        .live_border(border.smooth(crate::motion::HOVER_SPRING))
         .hover_group()
+        .on_hover_change(move |_s: &mut S, inside, tx| {
+            set_border.set(if inside {
+                ink("#ffffff1f")
+            } else {
+                ink("#ffffff12")
+            });
+            tx.live_only();
+        })
         .on_press(move |s: &mut S| on_config(s))
         .child(
             text(if label.is_empty() {
@@ -666,7 +699,10 @@ fn model_dropup<S: 'static>(
     open: bool,
     menu: Press<S>,
     pick: Pick<S>,
+    hover: &crate::motion::HoverSet,
 ) -> El {
+    let border = hover.border("composer-model-border", ink("#ffffff12"));
+    let set_border = border.clone();
     let mut wrap = col().key("composer-model").gap(4.0);
     let current = if model.is_empty() {
         "Automatic Fallback".to_string()
@@ -709,7 +745,16 @@ fn model_dropup<S: 'static>(
                 },
                 ink("#101013"),
             ))
+            .live_border(border.smooth(crate::motion::HOVER_SPRING))
             .hover_group()
+            .on_hover_change(move |_s: &mut S, inside, tx| {
+                set_border.set(if inside {
+                    ink("#ffffff1f")
+                } else {
+                    ink("#ffffff12")
+                });
+                tx.live_only();
+            })
             .on_press(move |s: &mut S| menu(s))
             .child(
                 text(current)
@@ -875,11 +920,12 @@ pub fn composer_card<S: 'static>(
         true
     })
     .on_submit(submit);
-    // Send / Stop (`.send-button`): violet when a prompt or attachment is
-    // staged, white at 72% (disabled) while empty+idle, white with a dark
-    // square while running an empty prompt (the later `index.css` block).
+    // Send / Stop (`.send-button`): the later `index.css` block wins — a
+    // white 34 pt circle with dark glyph, hover `scale(1.04)`, disabled at
+    // 72%, and the running empty state as a dark square.
     let has_text = !edit.text.trim().is_empty();
     let has_content = has_text || !meta.attachments.is_empty();
+    let send_scale = meta.hover.scale("composer-send-scale", 1.0);
     let mut send_btn = rune::el()
         .role("button")
         .label(if running { "Stop execution" } else { "Send" })
@@ -887,6 +933,7 @@ pub fn composer_card<S: 'static>(
         .radius(17.0)
         .center();
     if running && !has_content {
+        let set_scale = send_scale.clone();
         send_btn = send_btn
             .key("composer-stop")
             .fill(ink("#ffffff"))
@@ -897,6 +944,11 @@ pub fn composer_card<S: 'static>(
             // `.pressable:active { transform: scale(.96) }`; `press_scale`
             // only records after a press handler exists.
             .press_scale(0.96)
+            .live_scale(send_scale.smooth(crate::motion::HOVER_SPRING))
+            .on_hover_change(move |_s: &mut S, inside, tx| {
+                set_scale.set(if inside { 1.04 } else { 1.0 });
+                tx.live_only();
+            })
             .child(
                 rune::el()
                     .size(14.0, 14.0)
@@ -905,36 +957,25 @@ pub fn composer_card<S: 'static>(
                     .child(crate::lucide_square_filled(14.0, ink("#111113"))),
             );
     } else if has_content {
+        let set_scale = send_scale.clone();
         send_btn = send_btn
             .key("composer-send")
-            .linear_gradient(
-                135.0 * std::f32::consts::PI / 180.0,
-                [(0.0, ink("#aa8dff")), (1.0, ink("#7860d9"))],
-            )
+            .fill(ink("#ffffff"))
             .on_press({
                 let on_send = buttons.send.clone();
                 move |s: &mut S| on_send(s)
             })
             .press_scale(0.96)
-            .hover_group()
+            .live_scale(send_scale.smooth(crate::motion::HOVER_SPRING))
+            .on_hover_change(move |_s: &mut S, inside, tx| {
+                set_scale.set(if inside { 1.04 } else { 1.0 });
+                tx.live_only();
+            })
             .child(
                 rune::el()
                     .size(16.0, 16.0)
                     .inert()
-                    .shape(crate::lucide_arrow_up(16.0, 2.4, ink("#ffffff"))),
-            )
-            // `.send-button:hover:not(:disabled) { filter: brightness(1.12) }`.
-            // The button paints a gradient, which Rune's hover overlay skips;
-            // a white wash over the whole face is the compositing equivalent.
-            .child(
-                rune::el()
-                    .absolute(0.0, 0.0)
-                    .w_full()
-                    .h_full()
-                    .radius(17.0)
-                    .fill(ink("#ffffff1f"))
-                    .group_opacity(0.0, 1.0)
-                    .inert(),
+                    .shape(crate::lucide_arrow_up(16.0, 2.4, ink("#111113"))),
             );
     } else {
         send_btn = send_btn
@@ -1039,7 +1080,7 @@ pub fn composer_card<S: 'static>(
                 buttons.remove_attachment.clone(),
             ));
         }
-        deck = deck.child(attachment_add(buttons.attach.clone()));
+        deck = deck.child(attachment_add(buttons.attach.clone(), meta.hover));
         card = card.child(deck);
     }
     // React's `.prompt-dock` has no padding of its own: the input wrapper
@@ -1139,6 +1180,7 @@ pub fn composer_card<S: 'static>(
                         meta.provider_label,
                         meta.provider_warn,
                         buttons.config.clone(),
+                        meta.hover,
                     ))
                     .child(if meta.models.is_empty() {
                         // Map dock: no model list (HouseChat never passes
@@ -1157,6 +1199,7 @@ pub fn composer_card<S: 'static>(
                             meta.model_open,
                             buttons.model_menu.clone(),
                             buttons.model_pick.clone(),
+                            meta.hover,
                         )
                     })
                     .child(voice_button(voice_live, {

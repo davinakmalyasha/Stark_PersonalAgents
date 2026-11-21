@@ -43,6 +43,9 @@ pub struct GroupState {
     pub host: String,
     pub port: u16,
     pub open_id: Option<String>,
+    /// Project the route wants to open once the live Group list contains it.
+    /// The modal stays unmounted while this is pending.
+    pub pending_open: Option<String>,
     pub detail: Option<GroupDetail>,
     pub loading: bool,
     pub error: Option<String>,
@@ -88,6 +91,7 @@ impl Clone for GroupState {
             host: self.host.clone(),
             port: self.port,
             open_id: self.open_id.clone(),
+            pending_open: self.pending_open.clone(),
             detail: self.detail.clone(),
             loading: self.loading,
             error: self.error.clone(),
@@ -121,6 +125,7 @@ impl Default for GroupState {
             host: "127.0.0.1".to_string(),
             port: 8124,
             open_id: None,
+            pending_open: None,
             detail: None,
             loading: false,
             error: None,
@@ -159,6 +164,7 @@ impl GroupState {
         self.host = host;
         self.port = port;
         self.open_id = Some(id.clone());
+        self.pending_open = None;
         self.detail = None;
         self.loading = true;
         self.error = None;
@@ -184,6 +190,7 @@ impl GroupState {
 
     pub fn close(&mut self) {
         self.open_id = None;
+        self.pending_open = None;
         self.detail = None;
         self.loading = false;
         self.error = None;

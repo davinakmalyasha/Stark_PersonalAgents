@@ -100,17 +100,20 @@ white send button's `scale(1.04)`, message-image `scale(1.04)`, the project
 chevron `scale(1.08)`, chat-row/subagent 1 px slides, provider/model/attachment
 hover borders, message attachment chips, and the empty-canvas 27 pt circle
 (`scale(1.04)`, `#fff → #e8e8ea`). The sidebar delete row collapses its slot on
-the CSS bezier while its content goes absolute; the trace row folds over
-280 ms on close; the voice dot samples the full `voice-breathe` scale/opacity
-keyframe at 60 Hz while live. Spinners, pulse dots and sheens use their React
+the CSS bezier while its content goes absolute; the trace body fades over
+180 ms while its clipped 280 ms growth row folds on close; the voice dot
+samples the full `voice-breathe` scale/opacity keyframe at 60 Hz while live. Spinners, pulse dots and sheens use their React
 periods; the caret uses a near-step `Cycle` for `steps(1)`. Hover and spatial
 transitions respect Reduce Motion through Rune's motion gate (offsets snap,
 opacity still fades).
 
 The group-project modal, chat, approval cards, 3 s detail poll, progress rail,
-board/team/details tabs and skeleton shimmer are now ported. The remaining
-visual delta is the modal chrome's text glyphs (the layout boxes match the
-Lucide icons); details and the deterministic fixture are in `parity/README.md`.
+board/team/details tabs and skeleton shimmer are now ported, with the modal
+chrome drawn from the same Lucide paths as React. The `group` fixture route
+opens through the live Group list, so the shell behind the dialog matches a
+real navigation. The trace accordion now fades and clips its body inside a
+280 ms growth-row fold on close instead of dropping it. Details and the
+deterministic fixture are in `parity/README.md`.
 
 ## Transcript (MessageStream port)
 

@@ -556,9 +556,13 @@ Geometry matches React: the modal is `1180×860` at `(50,20)` on 1280×900 and
 `776×553` at `(12,10)` below 900 px; the rail is 350 pt on desktop and hidden
 behind the mobile toggle; the skeleton is 16/12/12 plus 24/36/36/36 blocks on
 the same 24 pt gutters. The 3 s detail poll reloads without replaying the modal
-entrance. Remaining visual differences are the action glyphs above and the
-dark shell behind the backdrop (the route opens the modal before the Group
-list has fetched).
+entrance. The chrome uses the same Lucide paths as React (`FolderKanban`,
+`FolderOpen`, `StickyNote`, `PanelRight*`, `Pause`/`Play`, `X`, plus the
+message/rail icons at their React sizes). The `group` route now navigates like
+a click: it opens the Group rail, loads `/api/groups`, and mounts the modal
+once the live list contains `p1`, so the shell behind the backdrop carries the
+real project card and loaded home card. Remaining full-frame difference is the
+dense text rasterisation and the canvas behind the blurred backdrop.
 
 ## Interaction sweep (2026-11-20)
 
@@ -574,7 +578,7 @@ These scripted poses exercise the paths against the fixture server:
 | `composer_send_hover.json` | type, then hover Send; capture 1.04/1.30 for the 1.04 scale |
 | `provider_hover.json` | hover the provider pill; its border rides a `Live` track |
 | `trace_open.json` | open `msg-0a4560f6`'s trace; groups fade/rise, the body fades 180 ms, the header chevron rotates |
-| `trace_close.json` | open, then close the trace; the row folds over 280 ms |
+| `trace_close.json` | open, then close the trace; the body clips/fades over 180 ms inside the 280 ms row fold |
 | `sidebar_delete.json` | two deletes; the 34.8 pt row fades, slides and collapses |
 | `group_rail_open.json` | below 900 px, open the mobile details rail |
 | `group_details.json` | open the Details tab and the activity log |
@@ -592,8 +596,10 @@ Measured checkpoints:
 | user message | 1.05 | group +12.6 pt, opacity 0.10 |
 | user message | 1.07 | group +10.1 pt, opacity 0.28 |
 | trace group | 1.06 / 1.12 / 1.40 | opacity 0.17 / 0.56 / 1.00 |
-| trace body | 1.06 / 1.12 / 1.40 | opacity 0.324 / 0.787 / 1.000 |
-| trace close | 1.66 / 1.82 | row 51 pt closed; body unmounted, no ghost |
+| trace body | 1.06 / 1.12 / 1.40 | opacity 0.078 / 0.632 / 0.997 (180 ms `ease`) |
+| trace close | 1.66 / 1.70 / 1.78 | body 38.67 / 26.14 / 7.05 pt, opacity 0.914 / 0.532 / 0.041; no ghost |
+| group 1280 | rest | full-frame 7.54 / 6.68; modal and rail geometry exact |
+| group 800 | rest | full-frame 9.07 / 3.88; modal 776×553 at `(12,10)` |
 | sidebar delete | unit probe | 34.8 pt slot → 7.8 pt with opacity 0.22 on the same frame |
 | send hover | 1.30 | scale 1.0382 (settles at 1.04), white face |
 | provider border | 1.6 | edge RGB 42→62 over the dock |
@@ -604,13 +610,11 @@ Measured checkpoints:
 
 ### Accepted deltas
 
-Rune now supports hover scale, offset and border colour through `Live`. The
-remaining deltas are structural or one-to-many:
-
-| React | Rune | Why |
-| --- | --- | --- |
-| `.trace-collapsible` closes with `.28 s` height + `.18 s` opacity | the body unmounts at once; the completed row `fold_glide`s its height over 280 ms | Rune draws presence exits outside ancestor clips, so a retained body ghosts below the folded header |
-| Group dialog action icons | text glyphs (`▤`, `✎`, `▱`, `✕`, `✓`) at the same boxes | the port reuses the existing icon vocabulary; Lucide paths for the modal chrome are a later polish pass |
+No accepted motion delta remains on the trace close or the group dialog:
+`.trace-collapsible` now folds the body inside its own clipped growth row
+(`46.75 → 38.67 → 26.14 → 7.05 pt`) on the 280 ms disclosure spring while its
+opacity follows the 180 ms `ease` clock, and the group chrome uses the real
+Lucide geometry at React's sizes.
 
 The sidebar delete now collapses its 34.8 pt slot on the CSS bezier (content
 absolute, the list lands layout immediately), the trace body fades in over

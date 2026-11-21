@@ -1479,9 +1479,33 @@ fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
 /// with the board via [`poll_projects_state`] — one drain path everywhere.
 fn poll_projects(s: &mut ShellState, clock: f64) -> bool {
     let mut changed = poll_projects_state(&mut s.canvas.projects, clock);
+    changed |= resolve_pending_group(s);
     changed |= s.canvas.projects.group.poll(clock);
     changed |= crate::notes::poll_notes_state(&mut s.canvas.projects.group.notes);
     changed
+}
+
+/// Open the group route's project only after the live list contains it. A
+/// failed or completed fetch without the id clears the request, so the route
+/// can never hang with an unmounted modal.
+fn resolve_pending_group(s: &mut ShellState) -> bool {
+    let Some(id) = s.canvas.projects.group.pending_open.clone() else {
+        return false;
+    };
+    if s.canvas.projects.projects.iter().any(|p| p.id == id) {
+        let group = &mut s.canvas.projects.group;
+        group.pending_open = None;
+        let (host, port) = (group.host.clone(), group.port);
+        group.open(host, port, id);
+        return true;
+    }
+    if !s.canvas.projects.loading
+        && (s.canvas.projects.error.is_some() || s.canvas.projects.last_ok > 0.0)
+    {
+        s.canvas.projects.group.pending_open = None;
+        return true;
+    }
+    false
 }
 
 fn init_shell() -> ShellState {
@@ -1574,12 +1598,12 @@ fn apply_settings(s: &mut ShellState) {
 }
 
 fn apply_group(s: &mut ShellState) {
+    // A real navigation: the Group rail loads its list, and the detail modal
+    // opens from the card once that list contains the project. This keeps the
+    // shell behind the backdrop identical to a user click.
     s.canvas.rail = RailTab::Group;
-    s.canvas.projects.group.open(
-        crate::rune_transcript::DEFAULT_API_HOST.to_string(),
-        crate::rune_transcript::api_port(),
-        "p1".to_string(),
-    );
+    s.canvas.projects.group.pending_open = Some("p1".to_string());
+    crate::projects::refresh_projects(&mut s.canvas.projects);
 }
 
 fn apply_group_loading(s: &mut ShellState) {
@@ -2232,5 +2256,57 @@ mod tests {
             rt.find("trace-agent-trace-body").is_none(),
             "the body unmounts when the fade ends"
         );
+    }
+    #[test]
+    fn group_route_opens_only_after_the_list_contains_the_project() {
+        let mut state = ShellState::default();
+        state.canvas.projects.auto = false;
+        state.canvas.projects.port = 1;
+        state.canvas.projects.group.port = 1;
+        apply_group(&mut state);
+        assert_eq!(
+            state.canvas.projects.group.pending_open.as_deref(),
+            Some("p1")
+        );
+        assert!(
+            state.canvas.projects.loading,
+            "the route loads the live list"
+        );
+        assert!(
+            state.canvas.projects.group.open_id.is_none(),
+            "the modal is not mounted before the list arrives"
+        );
+
+        // Still loading: the request stays pending and no modal mounts.
+        state.canvas.projects.loading = true;
+        assert!(!resolve_pending_group(&mut state));
+        assert!(state.canvas.projects.group.open_id.is_none());
+
+        // The fresh list contains the project: open it and consume the request.
+        state.canvas.projects.loading = false;
+        state.canvas.projects.last_ok = 1.0;
+        state.canvas.projects.projects = vec![crate::projects::GroupProject {
+            id: "p1".to_string(),
+            title: "Analytics".to_string(),
+            status: "running".to_string(),
+            done: 1,
+            total: 4,
+            waiting: 1,
+        }];
+        assert!(resolve_pending_group(&mut state));
+        assert_eq!(state.canvas.projects.group.open_id.as_deref(), Some("p1"));
+        assert!(state.canvas.projects.group.pending_open.is_none());
+    }
+
+    #[test]
+    fn group_route_clears_a_missing_project_instead_of_hanging() {
+        let mut state = ShellState::default();
+        state.canvas.projects.group.pending_open = Some("gone".to_string());
+        state.canvas.projects.loading = false;
+        state.canvas.projects.last_ok = 1.0;
+        state.canvas.projects.projects.clear();
+        assert!(resolve_pending_group(&mut state));
+        assert!(state.canvas.projects.group.pending_open.is_none());
+        assert!(state.canvas.projects.group.open_id.is_none());
     }
 }

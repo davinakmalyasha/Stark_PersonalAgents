@@ -321,6 +321,7 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
                     .role("button")
                     .focusable(true)
                     .label("Refresh projects")
+                    .help("Refresh projects")
                     .font(rune::tok::TextStyle::new(12.0, 600.0))
                     .color(ink("#a1a1aa"))
                     .on_press(|s: &mut S| {

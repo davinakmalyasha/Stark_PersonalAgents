@@ -1095,6 +1095,8 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                 card = card.child(
                     text(h.error.clone())
                         .key(format!("cloud-handoff-{id}-error", id = h.id))
+                        .role("alert")
+                        .live_region(rune::LiveRegion::Assertive)
                         .font(rune::tok::TextStyle::new(11.0, 400.0))
                         .wrap()
                         .color(ink("#fda4af")),
@@ -1108,6 +1110,8 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
         body = body.child(
             text(err.clone())
                 .key("cloud-error")
+                .role("alert")
+                .live_region(rune::LiveRegion::Assertive)
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
                 .color(ink("#fda4af")),
         );

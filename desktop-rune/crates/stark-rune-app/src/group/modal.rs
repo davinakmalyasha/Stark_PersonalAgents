@@ -536,16 +536,15 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         .border(1.0, ink("#27272a"))
         .border_layout()
         .clip_rounded(16.0)
-        .shadow(
-            0.0,
-            30.0,
-            rune::Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.55,
-            },
-        )
+        // Tailwind `shadow-2xl`: 0 25px 50px -12px rgb(0 0 0 / .25).
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 25.0,
+            blur: 50.0,
+            spread: -12.0,
+            color: rgba(0.0, 0.0, 0.0, 0.25),
+            inset: false,
+        })
         .transition(crate::motion::modal_enter())
         .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
         .child(header::<S>(g, &project, detail, compact, rail_visible));

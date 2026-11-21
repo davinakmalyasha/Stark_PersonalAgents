@@ -560,7 +560,13 @@ fn option_list<S: 'static>(
     current: &str,
     on_pick: CfgPick<S>,
 ) -> El {
-    let mut list = col().key(key.to_string()).w_full().gap(2.0);
+    let mut list = col()
+        .key(key.to_string())
+        .w_full()
+        .gap(2.0)
+        .role("listbox")
+        .label("Options")
+        .focus_group();
     for (value, label) in options {
         let target = value.clone();
         let selected = value == current;
@@ -575,8 +581,10 @@ fn option_list<S: 'static>(
                 .py(6.0)
                 .radius(6.0)
                 .fill(ink(if selected { "#ffffff14" } else { "#00000000" }))
-                .role("button")
+                .role("option")
                 .focusable(true)
+                .focus_selected(selected)
+                .focus_highlight(ink("#ffffff0f"))
                 .label(format!("Pick {label}"))
                 .on_press(move |s: &mut S| pick(s, target.clone()))
                 .child(
@@ -1036,6 +1044,8 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             main = main.child(
                 text(err.clone())
                     .key("agentcfg-error")
+                    .role("alert")
+                    .live_region(rune::LiveRegion::Assertive)
                     .font(rune::tok::TextStyle::new(11.0, 400.0))
                     .color(ink("#fca5a5")),
             );
@@ -1044,6 +1054,8 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             main = main.child(
                 text(s.status.clone())
                     .key("agentcfg-status")
+                    .role("status")
+                    .live_region(rune::LiveRegion::Polite)
                     .font(rune::tok::TextStyle::new(11.0, 400.0))
                     .color(ink("#6ee7b7")),
             );

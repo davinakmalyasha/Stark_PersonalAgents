@@ -763,7 +763,10 @@ fn question_block<S: TranscriptHost + 'static>(
         .key(format!("ask-options-{}", question.id))
         .w_full()
         .gap(if compact { 5.0 } else { 6.0 })
-        .pt(if compact { 7.0 } else { 10.0 });
+        .pt(if compact { 7.0 } else { 10.0 })
+        .role("group")
+        .label("Answers")
+        .focus_group();
     for (index, option) in question.options.iter().enumerate() {
         let selected = ask
             .answers
@@ -958,6 +961,8 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
     if let Some(error) = &ask.error {
         body = body.child(
             text(error.clone())
+                .role("alert")
+                .live_region(rune::LiveRegion::Assertive)
                 .font(style(
                     if compact { 10.0 } else { 12.0 },
                     400.0,

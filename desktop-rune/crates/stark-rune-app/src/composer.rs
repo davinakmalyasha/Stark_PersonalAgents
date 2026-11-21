@@ -1039,6 +1039,27 @@ pub fn composer_card<S: 'static>(
             );
     }
     let dragging = meta.attachments_dragging;
+    let border_color = if dragging {
+        // `.premium-surface.is-dragging`: white .55.
+        rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.55,
+        }
+    } else if voice_live {
+        // `.premium-surface.is-listening`: violet .58 wins over hover.
+        ink("#977fff94")
+    } else {
+        // `.premium-surface` rests at white .08; hover lifts to .14.
+        rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.08,
+        }
+    };
+    let hover_border = meta.hover.border("composer-card-border", border_color);
     let mut card = col()
         .key("composer-card")
         .w_full()
@@ -1048,19 +1069,13 @@ pub fn composer_card<S: 'static>(
             145.0 * std::f32::consts::PI / 180.0,
             [(0.0, ink("#161618fa")), (1.0, ink("#0e0e10fc"))],
         )
-        .border(
-            1.0,
-            rune::Color {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: if dragging { 0.55 } else { 0.08 },
-            },
-        )
-        // `.house-dock:focus-within`: border-color .28. The expanded shadow
-        // cannot be toggled declaratively; the ring is the exact border.
-        .focus_within_ring(1.0, -1.0, ink("#ffffff47"))
+        .border(1.0, border_color)
         .border_layout();
+    // `.prompt-dock:focus-within` removes the drop shadow. Listening and
+    // dragging have their own later shadows and keep them.
+    if !voice_live && !dragging {
+        card = card.focus_within_flat();
+    }
     if dragging {
         // `.premium-surface.is-dragging`: lifted ring + scale.
         card = card.scale(1.008).box_shadow(rune::Shadow {
@@ -1086,6 +1101,35 @@ pub fn composer_card<S: 'static>(
                 a: 0.38,
             },
         );
+    } else if voice_live {
+        // `.premium-surface.is-listening`: violet ring + glow + soft drop.
+        card = card
+            .box_shadow(rune::Shadow {
+                x: 0.0,
+                y: 0.0,
+                blur: 0.0,
+                spread: 1.0,
+                color: ink("#977fff1f"),
+                inset: false,
+            })
+            .box_shadow(rune::Shadow {
+                x: 0.0,
+                y: 0.0,
+                blur: 34.0,
+                spread: 0.0,
+                color: ink("#7a5cff24"),
+                inset: false,
+            })
+            .shadow(
+                14.0,
+                42.0,
+                rune::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.26,
+                },
+            );
     } else {
         card = card
             .shadow(
@@ -1100,6 +1144,21 @@ pub fn composer_card<S: 'static>(
             )
             // `.premium-surface`: `0 14px 42px … , inset 0 1px 0 .025`.
             .box_shadow(crate::motion::inset_top_light(0.025));
+    }
+    if !voice_live && !dragging {
+        // `.premium-surface:hover` border .14, over the .08 rest.
+        let set_border = hover_border.clone();
+        card = card
+            .live_border(hover_border.smooth(crate::motion::HOVER_SPRING))
+            .on_hover_change(move |_s: &mut S, inside, tx| {
+                set_border.set(rune::Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: if inside { 0.14 } else { 0.08 },
+                });
+                tx.live_only();
+            });
     }
     // React's dock is its own drop target (`onDragEnter/Leave/Over/Drop`).
     card = card

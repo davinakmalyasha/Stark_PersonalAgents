@@ -1236,7 +1236,8 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                 .wrap()
                 .font(text_style(11.5, 400.0))
                 .color(ink("#fca5a5"))
-                .role("alert"),
+                .role("alert")
+                .live_region(rune::LiveRegion::Assertive),
         );
     }
     if !s.status.is_empty() {

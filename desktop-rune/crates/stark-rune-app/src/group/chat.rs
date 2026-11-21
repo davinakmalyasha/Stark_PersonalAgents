@@ -1,5 +1,6 @@
 //! `GroupProjectChat`: participants, messages, approvals and the composer.
 
+use crate::keys::EnterPress;
 use std::collections::{HashMap, HashSet};
 
 use rune::{col, row, text, El};
@@ -171,7 +172,7 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
             .color(ink("#0a0a0d")),
         );
     if !busy {
-        approve = approve.on_press(move |s: &mut S| {
+        approve = approve.on_press_enter(move |s: &mut S| {
             let g = &mut s.projects_mut().group;
             if let Some(item) = g.detail.as_ref().and_then(|d| d.item(&resolve_id).cloned()) {
                 g.resolve(&item, true);
@@ -200,7 +201,7 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
                 .color(ink("#d4d4d8")),
         );
     if !busy {
-        reject = reject.on_press(move |s: &mut S| {
+        reject = reject.on_press_enter(move |s: &mut S| {
             let g = &mut s.projects_mut().group;
             if let Some(item) = g.detail.as_ref().and_then(|d| d.item(&reject_id).cloned()) {
                 g.resolve(&item, false);
@@ -338,7 +339,7 @@ fn message_body<S: ProjectsHost + 'static>(g: &GroupState, entry: &ChatEntry) ->
             ),
         );
     }
-    let mut inner = super::super::rune_transcript::render_markdown_standalone(
+    let mut inner = super::super::rune_transcript::render_markdown_in_group(
         &format!("gp-{}-body", entry.id),
         &entry.body,
         "#d6d7dc",
@@ -379,7 +380,7 @@ fn message_body<S: ProjectsHost + 'static>(g: &GroupState, entry: &ChatEntry) ->
             })
             .focusable(true)
             .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 let g = &mut s.projects_mut().group;
                 if !g.expanded.remove(&id) {
                     g.expanded.insert(id.clone());
@@ -639,16 +640,15 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                             },
                         )),
                     )
-                    .on_press(|s: &mut S| {
+                    .on_press_enter(|s: &mut S| {
                         s.projects_mut().group.filter = "everyone".to_string();
                     }),
                 )
                 .child(
-                    filter_button("You", g.filter == "you", Some("owner"), None, None).on_press(
-                        |s: &mut S| {
+                    filter_button("You", g.filter == "you", Some("owner"), None, None)
+                        .on_press_enter(|s: &mut S| {
                             s.projects_mut().group.filter = "you".to_string();
-                        },
-                    ),
+                        }),
                 )
                 .children(participants.iter().map(|name| {
                     let count = counts
@@ -661,7 +661,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         count,
                         None,
                     )
-                    .on_press({
+                    .on_press_enter({
                         let name = name.clone();
                         move |s: &mut S| {
                             s.projects_mut().group.filter = name.clone();
@@ -676,7 +676,9 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
         .gap(11.0)
         .px(pad)
         .pt(14.0)
-        .pb(28.0);
+        .pb(28.0)
+        // One group across every message body, as the DOM selects a chat.
+        .selection_group(true);
     let show_empty = filtered.is_empty() && pending.is_empty();
     if show_empty {
         let title = if g.filter == "you" {
@@ -805,6 +807,9 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
         .grow(1.0)
         .min_h(0.0)
         .scroll(rune::ScrollSpec { stick_bottom: true })
+        // React's focus-not-obscured padding: reveal a control 56 pt inside
+        // the viewport rather than flush against the composer.
+        .scroll_margin(56.0)
         .child(scroll_list);
 
     let mut composer_wrap = col()
@@ -1032,7 +1037,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .label("Choose message target")
                 .focusable(true)
                 .focus_ring(1.0, 1.0, rgba(255.0, 255.0, 255.0, 0.5))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let g = &mut s.projects_mut().group;
                     g.menu = if g.menu == Menu::Target {
                         Menu::None
@@ -1073,7 +1078,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         // React re-focuses the textarea after opening the @
                         // menu; keep the field's model focus.
                         .preserve_focus_on_press(true)
-                        .on_press(|s: &mut S| {
+                        .on_press_enter(|s: &mut S| {
                             let g = &mut s.projects_mut().group;
                             g.menu = Menu::Mention;
                             g.draft.focused = true;
@@ -1094,7 +1099,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                     .px(2.0)
                     .py(5.0)
                     .placeholder("Message the agents — @ to name one", ink("#5f626b"))
-                    .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                     .on_edit(move |s: &mut S| &mut s.projects_mut().group.draft)
                     .on_submit(|s: &mut S, _tx: &mut rune::Tx| {
                         s.projects_mut().group.send();
@@ -1126,7 +1131,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .label("Send message")
                 .focusable(true)
                 .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.projects_mut().group.send();
                 })
                 .child(icon(

@@ -5,6 +5,7 @@
 //! twin): totals + per-call rows. Tokens verbatim (`toLocaleString` ≈ plain
 //! digits — Rune has no locale grouping; documented, not faked).
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, El};
 
 use crate::rune_transcript::{UsageCall, UsageTotals};
@@ -515,7 +516,7 @@ pub fn stats_sheet<S: 'static>(
                                 .focusable(true)
                                 .label("Close usage")
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
-                                .on_press({
+                                .on_press_enter({
                                     let close = on_close.clone();
                                     move |s: &mut S| close(s)
                                 }),

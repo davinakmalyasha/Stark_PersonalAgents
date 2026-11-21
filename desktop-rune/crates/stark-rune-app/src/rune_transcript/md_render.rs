@@ -7,6 +7,7 @@
 //! rune-kit's syntax scanners (the OpenCode component crate) without its
 //! theme or block layout.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, El, ScrollSpec, TextStyle};
 
 use super::{home_icon_copy, Thread, TranscriptHost};
@@ -197,7 +198,8 @@ fn rich<S: TranscriptHost + 'static>(
         .font(style)
         .color(color)
         .exact_lines()
-        .selectable(true);
+        .selectable(true)
+        .selection_color(crate::motion::TEXT_SELECTION);
     for (start, end, c) in runs.strikes {
         e = e.strike(start, end, c);
     }
@@ -585,24 +587,20 @@ pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
             return col().key(format!("{key}-md"));
         }
         let body_color = ink(_body_ink);
+        // Selection belongs to the transcript's virtual list, not the row:
+        // Rune's virtual selection needs one group around the list so a drag
+        // can cross messages and pin rows that scroll out (a browser selects
+        // the whole message stream the same way).
         blocks_inner::<S>(
             s, which, key, &blocks, body_style, 0, false, false, body_color, false, false,
         )
-        // One selection across the message's paragraphs and code blocks, as
-        // a browser selects a message's DOM subtree.
-        .selection_group(true)
     })
 }
 
 /// Standalone markdown for surfaces outside the transcript (group chat and
 /// board item reports). Code copy still works; its feedback lives on a
 /// throwaway thread because these surfaces have no message row.
-pub(crate) fn render_body_standalone(
-    key: &str,
-    body: &str,
-    body_ink: &'static str,
-    style: TextStyle,
-) -> El {
+fn standalone_blocks(key: &str, body: &str, body_ink: &'static str, style: TextStyle) -> El {
     let host = super::RuneTranscriptState::empty_home();
     let blocks = parse_cached(body);
     if blocks.is_empty() {
@@ -621,7 +619,27 @@ pub(crate) fn render_body_standalone(
         false,
         false,
     )
-    .selection_group(true)
+}
+
+/// A standalone body that is its own selection island (a board item report).
+pub(crate) fn render_body_standalone(
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    style: TextStyle,
+) -> El {
+    standalone_blocks(key, body, body_ink, style).selection_group(true)
+}
+
+/// A standalone body inside a larger list that owns the selection group
+/// (group chat: one drag across messages, like the DOM).
+pub(crate) fn render_body_standalone_open(
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    style: TextStyle,
+) -> El {
+    standalone_blocks(key, body, body_ink, style)
 }
 
 /// `.markdown-compact`: activity notes (12.5pt / 1.7, 4pt paragraphs).
@@ -1048,6 +1066,7 @@ fn code_block<S: TranscriptHost + 'static>(
         .color(base)
         .exact_lines()
         .selectable(true)
+        .selection_color(crate::motion::TEXT_SELECTION)
         .w_full();
     let body = rune::el()
         .key(format!("{key}-code-well"))
@@ -1088,7 +1107,7 @@ fn code_block<S: TranscriptHost + 'static>(
         .hover_group()
         .pin(None, Some(8.0), Some(8.0), None)
         .child(icon)
-        .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+        .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
             let t = s.thread_mut(which);
             t.copied_code = Some(copy_key.clone());
             t.copied_at = Some(crate::clock::now_millis());
@@ -1395,7 +1414,7 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                     ink("#818cf8"),
                 )))
                 .child(text(label).font(label_style).color(ink("#818cf8")))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let t = s.thread_mut(which);
                     let expanded = &mut t.expanded_diffs;
                     if !expanded.remove(&toggle_key) {

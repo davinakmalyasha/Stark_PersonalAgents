@@ -16,6 +16,7 @@
 //! composer send). Everything else is read-only; failures keep last state
 //! (`catch {}` in `refresh`). Auto-refresh every 10s (`CloudRuns` interval).
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El, TextEdit};
 
 fn ink(hex: &'static str) -> rune::Color {
@@ -732,7 +733,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     .radius(8.0)
                     .fill(ink("#ffffff0d"))
                     .color(ink("#d4d4d8"))
-                    .on_press(|s: &mut S| {
+                    .on_press_enter(|s: &mut S| {
                         let c = s.cloud_mut();
                         refresh_cloud(c);
                         refresh_board(c);
@@ -870,7 +871,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     .role("button")
                     .focusable(true)
                     .label(format!("Send from {}", ws.name))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         let c = s.cloud_mut();
                         c.workspace_id = id.clone();
                         c.chat_id.clear();
@@ -899,7 +900,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                 .role("button")
                 .focusable(true)
                 .label("Send whole workspace")
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.cloud_mut().chat_id.clear();
                 })
                 .child(
@@ -925,7 +926,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     .role("button")
                     .focusable(true)
                     .label(format!("Send {}", chat.title))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         s.cloud_mut().chat_id = id.clone();
                     })
                     .child(
@@ -943,7 +944,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     "e.g. finish the failing tests on cloud/fix-login-…",
                     ink("#52525b"),
                 )
-                .caret(ink("#f2f2f4"), ink("#38bdf8"))
+                .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                 .on_edit(move |s: &mut S| &mut s.cloud_mut().task_edit),
         );
         send = send.child(
@@ -980,7 +981,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     } else {
                         "#7dd3fc"
                     }))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         send_cloud(s.cloud_mut());
                     }),
                 ),

@@ -13,6 +13,7 @@
 //! Tauri updater plugin does not exist in Rune yet, so "Check" reports that
 //! honestly instead of pretending an update ran.
 
+use crate::keys::EnterPress;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -748,7 +749,7 @@ fn action_button<S: SettingsHost + 'static>(
     if disabled {
         el.disabled(true).opacity(0.5)
     } else {
-        el.on_press_tx(press)
+        el.on_press_tx_enter(press)
     }
 }
 
@@ -916,7 +917,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                 .radius(6.0)
                 .hover(rgba(1.0, 1.0, 1.0, 0.05))
                 .hover_group()
-                .on_press(|s: &mut S| s.settings_mut().close())
+                .on_press_enter(|s: &mut S| s.settings_mut().close())
                 .child({
                     let mut stack = rune::el().size(16.0, 16.0).inert().child(
                         rune::el().size(16.0, 16.0).inert().shape(crate::lucide_x(
@@ -1041,8 +1042,9 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                         "Applied on the next start, after backing up the current data.",
                     ))
                     .child(
-                        file_row("settings-backup-file", s.backup_file.as_ref())
-                            .on_press_tx(|s: &mut S, tx: &mut rune::Tx| pick_backup::<S>(s, tx)),
+                        file_row("settings-backup-file", s.backup_file.as_ref()).on_press_tx_enter(
+                            |s: &mut S, tx: &mut rune::Tx| pick_backup::<S>(s, tx),
+                        ),
                     )
                     .child(
                         rune::text_input(&s.backup_root, text_style(11.0, 400.0))
@@ -1056,6 +1058,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                             .border_layout()
                             .placeholder("Projects root here (optional)", ink("#52525b"))
                             .color(ink("#e4e4e7"))
+                            .caret(ink("#e4e4e7"), crate::motion::TEXT_SELECTION)
                             .focus_within_ring(
                                 1.0,
                                 -1.0,
@@ -1095,7 +1098,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                     .hover_group()
                     .disabled(s.busy)
                     .opacity(if s.busy { 0.5 } else { 1.0 })
-                    .on_press(|s: &mut S| s.settings_mut().load())
+                    .on_press_enter(|s: &mut S| s.settings_mut().load())
                     .child(
                         rune::el()
                             .size(13.0, 13.0)

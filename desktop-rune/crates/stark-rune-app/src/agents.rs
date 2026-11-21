@@ -15,6 +15,7 @@
 //! Mount: a section in the Home sidebar (delegations surface per-workspace,
 //! like the React coding sidebar) with the detail drawer as a modal sheet.
 
+use crate::keys::EnterPress;
 use std::collections::{HashMap, HashSet};
 
 use rune::{col, row, text, text_input, El, TextEdit};
@@ -785,7 +786,7 @@ fn agent_rows<S: AgentsHost + 'static>(
                 .label("Expand agent")
                 .font(rune::tok::TextStyle::new(11.0, 600.0))
                 .color(ink("#71717a"))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let st = s.agents_mut();
                     if !st.expanded.remove(&toggle_id) {
                         st.expanded.insert(toggle_id.clone());
@@ -808,7 +809,7 @@ fn agent_rows<S: AgentsHost + 'static>(
                     .role("button")
                     .focusable(true)
                     .label(format!("Open {name}", name = agent.display()))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         open_agent(s.agents_mut(), &select_id);
                     }),
             )
@@ -852,7 +853,7 @@ fn agent_rows<S: AgentsHost + 'static>(
                     .focusable(true)
                     .label(format!("Cancel {}", agent.display()))
                     .shape(crate::lucide_x(12.0, 2.0, ink("#71717a")))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         dispatch_agent(
                             s.agents_mut(),
                             AgentOp::Cancel {
@@ -923,7 +924,7 @@ pub fn agents_section<S: AgentsHost + 'static>(s: &AgentsState) -> El {
             .role("button")
             .focusable(true)
             .label("Toggle agents")
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 s.agents_mut().open = !s.agents_mut().open;
             })
             .child(
@@ -1040,7 +1041,7 @@ pub fn agent_sheet<S: AgentsHost + 'static>(s: &AgentsState) -> El {
                         .focusable(true)
                         .label("Close agent details")
                         .shape(crate::lucide_x(14.0, 2.0, ink("#8a8a93")))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             let st = s.agents_mut();
                             st.selected = None;
                             st.detail = None;
@@ -1066,7 +1067,7 @@ pub fn agent_sheet<S: AgentsHost + 'static>(s: &AgentsState) -> El {
             .py(4.0)
             .radius(6.0)
             .color(ink(if active { "#ffffff" } else { "#71717a" }))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 s.agents_mut().tab = tab;
             });
         if active {
@@ -1223,7 +1224,7 @@ fn agent_overview<S: AgentsHost + 'static>(agent: &AgentNode) -> El {
                         .fill(ink("#00000000"))
                         .border(1.0, ink("#ffffff1a"))
                         .color(ink("#d4d4d8"))
-                        .on_press({
+                        .on_press_enter({
                             let id = id.clone();
                             move |s: &mut S| {
                                 dispatch_agent(
@@ -1269,7 +1270,7 @@ fn agent_mailbox<S: AgentsHost + 'static>(
                             },
                             ink("#52525b"),
                         )
-                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| &mut s.agents_mut().message_edit),
                 )
                 .child(
@@ -1284,7 +1285,7 @@ fn agent_mailbox<S: AgentsHost + 'static>(
                         .radius(8.0)
                         .fill(ink("#ffffff"))
                         .color(ink("#0a0a0d"))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             let st = s.agents_mut();
                             let message = st.message_edit.text.trim().to_string();
                             if message.is_empty() || st.busy {
@@ -1553,7 +1554,7 @@ fn agent_worktree<S: AgentsHost + 'static>(
                 .fill(ink("#00000000"))
                 .border(1.0, ink("#ffffff1a"))
                 .color(ink("#d4d4d8"))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.agents_mut().diff_busy = true;
                     dispatch_agent(
                         s.agents_mut(),
@@ -1575,7 +1576,7 @@ fn agent_worktree<S: AgentsHost + 'static>(
                     .radius(8.0)
                     .fill(ink("#ffffff"))
                     .color(ink("#0a0a0d"))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         // First tap arms the confirm gate; the second fires.
                         s.agents_mut().confirm = Some(format!("merge:{merge_id}"));
                     }),
@@ -1593,7 +1594,7 @@ fn agent_worktree<S: AgentsHost + 'static>(
                     .fill(ink("#00000000"))
                     .border(1.0, ink("#f871714d"))
                     .color(ink("#fda4af"))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         s.agents_mut().confirm = Some(format!("discard:{discard_id}"));
                     }),
             ),
@@ -1641,7 +1642,7 @@ fn agent_worktree<S: AgentsHost + 'static>(
                                     .fill(ink("#00000000"))
                                     .border(1.0, ink("#ffffff1a"))
                                     .color(ink("#a1a1aa"))
-                                    .on_press(move |s: &mut S| {
+                                    .on_press_enter(move |s: &mut S| {
                                         s.agents_mut().confirm = None;
                                     }),
                             )
@@ -1664,18 +1665,20 @@ fn agent_worktree<S: AgentsHost + 'static>(
                                 .radius(8.0)
                                 .fill(ink(if is_merge { "#ffffff" } else { "#ef4444" }))
                                 .color(ink(if is_merge { "#0a0a0d" } else { "#ffffff" }))
-                                .on_press(move |s: &mut S| {
-                                    let op = if is_merge {
-                                        AgentOp::Merge {
-                                            agent_id: fire_id.clone(),
-                                        }
-                                    } else {
-                                        AgentOp::Discard {
-                                            agent_id: fire_id.clone(),
-                                        }
-                                    };
-                                    dispatch_agent(s.agents_mut(), op);
-                                }),
+                                .on_press_enter(
+                                    move |s: &mut S| {
+                                        let op = if is_merge {
+                                            AgentOp::Merge {
+                                                agent_id: fire_id.clone(),
+                                            }
+                                        } else {
+                                            AgentOp::Discard {
+                                                agent_id: fire_id.clone(),
+                                            }
+                                        };
+                                        dispatch_agent(s.agents_mut(), op);
+                                    },
+                                ),
                             ),
                     ),
             );

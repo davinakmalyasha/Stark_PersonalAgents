@@ -17,6 +17,7 @@
 //! pattern). Everything else maps 1:1. All writes are explicit button
 //! presses. Opened from the provider pill in either dock.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El, TextEdit};
 
 fn ink(hex: &'static str) -> rune::Color {
@@ -639,7 +640,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             .role("button")
             .focusable(true)
             .label("Switch active provider")
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 let st = &mut s.thread_mut(which).agent_config;
                 st.picker = if st.picker == "active" {
                     String::new()
@@ -688,7 +689,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .role("button")
                 .focusable(true)
                 .label(format!("Configure {}", agent.display))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let st = &mut s.thread_mut(which).agent_config;
                     st.selected = key.clone();
                     st.status.clear();
@@ -899,7 +900,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                                 .key("agentcfg-mcp")
                                 .w_full()
                                 .placeholder("blank = all, none = none", ink("#52525b"))
-                                .caret(ink("#f2f2f4"), ink("#6366f1"))
+                                .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                                 .on_edit(move |s: &mut S| {
                                     &mut s.thread_mut(which).agent_config.form.mcp
                                 }),
@@ -958,7 +959,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         text_input(edit, rune::tok::TextStyle::new(12.5, 400.0))
                             .w_full()
                             .placeholder(&placeholder, ink("#52525b"))
-                            .caret(ink("#f2f2f4"), ink("#6366f1"))
+                            .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                             .on_edit(move |s: &mut S| {
                                 if key == "tools" {
                                     &mut s.thread_mut(which).agent_config.form.tools
@@ -979,7 +980,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     text_input(&s.form.system, rune::tok::TextStyle::new(12.5, 400.0))
                         .w_full()
                         .placeholder("blank = built-in prompt", ink("#52525b"))
-                        .caret(ink("#f2f2f4"), ink("#6366f1"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| {
                             &mut s.thread_mut(which).agent_config.form.system
                         }),
@@ -1086,7 +1087,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .fill(ink("#00000000"))
                     .border(1.0, ink("#ffffff1a"))
                     .color(ink("#a1a1aa"))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         reset_agent_config(&mut s.thread_mut(which).agent_config);
                     }),
                 )
@@ -1102,7 +1103,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .radius(8.0)
                         .fill(ink("#6366f1"))
                         .color(ink("#ffffff"))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             save_agent_config(&mut s.thread_mut(which).agent_config);
                         }),
                 ),
@@ -1185,7 +1186,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .focusable(true)
                                 .label("Close agents and providers")
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
-                                .on_press(move |s: &mut S| {
+                                .on_press_enter(move |s: &mut S| {
                                     s.thread_mut(which).agent_config.open = false;
                                 }),
                         ),
@@ -1236,7 +1237,7 @@ fn picker_row<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .role("button")
                 .focusable(true)
                 .label(format!("Pick {label}"))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let st = &mut s.thread_mut(which).agent_config;
                     st.picker = if st.picker == name {
                         String::new()

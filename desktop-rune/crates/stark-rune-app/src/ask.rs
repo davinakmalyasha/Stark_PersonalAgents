@@ -13,6 +13,7 @@
 //! agent (voice or another surface may still answer it). The panel replaces
 //! the prompt dock for the owning chat, never a global overlay.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El, ScrollSpec, TextEdit};
 
 use crate::rune_transcript::{RuneTranscriptState, Thread, TranscriptHost};
@@ -556,7 +557,7 @@ fn icon_button<S: TranscriptHost + 'static>(
         .radius(if size > 24.0 { 7.0 } else { 6.0 })
         .center()
         .hover(ink("#ffffff0f"))
-        .on_press(move |s: &mut S| press(s))
+        .on_press_enter(move |s: &mut S| press(s))
         .child(rune::el().size(icon, icon).inert().shape(shape))
 }
 
@@ -677,7 +678,7 @@ fn option_row<S: TranscriptHost + 'static>(
         option = option.hover(ink("#1c1c20"));
     }
     option = option
-        .on_press(move |s: &mut S| on_press(s))
+        .on_press_enter(move |s: &mut S| on_press(s))
         .child(radio_el)
         .child(copy)
         .child(index_el);
@@ -822,7 +823,7 @@ fn question_block<S: TranscriptHost + 'static>(
                     .border(1.0, ink("#3f3f46"))
                     .border_layout()
                     .placeholder("Type your answer…", ink("#52525b"))
-                    .caret(ink("#e4e4e7"), rgba(99.0, 102.0, 241.0, 0.6))
+                    .caret(ink("#e4e4e7"), crate::motion::TEXT_SELECTION)
                     .on_edit(move |s: &mut S| {
                         let ask = &mut s.thread_mut(which).ask;
                         ask.custom_edits
@@ -1006,7 +1007,7 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
                 .radius(8.0)
                 .color(ink("#a1a1aa"))
                 .hover(rgba(255.0, 255.0, 255.0, 0.05))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.thread_mut(which).ask.dismiss(&dismiss_foot);
                 }),
         )
@@ -1049,7 +1050,7 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
                     .color(ink("#0a0a0d"))
                     .opacity(if disabled { 0.4 } else { 1.0 })
                     .disabled(disabled)
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         submit::<S>(s, which, &submit_batch);
                     }),
                 ),

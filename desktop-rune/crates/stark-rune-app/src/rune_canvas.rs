@@ -13,6 +13,7 @@
 //!   `stark-kit::edge_path` (34pt, 0.48 factor). Inert so it never steals drags.
 //! - headless PNG: `--rune-canvas-snap out.png` (1280x720 `map` scene).
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, AppSpec, Cx, Drag, El, LineCap, Path, Phase, Shape};
 
 pub const MAP_W: f32 = 1280.0;
@@ -1067,6 +1068,51 @@ impl CanvasState {
         self.select_card(&card_id);
     }
 
+    /// Open the workspace + first chat a finished `NewProjectDialog` created.
+    /// The chat is not in a server snapshot yet, so register its workspace and
+    /// row locally before laying the map out; the next chats poll reconciles.
+    pub fn open_created_chat(&mut self, created: &crate::projects::NewProjectCreated) {
+        let workspace = created.workspace.clone();
+        if !self.workspaces.iter().any(|w| w.id == workspace.id) {
+            self.workspaces.push(workspace.clone());
+        }
+        let key = format!("{}:{}", workspace.id, created.chat_id);
+        if !self.chat_rows.iter().any(|chat| chat.key() == key) {
+            let at = crate::rune_transcript::now_iso();
+            self.chat_rows.push(crate::chats::ChatSummary {
+                id: created.chat_id.clone(),
+                workspace_id: workspace.id.clone(),
+                workspace_name: workspace.name.clone(),
+                workspace_kind: workspace.kind.clone(),
+                title: created.chat_title.clone(),
+                updated_at: at.clone(),
+                created_at: at,
+                ..crate::chats::ChatSummary::default()
+            });
+        }
+        if !self.open_tabs.contains(&key) {
+            self.open_tabs.push(key.clone());
+        }
+        self.active_tab = key.clone();
+        self.sync_graph_cards();
+        self.open_chat_row(&workspace.id, &created.chat_id);
+        let card_id = format!("chat:{key}");
+        // The new card is already on the map, so `open_chat_row` selects it
+        // without touching its thread; get-or-create the thread here.
+        let thread = self.thread_mut(&card_id);
+        thread.title = created.chat_title.clone();
+        thread.workspace_id = workspace.id.clone();
+        thread.chat_id = created.chat_id.clone();
+        thread.chat_ready = true;
+        if !created.prompt.is_empty() {
+            thread.edit.text = created.prompt.clone();
+            thread.edit.anchor = thread.edit.text.len();
+            thread.edit.focus = thread.edit.text.len();
+        }
+        self.manual_cards.insert(card_id.clone());
+        self.select_card(&card_id);
+    }
+
     pub fn card(&self, id: &str) -> Option<&MapCard> {
         self.cards.iter().find(|c| c.id == id)
     }
@@ -1899,7 +1945,7 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
                         .focusable(true)
                         .label(format!("Remove {}", card.title))
                         .shape(crate::lucide_x(14.0, 2.0, ink("#71717a")))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             s.canvas_mut().close_session(&close_id);
                         }),
                 ),
@@ -2348,7 +2394,7 @@ fn card_view<S: CanvasHost + 'static>(
                 .role("button")
                 .focusable(true)
                 .label(format!("Open {}", card.title))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.canvas_mut().open_sheet(&open_id);
                 })
                 .child(
@@ -2386,7 +2432,7 @@ fn card_view<S: CanvasHost + 'static>(
                 .role("button")
                 .focusable(true)
                 .label(format!("Connected agents ({})", kids.len()))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let c = s.canvas_mut();
                     if c.agents_open.as_deref() == Some(menu_id.as_str()) {
                         c.agents_open = None;
@@ -2424,7 +2470,7 @@ fn card_view<S: CanvasHost + 'static>(
                     2.0,
                     ink("#71717a"),
                 )))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.canvas_mut().close_session(&close_id);
                 }),
         );
@@ -2520,7 +2566,7 @@ fn card_view<S: CanvasHost + 'static>(
                     .label(format!("Open {kid_title}"))
                     .hover(ink("#ffffff0a"))
                     .hover_group()
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         let c = s.canvas_mut();
                         c.agents_open = None;
                         c.select_card(&target);
@@ -2588,7 +2634,7 @@ fn card_view<S: CanvasHost + 'static>(
                     },
                     ink("#5e626b"),
                 )
-                .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                 .on_edit(move |s: &mut S| s.canvas_mut().input_mut(&edit_id)),
         )
         .child(
@@ -2619,7 +2665,7 @@ fn card_view<S: CanvasHost + 'static>(
                     set_send_offset.set(if inside { [0.0, -1.0] } else { [0.0, 0.0] });
                     tx.live_only();
                 })
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let c = s.canvas_mut();
                     let prompt = c
                         .inputs
@@ -2798,7 +2844,7 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 .role("button")
                 .focusable(true)
                 .label(format!("{label} tab"))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.canvas_mut().add_tab = target.clone();
                 })
                 .child(
@@ -2856,7 +2902,7 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .grow(1.0)
                         .min_h(0.0)
                         .placeholder("Add chat, project, or addon…", ink("#52525b"))
-                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| &mut s.canvas_mut().add_search),
                 )
                 .child(
@@ -2867,7 +2913,7 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .focusable(true)
                         .label("Close add menu")
                         .shape(crate::lucide_x(12.0, 2.0, ink("#71717a")))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             s.canvas_mut().add_open = false;
                         }),
                 ),
@@ -2927,7 +2973,7 @@ fn add_row<S: 'static>(
                 .color(ink(if added { "#34d399" } else { "#52525b" })),
         );
     if !added {
-        btn = btn.on_press(on_add);
+        btn = btn.on_press_enter(on_add);
     }
     btn
 }
@@ -3096,7 +3142,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                             });
                             tx.live_only();
                         })
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             s.canvas_mut().add_open = true;
                         })
                         .child(
@@ -3178,7 +3224,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 .role("button")
                 .focusable(true)
                 .label("Add to canvas")
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.canvas_mut().add_open = true;
                 })
                 .child(
@@ -3257,70 +3303,67 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .shape(icon),
             )
     };
-    canvas = canvas
-        .child(
-            row()
-                .key("cam-hud")
-                .absolute(vw - 127.0, 10.0)
-                .items_center()
-                .gap(1.0)
-                .child(
-                    hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d"))).on_press_tx(
-                        move |s: &mut S, tx| {
-                            let c = s.canvas_mut();
-                            c.cam_auto = false;
-                            c.cam.zoom_by(0.86);
-                            c.sync_cam_live();
-                            // The world scales at draw time; no view run.
-                            tx.live_only();
-                        },
+    canvas =
+        canvas
+            .child(
+                row()
+                    .key("cam-hud")
+                    .absolute(vw - 127.0, 10.0)
+                    .items_center()
+                    .gap(1.0)
+                    .child(
+                        hud_icon("zoom-out", "Zoom out", icon_minus(ink("#81848d")))
+                            .on_press_tx_enter(move |s: &mut S, tx| {
+                                let c = s.canvas_mut();
+                                c.cam_auto = false;
+                                c.cam.zoom_by(0.86);
+                                c.sync_cam_live();
+                                // The world scales at draw time; no view run.
+                                tx.live_only();
+                            }),
+                    )
+                    .child(
+                        hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d")))
+                            .on_press_tx_enter(move |s: &mut S, tx| {
+                                let c = s.canvas_mut();
+                                c.cam_auto = false;
+                                c.cam.zoom_by(1.16);
+                                c.sync_cam_live();
+                                tx.live_only();
+                            }),
+                    )
+                    .child(
+                        hud_icon("fit", "Fit to view", icon_scan(ink("#81848d")))
+                            .on_press_tx_enter(move |s: &mut S, tx| {
+                                let c = s.canvas_mut();
+                                let cards = c.cards.clone();
+                                let (vw, vh) = (c.view_w, c.view_h);
+                                c.cam.fit_in(&cards, vw, vh);
+                                c.sync_cam_live();
+                                c.cam_auto = true;
+                                tx.live_only();
+                            }),
+                    )
+                    .child(
+                        hud_icon("reset", "Reset layout", icon_reset(ink("#81848d")))
+                            .on_press_enter(move |s: &mut S| {
+                                // `relayout`: tidy-tree slots again plus a fresh fit.
+                                s.canvas_mut().relayout();
+                            }),
                     ),
-                )
-                .child(
-                    hud_icon("zoom-in", "Zoom in", icon_plus(ink("#81848d"))).on_press_tx(
-                        move |s: &mut S, tx| {
-                            let c = s.canvas_mut();
-                            c.cam_auto = false;
-                            c.cam.zoom_by(1.16);
-                            c.sync_cam_live();
-                            tx.live_only();
-                        },
-                    ),
-                )
-                .child(
-                    hud_icon("fit", "Fit to view", icon_scan(ink("#81848d"))).on_press_tx(
-                        move |s: &mut S, tx| {
-                            let c = s.canvas_mut();
-                            let cards = c.cards.clone();
-                            let (vw, vh) = (c.view_w, c.view_h);
-                            c.cam.fit_in(&cards, vw, vh);
-                            c.sync_cam_live();
-                            c.cam_auto = true;
-                            tx.live_only();
-                        },
-                    ),
-                )
-                .child(
-                    hud_icon("reset", "Reset layout", icon_reset(ink("#81848d"))).on_press(
-                        move |s: &mut S| {
-                            // `relayout`: tidy-tree slots again plus a fresh fit.
-                            s.canvas_mut().relayout();
-                        },
-                    ),
-                ),
-        )
-        .child(if !s.cards.is_empty() {
-            // `.canvas-map-hint`: bottom-left, 9pt dim copy (hidden behind the
-            // home chat card when it is open, and absent when the canvas is
-            // empty, exactly like React).
-            text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
-                .key("cam-hint")
-                .absolute(18.0, vh - 26.0)
-                .font(rune::tok::TextStyle::new(9.0, 400.0))
-                .color(ink("#4f525a"))
-        } else {
-            rune::el().key("cam-hint-empty").size(0.0, 0.0).inert()
-        });
+            )
+            .child(if !s.cards.is_empty() {
+                // `.canvas-map-hint`: bottom-left, 9pt dim copy (hidden behind the
+                // home chat card when it is open, and absent when the canvas is
+                // empty, exactly like React).
+                text("Drag to pan · scroll to zoom · drag cards to arrange".to_string())
+                    .key("cam-hint")
+                    .absolute(18.0, vh - 26.0)
+                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                    .color(ink("#4f525a"))
+            } else {
+                rune::el().key("cam-hint-empty").size(0.0, 0.0).inert()
+            });
     // Sidebar rows mirror the cards: the active chat carries the white-9%
     // wash (`.house-sidebar-row.is-active`); a press switches selection.
     // Rows key off card ids so the board and the list can never disagree.
@@ -3650,7 +3693,7 @@ fn sidebar_spawn_row<S: CanvasHost + 'static>(
         .role("button")
         .focusable(true)
         .label(format!("Open {title}"))
-        .on_press(move |s: &mut S| {
+        .on_press_enter(move |s: &mut S| {
             commit_sidebar_rename(s);
             s.canvas_mut().open_chat_row(&ws, &chat_id);
         })
@@ -3770,7 +3813,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
             })
             // Cloud pages are out of scope for the chats-only shell; the
             // button still takes the press so it never opens the row.
-            .on_press(|_: &mut S| {})
+            .on_press_enter(|_: &mut S| {})
             .child(cloud_icon),
     );
     let pin_sid = sid.to_string();
@@ -3804,7 +3847,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
             } else {
                 rgba(255.0, 255.0, 255.0, 0.07)
             })
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 commit_sidebar_rename(s);
                 s.canvas_mut().toggle_pin(&pin_sid);
             })
@@ -3844,7 +3887,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
         } else {
             rgba(255.0, 255.0, 255.0, 0.07)
         })
-        .on_press(move |s: &mut S| {
+        .on_press_enter(move |s: &mut S| {
             commit_sidebar_rename(s);
             s.canvas_mut().press_delete(&delete_sid);
         });
@@ -3865,7 +3908,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
             .center()
             .hover_group()
             .hover(rgba(255.0, 255.0, 255.0, 0.07))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 commit_sidebar_rename(s);
                 s.canvas_mut().start_rename(&rename_sid);
             })
@@ -3903,7 +3946,7 @@ fn sidebar_rename_row<S: CanvasHost + 'static>(card_id: &str, edit: &rune::TextE
                 .border(1.0, rgba(255.0, 255.0, 255.0, 0.25))
                 .border_layout()
                 .fill(rgba(0.0, 0.0, 0.0, 0.4))
-                .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                 .on_edit(move |s: &mut S| {
                     let canvas = s.canvas_mut();
                     match canvas.sessions.editing.as_mut() {
@@ -4088,7 +4131,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                 .role("button")
                 .focusable(true)
                 .label(format!("Open {title}"))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     commit_sidebar_rename(s);
                     s.canvas_mut().open_chat_row(&ws, &chat_id);
                 });
@@ -4199,7 +4242,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
             .size(20.0, 20.0)
             .radius(6.0)
             .center()
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 commit_sidebar_rename(s);
                 let sessions = &mut s.canvas_mut().sessions;
                 if sessions.spawn_collapsed.remove(&toggle) {
@@ -4395,7 +4438,7 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                         tx.live_only();
                     }
                 })
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     commit_sidebar_rename(s);
                     let sessions = &mut s.canvas_mut().sessions;
                     if !sessions.collapsed_ws.remove(&toggle_id) {
@@ -4447,7 +4490,7 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                 .center()
                 .hover_group()
                 .hover(rgba(255.0, 255.0, 255.0, 0.08))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     commit_sidebar_rename(s);
                     s.canvas_mut().new_session_in(&plus_id);
                 })
@@ -4519,12 +4562,12 @@ fn sidebar_load_more<S: CanvasHost + 'static>(
                 ),
         );
     if general {
-        item = item.on_press(|s: &mut S| {
+        item = item.on_press_enter(|s: &mut S| {
             commit_sidebar_rename(s);
             s.canvas_mut().sessions.general_limit += GENERAL_PAGE;
         });
     } else if let Some(ws_id) = project {
-        item = item.on_press(move |s: &mut S| {
+        item = item.on_press_enter(move |s: &mut S| {
             commit_sidebar_rename(s);
             let sessions = &mut s.canvas_mut().sessions;
             let limit = sessions
@@ -4570,7 +4613,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .focusable(true)
                         .label("Switch mode")
                         .help("Switch mode")
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             let c = s.canvas_mut();
                             c.kind_open = !c.kind_open;
                         })
@@ -4606,7 +4649,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .size(24.0, 24.0)
                         .radius(6.0)
                         .center()
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             s.canvas_mut().new_session();
                         })
                         .child(
@@ -4671,7 +4714,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .label(format!("Switch to {kind}"))
                     .hover(ink("#ffffff0a"))
                     .hover_group()
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         let c = s.canvas_mut();
                         c.sessions.kind = target.clone();
                         c.kind_open = false;
@@ -4725,7 +4768,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .grow(1.0)
                         .h(17.3)
                         .placeholder("Search chats…", ink("#52525b"))
-                        .caret(ink("#f2f2f4"), ink("#3b82f6"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| &mut s.canvas_mut().sessions.search),
                 ),
         );
@@ -4974,7 +5017,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             .role("button")
             .focusable(true)
             .label(format!("Open {}", card.title))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 s.canvas_mut().select_card(&target);
             });
         if active {

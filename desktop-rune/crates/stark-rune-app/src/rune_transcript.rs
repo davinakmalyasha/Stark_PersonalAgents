@@ -15,6 +15,7 @@
 //! - headless PNG: `stark-rune --rune-snap out.png [--rune-scene name]`
 //!   runs `rune::App` headless (`--snap`); tree via `--tree`.
 
+use crate::keys::EnterPress;
 use std::borrow::Cow;
 
 use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
@@ -382,6 +383,17 @@ pub fn render_markdown_standalone(
     style: rune::tok::TextStyle,
 ) -> rune::El {
     md_render::render_body_standalone(key, body, body_ink, style)
+}
+
+/// Markdown inside a list that owns one selection group (group chat's
+/// message list): no per-message island, so a drag crosses messages.
+pub fn render_markdown_in_group(
+    key: &str,
+    body: &str,
+    body_ink: &'static str,
+    style: rune::tok::TextStyle,
+) -> rune::El {
+    md_render::render_body_standalone_open(key, body, body_ink, style)
 }
 
 /// `02:44 PM` (`CanvasChatBubble clock()`): the browser's local 12h clock.
@@ -2083,7 +2095,7 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
                 );
             }
             let file = file.clone();
-            deck = deck.child(button.on_press(move |s: &mut S| {
+            deck = deck.child(button.on_press_enter(move |s: &mut S| {
                 s.thread_mut(which).attachment_preview = Some(file.clone());
             }));
             continue;
@@ -2194,7 +2206,7 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
             );
         }
         if let Some(url) = open {
-            chip = chip.on_press_tx(move |_: &mut S, tx: &mut rune::Tx| {
+            chip = chip.on_press_tx_enter(move |_: &mut S, tx: &mut rune::Tx| {
                 let _ = tx.open_url(&url);
             });
         }
@@ -2289,7 +2301,7 @@ pub fn attachment_lightbox<S: 'static>(
                 .fill(home_rgba(20.0, 20.0, 24.0, 0.8))
                 .center()
                 .hover(home_rgba(255.0, 255.0, 255.0, 0.12))
-                .on_press({
+                .on_press_enter({
                     let close = close.clone();
                     move |s: &mut S| close(s)
                 })
@@ -2900,7 +2912,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             .center()
             .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
             .hover_group()
-            .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+            .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
                 copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
             })
             .child(if copied {
@@ -2932,7 +2944,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
                 .radius(6.0)
                 .fill(home_rgba(239.0, 68.0, 68.0, 0.15))
                 // React's confirm button has no hover state of its own.
-                .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+                .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
                     start_rewind(
                         s.thread_mut(which),
                         rewind_key.clone(),
@@ -2969,7 +2981,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
                 .center()
                 .hover(home_rgba(239.0, 68.0, 68.0, 0.1))
                 .hover_group()
-                .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+                .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
                     arm_rewind(s, which, &rewind_key, tx);
                 })
                 .child(crate::motion::hover_icon(
@@ -3419,7 +3431,7 @@ fn artifact_panel<S: TranscriptHost + 'static>(
     if undo_enabled {
         undo_btn = undo_btn
             .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 start_artifact_undo(s.thread_mut(which), &undo_key, &undo_run);
             });
     }
@@ -3585,7 +3597,7 @@ fn artifact_panel<S: TranscriptHost + 'static>(
                                 .font(rune::tok::TextStyle::new(11.5, 500.0))
                                 .color(home_ink("#c7c8ce"))
                                 .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
-                                .on_press(move |s: &mut S| {
+                                .on_press_enter(move |s: &mut S| {
                                     s.thread_mut(which).artifact_review = Some(review_key.clone());
                                 }),
                         ),
@@ -3611,7 +3623,7 @@ fn artifact_panel<S: TranscriptHost + 'static>(
                 .gap(4.0)
                 .py(8.0)
                 .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let t = s.thread_mut(which);
                     if !t.expanded_artifacts.remove(&more_key) {
                         t.expanded_artifacts.insert(more_key.clone());
@@ -3686,6 +3698,7 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
             .key("artifact-review-body")
             .w_full()
             .growth(GrowthSpec::default())
+            .selection_group(true)
             .virtual_rows(
                 file_total,
                 240.0,
@@ -3856,7 +3869,7 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
                                 .focusable(true)
                                 .label("Close review")
                                 .shape(crate::lucide_x(16.0, 2.0, home_ink("#8a8a93")))
-                                .on_press(move |s: &mut S| {
+                                .on_press_enter(move |s: &mut S| {
                                     s.thread_mut(which).artifact_review = None;
                                 }),
                         ),
@@ -3935,7 +3948,7 @@ fn home_agent_actions<S: TranscriptHost + 'static>(
                 .center()
                 .hover(home_ink("#27272a"))
                 .hover_group()
-                .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+                .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
                     stage_send_prompt(s.thread_mut(which), prompt.clone());
                 })
                 // `.pressable:active { transform: scale(.96) }`; after the
@@ -3961,7 +3974,7 @@ fn home_agent_actions<S: TranscriptHost + 'static>(
             .center()
             .hover(home_ink("#27272a"))
             .hover_group()
-            .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+            .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
                 copy_message(s, which, &copy_key, copy_text.clone(), false, tx);
             })
             .press_scale(0.96)
@@ -4039,7 +4052,7 @@ fn home_error_row<S: TranscriptHost + 'static>(
         .border(1.0, home_rgba(248.0, 113.0, 113.0, 0.15))
         .border_layout()
         .fill(home_rgba(248.0, 113.0, 113.0, 0.06))
-        .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+        .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
             stage_send_prompt(s.thread_mut(which), retry_prompt.clone());
         })
         .child(
@@ -4070,7 +4083,7 @@ fn home_error_row<S: TranscriptHost + 'static>(
         .py(4.0)
         .radius(6.0)
         .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
-        .on_press_tx(move |s: &mut S, tx: &mut rune::Tx| {
+        .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
             copy_message(s, which, &copy_key, copy_text.clone(), true, tx);
         })
         .child(rune::el().size(10.0, 10.0).inert().shape(if copied {
@@ -4280,7 +4293,7 @@ fn home_session_event<S: TranscriptHost + 'static>(
                 .border_layout()
                 .fill(home_rgba(255.0, 255.0, 255.0, 0.04))
                 .hover(home_rgba(255.0, 255.0, 255.0, 0.1))
-                .on_press_tx(move |s: &mut S, _tx: &mut rune::Tx| {
+                .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
                     stage_send_prompt(s.thread_mut(which), retry_prompt.clone());
                 })
                 .child(
@@ -4540,7 +4553,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 .radius(8.0)
                 .center()
                 .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
-                .on_press(move |s: &mut S| close_subagent(s.thread_mut(which)))
+                .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which)))
                 .child(
                     rune::el()
                         .size(15.0, 15.0)
@@ -4565,7 +4578,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                         .color(home_ink("#777982"))
                         .truncate()
                         .max_w(132.0)
-                        .on_press(move |s: &mut S| close_subagent(s.thread_mut(which))),
+                        .on_press_enter(move |s: &mut S| close_subagent(s.thread_mut(which))),
                 )
                 .child(
                     text("/".to_string())
@@ -4663,7 +4676,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                     .label("Retry opening child chat")
                     .font(rune::tok::TextStyle::new(11.5, 400.0))
                     .color(home_ink("#c7c8ce"))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         let t = s.thread_mut(which);
                         // Re-open drops the error and restarts the fetch.
                         t.active_subagent = None;
@@ -4693,6 +4706,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
             .pt(12.0)
             .pb(12.0)
             .growth(GrowthSpec::default())
+            .selection_group(true)
             .virtual_rows(
                 row_count,
                 ESTIMATED_ROW_H,
@@ -4788,7 +4802,12 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     // `.canvas-bubble-row.is-user`; agent bubbles `grow` full width.
     let home = !show_head;
     // React's home scroll area is `pl-8 pr-4 py-3`; the sheet keeps 12pt.
-    let mut stack = col().key("transcript-stack").growth(GrowthSpec::default());
+    // One selection group around the virtual list: a drag crosses messages,
+    // and Rune pins offscreen rows so the selection survives the window.
+    let mut stack = col()
+        .key("transcript-stack")
+        .growth(GrowthSpec::default())
+        .selection_group(true);
     stack = if home {
         stack.pl(32.0).pr(16.0).pt(12.0).pb(12.0)
     } else {
@@ -5079,7 +5098,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                         .label("Open settings")
                         .font(rune::tok::TextStyle::new(11.0, 500.0))
                         .color(rune::color::hex("#8a8a93").unwrap_or(rune::Color::BLACK))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             let thread = s.thread_mut(which);
                             let (host, port) = (thread.api_host.clone(), thread.api_port);
                             thread.settings.open(host, port);
@@ -5131,7 +5150,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                         },
                     )
                     .live_opacity(&s.scroll_pill)
-                    .on_press_tx(|_: &mut S, tx: &mut rune::Tx| {
+                    .on_press_tx_enter(|_: &mut S, tx: &mut rune::Tx| {
                         tx.scroll_to_bottom("transcript-viewport");
                     })
                     .child(
@@ -5465,7 +5484,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                                 .focusable(true)
                                 .label("Close voice input")
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
-                                .on_press(move |s: &mut S| {
+                                .on_press_enter(move |s: &mut S| {
                                     let t = s.thread_mut(which);
                                     t.voice.set_live(false);
                                     t.voice.note = None;
@@ -5501,7 +5520,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                     .font(rune::tok::TextStyle::new(12.0, 600.0))
                     .color(ink("#0a0a0d"))
                     .fill(ink("#ffffff"))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         let t = s.thread_mut(which);
                         t.voice.set_live(false);
                         t.voice.note = None;
@@ -6597,6 +6616,61 @@ mod tests {
         assert!(rt.find("msg-9999").is_some(), "tail row mounted");
         assert!(rt.find("msg-0").is_none(), "head row virtualized out");
         assert!(rt.find("composer-send").is_some());
+    }
+
+    #[test]
+    fn selection_crosses_virtual_messages_and_survives_scroll() {
+        use rune::{Mods, PhysicalInput};
+        let env = Env::new(true, 1.0);
+        let mut s = RuneTranscriptState::screenshot();
+        s.live = false;
+        s.rows = (0..80)
+            .map(|i| RowData {
+                key: format!("sel-{i}"),
+                role: "agent",
+                body: format!("Selection row {i} body text."),
+                ..RowData::default()
+            })
+            .collect();
+        // Every row is already seen: the visible-range callback stays a
+        // no-op, so the test exercises selection rather than reveal work.
+        s.seen_rows = s.rows.iter().map(|row| row.key.clone()).collect();
+        let mut rt = Runtime::new(s, transcript_view, (468.0, 720.0), env);
+        rt.frame(0.0);
+        // Stick-to-bottom opens at the tail; anchor the selection on the last row.
+        let (x, y) = rt.find("sel-79-blocks").expect("tail row mounted");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        // Scroll to the top so the anchor row leaves the mounted window.
+        for _ in 0..20 {
+            rt.wheel(234.0, 360.0, 200.0);
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(
+            rt.find("sel-79-blocks").is_none(),
+            "anchor row scrolled out"
+        );
+        // Shift-click an early visible row: the range must include every
+        // unmounted row between, not restart at the click.
+        rt.physical_input(PhysicalInput::Modifiers(Mods {
+            shift: true,
+            ..Mods::default()
+        }));
+        let (x, y) = rt.find("sel-1-blocks").expect("head row mounted");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.physical_input(PhysicalInput::Modifiers(Mods::default()));
+        rt.frame(0.0);
+        let selected = rt.selected_text().expect("cross-row selection");
+        assert!(
+            selected.contains("Selection row 40 body text."),
+            "unmounted rows between the ends are collected: {selected:?}"
+        );
+        assert!(
+            selected.contains("Selection row 60 body text."),
+            "later unmounted rows are collected: {selected:?}"
+        );
     }
 
     #[test]

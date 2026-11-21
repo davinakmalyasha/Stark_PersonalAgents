@@ -6,6 +6,7 @@
 //! canvas always stays mounted, so a running stream keeps draining whatever
 //! panel is up. A transcript sheet opens over the map for the active session.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, AppSpec, Cx, El, LineCap, Path, Shape};
 
 use crate::cloud::{cloud_view, poll_cloud_state, CloudHost, CloudState};
@@ -341,7 +342,7 @@ fn session_tab(s: &ShellState, id: &str) -> El {
         .radius(8.0)
         .border(1.0, ink(if active { "#ffffff24" } else { "#00000000" }))
         .hover_group()
-        .on_press(move |s: &mut ShellState| {
+        .on_press_enter(move |s: &mut ShellState| {
             s.canvas.select_card(&select);
         });
     if !active {
@@ -403,7 +404,7 @@ fn session_tab(s: &ShellState, id: &str) -> El {
             .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
             .hover(rgba(1.0, 1.0, 1.0, if active { 0.12 } else { 0.10 }))
             .hover_group()
-            .on_press(move |s: &mut ShellState| {
+            .on_press_enter(move |s: &mut ShellState| {
                 s.canvas.close_session(&close);
             })
             .child({
@@ -526,7 +527,7 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
         .radius(12.0)
         .center()
         .hover_group()
-        .on_press(move |s: &mut ShellState| {
+        .on_press_enter(move |s: &mut ShellState| {
             s.canvas.rail = tab;
             if tab == RailTab::Group
                 && !s.canvas.projects.loading
@@ -772,7 +773,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             .border_dash(3.0, 3.0)
             .hover(rgba(1.0, 1.0, 1.0, 0.04))
             .hover_group()
-            .on_press(move |s: &mut ShellState| {
+            .on_press_enter(move |s: &mut ShellState| {
                 s.canvas.new_session();
             })
             .child({
@@ -856,7 +857,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .center()
                 .hover(rgba(1.0, 1.0, 1.0, 0.07))
                 .hover_group()
-                .on_press(move |s: &mut ShellState| {
+                .on_press_enter(move |s: &mut ShellState| {
                     s.canvas.new_session();
                 })
                 .press_scale(0.94)
@@ -905,7 +906,7 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                 .center()
                 .hover(rgba(1.0, 1.0, 1.0, 0.07))
                 .hover_group()
-                .on_press(move |s: &mut ShellState| {
+                .on_press_enter(move |s: &mut ShellState| {
                     let (host, port) = s
                         .canvas
                         .sheet_thread()
@@ -1012,6 +1013,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     }
     for sheet in active_chat_sheets(s) {
         root = root.child(sheet);
+    }
+    if s.canvas.projects.dialog.open {
+        root = root.child(crate::projects::new_project_dialog::<ShellState>(
+            &s.canvas.projects,
+            w,
+            h,
+        ));
     }
     if s.settings.open {
         root = root.child(crate::settings::settings_sheet::<ShellState>(
@@ -1493,10 +1501,52 @@ fn poll_memory(s: &mut ShellState, clock: f64) -> bool {
 /// with the board via [`poll_projects_state`] — one drain path everywhere.
 fn poll_projects(s: &mut ShellState, clock: f64) -> bool {
     let mut changed = poll_projects_state(&mut s.canvas.projects, clock);
+    changed |= apply_created_project(s);
     changed |= resolve_pending_group(s);
     changed |= s.canvas.projects.group.poll(clock);
     changed |= crate::notes::poll_notes_state(&mut s.canvas.projects.group.notes);
     changed
+}
+
+/// Apply the full `NewProjectDialog` result once: open the created chat (and
+/// seed its dock in solo mode), refresh the session list, then open the team
+/// board in group mode. Mirrors `handleCreateProject` +
+/// `handleCreateGroupFromDialog`.
+fn apply_created_project(s: &mut ShellState) -> bool {
+    let Some(created) = crate::projects::take_new_project(&mut s.canvas.projects) else {
+        return false;
+    };
+    s.canvas.open_created_chat(&created);
+    if !s
+        .chats
+        .snapshot
+        .workspaces
+        .iter()
+        .any(|w| w.id == created.workspace.id)
+    {
+        s.chats.snapshot.workspaces.push(created.workspace.clone());
+    }
+    let chat_key = format!("{}:{}", created.workspace.id, created.chat_id);
+    if !s.chats.snapshot.chats.iter().any(|c| c.key() == chat_key) {
+        let at = crate::rune_transcript::now_iso();
+        s.chats.snapshot.chats.push(crate::chats::ChatSummary {
+            id: created.chat_id.clone(),
+            workspace_id: created.workspace.id.clone(),
+            workspace_name: created.workspace.name.clone(),
+            workspace_kind: created.workspace.kind.clone(),
+            title: created.chat_title.clone(),
+            updated_at: at.clone(),
+            created_at: at,
+            ..crate::chats::ChatSummary::default()
+        });
+    }
+    crate::chats::refresh(&mut s.chats);
+    if let Some(project_id) = created.project_id {
+        crate::projects::refresh_projects(&mut s.canvas.projects);
+        let (host, port) = (s.canvas.projects.host.clone(), s.canvas.projects.port);
+        s.canvas.projects.group.open(host, port, project_id);
+    }
+    true
 }
 
 /// Open the group route's project only after the live list contains it. A
@@ -2065,6 +2115,337 @@ mod tests {
             rt.find("gp-skeleton").is_some(),
             "detail starts as skeleton"
         );
+        // The card holds the modal root, so a backdrop press closes it.
+        rt.pointer_down(10.0, 10.0);
+        rt.pointer_up(10.0, 10.0);
+        rt.frame(0.0);
+        assert!(
+            rt.state.canvas.projects.group.open_id.is_none(),
+            "backdrop dismisses the group modal"
+        );
+        assert!(rt.find("gp-modal").is_none());
+    }
+
+    #[test]
+    fn new_project_dialog_opens_and_requires_a_folder() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("side-projects-new").expect("new project entry");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..20 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.canvas.projects.dialog.open);
+        assert!(rt.find("new-project-card").is_some());
+        assert!(rt.find("new-project-name").is_some());
+
+        // Return in the focused name input keeps step 1 and reports React's
+        // copy; the disabled Next itself takes no press.
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.canvas.projects.dialog.step, 1);
+        assert_eq!(
+            rt.state.canvas.projects.dialog.error.as_deref(),
+            Some("Choose a folder first.")
+        );
+        assert!(rt.find("new-project-error").is_some());
+    }
+
+    #[test]
+    fn new_project_dialog_step_two_switches_mode_and_returns() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.dialog.open = true;
+        state.canvas.projects.dialog.step = 1;
+        state.canvas.projects.dialog.path.text = "D:/work/project".to_string();
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        for _ in 0..20 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.find("new-project-card").is_some());
+
+        let (x, y) = rt.find("new-project-next").expect("next button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..20 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.canvas.projects.dialog.step, 2);
+        assert!(rt.find("new-project-mode-group").is_some());
+        assert!(rt.find("new-project-mode-solo").is_some());
+        assert!(rt.find("new-project-task").is_some());
+        assert!(rt.find("new-project-summary-path").is_some());
+        // Step 2 focuses the task, like React's `taskRef` effect.
+        rt.key(KeyEvent {
+            key: Key::Text("x".to_string()),
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.canvas.projects.dialog.task.text, "x");
+
+        let (x, y) = rt.find("new-project-mode-solo").expect("solo radio");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.canvas.projects.dialog.mode,
+            crate::projects::NewProjectMode::Solo
+        );
+
+        let (x, y) = rt.find("new-project-back").expect("back button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.canvas.projects.dialog.step, 1);
+        assert!(rt.find("new-project-name").is_some());
+    }
+
+    #[test]
+    fn new_project_dialog_backdrop_and_escape_dismiss() {
+        use rune::{Key, KeyEvent, Mods};
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.dialog.open = true;
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        for _ in 0..20 {
+            rt.frame(1.0 / 60.0);
+        }
+        // A press on the backdrop is outside the card and dismisses.
+        rt.pointer_down(10.0, 10.0);
+        rt.pointer_up(10.0, 10.0);
+        rt.frame(0.0);
+        assert!(!rt.state.canvas.projects.dialog.open);
+        assert!(rt.find("new-project-card").is_none());
+
+        // Escape is the same dismiss, while the card keeps the modal root.
+        let (x, y) = rt.find("side-projects-new").expect("new project entry");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..20 {
+            rt.frame(1.0 / 60.0);
+        }
+        rt.key(KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        });
+        rt.frame(0.0);
+        assert!(!rt.state.canvas.projects.dialog.open);
+        assert!(rt.find("new-project-card").is_none());
+    }
+
+    #[test]
+    fn new_project_dialog_close_resets_a_fresh_mount() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        state.canvas.rail = RailTab::Group;
+        state.canvas.projects.auto = false;
+        state.canvas.projects.dialog.open = true;
+        state.canvas.projects.dialog.name.text = "Old name".to_string();
+        state.canvas.projects.dialog.path.text = "D:/old".to_string();
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("new-project-close").expect("close button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(!rt.state.canvas.projects.dialog.open);
+        assert!(rt.find("new-project-card").is_none());
+
+        let (x, y) = rt.find("side-projects-new").expect("new project entry");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(rt.state.canvas.projects.dialog.step, 1);
+        assert!(rt.state.canvas.projects.dialog.name.text.is_empty());
+        assert!(rt.state.canvas.projects.dialog.path.text.is_empty());
+    }
+
+    #[test]
+    fn new_project_dialog_creates_workspace_chat_and_group_board() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                // Read the whole request: a response written while the body
+                // is still unread resets the connection on Windows.
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length: ")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&raw);
+                let (status, body) = if req.starts_with("POST /api/workspaces ") {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "id": "ws-new",
+                            "name": "New Project",
+                            "path": "C:/work/new",
+                            "exists": true,
+                            "chatCount": 0,
+                            "workspaceKind": "project"
+                        })
+                        .to_string(),
+                    )
+                } else if req.starts_with("POST /api/workspaces/ws-new/chats ") {
+                    (
+                        "200 OK",
+                        serde_json::json!({"id": "chat-new", "title": "New Chat"}).to_string(),
+                    )
+                } else if req.starts_with("POST /api/groups ") {
+                    (
+                        "200 OK",
+                        serde_json::json!({"id": "gp-new", "title": "Build it"}).to_string(),
+                    )
+                } else if req.starts_with("GET /api/groups/gp-new") {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "project": {"id": "gp-new", "goal": "Build it", "status": "running"},
+                            "items": [],
+                            "messages": [],
+                            "members": []
+                        })
+                        .to_string(),
+                    )
+                } else if req.starts_with("GET /api/groups") {
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "projects": [{
+                                "id": "gp-new",
+                                "title": "Build it",
+                                "status": "running",
+                                "items_done": 0,
+                                "items_total": 1
+                            }],
+                            "scoped": false
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("404 Not Found", "{}".to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = ShellState::default();
+        state.canvas.projects.auto = false;
+        state.canvas.projects.host = "127.0.0.1".to_string();
+        state.canvas.projects.port = port;
+        state.canvas.projects.dialog.open = true;
+        state.canvas.projects.dialog.step = 2;
+        state.canvas.projects.dialog.name.text = "New Project".to_string();
+        state.canvas.projects.dialog.path.text = "C:/work/new".to_string();
+        state.canvas.projects.dialog.task.text = "Build it".to_string();
+        crate::projects::create_new_project(&mut state.canvas.projects);
+        let started = Instant::now();
+        while state.canvas.projects.dialog.busy && started.elapsed() < Duration::from_secs(5) {
+            crate::projects::poll_projects_state(&mut state.canvas.projects, 1.0);
+            if state.canvas.projects.dialog.busy {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(!state.canvas.projects.dialog.busy, "worker finished");
+        assert!(
+            !state.canvas.projects.dialog.open,
+            "dialog closes on success: {:?}",
+            state.canvas.projects.dialog.error
+        );
+        assert!(poll_projects(&mut state, 1.0), "result applied");
+        assert_eq!(
+            state.canvas.active_id, "chat:ws-new:chat-new",
+            "created chat is active"
+        );
+        let thread = state.canvas.thread_mut("chat:ws-new:chat-new").clone();
+        assert_eq!(thread.workspace_id, "ws-new");
+        assert_eq!(thread.chat_id, "chat-new");
+        assert!(thread.chat_ready);
+        assert!(thread.edit.text.is_empty(), "group mode seeds no prompt");
+        assert!(
+            state
+                .canvas
+                .chat_rows
+                .iter()
+                .any(|chat| chat.key() == "ws-new:chat-new"),
+            "new chat registered on the map"
+        );
+        assert_eq!(
+            state.canvas.projects.group.open_id.as_deref(),
+            Some("gp-new"),
+            "team board opens"
+        );
+    }
+
+    #[test]
+    fn solo_project_seeds_the_new_chat_prompt() {
+        let mut state = ShellState::default();
+        let created = crate::projects::NewProjectCreated {
+            workspace: crate::chats::ChatWorkspace {
+                id: "ws-solo".to_string(),
+                name: "Solo".to_string(),
+                kind: "project".to_string(),
+                path: "C:/solo".to_string(),
+                chat_count: 0,
+                exists: true,
+            },
+            chat_id: "chat-solo".to_string(),
+            chat_title: "New Chat".to_string(),
+            project_id: None,
+            prompt: "Research the docs".to_string(),
+        };
+        state.canvas.open_created_chat(&created);
+        assert_eq!(state.canvas.active_id, "chat:ws-solo:chat-solo");
+        let thread = state.canvas.thread_mut("chat:ws-solo:chat-solo").clone();
+        assert_eq!(thread.edit.text, "Research the docs");
+        assert_eq!(thread.edit.focus, "Research the docs".len());
+        assert_eq!(thread.workspace_id, "ws-solo");
+        assert_eq!(thread.chat_id, "chat-solo");
     }
 
     #[test]

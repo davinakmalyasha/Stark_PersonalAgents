@@ -14,6 +14,7 @@
 //! like `ChatView.tsx`). Group scope (`GroupProjectModal.tsx`) arrives with
 //! the modal port — the state is already scope-driven.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El, TextEdit};
 
 fn ink(hex: &'static str) -> rune::Color {
@@ -369,7 +370,7 @@ pub fn notes_button<S: crate::rune_transcript::TranscriptHost + 'static>(
         .fill(ink("#101013"))
         .border(1.0, ink("#ffffff14"))
         .center()
-        .on_press(move |s: &mut S| {
+        .on_press_enter(move |s: &mut S| {
             let thread = s.thread_mut(which);
             let id = if scope_id.trim().is_empty() {
                 thread.chat_id.clone()
@@ -464,7 +465,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     .role("button")
                     .focusable(true)
                     .label(format!("Toggle {}", todo.text))
-                    .on_press(move |s: &mut S| {
+                    .on_press_enter(move |s: &mut S| {
                         dispatch_notes(
                             &mut s.thread_mut(which).notes,
                             NotesOp::ToggleTodo {
@@ -514,7 +515,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .radius(7.0)
                         .fill(ink(if armed { "#3a2226" } else { "#00000000" }))
                         .color(ink(if armed { "#fda4af" } else { "#71717a" }))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             let notes = &mut s.thread_mut(which).notes;
                             if notes.confirm_delete.as_deref() == Some(del_id.as_str()) {
                                 notes.confirm_delete = None;
@@ -563,7 +564,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .radius(8.0)
                         .fill(ink("#ffffff"))
                         .color(ink("#0a0a0d"))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             let notes = &mut s.thread_mut(which).notes;
                             notes.adding = !notes.adding;
                         }),
@@ -576,7 +577,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .focusable(true)
                         .label("Close notes")
                         .shape(crate::lucide_x(14.0, 2.0, ink("#8a8a93")))
-                        .on_press(move |s: &mut S| {
+                        .on_press_enter(move |s: &mut S| {
                             s.thread_mut(which).notes.open = false;
                         }),
                 ),
@@ -597,7 +598,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .key("notes-title-input")
                         .w_full()
                         .placeholder("Title", ink("#52525b"))
-                        .caret(ink("#f2f2f4"), ink("#fbbf24"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| &mut s.thread_mut(which).notes.title_edit),
                 )
                 .child(
@@ -605,7 +606,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .key("notes-body-input")
                         .w_full()
                         .placeholder("Note", ink("#52525b"))
-                        .caret(ink("#f2f2f4"), ink("#fbbf24"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| &mut s.thread_mut(which).notes.body_edit),
                 )
                 .child(
@@ -613,7 +614,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                         .key("notes-todos-input")
                         .w_full()
                         .placeholder("Checklist, one item per line", ink("#52525b"))
-                        .caret(ink("#f2f2f4"), ink("#fbbf24"))
+                        .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                         .on_edit(move |s: &mut S| &mut s.thread_mut(which).notes.todos_edit),
                 )
                 .child(
@@ -630,7 +631,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                                 .label("Cancel")
                                 .font(rune::tok::TextStyle::new(11.0, 400.0))
                                 .color(ink("#a1a1aa"))
-                                .on_press(move |s: &mut S| {
+                                .on_press_enter(move |s: &mut S| {
                                     s.thread_mut(which).notes.adding = false;
                                 }),
                         )
@@ -646,7 +647,7 @@ pub fn notes_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                                 .radius(8.0)
                                 .fill(ink("#fbbf24"))
                                 .color(ink("#0a0a0d"))
-                                .on_press(move |s: &mut S| {
+                                .on_press_enter(move |s: &mut S| {
                                     let notes = &mut s.thread_mut(which).notes;
                                     let title = notes.title_edit.text.trim().to_string();
                                     let body = notes.body_edit.text.trim().to_string();

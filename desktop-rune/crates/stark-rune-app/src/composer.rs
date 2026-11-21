@@ -4,6 +4,7 @@
 //! Voice button and live `text_input` binding arrive next; the input is static
 //! text for now.
 
+use crate::keys::EnterPress;
 use rune::{col, row, spacer, text, text_input, El, TextEdit, Tx};
 
 fn ink(hex: &'static str) -> rune::Color {
@@ -53,7 +54,7 @@ fn attach_button<S: 'static>(attach: PressTx<S>) -> El {
         .center()
         .hover(ink("#ffffff12"))
         .hover_group()
-        .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
+        .on_press_tx_enter(move |s: &mut S, tx: &mut Tx| attach(s, tx))
         .child(crate::motion::hover_icon(
             18.0,
             plus(ink("#b4b4bc")),
@@ -161,7 +162,7 @@ fn attachment_card<S: 'static>(
                 .center()
                 .hover(ink("#ffffff17"))
                 .hover_group()
-                .on_press(move |s: &mut S| remove(s, target.clone()))
+                .on_press_enter(move |s: &mut S| remove(s, target.clone()))
                 .child(crate::motion::hover_icon(
                     13.0,
                     crate::lucide_x(13.0, 2.0, ink("#777782")),
@@ -197,7 +198,7 @@ fn attachment_add<S: 'static>(attach: PressTx<S>, hover: &crate::motion::HoverSe
             });
             tx.live_only();
         })
-        .on_press_tx(move |s: &mut S, tx: &mut Tx| attach(s, tx))
+        .on_press_tx_enter(move |s: &mut S, tx: &mut Tx| attach(s, tx))
         .child({
             let plus = |color: rune::Color| {
                 rune::Shape::new()
@@ -259,7 +260,7 @@ fn voice_button<S: 'static>(
         .size(32.0, 32.0)
         .radius(11.0)
         .center()
-        .on_press(on_voice);
+        .on_press_enter(on_voice);
     if live {
         // `.voice-live-dot`: a 5 pt white dot with a 2 pt `#8a6fe9` ring,
         // top-right. `voice-breathe` scales and fades both over 1.2 s; the
@@ -399,7 +400,7 @@ fn target_toggle<S: 'static>(
                 .radius(6.0)
                 .fill(ink(if cloud_active { "#00000000" } else { "#27272a" }))
                 .color(ink(if cloud_active { "#71717a" } else { "#f4f4f5" }))
-                .on_press(on_local),
+                .on_press_enter(on_local),
         )
         .child(
             row()
@@ -418,7 +419,7 @@ fn target_toggle<S: 'static>(
                     "#00000000"
                 }))
                 .hover_group()
-                .on_press(on_cloud)
+                .on_press_enter(on_cloud)
                 .child(cloud)
                 .child({
                     let mut label = text("Cloud".to_string())
@@ -519,7 +520,7 @@ fn usage_orb<S: 'static>(
         .center()
         .hover(ink("#ffffff0e"))
         .hover_group()
-        .on_press(move |s: &mut S| on_usage(s))
+        .on_press_enter(move |s: &mut S| on_usage(s))
         .child(
             text(format!("{:.0}", pct))
                 .font(crate::motion::tabular(rune::tok::TextStyle::new(
@@ -638,7 +639,7 @@ fn usage_popover<S: 'static>(
                 .w_full()
                 .py(8.0)
                 .color(ink("#e8e8eb"))
-                .on_press(move |s: &mut S| on_stats(s)),
+                .on_press_enter(move |s: &mut S| on_stats(s)),
         )
 }
 
@@ -698,7 +699,7 @@ fn provider_pill<S: 'static>(
             });
             tx.live_only();
         })
-        .on_press(move |s: &mut S| on_config(s))
+        .on_press_enter(move |s: &mut S| on_config(s))
         .child(
             text(if label.is_empty() {
                 "Provider".to_string()
@@ -783,7 +784,7 @@ fn model_dropup<S: 'static>(
                 });
                 tx.live_only();
             })
-            .on_press(move |s: &mut S| menu(s))
+            .on_press_enter(move |s: &mut S| menu(s))
             .child(
                 text(current)
                     .font(rune::tok::TextStyle::new(11.0, 400.0))
@@ -953,7 +954,7 @@ pub fn composer_card<S: 'static>(
         },
         ink("#74747deb"),
     )
-    .caret(ink("#f2f2f4"), ink("#3b82f6"))
+    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
     .on_edit(move |s: &mut S| edit_of(s))
     .on_input_key(move |s: &mut S, key: &rune::KeyEvent, _tx: &mut Tx| {
         if key.key != rune::Key::Enter || key.mods.shift {
@@ -985,7 +986,7 @@ pub fn composer_card<S: 'static>(
         send_btn = send_btn
             .key("composer-stop")
             .fill(ink("#ffffff"))
-            .on_press({
+            .on_press_enter({
                 let cancel = buttons.cancel.clone();
                 move |s: &mut S| cancel(s)
             })
@@ -1009,7 +1010,7 @@ pub fn composer_card<S: 'static>(
         send_btn = send_btn
             .key("composer-send")
             .fill(ink("#ffffff"))
-            .on_press({
+            .on_press_enter({
                 let on_send = buttons.send.clone();
                 move |s: &mut S| on_send(s)
             })

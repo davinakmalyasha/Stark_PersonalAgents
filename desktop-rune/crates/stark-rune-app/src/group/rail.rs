@@ -1,5 +1,6 @@
 //! `GroupProjectRail`: progress, waiting approvals, board/team/details.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, El};
 
 use super::data::{GroupDetail, GroupItem, GroupMember};
@@ -121,7 +122,7 @@ fn resolve_button<S: ProjectsHost + 'static>(
         .focusable(true)
         .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55));
     if !busy {
-        el = el.on_press(move |s: &mut S| {
+        el = el.on_press_enter(move |s: &mut S| {
             s.projects_mut().group.resolve(&item, grant);
         });
     }
@@ -397,7 +398,7 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
                 .focusable(true)
                 .focus_selected(active)
                 .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     s.projects_mut().group.rail_tab = tab;
                 }),
         );
@@ -478,7 +479,7 @@ fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El 
                             .focusable(true)
                             .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
                             .hover(rgba(255.0, 255.0, 255.0, 0.04))
-                            .on_press(move |s: &mut S| {
+                            .on_press_enter(move |s: &mut S| {
                                 let g = &mut s.projects_mut().group;
                                 g.board_open = if g.board_open.as_deref() == Some(id.as_str()) {
                                     None
@@ -787,7 +788,7 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
                 .label("Open project folder")
                 .focusable(true)
                 .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-                .on_press_tx({
+                .on_press_tx_enter({
                     let path = path.clone();
                     move |s: &mut S, _tx: &mut rune::Tx| {
                         #[cfg(target_os = "windows")]
@@ -826,7 +827,7 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
             .label("Toggle activity")
             .focusable(true)
             .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 s.projects_mut().group.show_activity = !show_activity;
             })
             .child(
@@ -918,6 +919,7 @@ pub fn rail_panel<S: ProjectsHost + 'static>(
             .scroll(rune::ScrollSpec {
                 stick_bottom: false,
             })
+            .scroll_margin(56.0)
             .child({
                 let mut top = progress_card(detail);
                 if !detail.waiting().is_empty() {

@@ -117,6 +117,26 @@ pub(crate) fn cloud_off(size: f32, color: rune::Color) -> Shape {
         .view_box(24.0, 24.0)
 }
 
+/// Lucide `X`.
+pub(crate) fn x(size: f32, color: rune::Color) -> Shape {
+    lucide(&["M18 6 6 18", "m6 6 12 12"], size, 2.0, color)
+}
+
+/// Lucide `ArrowRight`.
+pub(crate) fn arrow_right(size: f32, color: rune::Color) -> Shape {
+    lucide(&["M5 12h14", "m12 5 7 7-7 7"], size, 2.0, color)
+}
+
+/// Lucide `ArrowLeft`.
+pub(crate) fn arrow_left(size: f32, color: rune::Color) -> Shape {
+    lucide(&["m12 19-7-7 7-7", "M19 12H5"], size, 2.0, color)
+}
+
+/// Lucide `LoaderCircle`: the open arc React spins while creating.
+pub(crate) fn loader(size: f32, color: rune::Color) -> Shape {
+    lucide(&["M21 12a9 9 0 1 1-6.219-8.56"], size, 2.0, color)
+}
+
 /// Lucide `FolderKanban` (group-project identity).
 pub(crate) fn folder_kanban(size: f32, color: rune::Color) -> Shape {
     lucide(

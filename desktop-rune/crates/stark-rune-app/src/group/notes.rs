@@ -1,6 +1,7 @@
 //! Group-scope sticky notes over the project modal. The chat notes sheet is
 //! transcript-owned; this is the same card for `scope_type = "group"`.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, text_input, El};
 
 use crate::notes::{AgentNote, NotesOp, NotesState};
@@ -49,7 +50,7 @@ fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
                 .role("button")
                 .focusable(true)
                 .label(format!("Toggle {}", todo.text))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     crate::notes::dispatch_notes(
                         &mut s.projects_mut().group.notes,
                         NotesOp::ToggleTodo {
@@ -82,7 +83,7 @@ fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
                 .role("button")
                 .focusable(true)
                 .label(format!("Delete {}", note.title))
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let notes = &mut s.projects_mut().group.notes;
                     if notes.confirm_delete.as_deref() == Some(del.as_str()) {
                         notes.confirm_delete = None;
@@ -148,7 +149,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                         .role("button")
                         .focusable(true)
                         .label("Add note")
-                        .on_press(|s: &mut S| {
+                        .on_press_enter(|s: &mut S| {
                             let notes = &mut s.projects_mut().group.notes;
                             notes.adding = !notes.adding;
                         })
@@ -171,7 +172,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                         .role("button")
                         .focusable(true)
                         .label("Close notes")
-                        .on_press(|s: &mut S| {
+                        .on_press_enter(|s: &mut S| {
                             s.projects_mut().group.notes.open = false;
                         })
                         .child(icon(14.0, crate::lucide_x(14.0, 2.0, ink("#8a8a93")))),
@@ -194,7 +195,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                     .key("gp-notes-title")
                     .w_full()
                     .placeholder("Title", ink("#52525b"))
-                    .caret(ink("#f2f2f4"), ink("#fbbf24"))
+                    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                     .on_edit(|s: &mut S| &mut s.projects_mut().group.notes.title_edit),
             )
             .child(
@@ -202,7 +203,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                     .key("gp-notes-body")
                     .w_full()
                     .placeholder("Note", ink("#52525b"))
-                    .caret(ink("#f2f2f4"), ink("#fbbf24"))
+                    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                     .on_edit(|s: &mut S| &mut s.projects_mut().group.notes.body_edit),
             )
             .child(
@@ -210,7 +211,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                     .key("gp-notes-todos")
                     .w_full()
                     .placeholder("Checklist, one item per line", ink("#52525b"))
-                    .caret(ink("#f2f2f4"), ink("#fbbf24"))
+                    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
                     .on_edit(|s: &mut S| &mut s.projects_mut().group.notes.todos_edit),
             )
             .child(
@@ -225,7 +226,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                             .role("button")
                             .focusable(true)
                             .label("Cancel note")
-                            .on_press(|s: &mut S| {
+                            .on_press_enter(|s: &mut S| {
                                 s.projects_mut().group.notes.adding = false;
                             }),
                     )
@@ -240,7 +241,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                             .role("button")
                             .focusable(true)
                             .label("Save note")
-                            .on_press(|s: &mut S| {
+                            .on_press_enter(|s: &mut S| {
                                 let notes = &mut s.projects_mut().group.notes;
                                 let title = notes.title_edit.text.trim().to_string();
                                 let body = notes.body_edit.text.trim().to_string();

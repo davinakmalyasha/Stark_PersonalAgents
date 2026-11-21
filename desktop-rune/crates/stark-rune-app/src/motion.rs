@@ -90,6 +90,33 @@ pub const ATTACH: Spring = Spring::smooth(0.26, 0.0);
 pub const ROTATE: Spring = Spring::smooth(0.18, 0.0);
 /// `.chat-row` / `.house-sidebar-row` entrance — 260 ms.
 pub const SIDEBAR_IN: Spring = Spring::smooth(0.26, 0.0);
+/// CSS `::selection`: `rgba(37, 99, 235, 0.3)` (`index.css`).
+pub const TEXT_SELECTION: Color = Color {
+    r: 37.0 / 255.0,
+    g: 99.0 / 255.0,
+    b: 235.0 / 255.0,
+    a: 0.3,
+};
+/// `.session-flow-enter` — 180 ms.
+pub const SESSION_FLOW: Spring = Spring::smooth(0.18, 0.0);
+/// `.project-step-enter` (`--stark-dur-2`) — 200 ms.
+pub const PROJECT_STEP: Spring = Spring::smooth(0.20, 0.0);
+
+/// `.session-flow-enter`: fade and a 6 pt left push.
+pub fn session_flow_enter() -> Transition {
+    enter(
+        SESSION_FLOW,
+        Transition::offset(-6.0, 0.0).combined(Transition::opacity()),
+    )
+}
+
+/// `.project-step-enter`: fade and a 5 pt right push between the two steps.
+pub fn project_step_enter() -> Transition {
+    enter(
+        PROJECT_STEP,
+        Transition::offset(5.0, 0.0).combined(Transition::opacity()),
+    )
+}
 
 /// `.chat-row` / `.house-sidebar-row` entrance: fade and a 4 pt drop.
 pub fn sidebar_row_enter() -> Transition {

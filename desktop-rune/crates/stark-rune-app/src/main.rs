@@ -45,6 +45,8 @@ mod icons;
 #[path = "image_cache.rs"]
 mod image_cache;
 #[cfg(feature = "rune-real")]
+mod keys;
+#[cfg(feature = "rune-real")]
 mod motion;
 #[cfg(feature = "rune-real")]
 mod notes;

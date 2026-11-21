@@ -33,6 +33,9 @@ pub mod icons;
 #[path = "image_cache.rs"]
 pub mod image_cache;
 #[cfg(feature = "rune-real")]
+#[path = "keys.rs"]
+pub mod keys;
+#[cfg(feature = "rune-real")]
 #[path = "motion.rs"]
 pub mod motion;
 #[cfg(feature = "rune-real")]

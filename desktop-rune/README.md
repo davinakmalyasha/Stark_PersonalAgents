@@ -51,12 +51,15 @@ over approximating a CSS property.
   `focus_selected`, `focus_return`, `focus_highlight` and `default_button`.
 - **Virtual rows** — `virtual_rows` builds only mounted rows;
   `virtual_rows_version` skips key calls when the key sequence is unchanged;
-  `on_visible_rows` reports the visible index range once. `memo` caches a
-  subtree while its row stays built; it does not keep scrolled-out rows.
+  `on_visible_rows` reports the visible index range once. `memo` inside a
+  `virtual_rows` row is dropped when the row leaves the mounted window (rows
+  built eagerly with `virtualize` keep their cached subtree).
 - **Text and selection** — `selection_group` joins selectable blocks into one
-  selection; `selection_copy` can return source text; `help` and
-  `help_when_truncated` draw native tooltips; `live_region` announces status
-  changes to assistive technology.
+  selection. Put it on the **virtual list itself** (not each row) and Rune
+  pins both endpoints, rebuilds unmounted rows on demand, and copies across
+  them (up to 10,000 rows / 4 MiB). `selection_copy` can return source text;
+  `help` and `help_when_truncated` draw native tooltips; `live_region`
+  announces status changes to assistive technology.
 - **Scrolling** — `stick_bottom`, `scroll_anchor`, `scroll_margin`,
   `scroll_edge_fade`, `Tx::scroll_to_bottom` and `Tx::scroll_into_view`.
   Virtual rows already preserve the first visible row.
@@ -65,6 +68,9 @@ over approximating a CSS property.
   matching CSS `backdrop-filter`.
 - **Growth and caching** — growth stacks and `fold_glide` animate disclosure
   rows; `cache` rasterizes a settled subtree until its draw output changes.
+- **Native dialogs** — `Tx::open_file`, `Tx::save_file` and `Tx::open_folder`
+  take `FileDialogOptions`; headless runs script the answers instead of
+  showing a picker.
 - **Compositing** — `App::srgb_blend` is on by default, matching CSS alpha
   compositing over dark surfaces. `El::focus_within_flat` drops an element's
   shadows and hover fill while focus is inside it.
@@ -76,11 +82,12 @@ over approximating a CSS property.
 - No audio element; audio attachments cannot play inside Rune.
 - Focus-within can add a ring or flatten shadows, but cannot swap arbitrary
   shadow stacks.
-- Virtualized rows cannot be cross-selected while offscreen.
-- Rune's ordinary `role("button")` responds to Space; Return is reserved for
-  links, highlighted rows, list rows and `default_button`. Account for that
-  when adding keyboard actions.
-- `memo` caches only built subtrees; it is not an offscreen cache.
+- Rune's native `role("button")` responds to Space; Return goes to links,
+  highlighted rows, list rows and `default_button`. This port adds Enter to
+  buttons with an `on_key` helper (`keys::EnterPress`) for web parity; keep
+  using that helper instead of a bare `on_press`.
+- `memo` inside `virtual_rows` caches only built rows; it is not an offscreen
+  cache (Rune's virtual selection rebuilds rows it needs by key).
 
 ## Architecture
 

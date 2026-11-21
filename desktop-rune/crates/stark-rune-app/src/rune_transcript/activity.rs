@@ -4,6 +4,7 @@
 //! The DOM/CSS values are ported literally from `index.css`; geometry follows
 //! the same flex/gap/padding rules as the React components.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, Easing, El, TextStyle};
 
 use super::{home_icon_copy, home_ink, home_rgba, md_render, RowData, Thread, TranscriptHost};
@@ -285,7 +286,7 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                     .radius(7.0)
                     .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
                     .hover_group()
-                    .on_press({
+                    .on_press_enter({
                         let row_key = row_key.to_string();
                         let item_key = group_key.clone();
                         move |s: &mut S| toggle_tool(s, which, &row_key, &item_key, default_open)
@@ -452,7 +453,7 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
         .radius(7.0)
         .hover(home_rgba(255.0, 255.0, 255.0, 0.045))
         .hover_group()
-        .on_press({
+        .on_press_enter({
             let row_key = row_key.to_string();
             let item_key = item_key.clone();
             move |s: &mut S| toggle_tool(s, which, &row_key, &item_key, false)
@@ -719,7 +720,7 @@ fn tool_panel<S: TranscriptHost + 'static>(
             .radius(5.0)
             .center()
             .hover(home_rgba(255.0, 255.0, 255.0, 0.07))
-            .on_press_tx(move |_: &mut S, tx: &mut rune::Tx| {
+            .on_press_tx_enter(move |_: &mut S, tx: &mut rune::Tx| {
                 tx.copy(copy_text.clone());
             })
             .child(icon_box(11.0, home_icon_copy(11.0, home_ink("#777b85")))),
@@ -1051,7 +1052,7 @@ fn delegation_card<S: TranscriptHost + 'static>(
             .label(format!("Open {name} subagent session"))
             .focus_ring(1.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
             .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 // Workspace hint resolves inside `open_subagent` (explicit
                 // hint wins, else the parent thread's workspace).
                 super::open_subagent(s.thread_mut(which), &child_id, &label, workspace.as_deref());
@@ -1109,7 +1110,7 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         .border_layout()
         .hover(home_rgba(255.0, 255.0, 255.0, 0.04))
         .hover_group()
-        .on_press({
+        .on_press_enter({
             let key = r.key.clone();
             move |s: &mut S| {
                 let now = crate::rune_transcript::frame_millis();
@@ -1369,7 +1370,7 @@ fn delegation_step_card<S: TranscriptHost + 'static>(
             .label(format!("Open {name} subagent session"))
             .focus_ring(1.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
             .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 super::open_subagent(s.thread_mut(which), &child_id, &label, workspace.as_deref());
             });
     }

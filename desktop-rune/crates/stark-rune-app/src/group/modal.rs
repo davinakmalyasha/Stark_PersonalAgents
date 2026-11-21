@@ -1,5 +1,6 @@
 //! `GroupProjectModal`: overlay, header, skeleton and the chat/rail split.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, Easing, El, LoopSpec};
 
 use super::data::{GroupDetail, ProjectInfo};
@@ -207,7 +208,7 @@ fn header<S: ProjectsHost + 'static>(
                         crate::icons::panel_right_open(15.0, ink("#71717a"))
                     },
                 )
-                .on_press({
+                .on_press_enter({
                     let id = pause_id.clone();
                     move |s: &mut S| {
                         let _ = id;
@@ -224,7 +225,7 @@ fn header<S: ProjectsHost + 'static>(
                 "Open sticky notes",
                 crate::icons::sticky_note(14.0, ink("#71717a")),
             )
-            .on_press({
+            .on_press_enter({
                 let id = pause_id.clone();
                 move |s: &mut S| {
                     let g = &mut s.projects_mut().group;
@@ -238,7 +239,7 @@ fn header<S: ProjectsHost + 'static>(
                 "Open folder",
                 crate::icons::folder_open(15.0, ink("#71717a")),
             )
-            .on_press_tx({
+            .on_press_tx_enter({
                 let path = folder_path.clone();
                 move |s: &mut S, tx: &mut rune::Tx| {
                     let _ = &tx;
@@ -268,7 +269,7 @@ fn header<S: ProjectsHost + 'static>(
                 Some(crate::icons::pause(12.0, ink("#d4d4d8"))),
             )
             .key("gp-pause")
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 let _ = &pause_id;
                 s.projects_mut().group.op("pause");
             }),
@@ -281,7 +282,7 @@ fn header<S: ProjectsHost + 'static>(
                 Some(crate::icons::play(12.0, ink("#0a0a0d"))),
             )
             .key("gp-resume")
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 s.projects_mut().group.op("resume");
             }),
         );
@@ -290,7 +291,7 @@ fn header<S: ProjectsHost + 'static>(
         actions = actions.child(
             action_button("Close", false, None)
                 .key("gp-close-project")
-                .on_press(move |s: &mut S| {
+                .on_press_enter(move |s: &mut S| {
                     let _ = &close_id;
                     s.projects_mut().group.op("close");
                 }),
@@ -302,7 +303,7 @@ fn header<S: ProjectsHost + 'static>(
             "Close",
             crate::lucide_x(16.0, 2.0, ink("#71717a")),
         )
-        .on_press(|s: &mut S| {
+        .on_press_enter(|s: &mut S| {
             s.projects_mut().group.close();
         }),
     );
@@ -547,6 +548,9 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         })
         .transition(crate::motion::modal_enter())
         .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
+        // The card is the modal root, so the backdrop is outside it: a
+        // backdrop press dismisses and focus is trapped inside the card.
+        .modal(true, |s: &mut S| s.projects_mut().group.close())
         .child(header::<S>(g, &project, detail, compact, rail_visible));
     if has_notice {
         card = card.child(notice);
@@ -561,9 +565,6 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         .fill(rgba(0.0, 0.0, 0.0, 0.65))
         .backdrop_blur(4.0)
         .center()
-        .modal(true, |s: &mut S| {
-            s.projects_mut().group.close();
-        })
         .transition(crate::motion::backdrop_enter())
         .child(card);
     if g.notes.open {

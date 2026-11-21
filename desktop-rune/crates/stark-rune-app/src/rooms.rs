@@ -11,6 +11,7 @@
 //! wired: it moves blinds/cameras in the user's home. Refresh/display only.
 //! Views are generic over host traits like the transcript/canvas families.
 
+use crate::keys::EnterPress;
 use rune::{col, row, text, El};
 
 fn ink(hex: &'static str) -> rune::Color {
@@ -552,7 +553,7 @@ fn refresh_button<S: 'static>(key: &str, loading: bool, on_press: impl Fn(&mut S
         .radius(8.0)
         .fill(ink("#ffffff0d"))
         .color(ink("#d4d4d8"))
-        .on_press(on_press)
+        .on_press_enter(on_press)
 }
 
 /// House board: room sections with device rows (name, state, online dot).
@@ -721,7 +722,7 @@ pub fn memory_view<S: MemoryHost + 'static>(s: &MemoryState) -> El {
             .role("button")
             .focusable(true)
             .label(format!("Open {name} memory", name = ws.name))
-            .on_press(move |s: &mut S| {
+            .on_press_enter(move |s: &mut S| {
                 select_memory(s.memory_mut(), &id);
             })
             .child(

@@ -241,14 +241,6 @@ pub fn fade_in(spring: Spring) -> Transition {
     enter(spring, Transition::opacity())
 }
 
-/// `.trace-collapsible` opening fade. Rune draws presence exits outside every
-/// ancestor clip, so a retained close would paint the body below the folded
-/// header. The body therefore unmounts at once; the row's `fold_glide`
-/// carries the 280 ms height collapse.
-pub fn trace_body_enter() -> Transition {
-    enter(TRACE_BODY, Transition::opacity())
-}
-
 /// CSS replaces the whole background on `hover:bg-*`; Rune paints `hover` as an
 /// overlay *over* the element's own fill. For a transparent rest fill the two
 /// are identical, so this returns `target` unchanged. For a filled row it
@@ -519,11 +511,6 @@ mod tests {
         assert_eq!(HOVER_SPRING, Spring::smooth(0.15, 0.0));
         assert_eq!(TRACE_BODY, Spring::smooth(0.18, 0.0));
         assert_eq!(TRACE_FOLD, Spring::smooth(0.28, 0.0));
-
-        let body = trace_body_enter();
-        assert_eq!(body.insertion.opacity, 0.0);
-        assert_eq!(body.removal, rune::Effect::IDENTITY);
-        assert_eq!(body.springs, SpringPair::new(TRACE_BODY, Spring::NONE));
     }
 
     #[test]

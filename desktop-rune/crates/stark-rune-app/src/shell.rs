@@ -1165,6 +1165,11 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         // ~60 fps while the row fades out.
         tx.wake_after(std::time::Duration::from_millis(16));
     }
+    if trace_animating(s) {
+        // ~60 fps while a trace body fades in or out.
+        tx.wake_after(std::time::Duration::from_millis(16));
+        changed = true;
+    }
     if s.canvas.projects.group.is_open() {
         let g = &s.canvas.projects.group;
         let wait = if g.loading || g.sending || g.busy_item.is_some() || g.op_busy.is_some() {
@@ -1185,6 +1190,22 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         tx.wake_after(std::time::Duration::from_secs_f64(left));
     }
     changed
+}
+
+/// Whether any mounted transcript has a trace body inside its 180 ms open or
+/// close fade. The shell forces a rebuild each frame so the opacity lands on
+/// the poll clock rather than a presence spring.
+fn trace_animating(s: &ShellState) -> bool {
+    let now = crate::rune_transcript::frame_millis();
+    let closing = |thread: &RuneTranscriptState| {
+        thread.rows.iter().any(|row| {
+            row.trace_anim_at
+                .is_some_and(|at| now.saturating_sub(at) < 180)
+        })
+    };
+    closing(&s.transcript)
+        || closing(&s.personal)
+        || s.canvas.sessions.threads.values().any(closing)
 }
 
 /// Publish the `voice-breathe` pose for every live voice bus. Clones share
@@ -2141,5 +2162,75 @@ mod tests {
         let thread = rt.state.canvas.sessions.threads.get(&active).unwrap();
         assert!(thread.rows.iter().any(|r| r.body == "hello map"));
         assert!(rt.find("home-chat-card").is_some(), "home chat card mounts");
+    }
+    #[test]
+    fn closing_a_trace_fades_the_body_while_the_row_folds() {
+        let env = Env::new(true, 1.0);
+        let mut state = ShellState::default();
+        apply_trace(&mut state);
+        let mut rt = Runtime::new(state, shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let open_h = rt
+            .presented("trace-agent-trace-body")
+            .expect("open trace body")
+            .0[3];
+        let (x, y) = rt.find("trace-agent-trace-head").expect("trace head");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.frame(1.0 / 60.0);
+        {
+            let thread = rt.state.canvas.sheet_thread().expect("trace sheet");
+            let row = thread
+                .rows
+                .iter()
+                .find(|row| row.key == "trace-agent")
+                .expect("trace row");
+            assert!(!row.trace_open, "the header closes the accordion");
+            assert!(row.trace_anim_at.is_some(), "the close starts the clock");
+        }
+        // Pin the pose mid-fade: a real frame after the press is only a few
+        // milliseconds in, so the eased opacity is still near 1.
+        rt.update(|s, _| {
+            crate::rune_transcript::set_frame_millis(1_000);
+            if let Some(thread) = s.canvas.sheet_thread_mut() {
+                if let Some(row) = thread.rows.iter_mut().find(|row| row.key == "trace-agent") {
+                    row.trace_anim_at = Some(910);
+                }
+            }
+        });
+        for _ in 0..4 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (rect, opacity) = rt
+            .presented("trace-agent-trace-body")
+            .expect("body stays mounted through the fade");
+        assert!(
+            opacity > 0.1 && opacity < 0.9,
+            "body is mid-fade: {opacity} at {rect:?}"
+        );
+        assert!(
+            rect[3] > 1.0 && rect[3] < open_h - 2.0,
+            "the row folds its content: {rect:?} (open {open_h})"
+        );
+        assert!(
+            rect[1] < 900.0 && rect[1] > 0.0,
+            "body rides the header margin: {rect:?}"
+        );
+        // After the 180 ms window the normal child unmounts. It never becomes
+        // a presence layer, so there is no ghost below the folded row.
+        rt.update(|s, _| {
+            crate::rune_transcript::set_frame_millis(2_000);
+            if let Some(thread) = s.canvas.sheet_thread_mut() {
+                if let Some(row) = thread.rows.iter_mut().find(|row| row.key == "trace-agent") {
+                    row.trace_anim_at = Some(1_780);
+                }
+            }
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.find("trace-agent-trace-body").is_none(),
+            "the body unmounts when the fade ends"
+        );
     }
 }

@@ -4,7 +4,7 @@
 //! The DOM/CSS values are ported literally from `index.css`; geometry follows
 //! the same flex/gap/padding rules as the React components.
 
-use rune::{col, row, text, El, TextStyle};
+use rune::{col, row, text, Easing, El, TextStyle};
 
 use super::{home_icon_copy, home_ink, home_rgba, md_render, RowData, Thread, TranscriptHost};
 use crate::stream_accum::{
@@ -1073,6 +1073,21 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         format!("Worked for {}", r.duration)
     };
     let open = r.trace_open;
+    // `.trace-collapsible` opacity is `.18s ease` in both directions. Rune
+    // paints presence exits outside ancestor clips, so this body never uses
+    // presence: the frame clock drives one normal opacity value for open and
+    // close, and the closing body collapses inside its own clip.
+    let now = crate::rune_transcript::frame_millis();
+    let anim_t = r
+        .trace_anim_at
+        .map(|at| {
+            let t = (now.saturating_sub(at) as f32 / 180.0).clamp(0.0, 1.0);
+            Easing::cubic(0.25, 0.1, 0.25, 1.0).eval(t)
+        })
+        .unwrap_or(1.0);
+    let closing = !open && r.trace_anim_at.is_some() && anim_t < 1.0;
+    let body_opacity = if open { anim_t } else { 1.0 - anim_t };
+    let close_t = anim_t;
     let header = row()
         .key(format!("{}-trace-head", r.key))
         .role("button")
@@ -1088,9 +1103,16 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         .on_press({
             let key = r.key.clone();
             move |s: &mut S| {
+                let now = crate::rune_transcript::frame_millis();
                 let thread = s.thread_mut(which);
                 if let Some(row) = thread.rows.iter_mut().find(|row| row.key == key) {
-                    row.trace_open = !row.trace_open;
+                    if row.trace_open {
+                        row.trace_open = false;
+                        row.trace_anim_at = Some(now);
+                    } else {
+                        row.trace_open = true;
+                        row.trace_anim_at = Some(now);
+                    }
                 }
             }
         })
@@ -1116,20 +1138,25 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         .w_full()
         .mt(8.0)
         .mb(22.0)
-        // `.trace-collapsible > div { overflow:hidden }`: while the row
-        // folds, the exiting body must not paint below the closed header.
-        .clip_rounded(0.0)
         .transition(crate::motion::trace_enter())
-        .child(header)
-        // Header inline margin (14 open / 0 closed) + collapsible top 9.
-        // React's `.18s` transition covers the header's margin change, so the
-        // spacer glides with the body fade rather than snapping 14 pt.
-        .child(
+        .child(header);
+    // Header inline margin (14 open / 0 closed) + collapsible top 9. While
+    // closing, the margin rides the same eased clock as the body so the two
+    // cannot drift; on open it keeps the 180 ms layout spring.
+    if closing {
+        shell = shell.child(
+            rune::el()
+                .h(23.0 - 14.0 * close_t)
+                .motion(rune::Spring::NONE),
+        );
+    } else {
+        shell = shell.child(
             rune::el()
                 .h(if open { 23.0 } else { 9.0 })
                 .motion(crate::motion::TRACE_BODY),
         );
-    if open {
+    }
+    if open || closing {
         let timeline: Vec<StreamSegment> = if !r.activity.is_empty() {
             r.activity.clone()
         } else {
@@ -1138,10 +1165,19 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
         // `.trace-collapsible { opacity:0; transition: opacity .18s }`.
         // The parent growth stack supplies the height glide; this wrapper
         // supplies the child fade so the body does not pop in at full ink.
+        // A one-row growth stack is the Rune equivalent of the CSS
+        // `.trace-collapsible` grid row: the row mounts at 0 and grows to its
+        // content (or folds back to 0), and the stack's mask clips it while it
+        // moves. Its opacity is driven by the same frame clock, so opening and
+        // closing both land without a presence layer.
         let mut body = col()
             .key(format!("{}-trace-body", r.key))
             .w_full()
-            .transition(crate::motion::trace_body_enter());
+            .opacity(body_opacity)
+            .opacity_motion(rune::Anim::INSTANT)
+            .clip_rounded(0.0)
+            .transition(rune::Transition::none())
+            .fold_glide(crate::motion::TRACE_FOLD);
         if !timeline.is_empty() {
             body = body.child(activity_timeline::<S>(
                 s, which, &r.key, &timeline, false, r,
@@ -1163,7 +1199,18 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
             }
             body = body.child(list);
         }
-        shell = shell.child(body);
+        if closing {
+            // `.trace-collapsible > div { overflow:hidden }`: the row keeps
+            // its content and folds its height to 0 on the disclosure spring,
+            // clipped by the stack mask while the header margin slides 23→9.
+            body = body.h(0.0).min_h(0.0);
+        }
+        shell = shell.child(
+            col()
+                .w_full()
+                .growth(rune::GrowthSpec::default())
+                .child(body),
+        );
     }
     shell
 }

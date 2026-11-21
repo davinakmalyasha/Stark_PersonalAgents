@@ -91,6 +91,10 @@ pub struct RowData {
     pub steps: Vec<TraceStep>,
     /// Completed "Worked for …" accordion open.
     pub trace_open: bool,
+    /// Frame-clock millis of the last open/close. The body fades on this
+    /// clock (180 ms) while the completed row folds; `None` means the body is
+    /// already settled (history rows loaded open, or a finished close).
+    pub trace_anim_at: Option<u64>,
     /// Per-tool-group open state. Absence means React's default.
     pub tool_open: std::collections::HashMap<String, bool>,
     /// Live fold owned by the row (never duplicated in app state).
@@ -5587,7 +5591,23 @@ pub fn ask_demo() -> RuneTranscriptState {
 
 /// `poll` hook: drain run frames queued by the transport thread into rows.
 /// Returns true when state changed (requests another frame).
-pub fn drain_run_inbox(s: &mut RuneTranscriptState, _clock: f64, tx: &mut rune::Tx) -> bool {
+/// The shell/standalone poll clock in milliseconds. Views that animate on the
+/// app clock (the closing trace body) read this instead of wall time, so a
+/// simulated `--at` capture and the real app progress identically.
+static FRAME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn frame_millis() -> u64 {
+    FRAME_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_frame_millis(ms: u64) {
+    // Monotonic: unit-test runtimes poll at 0, and a stale zero must not
+    // rewind a clock a test (or a running app) already advanced.
+    FRAME_MS.fetch_max(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn drain_run_inbox(s: &mut RuneTranscriptState, clock: f64, tx: &mut rune::Tx) -> bool {
+    set_frame_millis((clock.max(0.0) * 1000.0) as u64);
     let mut changed = false;
     changed |= crate::settings::poll_settings(&mut s.settings);
     if s.settings.loading || s.settings.busy || s.settings.backup_busy {

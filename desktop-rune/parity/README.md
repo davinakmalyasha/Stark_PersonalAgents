@@ -651,3 +651,34 @@ Dead keyframes (`.voice-orb` 1.5 s, `canvas-dot-pulse` 1.4 s) are omitted.
 Rune's canvas status dot is static, matching `.canvas-card-status-dot`; the
 extra 2.2 s badge pulse was removed. Reduce Motion zeroes looping amplitude
 through Rune's motion gate; finite sequences still land.
+
+## Capability pass (2026-11-21)
+
+- **Shadow layers.** `El::box_shadow` appends to a layer list, so the old
+  “one shadow per element” note was wrong. Canvas cards now carry the exact
+  default, running and active stacks (inset top-light, ring, drop, halo), and
+  the user bubble/dock carry their inset top-lights.
+- **Anchored overlays.** The model menu, usage popover and group target menu
+  use `anchored_fit` instead of growing their parent. Button-opened menus are
+  `modal(true, close)` with `focus_group`/`focus_selected`/`focus_return`; the
+  typed `@` popup stays non-modal so the composer keeps focus and filtering.
+  The usage popover measures 190 × 130.75 at (777, 698) on 1280 × 900, 9 pt
+  above the orb (`usage-open.json`).
+- **Memoized bodies.** Markdown bodies are wrapped in `memo` keyed by body,
+  style and a `body_rev` counter for code-copy/diff state. The virtual list
+  skips per-row key calls with `virtual_rows_version` and marks seen rows with
+  one `on_visible_rows` range callback instead of one handler per row. The
+  suite still passes (222 tests); the first memo run dropped from ~20 s to
+  ~4 s before later builds recompiled the test binary.
+- **Focus and tooltips.** Every `role("button")` control is now focusable;
+  group rings match the CSS values (2 px white .55, composer target 1 px .5,
+  trace/artifact 1–2 px .7), rail/session/filter tabs are focus groups, and
+  retry/compaction/error lines are live regions. Icon-only and truncated
+  controls use native `help`/`help_when_truncated` tooltips.
+- **Selection.** Markdown message roots use `selection_group(true)`, so a
+  drag or Cmd+A spans paragraphs and code blocks within one message.
+
+Known boundaries: Rune exposes focus-within rings but not an arbitrary
+focus-within shadow swap; the running border sweep is a clipped sheen rather
+than CSS `mask-composite`; virtualized rows cannot be cross-selected while
+offscreen; `memo` does not keep scrolled-out rows (only built rows).

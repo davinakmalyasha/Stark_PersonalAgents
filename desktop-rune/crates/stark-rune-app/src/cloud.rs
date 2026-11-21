@@ -724,6 +724,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     )
                     .key("cloud-refresh")
                     .role("button")
+                    .focusable(true)
                     .label("Refresh cloud status")
                     .font(rune::tok::TextStyle::new(11.0, 600.0))
                     .px(12.0)
@@ -867,6 +868,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     .fill(ink(if selected { "#1b1b20" } else { "#00000000" }))
                     .border(1.0, ink(if selected { "#ffffff30" } else { "#ffffff14" }))
                     .role("button")
+                    .focusable(true)
                     .label(format!("Send from {}", ws.name))
                     .on_press(move |s: &mut S| {
                         let c = s.cloud_mut();
@@ -895,6 +897,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                 .fill(ink(if whole { "#1b1b20" } else { "#00000000" }))
                 .border(1.0, ink(if whole { "#ffffff30" } else { "#ffffff14" }))
                 .role("button")
+                .focusable(true)
                 .label("Send whole workspace")
                 .on_press(move |s: &mut S| {
                     s.cloud_mut().chat_id.clear();
@@ -920,6 +923,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     .fill(ink(if selected { "#1b1b20" } else { "#00000000" }))
                     .border(1.0, ink(if selected { "#ffffff30" } else { "#ffffff14" }))
                     .role("button")
+                    .focusable(true)
                     .label(format!("Send {}", chat.title))
                     .on_press(move |s: &mut S| {
                         s.cloud_mut().chat_id = id.clone();
@@ -959,6 +963,7 @@ pub fn cloud_view<S: CloudHost + 'static>(s: &CloudState) -> El {
                     )
                     .key("cloud-send-button")
                     .role("button")
+                    .focusable(true)
                     .label("Send to cloud")
                     .font(rune::tok::TextStyle::new(12.0, 600.0))
                     .px(12.0)

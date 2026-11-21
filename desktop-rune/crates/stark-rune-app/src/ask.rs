@@ -550,6 +550,7 @@ fn icon_button<S: TranscriptHost + 'static>(
     rune::el()
         .key(key)
         .role("button")
+        .focusable(true)
         .label(label)
         .size(size, size)
         .radius(if size > 24.0 { 7.0 } else { 6.0 })
@@ -657,6 +658,7 @@ fn option_row<S: TranscriptHost + 'static>(
     let mut option = row()
         .key(format!("ask-option-{}-{index}-button", question.id))
         .role("button")
+        .focusable(true)
         .label(label.to_string())
         .w_full()
         .items_center()
@@ -669,7 +671,8 @@ fn option_row<S: TranscriptHost + 'static>(
         .border_layout();
     // `.ask-option:hover` replaces the zinc surface and lifts the border to
     // `#3f3f46`. The fill is opaque, so the overlay replaces it exactly; the
-    // border needs a paint-only sibling because Rune has no hover border.
+    // border needs a paint-only sibling because Rune has no declarative
+    // hover-border builder (a `Live` border track is the alternative).
     if !selected {
         option = option.hover(ink("#1c1c20"));
     }
@@ -986,6 +989,7 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
             text("Dismiss".to_string())
                 .key("ask-dismiss-foot")
                 .role("button")
+                .focusable(true)
                 .label("Dismiss")
                 .font(style(
                     if compact { 10.0 } else { 12.0 },
@@ -1026,6 +1030,7 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
                     )
                     .key("ask-submit")
                     .role("button")
+                    .focusable(true)
                     .label("Submit answer")
                     .font(style(
                         if compact { 10.0 } else { 12.5 },

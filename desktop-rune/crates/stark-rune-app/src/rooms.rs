@@ -545,6 +545,7 @@ fn refresh_button<S: 'static>(key: &str, loading: bool, on_press: impl Fn(&mut S
     text(if loading { "…" } else { "Refresh" }.to_string())
         .key(key.to_string())
         .role("button")
+        .focusable(true)
         .font(rune::tok::TextStyle::new(11.0, 600.0))
         .px(12.0)
         .py(8.0)
@@ -718,6 +719,7 @@ pub fn memory_view<S: MemoryHost + 'static>(s: &MemoryState) -> El {
             .px(12.0)
             .py(9.0)
             .role("button")
+            .focusable(true)
             .label(format!("Open {name} memory", name = ws.name))
             .on_press(move |s: &mut S| {
                 select_memory(s.memory_mut(), &id);

@@ -576,6 +576,7 @@ fn option_list<S: 'static>(
                 .radius(6.0)
                 .fill(ink(if selected { "#ffffff14" } else { "#00000000" }))
                 .role("button")
+                .focusable(true)
                 .label(format!("Pick {label}"))
                 .on_press(move |s: &mut S| pick(s, target.clone()))
                 .child(
@@ -628,6 +629,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
             .border(1.0, ink("#ffffff1a"))
             .color(ink("#e4e4e7"))
             .role("button")
+            .focusable(true)
             .label("Switch active provider")
             .on_press(move |s: &mut S| {
                 let st = &mut s.thread_mut(which).agent_config;
@@ -676,6 +678,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                 .py(8.0)
                 .fill(ink(if selected { "#ffffff14" } else { "#00000000" }))
                 .role("button")
+                .focusable(true)
                 .label(format!("Configure {}", agent.display))
                 .on_press(move |s: &mut S| {
                     let st = &mut s.thread_mut(which).agent_config;
@@ -1062,6 +1065,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     )
                     .key("agentcfg-reset")
                     .role("button")
+                    .focusable(true)
                     .label("Reset agent config")
                     .font(rune::tok::TextStyle::new(11.5, 400.0))
                     .px(12.0)
@@ -1078,6 +1082,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                     text(if s.busy { "Saving…" } else { "Save agent" }.to_string())
                         .key("agentcfg-save")
                         .role("button")
+                        .focusable(true)
                         .label("Save agent config")
                         .font(rune::tok::TextStyle::new(11.5, 600.0))
                         .px(14.0)
@@ -1165,6 +1170,7 @@ pub fn agent_config_sheet<S: crate::rune_transcript::TranscriptHost + 'static>(
                                 .key("agentcfg-close")
                                 .size(16.0, 16.0)
                                 .role("button")
+                .focusable(true)
                                 .label("Close agents and providers")
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press(move |s: &mut S| {
@@ -1216,6 +1222,7 @@ fn picker_row<S: crate::rune_transcript::TranscriptHost + 'static>(
                 })
                 .border(1.0, ink("#ffffff1a"))
                 .role("button")
+                .focusable(true)
                 .label(format!("Pick {label}"))
                 .on_press(move |s: &mut S| {
                     let st = &mut s.thread_mut(which).agent_config;

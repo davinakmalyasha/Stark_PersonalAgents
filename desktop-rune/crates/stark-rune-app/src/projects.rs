@@ -319,6 +319,7 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
                 text(if s.loading { "…" } else { "↻" }.to_string())
                     .key("side-projects-refresh")
                     .role("button")
+                    .focusable(true)
                     .label("Refresh projects")
                     .font(rune::tok::TextStyle::new(12.0, 600.0))
                     .color(ink("#a1a1aa"))
@@ -350,6 +351,8 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
         body = body.child(
             text(err.clone())
                 .key("side-projects-error")
+                .role("alert")
+                .live_region(rune::LiveRegion::Assertive)
                 .font(rune::tok::TextStyle::new(10.0, 400.0))
                 .color(ink("#fda4af")),
         );
@@ -359,7 +362,9 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
         text(if s.new_open { "Close" } else { "+ New project" }.to_string())
             .key("side-projects-new")
             .role("button")
+            .focusable(true)
             .label("New project")
+            .help("New group project")
             .font(rune::tok::TextStyle::new(11.0, 600.0))
             .px(10.0)
             .py(6.0)
@@ -387,12 +392,22 @@ pub fn projects_section<S: ProjectsHost + 'static>(s: &ProjectsState) -> El {
                         .w_full()
                         .placeholder("Project goal…", ink("#52525b"))
                         .caret(ink("#f2f2f4"), ink("#3b82f6"))
-                        .on_edit(move |s: &mut S| &mut s.projects_mut().goal_edit),
+                        .on_edit(move |s: &mut S| &mut s.projects_mut().goal_edit)
+                        // Enter in the goal submits the form, like the dialog.
+                        .on_submit(|s: &mut S, _tx: &mut rune::Tx| {
+                            let p = s.projects_mut();
+                            if !p.creating {
+                                create_project(p);
+                                p.new_open = false;
+                                p.goal_edit.text.clear();
+                            }
+                        }),
                 )
                 .child(
                     text(if s.creating { "Creating…" } else { "Create" }.to_string())
                         .key("side-projects-create")
                         .role("button")
+                        .focusable(true)
                         .label("Create project")
                         .font(rune::tok::TextStyle::new(11.0, 600.0))
                         .px(10.0)
@@ -431,7 +446,10 @@ fn project_card<S: ProjectsHost + 'static>(prefix: &str, p: &GroupProject, compa
         .px(pad_x)
         .py(pad_y)
         .role("button")
+        .focusable(true)
         .label(format!("Open project {}", p.title))
+        .focusable(true)
+        .focus_ring(2.0, 2.0, ink("#ffffff8c"))
         .hover(ink("#ffffff0a"))
         .on_press(move |s: &mut S| {
             let projects = s.projects_mut();

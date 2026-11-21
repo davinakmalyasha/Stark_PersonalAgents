@@ -64,7 +64,10 @@ fn filter_button(
         .px(7.0)
         .radius(6.0)
         .role("tab")
-        .label(label.to_string());
+        .label(label.to_string())
+        .focusable(true)
+        .focus_selected(active)
+        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55));
     if active {
         el = el.fill(rgba(255.0, 255.0, 255.0, 0.07));
     }
@@ -155,6 +158,8 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
         .fill(ink("#ffffff"))
         .role("button")
         .label(format!("Approve {}", item.title))
+        .focusable(true)
+        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
         .child(icon(13.0, crate::lucide_check(13.0, 2.0, ink("#0a0a0d"))))
         .child(
             text(if busy {
@@ -186,6 +191,8 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
         .border_layout()
         .role("button")
         .label(format!("Reject {}", item.title))
+        .focusable(true)
+        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
         .child(icon(13.0, crate::lucide_x(13.0, 2.0, ink("#d4d4d8"))))
         .child(
             text("Reject".to_string())
@@ -342,7 +349,10 @@ fn message_body<S: ProjectsHost + 'static>(g: &GroupState, entry: &ChatEntry) ->
         },
     );
     if long && !expanded {
-        inner = inner.max_h(260.0).clip_fade(0.0, 0.0, 0.0, 40.0);
+        // `.gp-message-body.is-clamped`: `linear-gradient(180deg, #000 76%,
+        // transparent)` over 260 pt — a 62.4 pt linear ramp, not a 40 pt
+        // smoothstep.
+        inner = inner.max_h(260.0).clip_fade_linear(0.0, 0.0, 0.0, 62.4);
     }
     body = body.child(inner);
     let mut out = col().w_full().gap(0.0).child(body);
@@ -367,6 +377,8 @@ fn message_body<S: ProjectsHost + 'static>(g: &GroupState, entry: &ChatEntry) ->
             } else {
                 "Show full report"
             })
+            .focusable(true)
+            .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
             .on_press(move |s: &mut S| {
                 let g = &mut s.projects_mut().group;
                 if !g.expanded.remove(&id) {
@@ -591,7 +603,9 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                                 ))
                                 .child(
                                     text(format!("{} waiting", waiting.len()))
-                                        .font(rune::tok::TextStyle::new(9.5, 650.0))
+                                        .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                                            9.5, 650.0,
+                                        )))
                                         .color(ink("#fcd34d")),
                                 )
                         })
@@ -607,6 +621,9 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .gap(4.0)
                 .px(pad)
                 .pb(16.0)
+                .role("tablist")
+                .label("Message filters")
+                .focus_group()
                 .child(
                     filter_button(
                         "Everyone",
@@ -804,6 +821,8 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
     if let Some(error) = &g.send_error {
         composer_wrap = composer_wrap.child(
             text(error.clone())
+                .role("alert")
+                .live_region(rune::LiveRegion::Assertive)
                 .mb(6.0)
                 .px(8.0)
                 .py(6.0)
@@ -815,21 +834,38 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .color(ink("#fda4af")),
         );
     }
-    if show_menu {
+    let target_menu = if show_menu {
+        // The @ button opens the mention popup before any `@` is typed; it
+        // must still leave focus in the field. The header follows React's
+        // `mentionMatch`, which is only true for a typed `@query`.
+        let mention_mode = g.menu == Menu::Mention || mention.is_some();
         let mut menu = col()
             .key("gp-target-menu")
+            .role(if mention_mode { "listbox" } else { "menu" })
+            .label(if mention_mode {
+                "Mention an agent"
+            } else {
+                "Message target"
+            })
+            // React `.gp-target-menu`: absolute above the composer, 262 wide,
+            // max-height 270, 2 pt overlap with the composer wrap (here 6 pt
+            // clear of the 8 pt wrap padding).
+            .anchored_fit("gp-composer", rune::Side::Top, rune::Align::Start, 6.0)
             .w(262.0)
             .max_h(270.0)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .clip_rounded(11.0)
             .gap(1.0)
             .padding(4.0)
-            .mb(6.0)
             .radius(11.0)
             .border(1.0, rgba(255.0, 255.0, 255.0, 0.09))
             .border_layout()
             .fill(ink("#151515"))
             .shadow(
                 0.0,
-                18.0,
+                48.0,
                 rune::Color {
                     r: 0.0,
                     g: 0.0,
@@ -838,6 +874,16 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 },
             )
             .transition(crate::motion::menu_enter());
+        if !mention_mode {
+            // The button-opened target menu takes focus; the typed `@` popup
+            // must leave focus in the field so filtering keeps working.
+            menu =
+                menu.focus_group()
+                    .focus_return("gp-composer-target")
+                    .modal(true, |s: &mut S| {
+                        s.projects_mut().group.menu = Menu::None;
+                    });
+        }
         menu = menu.child(
             row()
                 .items_center()
@@ -879,17 +925,23 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
         for option in target_options {
             let value = option.value.clone();
             let active = g.target == option.value;
+            let mut option_row = row()
+                .w_full()
+                .items_center()
+                .gap(7.0)
+                .px(7.0)
+                .py(6.0)
+                .radius(7.0)
+                .hover(rgba(255.0, 255.0, 255.0, 0.06))
+                .role(if mention_mode { "option" } else { "menuitem" })
+                .label(format!("Send to {}", option.label))
+                .focusable(!mention_mode)
+                .focus_selected(active);
+            if !mention_mode {
+                option_row = option_row.focus_highlight(rgba(255.0, 255.0, 255.0, 0.06));
+            }
             menu = menu.child(
-                row()
-                    .w_full()
-                    .items_center()
-                    .gap(7.0)
-                    .px(7.0)
-                    .py(6.0)
-                    .radius(7.0)
-                    .hover(rgba(255.0, 255.0, 255.0, 0.06))
-                    .role("menuitem")
-                    .label(format!("Send to {}", option.label))
+                option_row
                     .on_press({
                         let value = value.clone();
                         move |s: &mut S| {
@@ -945,8 +997,10 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                     }),
             );
         }
-        composer_wrap = composer_wrap.child(menu);
-    }
+        Some(menu)
+    } else {
+        None
+    };
 
     let send_enabled = !g.draft.text.trim().is_empty() && !g.sending;
     let target_value = g.target.clone();
@@ -958,10 +1012,14 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
         .padding(5.0)
         .radius(12.0)
         .border(1.0, rgba(255.0, 255.0, 255.0, 0.09))
+        // `.gp-composer:focus-within` border .19 (background .17 cannot be
+        // toggled by Rune's focus-within paint).
+        .focus_within_ring(1.0, -1.0, rgba(255.0, 255.0, 255.0, 0.19))
         .border_layout()
         .fill(ink("#141414"))
         .child(
             row()
+                .key("gp-composer-target")
                 .items_center()
                 .gap(4.0)
                 .h(26.0)
@@ -972,6 +1030,8 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .fill(rgba(255.0, 255.0, 255.0, 0.035))
                 .role("button")
                 .label("Choose message target")
+                .focusable(true)
+                .focus_ring(1.0, 1.0, rgba(255.0, 255.0, 255.0, 0.5))
                 .on_press(move |s: &mut S| {
                     let g = &mut s.projects_mut().group;
                     g.menu = if g.menu == Menu::Target {
@@ -1007,8 +1067,16 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         .hover(ink("#ffffff0f"))
                         .role("button")
                         .label("Mention an agent")
+                        .help("Mention an agent")
+                        .focusable(true)
+                        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
+                        // React re-focuses the textarea after opening the @
+                        // menu; keep the field's model focus.
+                        .preserve_focus_on_press(true)
                         .on_press(|s: &mut S| {
-                            s.projects_mut().group.menu = Menu::Mention;
+                            let g = &mut s.projects_mut().group;
+                            g.menu = Menu::Mention;
+                            g.draft.focused = true;
                         })
                         .child(icon(13.0, crate::icons::at_sign(13.0, ink("#6f727b")))),
                 )
@@ -1030,6 +1098,16 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                     .on_edit(move |s: &mut S| &mut s.projects_mut().group.draft)
                     .on_submit(|s: &mut S, _tx: &mut rune::Tx| {
                         s.projects_mut().group.send();
+                    })
+                    // React closes the @/target popup on Escape; the field
+                    // keeps focus, so typing never stops.
+                    .on_key(|s: &mut S, key, _tx| {
+                        if key.key == rune::Key::Escape {
+                            s.projects_mut().group.menu = Menu::None;
+                            true
+                        } else {
+                            false
+                        }
                     }),
                 ),
         )
@@ -1046,6 +1124,8 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 })
                 .role("button")
                 .label("Send message")
+                .focusable(true)
+                .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
                 .on_press(move |s: &mut S| {
                     s.projects_mut().group.send();
                 })
@@ -1079,6 +1159,11 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                     .color(ink("#4f525a")),
             ),
     );
+    // Mounted after the trigger so `anchored_fit` can find it earlier in the
+    // flattened tree; absolute positioning keeps it out of the composer flow.
+    if let Some(menu) = target_menu {
+        composer_wrap = composer_wrap.child(menu);
+    }
 
     col()
         .key("gp-chat")

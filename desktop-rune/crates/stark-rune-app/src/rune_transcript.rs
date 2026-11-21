@@ -809,6 +809,10 @@ pub struct RuneTranscriptState {
     /// CSS entrance on rows the user has already seen. React animates a message
     /// once, on mount, and never again.
     pub seen_rows: std::collections::HashSet<String>,
+    /// Bumped whenever code-copy or diff-expand state changes. Markdown bodies
+    /// are memoized on this, so a check icon or an expanded diff rebuilds the
+    /// block without rebuilding every other message body.
+    pub body_rev: u64,
 }
 
 impl std::fmt::Debug for RuneTranscriptState {
@@ -915,6 +919,7 @@ impl Clone for RuneTranscriptState {
             refresh_list: self.refresh_list,
             pending_rekey: self.pending_rekey.clone(),
             seen_rows: self.seen_rows.clone(),
+            body_rev: self.body_rev,
         }
     }
 }
@@ -1017,6 +1022,7 @@ impl RuneTranscriptState {
             refresh_list: false,
             pending_rekey: None,
             seen_rows: std::collections::HashSet::new(),
+            body_rev: 0,
         }
     }
 
@@ -1098,6 +1104,7 @@ impl RuneTranscriptState {
             refresh_list: false,
             pending_rekey: None,
             seen_rows: std::collections::HashSet::new(),
+            body_rev: 0,
         }
     }
 
@@ -1955,6 +1962,22 @@ fn raw_of(row: &RowData) -> &str {
     }
 }
 
+/// FNV-1a over the row keys, with a separator between keys. A cheap version
+/// for `virtual_rows_version`: any append, replace or reorder changes it, so
+/// Rune may skip calling `key` for every row without risking stale keys.
+fn row_keys_fingerprint(rows: &[RowData]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for row in rows {
+        for &b in row.key.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// `MessageBubble`'s `src`: the persisted URL or the chat attachment endpoint.
 /// The native image cache can also decode the upload's local path.
 fn attachment_has_src(s: &RuneTranscriptState, file: &ChatAttachment) -> bool {
@@ -2024,6 +2047,7 @@ fn home_message_attachments<S: TranscriptHost + 'static>(
             let mut button = rune::el()
                 .key(key.clone())
                 .role("button")
+                .focusable(true)
                 .label(format!("Open {}", file.name))
                 .size(86.0, 66.0)
                 .radius(9.0)
@@ -2256,6 +2280,7 @@ pub fn attachment_lightbox<S: 'static>(
                 .key("message-lightbox-close")
                 .pin(None, Some(18.0), Some(18.0), None)
                 .role("button")
+                .focusable(true)
                 .label("Close image preview")
                 .size(34.0, 34.0)
                 .radius(10.0)
@@ -2825,6 +2850,8 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             ],
         )
         .border(1.0, home_ink("#ffffff17"))
+        // `.user-message-premium`: inset top-light over the gradient.
+        .box_shadow(crate::motion::inset_top_light(0.04))
         .border_layout()
         .px(16.0)
         .py(10.0)
@@ -2865,7 +2892,9 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
         rune::el()
             .key(format!("{}-copy", r.key))
             .role("button")
+            .focusable(true)
             .label(if copied { "Copied" } else { "Copy message" })
+            .help(if copied { "Copied" } else { "Copy message" })
             .size(24.0, 24.0)
             .radius(6.0)
             .center()
@@ -2894,6 +2923,7 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             row()
                 .key(format!("{}-rewind", r.key))
                 .role("button")
+                .focusable(true)
                 .label("Confirm rewind")
                 .items_center()
                 .gap(4.0)
@@ -2931,7 +2961,9 @@ fn home_user_row<S: TranscriptHost + 'static>(s: &S, which: Thread, r: &RowData,
             rune::el()
                 .key(format!("{}-rewind", r.key))
                 .role("button")
+                .focusable(true)
                 .label("Rewind to this message")
+                .focus_ring(2.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
                 .size(24.0, 24.0)
                 .radius(6.0)
                 .center()
@@ -3351,7 +3383,9 @@ fn artifact_panel<S: TranscriptHost + 'static>(
     let mut undo_btn = row()
         .key(format!("{row_key}-artifact-undo"))
         .role("button")
+        .focusable(true)
         .label(format!("{undo_label} this run"))
+        .focus_ring(2.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
         .items_center()
         .gap(6.0)
         .px(12.0)
@@ -3542,7 +3576,9 @@ fn artifact_panel<S: TranscriptHost + 'static>(
                             text("Review".to_string())
                                 .key(format!("{row_key}-artifact-review"))
                                 .role("button")
+                                .focusable(true)
                                 .label("Review changed files")
+                                .focus_ring(2.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
                                 .px(12.0)
                                 .py(6.0)
                                 .radius(8.0)
@@ -3562,11 +3598,13 @@ fn artifact_panel<S: TranscriptHost + 'static>(
             row()
                 .key(format!("{row_key}-artifact-more"))
                 .role("button")
+                .focusable(true)
                 .label(if expanded {
                     "Show fewer files"
                 } else {
                     "Show more files"
                 })
+                .focus_ring(2.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
                 .w_full()
                 .justify_center()
                 .items_center()
@@ -3815,6 +3853,7 @@ fn artifact_review_overlay<S: TranscriptHost + 'static>(
                                 .key("artifact-review-close")
                                 .size(16.0, 16.0)
                                 .role("button")
+                                .focusable(true)
                                 .label("Close review")
                                 .shape(crate::lucide_x(16.0, 2.0, home_ink("#8a8a93")))
                                 .on_press(move |s: &mut S| {
@@ -3889,6 +3928,7 @@ fn home_agent_actions<S: TranscriptHost + 'static>(
             rune::el()
                 .key(format!("{}-retry", r.key))
                 .role("button")
+                .focusable(true)
                 .label("Retry — re-run the last request")
                 .size(25.0, 25.0)
                 .radius(6.0)
@@ -3914,6 +3954,7 @@ fn home_agent_actions<S: TranscriptHost + 'static>(
         rune::el()
             .key(format!("{}-copy", r.key))
             .role("button")
+            .focusable(true)
             .label("Copy to clipboard")
             .size(25.0, 25.0)
             .radius(6.0)
@@ -3988,6 +4029,7 @@ fn home_error_row<S: TranscriptHost + 'static>(
     let retry = row()
         .key(format!("{}-retry", r.key))
         .role("button")
+        .focusable(true)
         .label("Retry")
         .items_center()
         .gap(4.0)
@@ -4020,6 +4062,7 @@ fn home_error_row<S: TranscriptHost + 'static>(
     let copy = row()
         .key(format!("{}-copy", r.key))
         .role("button")
+        .focusable(true)
         .label(if copied { "Copied" } else { "Copy" })
         .items_center()
         .gap(4.0)
@@ -4225,6 +4268,7 @@ fn home_session_event<S: TranscriptHost + 'static>(
             row()
                 .key(format!("{}-retry", r.key))
                 .role("button")
+                .focusable(true)
                 .label("Retry")
                 .items_center()
                 .gap(3.0)
@@ -4258,6 +4302,8 @@ fn home_session_event<S: TranscriptHost + 'static>(
     }
     row()
         .key(format!("{}-session-event", r.key))
+        .role("status")
+        .live_region(rune::LiveRegion::Polite)
         .w_full()
         .items_center()
         .gap(10.0)
@@ -4326,7 +4372,6 @@ fn home_row<S: TranscriptHost + 'static>(
     let retry_prompt = meta.retry_prompts[i].clone();
     // The day divider stays put; the entrance belongs to the message group.
     let entrance = row_entrance(r, &t.seen_rows);
-    let seen_key = r.key.clone();
     let mut group = if !r.event.is_empty() {
         home_session_event::<S>(r, which, &retry_prompt)
     } else {
@@ -4338,13 +4383,8 @@ fn home_row<S: TranscriptHost + 'static>(
         }
     };
     if let Some(entrance) = entrance {
-        group = group
-            .transition(entrance)
-            .on_visible(move |s: &mut S, on, _tx| {
-                if on {
-                    s.thread_mut(which).seen_rows.insert(seen_key.clone());
-                }
-            });
+        // Seen bookkeeping runs once for the whole visible range on the list.
+        group = group.transition(entrance);
     }
     root.child(group)
 }
@@ -4494,6 +4534,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
             rune::el()
                 .key("subagent-view-back")
                 .role("button")
+                .focusable(true)
                 .label("Back to main session")
                 .size(30.0, 30.0)
                 .radius(8.0)
@@ -4518,6 +4559,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                     text(parent_title)
                         .key("subagent-view-parent")
                         .role("button")
+                        .focusable(true)
                         .label("Back to main session")
                         .font(rune::tok::TextStyle::new(12.0, 400.0))
                         .color(home_ink("#777982"))
@@ -4617,6 +4659,7 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
                 text("Try again".to_string())
                     .key("subagent-view-retry")
                     .role("button")
+                    .focusable(true)
                     .label("Retry opening child chat")
                     .font(rune::tok::TextStyle::new(11.5, 400.0))
                     .color(home_ink("#c7c8ce"))
@@ -4782,168 +4825,199 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                 ),
         )
     } else {
-        stack.virtual_rows(
-            s.rows.len() + voice_extra,
-            ESTIMATED_ROW_H,
-            // Typed to the window state `S` (Rune checks the registration):
-            // read rows through the host, never by closing over `s`.
-            move |s: &S, i| {
-                if i < s.thread(which).rows.len() {
-                    Cow::Borrowed(s.thread(which).rows[i].key.as_str())
-                } else {
-                    // React's stable `voice-live-input` id for the interim
-                    // bubble (overwritten in place per `transcript` event).
-                    Cow::Owned("voice-live-input".to_string())
-                }
-            },
-            move |s: &S, i| {
-                let t = s.thread(which);
-                if i >= t.rows.len() {
-                    // Trailing interim dictation bubble (no meta entry, no
-                    // actions — like React's plain live bubble).
-                    return voice_live_bubble::<S>(s, which, &t.voice.live_text, home_max_w);
-                }
-                if let Some(meta) = &home_rows {
-                    return home_row::<S>(s, which, i, meta, home_max_w);
-                }
-                // Live row: the streaming agent row (last, non-user, non-error)
-                // while a run is in flight. Mirrors
-                // `.canvas-bubble-row.is-live .canvas-bubble` (`#1b1b20`, .10
-                // hairline) plus the 3-dot `.canvas-bubble-typing` bounce
-                // (1.1s period, .14s stagger).
-                let live_row = t.live
-                    && i + 1 == t.rows.len()
-                    && t.rows[i].role != "user"
-                    && t.rows[i].role != "error";
-                let r = &s.thread(which).rows[i];
-                // Role palette from `canvas.css` `.canvas-bubble*`: per-role
-                // fills, hairlines (agent .05 / user .075 / live .10), and
-                // the translucent rose error system; 22px avatars, 11px/650
-                // `#f0f0f3` name headers, role-tinted 12.5px bodies
-                // (`#dedee5` user, `#d2d2da` agent).
-                let (fill, hair_a, avatar_bg, initial, initial_ink, name, body_ink) = match r.role {
-                    "user" => (
-                        "#28282f", 0.075, "#303038", "Y", "#e6e6ec", "You", "#dedee5",
-                    ),
-                    "error" => (
-                        "#fb718511",
-                        0.24,
-                        "#3a2226",
-                        "!",
-                        "#f0f0f3",
-                        "Error",
-                        "#d2d2da",
-                    ),
-                    "system" => (
-                        "#101013", 0.05, "#24242a", "S", "#c9c9d1", "System", "#d2d2da",
-                    ),
-                    _ => (
-                        "#19191e", 0.05, "#24242a", "A", "#c9c9d1", "Agent", "#d2d2da",
-                    ),
-                };
-                let ink = |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
-                let hairline = if live_row {
-                    rune::Color {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.10,
+        stack
+            .virtual_rows(
+                s.rows.len() + voice_extra,
+                ESTIMATED_ROW_H,
+                // Typed to the window state `S` (Rune checks the registration):
+                // read rows through the host, never by closing over `s`.
+                move |s: &S, i| {
+                    if i < s.thread(which).rows.len() {
+                        Cow::Borrowed(s.thread(which).rows[i].key.as_str())
+                    } else {
+                        // React's stable `voice-live-input` id for the interim
+                        // bubble (overwritten in place per `transcript` event).
+                        Cow::Owned("voice-live-input".to_string())
                     }
-                } else if r.role == "error" {
-                    rune::color::hex("#fb71853d").unwrap_or(rune::Color::BLACK)
-                } else {
-                    rune::Color {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: hair_a,
+                },
+                move |s: &S, i| {
+                    let t = s.thread(which);
+                    if i >= t.rows.len() {
+                        // Trailing interim dictation bubble (no meta entry, no
+                        // actions — like React's plain live bubble).
+                        return voice_live_bubble::<S>(s, which, &t.voice.live_text, home_max_w);
                     }
-                };
-                let name_style = rune::tok::TextStyle::new(11.0, 650.0);
-                let initial_style = rune::tok::TextStyle::new(9.5, 700.0);
-                let bubble = col()
-                    .key(format!("{}-bubble", r.key))
-                    .radius(14.0)
-                    .fill(ink(if live_row { "#1b1b20" } else { fill }))
-                    .border(1.0, hairline)
-                    .px(13.0)
-                    .py(10.0)
-                    .child(
-                        text(name.to_string())
-                            .key(format!("{}-name", r.key))
-                            .font(name_style)
-                            .color(ink("#f0f0f3")),
-                    )
-                    .child(render_body::<S>(s, which, &r.key, &r.body, body_ink));
-                // Bubble foot (`canvas-bubble-foot`): `hh:MM AM/PM`, nothing
-                // else — copy/rewind need clipboard + server endpoints Rune
-                // has no target for, so they stay out (documented, not faked).
-                let bubble = match clock(&r.at) {
-                    t if t.is_empty() => bubble,
-                    t => bubble.child(
-                        text(t)
-                            .key(format!("{}-time", r.key))
-                            .font(rune::tok::TextStyle::new(10.0, 400.0))
-                            .color(ink("#71717a")),
-                    ),
-                };
-                // Typing bounce on the live row only (`.canvas-bubble-typing`).
-                let bubble = if live_row {
-                    let mut dots = row()
-                        .key(format!("{}-typing", r.key))
-                        .items_center()
-                        .gap(3.0)
-                        .pt(4.0);
-                    for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
-                        dots = dots.child(
-                            rune::el()
-                                .key(format!("{}-typing-{n}", r.key))
-                                .size(3.0, 3.0)
-                                .radius(1.5)
-                                .fill(ink("#9b9ba5"))
-                                .looping(rune::LoopSpec::opacity(1.1, delay, 0.35, 1.0)),
-                        );
+                    if let Some(meta) = &home_rows {
+                        return home_row::<S>(s, which, i, meta, home_max_w);
                     }
-                    bubble.child(dots)
-                } else {
-                    bubble
-                };
-                let bubble = if r.role == "user" {
-                    // Content-sized (no `grow`) + `justify_end` row hugs right
-                    // like `.canvas-bubble-row.is-user`. `max_w` bounds the
-                    // wrap: 468 viewport − 24 stack px − 22 avatar − 8 gap.
-                    // Without it the bubble measures max-content and overflows.
-                    bubble.max_w(414.0)
-                } else {
-                    bubble.grow(1.0).min_h(0.0)
-                };
-                let message = row()
-                    .key(r.key.clone())
-                    .role("bubble")
-                    .label(r.role.to_string())
-                    .w_full()
-                    .gap(8.0)
-                    .child(
-                        rune::el()
-                            .key(format!("{}-avatar", r.key))
-                            .size(22.0, 22.0)
-                            .radius(11.0)
-                            .fill(ink(avatar_bg))
-                            .center()
-                            .child(
-                                text(initial.to_string())
-                                    .font(initial_style)
-                                    .color(ink(initial_ink)),
+                    // Live row: the streaming agent row (last, non-user, non-error)
+                    // while a run is in flight. Mirrors
+                    // `.canvas-bubble-row.is-live .canvas-bubble` (`#1b1b20`, .10
+                    // hairline) plus the 3-dot `.canvas-bubble-typing` bounce
+                    // (1.1s period, .14s stagger).
+                    let live_row = t.live
+                        && i + 1 == t.rows.len()
+                        && t.rows[i].role != "user"
+                        && t.rows[i].role != "error";
+                    let r = &s.thread(which).rows[i];
+                    // Role palette from `canvas.css` `.canvas-bubble*`: per-role
+                    // fills, hairlines (agent .05 / user .075 / live .10), and
+                    // the translucent rose error system; 22px avatars, 11px/650
+                    // `#f0f0f3` name headers, role-tinted 12.5px bodies
+                    // (`#dedee5` user, `#d2d2da` agent).
+                    let (fill, hair_a, avatar_bg, initial, initial_ink, name, body_ink) =
+                        match r.role {
+                            "user" => (
+                                "#28282f", 0.075, "#303038", "Y", "#e6e6ec", "You", "#dedee5",
                             ),
-                    )
-                    .child(bubble);
-                if r.role == "user" {
-                    message.justify_end()
-                } else {
-                    message
+                            "error" => (
+                                "#fb718511",
+                                0.24,
+                                "#3a2226",
+                                "!",
+                                "#f0f0f3",
+                                "Error",
+                                "#d2d2da",
+                            ),
+                            "system" => (
+                                "#101013", 0.05, "#24242a", "S", "#c9c9d1", "System", "#d2d2da",
+                            ),
+                            _ => (
+                                "#19191e", 0.05, "#24242a", "A", "#c9c9d1", "Agent", "#d2d2da",
+                            ),
+                        };
+                    let ink =
+                        |hex: &'static str| rune::color::hex(hex).unwrap_or(rune::Color::BLACK);
+                    let hairline = if live_row {
+                        rune::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 0.10,
+                        }
+                    } else if r.role == "error" {
+                        rune::color::hex("#fb71853d").unwrap_or(rune::Color::BLACK)
+                    } else {
+                        rune::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: hair_a,
+                        }
+                    };
+                    let name_style = rune::tok::TextStyle::new(11.0, 650.0);
+                    let initial_style = rune::tok::TextStyle::new(9.5, 700.0);
+                    let bubble = col()
+                        .key(format!("{}-bubble", r.key))
+                        .radius(14.0)
+                        .fill(ink(if live_row { "#1b1b20" } else { fill }))
+                        .border(1.0, hairline)
+                        .px(13.0)
+                        .py(10.0)
+                        .child(
+                            text(name.to_string())
+                                .key(format!("{}-name", r.key))
+                                .font(name_style)
+                                .color(ink("#f0f0f3")),
+                        )
+                        .child(render_body::<S>(s, which, &r.key, &r.body, body_ink));
+                    // Bubble foot (`canvas-bubble-foot`): `hh:MM AM/PM`, nothing
+                    // else. The compact card bubble stays display-only; the
+                    // full transcript owns copy/rewind, as React's card does.
+                    let bubble = match clock(&r.at) {
+                        t if t.is_empty() => bubble,
+                        t => bubble.child(
+                            text(t)
+                                .key(format!("{}-time", r.key))
+                                .font(rune::tok::TextStyle::new(10.0, 400.0))
+                                .color(ink("#71717a")),
+                        ),
+                    };
+                    // Typing bounce on the live row only (`.canvas-bubble-typing`).
+                    let bubble = if live_row {
+                        let mut dots = row()
+                            .key(format!("{}-typing", r.key))
+                            .items_center()
+                            .gap(3.0)
+                            .pt(4.0);
+                        for (n, delay) in [0.0, 0.14, 0.28].into_iter().enumerate() {
+                            dots = dots.child(
+                                rune::el()
+                                    .key(format!("{}-typing-{n}", r.key))
+                                    .size(3.0, 3.0)
+                                    .radius(1.5)
+                                    .fill(ink("#9b9ba5"))
+                                    .looping(rune::LoopSpec::opacity(1.1, delay, 0.35, 1.0)),
+                            );
+                        }
+                        bubble.child(dots)
+                    } else {
+                        bubble
+                    };
+                    let bubble = if r.role == "user" {
+                        // Content-sized (no `grow`) + `justify_end` row hugs right
+                        // like `.canvas-bubble-row.is-user`. `max_w` bounds the
+                        // wrap: 468 viewport − 24 stack px − 22 avatar − 8 gap.
+                        // Without it the bubble measures max-content and overflows.
+                        bubble.max_w(414.0)
+                    } else {
+                        bubble.grow(1.0).min_h(0.0)
+                    };
+                    let message = row()
+                        .key(r.key.clone())
+                        .role("bubble")
+                        .label(r.role.to_string())
+                        .w_full()
+                        .gap(8.0)
+                        .child(
+                            rune::el()
+                                .key(format!("{}-avatar", r.key))
+                                .size(22.0, 22.0)
+                                .radius(11.0)
+                                .fill(ink(avatar_bg))
+                                .center()
+                                .child(
+                                    text(initial.to_string())
+                                        .font(initial_style)
+                                        .color(ink(initial_ink)),
+                                ),
+                        )
+                        .child(bubble);
+                    if r.role == "user" {
+                        message.justify_end()
+                    } else {
+                        message
+                    }
+                },
+            )
+            // Skip the per-row key calls when the key sequence cannot have
+            // changed. The fingerprint catches appends, same-count
+            // replacements and reorders; the chat id catches a thread swap.
+            .virtual_rows_version({
+                let thread = match which {
+                    Thread::Main => "main",
+                    Thread::Open => "open",
+                };
+                (
+                    thread,
+                    s.rows.len(),
+                    row_keys_fingerprint(&s.rows),
+                    s.chat_id.as_str(),
+                )
+            })
+            // One callback for the visible range, instead of one handler per row:
+            // mark rows seen in a single pass and rerun only when a new key shows.
+            .on_visible_rows(move |s: &mut S, range| {
+                let t = s.thread_mut(which);
+                let mut changed = false;
+                for i in range {
+                    let Some(row) = t.rows.get(i) else { continue };
+                    if t.seen_rows.insert(row.key.clone()) {
+                        changed = true;
+                    }
                 }
-            },
-        )
+                changed
+            })
     };
     // Bounded root (window height) + growing viewport: the viewport takes the
     // free space between title and composer instead of pushing the composer
@@ -5001,6 +5075,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                     text("Settings".to_string())
                         .key("settings-open")
                         .role("button")
+                        .focusable(true)
                         .label("Open settings")
                         .font(rune::tok::TextStyle::new(11.0, 500.0))
                         .color(rune::color::hex("#8a8a93").unwrap_or(rune::Color::BLACK))
@@ -5035,6 +5110,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                 row()
                     .key("scroll-bottom-pill")
                     .role("button")
+                    .focusable(true)
                     .label("Jump to latest")
                     .items_center()
                     .gap(6.0)
@@ -5386,6 +5462,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                                 .key("voice-close")
                                 .size(16.0, 16.0)
                                 .role("button")
+                                .focusable(true)
                                 .label("Close voice input")
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press(move |s: &mut S| {
@@ -5411,6 +5488,7 @@ pub fn voice_overlay<S: TranscriptHost + 'static>(s: &RuneTranscriptState, which
                     })
                     .key("voice-stop")
                     .role("button")
+                    .focusable(true)
                     .label(if live {
                         "Stop voice input"
                     } else {
@@ -5621,6 +5699,7 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, clock: f64, tx: &mut rune::T
     {
         s.copied_code = None;
         s.copied_at = None;
+        s.body_rev = s.body_rev.wrapping_add(1);
         changed = true;
     }
     // Message copy (1.5s) and rewind arming (3.2s) are simple expiries.
@@ -6996,6 +7075,20 @@ mod tests {
         assert!(rt.find("t1-b0-thead").is_some(), "header placed");
         assert!(rt.find("t1-b0-tr-0").is_some(), "first row placed");
         assert!(rt.find("t1-b0-tr-1").is_some(), "second row placed");
+    }
+
+    #[test]
+    fn row_key_fingerprint_detects_reorder_and_same_count_replacement() {
+        let row = |key: &str| RowData {
+            key: key.to_string(),
+            ..RowData::default()
+        };
+        let ab = [row("a"), row("b")];
+        let ba = [row("b"), row("a")];
+        let ac = [row("a"), row("c")];
+        assert_ne!(row_keys_fingerprint(&ab), row_keys_fingerprint(&ba));
+        assert_ne!(row_keys_fingerprint(&ab), row_keys_fingerprint(&ac));
+        assert_eq!(row_keys_fingerprint(&ab), row_keys_fingerprint(&ab));
     }
 
     #[test]

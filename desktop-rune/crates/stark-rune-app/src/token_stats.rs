@@ -90,7 +90,9 @@ pub fn token_summary(usage: &UsageTotals, model: &str) -> El {
             )
             .child(
                 text(value)
-                    .font(rune::tok::TextStyle::new(15.0, 600.0))
+                    .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                        15.0, 600.0,
+                    )))
                     .color(ink("#f4f4f5")),
             )
             .child(
@@ -137,7 +139,9 @@ pub fn token_summary(usage: &UsageTotals, model: &str) -> El {
                                 .child(
                                     text(format!("${:.5}", usage.cost))
                                         .key("stats-cost")
-                                        .font(rune::tok::TextStyle::new(28.0, 600.0))
+                                        .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                                            28.0, 600.0,
+                                        )))
                                         .color(ink("#fafafa")),
                                 )
                                 .child(
@@ -160,7 +164,9 @@ pub fn token_summary(usage: &UsageTotals, model: &str) -> El {
                                     "calls"
                                 }
                             ))
-                            .font(rune::tok::TextStyle::new(11.0, 400.0))
+                            .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                                11.0, 400.0,
+                            )))
                             .color(ink("#71717a")),
                         )
                         .child(
@@ -506,6 +512,7 @@ pub fn stats_sheet<S: 'static>(
                                 .key("stats-close")
                                 .size(16.0, 16.0)
                                 .role("button")
+                                .focusable(true)
                                 .label("Close usage")
                                 .shape(crate::lucide_x(16.0, 2.0, ink("#8a8a93")))
                                 .on_press({

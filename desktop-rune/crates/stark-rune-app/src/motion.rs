@@ -269,6 +269,29 @@ pub fn hover_replace(base: Color, target: Color, backdrop: Color) -> Color {
 /// by the nearest hover group. Rune's `Shape` carries its own stroke colours,
 /// so `group_color` cannot tint it; this is the compositing-equivalent pattern
 /// already used by the rail and Settings icons.
+/// CSS `font-variant-numeric: tabular-nums` as Rune's OpenType features.
+pub fn tabular(mut style: rune::tok::TextStyle) -> rune::tok::TextStyle {
+    style.features = "'tnum' 1";
+    style
+}
+
+/// CSS `0 1px 0 rgba(255,255,255,a) inset`: the top-light Stark surfaces share.
+pub fn inset_top_light(a: f32) -> rune::Shadow {
+    rune::Shadow {
+        x: 0.0,
+        y: 1.0,
+        blur: 0.0,
+        spread: 0.0,
+        color: Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a,
+        },
+        inset: true,
+    }
+}
+
 pub fn hover_icon(size: f32, base: rune::Shape, hovered: rune::Shape) -> El {
     rune::el()
         .size(size, size)

@@ -570,14 +570,28 @@ pub(super) fn render_body_styled<S: TranscriptHost + 'static>(
     _body_ink: &'static str,
     body_style: TextStyle,
 ) -> El {
-    let blocks = parse_cached(body);
-    if blocks.is_empty() {
-        return col().key(format!("{key}-md"));
-    }
-    let body_color = ink(_body_ink);
-    blocks_inner::<S>(
-        s, which, key, &blocks, body_style, 0, false, false, body_color, false, false,
-    )
+    // A message body is the expensive subtree: markdown parse, syntax spans,
+    // text shaping and dozens of handlers. Memoize it per row and rebuild only
+    // when its source, style, or code-copy/diff UI state changes. Theme and
+    // scale are part of Rune's memo environment already.
+    // The memo id becomes the root key (Rune reuses the subtree by it), so
+    // use the key the block column already had. Style and copy/diff state are
+    // in the version; the memo scope separates home, sheet and drill trees.
+    let id = format!("{key}-blocks");
+    let version = (body, _body_ink, body_style, s.thread(which).body_rev);
+    rune::memo(id, version, || {
+        let blocks = parse_cached(body);
+        if blocks.is_empty() {
+            return col().key(format!("{key}-md"));
+        }
+        let body_color = ink(_body_ink);
+        blocks_inner::<S>(
+            s, which, key, &blocks, body_style, 0, false, false, body_color, false, false,
+        )
+        // One selection across the message's paragraphs and code blocks, as
+        // a browser selects a message's DOM subtree.
+        .selection_group(true)
+    })
 }
 
 /// Standalone markdown for surfaces outside the transcript (group chat and
@@ -607,6 +621,7 @@ pub(crate) fn render_body_standalone(
         false,
         false,
     )
+    .selection_group(true)
 }
 
 /// `.markdown-compact`: activity notes (12.5pt / 1.7, 4pt paragraphs).
@@ -1062,6 +1077,9 @@ fn code_block<S: TranscriptHost + 'static>(
         .key(copy_key.clone())
         .role("button")
         .label("Copy code")
+        .help("Copy code")
+        .focusable(true)
+        .focus_ring(2.0, 2.0, ink("#ffffffb3"))
         .size(25.0, 25.0)
         .radius(6.0)
         .center()
@@ -1074,6 +1092,7 @@ fn code_block<S: TranscriptHost + 'static>(
             let t = s.thread_mut(which);
             t.copied_code = Some(copy_key.clone());
             t.copied_at = Some(crate::clock::now_millis());
+            t.body_rev = t.body_rev.wrapping_add(1);
             tx.copy(code_owned.clone());
             tx.wake_after(std::time::Duration::from_millis(1800));
         });
@@ -1359,6 +1378,9 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
             row()
                 .key(toggle_key.clone())
                 .role("button")
+                .label(label.clone())
+                .focusable(true)
+                .focus_ring(2.0, 2.0, ink("#ffffffb3"))
                 .w_full()
                 .items_center()
                 .justify_center()
@@ -1374,10 +1396,12 @@ fn diff<S: TranscriptHost + 'static>(s: &S, which: Thread, key: &str, raw: &str)
                 )))
                 .child(text(label).font(label_style).color(ink("#818cf8")))
                 .on_press(move |s: &mut S| {
-                    let set = &mut s.thread_mut(which).expanded_diffs;
-                    if !set.remove(&toggle_key) {
-                        set.insert(toggle_key.clone());
+                    let t = s.thread_mut(which);
+                    let expanded = &mut t.expanded_diffs;
+                    if !expanded.remove(&toggle_key) {
+                        expanded.insert(toggle_key.clone());
                     }
+                    t.body_rev = t.body_rev.wrapping_add(1);
                 }),
         );
     }

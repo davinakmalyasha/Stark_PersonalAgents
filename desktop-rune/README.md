@@ -115,6 +115,14 @@ real navigation. The trace accordion now fades and clips its body inside a
 280 ms growth-row fold on close instead of dropping it. Details and the
 deterministic fixture are in `parity/README.md`.
 
+Rune is also used where CSS names do not map one-to-one: `box_shadow` layers
+for the full canvas-card stack, `anchored_fit` for the model/usage/group
+popups, `memo` for unchanged markdown bodies, `on_visible_rows` +
+`virtual_rows_version` for the transcript window, native `help` tooltips,
+focus groups/rings, live regions and `selection_group`. The remaining honest
+boundaries (focus-within shadow swaps, `mask-composite` sweeps, cross-message
+selection while virtualized) are listed in `parity/README.md`.
+
 ## Transcript (MessageStream port)
 
 - Pure math: `crates/stark-kit/src/transcript.rs` — role-based height

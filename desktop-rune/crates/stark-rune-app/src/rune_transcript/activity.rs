@@ -274,7 +274,9 @@ pub(super) fn activity_timeline<S: TranscriptHost + 'static>(
                 let header = row()
                     .key(format!("{row_key}-{group_key}-head"))
                     .role("button")
+                    .focusable(true)
                     .label(format!("{title} details"))
+                    .focus_ring(1.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
                     .w_full()
                     .items_center()
                     .gap(7.0)
@@ -434,11 +436,13 @@ fn tool_event_detail<S: TranscriptHost + 'static>(
     let mut title = row()
         .key(format!("{row_key}-{item_key}-row"))
         .role("button")
+        .focusable(true)
         .label(format!(
             "{verb}{}{}",
             if subject.is_empty() { "" } else { " " },
             subject
         ))
+        .focus_ring(1.0, 1.0, home_rgba(255.0, 255.0, 255.0, 0.65))
         .w_full()
         .items_center()
         .gap(7.0)
@@ -709,6 +713,7 @@ fn tool_panel<S: TranscriptHost + 'static>(
         rune::el()
             .key(format!("{key}-copy"))
             .role("button")
+            .focusable(true)
             .label("Copy tool details")
             .size(22.0, 22.0)
             .radius(5.0)
@@ -1042,7 +1047,9 @@ fn delegation_card<S: TranscriptHost + 'static>(
     if let Some((child_id, label, workspace)) = drill {
         card = card
             .role("button")
+            .focusable(true)
             .label(format!("Open {name} subagent session"))
+            .focus_ring(1.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
             .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
             .on_press(move |s: &mut S| {
                 // Workspace hint resolves inside `open_subagent` (explicit
@@ -1091,7 +1098,9 @@ pub(super) fn trace_accordion<S: TranscriptHost + 'static>(
     let header = row()
         .key(format!("{}-trace-head", r.key))
         .role("button")
+        .focusable(true)
         .label(format!("{duration} activity details"))
+        .focus_ring(1.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
         .w_full()
         .h(42.0)
         .items_center()
@@ -1356,7 +1365,9 @@ fn delegation_step_card<S: TranscriptHost + 'static>(
     if let Some((child_id, label, workspace)) = drill {
         card = card
             .role("button")
+            .focusable(true)
             .label(format!("Open {name} subagent session"))
+            .focus_ring(1.0, 2.0, home_rgba(255.0, 255.0, 255.0, 0.7))
             .hover(home_rgba(255.0, 255.0, 255.0, 0.06))
             .on_press(move |s: &mut S| {
                 super::open_subagent(s.thread_mut(which), &child_id, &label, workspace.as_deref());
@@ -1456,6 +1467,8 @@ pub(super) fn retry_status(key: &str, retry: &RetryNotice) -> El {
     }
     row()
         .key(format!("{key}-retry"))
+        .role("status")
+        .live_region(rune::LiveRegion::Polite)
         .w_full()
         .max_w(520.0)
         .transition(crate::motion::retry_enter())
@@ -1604,6 +1617,8 @@ pub(super) fn live_compaction_status(key: &str, status: &RunStatusNotice) -> El 
     }
     row()
         .key(format!("{key}-compaction"))
+        .role("status")
+        .live_region(rune::LiveRegion::Polite)
         .w_full()
         .items_center()
         .gap(10.0)

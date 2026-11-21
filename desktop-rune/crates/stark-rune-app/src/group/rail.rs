@@ -117,7 +117,9 @@ fn resolve_button<S: ProjectsHost + 'static>(
             format!("Approve {}", item.title)
         } else {
             format!("Reject {}", item.title)
-        });
+        })
+        .focusable(true)
+        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55));
     if !busy {
         el = el.on_press(move |s: &mut S| {
             s.projects_mut().group.resolve(&item, grant);
@@ -215,12 +217,12 @@ fn progress_card(detail: &GroupDetail) -> El {
             text(format!("{pct}%"))
                 .px(12.0)
                 .pt(8.0)
-                .font({
+                .font(crate::motion::tabular({
                     let mut style = rune::tok::TextStyle::new(27.0, 650.0);
                     style.line_height = 27.0;
                     style.tracking = -0.8;
                     style
-                })
+                }))
                 .color(ink("#f4f4f5")),
         )
         .child({
@@ -259,7 +261,9 @@ fn progress_card(detail: &GroupDetail) -> El {
                                 detail.milestones_done(),
                                 detail.milestones.len()
                             ))
-                            .font(rune::tok::TextStyle::new(10.0, 600.0))
+                            .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                                10.0, 600.0,
+                            )))
                             .color(ink("#d4d4d8")),
                         )
                         .child(
@@ -273,7 +277,9 @@ fn progress_card(detail: &GroupDetail) -> El {
                         .gap(3.0)
                         .child(
                             text(format!("{items_done}/{total}"))
-                                .font(rune::tok::TextStyle::new(10.0, 600.0))
+                                .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                                    10.0, 600.0,
+                                )))
                                 .color(ink("#d4d4d8")),
                         )
                         .child(
@@ -304,7 +310,9 @@ fn progress_card(detail: &GroupDetail) -> El {
                         .gap(3.0)
                         .child(
                             text(money(spent))
-                                .font(rune::tok::TextStyle::new(10.0, 600.0))
+                                .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                                    10.0, 600.0,
+                                )))
                                 .color(ink("#d4d4d8")),
                         )
                         .child(text(" / ".to_string()).color(ink("#52525b")))
@@ -345,7 +353,10 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
         .radius(8.0)
         .border(1.0, rgba(255.0, 255.0, 255.0, 0.07))
         .border_layout()
-        .fill(rgba(255.0, 255.0, 255.0, 0.02));
+        .fill(rgba(255.0, 255.0, 255.0, 0.02))
+        .role("tablist")
+        .label("Project views")
+        .focus_group();
     for (tab, label) in [
         (RailTab::Board, "Board".to_string()),
         (RailTab::Team, format!("Team {team}")),
@@ -383,6 +394,9 @@ fn tabs<S: ProjectsHost + 'static>(g: &GroupState, team: usize) -> El {
                     RailTab::Team => "Team",
                     RailTab::Details => "Details",
                 })
+                .focusable(true)
+                .focus_selected(active)
+                .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
                 .on_press(move |s: &mut S| {
                     s.projects_mut().group.rail_tab = tab;
                 }),
@@ -461,6 +475,8 @@ fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El 
                             .py(4.0)
                             .role("button")
                             .label(format!("{} details", item.title))
+                            .focusable(true)
+                            .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
                             .hover(rgba(255.0, 255.0, 255.0, 0.04))
                             .on_press(move |s: &mut S| {
                                 let g = &mut s.projects_mut().group;
@@ -734,7 +750,9 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
                 )
                 .child(
                     text(value)
-                        .font(rune::tok::TextStyle::new(10.0, 600.0))
+                        .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                            10.0, 600.0,
+                        )))
                         .color(ink("#d4d4d8")),
                 ),
         );
@@ -767,6 +785,8 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
                 .border_layout()
                 .role("button")
                 .label("Open project folder")
+                .focusable(true)
+                .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
                 .on_press_tx({
                     let path = path.clone();
                     move |s: &mut S, _tx: &mut rune::Tx| {
@@ -804,6 +824,8 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
             .mt(7.0)
             .role("button")
             .label("Toggle activity")
+            .focusable(true)
+            .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
             .on_press(move |s: &mut S| {
                 s.projects_mut().group.show_activity = !show_activity;
             })

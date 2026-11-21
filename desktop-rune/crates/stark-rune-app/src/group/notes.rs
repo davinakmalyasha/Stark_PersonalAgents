@@ -47,6 +47,7 @@ fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
                 .items_center()
                 .gap(6.0)
                 .role("button")
+                .focusable(true)
                 .label(format!("Toggle {}", todo.text))
                 .on_press(move |s: &mut S| {
                     crate::notes::dispatch_notes(
@@ -79,6 +80,7 @@ fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
                     ink("#71717a")
                 })
                 .role("button")
+                .focusable(true)
                 .label(format!("Delete {}", note.title))
                 .on_press(move |s: &mut S| {
                     let notes = &mut s.projects_mut().group.notes;
@@ -144,6 +146,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                         .radius(8.0)
                         .fill(ink("#ffffff"))
                         .role("button")
+                        .focusable(true)
                         .label("Add note")
                         .on_press(|s: &mut S| {
                             let notes = &mut s.projects_mut().group.notes;
@@ -166,6 +169,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                         .size(16.0, 16.0)
                         .center()
                         .role("button")
+                        .focusable(true)
                         .label("Close notes")
                         .on_press(|s: &mut S| {
                             s.projects_mut().group.notes.open = false;
@@ -219,6 +223,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                             .font(rune::tok::TextStyle::new(11.0, 400.0))
                             .color(ink("#a1a1aa"))
                             .role("button")
+                            .focusable(true)
                             .label("Cancel note")
                             .on_press(|s: &mut S| {
                                 s.projects_mut().group.notes.adding = false;
@@ -233,6 +238,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                             .fill(ink("#fbbf24"))
                             .color(ink("#0a0a0d"))
                             .role("button")
+                            .focusable(true)
                             .label("Save note")
                             .on_press(|s: &mut S| {
                                 let notes = &mut s.projects_mut().group.notes;

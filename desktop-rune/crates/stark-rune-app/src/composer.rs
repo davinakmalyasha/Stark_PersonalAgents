@@ -46,6 +46,7 @@ fn attach_button<S: 'static>(attach: PressTx<S>) -> El {
     rune::el()
         .key("composer-attach")
         .role("button")
+        .focusable(true)
         .label("Attach files")
         .size(30.0, 30.0)
         .radius(10.0)
@@ -153,6 +154,7 @@ fn attachment_card<S: 'static>(
             rune::el()
                 .key(format!("composer-file-remove-{id}"))
                 .role("button")
+                .focusable(true)
                 .label(format!("Remove {}", file.name))
                 .size(21.0, 21.0)
                 .radius(8.0)
@@ -175,6 +177,7 @@ fn attachment_add<S: 'static>(attach: PressTx<S>, hover: &crate::motion::HoverSe
     rune::el()
         .key("composer-attachment-add")
         .role("button")
+        .focusable(true)
         .label("Add files")
         .min_w(38.0)
         .min_h(48.0)
@@ -247,6 +250,7 @@ fn voice_button<S: 'static>(
     let mut button = rune::el()
         .key("composer-voice")
         .role("button")
+        .focusable(true)
         .label(if live {
             "Stop voice input"
         } else {
@@ -382,6 +386,7 @@ fn target_toggle<S: 'static>(
             text("Local".to_string())
                 .key("composer-target-local")
                 .role("button")
+                .focusable(true)
                 .label("Run on Local — click to target Cloud (VPS)")
                 .font({
                     // `text-[11px]` at Tailwind's 1.5 line-height.
@@ -402,6 +407,7 @@ fn target_toggle<S: 'static>(
                 .items_center()
                 .gap(4.0)
                 .role("button")
+                .focusable(true)
                 .label("Run on Cloud (VPS) — preference saved per chat")
                 .px(8.0)
                 .py(6.0)
@@ -506,6 +512,7 @@ fn usage_orb<S: 'static>(
     let mut orb = rune::el()
         .key("composer-usage")
         .role("button")
+        .focusable(true)
         .label(format!("Context {:.0}% of 1M", pct))
         .size(31.0, 31.0)
         .radius(15.5)
@@ -515,11 +522,9 @@ fn usage_orb<S: 'static>(
         .on_press(move |s: &mut S| on_usage(s))
         .child(
             text(format!("{:.0}", pct))
-                .font({
-                    let mut style = rune::tok::TextStyle::new(9.0, 400.0);
-                    style.features = "'tnum' 1";
-                    style
-                })
+                .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                    9.0, 400.0,
+                )))
                 .color(ink(number_ink))
                 .group_color(ink("#ffffff")),
         );
@@ -568,9 +573,8 @@ fn usage_orb<S: 'static>(
 }
 
 /// Usage popover: Cost / Tokens / Context / Cache rows + View details.
-/// React hovers (portal above the orb); Rune taps the orb and the panel
-/// expands under the toolbar (no portal/hover targeting headlessly —
-/// position differs, content identical).
+/// React portals it above the orb (or below when the window is short); the
+/// anchored overlay reproduces that placement and flips at the edges.
 fn usage_popover<S: 'static>(
     usage: &super::rune_transcript::UsageTotals,
     on_stats: Press<S>,
@@ -588,7 +592,9 @@ fn usage_popover<S: 'static>(
             )
             .child(
                 text(value)
-                    .font(rune::tok::TextStyle::new(11.0, 500.0))
+                    .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                        11.0, 500.0,
+                    )))
                     .color(ink("#e8e8eb")),
             )
     };
@@ -599,7 +605,9 @@ fn usage_popover<S: 'static>(
     };
     col()
         .key("composer-usage-popover")
-        .w_full()
+        .anchored_fit("composer-usage", rune::Side::Top, rune::Align::End, 9.0)
+        .anchored_round()
+        .w(190.0)
         .gap(3.0)
         .transition(crate::motion::popover_enter())
         .radius(12.0)
@@ -624,6 +632,7 @@ fn usage_popover<S: 'static>(
             text("View details".to_string())
                 .key("composer-usage-details")
                 .role("button")
+                .focusable(true)
                 .label("Open usage details")
                 .font(rune::tok::TextStyle::new(11.0, 400.0))
                 .w_full()
@@ -647,6 +656,7 @@ fn provider_pill<S: 'static>(
     row()
         .key("composer-provider")
         .role("button")
+        .focusable(true)
         .label("Configure agents and providers")
         .items_center()
         .px(8.0)
@@ -719,6 +729,7 @@ fn model_dropup<S: 'static>(
 ) -> El {
     let border = hover.border("composer-model-border", ink("#ffffff12"));
     let set_border = border.clone();
+    let close = menu.clone();
     let mut wrap = col().key("composer-model").gap(4.0);
     let current = if model.is_empty() {
         "Automatic Fallback".to_string()
@@ -735,6 +746,7 @@ fn model_dropup<S: 'static>(
             .items_center()
             .gap(4.0)
             .role("button")
+            .focusable(true)
             .label("Model")
             .px(8.0)
             .py(7.0)
@@ -796,14 +808,29 @@ fn model_dropup<S: 'static>(
     if open {
         let mut menu_col = col()
             .key("composer-model-menu")
-            .w_full()
+            .role("menu")
+            .label("Model")
+            .focus_group()
+            .focus_return("composer-model-trigger")
+            // React `.model-menu`: width 264, max-height 280, absolute above
+            // the trigger with an 8 pt gap. `anchored_fit` flips it below and
+            // bounds it at small window heights.
+            .anchored_fit(
+                "composer-model-trigger",
+                rune::Side::Top,
+                rune::Align::Start,
+                8.0,
+            )
+            .w(264.0)
+            .max_h(280.0)
             .gap(2.0)
             .transition(crate::motion::menu_enter())
             .radius(9.0)
             .fill(ink("#17171b"))
             .border(1.0, ink("#ffffff14"))
             .px(6.0)
-            .py(4.0);
+            .py(4.0)
+            .modal(true, move |s: &mut S| close(s));
         let head_selected = model.is_empty() || model == "Automatic Fallback";
         menu_col = menu_col.child(model_row::<S>(
             "Automatic Fallback",
@@ -835,10 +862,14 @@ fn model_row<S: 'static>(id: &str, name: &str, selected: bool, pick: Pick<S>) ->
         } else {
             ink("#00000000")
         })
-        .role("button")
-        .label(format!("Use {name}"));
+        .role("menuitem")
+        .label(format!("Use {name}"))
+        .focusable(true)
+        .focus_selected(selected)
+        // `.model-menu button:hover` is the same violet wash as `.selected`;
+        // one highlight serves pointer and arrow keys, as NSMenu does.
+        .focus_highlight(ink("#9577ff24"));
     if !selected {
-        // `.model-menu button:hover` is the same violet wash as `.selected`.
         el = el.hover(ink("#9577ff24")).hover_group();
     }
     el.on_press(move |s: &mut S| pick(s, target.clone()))
@@ -944,6 +975,7 @@ pub fn composer_card<S: 'static>(
     let send_scale = meta.hover.scale("composer-send-scale", 1.0);
     let mut send_btn = rune::el()
         .role("button")
+        .focusable(true)
         .label(if running { "Stop execution" } else { "Send" })
         .size(34.0, 34.0)
         .radius(17.0)
@@ -1025,6 +1057,9 @@ pub fn composer_card<S: 'static>(
                 a: if dragging { 0.55 } else { 0.08 },
             },
         )
+        // `.house-dock:focus-within`: border-color .28. The expanded shadow
+        // cannot be toggled declaratively; the ring is the exact border.
+        .focus_within_ring(1.0, -1.0, ink("#ffffff47"))
         .border_layout();
     if dragging {
         // `.premium-surface.is-dragging`: lifted ring + scale.
@@ -1052,16 +1087,19 @@ pub fn composer_card<S: 'static>(
             },
         );
     } else {
-        card = card.shadow(
-            14.0,
-            42.0,
-            rune::Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.34,
-            },
-        );
+        card = card
+            .shadow(
+                14.0,
+                42.0,
+                rune::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.34,
+                },
+            )
+            // `.premium-surface`: `0 14px 42px … , inset 0 1px 0 .025`.
+            .box_shadow(crate::motion::inset_top_light(0.025));
     }
     // React's dock is its own drop target (`onDragEnter/Leave/Over/Drop`).
     card = card
@@ -1230,4 +1268,87 @@ pub fn composer_card<S: 'static>(
         card = card.child(usage_popover::<S>(meta.usage, buttons.stats.clone()));
     }
     card
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::{Cx, Env, Runtime};
+    use std::rc::Rc;
+
+    fn models() -> Vec<super::super::rune_transcript::ModelOption> {
+        vec![
+            super::super::rune_transcript::ModelOption {
+                id: "fast".to_string(),
+                name: "Fast".to_string(),
+            },
+            super::super::rune_transcript::ModelOption {
+                id: "deep".to_string(),
+                name: "Deep".to_string(),
+            },
+        ]
+    }
+
+    fn view_model_menu(top: &f32, _: &mut Cx<f32>) -> El {
+        let models = models();
+        let hover = crate::motion::HoverSet::default();
+        col()
+            .w_full()
+            .h_full()
+            .pt(*top)
+            .pl(40.0)
+            .child(model_dropup::<f32>(
+                "",
+                &models,
+                true,
+                Rc::new(|_: &mut f32| {}),
+                Rc::new(|_: &mut f32, _: String| {}),
+                &hover,
+            ))
+    }
+
+    #[test]
+    fn anchored_model_menu_does_not_grow_the_dock_and_flips() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(250.0, view_model_menu, (600.0, 400.0), env);
+        rt.frame(0.0);
+        let (menu, _) = rt.presented("composer-model-menu").expect("menu mounted");
+        let (trigger, _) = rt
+            .presented("composer-model-trigger")
+            .expect("trigger mounted");
+        let (dock, _) = rt.presented("composer-model").expect("dock mounted");
+        assert!((menu[2] - 264.0).abs() < 0.51, "menu width {}", menu[2]);
+        assert!(
+            (menu[0] - trigger[0]).abs() < 0.51,
+            "start-aligned: menu {} trigger {}",
+            menu[0],
+            trigger[0]
+        );
+        assert!(
+            menu[1] + menu[3] <= trigger[1] - 7.5,
+            "8 pt above the trigger: menu {}..{} trigger {}",
+            menu[1],
+            menu[1] + menu[3],
+            trigger[1]
+        );
+        assert!(
+            (dock[3] - trigger[3]).abs() < 0.51,
+            "absolute menu must not grow the wrapper: dock {} trigger {}",
+            dock[3],
+            trigger[3]
+        );
+
+        let mut rt = Runtime::new(20.0, view_model_menu, (600.0, 400.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let (menu, _) = rt.presented("composer-model-menu").expect("menu mounted");
+        let (trigger, _) = rt
+            .presented("composer-model-trigger")
+            .expect("trigger mounted");
+        assert!(
+            menu[1] >= trigger[1] + trigger[3] + 7.5,
+            "flips below at the top edge: menu {} trigger bottom {}",
+            menu[1],
+            trigger[1] + trigger[3]
+        );
+    }
 }

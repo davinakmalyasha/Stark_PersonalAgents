@@ -1432,9 +1432,10 @@ impl CanvasState {
             .unwrap_or_default();
         self.sessions.confirm_delete = None;
         // React focuses the input and selects the title. Rune has no
-        // programmatic focus call; a model field marked focused takes focus
-        // when it first mounts (and blur writes `focused = false` back here,
-        // which the shell tick commits).
+        // imperative focus call, but a model field marked focused takes focus
+        // when it first mounts; `anchor..focus` selects the whole title
+        // (blur writes `focused = false` back here, which the shell tick
+        // commits).
         let mut edit = rune::TextEdit::new(title);
         edit.anchor = 0;
         edit.focus = edit.text.len();
@@ -1642,6 +1643,67 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
     }
 }
 
+/// `.canvas-card`'s full `box-shadow` stack: inset, optional ring/halo, drop.
+fn canvas_card_shadows(active: bool, running: bool) -> Vec<rune::Shadow> {
+    let top = if active {
+        0.08
+    } else if running {
+        0.07
+    } else {
+        0.045
+    };
+    let drop = |y: f32, blur: f32, a: f32| rune::Shadow {
+        x: 0.0,
+        y,
+        blur,
+        spread: 0.0,
+        color: rune::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a,
+        },
+        inset: false,
+    };
+    let halo = |blur: f32, a: f32| rune::Shadow {
+        x: 0.0,
+        y: 0.0,
+        blur,
+        spread: 0.0,
+        color: rune::Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a,
+        },
+        inset: false,
+    };
+    let mut shadows = vec![crate::motion::inset_top_light(top)];
+    if active {
+        shadows.push(rune::Shadow {
+            x: 0.0,
+            y: 0.0,
+            blur: 0.0,
+            spread: 1.0,
+            color: rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.05,
+            },
+            inset: false,
+        });
+        shadows.push(drop(28.0, 74.0, 0.58));
+        shadows.push(halo(52.0, 0.06));
+    } else if running {
+        shadows.push(drop(24.0, 66.0, 0.56));
+        shadows.push(halo(44.0, 0.05));
+    } else {
+        shadows.push(drop(26.0, 70.0, 0.50));
+    }
+    shadows
+}
+
 /// Cubic edge path in canvas points (mirrors `stark-kit::edge_path`).
 pub fn edge_cubic(parent: &MapCard, child: &MapCard) -> Path {
     let (pw, ph) = parent.size();
@@ -1749,16 +1811,16 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
             ],
         )
         .border(1.0, border)
-        .shadow(
-            26.0,
-            70.0,
-            rune::Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.50,
-            },
-        )
+        // `.canvas-card`: inset top-light over the drop, both layers.
+        .box_shadow(crate::motion::inset_top_light(0.045))
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 26.0,
+            blur: 70.0,
+            spread: 0.0,
+            color: rgba(0.0, 0.0, 0.0, 0.50),
+            inset: false,
+        })
         .clip_rounded(16.0)
         .child(
             row()
@@ -1834,6 +1896,7 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
                         .key(format!("{id}-close"))
                         .size(14.0, 14.0)
                         .role("button")
+                        .focusable(true)
                         .label(format!("Remove {}", card.title))
                         .shape(crate::lucide_x(14.0, 2.0, ink("#71717a")))
                         .on_press(move |s: &mut S| {
@@ -2086,9 +2149,6 @@ fn card_view<S: CanvasHost + 'static>(
     let id = card.id.clone();
     let drag_id = card.id.clone();
     // Borders mirror `canvas.css`: default .085, running .22, active .30.
-    // (Rune carries one shadow per element, so the card takes the drop
-    // `0 26px 70px rgba(0,0,0,.50)`; the inset top-light and active halo have
-    // no slot — documented, not faked.)
     let border = if active {
         ink("#ffffff4d")
     } else if card.running {
@@ -2114,19 +2174,13 @@ fn card_view<S: CanvasHost + 'static>(
                 (1.0, ink("#0000000c")),
             ],
         )
-        .border(1.0, border)
-        .shadow(
-            26.0,
-            70.0,
-            rune::Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.50,
-            },
-        )
-        .clip_rounded(radius)
-        .hover_group();
+        .border(1.0, border);
+    // `box-shadow` is a layer list, not one slot: the inset top-light, the
+    // drop, and the active/running ring + halo all draw.
+    for shadow in canvas_card_shadows(active, card.running) {
+        view = view.box_shadow(shadow);
+    }
+    view = view.clip_rounded(radius).hover_group();
     // `.canvas-card:hover`: a 1 pt lift on every card; the white/.16 border
     // only on the plain card because `.is-active`/`.is-running` keep their
     // stronger border colours. `Live` tracks avoid a rebuild per pointer move.
@@ -2147,39 +2201,26 @@ fn card_view<S: CanvasHost + 'static>(
         view = view.live_border(hover_border.smooth(crate::motion::HOVER_SPRING));
     }
     if card.running {
-        // One shadow slot: the running glow wins over the drop (the glow is
-        // the running signal; `.canvas-card.is-running` keeps both).
-        view = view
-            .shadow(
-                0.0,
-                44.0,
-                rune::Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.05,
-                },
-            )
-            // Sweep sheen: 110pt bar sliding across on the 2.6s linear loop,
-            // clipped to the card. Mirrors `canvas-border-sweep`.
-            .child(
-                rune::el()
-                    .key(format!("{id}-sheen"))
-                    .absolute(0.0, 0.0)
-                    .size(110.0, h)
-                    .linear_gradient(
-                        std::f32::consts::FRAC_PI_2,
-                        [
-                            (0.0, ink("#ffffff00")),
-                            (0.5, ink("#ffffff1f")),
-                            (1.0, ink("#ffffff00")),
-                        ],
-                    )
-                    .looping(
-                        rune::LoopSpec::slide(2.6, [-130.0, 0.0], [w + 20.0, 0.0])
-                            .easing(rune::Easing::LINEAR),
-                    ),
-            );
+        // Sweep sheen: 110pt bar sliding across on the 2.6s linear loop,
+        // clipped to the card. Mirrors `canvas-border-sweep`.
+        view = view.child(
+            rune::el()
+                .key(format!("{id}-sheen"))
+                .absolute(0.0, 0.0)
+                .size(110.0, h)
+                .linear_gradient(
+                    std::f32::consts::FRAC_PI_2,
+                    [
+                        (0.0, ink("#ffffff00")),
+                        (0.5, ink("#ffffff1f")),
+                        (1.0, ink("#ffffff00")),
+                    ],
+                )
+                .looping(
+                    rune::LoopSpec::slide(2.6, [-130.0, 0.0], [w + 20.0, 0.0])
+                        .easing(rune::Easing::LINEAR),
+                ),
+        );
     }
     // Card status from the thread (`childStatus`): the run dot while live,
     // failed on an error tail, done once rows exist, idle otherwise. Queued
@@ -2305,6 +2346,7 @@ fn card_view<S: CanvasHost + 'static>(
                 .grow(1.0)
                 .min_h(0.0)
                 .role("button")
+                .focusable(true)
                 .label(format!("Open {}", card.title))
                 .on_press(move |s: &mut S| {
                     s.canvas_mut().open_sheet(&open_id);
@@ -2342,6 +2384,7 @@ fn card_view<S: CanvasHost + 'static>(
                 .center()
                 .gap(3.0)
                 .role("button")
+                .focusable(true)
                 .label(format!("Connected agents ({})", kids.len()))
                 .on_press(move |s: &mut S| {
                     let c = s.canvas_mut();
@@ -2374,6 +2417,7 @@ fn card_view<S: CanvasHost + 'static>(
                 .size(26.0, 26.0)
                 .center()
                 .role("button")
+                .focusable(true)
                 .label(format!("Close {}", card.title))
                 .child(rune::el().size(14.0, 14.0).inert().shape(crate::lucide_x(
                     14.0,
@@ -2472,6 +2516,7 @@ fn card_view<S: CanvasHost + 'static>(
                     .px(8.0)
                     .py(5.0)
                     .role("button")
+                    .focusable(true)
                     .label(format!("Open {kid_title}"))
                     .hover(ink("#ffffff0a"))
                     .hover_group()
@@ -2550,6 +2595,7 @@ fn card_view<S: CanvasHost + 'static>(
             rune::el()
                 .key(format!("{id}-send"))
                 .role("button")
+                .focusable(true)
                 .label(format!("Send to {send_id}"))
                 .size(25.0, 25.0)
                 .radius(8.0)
@@ -2750,6 +2796,7 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 .radius(4.0)
                 .fill(ink(if active { "#ffffff17" } else { "#00000000" }))
                 .role("button")
+                .focusable(true)
                 .label(format!("{label} tab"))
                 .on_press(move |s: &mut S| {
                     s.canvas_mut().add_tab = target.clone();
@@ -2817,6 +2864,7 @@ pub fn add_menu<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .key("canvas-add-close")
                         .size(12.0, 12.0)
                         .role("button")
+                        .focusable(true)
                         .label("Close add menu")
                         .shape(crate::lucide_x(12.0, 2.0, ink("#71717a")))
                         .on_press(move |s: &mut S| {
@@ -2847,6 +2895,7 @@ fn add_row<S: 'static>(
         .px(8.0)
         .py(4.0)
         .role("button")
+        .focusable(true)
         .label(if added {
             "Already on the canvas".to_string()
         } else {
@@ -3036,6 +3085,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .items_center()
                         .gap(8.0)
                         .role("button")
+                        .focusable(true)
                         .label("Add to canvas")
                         .on_hover_change(move |_s: &mut S, inside, tx| {
                             set_scale.set(if inside { 1.04 } else { 1.0 });
@@ -3126,6 +3176,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                 .pr(9.0)
                 .backdrop_blur(12.0)
                 .role("button")
+                .focusable(true)
                 .label("Add to canvas")
                 .on_press(move |s: &mut S| {
                     s.canvas_mut().add_open = true;
@@ -3177,6 +3228,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     a: 0.0,
                 })
                 .role("button")
+                .focusable(true)
                 .label("Close add menu")
                 .modal(true, move |s: &mut S| {
                     s.canvas_mut().add_open = false;
@@ -3192,6 +3244,7 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         rune::el()
             .key(format!("cam-{key}"))
             .role("button")
+            .focusable(true)
             .label(label.to_string())
             .size(28.0, 28.0)
             .radius(8.0)
@@ -3595,6 +3648,7 @@ fn sidebar_spawn_row<S: CanvasHost + 'static>(
         .radius(8.0)
         .hover(rgba(255.0, 255.0, 255.0, 0.04))
         .role("button")
+        .focusable(true)
         .label(format!("Open {title}"))
         .on_press(move |s: &mut S| {
             commit_sidebar_rename(s);
@@ -3699,6 +3753,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
         rune::el()
             .key(format!("side-{card_id}-cloud"))
             .role("button")
+            .focusable(true)
             .label(if running {
                 "Running — cloud run details"
             } else {
@@ -3738,6 +3793,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
         rune::el()
             .key(format!("side-{card_id}-pin"))
             .role("button")
+            .focusable(true)
             .label(if pinned { "Unpin" } else { "Pin" })
             .size(24.0, 24.0)
             .radius(6.0)
@@ -3773,6 +3829,7 @@ fn sidebar_actions<S: CanvasHost + 'static>(
     let mut delete = rune::el()
         .key(format!("side-{card_id}-delete"))
         .role("button")
+        .focusable(true)
         .label(if confirming {
             "Click again to confirm"
         } else {
@@ -3800,7 +3857,9 @@ fn sidebar_actions<S: CanvasHost + 'static>(
         rune::el()
             .key(format!("side-{card_id}-rename"))
             .role("button")
+            .focusable(true)
             .label("Rename")
+            .help("Rename")
             .size(24.0, 24.0)
             .radius(6.0)
             .center()
@@ -3876,7 +3935,7 @@ fn sidebar_title_style() -> rune::tok::TextStyle {
 
 /// Timestamp style for sidebar rows (10pt stamp).
 fn sidebar_stamp_style() -> rune::tok::TextStyle {
-    let mut style = rune::tok::TextStyle::new(10.0, 400.0);
+    let mut style = crate::motion::tabular(rune::tok::TextStyle::new(10.0, 400.0));
     style.line_height = 15.0;
     style
 }
@@ -4027,6 +4086,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         if !deleting {
             item = item
                 .role("button")
+                .focusable(true)
                 .label(format!("Open {title}"))
                 .on_press(move |s: &mut S| {
                     commit_sidebar_rename(s);
@@ -4071,6 +4131,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
                     .key(format!("side-{card_id}-title"))
                     .min_w(0.0)
                     .truncate()
+                    .help_when_truncated(title.clone())
                     .font(sidebar_title_style())
                     .color(ink(if active { "#ffffff" } else { "#a1a1aa" })),
             );
@@ -4129,6 +4190,7 @@ fn sidebar_thread<S: CanvasHost + 'static>(
         rune::el()
             .key(format!("side-{card_id}-lead"))
             .role("button")
+            .focusable(true)
             .label(if open {
                 "Collapse nested chats"
             } else {
@@ -4290,7 +4352,7 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
     let mut name_style = rune::tok::TextStyle::new(10.0, 600.0);
     name_style.line_height = 15.0;
     name_style.tracking = 1.0;
-    let mut count_style = rune::tok::TextStyle::new(9.5, 400.0);
+    let mut count_style = crate::motion::tabular(rune::tok::TextStyle::new(9.5, 400.0));
     count_style.line_height = 14.25;
     let name_color = if ws.exists {
         ink("#52525b")
@@ -4315,6 +4377,7 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
                 .items_center()
                 .gap(6.0)
                 .role("button")
+                .focusable(true)
                 .label(if collapsed {
                     format!("Expand {ws_name}")
                 } else {
@@ -4376,7 +4439,9 @@ fn sidebar_group_header<S: CanvasHost + 'static>(
             rune::el()
                 .key(format!("side-group-{ws_id}-plus"))
                 .role("button")
+                .focusable(true)
                 .label(format!("New chat in {ws_name}"))
+                .help("New chat")
                 .size(20.0, 20.0)
                 .radius(6.0)
                 .center()
@@ -4429,6 +4494,7 @@ fn sidebar_load_more<S: CanvasHost + 'static>(
         // (React: row `mb-1` + wrapper `mb-0.5` = 6).
         .radius(8.0)
         .role("button")
+        .focusable(true)
         .label(format!("Load {remaining} more chats"))
         .hover_group()
         .hover(rgba(255.0, 255.0, 255.0, 0.04))
@@ -4501,7 +4567,9 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                         .py(6.0)
                         .radius(8.0)
                         .role("button")
+                        .focusable(true)
                         .label("Switch mode")
+                        .help("Switch mode")
                         .on_press(move |s: &mut S| {
                             let c = s.canvas_mut();
                             c.kind_open = !c.kind_open;
@@ -4532,7 +4600,9 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     rune::el()
                         .key("map-new")
                         .role("button")
+                        .focusable(true)
                         .label("New chat")
+                        .help("New chat")
                         .size(24.0, 24.0)
                         .radius(6.0)
                         .center()
@@ -4597,6 +4667,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
                     .gap(1.0)
                     .fill(ink(if current { "#ffffff0d" } else { "#00000000" }))
                     .role("button")
+                    .focusable(true)
                     .label(format!("Switch to {kind}"))
                     .hover(ink("#ffffff0a"))
                     .hover_group()
@@ -4901,6 +4972,7 @@ pub fn chats_panel<S: CanvasHost + 'static>(s: &CanvasState) -> El {
             .py(8.0)
             .radius(8.0)
             .role("button")
+            .focusable(true)
             .label(format!("Open {}", card.title))
             .on_press(move |s: &mut S| {
                 s.canvas_mut().select_card(&target);

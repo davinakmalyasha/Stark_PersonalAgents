@@ -92,6 +92,7 @@ fn skeleton(w: f32) -> El {
 fn shell_badge() -> El {
     row()
         .key("gp-shell-badge")
+        .help("Members can run shell commands")
         .items_center()
         .gap(3.0)
         .px(6.0)
@@ -120,7 +121,15 @@ fn action_button(label: &str, primary: bool, glyph: Option<rune::Shape>) -> El {
         content = content.child(icon(12.0, shape));
     }
     content = content.child(text(label.to_string()).font(style).color(fg));
-    let mut el = content.h(30.0).px(10.0).radius(8.0).center();
+    let mut el = content
+        .h(30.0)
+        .px(10.0)
+        .radius(8.0)
+        .center()
+        .role("button")
+        .label(label.to_string())
+        .focusable(true)
+        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55));
     if primary {
         el = el.fill(ink("#ffffff")).color(ink("#0a0a0d"));
     } else {
@@ -141,6 +150,9 @@ fn icon_action(key: &str, label: &str, shape: rune::Shape) -> El {
         .hover(ink("#ffffff0f"))
         .role("button")
         .label(label)
+        .help(label.to_string())
+        .focusable(true)
+        .focus_ring(2.0, 2.0, rgba(255.0, 255.0, 255.0, 0.55))
         .child(icon(15.0, shape))
 }
 
@@ -321,7 +333,9 @@ fn header<S: ProjectsHost + 'static>(
     if waiting > 0 {
         subline = subline.child(
             text(format!("{waiting} waiting on you"))
-                .font(rune::tok::TextStyle::new(10.5, 650.0))
+                .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                    10.5, 650.0,
+                )))
                 .color(ink("#fbbf24")),
         );
     }

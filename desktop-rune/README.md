@@ -70,10 +70,16 @@ over approximating a CSS property.
   rows; `cache` rasterizes a settled subtree until its draw output changes.
 - **Native dialogs** — `Tx::open_file`, `Tx::save_file` and `Tx::open_folder`
   take `FileDialogOptions`; headless runs script the answers instead of
-  showing a picker.
+  showing a picker. The browser build uses a real `<input type="file">` and
+  the same multipart upload endpoint.
 - **Compositing** — `App::srgb_blend` is on by default, matching CSS alpha
   compositing over dark surfaces. `El::focus_within_flat` drops an element's
   shadows and hover fill while focus is inside it.
+- **Browser shell** — the wasm transport resolves the API origin from
+  `__STARK_API_ORIGIN__` or the page origin, carries the pairing token on
+  every request, and gates the app on a 401. The phone layout hides the rail,
+  adds the bottom navigation with safe-area padding, and turns the side panel
+  into a backdrop-backed drawer.
 
 ### Known boundaries
 
@@ -82,6 +88,8 @@ over approximating a CSS property.
 - No audio element; audio attachments cannot play inside Rune.
 - Focus-within can add a ring or flatten shadows, but cannot swap arbitrary
   shadow stacks.
+- Auto-update is an honest stub: there is no signed Rune release feed or
+  in-app installer yet. The portable package ships a versioned zip.
 - Rune's native `role("button")` responds to Space; Return goes to links,
   highlighted rows, list rows and `default_button`. This port adds Enter to
   buttons with an `on_key` helper (`keys::EnterPress`) for web parity; keep
@@ -96,6 +104,12 @@ canvas map and a transcript/chat surface. The canvas and transcript are
 always mounted; panels switch content rather than routes. Overlays mount at
 the shell or modal root so they escape the clipping of the surface that
 opened them.
+
+Canvas cards are small chat surfaces, not previews: each card dock owns its
+own attachment draft and send path, pending questions replace the dock with
+the compact Ask panel, and the latest bubbles carry copy and two-step rewind
+actions. Background cards poll Ask alongside the open transcript, so a
+question raised on the map is visible without opening the card.
 
 State is plain Rust. `TranscriptHost`, `CanvasHost`, `ProjectsHost`,
 `SettingsHost` and related traits let shared views resolve the active thread

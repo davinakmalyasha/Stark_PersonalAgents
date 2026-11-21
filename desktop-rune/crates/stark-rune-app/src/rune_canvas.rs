@@ -432,6 +432,14 @@ pub struct CanvasState {
     /// `disabled={sending || running || empty}` — type-ahead while running,
     /// no double-send.
     pub inputs: std::collections::HashMap<String, rune::TextEdit>,
+    /// Card dock attachment drafts (React's per-card `files` state). Kept
+    /// separate from the thread's composer deck: opening the full chat must
+    /// not inherit files staged on the map.
+    pub card_attachments: std::collections::HashMap<String, Vec<crate::chats::ChatAttachment>>,
+    /// Amber error line under a card dock (`canvas-card-error`).
+    pub card_attachment_errors: std::collections::HashMap<String, String>,
+    /// Card currently showing the compact file-drop ring.
+    pub card_drop: Option<String>,
     /// Card id whose connected-agents menu is open (single open at a time).
     pub agents_open: Option<String>,
     /// Kind dropdown open in the chats panel.
@@ -522,6 +530,9 @@ impl Clone for CanvasState {
             real: self.real,
             manual_cards: self.manual_cards.clone(),
             inputs: self.inputs.clone(),
+            card_attachments: self.card_attachments.clone(),
+            card_attachment_errors: self.card_attachment_errors.clone(),
+            card_drop: self.card_drop.clone(),
             agents_open: self.agents_open.clone(),
         }
     }
@@ -626,6 +637,9 @@ impl CanvasState {
             real: false,
             manual_cards: std::collections::HashSet::new(),
             inputs: std::collections::HashMap::new(),
+            card_attachments: std::collections::HashMap::new(),
+            card_attachment_errors: std::collections::HashMap::new(),
+            card_drop: None,
             agents_open: None,
         };
         state.seed_sessions();
@@ -767,6 +781,9 @@ impl CanvasState {
             self.sessions.threads.clear();
             self.sessions.sheet = None;
             self.inputs.clear();
+            self.card_attachments.clear();
+            self.card_attachment_errors.clear();
+            self.card_drop = None;
             self.known_chats.clear();
             self.running_tab = None;
             return;
@@ -1283,6 +1300,15 @@ impl CanvasState {
         if let Some(edit) = self.inputs.remove(old_id) {
             self.inputs.insert(new_id.clone(), edit);
         }
+        if let Some(files) = self.card_attachments.remove(old_id) {
+            self.card_attachments.insert(new_id.clone(), files);
+        }
+        if let Some(error) = self.card_attachment_errors.remove(old_id) {
+            self.card_attachment_errors.insert(new_id.clone(), error);
+        }
+        if self.card_drop.as_deref() == Some(old_id) {
+            self.card_drop = Some(new_id.clone());
+        }
         if let Some(card) = self.cards.iter_mut().find(|c| c.id == old_id) {
             card.id = new_id.clone();
         }
@@ -1305,6 +1331,60 @@ impl CanvasState {
         self.inputs
             .entry(id.to_string())
             .or_insert_with(|| rune::TextEdit::new(""))
+    }
+
+    /// Files staged on a canvas card dock (React `CanvasItemCard.files`).
+    pub fn card_attachments(&self, id: &str) -> &[crate::chats::ChatAttachment] {
+        self.card_attachments
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn add_card_attachments(&mut self, id: &str, paths: &[std::path::PathBuf]) {
+        let files = self.card_attachments.entry(id.to_string()).or_default();
+        let error = self
+            .card_attachment_errors
+            .entry(id.to_string())
+            .or_default();
+        let mut message = (!error.is_empty()).then(|| error.clone());
+        crate::rune_transcript::add_attachment_paths_to(files, &mut message, paths);
+        match message {
+            Some(text) => {
+                *error = text;
+            }
+            None => {
+                self.card_attachment_errors.remove(id);
+            }
+        }
+    }
+
+    pub fn remove_card_attachment(&mut self, id: &str, target: &str) {
+        let Some(files) = self.card_attachments.get_mut(id) else {
+            return;
+        };
+        let error = self
+            .card_attachment_errors
+            .entry(id.to_string())
+            .or_default();
+        let mut message = (!error.is_empty()).then(|| error.clone());
+        crate::rune_transcript::remove_attachment_from(files, &mut message, target);
+        if let Some(text) = message {
+            *error = text;
+        } else {
+            self.card_attachment_errors.remove(id);
+        }
+        if files.is_empty() {
+            self.card_attachments.remove(id);
+        }
+    }
+
+    pub fn clear_card_draft(&mut self, id: &str) {
+        self.card_attachments.remove(id);
+        self.card_attachment_errors.remove(id);
+        if self.card_drop.as_deref() == Some(id) {
+            self.card_drop = None;
+        }
     }
 
     /// Open the transcript sheet for a card (ensures its thread).
@@ -1412,6 +1492,7 @@ impl CanvasState {
         }
         self.cards.retain(|c| c.id != id);
         self.manual_cards.remove(id);
+        self.clear_card_draft(id);
         self.sessions.order.retain(|o| o != id);
         if self.sessions.sheet.as_deref() == Some(id) {
             self.sessions.sheet = None;
@@ -1780,6 +1861,48 @@ impl CanvasHost for CanvasState {
     }
 }
 
+impl crate::rune_transcript::TranscriptHost for CanvasState {
+    fn thread(
+        &self,
+        which: crate::rune_transcript::Thread,
+    ) -> &crate::rune_transcript::RuneTranscriptState {
+        use crate::rune_transcript::Thread;
+        let id = match which {
+            Thread::Card(index) => self.sessions.order.get(index).cloned(),
+            Thread::Main | Thread::Open => self
+                .sessions
+                .sheet
+                .clone()
+                .or_else(|| Some(self.active_id.clone())),
+        };
+        id.and_then(|id| self.sessions.threads.get(&id))
+            .or_else(|| self.sessions.threads.values().next())
+            .expect("canvas card views always have a thread")
+    }
+
+    fn thread_mut(
+        &mut self,
+        which: crate::rune_transcript::Thread,
+    ) -> &mut crate::rune_transcript::RuneTranscriptState {
+        use crate::rune_transcript::Thread;
+        let id = match which {
+            Thread::Card(index) => self.sessions.order.get(index).cloned(),
+            Thread::Main | Thread::Open => self
+                .sessions
+                .sheet
+                .clone()
+                .or_else(|| Some(self.active_id.clone())),
+        };
+        match id {
+            Some(id) => self.thread_mut(&id),
+            None => {
+                let fallback = self.active_id.clone();
+                self.thread_mut(&fallback)
+            }
+        }
+    }
+}
+
 /// Commit (or drop) an inline rename once the field lost focus, React's
 /// `onBlur`. The shell calls this from its poll, so the input's old node is
 /// gone before the draft is dropped.
@@ -2018,8 +2141,36 @@ fn project_card_view<S: CanvasHost + 'static>(card: &MapCard, active: bool) -> E
         )
 }
 
-/// Lucide `Paperclip` approximation at a 24-unit box (the native card's
-/// attach button is inert; the glyph still matches React's dock).
+/// Canvas dock picker. Native opens the real file dialog; the browser build
+/// opens a real `<input type="file">` and uploads through the shared
+/// multipart endpoint.
+fn pick_card_attachments<S: CanvasHost + 'static>(_s: &mut S, id: &str, tx: &mut rune::Tx) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tx;
+        crate::transport::pick_files(crate::transport::WebTarget::Card(id.to_string()));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let options = rune::FileDialogOptions {
+            title: "Attach files".to_string(),
+            ..Default::default()
+        };
+        let target = id.to_string();
+        tx.open_file(options, move |s: &mut S, result, _tx| match result {
+            Ok(Some(path)) => s.canvas_mut().add_card_attachments(&target, &[path]),
+            Ok(None) => {}
+            Err(error) => {
+                s.canvas_mut()
+                    .card_attachment_errors
+                    .insert(target.clone(), error.to_string());
+            }
+        });
+    }
+}
+
+/// Lucide `Paperclip` approximation at a 24-unit box, matching React's card
+/// dock attach control.
 fn paperclip_icon(size: f32, color: rune::Color) -> Shape {
     let p = Path::new()
         .move_to([16.0, 6.0])
@@ -2038,7 +2189,14 @@ fn paperclip_icon(size: f32, color: rune::Color) -> Shape {
         .view_box(24.0, 24.0)
 }
 
-fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) -> El {
+fn mini_bubble<S: CanvasHost + 'static>(
+    id: &str,
+    r: &crate::rune_transcript::RowData,
+    live_row: bool,
+    copied: bool,
+    armed: bool,
+    can_rewind: bool,
+) -> El {
     // `CanvasChatBubble` + `.canvas-bubble*`: agent rows put the 22pt avatar
     // first, user rows put it after the bubble.
     let (fill, hair_a, avatar_bg, avatar_ink, initial, name, body_ink) = match r.role {
@@ -2127,20 +2285,141 @@ fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) ->
         }
         bubble = bubble.child(dots);
     }
-    // `.canvas-bubble-foot`: 22pt tall, time pushed right (the hover actions
-    // are invisible at rest but set the height).
+    // `.canvas-bubble-foot`: 22pt tall. Actions sit left and stay invisible
+    // at rest (but occupy their slot); the clock is pushed right.
     let t = crate::rune_transcript::clock(&r.at);
+    let copy_target = id.to_string();
+    let copy_key = r.key.clone();
+    let copy_text = if r.raw_body.is_empty() {
+        r.body.clone()
+    } else {
+        r.raw_body.clone()
+    };
+    let rewind_target = id.to_string();
+    let rewind_key = r.key.clone();
+    let rewind_attachments = r.attachments.clone();
+    let mut actions = row()
+        .key(format!("{id}-mini-{}-actions", r.key))
+        .items_center()
+        .gap(6.0)
+        .group_opacity(0.0, 1.0)
+        .child(
+            rune::el()
+                .key(format!("{id}-mini-{}-copy", r.key))
+                .role("button")
+                .focusable(true)
+                .label(if copied { "Copied" } else { "Copy message" })
+                .help(if copied { "Copied" } else { "Copy message" })
+                .size(22.0, 22.0)
+                .radius(6.0)
+                .center()
+                .hover(ink("#ffffff13"))
+                .hover_group()
+                .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
+                    tx.copy(copy_text.clone());
+                    let now = crate::clock::now_millis();
+                    if let Some(thread) = s.canvas_mut().sessions.threads.get_mut(&copy_target) {
+                        thread.copied_messages.insert(copy_key.clone(), now);
+                    }
+                    tx.wake_after(std::time::Duration::from_millis(50));
+                })
+                .child(if copied {
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(crate::lucide_check(12.0, 2.0, ink("#34d399")))
+                } else {
+                    rune::el()
+                        .size(12.0, 12.0)
+                        .inert()
+                        .shape(crate::rune_transcript::home_icon_copy(12.0, ink("#6f6f79")))
+                }),
+        );
+    if r.role == "user" {
+        if armed {
+            actions = actions.child(
+                row()
+                    .key(format!("{id}-mini-{}-rewind", r.key))
+                    .role("button")
+                    .focusable(true)
+                    .label("Confirm rewind")
+                    .items_center()
+                    .gap(4.0)
+                    .h(22.0)
+                    .px(7.0)
+                    .radius(6.0)
+                    .fill(ink("#fb718524"))
+                    .on_press_tx_enter(move |s: &mut S, _tx: &mut rune::Tx| {
+                        let c = s.canvas_mut();
+                        if let Some(thread) = c.sessions.threads.get_mut(&rewind_target) {
+                            crate::rune_transcript::rewind_row(
+                                thread,
+                                &rewind_key,
+                                rewind_attachments.clone(),
+                            );
+                        }
+                    })
+                    .child(rune::el().size(11.0, 11.0).inert().shape(
+                        crate::rune_transcript::home_icon_rotate(11.0, ink("#fda4af")),
+                    ))
+                    .child(
+                        text("Rewind?".to_string())
+                            .font(rune::tok::TextStyle::new(9.0, 650.0))
+                            .color(ink("#fda4af")),
+                    ),
+            );
+        } else {
+            actions = actions.child(
+                rune::el()
+                    .key(format!("{id}-mini-{}-rewind", r.key))
+                    .role("button")
+                    .focusable(true)
+                    .label("Rewind to this message")
+                    .help(if can_rewind {
+                        "Rewind to before this message"
+                    } else {
+                        "Wait for this run to finish"
+                    })
+                    .size(22.0, 22.0)
+                    .radius(6.0)
+                    .center()
+                    .hover(ink("#fb71851a"))
+                    .hover_group()
+                    .disabled(!can_rewind)
+                    .opacity(if can_rewind { 1.0 } else { 0.4 })
+                    .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
+                        if !can_rewind {
+                            return;
+                        }
+                        if let Some(thread) =
+                            s.canvas_mut().sessions.threads.get_mut(&rewind_target)
+                        {
+                            thread
+                                .rewind_armed
+                                .insert(rewind_key.clone(), crate::clock::now_millis());
+                        }
+                        tx.wake_after(std::time::Duration::from_millis(50));
+                    })
+                    .child(rune::el().size(12.0, 12.0).inert().shape(
+                        crate::rune_transcript::home_icon_rotate(12.0, ink("#6f6f79")),
+                    )),
+            );
+        }
+    }
     bubble = bubble.child(
         row()
             .w_full()
             .items_center()
             .min_h(22.0)
             .mt(8.0)
+            .child(actions)
             .child(rune::el().grow(1.0))
             .child(
                 text(t)
                     .key(format!("{id}-mini-{}-time", r.key))
-                    .font(rune::tok::TextStyle::new(9.5, 400.0))
+                    .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                        9.5, 400.0,
+                    )))
                     .color(ink("#6d6d77")),
             ),
     );
@@ -2165,6 +2444,7 @@ fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) ->
             .items_start()
             .justify_end()
             .gap(8.0)
+            .hover_group()
             .child(bubble)
             .child(avatar())
     } else {
@@ -2173,16 +2453,22 @@ fn mini_bubble(id: &str, r: &crate::rune_transcript::RowData, live_row: bool) ->
             .w_full()
             .items_start()
             .gap(8.0)
+            .hover_group()
             .child(avatar())
             .child(bubble)
     }
 }
 
-fn card_view<S: CanvasHost + 'static>(
+#[allow(clippy::too_many_arguments)]
+fn card_view<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
     card: &MapCard,
     active: bool,
+    card_index: usize,
     thread: Option<&crate::rune_transcript::RuneTranscriptState>,
     input: &rune::TextEdit,
+    files: &[crate::chats::ChatAttachment],
+    files_error: Option<&str>,
+    drop_active: bool,
     kids: &[(String, String)],
     menu_open: bool,
     hover: &crate::motion::HoverSet,
@@ -2506,10 +2792,14 @@ fn card_view<S: CanvasHost + 'static>(
                 }
                 let mut convo = base;
                 for i in idxs {
-                    convo = convo.child(mini_bubble(
+                    let row = &t.rows[i];
+                    convo = convo.child(mini_bubble::<S>(
                         &id,
-                        &t.rows[i],
-                        live && t.rows[i].key == "live-agent",
+                        row,
+                        live && row.key == "live-agent",
+                        t.copied_messages.contains_key(&row.key),
+                        t.rewind_armed.contains_key(&row.key),
+                        !live && t.rewind_inbox.is_none(),
                     ));
                 }
                 convo
@@ -2582,128 +2872,280 @@ fn card_view<S: CanvasHost + 'static>(
         view = view.child(menu);
     }
     view = view.child(convo);
-    // Card dock (`canvas-card-dock`): 4/14/14 padding around the bordered
-    // input wrap; attach (inert — no Rune file picker), input, and the 25pt
-    // send button. React's `sending` spinner state has no native target.
-    let draft_empty = input.text.trim().is_empty();
-    let send_id = id.clone();
-    let edit_id = id.clone();
-    let send_disabled = live || draft_empty;
-    let send_offset = hover.offset(format!("{id}-send-offset"), [0.0, 0.0]);
-    let set_send_offset = send_offset.clone();
-    let attach = rune::el()
-        .key(format!("{id}-attach"))
-        .size(22.0, 22.0)
-        .radius(6.0)
-        .center()
-        .inert()
-        .child(
-            rune::el()
-                .size(12.0, 12.0)
-                .inert()
-                .shape(paperclip_icon(12.0, ink("#676b74"))),
-        );
-    let wrap = row()
-        .key(format!("{id}-input-wrap"))
-        .w_full()
-        .min_h(38.0)
-        .items_center()
-        .gap(5.0)
-        .px(5.0)
-        .py(4.0)
-        .radius(10.0)
-        .border(1.0, ink("#ffffff16"))
-        .border_layout()
-        .fill(rune::Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.22,
-        })
-        .child(attach)
-        .child(
-            text_input(input, rune::tok::TextStyle::new(10.5, 400.0))
-                .key(format!("{id}-input"))
-                .grow(1.0)
-                .min_w(0.0)
-                .placeholder(
-                    if live {
-                        "Agent is running — you can type ahead…"
+    // Canvas card dock. Pending questions replace the prompt dock with the
+    // compact Ask panel on every card except the active one (whose full
+    // transcript owns the question). The compact panel caps at 250pt, the
+    // same `canvas.css` cap as React.
+    let ask_batch = if active {
+        None
+    } else {
+        thread
+            .and_then(|t| t.ask.visible_batch(&t.chat_id).cloned())
+            .zip(thread)
+    };
+    let dock = if let Some((batch, t)) = ask_batch {
+        col()
+            .key(format!("{id}-dock"))
+            .w_full()
+            .px(14.0)
+            .pt(4.0)
+            .pb(14.0)
+            .child(crate::ask::ask_panel::<S>(
+                &batch,
+                &t.ask,
+                crate::rune_transcript::Thread::Card(card_index),
+                true,
+                h,
+            ))
+    } else {
+        // Card dock (`canvas-card-dock`): 4/14/14 padding around the bordered
+        // input wrap; attach, input, and the 25pt send button.
+        let draft_empty = input.text.trim().is_empty();
+        let send_id = id.clone();
+        let edit_id = id.clone();
+        let send_files = files.to_vec();
+        let send_disabled = live || (draft_empty && files.is_empty());
+        let send_offset = hover.offset(format!("{id}-send-offset"), [0.0, 0.0]);
+        let set_send_offset = send_offset.clone();
+        let pick_id = id.clone();
+        let attach = rune::el()
+            .key(format!("{id}-attach"))
+            .role("button")
+            .focusable(true)
+            .label("Attach files")
+            .help("Attach files")
+            .size(22.0, 22.0)
+            .radius(6.0)
+            .center()
+            .hover(ink("#ffffff12"))
+            .hover_group()
+            .on_press_tx_enter(move |s: &mut S, tx: &mut rune::Tx| {
+                pick_card_attachments::<S>(s, &pick_id, tx);
+            })
+            .child(
+                rune::el()
+                    .size(12.0, 12.0)
+                    .inert()
+                    .shape(paperclip_icon(12.0, ink("#676b74"))),
+            );
+        let mut files_row = row()
+            .key(format!("{id}-files"))
+            .w_full()
+            .wrap()
+            .gap(4.0)
+            .mb(6.0);
+        for (index, file) in files.iter().enumerate() {
+            let remove_id = id.clone();
+            let target = if file.id.is_empty() {
+                format!("local:{index}")
+            } else {
+                file.id.clone()
+            };
+            let icon = if file.is_image {
+                crate::lucide_image(9.0, ink("#b9b9c1"))
+            } else if file.file_type.starts_with("audio/") {
+                crate::lucide_audio_lines(9.0, ink("#b9b9c1"))
+            } else {
+                crate::lucide_file_text(9.0, ink("#b9b9c1"))
+            };
+            files_row = files_row.child(
+                row()
+                    .key(format!("{id}-file-{index}"))
+                    .items_center()
+                    .gap(4.0)
+                    .px(5.0)
+                    .py(3.0)
+                    .radius(6.0)
+                    .border(1.0, ink("#ffffff14"))
+                    .fill(ink("#ffffff09"))
+                    .child(rune::el().size(9.0, 9.0).inert().shape(icon))
+                    .child(
+                        text(file.name.clone())
+                            .font(rune::tok::TextStyle::new(8.5, 400.0))
+                            .max_w(150.0)
+                            .truncate()
+                            .color(ink("#b9b9c1")),
+                    )
+                    .child(
+                        rune::el()
+                            .key(format!("{id}-file-{index}-remove"))
+                            .role("button")
+                            .focusable(true)
+                            .label(format!("Remove {}", file.name))
+                            .size(13.0, 13.0)
+                            .radius(4.0)
+                            .center()
+                            .hover(ink("#ffffff1a"))
+                            .hover_group()
+                            .on_press_enter(move |s: &mut S| {
+                                s.canvas_mut().remove_card_attachment(&remove_id, &target);
+                            })
+                            .child(rune::el().size(8.0, 8.0).inert().shape(crate::lucide_x(
+                                8.0,
+                                2.0,
+                                ink("#74747d"),
+                            ))),
+                    ),
+            );
+        }
+        let wrap_border = if drop_active {
+            rune::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.3,
+            }
+        } else {
+            ink("#ffffff16")
+        };
+        let wrap = row()
+            .key(format!("{id}-input-wrap"))
+            .w_full()
+            .min_h(38.0)
+            .items_center()
+            .gap(5.0)
+            .px(5.0)
+            .py(4.0)
+            .radius(10.0)
+            .border(1.0, wrap_border)
+            .border_layout()
+            .fill(rune::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.22,
+            })
+            .focus_within_ring(1.0, -1.0, ink("#ffffff33"))
+            .child(attach)
+            .child(
+                text_input(input, rune::tok::TextStyle::new(10.5, 400.0))
+                    .key(format!("{id}-input"))
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .placeholder(
+                        if live {
+                            "Agent is running — you can type ahead…"
+                        } else {
+                            "Message this chat…"
+                        },
+                        ink("#5e626b"),
+                    )
+                    .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
+                    .on_edit(move |s: &mut S| s.canvas_mut().input_mut(&edit_id)),
+            )
+            .child(
+                rune::el()
+                    .key(format!("{id}-send"))
+                    .role("button")
+                    .focusable(true)
+                    .label(format!("Send to {send_id}"))
+                    .help(if live {
+                        "Wait for this run to finish"
                     } else {
-                        "Message this chat…"
-                    },
-                    ink("#5e626b"),
-                )
-                .caret(ink("#f2f2f4"), crate::motion::TEXT_SELECTION)
-                .on_edit(move |s: &mut S| s.canvas_mut().input_mut(&edit_id)),
-        )
-        .child(
-            rune::el()
-                .key(format!("{id}-send"))
-                .role("button")
-                .focusable(true)
-                .label(format!("Send to {send_id}"))
-                .size(25.0, 25.0)
-                .radius(8.0)
-                .fill(if send_disabled {
-                    ink("#ffffff14")
-                } else {
-                    ink("#f2f2f4")
-                })
-                .center()
-                // `.gp-composer-send:hover`: white face and a 1 pt lift.
-                .hover(if send_disabled {
-                    ink("#00000000")
-                } else {
-                    ink("#ffffff")
-                })
-                .live_offset(send_offset.smooth(crate::motion::HOVER_SPRING))
-                .on_hover_change(move |_s: &mut S, inside, tx| {
-                    if send_disabled {
-                        return;
-                    }
-                    set_send_offset.set(if inside { [0.0, -1.0] } else { [0.0, 0.0] });
-                    tx.live_only();
-                })
-                .on_press_enter(move |s: &mut S| {
-                    let c = s.canvas_mut();
-                    let prompt = c
-                        .inputs
-                        .get(&send_id)
-                        .map(|e| e.text.trim().to_string())
-                        .unwrap_or_default();
-                    if prompt.is_empty() {
-                        return;
-                    }
-                    if c.sessions.threads.get(&send_id).is_some_and(|t| t.live) {
-                        return;
-                    }
-                    if let Some(e) = c.inputs.get_mut(&send_id) {
-                        e.text.clear();
-                        e.anchor = 0;
-                        e.focus = 0;
-                    }
-                    let thread = c.thread_mut(&send_id);
-                    crate::rune_transcript::stage_send_prompt(thread, prompt);
-                })
-                .child(
-                    rune::el()
-                        .size(12.0, 12.0)
-                        .inert()
-                        .shape(crate::lucide_arrow_up(
-                            12.0,
-                            2.0,
-                            ink(if send_disabled { "#5e626b" } else { "#0a0a0d" }),
-                        )),
-                ),
-        );
-    let dock = col()
-        .key(format!("{id}-dock"))
-        .w_full()
-        .px(14.0)
-        .pt(4.0)
-        .pb(14.0)
-        .child(wrap);
+                        "Send message"
+                    })
+                    .size(25.0, 25.0)
+                    .radius(8.0)
+                    .fill(if send_disabled {
+                        ink("#ffffff14")
+                    } else {
+                        ink("#f2f2f4")
+                    })
+                    .center()
+                    // `.gp-composer-send:hover`: white face and a 1 pt lift.
+                    .hover(if send_disabled {
+                        ink("#00000000")
+                    } else {
+                        ink("#ffffff")
+                    })
+                    .live_offset(send_offset.smooth(crate::motion::HOVER_SPRING))
+                    .on_hover_change(move |_s: &mut S, inside, tx| {
+                        if send_disabled {
+                            return;
+                        }
+                        set_send_offset.set(if inside { [0.0, -1.0] } else { [0.0, 0.0] });
+                        tx.live_only();
+                    })
+                    .on_press_enter(move |s: &mut S| {
+                        let c = s.canvas_mut();
+                        let prompt = c
+                            .inputs
+                            .get(&send_id)
+                            .map(|e| e.text.trim().to_string())
+                            .unwrap_or_default();
+                        if prompt.is_empty() && send_files.is_empty() {
+                            return;
+                        }
+                        if c.sessions.threads.get(&send_id).is_some_and(|t| t.live) {
+                            return;
+                        }
+                        let thread = c.thread_mut(&send_id);
+                        let staged = crate::rune_transcript::stage_send_prompt_with_attachments(
+                            thread,
+                            prompt,
+                            send_files.clone(),
+                        );
+                        if staged {
+                            if let Some(e) = c.inputs.get_mut(&send_id) {
+                                e.text.clear();
+                                e.anchor = 0;
+                                e.focus = 0;
+                            }
+                            c.card_attachments.remove(&send_id);
+                            c.card_attachment_errors.remove(&send_id);
+                        } else {
+                            let error = c
+                                .sessions
+                                .threads
+                                .get(&send_id)
+                                .and_then(|t| t.attachments_error.clone());
+                            if let Some(error) = error {
+                                c.card_attachment_errors.insert(send_id.clone(), error);
+                            }
+                        }
+                    })
+                    .child(
+                        rune::el()
+                            .size(12.0, 12.0)
+                            .inert()
+                            .shape(crate::lucide_arrow_up(
+                                12.0,
+                                2.0,
+                                ink(if send_disabled { "#5e626b" } else { "#0a0a0d" }),
+                            )),
+                    ),
+            );
+        let drop_id = id.clone();
+        let hover_id = id.clone();
+        let mut body = col()
+            .key(format!("{id}-dock"))
+            .w_full()
+            .px(14.0)
+            .pt(4.0)
+            .pb(14.0)
+            .accepts_files(|_| true)
+            .on_drop_files(move |s: &mut S, dropped: &[std::path::PathBuf], _tx| {
+                s.canvas_mut().add_card_attachments(&drop_id, dropped);
+                s.canvas_mut().card_drop = None;
+            })
+            .on_drop_hover(move |s: &mut S, over, _tx| {
+                s.canvas_mut().card_drop = over.then(|| hover_id.clone());
+            });
+        if !files.is_empty() {
+            body = body.child(files_row);
+        }
+        body = body.child(wrap);
+        if let Some(error) = files_error {
+            body = body.child(
+                text(error.to_string())
+                    .key(format!("{id}-files-error"))
+                    .mt(4.0)
+                    .font(rune::tok::TextStyle::new(8.5, 400.0))
+                    .color(ink("#fda4af")),
+            );
+        }
+        body
+    };
     view = view
         .child(dock)
         // Edge ports (`.canvas-card-port`): 9px dots centred on the top and
@@ -2983,7 +3425,9 @@ pub fn canvas_view(s: &CanvasState, _: &mut Cx<CanvasState>) -> El {
 }
 
 /// Canvas body shared by the standalone view and the shell.
-pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
+pub fn canvas_body<S: CanvasHost + crate::rune_transcript::TranscriptHost + 'static>(
+    s: &CanvasState,
+) -> El {
     let dot = rune::Color {
         r: 1.0,
         g: 1.0,
@@ -3087,11 +3531,21 @@ pub fn canvas_body<S: CanvasHost + 'static>(s: &CanvasState) -> El {
         // Inputs are ensured in `seed_sessions`/`new_session`; the blank is
         // a borrow-safe fallback that never renders (every card has one).
         let input = s.inputs.get(&card.id).unwrap_or(&blank);
+        let card_index = s
+            .sessions
+            .order
+            .iter()
+            .position(|id| id == &card.id)
+            .unwrap_or(0);
         world = world.child(card_view::<S>(
             card,
             card.id == s.active_id,
+            card_index,
             s.sessions.threads.get(&card.id),
             input,
+            s.card_attachments(&card.id),
+            s.card_attachment_errors.get(&card.id).map(String::as_str),
+            s.card_drop.as_deref() == Some(card.id.as_str()),
             &kids,
             s.agents_open.as_deref() == Some(card.id.as_str()),
             &s.hover,
@@ -5115,6 +5569,133 @@ mod tests {
     use rune::{Env, Runtime};
 
     #[test]
+    fn card_dock_attachments_are_per_card_and_capped() {
+        let mut s = CanvasState::map();
+        let card = s.cards[0].id.clone();
+        let other = s.cards[1].id.clone();
+        let dir = std::env::temp_dir().join(format!(
+            "stark-card-files-{}-{}",
+            std::process::id(),
+            crate::clock::now_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<std::path::PathBuf> = (0..9)
+            .map(|index| {
+                let path = dir.join(format!("file-{index}.txt"));
+                std::fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect();
+        s.add_card_attachments(&card, &paths);
+        assert_eq!(s.card_attachments(&card).len(), 8, "eight-file cap");
+        assert!(
+            s.card_attachment_errors
+                .get(&card)
+                .is_some_and(|error| error.contains("up to 8")),
+            "amber cap message"
+        );
+        assert!(s.card_attachments(&other).is_empty(), "per-card draft");
+        assert!(
+            s.sessions.threads[&card].draft_attachments.is_empty(),
+            "map draft must not leak into the full chat dock"
+        );
+        s.remove_card_attachment(&card, "local:0");
+        assert_eq!(s.card_attachments(&card).len(), 7);
+        assert!(
+            !s.card_attachment_errors.contains_key(&card),
+            "clearing under the cap drops the message"
+        );
+        s.clear_card_draft(&card);
+        assert!(s.card_attachments(&card).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mini_bubble_actions_copy_and_arm_rewind() {
+        let mut s = CanvasState::map();
+        let card = s.cards[0].id.clone();
+        {
+            let thread = s.thread_mut(&card);
+            thread.live = false;
+            thread.rows = vec![
+                crate::rune_transcript::RowData {
+                    key: "msg-0".to_string(),
+                    role: "user",
+                    body: "hello".to_string(),
+                    ..Default::default()
+                },
+                crate::rune_transcript::RowData {
+                    key: "msg-1".to_string(),
+                    role: "agent",
+                    body: "hi".to_string(),
+                    ..Default::default()
+                },
+            ];
+        }
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, canvas_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let copy = format!("{card}-mini-msg-0-copy");
+        let (cx, cy) = rt.find(&copy).expect("copy action mounted");
+        rt.pointer_move(cx, cy);
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.sessions.threads[&card]
+                .copied_messages
+                .contains_key("msg-0"),
+            "copy feedback keyed to the message"
+        );
+        let rewind = format!("{card}-mini-msg-0-rewind");
+        let (rx, ry) = rt.find(&rewind).expect("rewind action mounted");
+        rt.pointer_move(rx, ry);
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.sessions.threads[&card]
+                .rewind_armed
+                .contains_key("msg-0"),
+            "first rewind press arms the two-step confirm"
+        );
+    }
+
+    #[test]
+    fn background_card_mounts_the_compact_ask_panel() {
+        let mut s = CanvasState::map();
+        let background = s.cards[1].id.clone();
+        s.active_id = s.cards[0].id.clone();
+        s.sessions.sheet = Some(s.active_id.clone());
+        let chat_id = s.sessions.threads[&background].chat_id.clone();
+        let mut batch = crate::ask::AskBatch::list_from_json(&serde_json::json!({
+            "batches": [{
+                "batch_id": "b-card",
+                "chat_id": chat_id,
+                "created": 1,
+                "questions": [{
+                    "id": "q1",
+                    "question": "Which branch?",
+                    "options": ["main", "dev"]
+                }]
+            }]
+        }))
+        .remove(0);
+        batch.chat_id = chat_id;
+        s.sessions.threads.get_mut(&background).unwrap().ask.batches = vec![batch];
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(s, canvas_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("ask-panel").is_some(), "compact ask mounted");
+        let (rect, _) = rt.presented("ask-panel").expect("panel laid out");
+        assert!(
+            rect[3] <= 250.5,
+            "canvas ask panel respects its 250pt cap, got {}",
+            rect[3]
+        );
+    }
+
+    #[test]
     fn history_refresh_keeps_seen_rows_and_drops_deleted_keys() {
         let mut canvas = CanvasState::map();
         let mut thread = crate::rune_transcript::RuneTranscriptState::screenshot();
@@ -5157,6 +5738,21 @@ mod tests {
                 parent_item_id: Some("chat:ws-general:chat-1".to_string()),
             },
         );
+        s.card_attachments.insert(
+            old.clone(),
+            vec![crate::chats::ChatAttachment {
+                id: "a1".to_string(),
+                name: "notes.txt".to_string(),
+                file_type: "text/plain".to_string(),
+                size: 3,
+                path: "notes.txt".to_string(),
+                is_image: false,
+                url: None,
+            }],
+        );
+        s.card_attachment_errors
+            .insert(old.clone(), "keep me".to_string());
+        s.card_drop = Some(old.clone());
         {
             let thread = s.sessions.threads.get_mut(&old).unwrap();
             thread.pending_rekey = Some(("team".to_string(), "real-9".to_string()));
@@ -5177,6 +5773,10 @@ mod tests {
         assert_eq!(s.active_id, new);
         assert_eq!(s.inputs.get(new).unwrap().text, "keep me");
         assert!(!s.inputs.contains_key(&old));
+        assert_eq!(s.card_attachments(new).len(), 1);
+        assert!(!s.card_attachments.contains_key(&old));
+        assert_eq!(s.card_attachment_errors.get(new).unwrap(), "keep me");
+        assert_eq!(s.card_drop.as_deref(), Some(new));
         assert!(s.closed.iter().any(|(id, _)| id == new));
         assert!(s.layout_meta.contains_key(new));
         assert!(s.manual_cards.contains(new));

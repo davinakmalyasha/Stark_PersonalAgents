@@ -400,12 +400,13 @@ impl SettingsState {
         self.op_inbox = Some(rx);
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (file, root);
-            let _ = tx.send(OpResult {
-                kind: OpKind::Backup,
-                status: None,
-                error: Some("Backup import is available in the desktop app.".to_string()),
-                clear_file: false,
+            let _ = file;
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = crate::transport::upload_backup_web(&root).await;
+                if result.is_ok() {
+                    crate::transport::clear_backup_file();
+                }
+                let _ = tx.send(backup_op(result));
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -443,21 +444,23 @@ impl SettingsState {
         });
     }
 
-    /// Web build: let the browser download the endpoint's attachment.
+    /// Web build: fetch the backup with the pairing header, then hand the
+    /// bytes to a browser download (`window.open` cannot send the token).
     #[cfg(target_arch = "wasm32")]
     pub fn export_web(&mut self) {
+        if self.backup_busy {
+            return;
+        }
+        self.backup_busy = true;
         self.error = None;
         self.status.clear();
-        let url = format!("http://{}:{}/api/data/export", self.host, self.port);
-        let opened = web_sys::window()
-            .and_then(|w| w.open_with_url_and_target(&url, "_blank").ok())
-            .is_some();
-        if opened {
-            self.status = "Exported stark-backup.zip. Keep it safe — it contains chats and config, never API keys."
-                .to_string();
-        } else {
-            self.error = Some("Export failed: the browser blocked the download.".to_string());
-        }
+        let (tx, rx) = mpsc::channel();
+        self.op_inbox = Some(rx);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result =
+                crate::transport::download_web("/api/data/export", "stark-backup.zip").await;
+            let _ = tx.send(export_op(result));
+        });
     }
 
     /// `checkForAppUpdate({manual:true})`. Rune has no updater yet; say so.
@@ -575,6 +578,18 @@ fn export_op(result: Result<String, String>) -> OpResult {
 /// Drain background settings work. Returns whether the view must commit.
 pub fn poll_settings(s: &mut SettingsState) -> bool {
     let mut changed = false;
+    #[cfg(target_arch = "wasm32")]
+    if let Some(name) = crate::transport::backup_file_name() {
+        let current = s
+            .backup_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str());
+        if current != Some(name.as_str()) {
+            s.backup_file = Some(PathBuf::from(name));
+            changed = true;
+        }
+    }
     while let Some(msg) = s.load_inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
         if msg.generation == s.generation {
             s.loading = false;
@@ -810,8 +825,8 @@ fn pick_backup<S: SettingsHost + 'static>(s: &mut S, tx: &mut rune::Tx) {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = tx;
-        s.settings_mut().error =
-            Some("Choosing a backup file is available in the desktop app.".to_string());
+        s.settings_mut().error = None;
+        crate::transport::pick_backup_file();
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

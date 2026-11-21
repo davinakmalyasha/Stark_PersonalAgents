@@ -418,8 +418,9 @@ fn spawn_poll(host: String, port: u16, tx: std::sync::mpsc::Sender<Result<Vec<As
     });
 }
 
-/// Drain ask poll/submit results and start the 1.5s poll. Only called for the
-/// visible sheet thread, so background chats stay offline until opened.
+/// Drain ask poll/submit results and start the 1.5s poll. The shell calls
+/// this for the visible transcript and every open canvas card, so a question
+/// on a background card mounts its compact panel without opening the card.
 pub fn poll_ask_state(s: &mut RuneTranscriptState, clock: f64) -> bool {
     let mut changed = false;
     let (polls, poll_dead) = crate::rooms::drain_results(&mut s.ask.poll_inbox);
@@ -776,6 +777,7 @@ fn question_block<S: TranscriptHost + 'static>(
         let question_id = question.id.clone();
         let label = option.label.clone();
         let multi = question.multi;
+        let target = which;
         options = options.child(option_row::<S>(
             question,
             index,
@@ -784,7 +786,7 @@ fn question_block<S: TranscriptHost + 'static>(
             selected,
             compact,
             std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).ask.toggle(&question_id, &label, multi);
+                s.thread_mut(target).ask.toggle(&question_id, &label, multi);
             }),
         ));
     }
@@ -793,6 +795,7 @@ fn question_block<S: TranscriptHost + 'static>(
         ask.custom_open.contains(&question.id) || !ask.custom_text(&question.id).is_empty();
     {
         let question_id = question.id.clone();
+        let target = which;
         options = options.child(option_row::<S>(
             question,
             question.options.len(),
@@ -801,7 +804,7 @@ fn question_block<S: TranscriptHost + 'static>(
             custom,
             compact,
             std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).ask.open_custom(&question_id);
+                s.thread_mut(target).ask.open_custom(&question_id);
             }),
         ));
     }
@@ -809,6 +812,8 @@ fn question_block<S: TranscriptHost + 'static>(
     if custom {
         if let Some(edit) = ask.custom_edits.get(&question.id) {
             let question_id = question.id.clone();
+            let edit_target = which;
+            let enter_target = which;
             let input_style = style(if compact { 11.0 } else { 13.0 }, 400.0, 16.9);
             let enter_batch = batch.clone();
             options = options.child(
@@ -825,7 +830,7 @@ fn question_block<S: TranscriptHost + 'static>(
                     .placeholder("Type your answer…", ink("#52525b"))
                     .caret(ink("#e4e4e7"), crate::motion::TEXT_SELECTION)
                     .on_edit(move |s: &mut S| {
-                        let ask = &mut s.thread_mut(which).ask;
+                        let ask = &mut s.thread_mut(edit_target).ask;
                         ask.custom_edits
                             .entry(question_id.clone())
                             .or_insert_with(|| TextEdit::new(""))
@@ -834,10 +839,10 @@ fn question_block<S: TranscriptHost + 'static>(
                         if key.key != rune::Key::Enter || key.mods.shift {
                             return false;
                         }
-                        if !s.thread(which).ask.all_answered(&enter_batch) {
+                        if !s.thread(enter_target).ask.all_answered(&enter_batch) {
                             return false;
                         }
-                        submit::<S>(s, which, &enter_batch);
+                        submit::<S>(s, enter_target, &enter_batch);
                         true
                     }),
             );
@@ -856,9 +861,13 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
 ) -> El {
     let radius = if compact { 12.0 } else { 16.0 };
     let max_h = if compact {
-        // Canvas cards cap at 250px (`canvas.css`); the dock's compact panel
-        // is the home card's, so keep `askDock.css`'s 292pt cap here.
-        292.0
+        // Canvas cards cap at 250px (`canvas.css .canvas-card-ask`); the
+        // home card's compact dock keeps `askDock.css`'s 292pt cap.
+        if matches!(&which, Thread::Card(_)) {
+            250.0
+        } else {
+            292.0
+        }
     } else {
         (window_h * 0.62).min(560.0)
     };
@@ -929,11 +938,14 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
             button_size,
             control_icon,
             chevron_down(control_icon, ask.collapsed, ink("#71717a")),
-            std::rc::Rc::new(move |s: &mut S| {
-                let ask = &mut s.thread_mut(which).ask;
-                ask.collapsed = !ask.collapsed;
-                let _ = &batch_collapse;
-            }),
+            {
+                let target = which;
+                std::rc::Rc::new(move |s: &mut S| {
+                    let ask = &mut s.thread_mut(target).ask;
+                    ask.collapsed = !ask.collapsed;
+                    let _ = &batch_collapse;
+                })
+            },
         ))
         .child(icon_button::<S>(
             "ask-dismiss",
@@ -941,9 +953,12 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
             button_size,
             control_icon,
             crate::lucide_x(control_icon, 2.0, ink("#71717a")),
-            std::rc::Rc::new(move |s: &mut S| {
-                s.thread_mut(which).ask.dismiss(&batch_dismiss);
-            }),
+            {
+                let target = which;
+                std::rc::Rc::new(move |s: &mut S| {
+                    s.thread_mut(target).ask.dismiss(&batch_dismiss);
+                })
+            },
         ));
 
     let mut body = col()
@@ -1007,8 +1022,11 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
                 .radius(8.0)
                 .color(ink("#a1a1aa"))
                 .hover(rgba(255.0, 255.0, 255.0, 0.05))
-                .on_press_enter(move |s: &mut S| {
-                    s.thread_mut(which).ask.dismiss(&dismiss_foot);
+                .on_press_enter({
+                    let target = which;
+                    move |s: &mut S| {
+                        s.thread_mut(target).ask.dismiss(&dismiss_foot);
+                    }
                 }),
         )
         .child(
@@ -1050,8 +1068,11 @@ pub fn ask_panel<S: TranscriptHost + 'static>(
                     .color(ink("#0a0a0d"))
                     .opacity(if disabled { 0.4 } else { 1.0 })
                     .disabled(disabled)
-                    .on_press_enter(move |s: &mut S| {
-                        submit::<S>(s, which, &submit_batch);
+                    .on_press_enter({
+                        let target = which;
+                        move |s: &mut S| {
+                            submit::<S>(s, target, &submit_batch);
+                        }
                     }),
                 ),
         );

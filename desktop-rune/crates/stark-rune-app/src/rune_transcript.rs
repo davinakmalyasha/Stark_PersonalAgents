@@ -1341,7 +1341,14 @@ pub fn stage_send(s: &mut RuneTranscriptState) {
 /// One picked path becomes a local draft card (`id` empty until upload).
 /// React's `addFiles`: drop >20 MB files, dedupe by name+size, cap at eight,
 /// and report the matching amber line.
-pub fn add_attachment_paths(s: &mut RuneTranscriptState, paths: &[std::path::PathBuf]) {
+///
+/// Shared by the transcript composer and canvas card docks so both surfaces
+/// enforce the same limits.
+pub fn add_attachment_paths_to(
+    attachments: &mut Vec<ChatAttachment>,
+    error: &mut Option<String>,
+    paths: &[std::path::PathBuf],
+) {
     if paths.is_empty() {
         return;
     }
@@ -1368,52 +1375,64 @@ pub fn add_attachment_paths(s: &mut RuneTranscriptState, paths: &[std::path::Pat
     let size_rejected = valid.len() != paths.len();
     let mut dropped = false;
     for file in valid {
-        if s.draft_attachments
+        if attachments
             .iter()
             .any(|item| item.id.is_empty() && item.name == file.name && item.size == file.size)
         {
             dropped = true;
             continue;
         }
-        s.draft_attachments.push(file);
+        attachments.push(file);
     }
-    if s.draft_attachments.len() > MAX_ATTACHMENTS {
-        let extra = s.draft_attachments.len() - MAX_ATTACHMENTS;
-        s.draft_attachments.truncate(MAX_ATTACHMENTS);
+    if attachments.len() > MAX_ATTACHMENTS {
+        let extra = attachments.len() - MAX_ATTACHMENTS;
+        attachments.truncate(MAX_ATTACHMENTS);
         dropped |= extra > 0;
     }
     if size_rejected {
-        s.attachments_error = Some("Files must be 20 MB or smaller.".to_string());
+        *error = Some("Files must be 20 MB or smaller.".to_string());
     } else if dropped {
-        s.attachments_error = Some(format!(
+        *error = Some(format!(
             "You can attach up to {MAX_ATTACHMENTS} files at once."
         ));
-    } else if !s.draft_attachments.is_empty() {
-        s.attachments_error = None;
+    } else if !attachments.is_empty() {
+        *error = None;
     }
+}
+
+pub fn add_attachment_paths(s: &mut RuneTranscriptState, paths: &[std::path::PathBuf]) {
+    add_attachment_paths_to(&mut s.draft_attachments, &mut s.attachments_error, paths);
 }
 
 /// Remove one deck card. Local picks have no id yet (the composer passes
 /// `local:<index>`); restored uploads pass their id. Clearing back under the
 /// cap also drops React's "up to 8" line.
-pub fn remove_draft_attachment(s: &mut RuneTranscriptState, target: &str) {
+pub fn remove_attachment_from(
+    attachments: &mut Vec<ChatAttachment>,
+    error: &mut Option<String>,
+    target: &str,
+) {
     if let Some(index) = target
         .strip_prefix("local:")
         .and_then(|value| value.parse::<usize>().ok())
     {
-        if index < s.draft_attachments.len() {
-            s.draft_attachments.remove(index);
+        if index < attachments.len() {
+            attachments.remove(index);
         }
     } else {
-        s.draft_attachments.retain(|file| file.id != target);
+        attachments.retain(|file| file.id != target);
     }
-    if s.draft_attachments.len() < MAX_ATTACHMENTS
-        && s.attachments_error
+    if attachments.len() < MAX_ATTACHMENTS
+        && error
             .as_deref()
-            .is_some_and(|error| error.contains("up to 8"))
+            .is_some_and(|message| message.contains("up to 8"))
     {
-        s.attachments_error = None;
+        *error = None;
     }
+}
+
+pub fn remove_draft_attachment(s: &mut RuneTranscriptState, target: &str) {
+    remove_attachment_from(&mut s.draft_attachments, &mut s.attachments_error, target);
 }
 
 /// The dock's attach button / dashed tile: one native file dialog per pick
@@ -1423,17 +1442,30 @@ pub fn open_attachment_picker<S: TranscriptHost + 'static>(
     which: Thread,
     tx: &mut rune::Tx,
 ) {
-    let options = rune::FileDialogOptions {
-        title: "Attach files".to_string(),
-        ..Default::default()
-    };
-    tx.open_file(options, move |s: &mut S, result, _tx| match result {
-        Ok(Some(path)) => add_attachment_paths(s.thread_mut(which), &[path]),
-        Ok(None) => {}
-        Err(error) => {
-            s.thread_mut(which).attachments_error = Some(error.to_string());
-        }
-    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tx;
+        let target = match which {
+            Thread::Main => crate::transport::WebTarget::Main,
+            Thread::Open => crate::transport::WebTarget::Open,
+            Thread::Card(_) => return,
+        };
+        crate::transport::pick_files(target);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let options = rune::FileDialogOptions {
+            title: "Attach files".to_string(),
+            ..Default::default()
+        };
+        tx.open_file(options, move |s: &mut S, result, _tx| match result {
+            Ok(Some(path)) => add_attachment_paths(s.thread_mut(which), &[path]),
+            Ok(None) => {}
+            Err(error) => {
+                s.thread_mut(which).attachments_error = Some(error.to_string());
+            }
+        });
+    }
 }
 
 /// Drop files anywhere on the composer card (multi-file, unlike the picker).
@@ -1550,7 +1582,8 @@ pub fn stage_send_prompt_with_attachments(
         }
         #[cfg(target_arch = "wasm32")]
         {
-            s.attachments_error = Some("File uploads need the desktop app.".to_string());
+            s.attachments_error =
+                Some("Use the browser picker to attach files in the web app.".to_string());
             return false;
         }
     }
@@ -1885,11 +1918,14 @@ pub fn stage_abort(s: &mut RuneTranscriptState) {
 /// the shell state while reading transcript data. The standalone transcript
 /// view hosts itself. `Main` is the fallback thread; `Open` is the transcript
 /// sheet's card thread (resolved through the sessions map — one page, chat
-/// types only, no workspace routes).
+/// types only, no workspace routes). `Card` targets one canvas card by its
+/// position in `Sessions::order` so its compact dock can host the same Ask
+/// panel; the view is rebuilt with the current index every frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Thread {
     Main,
     Open,
+    Card(usize),
 }
 
 pub trait TranscriptHost {
@@ -2003,8 +2039,18 @@ fn attachment_has_src(s: &RuneTranscriptState, file: &ChatAttachment) -> bool {
 /// no native download endpoint, so they keep the anchor's visual but no press.
 fn attachment_open_url(s: &RuneTranscriptState, file: &ChatAttachment) -> Option<String> {
     let _ = s;
+    #[cfg(target_arch = "wasm32")]
+    let absolute = |url: &str| {
+        if url.starts_with('/') {
+            crate::transport::api_url(url)
+        } else {
+            url.to_string()
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let absolute = |url: &str| url.to_string();
     if let Some(url) = file.url.as_deref().filter(|url| !url.is_empty()) {
-        return Some(url.to_string());
+        return Some(absolute(url));
     }
     if !file.path.is_empty() && std::path::Path::new(&file.path).exists() {
         let path = file.path.replace('\\', "/");
@@ -2012,10 +2058,10 @@ fn attachment_open_url(s: &RuneTranscriptState, file: &ChatAttachment) -> Option
     }
     #[cfg(target_arch = "wasm32")]
     if !s.workspace_id.is_empty() && !s.chat_id.is_empty() && !file.id.is_empty() {
-        return Some(format!(
+        return Some(absolute(&format!(
             "/api/workspaces/{}/chats/{}/attachments/{}",
             s.workspace_id, s.chat_id, file.id
-        ));
+        )));
     }
     None
 }
@@ -2359,6 +2405,12 @@ fn detach_live_run(s: &mut RuneTranscriptState) {
 
 /// Second press: POST `/rewind` and refetch the chat. Results land in
 /// `rewind_inbox` for the poll hook, exactly like a run.
+/// Canvas mini-bubble rewind entry: the same two-step rule as the full
+/// transcript, targeting one message row in a card thread.
+pub fn rewind_row(s: &mut RuneTranscriptState, row_id: &str, attachments: Vec<ChatAttachment>) {
+    start_rewind(s, row_id.to_string(), attachments);
+}
+
 fn start_rewind(s: &mut RuneTranscriptState, row_id: String, attachments: Vec<ChatAttachment>) {
     if s.rewind_inbox.is_some() {
         return;
@@ -2722,7 +2774,7 @@ fn home_body_style() -> rune::tok::TextStyle {
 }
 
 /// Lucide `Copy` at a 24-unit box.
-fn home_icon_copy(size: f32, color: rune::Color) -> rune::Shape {
+pub(crate) fn home_icon_copy(size: f32, color: rune::Color) -> rune::Shape {
     let p = rune::Path::new()
         .move_to([10.0, 8.0])
         .line_to([20.0, 8.0])
@@ -2759,7 +2811,7 @@ fn home_icon_arrow_down(size: f32, color: rune::Color) -> rune::Shape {
 }
 
 /// Lucide `RotateCcw` at a 24-unit box (rewind / retry).
-fn home_icon_rotate(size: f32, color: rune::Color) -> rune::Shape {
+pub(crate) fn home_icon_rotate(size: f32, color: rune::Color) -> rune::Shape {
     const K: f32 = 4.971;
     let p = rune::Path::new()
         .move_to([12.0, 3.0])
@@ -5013,9 +5065,11 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
             // changed. The fingerprint catches appends, same-count
             // replacements and reorders; the chat id catches a thread swap.
             .virtual_rows_version({
-                let thread = match which {
+                let thread = match &which {
                     Thread::Main => "main",
                     Thread::Open => "open",
+                    // `s.chat_id` below distinguishes one card from another.
+                    Thread::Card(_) => "card",
                 };
                 (
                     thread,

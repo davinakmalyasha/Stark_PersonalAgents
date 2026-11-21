@@ -7,7 +7,7 @@
 //! panel is up. A transcript sheet opens over the map for the active session.
 
 use crate::keys::EnterPress;
-use rune::{col, row, text, AppSpec, Cx, El, LineCap, Path, Shape};
+use rune::{col, row, text, text_input, AppSpec, Cx, El, LineCap, Path, Shape};
 
 use crate::cloud::{cloud_view, poll_cloud_state, CloudHost, CloudState};
 use crate::projects::{poll_projects_state, ProjectsHost};
@@ -24,6 +24,7 @@ use crate::rune_transcript::{
 /// The first frame before layout uses the spec size.
 static mut WINDOW_W: f32 = 1280.0;
 static mut WINDOW_H: f32 = 900.0;
+static mut WINDOW_SAFE_BOTTOM: f32 = 0.0;
 
 /// Sidebar/side-panel fold threshold (React `md:` = 768).
 const PANEL_FOLD_W: f32 = 768.0;
@@ -31,6 +32,8 @@ const PANEL_FOLD_W: f32 = 768.0;
 const TAB_H: f32 = 52.0;
 /// Side panel width (`HouseSidebar` w-[248px]).
 const PANEL_W: f32 = 248.0;
+/// Phone bottom nav (icons + labels), before safe-area padding.
+const MOBILE_NAV_H: f32 = 52.0;
 
 fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
@@ -181,6 +184,54 @@ fn rail_icon(tab: RailTab, size: f32, color: rune::Color) -> Shape {
     }
 }
 
+/// Phone/browser pairing gate. Desktop never shows it: loopback requests are
+/// already trusted. The token lives in localStorage and every wasm request
+/// carries `X-API-Token` (see `transport`).
+pub struct PairingState {
+    pub locked: bool,
+    pub token: rune::TextEdit,
+    pub error: Option<String>,
+    pub busy: bool,
+    /// In-flight `/api/health` probe after a token submit. Dropped on clone.
+    #[allow(dead_code)] // only drained by the wasm poll
+    pub inbox: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+}
+
+impl std::fmt::Debug for PairingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingState")
+            .field("locked", &self.locked)
+            .field("token_len", &self.token.text.len())
+            .field("error", &self.error)
+            .field("busy", &self.busy)
+            .finish()
+    }
+}
+
+impl Default for PairingState {
+    fn default() -> Self {
+        Self {
+            locked: false,
+            token: rune::TextEdit::new(""),
+            error: None,
+            busy: false,
+            inbox: None,
+        }
+    }
+}
+
+impl Clone for PairingState {
+    fn clone(&self) -> Self {
+        Self {
+            locked: self.locked,
+            token: self.token.clone(),
+            error: self.error.clone(),
+            busy: self.busy,
+            inbox: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellState {
     pub transcript: RuneTranscriptState,
@@ -193,6 +244,10 @@ pub struct ShellState {
     pub chats: crate::chats::ChatsState,
     /// Global Settings modal (Tauri's modal lives above every chat).
     pub settings: crate::settings::SettingsState,
+    pub pairing: PairingState,
+    /// Phone drawer. Desktop ignores it; below `md` it is closed until the
+    /// bottom nav asks for a panel.
+    pub mobile_panel_open: bool,
 }
 
 impl Default for ShellState {
@@ -214,6 +269,8 @@ impl Default for ShellState {
             memory: MemoryState::default(),
             chats: crate::chats::ChatsState::default(),
             settings: crate::settings::SettingsState::default(),
+            pairing: PairingState::default(),
+            mobile_panel_open: false,
         }
     }
 }
@@ -233,6 +290,13 @@ impl TranscriptHost for ShellState {
             Thread::Main => &self.transcript,
             // The sheet's card thread; falls back to Main when closed.
             Thread::Open => self.canvas.sheet_thread().unwrap_or(&self.transcript),
+            Thread::Card(index) => self
+                .canvas
+                .sessions
+                .order
+                .get(index)
+                .and_then(|id| self.canvas.sessions.threads.get(id))
+                .unwrap_or(&self.transcript),
         }
     }
     fn thread_mut(&mut self, which: Thread) -> &mut RuneTranscriptState {
@@ -243,6 +307,13 @@ impl TranscriptHost for ShellState {
                     self.canvas.sheet_thread_mut().expect("checked above")
                 } else {
                     &mut self.transcript
+                }
+            }
+            Thread::Card(index) => {
+                let id = self.canvas.sessions.order.get(index).cloned();
+                match id {
+                    Some(id) => self.canvas.thread_mut(&id),
+                    None => &mut self.transcript,
                 }
             }
         }
@@ -514,6 +585,150 @@ fn tab_code_icon(size: f32, color: rune::Color) -> Shape {
 }
 
 /// Icon rail button (Lucide-shaped icon + label for assistive tech).
+/// Phone bottom navigation (`HouseMobileNav`): same destinations as the
+/// desktop rail without stealing chat width. Safe-area bottom padding keeps
+/// the bar above the home indicator.
+fn mobile_nav(s: &ShellState, safe_bottom: f32) -> El {
+    let waiting: u64 = s.canvas.projects.projects.iter().map(|p| p.waiting).sum();
+    let mut nav = row()
+        .key("house-mobile-nav")
+        .w_full()
+        .h(MOBILE_NAV_H + safe_bottom)
+        .items_stretch()
+        .gap(4.0)
+        .px(8.0)
+        .pt(4.0)
+        .pb(4.0 + safe_bottom)
+        .fill(ink("#0c0c0c"))
+        .border_sides([1.0, 0.0, 0.0, 0.0], ink("#ffffff12"))
+        .border_layout();
+    #[derive(Clone, Copy)]
+    enum NavGlyph {
+        Rail(RailTab),
+        New,
+        Settings,
+    }
+    let glyph = |glyph: NavGlyph, color: rune::Color| match glyph {
+        NavGlyph::Rail(tab) => rail_icon(tab, 18.0, color),
+        NavGlyph::New => icon_new_chat(18.0, color),
+        NavGlyph::Settings => icon_settings(18.0, color),
+    };
+    let item = |key: &str,
+                label: &'static str,
+                active: bool,
+                icon: NavGlyph,
+                badge: u64,
+                action: std::rc::Rc<dyn Fn(&mut ShellState)>| {
+        let color = ink(if active { "#fafafa" } else { "#71717a" });
+        let mut button = col()
+            .key(key)
+            .role("button")
+            .focusable(true)
+            .label(label)
+            .help(label)
+            .grow(1.0)
+            .items_center()
+            .justify_center()
+            .gap(2.0)
+            .py(6.0)
+            .radius(8.0)
+            .on_press_enter(move |s: &mut ShellState| action(s))
+            .child(
+                rune::el()
+                    .size(18.0, 18.0)
+                    .inert()
+                    .shape(glyph(icon, color)),
+            )
+            .child(
+                text(label.to_string())
+                    .font(rune::tok::TextStyle::new(9.0, 400.0))
+                    .color(color),
+            );
+        if badge > 0 {
+            button = button.child(
+                text(badge.to_string())
+                    .absolute(30.0, 0.0)
+                    .font(crate::motion::tabular(rune::tok::TextStyle::new(
+                        8.0, 700.0,
+                    )))
+                    .color(ink("#0a0a0d")),
+            );
+        }
+        button
+    };
+    nav = nav
+        .child(item(
+            "mobile-chats",
+            "Chats",
+            s.canvas.rail == RailTab::Chats,
+            NavGlyph::Rail(RailTab::Chats),
+            0,
+            std::rc::Rc::new(|s: &mut ShellState| {
+                s.canvas.rail = RailTab::Chats;
+                s.mobile_panel_open = true;
+            }),
+        ))
+        .child(item(
+            "mobile-new",
+            "New",
+            false,
+            NavGlyph::New,
+            0,
+            std::rc::Rc::new(|s: &mut ShellState| {
+                s.canvas.new_session();
+                s.mobile_panel_open = false;
+            }),
+        ))
+        .child(item(
+            "mobile-projects",
+            "Projects",
+            s.canvas.rail == RailTab::Group,
+            NavGlyph::Rail(RailTab::Group),
+            waiting,
+            std::rc::Rc::new(|s: &mut ShellState| {
+                s.canvas.rail = RailTab::Group;
+                s.mobile_panel_open = true;
+                if !s.canvas.projects.loading && s.canvas.projects.projects.is_empty() {
+                    crate::projects::refresh_projects(&mut s.canvas.projects);
+                }
+            }),
+        ))
+        .child(item(
+            "mobile-cloud",
+            "Cloud",
+            s.canvas.rail == RailTab::Cloud,
+            NavGlyph::Rail(RailTab::Cloud),
+            0,
+            std::rc::Rc::new(|s: &mut ShellState| {
+                s.canvas.rail = RailTab::Cloud;
+                s.mobile_panel_open = true;
+            }),
+        ))
+        .child(item(
+            "mobile-settings",
+            "Settings",
+            false,
+            NavGlyph::Settings,
+            0,
+            std::rc::Rc::new(open_settings),
+        ));
+    nav
+}
+
+fn open_settings(s: &mut ShellState) {
+    let (host, port) = s
+        .canvas
+        .sheet_thread()
+        .map(|t| (t.api_host.clone(), t.api_port))
+        .unwrap_or_else(|| {
+            (
+                crate::rune_transcript::DEFAULT_API_HOST.to_string(),
+                crate::rune_transcript::api_port(),
+            )
+        });
+    s.settings.open(host, port);
+}
+
 fn rail_button(s: &ShellState, tab: RailTab) -> El {
     let active = s.canvas.rail == tab;
     let color = ink(if active { "#fafafa" } else { "#71717a" });
@@ -577,13 +792,13 @@ fn rail_button(s: &ShellState, tab: RailTab) -> El {
 
 /// Side panel content for the active rail tab. Chat-local panels read the
 /// canvas; cloud/memory/house read shell state.
-fn side_panel(s: &ShellState) -> El {
+fn side_panel(s: &ShellState, width: f32) -> El {
     // The chats panel owns its own gutters (`HouseSidebar`); the other boards
     // sit inside the shared 12pt shell padding.
     let chats = s.canvas.rail == RailTab::Chats;
     let mut panel = col()
         .key("side-panel")
-        .w(PANEL_W)
+        .w(width)
         .h_full()
         .fill(ink("#0f0f0f"))
         .border_sides([0.0, 1.0, 0.0, 0.0], ink("#ffffff12"))
@@ -730,10 +945,13 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .map(|r| (r[2], r[3]))
         .filter(|(w, h)| *w > 1.0 && *h > 1.0)
         .unwrap_or((crate::rune_canvas::MAP_W, crate::rune_canvas::MAP_H));
+    // Browser notch/home-indicator inset; zero on native.
+    let safe_bottom = cx.safe_area()[2];
     // SAFETY: the view runs single-threaded on the UI thread.
     unsafe {
         WINDOW_W = w;
         WINDOW_H = h;
+        WINDOW_SAFE_BOTTOM = safe_bottom;
     }
     let mut tabs = row()
         .key("shell-tabs")
@@ -743,6 +961,9 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
         .gap(4.0)
         .px(16.0)
         .pb(1.0)
+        // React's strip is `overflow-x-auto`; phones scroll tabs instead of
+        // clipping the tail at the window edge.
+        .scroll_x()
         .border_sides([0.0, 0.0, 1.0, 0.0], ink("#ffffff14"))
         .role("tablist")
         .label("Sessions")
@@ -941,8 +1162,15 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
                         ),
                 ),
         );
-    let stage_w = (w - RAIL_W - if folded { 0.0 } else { PANEL_W }).max(320.0);
-    let stage_h = (h - TAB_H).max(240.0);
+    let stage_w = (w - if folded { 0.0 } else { RAIL_W + PANEL_W }).max(320.0);
+    let stage_h = (h
+        - TAB_H
+        - if folded {
+            MOBILE_NAV_H + safe_bottom
+        } else {
+            0.0
+        })
+    .max(240.0);
     let mut stage = col()
         .key("canvas-stack")
         .w_full()
@@ -963,38 +1191,69 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
     if let Some(overlay) = home_chat_overlay(s, stage_w, stage_h, h) {
         stage = stage.child(overlay);
     }
-    let main = row()
+    let mut main = row()
         .key("stark-main")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .fill(ink("#0a0a0a"))
-        .child(rail)
-        .child(if folded {
-            rune::el().key("side-spacer").w(0.0)
-        } else {
-            side_panel(s)
-        })
-        .child(stage);
+        .fill(ink("#0a0a0a"));
+    if !folded {
+        // Desktop: icon rail + docked panel. Below `md` both disappear and
+        // the panel becomes an on-demand drawer (React `House.tsx`).
+        main = main.child(rail).child(side_panel(s, PANEL_W));
+    }
+    main = main.child(stage);
     let mut root = col()
         .key("stark-shell")
         .w_full()
         .h_full()
         .fill(ink("#0a0a0a"))
         .hover_motion_within(crate::motion::HOVER, crate::motion::HOVER)
+        .on_key(
+            |s: &mut ShellState, key: &rune::KeyEvent, _tx: &mut rune::Tx| {
+                // React closes the phone drawer on Escape; modals keep their own
+                // handlers because they sit above this root.
+                if key.key == rune::Key::Escape && s.mobile_panel_open {
+                    s.mobile_panel_open = false;
+                    return true;
+                }
+                false
+            },
+        )
         .child(tabs)
         .child(main);
     if folded {
-        // Drawer: absolute over the map's left edge, same panel content.
-        root = root.child(
-            rune::el()
-                .key("side-drawer")
-                .absolute(RAIL_W, TAB_H)
-                .h((h - TAB_H).max(0.0))
-                // `.house-drawer-enter`: 280 ms fade and a 10 pt left push.
-                .transition(crate::motion::drawer_enter())
-                .child(side_panel(s)),
-        );
+        root = root.child(mobile_nav(s, safe_bottom));
+        if s.mobile_panel_open {
+            let drawer_w = (w * 0.84).clamp(240.0, 320.0);
+            root = root
+                .child(
+                    rune::el()
+                        .key("side-backdrop")
+                        .absolute(0.0, 0.0)
+                        .size(w, h)
+                        .fill(rgba(0.0, 0.0, 0.0, 0.6))
+                        .backdrop_blur(4.0)
+                        .on_press_enter(|s: &mut ShellState| s.mobile_panel_open = false),
+                )
+                .child(
+                    rune::el()
+                        .key("side-drawer")
+                        .absolute(0.0, 0.0)
+                        .w(drawer_w)
+                        .h(h)
+                        .transition(crate::motion::drawer_enter())
+                        .box_shadow(rune::Shadow {
+                            x: 18.0,
+                            y: 0.0,
+                            blur: 60.0,
+                            spread: 0.0,
+                            color: rgba(0.0, 0.0, 0.0, 0.45),
+                            inset: false,
+                        })
+                        .child(side_panel(s, drawer_w)),
+                );
+        }
     }
     if s.canvas.agents.selected.is_some() {
         root = root.child(crate::agents::agent_sheet::<ShellState>(&s.canvas.agents));
@@ -1035,20 +1294,221 @@ pub fn shell_view(s: &ShellState, cx: &mut Cx<ShellState>) -> El {
             h,
         ));
     }
+    if s.pairing.locked {
+        root = root.child(pairing_gate(s, w, h));
+    }
     root
+}
+
+/// Full-screen phone gate, shown when the server answered 401. The desktop
+/// is the pairing host, so this only ever mounts in the web build.
+fn pairing_gate(s: &ShellState, w: f32, h: f32) -> El {
+    let card_w = (w - 48.0).clamp(280.0, 384.0);
+    let can_submit = !s.pairing.busy && !s.pairing.token.text.trim().is_empty();
+    let mut card = col()
+        .key("pairing-gate-card")
+        .w(card_w)
+        .gap(18.0)
+        .child(
+            rune::el()
+                .size(44.0, 44.0)
+                .radius(14.0)
+                .border(1.0, ink("#27272a"))
+                .fill(ink("#18181b"))
+                .center()
+                .child(
+                    rune::el()
+                        .size(20.0, 20.0)
+                        .inert()
+                        .shape(icon_lock(20.0, ink("#e4e4e7"))),
+                ),
+        )
+        .child(
+            text("Pair this device".to_string())
+                .font(rune::tok::TextStyle::new(18.0, 600.0))
+                .color(ink("#fafafa")),
+        )
+        .child(
+            text(
+                "Enter the pairing token shown on the desktop, or open the link it gives you."
+                    .to_string(),
+            )
+            .font(rune::tok::TextStyle::new(13.0, 400.0))
+            .wrap()
+            .color(ink("#a1a1aa")),
+        );
+    if let Some(error) = &s.pairing.error {
+        card = card.child(
+            text(error.clone())
+                .key("pairing-error")
+                .role("alert")
+                .live_region(rune::LiveRegion::Assertive)
+                .font(rune::tok::TextStyle::new(12.0, 400.0))
+                .wrap()
+                .color(ink("#f87171")),
+        );
+    }
+    let mut input = text_input(&s.pairing.token, rune::tok::TextStyle::new(13.0, 400.0))
+        .key("pairing-token")
+        .grow(1.0)
+        .h(46.0)
+        .px(12.0)
+        .radius(10.0)
+        .fill(ink("#00000080"))
+        .border(1.0, ink("#27272a"))
+        .border_layout()
+        .caret(ink("#e4e4e7"), crate::motion::TEXT_SELECTION)
+        .placeholder("Pairing token", ink("#52525b"))
+        .on_edit(|s: &mut ShellState| &mut s.pairing.token);
+    input = input.on_input_key(
+        |s: &mut ShellState, key: &rune::KeyEvent, tx: &mut rune::Tx| {
+            if key.key != rune::Key::Enter || key.mods.shift {
+                return false;
+            }
+            submit_pairing(s, tx);
+            true
+        },
+    );
+    let send = rune::el()
+        .key("pairing-submit")
+        .role("button")
+        .focusable(true)
+        .label("Continue")
+        .size(46.0, 46.0)
+        .radius(10.0)
+        .center()
+        .fill(if can_submit {
+            ink("#0284c7")
+        } else {
+            ink("#0c4a6e")
+        })
+        .opacity(if can_submit { 1.0 } else { 0.45 })
+        .disabled(!can_submit)
+        .on_press_tx_enter(move |s: &mut ShellState, tx: &mut rune::Tx| {
+            submit_pairing(s, tx);
+        })
+        .child(
+            rune::el()
+                .size(18.0, 18.0)
+                .inert()
+                .shape(icon_arrow_right(18.0, ink("#ffffff"))),
+        );
+    card = card.child(
+        row()
+            .w_full()
+            .items_center()
+            .gap(10.0)
+            .child(input)
+            .child(send),
+    );
+    rune::el()
+        .key("pairing-gate")
+        .absolute(0.0, 0.0)
+        .size(w, h)
+        .fill(ink("#0a0a0c"))
+        .center()
+        .child(card)
+}
+
+fn submit_pairing(s: &mut ShellState, _tx: &mut rune::Tx) {
+    if s.pairing.busy {
+        return;
+    }
+    let token = s.pairing.token.text.trim().to_string();
+    if token.is_empty() {
+        return;
+    }
+    s.pairing.busy = true;
+    s.pairing.error = None;
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::transport::set_pairing_token(&token);
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.pairing.inbox = Some(rx);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::transport::fetch_json("/api/health")
+                .await
+                .map(|_| ());
+            let _ = tx.send(result);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.pairing.busy = false;
+    }
+}
+
+fn icon_lock(size: f32, color: rune::Color) -> Shape {
+    let x0 = size * (3.0 / 24.0);
+    let x1 = size * (21.0 / 24.0);
+    let y0 = size * (10.0 / 24.0);
+    let y1 = size * (21.0 / 24.0);
+    let body = Path::new()
+        .move_to([x0, y0])
+        .line_to([x1, y0])
+        .line_to([x1, y1])
+        .line_to([x0, y1])
+        .close();
+    let shackle = Path::new()
+        .move_to([size * (7.0 / 24.0), size * (10.0 / 24.0)])
+        .line_to([size * (7.0 / 24.0), size * (7.0 / 24.0)])
+        .cubic_to(
+            [size * (7.0 / 24.0), size * (4.0 / 24.0)],
+            [size * (10.0 / 24.0), size * (3.0 / 24.0)],
+            [size * 0.5, size * (3.0 / 24.0)],
+        )
+        .cubic_to(
+            [size * (14.0 / 24.0), size * (3.0 / 24.0)],
+            [size * (17.0 / 24.0), size * (4.0 / 24.0)],
+            [size * (17.0 / 24.0), size * (7.0 / 24.0)],
+        )
+        .line_to([size * (17.0 / 24.0), size * (10.0 / 24.0)]);
+    Shape::new()
+        .stroke_path(&body, crate::lucide_stroke(size), LineCap::Round, color)
+        .stroke_path(&shackle, crate::lucide_stroke(size), LineCap::Round, color)
+        .view_box(24.0, 24.0)
+}
+
+fn icon_arrow_right(size: f32, color: rune::Color) -> Shape {
+    let p = Path::new()
+        .move_to([5.0, 12.0])
+        .line_to([19.0, 12.0])
+        .move_to([12.0, 5.0])
+        .line_to([19.0, 12.0])
+        .line_to([12.0, 19.0]);
+    Shape::new()
+        .stroke_path(&p, crate::lucide_stroke(size), LineCap::Round, color)
+        .view_box(24.0, 24.0)
 }
 
 /// `poll` drains every session thread (runs + notes) whatever panel is up
 /// and refreshes status rooms at most every 10–15s, so runs started from the
 /// dock keep streaming on the map. Card `running` flags mirror thread liveness.
 pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
+    let mut changed = poll_pairing(s);
+    #[cfg(target_arch = "wasm32")]
+    {
+        changed |= apply_web_picks(s);
+        changed |= apply_web_uploads(s);
+        if crate::transport::web_busy() {
+            tx.wake_after(std::time::Duration::from_millis(250));
+        }
+    }
     // Keep the canvas stage sized to the live window (React's container
     // drives `fitView`). While the camera is auto it refits on resize.
-    let (win_w, win_h) = unsafe { (WINDOW_W, WINDOW_H) };
+    let (win_w, win_h, safe_bottom) = unsafe { (WINDOW_W, WINDOW_H, WINDOW_SAFE_BOTTOM) };
     let folded = win_w < PANEL_FOLD_W;
-    let stage_w = (win_w - RAIL_W - if folded { 0.0 } else { PANEL_W } - 40.0).max(320.0);
-    let stage_h = (win_h - TAB_H - 12.0).max(240.0);
-    let mut changed = s.canvas.set_viewport(stage_w, stage_h);
+    let stage_w = (win_w - if folded { 0.0 } else { RAIL_W + PANEL_W } - 40.0).max(320.0);
+    let stage_h = (win_h
+        - TAB_H
+        - 12.0
+        - if folded {
+            MOBILE_NAV_H + safe_bottom
+        } else {
+            0.0
+        })
+    .max(240.0);
+    changed |= s.canvas.set_viewport(stage_w, stage_h);
     changed |= drain_run_inbox(&mut s.transcript, clock, tx);
     changed |= drain_run_inbox(&mut s.personal, clock, tx);
     changed |= crate::notes::poll_notes_state(&mut s.transcript.notes);
@@ -1070,23 +1530,23 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
         }
         changed |= crate::rune_transcript::poll_provider_state(thread, clock);
         changed |= crate::rune_transcript::poll_models_state(thread, clock);
-        // Pending questions poll every 1.5s (`usePendingAsk`), but only for
-        // the chat that is actually on screen. Switching chats starts that
-        // chat's poll within one interval.
-        changed |= crate::ask::poll_ask_state(thread, clock);
-        if crate::ask::ask_busy(thread) {
-            tx.wake_after(std::time::Duration::from_millis(100));
-        } else if let Some(ms) = crate::ask::poll_wait_ms(thread, clock) {
-            tx.wake_after(std::time::Duration::from_millis(ms));
-        }
     }
-    // Session threads: drain + sync card flags.
+    // Pending questions poll every 1.5s (`usePendingAsk`) for every open
+    // surface. Canvas cards are visible in the map even while another chat is
+    // active, so their compact Ask panels must stay live in the background.
+    changed |= poll_thread_ask(&mut s.transcript, clock, tx);
+    changed |= poll_thread_ask(&mut s.personal, clock, tx);
+    // Session threads: drain + sync card flags + per-card ask polling.
     let ids: Vec<String> = s.canvas.sessions.order.clone();
     for id in &ids {
         if let Some(thread) = s.canvas.sessions.threads.get_mut(id) {
+            if services_auto {
+                thread.services_auto = true;
+            }
             changed |= drain_run_inbox(thread, clock, tx);
             changed |= crate::notes::poll_notes_state(&mut thread.notes);
             changed |= crate::agent_config::poll_agent_config(&mut thread.agent_config);
+            changed |= poll_thread_ask(thread, clock, tx);
             let live = thread.live;
             if let Some(card) = s.canvas.cards.iter_mut().find(|c| c.id == *id) {
                 if card.running != live {
@@ -1242,6 +1702,206 @@ fn tick_voice_breathe(s: &ShellState) -> bool {
         live |= thread.voice.tick_breathe(now);
     }
     live
+}
+
+/// Start uploads for browser-picked files. Fresh cards create their chat
+/// first, matching React's create-before-upload send path.
+#[cfg(target_arch = "wasm32")]
+fn apply_web_picks(s: &mut ShellState) -> bool {
+    use crate::transport::WebTarget;
+    let picks = crate::transport::take_web_picks();
+    if picks.is_empty() {
+        return false;
+    }
+    for pick in picks {
+        let source = match &pick.target {
+            WebTarget::Main => Some(&s.transcript),
+            WebTarget::Open => s.canvas.sheet_thread().or(Some(&s.transcript)),
+            WebTarget::Card(id) => s.canvas.sessions.threads.get(id),
+        };
+        let Some(thread) = source else {
+            continue;
+        };
+        let chat_id = if thread.chat_ready {
+            thread.chat_id.clone()
+        } else {
+            String::new()
+        };
+        crate::transport::spawn_web_upload(
+            pick,
+            thread.workspace_id.clone(),
+            chat_id,
+            thread.title.clone(),
+        );
+    }
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+fn apply_web_upload_to_thread(
+    thread: &mut RuneTranscriptState,
+    workspace_id: &str,
+    chat_id: &str,
+    created: bool,
+    result: Result<Vec<crate::chats::ChatAttachment>, String>,
+    append_to_draft: bool,
+) -> Result<Vec<crate::chats::ChatAttachment>, String> {
+    if created && !chat_id.is_empty() {
+        thread.workspace_id = workspace_id.to_string();
+        thread.chat_id = chat_id.to_string();
+        thread.chat_ready = true;
+        thread.pending_rekey = Some((workspace_id.to_string(), chat_id.to_string()));
+        thread.refresh_list = true;
+    }
+    match result {
+        Ok(files) => {
+            if append_to_draft {
+                thread.draft_attachments.extend(files.clone());
+            }
+            thread.attachments_error = None;
+            Ok(files)
+        }
+        Err(error) => {
+            thread.attachments_error = Some(error.clone());
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn apply_web_uploads(s: &mut ShellState) -> bool {
+    use crate::transport::WebTarget;
+    let uploads = crate::transport::take_web_uploads();
+    if uploads.is_empty() {
+        return false;
+    }
+    for upload in uploads {
+        let crate::transport::WebUpload {
+            target,
+            workspace_id,
+            chat_id,
+            created,
+            result,
+        } = upload;
+        match target {
+            WebTarget::Main => {
+                let _ = apply_web_upload_to_thread(
+                    &mut s.transcript,
+                    &workspace_id,
+                    &chat_id,
+                    created,
+                    result,
+                    true,
+                );
+            }
+            WebTarget::Open => {
+                if let Some(thread) = s.canvas.sheet_thread_mut() {
+                    let _ = apply_web_upload_to_thread(
+                        thread,
+                        &workspace_id,
+                        &chat_id,
+                        created,
+                        result,
+                        true,
+                    );
+                } else {
+                    let _ = apply_web_upload_to_thread(
+                        &mut s.transcript,
+                        &workspace_id,
+                        &chat_id,
+                        created,
+                        result,
+                        true,
+                    );
+                }
+            }
+            WebTarget::Card(card_id) => {
+                let applied = {
+                    let thread = s.canvas.thread_mut(&card_id);
+                    apply_web_upload_to_thread(
+                        thread,
+                        &workspace_id,
+                        &chat_id,
+                        created,
+                        result,
+                        false,
+                    )
+                };
+                match applied {
+                    Ok(files) => {
+                        s.canvas
+                            .card_attachments
+                            .entry(card_id.clone())
+                            .or_default()
+                            .extend(files);
+                        s.canvas.card_attachment_errors.remove(&card_id);
+                    }
+                    Err(error) => {
+                        s.canvas.card_attachment_errors.insert(card_id, error);
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Browser pairing gate state. A failed API request flips the gate; a token
+/// probe either unlocks the shell and refreshes chats or reports the token.
+fn poll_pairing(s: &mut ShellState) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = s;
+        false
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut changed = false;
+        if crate::transport::auth_rejected() && !s.pairing.locked {
+            s.pairing.locked = true;
+            s.pairing.token.focused = true;
+            changed = true;
+        }
+        if let Some(result) = s.pairing.inbox.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            s.pairing.inbox = None;
+            s.pairing.busy = false;
+            match result {
+                Ok(()) => {
+                    crate::transport::clear_auth_rejected();
+                    s.pairing.locked = false;
+                    s.pairing.error = None;
+                    s.pairing.token.text.clear();
+                    s.pairing.token.anchor = 0;
+                    s.pairing.token.focus = 0;
+                    crate::chats::refresh(&mut s.chats);
+                }
+                Err(_) => {
+                    s.pairing.error = Some(
+                        "That pairing token was not accepted. Check the token on the desktop."
+                            .to_string(),
+                    );
+                }
+            }
+            changed = true;
+        }
+        if s.pairing.busy {
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// One thread's pending-Ask poll. Keeping the 1.5s cadence and the 100ms
+/// in-flight ticket here means every visible surface schedules its own wake,
+/// including cards behind the active chat.
+fn poll_thread_ask(thread: &mut RuneTranscriptState, clock: f64, tx: &mut rune::Tx) -> bool {
+    let changed = crate::ask::poll_ask_state(thread, clock);
+    if crate::ask::ask_busy(thread) {
+        tx.wake_after(std::time::Duration::from_millis(100));
+    } else if let Some(ms) = crate::ask::poll_wait_ms(thread, clock) {
+        tx.wake_after(std::time::Duration::from_millis(ms));
+    }
+    changed
 }
 
 /// Drain the real-chat stream: adopt snapshots, apply per-chat history, and
@@ -1719,6 +2379,8 @@ fn apply_voice(s: &mut ShellState) {
 const SHELL_FONTS: &[&[u8]] = &[include_bytes!("../assets/InterVariable.ttf")];
 
 pub fn shell_spec() -> AppSpec<ShellState> {
+    #[cfg(target_arch = "wasm32")]
+    crate::transport::init_web_auth();
     let mut spec = AppSpec::new("Stark", (1280.0, 900.0), init_shell, shell_view);
     spec.scenes = &[
         ("home", apply_home),
@@ -1790,6 +2452,32 @@ mod tests {
                 rect[2]
             );
         }
+    }
+
+    #[test]
+    fn phone_layout_hides_the_rail_and_opens_the_drawer_from_bottom_nav() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ShellState::default(), shell_view, (390.0, 844.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("icon-rail").is_none(), "rail hidden below md");
+        assert!(rt.find("map-sidebar").is_none(), "panel starts closed");
+        assert!(rt.find("house-mobile-nav").is_some(), "bottom nav mounted");
+        let (x, y) = rt.find("mobile-chats").expect("chats button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.mobile_panel_open, "nav opens the drawer");
+        assert!(rt.find("side-drawer").is_some(), "drawer mounted");
+        assert!(rt.find("side-backdrop").is_some(), "backdrop mounted");
+        assert!(rt.find("side-panel").is_some(), "chats panel in drawer");
+        let (backdrop, _) = rt.presented("side-backdrop").expect("backdrop");
+        let bx = backdrop[0] + backdrop[2] - 8.0;
+        let by = backdrop[1] + backdrop[3] * 0.5;
+        rt.pointer_down(bx, by);
+        rt.pointer_up(bx, by);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.mobile_panel_open, "backdrop dismisses");
+        assert!(rt.find("side-drawer").is_none());
     }
 
     #[test]

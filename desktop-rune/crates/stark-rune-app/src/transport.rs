@@ -109,8 +109,8 @@ pub struct RunOutcome {
 /// Chunked and close-delimited bodies both supported. Errors are strings so
 /// the UI thread can surface them as an `error` frame.
 ///
-/// Native only: browsers have no TCP sockets — the web build uses `fetch`
-/// (not yet wired; sends stage locally, see `stage_send`).
+/// Native only: browsers have no TCP sockets — the web build uses
+/// [`post_run_stream`] over `fetch`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn post_run(
     host: &str,
@@ -300,6 +300,180 @@ pub fn is_locked_error(message: &str) -> bool {
     message.contains("401")
 }
 
+/// Browser pairing state. The phone stores its token in localStorage and
+/// sends `X-API-Token` on every API request; a 401 raises this flag so the
+/// shell can show the pairing gate instead of a dead chat list.
+#[cfg(target_arch = "wasm32")]
+pub const PAIRING_TOKEN_KEY: &str = "stark.pairingToken";
+#[cfg(target_arch = "wasm32")]
+const LEGACY_PAIRING_TOKEN_KEY: &str = "vincode.pairingToken";
+
+#[cfg(target_arch = "wasm32")]
+static AUTH_REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Web API origin: an injected origin wins (static hosts), otherwise the
+/// page's own origin (the normal same-origin deployment), with the desktop
+/// default only for `file:`/opaque contexts.
+#[cfg(target_arch = "wasm32")]
+pub fn api_origin() -> String {
+    let Some(window) = web_sys::window() else {
+        return "http://127.0.0.1:8124".to_string();
+    };
+    if let Ok(injected) = js_sys::Reflect::get(&window, &"__STARK_API_ORIGIN__".into()) {
+        if let Some(origin) = injected.as_string() {
+            let origin = origin.trim().trim_end_matches('/');
+            if !origin.is_empty() {
+                return origin.to_string();
+            }
+        }
+    }
+    if let Ok(location) = window.location().origin() {
+        if location != "null" && !location.is_empty() {
+            return location;
+        }
+    }
+    "http://127.0.0.1:8124".to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn api_url(path: &str) -> String {
+    format!("{}{}", api_origin(), path)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn pairing_token() -> String {
+    let Some(storage) = storage() else {
+        return String::new();
+    };
+    if let Ok(Some(token)) = storage.get_item(PAIRING_TOKEN_KEY) {
+        return token;
+    }
+    let Ok(Some(legacy)) = storage.get_item(LEGACY_PAIRING_TOKEN_KEY) else {
+        return String::new();
+    };
+    let _ = storage.set_item(PAIRING_TOKEN_KEY, &legacy);
+    let _ = storage.remove_item(LEGACY_PAIRING_TOKEN_KEY);
+    legacy
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_pairing_token(token: &str) {
+    if let Some(storage) = storage() {
+        let token = token.trim();
+        if token.is_empty() {
+            let _ = storage.remove_item(PAIRING_TOKEN_KEY);
+        } else {
+            let _ = storage.set_item(PAIRING_TOKEN_KEY, token);
+        }
+        let _ = storage.remove_item(LEGACY_PAIRING_TOKEN_KEY);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn auth_rejected() -> bool {
+    AUTH_REJECTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn clear_auth_rejected() {
+    AUTH_REJECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn mark_auth_rejected() {
+    AUTH_REJECTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pull `?token=` (or `#…?token=`) out of the URL, persist it, and remove it
+/// from the address bar so it is not left in history or shares.
+#[cfg(target_arch = "wasm32")]
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (name == key).then(|| value.to_string())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn without_query_param(query: &str, key: &str) -> String {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            !pair.is_empty() && name != key
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn capture_url_token() -> String {
+    let Some(window) = web_sys::window() else {
+        return String::new();
+    };
+    let location = window.location();
+    let search = location.search().unwrap_or_default();
+    let hash = location.hash().unwrap_or_default();
+    let token = query_param(&search, "token")
+        .or_else(|| {
+            hash.split_once('?')
+                .and_then(|(_, query)| query_param(query, "token"))
+        })
+        .unwrap_or_default();
+    if !token.is_empty() {
+        set_pairing_token(&token);
+        let clean_search = without_query_param(&search, "token");
+        let clean_hash = hash.split('?').next().unwrap_or_default();
+        let clean = format!(
+            "{}{}{}",
+            location.pathname().unwrap_or_else(|_| "/".to_string()),
+            if clean_search.is_empty() {
+                String::new()
+            } else {
+                format!("?{clean_search}")
+            },
+            clean_hash
+        );
+        let _ = window.history().and_then(|history| {
+            history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&clean))
+        });
+    }
+    token
+}
+
+/// Install browser auth once: capture a `?token=` link before the first poll.
+#[cfg(target_arch = "wasm32")]
+pub fn init_web_auth() {
+    let _ = capture_url_token();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn auth_headers(content_type: bool) -> Result<web_sys::Headers, String> {
+    let headers = web_sys::Headers::new().map_err(|e| format!("headers: {e:?}"))?;
+    if content_type {
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|e| format!("headers: {e:?}"))?;
+    }
+    let token = pairing_token();
+    if !token.is_empty() {
+        headers
+            .set("X-API-Token", &token)
+            .map_err(|e| format!("headers: {e:?}"))?;
+    }
+    Ok(headers)
+}
+
 /// Web `fetch` GET returning JSON — the browser twin of [`get_json`].
 /// Same contract; the page talks to the LAN backend over plain HTTP
 /// (default `127.0.0.1:8124`, mirroring the desktop default). CORS is open
@@ -308,11 +482,12 @@ pub fn is_locked_error(message: &str) -> bool {
 pub async fn fetch_json(path: &str) -> Result<serde_json::Value, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-    let url = format!("http://127.0.0.1:8124{path}");
+    let url = api_url(path);
     let window = web_sys::window().ok_or("no window")?;
     let init = web_sys::RequestInit::new();
     init.set_method("GET");
     init.set_mode(web_sys::RequestMode::Cors);
+    init.set_headers(&auth_headers(false)?.into());
     let request = web_sys::Request::new_with_str_and_init(&url, &init)
         .map_err(|e| format!("request: {e:?}"))?;
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
@@ -321,6 +496,10 @@ pub async fn fetch_json(path: &str) -> Result<serde_json::Value, String> {
     let resp: web_sys::Response = resp_value
         .dyn_into()
         .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -344,7 +523,7 @@ pub async fn fetch_send(
 ) -> Result<serde_json::Value, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-    let url = format!("http://127.0.0.1:8124{path}");
+    let url = api_url(path);
     let window = web_sys::window().ok_or("no window")?;
     let init = web_sys::RequestInit::new();
     init.set_method(method);
@@ -352,12 +531,7 @@ pub async fn fetch_send(
     if let Some(b) = body {
         init.set_body(&wasm_bindgen::JsValue::from_str(&b.to_string()));
     }
-    init.set_headers(&{
-        let h = web_sys::Headers::new().map_err(|e| format!("headers: {e:?}"))?;
-        h.set("Content-Type", "application/json")
-            .map_err(|e| format!("headers: {e:?}"))?;
-        h.into()
-    });
+    init.set_headers(&auth_headers(true)?.into());
     let request = web_sys::Request::new_with_str_and_init(&url, &init)
         .map_err(|e| format!("request: {e:?}"))?;
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
@@ -367,6 +541,7 @@ pub async fn fetch_send(
         .dyn_into()
         .map_err(|e| format!("response: {e:?}"))?;
     if resp.status() == 401 {
+        mark_auth_rejected();
         return Err("HTTP 401 Unauthorized".to_string());
     }
     if !resp.ok() {
@@ -394,7 +569,7 @@ pub async fn fetch_abort(chat_id: &str) -> bool {
     if chat_id.trim().is_empty() {
         return false;
     }
-    let url = "http://127.0.0.1:8124/api/abort".to_string();
+    let url = api_url("/api/abort");
     let body = serde_json::json!({"chat_id": chat_id}).to_string();
     let window = match web_sys::window() {
         Some(w) => w,
@@ -404,16 +579,11 @@ pub async fn fetch_abort(chat_id: &str) -> bool {
     init.set_method("POST");
     init.set_mode(web_sys::RequestMode::Cors);
     init.set_body(&wasm_bindgen::JsValue::from_str(&body));
-    init.set_headers(&{
-        let h = match web_sys::Headers::new() {
-            Ok(h) => h,
-            Err(_) => return false,
-        };
-        if h.set("Content-Type", "application/json").is_err() {
-            return false;
-        }
-        h.into()
-    });
+    let headers = match auth_headers(true) {
+        Ok(headers) => headers,
+        Err(_) => return false,
+    };
+    init.set_headers(&headers.into());
     let request = match web_sys::Request::new_with_str_and_init(&url, &init) {
         Ok(r) => r,
         Err(_) => return false,
@@ -426,7 +596,375 @@ pub async fn fetch_abort(chat_id: &str) -> bool {
         Ok(r) => r,
         Err(_) => return false,
     };
+    if resp.status() == 401 {
+        mark_auth_rejected();
+    }
     resp.ok()
+}
+
+/// Browser download with the pairing token. `window.open` cannot attach the
+/// header, so fetch the bytes, hand them to a temporary object URL, and click
+/// an anchor with the server filename.
+#[cfg(target_arch = "wasm32")]
+pub async fn download_web(path: &str, filename: &str) -> Result<String, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_headers(&auth_headers(false)?.into());
+    let request = web_sys::Request::new_with_str_and_init(&api_url(path), &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("download: HTTP {}", resp.status()));
+    }
+    let blob = JsFuture::from(resp.blob().map_err(|e| format!("blob: {e:?}"))?)
+        .await
+        .map_err(|e| format!("blob: {e:?}"))?;
+    let blob: web_sys::Blob = blob.dyn_into().map_err(|e| format!("blob: {e:?}"))?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| format!("object url: {e:?}"))?;
+    let document = window.document().ok_or("no document")?;
+    let anchor: web_sys::HtmlAnchorElement = document
+        .create_element("a")
+        .map_err(|e| format!("anchor: {e:?}"))?
+        .dyn_into()
+        .map_err(|e| format!("anchor: {e:?}"))?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&anchor);
+    }
+    anchor.click();
+    let _ = anchor.remove();
+    web_sys::Url::revoke_object_url(&url).ok();
+    Ok(filename.to_string())
+}
+
+/// Stable upload target. Cards carry their id (not a map order index) because
+/// the upload outlives the frame that opened the picker.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, PartialEq, Eq)]
+pub enum WebTarget {
+    Main,
+    Open,
+    Card(String),
+}
+
+/// A browser picker result waiting for the shell poll. Files stay as browser
+/// `File` handles until the async upload runs.
+#[cfg(target_arch = "wasm32")]
+pub struct WebPick {
+    pub target: WebTarget,
+    pub files: Vec<web_sys::File>,
+}
+
+/// Completed browser upload. `created` means the picker had to create the
+/// chat first (React creates it at send time; uploading first needs an id).
+#[cfg(target_arch = "wasm32")]
+pub struct WebUpload {
+    pub target: WebTarget,
+    pub workspace_id: String,
+    pub chat_id: String,
+    pub created: bool,
+    pub result: Result<Vec<crate::chats::ChatAttachment>, String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WEB_PICKS: std::cell::RefCell<Vec<WebPick>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static WEB_UPLOADS: std::cell::RefCell<Vec<WebUpload>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Picker opened at (millis); cleared on a selection or after two minutes.
+    static WEB_PICK_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WEB_UPLOADS_IN_FLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WEB_BACKUP: std::cell::RefCell<Option<web_sys::File>> =
+        const { std::cell::RefCell::new(None) };
+    static WEB_BACKUP_NAME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// True while a browser picker may still answer or an upload is in flight;
+/// the shell schedules a wake so the async result is applied promptly.
+#[cfg(target_arch = "wasm32")]
+pub fn web_busy() -> bool {
+    let now = crate::clock::now_millis();
+    let picking = WEB_PICK_AT.with(|at| {
+        let at = at.get();
+        at != 0 && now.saturating_sub(at) < 120_000
+    });
+    picking
+        || WEB_UPLOADS_IN_FLIGHT.with(std::cell::Cell::get) > 0
+        || WEB_UPLOADS.with(|queue| !queue.borrow().is_empty())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn take_web_picks() -> Vec<WebPick> {
+    WEB_PICKS.with(|queue| std::mem::take(&mut *queue.borrow_mut()))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn take_web_uploads() -> Vec<WebUpload> {
+    WEB_UPLOADS.with(|queue| std::mem::take(&mut *queue.borrow_mut()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn push_web_upload(upload: WebUpload) {
+    WEB_UPLOADS.with(|queue| queue.borrow_mut().push(upload));
+}
+
+/// Open the browser's native file picker for one surface. The change handler
+/// queues the selected `File`s; the shell uploads them on the next poll.
+#[cfg(target_arch = "wasm32")]
+pub fn pick_files(target: WebTarget) {
+    use wasm_bindgen::{closure::Closure, JsCast};
+    WEB_PICK_AT.with(|at| at.set(crate::clock::now_millis()));
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Ok(element) = document.create_element("input") else {
+        return;
+    };
+    let Ok(input) = element.dyn_into::<web_sys::HtmlInputElement>() else {
+        return;
+    };
+    input.set_type("file");
+    input.set_multiple(true);
+    input.set_accept(
+        "image/*,audio/*,.pdf,.txt,.md,.json,.js,.ts,.tsx,.py,.html,.css,.csv,.doc,.docx,.zip",
+    );
+    let _ = input.set_attribute("style", "display:none");
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&input);
+    }
+    let change_input = input.clone();
+    let closure = Closure::wrap(Box::new(move || {
+        let files: Vec<web_sys::File> = change_input
+            .files()
+            .map(|list| {
+                (0..list.length())
+                    .filter_map(|index| list.get(index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !files.is_empty() {
+            WEB_PICK_AT.with(|at| at.set(0));
+            WEB_PICKS.with(|queue| {
+                queue.borrow_mut().push(WebPick {
+                    target: target.clone(),
+                    files,
+                });
+            });
+        }
+        let _ = change_input.remove();
+    }) as Box<dyn FnMut()>);
+    input.set_onchange(Some(closure.as_ref().unchecked_ref()));
+    closure.forget();
+    input.click();
+}
+
+/// Browser zip picker for Settings' backup import. The selected `File`
+/// stays here until `run_backup_import` uploads it.
+#[cfg(target_arch = "wasm32")]
+pub fn pick_backup_file() {
+    use wasm_bindgen::{closure::Closure, JsCast};
+    WEB_PICK_AT.with(|at| at.set(crate::clock::now_millis()));
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Ok(element) = document.create_element("input") else {
+        return;
+    };
+    let Ok(input) = element.dyn_into::<web_sys::HtmlInputElement>() else {
+        return;
+    };
+    input.set_type("file");
+    input.set_accept(".zip,application/zip");
+    let _ = input.set_attribute("style", "display:none");
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&input);
+    }
+    let change_input = input.clone();
+    let closure = Closure::wrap(Box::new(move || {
+        if let Some(file) = change_input.files().and_then(|list| list.get(0)) {
+            WEB_PICK_AT.with(|at| at.set(0));
+            WEB_BACKUP_NAME.with(|name| *name.borrow_mut() = Some(file.name()));
+            WEB_BACKUP.with(|slot| *slot.borrow_mut() = Some(file));
+        }
+        let _ = change_input.remove();
+    }) as Box<dyn FnMut()>);
+    input.set_onchange(Some(closure.as_ref().unchecked_ref()));
+    closure.forget();
+    input.click();
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn backup_file_name() -> Option<String> {
+    WEB_BACKUP_NAME.with(|name| name.borrow().clone())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn clear_backup_file() {
+    WEB_BACKUP.with(|slot| *slot.borrow_mut() = None);
+    WEB_BACKUP_NAME.with(|name| *name.borrow_mut() = None);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn upload_backup_web(projects_root: &str) -> Result<serde_json::Value, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let file = WEB_BACKUP.with(|slot| slot.borrow().clone());
+    let file = file.ok_or("Choose a backup zip first.")?;
+    let form = web_sys::FormData::new().map_err(|e| format!("form: {e:?}"))?;
+    form.append_with_blob_and_filename("file", file.as_ref(), &file.name())
+        .map_err(|e| format!("form file: {e:?}"))?;
+    let root = projects_root.trim();
+    if !root.is_empty() {
+        form.append_with_str("projects_root", root)
+            .map_err(|e| format!("form root: {e:?}"))?;
+    }
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_body(form.as_ref());
+    init.set_headers(&auth_headers(false)?.into());
+    let request = web_sys::Request::new_with_str_and_init(&api_url("/api/data/import"), &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("import: HTTP {}", resp.status()));
+    }
+    let json = JsFuture::from(resp.json().map_err(|e| format!("json: {e:?}"))?)
+        .await
+        .map_err(|e| format!("body: {e:?}"))?;
+    let text = js_sys::JSON::stringify(&json)
+        .map_err(|e| format!("stringify: {e:?}"))?
+        .as_string()
+        .ok_or("non-string json")?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// Upload picked browser files with the same multipart contract React uses.
+#[cfg(target_arch = "wasm32")]
+async fn upload_web_files(
+    workspace_id: &str,
+    chat_id: &str,
+    files: &[web_sys::File],
+) -> Result<Vec<crate::chats::ChatAttachment>, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let form = web_sys::FormData::new().map_err(|e| format!("form: {e:?}"))?;
+    for file in files {
+        form.append_with_blob_and_filename("files", file.as_ref(), &file.name())
+            .map_err(|e| format!("form file: {e:?}"))?;
+    }
+    let url = api_url(&format!(
+        "/api/workspaces/{workspace_id}/chats/{chat_id}/attachments"
+    ));
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_body(form.as_ref());
+    init.set_headers(&auth_headers(false)?.into());
+    let request = web_sys::Request::new_with_str_and_init(&url, &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("upload: HTTP {}", resp.status()));
+    }
+    let json = JsFuture::from(resp.json().map_err(|e| format!("json: {e:?}"))?)
+        .await
+        .map_err(|e| format!("body: {e:?}"))?;
+    let text = js_sys::JSON::stringify(&json)
+        .map_err(|e| format!("stringify: {e:?}"))?
+        .as_string()
+        .ok_or("non-string json")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    Ok(value
+        .get("attachments")
+        .and_then(|v| v.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .map(crate::chats::ChatAttachment::from_json)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Create the chat (when this is a fresh card) then upload. Results land in
+/// `take_web_uploads()` for the shell poll to attach to the right surface.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_web_upload(pick: WebPick, workspace_id: String, chat_id: String, title: String) {
+    WEB_UPLOADS_IN_FLIGHT.with(|count| count.set(count.get() + 1));
+    wasm_bindgen_futures::spawn_local(async move {
+        let (workspace_id, chat_id, created) = if chat_id.trim().is_empty() {
+            match create_chat_wasm(&workspace_id, &title).await {
+                Ok(id) => (workspace_id, id, true),
+                Err(error) => {
+                    WEB_UPLOADS_IN_FLIGHT.with(|count| count.set(count.get().saturating_sub(1)));
+                    push_web_upload(WebUpload {
+                        target: pick.target,
+                        workspace_id,
+                        chat_id: String::new(),
+                        created: false,
+                        result: Err(error),
+                    });
+                    return;
+                }
+            }
+        } else {
+            (workspace_id, chat_id, false)
+        };
+        let result = upload_web_files(&workspace_id, &chat_id, &pick.files).await;
+        WEB_UPLOADS_IN_FLIGHT.with(|count| count.set(count.get().saturating_sub(1)));
+        push_web_upload(WebUpload {
+            target: pick.target,
+            workspace_id,
+            chat_id,
+            created,
+            result,
+        });
+    });
 }
 
 /// Web `POST /api/run` with ReadableStream SSE decode — the browser twin of
@@ -450,19 +988,14 @@ async fn post_run_stream_inner(
 ) -> Result<String, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-    let url = "http://127.0.0.1:8124/api/run".to_string();
+    let url = api_url("/api/run");
     let body = req.to_json().to_string();
     let window = web_sys::window().ok_or("no window")?;
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
     init.set_mode(web_sys::RequestMode::Cors);
     init.set_body(&wasm_bindgen::JsValue::from_str(&body));
-    init.set_headers(&{
-        let h = web_sys::Headers::new().map_err(|e| format!("headers: {e:?}"))?;
-        h.set("Content-Type", "application/json")
-            .map_err(|e| format!("headers: {e:?}"))?;
-        h.into()
-    });
+    init.set_headers(&auth_headers(true)?.into());
     let request = web_sys::Request::new_with_str_and_init(&url, &init)
         .map_err(|e| format!("request: {e:?}"))?;
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
@@ -471,6 +1004,10 @@ async fn post_run_stream_inner(
     let resp: web_sys::Response = resp_value
         .dyn_into()
         .map_err(|e| format!("response: {e:?}"))?;
+    if resp.status() == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
     }

@@ -56,8 +56,15 @@ pub fn attachment(
     }
     #[cfg(target_arch = "wasm32")]
     {
+        let absolute = |url: &str| {
+            if url.starts_with('/') {
+                crate::transport::api_url(url)
+            } else {
+                url.to_string()
+            }
+        };
         if let Some(url) = attachment.url.as_deref() {
-            if let Some(image) = url_image(url, size_pt) {
+            if let Some(image) = url_image(&absolute(url), size_pt) {
                 return Some(image);
             }
         }
@@ -65,10 +72,10 @@ pub fn attachment(
             && !chat_id.trim().is_empty()
             && !attachment.id.trim().is_empty()
         {
-            let url = format!(
+            let url = absolute(&format!(
                 "/api/workspaces/{workspace_id}/chats/{chat_id}/attachments/{}",
                 attachment.id
-            );
+            ));
             return url_image(&url, size_pt);
         }
         None

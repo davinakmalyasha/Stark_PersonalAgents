@@ -39,18 +39,18 @@ fn card() -> El {
         .fill(rgba(255.0, 255.0, 255.0, 0.018))
 }
 
-fn section_title(label: &str, glyph: &str) -> El {
+fn icon(size: f32, shape: rune::Shape) -> El {
+    rune::el().size(size, size).inert().shape(shape)
+}
+
+fn section_title(label: &str, glyph: rune::Shape) -> El {
     row()
         .items_center()
         .gap(5.0)
         .px(12.0)
         .pt(11.0)
         .pb(8.0)
-        .child(
-            text(glyph.to_string())
-                .font(rune::tok::TextStyle::new(11.0, 400.0))
-                .color(ink("#71717a")),
-        )
+        .child(icon(12.0, glyph))
         .child(
             text(label.to_uppercase())
                 .font({
@@ -63,21 +63,32 @@ fn section_title(label: &str, glyph: &str) -> El {
         )
 }
 
-fn button(label: &str, primary: bool, height: f32) -> El {
-    let mut el = text(label.to_string())
+fn button(label: &str, primary: bool, height: f32, glyph: rune::Shape) -> El {
+    let fg = if primary {
+        ink("#0a0a0d")
+    } else {
+        ink("#d4d4d8")
+    };
+    let mut el = row()
+        .items_center()
+        .gap(5.0)
         .h(height)
         .px(9.0)
         .radius(7.0)
         .center()
-        .font(rune::tok::TextStyle::new(10.0, 550.0));
+        .child(icon(12.0, glyph))
+        .child(
+            text(label.to_string())
+                .font(rune::tok::TextStyle::new(10.0, 550.0))
+                .color(fg),
+        );
     if primary {
-        el = el.fill(ink("#ffffff")).color(ink("#0a0a0d"));
+        el = el.fill(ink("#ffffff"));
     } else {
         el = el
             .fill(rgba(255.0, 255.0, 255.0, 0.035))
             .border(1.0, rgba(255.0, 255.0, 255.0, 0.1))
-            .border_layout()
-            .color(ink("#d4d4d8"));
+            .border_layout();
     }
     el
 }
@@ -90,12 +101,17 @@ fn resolve_button<S: ProjectsHost + 'static>(
     busy: bool,
 ) -> El {
     let item = item.clone();
-    let label = if grant {
-        format!("✓  {label}")
+    let fg = if primary {
+        ink("#0a0a0d")
     } else {
-        format!("✕  {label}")
+        ink("#d4d4d8")
     };
-    let mut el = button(&label, primary, 26.0)
+    let glyph = if grant {
+        crate::lucide_check(12.0, 2.0, fg)
+    } else {
+        crate::lucide_x(12.0, 2.0, fg)
+    };
+    let mut el = button(label, primary, 26.0, glyph)
         .role("button")
         .label(if grant {
             format!("Approve {}", item.title)
@@ -117,7 +133,10 @@ fn waiting_card<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail)
         .border(1.0, rgba(251.0, 191.0, 36.0, 0.18))
         .fill(rgba(251.0, 191.0, 36.0, 0.035))
         .pb(2.0);
-    card = card.child(section_title("Waiting on you", "!"));
+    card = card.child(section_title(
+        "Waiting on you",
+        crate::icons::triangle_alert(12.0, ink("#71717a")),
+    ));
     for item in waiting {
         let busy = g.busy_item.as_deref() == Some(item.id.as_str());
         card = card.child(
@@ -305,11 +324,7 @@ fn progress_card(detail: &GroupDetail) -> El {
                 .gap(4.0)
                 .mx(12.0)
                 .mt(6.0)
-                .child(
-                    text("◷".to_string())
-                        .font(rune::tok::TextStyle::new(10.0, 400.0))
-                        .color(ink("#71717a")),
-                )
+                .child(icon(11.0, crate::icons::clock(11.0, ink("#71717a"))))
                 .child(
                     text(super::ui::deadline_label(deadline))
                         .font(rune::tok::TextStyle::new(9.5, 400.0))
@@ -402,11 +417,10 @@ fn board<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> El 
                     .items_center()
                     .gap(5.0)
                     .padding(8.0)
-                    .child(
-                        text("›".to_string())
-                            .font(rune::tok::TextStyle::new(12.0, 400.0))
-                            .color(ink("#52525b")),
-                    )
+                    .child(icon(
+                        12.0,
+                        crate::icons::chevron_right(12.0, ink("#52525b")),
+                    ))
                     .child(
                         text(milestone.title.clone())
                             .grow(1.0)
@@ -670,10 +684,10 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
         detail.project.status.as_str()
     };
     let path = detail.path.clone();
-    let mut out = card()
-        .key("gp-details")
-        .pb(9.0)
-        .child(section_title("Project", "◉"));
+    let mut out = card().key("gp-details").pb(9.0).child(section_title(
+        "Project",
+        crate::icons::users(12.0, ink("#71717a")),
+    ));
     if !detail.project.goal.is_empty() {
         out = out.child(
             text(detail.project.goal.clone())
@@ -727,11 +741,17 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
     }
     if detail.shell_enabled {
         out = out.child(
-            text("▣ Members can run shell commands.".to_string())
+            row()
+                .items_center()
+                .gap(6.0)
                 .mx(12.0)
                 .my(7.0)
-                .font(rune::tok::TextStyle::new(9.5, 400.0))
-                .color(ink("#71717a")),
+                .child(icon(12.0, crate::icons::shield(12.0, ink("#71717a"))))
+                .child(
+                    text("Members can run shell commands.".to_string())
+                        .font(rune::tok::TextStyle::new(9.5, 400.0))
+                        .color(ink("#71717a")),
+                ),
         );
     }
     if !path.is_empty() {
@@ -766,11 +786,7 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
                         }
                     }
                 })
-                .child(
-                    text("▱".to_string())
-                        .font(rune::tok::TextStyle::new(12.0, 400.0))
-                        .color(ink("#a1a1aa")),
-                )
+                .child(icon(12.0, crate::icons::folder_open(12.0, ink("#a1a1aa"))))
                 .child(
                     text(path)
                         .font(rune::tok::TextStyle::new(9.5, 400.0))
@@ -792,9 +808,13 @@ fn details<S: ProjectsHost + 'static>(g: &GroupState, detail: &GroupDetail) -> E
                 s.projects_mut().group.show_activity = !show_activity;
             })
             .child(
-                text(if show_activity { "⌄" } else { "›" }.to_string())
-                    .font(rune::tok::TextStyle::new(12.0, 400.0))
-                    .color(ink("#71717a")),
+                icon(12.0, crate::icons::chevron_right(12.0, ink("#71717a"))).rotate(
+                    if show_activity {
+                        std::f32::consts::FRAC_PI_2
+                    } else {
+                        0.0
+                    },
+                ),
             )
             .child(
                 text(format!("Activity · {}", detail.events.len()))

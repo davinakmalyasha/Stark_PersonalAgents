@@ -175,7 +175,7 @@ pub fn status_chip(status: &str, awaiting: bool) -> El {
         }
     };
     text(if awaiting {
-        "needs you".to_string()
+        "NEEDS YOU".to_string()
     } else if status.is_empty() {
         "unknown".to_string()
     } else {

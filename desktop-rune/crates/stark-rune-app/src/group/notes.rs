@@ -10,6 +10,10 @@ fn ink(hex: &'static str) -> rune::Color {
     rune::color::hex(hex).unwrap_or(rune::Color::BLACK)
 }
 
+fn icon(size: f32, shape: rune::Shape) -> El {
+    rune::el().size(size, size).inert().shape(shape)
+}
+
 fn note_card<S: ProjectsHost + 'static>(note: &AgentNote, armed: bool) -> El {
     let id = note.id.clone();
     let del = note.id.clone();
@@ -124,6 +128,7 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                 .w_full()
                 .items_center()
                 .gap(8.0)
+                .child(icon(14.0, crate::icons::sticky_note(14.0, ink("#fcd34d"))))
                 .child(
                     text("Notes".to_string())
                         .grow(1.0)
@@ -131,32 +136,41 @@ pub fn group_notes_sheet<S: ProjectsHost + 'static>(notes: &NotesState, project_
                         .color(ink("#a1a1aa")),
                 )
                 .child(
-                    text(if notes.adding { "Close" } else { "+ Add" }.to_string())
+                    row()
+                        .items_center()
+                        .gap(4.0)
                         .px(10.0)
                         .py(6.0)
                         .radius(8.0)
-                        .font(rune::tok::TextStyle::new(11.0, 600.0))
                         .fill(ink("#ffffff"))
-                        .color(ink("#0a0a0d"))
                         .role("button")
                         .label("Add note")
                         .on_press(|s: &mut S| {
                             let notes = &mut s.projects_mut().group.notes;
                             notes.adding = !notes.adding;
-                        }),
+                        })
+                        .child(if notes.adding {
+                            icon(12.0, crate::lucide_x(12.0, 2.0, ink("#0a0a0d")))
+                        } else {
+                            icon(12.0, crate::icons::plus(12.0, ink("#0a0a0d")))
+                        })
+                        .child(
+                            text(if notes.adding { "Close" } else { "Add" }.to_string())
+                                .font(rune::tok::TextStyle::new(11.0, 600.0))
+                                .color(ink("#0a0a0d")),
+                        ),
                 )
                 .child(
-                    text("✕".to_string())
+                    rune::el()
                         .key("gp-notes-close")
                         .size(16.0, 16.0)
                         .center()
-                        .font(rune::tok::TextStyle::new(13.0, 400.0))
-                        .color(ink("#8a8a93"))
                         .role("button")
                         .label("Close notes")
                         .on_press(|s: &mut S| {
                             s.projects_mut().group.notes.open = false;
-                        }),
+                        })
+                        .child(icon(14.0, crate::lucide_x(14.0, 2.0, ink("#8a8a93")))),
                 ),
         );
     if notes.adding {

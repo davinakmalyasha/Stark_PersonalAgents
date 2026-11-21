@@ -33,10 +33,8 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
     }
 }
 
-fn icon_text(glyph: &str, size: f32, color: rune::Color) -> El {
-    text(glyph.to_string())
-        .font(rune::tok::TextStyle::new(size, 400.0))
-        .color(color)
+fn icon(size: f32, shape: rune::Shape) -> El {
+    rune::el().size(size, size).inert().shape(shape)
 }
 
 fn participant_avatar(name: &str) -> El {
@@ -52,7 +50,13 @@ fn participant_avatar(name: &str) -> El {
         )
 }
 
-fn filter_button(label: &str, active: bool, mouth: Option<&str>, count: Option<usize>) -> El {
+fn filter_button(
+    label: &str,
+    active: bool,
+    mouth: Option<&str>,
+    count: Option<usize>,
+    glyph: Option<rune::Shape>,
+) -> El {
     let mut el = row()
         .items_center()
         .gap(4.0)
@@ -67,6 +71,9 @@ fn filter_button(label: &str, active: bool, mouth: Option<&str>, count: Option<u
     let mut body = row().items_center().gap(4.0);
     if let Some(name) = mouth {
         body = body.child(participant_avatar(name));
+    }
+    if let Some(shape) = glyph {
+        body = body.child(icon(11.0, shape));
     }
     body = body.child(
         text(label.to_string())
@@ -137,17 +144,27 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
             .clone()
             .unwrap_or_else(|| "Waiting for your decision.".to_string())
     };
-    let mut approve = text(if busy { "Working…" } else { "✓  Approve" }.to_string())
+    let mut approve = row()
         .key(format!("gp-approve-{}", item.id))
-        .font(rune::tok::TextStyle::new(10.0, 550.0))
+        .items_center()
+        .gap(5.0)
         .h(26.0)
         .px(9.0)
         .radius(7.0)
         .center()
         .fill(ink("#ffffff"))
-        .color(ink("#0a0a0d"))
         .role("button")
-        .label(format!("Approve {}", item.title));
+        .label(format!("Approve {}", item.title))
+        .child(icon(13.0, crate::lucide_check(13.0, 2.0, ink("#0a0a0d"))))
+        .child(
+            text(if busy {
+                "Working…".to_string()
+            } else {
+                "Approve".to_string()
+            })
+            .font(rune::tok::TextStyle::new(10.0, 550.0))
+            .color(ink("#0a0a0d")),
+        );
     if !busy {
         approve = approve.on_press(move |s: &mut S| {
             let g = &mut s.projects_mut().group;
@@ -156,9 +173,10 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
             }
         });
     }
-    let mut reject = text("✕  Reject".to_string())
+    let mut reject = row()
         .key(format!("gp-reject-{}", item.id))
-        .font(rune::tok::TextStyle::new(10.0, 550.0))
+        .items_center()
+        .gap(5.0)
         .h(26.0)
         .px(9.0)
         .radius(7.0)
@@ -166,9 +184,14 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
         .fill(rgba(255.0, 255.0, 255.0, 0.035))
         .border(1.0, rgba(255.0, 255.0, 255.0, 0.1))
         .border_layout()
-        .color(ink("#d4d4d8"))
         .role("button")
-        .label(format!("Reject {}", item.title));
+        .label(format!("Reject {}", item.title))
+        .child(icon(13.0, crate::lucide_x(13.0, 2.0, ink("#d4d4d8"))))
+        .child(
+            text("Reject".to_string())
+                .font(rune::tok::TextStyle::new(10.0, 550.0))
+                .color(ink("#d4d4d8")),
+        );
     if !busy {
         reject = reject.on_press(move |s: &mut S| {
             let g = &mut s.projects_mut().group;
@@ -193,7 +216,10 @@ fn approval_card<S: ProjectsHost + 'static>(item: &GroupItem, busy: bool) -> El 
                 .radius(7.0)
                 .center()
                 .fill(rgba(251.0, 191.0, 36.0, 0.12))
-                .child(icon_text("!", 14.0, ink("#fcd34d"))),
+                .child(icon(
+                    15.0,
+                    crate::icons::triangle_alert(15.0, ink("#fcd34d")),
+                )),
         )
         .child(
             col()
@@ -293,15 +319,16 @@ fn message_body<S: ProjectsHost + 'static>(g: &GroupState, entry: &ChatEntry) ->
         });
     if let Some(item_id) = &entry.item_id {
         body = body.child(
-            text(item_id.clone())
-                .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
-                .px(6.0)
-                .py(1.0)
-                .mb(6.0)
-                .radius(5.0)
-                .border(1.0, rgba(255.0, 255.0, 255.0, 0.07))
-                .border_layout()
-                .color(ink("#71717a")),
+            row().self_start().mb(6.0).child(
+                text(item_id.clone())
+                    .font(rune::tok::TextStyle::new(9.0, 400.0).mono())
+                    .px(6.0)
+                    .py(1.0)
+                    .radius(5.0)
+                    .border(1.0, rgba(255.0, 255.0, 255.0, 0.07))
+                    .border_layout()
+                    .color(ink("#71717a")),
+            ),
         );
     }
     let mut inner = super::super::rune_transcript::render_markdown_standalone(
@@ -515,7 +542,10 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                             row()
                                 .items_center()
                                 .gap(6.0)
-                                .child(icon_text("▢", 12.0, ink("#a1a1aa")))
+                                .child(icon(
+                                    12.0,
+                                    crate::icons::message_square(12.0, ink("#a1a1aa")),
+                                ))
                                 .child(
                                     text("GROUP CONVERSATION".to_string())
                                         .font({
@@ -555,7 +585,10 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                                 .py(2.0)
                                 .radius(9.0)
                                 .fill(rgba(251.0, 191.0, 36.0, 0.12))
-                                .child(icon_text("!", 10.0, ink("#fcd34d")))
+                                .child(icon(
+                                    11.0,
+                                    crate::icons::triangle_alert(11.0, ink("#fcd34d")),
+                                ))
                                 .child(
                                     text(format!("{} waiting", waiting.len()))
                                         .font(rune::tok::TextStyle::new(9.5, 650.0))
@@ -575,14 +608,26 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .px(pad)
                 .pb(16.0)
                 .child(
-                    filter_button("Everyone", g.filter == "everyone", None, None).on_press(
-                        |s: &mut S| {
-                            s.projects_mut().group.filter = "everyone".to_string();
-                        },
-                    ),
+                    filter_button(
+                        "Everyone",
+                        g.filter == "everyone",
+                        None,
+                        None,
+                        Some(crate::icons::users(
+                            11.0,
+                            if g.filter == "everyone" {
+                                ink("#f4f4f5")
+                            } else {
+                                ink("#71717a")
+                            },
+                        )),
+                    )
+                    .on_press(|s: &mut S| {
+                        s.projects_mut().group.filter = "everyone".to_string();
+                    }),
                 )
                 .child(
-                    filter_button("You", g.filter == "you", Some("owner"), None).on_press(
+                    filter_button("You", g.filter == "you", Some("owner"), None, None).on_press(
                         |s: &mut S| {
                             s.projects_mut().group.filter = "you".to_string();
                         },
@@ -597,6 +642,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         g.filter == *name || same_actor(&g.filter, name),
                         Some(name),
                         count,
+                        None,
                     )
                     .on_press({
                         let name = name.clone();
@@ -646,7 +692,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         .border_layout()
                         .fill(rgba(255.0, 255.0, 255.0, 0.035))
                         .center()
-                        .child(icon_text("✦", 20.0, ink("#a1a1aa"))),
+                        .child(icon(20.0, crate::icons::sparkles(20.0, ink("#a1a1aa")))),
                 )
                 .child(
                     text(title)
@@ -799,10 +845,13 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .px(7.0)
                 .pt(5.0)
                 .pb(4.0)
-                .child(icon_text(
-                    if mention.is_some() { "@" } else { "◉" },
-                    10.0,
-                    ink("#6f727b"),
+                .child(icon(
+                    11.0,
+                    if mention.is_some() {
+                        crate::icons::at_sign(11.0, ink("#6f727b"))
+                    } else {
+                        crate::icons::users(11.0, ink("#6f727b"))
+                    },
                 ))
                 .child(
                     text(if mention.is_some() {
@@ -890,7 +939,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                             ),
                     )
                     .child(if active {
-                        icon_text("✓", 12.0, ink("#34d399"))
+                        icon(12.0, crate::lucide_check(12.0, 2.0, ink("#34d399")))
                     } else {
                         rune::el().size(0.0, 0.0).inert()
                     }),
@@ -941,7 +990,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                         .font(rune::tok::TextStyle::new(9.5, 400.0))
                         .color(ink("#c6c8cf")),
                 )
-                .child(icon_text("⌄", 10.0, ink("#666a74"))),
+                .child(icon(11.0, crate::icons::chevron_down(11.0, ink("#666a74")))),
         )
         .child(
             row()
@@ -950,18 +999,18 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 .items_end()
                 .gap(2.0)
                 .child(
-                    text("@".to_string())
+                    rune::el()
+                        .key("gp-composer-at")
                         .size(25.0, 26.0)
                         .radius(6.0)
                         .center()
-                        .font(rune::tok::TextStyle::new(13.0, 500.0))
-                        .color(ink("#6f727b"))
                         .hover(ink("#ffffff0f"))
                         .role("button")
                         .label("Mention an agent")
                         .on_press(|s: &mut S| {
                             s.projects_mut().group.menu = Menu::Mention;
-                        }),
+                        })
+                        .child(icon(13.0, crate::icons::at_sign(13.0, ink("#6f727b")))),
                 )
                 .child(
                     rune::text_input(&g.draft, {
@@ -985,26 +1034,33 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
                 ),
         )
         .child(
-            text("↑".to_string())
+            rune::el()
+                .key("gp-composer-send")
                 .size(26.0, 26.0)
                 .radius(7.0)
                 .center()
-                .font(rune::tok::TextStyle::new(14.0, 600.0))
                 .fill(if send_enabled {
                     ink("#f1f1f3")
                 } else {
                     rgba(255.0, 255.0, 255.0, 0.08)
                 })
-                .color(if send_enabled {
-                    ink("#0a0a0d")
-                } else {
-                    ink("#5f626b")
-                })
                 .role("button")
                 .label("Send message")
                 .on_press(move |s: &mut S| {
                     s.projects_mut().group.send();
-                }),
+                })
+                .child(icon(
+                    14.0,
+                    crate::lucide_arrow_up(
+                        14.0,
+                        2.0,
+                        if send_enabled {
+                            ink("#0a0a0d")
+                        } else {
+                            ink("#5f626b")
+                        },
+                    ),
+                )),
         );
     if !send_enabled {
         composer = composer.opacity(1.0);
@@ -1016,7 +1072,7 @@ pub fn chat_panel<S: ProjectsHost + 'static>(
             .gap(5.0)
             .pt(5.0)
             .px(2.0)
-            .child(icon_text("◇", 9.0, ink("#4f525a")))
+            .child(icon(10.0, crate::icons::bot(10.0, ink("#4f525a"))))
             .child(
                 text("Messages reach the team on its next turn; replies land here.".to_string())
                     .font(rune::tok::TextStyle::new(9.0, 400.0))

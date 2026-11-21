@@ -3,8 +3,8 @@
 //! Rune draws shapes from `Path` commands, while Lucide ships SVG `d`
 //! strings. Rather than hand-converting every glyph (and losing arc fidelity),
 //! this module parses the subset of the SVG path grammar Lucide uses: `M/m`,
-//! `L/l`, `H/h`, `V/v`, `A/a` and `Z/z`, with elliptical arcs converted to
-//! cubic Béziers. The 24-unit view box keeps the exact Lucide geometry.
+//! `L/l`, `H/h`, `V/v`, `C/c`, `A/a` and `Z/z`, with elliptical arcs converted
+//! to cubic Béziers. The 24-unit view box keeps the exact Lucide geometry.
 
 use rune::{LineCap, Path, Shape};
 
@@ -115,6 +115,257 @@ pub(crate) fn cloud_off(size: f32, color: rune::Color) -> Shape {
     Shape::new()
         .stroke_path(&p, size * (2.0 / 24.0), LineCap::Round, color)
         .view_box(24.0, 24.0)
+}
+
+/// Lucide `FolderKanban` (group-project identity).
+pub(crate) fn folder_kanban(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z",
+            "M8 10v4",
+            "M12 10v2",
+            "M16 10v6",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `PanelRightClose` (mobile details toggle while the rail is open).
+pub(crate) fn panel_right_close(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            // rect 3,3 18×18 rx 2 (Lucide ships this as a `<rect>`).
+            "M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z",
+            "M15 3v18",
+            "m8 9 3 3-3 3",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `PanelRightOpen` (mobile details toggle while the chat shows).
+pub(crate) fn panel_right_open(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z",
+            "M15 3v18",
+            "m10 15-3-3 3-3",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `StickyNote` (group notes button and sheet).
+pub(crate) fn sticky_note(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M21 9a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 15 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z",
+            "M15 3v5a1 1 0 0 0 1 1h5",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `FolderOpen`.
+pub(crate) fn folder_open(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &["m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Pause` (two 5×18 rounded bars).
+pub(crate) fn pause(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M6 3h3a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z",
+            "M15 3h3a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Play`.
+pub(crate) fn play(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &["M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `MessageSquare` (the group chat kicker).
+pub(crate) fn message_square(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &["M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `TriangleAlert` (approvals, waiting chips, room notices).
+pub(crate) fn triangle_alert(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3",
+            "M12 9v4",
+            "M12 17h.01",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Users`.
+pub(crate) fn users(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2",
+            "M16 3.128a4 4 0 0 1 0 7.744",
+            "M22 21v-2a4 4 0 0 0-3-3.87",
+            // circle cx 9 cy 7 r 4.
+            "M5 7a4 4 0 1 0 8 0a4 4 0 1 0-8 0",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Sparkles` (empty group conversation).
+pub(crate) fn sparkles(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z",
+            "M20 2v4",
+            "M22 4h-4",
+            // circle cx 4 cy 20 r 2.
+            "M2 20a2 2 0 1 0 4 0a2 2 0 1 0-4 0",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `AtSign` (mention button and menu kicker).
+pub(crate) fn at_sign(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            // circle cx 12 cy 12 r 4.
+            "M8 12a4 4 0 1 0 8 0a4 4 0 1 0-8 0",
+            "M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Plus` (notes sheet's Add button).
+pub(crate) fn plus(size: f32, color: rune::Color) -> Shape {
+    lucide(&["M5 12h14", "M12 5v14"], size, 2.0, color)
+}
+
+/// Lucide `ChevronDown`.
+pub(crate) fn chevron_down(size: f32, color: rune::Color) -> Shape {
+    lucide(&["m6 9 6 6 6-6"], size, 2.0, color)
+}
+
+/// Lucide `ChevronRight`.
+pub(crate) fn chevron_right(size: f32, color: rune::Color) -> Shape {
+    lucide(&["m9 18 6-6-6-6"], size, 2.0, color)
+}
+
+/// Lucide `Clock`.
+pub(crate) fn clock(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            // circle cx 12 cy 12 r 10.
+            "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0",
+            "M12 6v6l4 2",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Shield`.
+pub(crate) fn shield(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &["M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Bot` (the composer hint).
+pub(crate) fn bot(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            "M12 8V4H8",
+            // rect 4,8 16×12 rx 2.
+            "M6 8h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z",
+            "M2 14h2",
+            "M20 14h2",
+            "M15 13v2",
+            "M9 13v2",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `Terminal` (the shell-enabled badge).
+pub(crate) fn terminal(size: f32, color: rune::Color) -> Shape {
+    lucide(&["M12 19h8", "m4 17 6-6-6-6"], size, 2.0, color)
+}
+
+/// Lucide `Info` (runtime notice).
+pub(crate) fn info(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            // circle cx 12 cy 12 r 10.
+            "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0",
+            "M12 16v-4",
+            "M12 8h.01",
+        ],
+        size,
+        2.0,
+        color,
+    )
+}
+
+/// Lucide `CircleCheck` (queued-operation notice).
+pub(crate) fn circle_check(size: f32, color: rune::Color) -> Shape {
+    lucide(
+        &[
+            // circle cx 12 cy 12 r 10.
+            "M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0",
+            "m9 12 2 2 4-4",
+        ],
+        size,
+        2.0,
+        color,
+    )
 }
 
 struct Parser<'a> {
@@ -285,6 +536,25 @@ fn parse_path(d: &str) -> Path {
                 cur[1] = if rel { cur[1] + v } else { v };
                 path = path.line_to(cur);
             },
+            b'C' => loop {
+                p.skip_ws();
+                if !p.at_number() {
+                    break;
+                }
+                let Some(mut c1) = p.point() else { break };
+                let Some(mut c2) = p.point() else { break };
+                let Some(mut to) = p.point() else { break };
+                if rel {
+                    c1[0] += cur[0];
+                    c1[1] += cur[1];
+                    c2[0] += cur[0];
+                    c2[1] += cur[1];
+                    to[0] += cur[0];
+                    to[1] += cur[1];
+                }
+                path = path.cubic_to(c1, c2, to);
+                cur = to;
+            },
             b'A' => loop {
                 p.skip_ws();
                 if !p.at_number() {
@@ -427,5 +697,42 @@ mod tests {
         let _ = parse_path("M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z");
         let _ = parse_path("M12 17v5 M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9Z");
         let _ = parse_path("m2 2 20 20");
+    }
+
+    #[test]
+    fn group_icons_build_real_24_unit_geometry() {
+        let color = rune::color::hex("#ffffff").unwrap();
+        let icons: Vec<(&str, Shape)> = vec![
+            ("folder-kanban", folder_kanban(18.0, color)),
+            ("panel-right-close", panel_right_close(15.0, color)),
+            ("panel-right-open", panel_right_open(15.0, color)),
+            ("sticky-note", sticky_note(14.0, color)),
+            ("folder-open", folder_open(15.0, color)),
+            ("pause", pause(12.0, color)),
+            ("play", play(12.0, color)),
+            ("message-square", message_square(12.0, color)),
+            ("triangle-alert", triangle_alert(12.0, color)),
+            ("users", users(12.0, color)),
+            ("sparkles", sparkles(20.0, color)),
+            ("at-sign", at_sign(13.0, color)),
+            ("plus", plus(12.0, color)),
+            ("chevron-down", chevron_down(11.0, color)),
+            ("chevron-right", chevron_right(12.0, color)),
+            ("clock", clock(11.0, color)),
+            ("shield", shield(12.0, color)),
+            ("bot", bot(10.0, color)),
+            ("terminal", terminal(9.0, color)),
+            ("info", info(12.0, color)),
+            ("circle-check", circle_check(12.0, color)),
+        ];
+        for (name, icon) in icons {
+            assert!(!icon.is_empty(), "{name} drew nothing");
+            // `view_box` is crate-private in Rune; Debug prints it, which keeps
+            // this test honest without widening Rune's API.
+            assert!(
+                format!("{icon:?}").contains("view_box: Some([24.0, 24.0])"),
+                "{name} must stay on the 24-unit Lucide box: {icon:?}"
+            );
+        }
     }
 }

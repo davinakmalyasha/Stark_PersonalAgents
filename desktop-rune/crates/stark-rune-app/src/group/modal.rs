@@ -28,6 +28,10 @@ fn rgba(r: f32, g: f32, b: f32, a: f32) -> rune::Color {
     }
 }
 
+fn icon(size: f32, shape: rune::Shape) -> El {
+    rune::el().size(size, size).inert().shape(shape)
+}
+
 fn icon_box(size: f32, glyph: El) -> El {
     rune::el()
         .size(size, size)
@@ -95,11 +99,7 @@ fn shell_badge() -> El {
         .radius(5.0)
         .border(1.0, rgba(255.0, 255.0, 255.0, 0.08))
         .border_layout()
-        .child(
-            text("▣".to_string())
-                .font(rune::tok::TextStyle::new(9.0, 500.0))
-                .color(ink("#a1a1aa")),
-        )
+        .child(icon(9.0, crate::icons::terminal(9.0, ink("#a1a1aa"))))
         .child(
             text("shell".to_string())
                 .font(rune::tok::TextStyle::new(9.0, 500.0))
@@ -107,38 +107,41 @@ fn shell_badge() -> El {
         )
 }
 
-fn action_button(label: &str, primary: bool) -> El {
+fn action_button(label: &str, primary: bool, glyph: Option<rune::Shape>) -> El {
     let mut style = rune::tok::TextStyle::new(11.0, 550.0);
     style.line_height = 16.5;
-    let mut el = text(label.to_string())
-        .font(style)
-        .px(10.0)
-        .radius(8.0)
-        .h(30.0)
-        .center();
+    let fg = if primary {
+        ink("#0a0a0d")
+    } else {
+        ink("#d4d4d8")
+    };
+    let mut content = row().items_center().gap(5.0);
+    if let Some(shape) = glyph {
+        content = content.child(icon(12.0, shape));
+    }
+    content = content.child(text(label.to_string()).font(style).color(fg));
+    let mut el = content.h(30.0).px(10.0).radius(8.0).center();
     if primary {
         el = el.fill(ink("#ffffff")).color(ink("#0a0a0d"));
     } else {
         el = el
             .fill(rgba(255.0, 255.0, 255.0, 0.035))
             .border(1.0, rgba(255.0, 255.0, 255.0, 0.1))
-            .border_layout()
-            .color(ink("#d4d4d8"));
+            .border_layout();
     }
     el
 }
 
-fn icon_action(key: &str, label: &str, glyph: &'static str) -> El {
-    text(glyph.to_string())
+fn icon_action(key: &str, label: &str, shape: rune::Shape) -> El {
+    rune::el()
         .key(key)
         .size(30.0, 30.0)
         .radius(8.0)
         .center()
-        .font(rune::tok::TextStyle::new(15.0, 400.0))
-        .color(ink("#71717a"))
         .hover(ink("#ffffff0f"))
         .role("button")
         .label(label)
+        .child(icon(15.0, shape))
 }
 
 fn header<S: ProjectsHost + 'static>(
@@ -186,7 +189,11 @@ fn header<S: ProjectsHost + 'static>(
                     } else {
                         "Show details"
                     },
-                    "▤",
+                    if rail_visible {
+                        crate::icons::panel_right_close(15.0, ink("#71717a"))
+                    } else {
+                        crate::icons::panel_right_open(15.0, ink("#71717a"))
+                    },
                 )
                 .on_press({
                     let id = pause_id.clone();
@@ -199,51 +206,77 @@ fn header<S: ProjectsHost + 'static>(
             .child(rune::spacer());
     }
     actions = actions
-        .child(icon_action("gp-notes", "Open sticky notes", "✎").on_press({
-            let id = pause_id.clone();
-            move |s: &mut S| {
-                let g = &mut s.projects_mut().group;
-                crate::notes::open_notes(&mut g.notes, "group", &id);
-            }
-        }))
-        .child(icon_action("gp-folder", "Open folder", "▱").on_press_tx({
-            let path = folder_path.clone();
-            move |s: &mut S, tx: &mut rune::Tx| {
-                let _ = &tx;
-                let note = if path.is_empty() {
-                    "No project folder.".to_string()
-                } else {
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = std::process::Command::new("explorer").arg(&path).spawn();
-                        "Opened folder.".to_string()
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        tx.copy(path.clone());
-                        "Path copied.".to_string()
-                    }
-                };
-                s.projects_mut().group.set_path_note(note);
-            }
-        }));
+        .child(
+            icon_action(
+                "gp-notes",
+                "Open sticky notes",
+                crate::icons::sticky_note(14.0, ink("#71717a")),
+            )
+            .on_press({
+                let id = pause_id.clone();
+                move |s: &mut S| {
+                    let g = &mut s.projects_mut().group;
+                    crate::notes::open_notes(&mut g.notes, "group", &id);
+                }
+            }),
+        )
+        .child(
+            icon_action(
+                "gp-folder",
+                "Open folder",
+                crate::icons::folder_open(15.0, ink("#71717a")),
+            )
+            .on_press_tx({
+                let path = folder_path.clone();
+                move |s: &mut S, tx: &mut rune::Tx| {
+                    let _ = &tx;
+                    let note = if path.is_empty() {
+                        "No project folder.".to_string()
+                    } else {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = std::process::Command::new("explorer").arg(&path).spawn();
+                            "Opened folder.".to_string()
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            tx.copy(path.clone());
+                            "Path copied.".to_string()
+                        }
+                    };
+                    s.projects_mut().group.set_path_note(note);
+                }
+            }),
+        );
     if status == "running" {
-        actions = actions.child(action_button("❚❚  Pause", false).key("gp-pause").on_press(
-            move |s: &mut S| {
+        actions = actions.child(
+            action_button(
+                "Pause",
+                false,
+                Some(crate::icons::pause(12.0, ink("#d4d4d8"))),
+            )
+            .key("gp-pause")
+            .on_press(move |s: &mut S| {
                 let _ = &pause_id;
                 s.projects_mut().group.op("pause");
-            },
-        ));
+            }),
+        );
     } else if status == "paused" {
-        actions = actions.child(action_button("▶  Resume", true).key("gp-resume").on_press(
-            move |s: &mut S| {
+        actions = actions.child(
+            action_button(
+                "Resume",
+                true,
+                Some(crate::icons::play(12.0, ink("#0a0a0d"))),
+            )
+            .key("gp-resume")
+            .on_press(move |s: &mut S| {
                 s.projects_mut().group.op("resume");
-            },
-        ));
+            }),
+        );
     }
     if status != "done" && status != "closed" {
         actions = actions.child(
-            action_button("Close", false)
+            action_button("Close", false, None)
                 .key("gp-close-project")
                 .on_press(move |s: &mut S| {
                     let _ = &close_id;
@@ -252,7 +285,12 @@ fn header<S: ProjectsHost + 'static>(
         );
     }
     actions = actions.child(
-        icon_action("gp-close-x", "Close", "✕").on_press(|s: &mut S| {
+        icon_action(
+            "gp-close-x",
+            "Close",
+            crate::lucide_x(16.0, 2.0, ink("#71717a")),
+        )
+        .on_press(|s: &mut S| {
             s.projects_mut().group.close();
         }),
     );
@@ -296,9 +334,7 @@ fn header<S: ProjectsHost + 'static>(
         .gap(11.0)
         .child(icon_box(
             36.0,
-            text("▦".to_string())
-                .font(rune::tok::TextStyle::new(18.0, 400.0))
-                .color(ink("#a1a1aa")),
+            icon(18.0, crate::icons::folder_kanban(18.0, ink("#a1a1aa"))),
         ))
         .child(
             col()
@@ -411,10 +447,12 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
         }
     }
 
-    let mut notice = col()
+    let mut notice = row()
         .key("gp-modal-notice")
         .w_full()
-        .gap(4.0)
+        .items_center()
+        .flex_wrap()
+        .gap(12.0)
         .px(18.0)
         .py(7.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], rgba(255.0, 255.0, 255.0, 0.06))
@@ -424,17 +462,32 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
     if let Some(error) = &g.action_error {
         has_notice = true;
         notice = notice.child(
-            text(format!("⚠  {error}"))
-                .font(rune::tok::TextStyle::new(10.5, 400.0))
-                .color(ink("#fda4af")),
+            row()
+                .items_center()
+                .gap(5.0)
+                .child(icon(
+                    12.0,
+                    crate::icons::triangle_alert(12.0, ink("#fda4af")),
+                ))
+                .child(
+                    text(error.clone())
+                        .font(rune::tok::TextStyle::new(10.5, 400.0))
+                        .color(ink("#fda4af")),
+                ),
         );
     }
     if let Some(queued) = &g.queued {
         has_notice = true;
         notice = notice.child(
-            text(format!("✓  {queued}"))
-                .font(rune::tok::TextStyle::new(10.5, 400.0))
-                .color(ink("#a1a1aa")),
+            row()
+                .items_center()
+                .gap(5.0)
+                .child(icon(12.0, crate::icons::circle_check(12.0, ink("#a1a1aa"))))
+                .child(
+                    text(queued.clone())
+                        .font(rune::tok::TextStyle::new(10.5, 400.0))
+                        .color(ink("#a1a1aa")),
+                ),
         );
     }
     if let Some(note) = &g.path_note {
@@ -448,9 +501,15 @@ pub fn group_modal<S: ProjectsHost + 'static>(g: &GroupState, w: f32, h: f32) ->
     if let Some(runtime) = detail.and_then(|d| d.runtime_notice.as_ref()) {
         has_notice = true;
         notice = notice.child(
-            text(format!("ⓘ  {runtime}"))
-                .font(rune::tok::TextStyle::new(10.5, 400.0))
-                .color(ink("#a1a1aa")),
+            row()
+                .items_center()
+                .gap(5.0)
+                .child(icon(12.0, crate::icons::info(12.0, ink("#a1a1aa"))))
+                .child(
+                    text(runtime.clone())
+                        .font(rune::tok::TextStyle::new(10.5, 400.0))
+                        .color(ink("#a1a1aa")),
+                ),
         );
     }
 

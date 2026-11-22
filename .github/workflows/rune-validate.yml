@@ -1,6 +1,7 @@
 name: rune-validate
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "desktop-rune/**"

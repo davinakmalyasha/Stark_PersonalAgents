@@ -1,6 +1,7 @@
 name: rust-validate
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "backend-rs/**"

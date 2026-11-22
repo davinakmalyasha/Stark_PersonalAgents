@@ -3184,7 +3184,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stark-kit"
-version = "2.6.4"
+version = "2.7.0"
 dependencies = [
  "pulldown-cmark",
  "stark-theme",
@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "stark-launcher"
-version = "2.6.4"
+version = "2.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "stark-rune-app"
-version = "2.6.4"
+version = "2.7.0"
 dependencies = [
  "cpal",
  "js-sys",
@@ -3225,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "stark-rune-web"
-version = "2.6.4"
+version = "2.7.0"
 dependencies = [
  "rune",
  "stark-rune-app",
@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "stark-theme"
-version = "2.6.4"
+version = "2.7.0"
 
 [[package]]
 name = "static_assertions"

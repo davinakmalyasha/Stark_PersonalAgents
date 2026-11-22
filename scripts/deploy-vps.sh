@@ -92,6 +92,13 @@ EOF
   chown stark:stark /etc/stark/stark.env
 fi
 sed -i '/^STARK_FRONTEND_DIST=/d' /etc/stark/stark.env || true
+# Expose the deployed commit through /api/health so CI and the desktop can
+# confirm the VPS is running the same master revision.
+if grep -q '^STARK_BUILD_SHA=' /etc/stark/stark.env; then
+  sed -i "s|^STARK_BUILD_SHA=.*|STARK_BUILD_SHA=$REVISION|" /etc/stark/stark.env
+else
+  printf 'STARK_BUILD_SHA=%s\n' "$REVISION" >> /etc/stark/stark.env
+fi
 systemctl daemon-reload
 
 echo "==> drain (refuse new runs, wait for active ones)"

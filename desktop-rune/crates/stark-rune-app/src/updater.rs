@@ -6,9 +6,10 @@
 //! then writes `pending.json`. `stark-launcher` applies that pending version
 //! after the UI exits and rolls back if the new build fails to start.
 //!
-//! Tests can point `STARK_UPDATE_URL` at a local fixture and
-//! `STARK_INSTALL_ROOT` at a temporary tree; the release workflow embeds the
-//! minisign public key and publishes the matching manifest.
+//! The default feed is the master channel: every push to `master` publishes a
+//! signed build there, and installed builds check it on launch and every five
+//! minutes. Tests can point `STARK_UPDATE_URL` at a local fixture and
+//! `STARK_INSTALL_ROOT` at a temporary tree.
 
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,10 +24,17 @@ use sha2::{Digest, Sha256};
 
 use crate::settings::{UpdatePhase, UpdateState};
 
-/// Default feed. The Rune releases have their own repo so
-/// `releases/latest` can never resolve to an NSIS installer for the wrong app.
+/// Default feed. Every push to `master` publishes a signed build here, so
+/// `releases/latest` always names the newest master version. The dedicated
+/// repo keeps the lookup away from the retired Tauri installer feed.
 pub const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/davinakmalyasha/Stark_Rune_Releases/releases/latest/download/latest-rune.json";
+
+/// Installed builds check the master feed on launch and every five minutes.
+/// The feed changes only when a master build finishes, so this is frequent
+/// enough to follow `master` without a manual check and well inside GitHub's
+/// request limits.
+pub const AUTO_CHECK_SECONDS: f64 = 5.0 * 60.0;
 
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -185,7 +193,13 @@ fn check_inner(manual: bool, tx: &Sender<UpdateEvent>) -> Result<(), String> {
         return Ok(());
     }
     if !version_is_newer(&manifest.version, current_version()) {
-        let _ = tx.send(UpdateEvent::UpToDate);
+        // A five-minute poll must stay invisible; only an explicit check
+        // reports "up to date".
+        let _ = tx.send(if manual {
+            UpdateEvent::UpToDate
+        } else {
+            UpdateEvent::Quiet
+        });
         return Ok(());
     }
     if let Some(min) = &manifest.min_version {
@@ -535,15 +549,14 @@ fn sanitize_version(version: &str) -> Result<String, String> {
 }
 
 /// Semver-ish ordering: numeric release segments, then a pre-release suffix.
+/// Pre-release identifiers compare numerically when both are numbers, so
+/// `master.10` is newer than `master.9` (the master feed publishes many builds).
 pub fn version_is_newer(candidate: &str, current: &str) -> bool {
     fn parse(value: &str) -> (Vec<u64>, Option<String>) {
+        let value = value.trim().trim_start_matches('v');
         let (release, pre) = value
-            .trim()
-            .trim_start_matches('v')
             .split_once('-')
-            .map_or((value.trim().trim_start_matches('v'), None), |(r, p)| {
-                (r, Some(p.to_string()))
-            });
+            .map_or((value, None), |(r, p)| (r, Some(p.to_string())));
         let nums = release
             .split('.')
             .map(|part| {
@@ -555,6 +568,35 @@ pub fn version_is_newer(candidate: &str, current: &str) -> bool {
             })
             .collect();
         (nums, pre)
+    }
+    // Semver pre-release precedence: numeric identifiers compare numerically
+    // and rank below alphanumeric ones; alphanumeric identifiers compare
+    // lexically. A longer identifier list wins when the common prefix matches.
+    fn prerelease_is_newer(candidate: &str, current: &str) -> bool {
+        let left: Vec<&str> = candidate.split('.').collect();
+        let right: Vec<&str> = current.split('.').collect();
+        for index in 0..left.len().max(right.len()) {
+            match (left.get(index), right.get(index)) {
+                (None, None) => return false,
+                (None, Some(_)) => return false,
+                (Some(_), None) => return true,
+                (Some(a), Some(b)) => match (a.parse::<u64>(), b.parse::<u64>()) {
+                    (Ok(a), Ok(b)) => {
+                        if a != b {
+                            return a > b;
+                        }
+                    }
+                    (Ok(_), Err(_)) => return false,
+                    (Err(_), Ok(_)) => return true,
+                    (Err(_), Err(_)) => {
+                        if a != b {
+                            return a > b;
+                        }
+                    }
+                },
+            }
+        }
+        false
     }
     let (a, pa) = parse(candidate);
     let (b, pb) = parse(current);
@@ -570,7 +612,7 @@ pub fn version_is_newer(candidate: &str, current: &str) -> bool {
         (None, None) => false,
         (None, Some(_)) => true,
         (Some(_), None) => false,
-        (Some(a), Some(b)) => a > b,
+        (Some(a), Some(b)) => prerelease_is_newer(&a, &b),
     }
 }
 
@@ -633,11 +675,11 @@ pub fn apply_event(state: &mut UpdateState, event: UpdateEvent) -> bool {
     }
 }
 
-/// Optional automatic check at launch and every six hours. Installed builds
-/// only; a dev checkout never reaches the feed.
+/// Automatic check at launch and every [`AUTO_CHECK_SECONDS`]. Installed
+/// builds only; a dev checkout never reaches the feed.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn auto_check_due(last: Option<f64>, now: f64) -> bool {
-    install_root().is_some() && last.is_none_or(|last| now - last >= 6.0 * 60.0 * 60.0)
+    install_root().is_some() && last.is_none_or(|last| now - last >= AUTO_CHECK_SECONDS)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -659,6 +701,16 @@ mod tests {
         assert!(version_is_newer("2.7.0", "2.7.0-beta.1"));
         assert!(!version_is_newer("2.7.0-beta.1", "2.7.0"));
         assert!(version_is_newer("v2.7.0", "2.6.4"));
+        // Master builds are many per day; suffix numbers must compare
+        // numerically, not as strings ("master.10" > "master.9").
+        assert!(version_is_newer("2.7.1-master.10", "2.7.1-master.9"));
+        assert!(!version_is_newer("2.7.1-master.9", "2.7.1-master.10"));
+        assert!(version_is_newer("2.7.1-master.123.2", "2.7.1-master.123.1"));
+        assert!(version_is_newer("2.7.1-rc.10", "2.7.1-rc.9"));
+        assert!(!version_is_newer("2.7.1-rc.9", "2.7.1-rc.10"));
+        assert!(version_is_newer("2.7.1", "2.7.1-master.10"));
+        assert!(!version_is_newer("2.7.1-master.10", "2.7.1"));
+        assert!(version_is_newer("2.7.1-master.1", "2.7.0"));
     }
 
     #[test]

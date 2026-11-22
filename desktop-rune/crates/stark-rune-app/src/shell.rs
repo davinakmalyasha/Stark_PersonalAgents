@@ -1909,6 +1909,9 @@ pub fn shell_poll(s: &mut ShellState, clock: f64, tx: &mut rune::Tx) -> bool {
     changed |= crate::agents::poll_agents_state(&mut s.canvas.agents, clock);
     changed |= crate::settings::poll_settings(&mut s.settings);
     s.settings.auto_update(clock);
+    if let Some(left) = s.settings.next_auto_check_in(clock) {
+        tx.wake_after(std::time::Duration::from_secs_f64(left.max(0.05)));
+    }
     changed |= sync_audio_owner(s);
     if poll_audio(s) {
         tx.wake_after(std::time::Duration::from_millis(250));

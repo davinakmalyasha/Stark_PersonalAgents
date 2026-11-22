@@ -72,8 +72,8 @@ jobs:
           SHA: ${{ steps.build.outputs.sha }}
         run: |
           set -euo pipefail
-          # deploy-vps is not a validation gate.
-          filter='[.[] | select(.name != "deploy-vps")]'
+          # deploy-vps and the desktop master release are not validation gates.
+          filter='[.[] | select(.name != "deploy-vps" and .name != "rune-master")]'
 
           # Path-filtered workflows only exist when their paths changed.
           files="$(gh api "repos/$REPO/commits/$SHA" --jq '.files[].filename')"

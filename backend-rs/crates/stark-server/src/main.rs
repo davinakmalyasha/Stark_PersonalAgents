@@ -3215,6 +3215,10 @@ async fn health_handler() -> Json<Value> {
     Json(json!({
         "ok": true,
         "code_version": "stark-rs-0.1",
+        // Set by stark-launcher for the bundled desktop server; empty on the
+        // VPS, where `build` names the deployed commit instead.
+        "app_version": std::env::var("STARK_APP_VERSION").unwrap_or_default(),
+        "build": std::env::var("STARK_BUILD_SHA").unwrap_or_default(),
         "origin": server_origin(),
         "cap": concurrent_cap(),
     }))

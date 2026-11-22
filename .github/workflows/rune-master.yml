@@ -1,0 +1,324 @@
+name: rune-master
+
+# Every push to master builds, signs and publishes a Rune desktop release.
+# Installed builds poll the feed on launch and every five minutes, so a merged
+# change becomes available to the desktop without a manual check.
+#
+# The same push also triggers build-linux/deploy-vps for the server. This
+# workflow only publishes the desktop feed and the downloadable installer.
+#
+# Required secrets:
+#   MINISIGN_SECRET_KEY       minisign secret key text
+#   STARK_UPDATE_PUBKEY       matching minisign public key text
+#   RELEASES_TOKEN            fine-grained token for the public feed repo
+# Optional:
+#   WINDOWS_CERT_BASE64, WINDOWS_CERT_PASSWORD  Authenticode signing
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: rune-master
+  # A newer master commit supersedes an older build. Publishing happens as a
+  # draft first, so a cancelled run never becomes "latest".
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  RELEASES_REPO: davinakmalyasha/Stark_Rune_Releases
+  MIN_VERSION: "2.7.0"
+  REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop-rune -> target
+            backend-rs -> target
+
+      - name: Require green validation for this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Path-filtered workflows only exist when their paths changed.
+          files="$(gh api "repos/$REPO/commits/$SHA" --jq '.files[].filename')"
+          need_rune=false
+          need_rust=false
+          grep -q '^desktop-rune/' <<<"$files" && need_rune=true || true
+          grep -q '^\.github/workflows/rune-validate\.yml$' <<<"$files" && need_rune=true || true
+          grep -q '^backend-rs/' <<<"$files" && need_rust=true || true
+          grep -q '^\.github/workflows/rust-validate\.yml$' <<<"$files" && need_rust=true || true
+          echo "required validation: rune=$need_rune rust=$need_rust"
+
+          for attempt in $(seq 1 90); do
+            runs="$(gh run list --repo "$REPO" --commit "$SHA" --limit 50 \
+              --json name,status,conclusion)"
+            # A merge commit's diff can hide a path from the commit API; if a
+            # validation run exists at all, wait for it.
+            rune_seen="$(jq '[.[] | select(.name == "rune-validate")] | length' <<<"$runs")"
+            rust_seen="$(jq '[.[] | select(.name == "rust-validate")] | length' <<<"$runs")"
+            [ "$rune_seen" != "0" ] && need_rune=true || true
+            [ "$rust_seen" != "0" ] && need_rust=true || true
+            bad="$(jq '[.[] | select((.name == "rune-validate" or .name == "rust-validate")
+              and .status == "completed" and .conclusion != "success")] | length' <<<"$runs")"
+            if [ "$bad" != "0" ]; then
+              echo "::error::validation failed for $SHA"
+              jq -r '.[] | select((.name == "rune-validate" or .name == "rust-validate")
+                and .status == "completed" and .conclusion != "success")
+                | "\(.name): \(.conclusion)"' <<<"$runs"
+              exit 1
+            fi
+
+            rune_ok="$(jq '[.[] | select(.name == "rune-validate" and .conclusion == "success")] | length' <<<"$runs")"
+            rust_ok="$(jq '[.[] | select(.name == "rust-validate" and .conclusion == "success")] | length' <<<"$runs")"
+            ok=true
+            [ "$need_rune" = "true" ] && [ "$rune_ok" = "0" ] && ok=false
+            [ "$need_rust" = "true" ] && [ "$rust_ok" = "0" ] && ok=false
+            if [ "$ok" = "true" ]; then
+              echo "validation green for $SHA"
+              exit 0
+            fi
+            echo "waiting for validation ($attempt/90, rune=$rune_ok rust=$rust_ok)"
+            sleep 15
+          done
+          echo "::error::timed out waiting for validation of $SHA"
+          exit 1
+
+      - name: Compute master version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(grep '^version' desktop-rune/Cargo.toml | head -1 | cut -d'"' -f2)"
+          case "$base" in
+            *-*) echo "::error::master version must be x.y.z, got $base"; exit 1 ;;
+          esac
+          IFS=. read -r major minor patch <<<"$base"
+          case "$major$minor$patch" in
+            *[!0-9]*) echo "::error::master version must be numeric, got $base"; exit 1 ;;
+          esac
+          version="$major.$minor.$((patch + 1))-master.${{ github.run_number }}.${{ github.run_attempt }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=rune-$version" >> "$GITHUB_OUTPUT"
+          sed -i "s/^version = \".*\"/version = \"$version\"/" desktop-rune/Cargo.toml
+          echo "building $version from ${{ github.sha }}"
+
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          choco install nsis minisign -y --no-progress
+
+      - name: Fetch ONNX Runtime 1.26
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/onnxruntime-win-x64-1.26.0.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "onnxruntime.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "onnxruntime"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $dll = Get-ChildItem $dir -Recurse -Filter onnxruntime.dll | Select-Object -First 1
+          if (-not $dll) { throw "onnxruntime.dll not found" }
+          Copy-Item $dll.FullName "backend-rs\onnxruntime.dll" -Force
+
+      - name: Stage key files
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${{ secrets.MINISIGN_SECRET_KEY }}" > "$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "${{ secrets.STARK_UPDATE_PUBKEY }}" > "$RUNNER_TEMP/update.pub"
+          chmod 600 "$RUNNER_TEMP/minisign.key"
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          STARK_UPDATE_PUBKEY: ${{ secrets.STARK_UPDATE_PUBKEY }}
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path desktop-rune/Cargo.toml --release \
+            -p stark-rune-app -p stark-launcher \
+            --features stark-rune-app/rune-real
+          cargo build --manifest-path backend-rs/Cargo.toml --release -p stark-server
+
+      - name: Authenticode sign binaries (optional)
+        if: ${{ env.WINDOWS_CERT_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          $cert = Join-Path $env:RUNNER_TEMP "stark.pfx"
+          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          $files = @(
+            "desktop-rune/target/release/stark-rune.exe",
+            "desktop-rune/target/release/stark-launcher.exe",
+            "backend-rs/target/release/stark-server.exe"
+          ) | Where-Object { Test-Path $_ }
+          foreach ($file in $files) {
+            & signtool sign /fd SHA256 /f $cert /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 $file
+          }
+
+      - name: Stage signed package
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ runner.temp }}/minisign.key
+          STARK_UPDATE_PUBKEY: ${{ secrets.STARK_UPDATE_PUBKEY }}
+          STARK_UPDATE_PUBKEY_FILE: ${{ runner.temp }}/update.pub
+        run: |
+          set -euo pipefail
+          [ -s "$STARK_UPDATE_PUBKEY_FILE" ] || { echo "missing update public key"; exit 1; }
+          [ -s "$MINISIGN_SECRET_KEY" ] || { echo "missing minisign secret key"; exit 1; }
+          bash desktop-rune/packaging/package.sh --stage-only
+
+      - name: Authenticode sign installer (optional)
+        if: ${{ env.WINDOWS_CERT_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          $cert = Join-Path $env:RUNNER_TEMP "stark.pfx"
+          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          $version = (Get-Content desktop-rune/Cargo.toml | Select-String '^version' | Select-Object -First 1).ToString().Split('"')[1]
+          $installer = "desktop-rune/dist/StarkRune-Setup-$version.exe"
+          if (Test-Path $installer) {
+            & signtool sign /fd SHA256 /f $cert /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr http://timestamp.digicert.com /td SHA256 $installer
+            $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+            "$hash  StarkRune-Setup-$version.exe" | Set-Content "$installer.sha256" -Encoding ascii
+          }
+
+      - name: Build update manifest
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          RELEASES_REPO: davinakmalyasha/Stark_Rune_Releases
+          MIN_VERSION: "2.7.0"
+        run: |
+          $payload = Get-Item "desktop-rune/dist/StarkRune-$env:VERSION-x64.zip"
+          $signature = Get-Content "$($payload.FullName).minisig" -Raw
+          $sha = (Get-Content "$($payload.FullName).sha256" -Raw).Split(' ')[0]
+          $manifest = [ordered]@{
+            schema = 1
+            version = $env:VERSION
+            min_version = $env:MIN_VERSION
+            pub_date = (Get-Date).ToUniversalTime().ToString("o")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                url = "https://github.com/$env:RELEASES_REPO/releases/download/$env:TAG/$($payload.Name)"
+                sha256 = $sha
+                size = [int64]$payload.Length
+                signature = $signature
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content "desktop-rune/dist/latest-rune.json" -Encoding utf8NoBOM
+          Copy-Item "$env:RUNNER_TEMP/update.pub" "desktop-rune/dist/update.pub" -Force
+          Get-Content "desktop-rune/dist/latest-rune.json"
+
+      - name: Publish feed release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          dist=desktop-rune/dist
+          payload="$dist/StarkRune-$VERSION-x64.zip"
+          files=(
+            "$payload"
+            "$payload.minisig"
+            "$payload.sha256"
+            "$dist/latest-rune.json"
+            "$dist/update.pub"
+            "$dist/StarkRune-$VERSION-windows-x86_64.zip"
+            "$dist/StarkRune-$VERSION-windows-x86_64.zip.sha256"
+          )
+          for installer in "$dist"/StarkRune-Setup-*.exe; do
+            if [ -f "$installer" ]; then
+              files+=("$installer")
+              [ -f "$installer.sha256" ] && files+=("$installer.sha256")
+            fi
+          done
+          notes="Signed Rune $VERSION built from master at ${{ github.sha }}. Installed builds apply this automatically."
+          if gh release view "$TAG" -R "$RELEASES_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" -R "$RELEASES_REPO" --clobber
+            gh release edit "$TAG" -R "$RELEASES_REPO" --draft=false --latest --title "Stark Rune $VERSION" --notes "$notes"
+          else
+            gh release create "$TAG" "${files[@]}" -R "$RELEASES_REPO" --draft \
+              --title "Stark Rune $VERSION" --notes "$notes"
+            gh release edit "$TAG" -R "$RELEASES_REPO" --draft=false --latest
+          fi
+
+      - name: Publish rolling master release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          dist=desktop-rune/dist
+          notes="$dist/RELEASE_NOTES.md"
+          cat > "$notes" <<EOF
+          ## Stark Rune $VERSION
+
+          Built from \`master\` at \`${{ github.sha }}\`.
+
+          - Installer: \`StarkRune-Setup-latest.exe\`
+          - Portable: \`StarkRune-latest-windows-x86_64.zip\`
+          - Desktop updates: [latest-rune.json](https://github.com/$RELEASES_REPO/releases/latest/download/latest-rune.json)
+          - Server: deployed to the VPS from the same commit by \`deploy-vps\`.
+
+          This rolling release always carries the newest master installer under
+          fixed asset names; the title and notes name the exact version.
+          EOF
+          sed -i 's/^          //' "$notes"
+          portable="$dist/StarkRune-$VERSION-windows-x86_64.zip"
+          cp "$portable" "$dist/StarkRune-latest-windows-x86_64.zip"
+          portable_hash="$(cut -d' ' -f1 "$portable.sha256")"
+          printf '%s  StarkRune-latest-windows-x86_64.zip\n' "$portable_hash" \
+            > "$dist/StarkRune-latest-windows-x86_64.zip.sha256"
+          files=(
+            "$dist/StarkRune-latest-windows-x86_64.zip"
+            "$dist/StarkRune-latest-windows-x86_64.zip.sha256"
+            "$dist/latest-rune.json"
+            "$dist/update.pub"
+          )
+          installer="$dist/StarkRune-Setup-$VERSION.exe"
+          if [ -f "$installer" ]; then
+            cp "$installer" "$dist/StarkRune-Setup-latest.exe"
+            files+=("$dist/StarkRune-Setup-latest.exe")
+          fi
+          main_tag=rune-master
+          if gh release view "$main_tag" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$main_tag" "${files[@]}" -R "$REPO" --clobber
+            gh release edit "$main_tag" -R "$REPO" --draft=false --latest \
+              --title "Stark Rune master ($VERSION)" --notes-file "$notes"
+          else
+            gh release create "$main_tag" "${files[@]}" -R "$REPO" --draft \
+              --title "Stark Rune master ($VERSION)" --notes-file "$notes"
+            gh release edit "$main_tag" -R "$REPO" --draft=false --latest
+          fi
+
+      - name: Check feed JSON
+        shell: pwsh
+        run: |
+          Get-Content desktop-rune/dist/latest-rune.json -Raw | ConvertFrom-Json | Out-Null
+          Write-Host "latest-rune.json is valid"

@@ -474,29 +474,6 @@ impl SettingsState {
         });
     }
 
-    /// `checkForAppUpdate({manual:true})`. Starts the signed, staged update
-    /// worker; the shell poll maps its events into the shared toast/settings
-    /// state. The browser build is updated with the server deploy.
-    pub fn check_updates(&mut self) {
-        if cfg!(target_arch = "wasm32") {
-            self.update = UpdateState {
-                phase: UpdatePhase::Unsupported,
-                message: "Web build — updates are applied when the server deploys.".to_string(),
-                ..UpdateState::default()
-            };
-            return;
-        }
-        if crate::updater::install_root().is_none() && std::env::var("STARK_UPDATE_URL").is_err() {
-            self.update = UpdateState {
-                phase: UpdatePhase::Error,
-                message: "Updates are available in the installed app.".to_string(),
-                ..UpdateState::default()
-            };
-            return;
-        }
-        self.start_update_check(true);
-    }
-
     /// One worker at a time. A ready update is not re-checked until it applies.
     pub fn start_update_check(&mut self, manual: bool) {
         if self.update_inbox.is_some()
@@ -521,8 +498,8 @@ impl SettingsState {
         crate::updater::spawn_check(manual, tx);
     }
 
-    /// Six-hour launch/periodic check. `clock` is the shell's wall clock in
-    /// seconds; installed builds only, so headless scenes and dev runs stay
+    /// Launch/five-minute master-feed check. `clock` is the shell's wall clock
+    /// in seconds; installed builds only, so headless scenes and dev runs stay
     /// offline.
     pub fn auto_update(&mut self, clock: f64) {
         if self.update_inbox.is_some()
@@ -537,6 +514,32 @@ impl SettingsState {
             self.update_last_check = Some(clock);
             self.start_update_check(false);
         }
+    }
+
+    /// Seconds until the updater needs the shell again. While a worker is in
+    /// flight this is short so progress events are drained on an idle screen;
+    /// otherwise it is the next master-feed check. `None` means no wake is
+    /// needed (dev build, ready update, or wasm).
+    pub fn next_auto_check_in(&self, clock: f64) -> Option<f64> {
+        if !self.desktop() {
+            return None;
+        }
+        if self.update_inbox.is_some()
+            || matches!(
+                self.update.phase,
+                UpdatePhase::Checking | UpdatePhase::Downloading
+            )
+        {
+            return Some(0.1);
+        }
+        if self.update.phase == UpdatePhase::Ready {
+            return None;
+        }
+        crate::updater::install_root()?;
+        Some(match self.update_last_check {
+            None => 0.0,
+            Some(last) => (last + crate::updater::AUTO_CHECK_SECONDS - clock).max(0.0),
+        })
     }
 
     /// The staged build waits for the shell's busy/draft gate.
@@ -1034,7 +1037,7 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                         .min_w(0.0)
                         .child(heading(&format!("Stark v{STARK_VERSION}")))
                         .child(muted(if desktop {
-                            "Checked on every launch and applied automatically — no manual step."
+                            "Checked on launch and every 5 minutes; new master builds download and apply automatically — no manual step."
                         } else {
                             "Web build — updates arrive when the server deploys."
                         }))
@@ -1055,8 +1058,8 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                                 }),
                         ),
                 )
-                .children(desktop.then(|| {
-                    if s.update_restart_ready() {
+                .children(
+                    (desktop && s.update_restart_ready()).then(|| {
                         action_button::<S>(
                             "settings-restart",
                             "Restart",
@@ -1066,21 +1069,8 @@ pub fn settings_sheet<S: SettingsHost + 'static>(s: &SettingsState, width: f32, 
                             false,
                             |_s: &mut S, tx: &mut rune::Tx| tx.quit(),
                         )
-                    } else {
-                        action_button::<S>(
-                            "settings-check",
-                            "Check",
-                            Some(icon_refresh(14.0, ink("#d4d4d8"))),
-                            false,
-                            matches!(
-                                s.update.phase,
-                                UpdatePhase::Checking | UpdatePhase::Downloading
-                            ),
-                            s.update.phase == UpdatePhase::Checking,
-                            |s: &mut S, _tx: &mut rune::Tx| s.settings_mut().check_updates(),
-                        )
-                    }
-                })),
+                    }),
+                ),
         );
     // Backup & move.
     let mut backup = section("settings-section-backup")
@@ -1613,17 +1603,14 @@ mod tests {
     }
 
     #[test]
-    fn update_stub_is_honest_on_native_and_web() {
+    fn updater_schedules_short_wakes_while_a_worker_is_in_flight() {
         let mut s = SettingsState::default();
-        s.check_updates();
-        if cfg!(target_arch = "wasm32") {
-            assert_eq!(s.update.phase, UpdatePhase::Unsupported);
-            assert!(s.update.message.contains("Web build"));
-        } else {
-            assert_eq!(s.update.phase, UpdatePhase::Error);
-            assert!(s.update.message.contains("installed app"));
-        }
-        assert!(!s.desktop() == cfg!(target_arch = "wasm32"));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        s.update_inbox = Some(rx);
+        assert_eq!(s.next_auto_check_in(0.0), Some(0.1));
+        s.update_inbox = None;
+        s.update.phase = UpdatePhase::Ready;
+        assert_eq!(s.next_auto_check_in(0.0), None);
     }
 
     #[test]

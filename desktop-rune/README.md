@@ -86,9 +86,11 @@ over approximating a CSS property.
   Symphonia; web uses a hidden `HtmlAudioElement` fed by an authenticated
   Blob URL. The engine lives in the thread, so virtual rows can unmount
   without stopping a clip.
-- **Updates** — `updater.rs` checks a signed manifest, downloads and verifies
-  a payload, and stages it under `app/<version>`; `stark-launcher` switches
-  `current.json` after the UI exits and rolls back on a failed launch.
+- **Updates** — `updater.rs` follows the master feed. It checks on launch and
+  every five minutes, downloads and verifies the signed payload, and stages it
+  under `app/<version>`; `stark-launcher` switches `current.json` after the UI
+  exits and rolls back on a failed launch. Every push to master publishes a
+  new signed version, so no tag or manual check is involved.
 - **Browser shell** — the wasm transport resolves the API origin from
   `__STARK_API_ORIGIN__` or the page origin, carries the pairing token on
   every request, and gates the app on a 401. The phone layout hides the rail,
@@ -134,10 +136,23 @@ bundled `stark-server`, starts the UI from `app/<version>`, and applies a
 staged update only after the UI exits. `current.json` is the atomic switch;
 `pending.json` is the handoff; `blocked.json` records a version that failed to
 start. A failed new build rolls back to the previous version automatically.
-The updater feed is a dedicated public Rune release repo. Rune keeps its data
-in `%LOCALAPPDATA%\StarkRune\data`
+Every push to master publishes a signed build to the dedicated public feed
+repo (`davinakmalyasha/Stark_Rune_Releases`), and the installed app checks that
+feed on launch and every five minutes. The rolling `rune-master` release on the
+main repo carries the matching installer. The VPS is deployed from the same
+commit by `build-linux`/`deploy-vps`, and its `/api/health` reports the
+revision in `build`.
+
+Rune keeps its data in `%LOCALAPPDATA%\StarkRune\data`
 (override with `STARK_HARNESS_ROOT`); use Settings' backup import to adopt an
 existing `D:\StarkData` tree instead of running two servers on one database.
+The launcher refuses to reuse a backend on port 8124 unless it reports the
+same app version, so a development server cannot silently capture the
+installed app.
+
+Development uses `scripts/dev-rune.ps1` (latest master against the repo harness
+root) and `scripts/check-rune.ps1` (format, clippy, tests). Packaging and feed
+details live in `packaging/RELEASE.md`.
 
 State is plain Rust. `TranscriptHost`, `CanvasHost`, `ProjectsHost`,
 `SettingsHost` and related traits let shared views resolve the active thread

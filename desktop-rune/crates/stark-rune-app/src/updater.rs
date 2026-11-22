@@ -246,12 +246,26 @@ fn check_inner(manual: bool, tx: &Sender<UpdateEvent>) -> Result<(), String> {
         .map_err(|error| format!("cannot create {}: {error}", updates.display()))?;
     let part = updates.join(format!("{version}.zip.part"));
     let complete = updates.join(format!("{version}.zip"));
+    let staging = updates.join(format!("{version}.staging"));
 
     if target.join("stark-rune.exe").is_file() && target.join("stark-server.exe").is_file() {
         validate_staged(&target, &version)?;
         write_pending(&root, &version, "already-staged")?;
         let _ = tx.send(UpdateEvent::Ready { version });
         return Ok(());
+    }
+    // A previous attempt may have extracted and validated the payload but
+    // lost the final directory rename to a transient Windows file lock
+    // (Defender or a just-executed image section). Reuse it rather than
+    // downloading the payload again.
+    if staging.join("stark-rune.exe").is_file() && staging.join("stark-server.exe").is_file() {
+        if validate_staged(&staging, &version).is_ok() {
+            install_staged(&root, &staging, &target, &version)?;
+            let _ = fs::remove_file(&complete);
+            let _ = tx.send(UpdateEvent::Ready { version });
+            return Ok(());
+        }
+        let _ = fs::remove_dir_all(&staging);
     }
     if target.exists() {
         let _ = fs::remove_dir_all(&target);
@@ -270,26 +284,45 @@ fn check_inner(manual: bool, tx: &Sender<UpdateEvent>) -> Result<(), String> {
     verify_signature(&part, &platform.signature, root.as_path())?;
     fs::rename(&part, &complete).map_err(|error| format!("cannot finalise download: {error}"))?;
 
-    let staging = updates.join(format!("{version}.staging"));
     let _ = fs::remove_dir_all(&staging);
     extract_zip(&complete, &staging)?;
     validate_staged(&staging, &version)?;
+    install_staged(&root, &staging, &target, &version)?;
+    let _ = fs::remove_file(&complete);
+    let _ = tx.send(UpdateEvent::Ready { version });
+    Ok(())
+}
 
+#[cfg(not(target_arch = "wasm32"))]
+fn install_staged(root: &Path, staging: &Path, target: &Path, version: &str) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
-    let _ = fs::remove_dir_all(&target);
-    fs::rename(&staging, &target).map_err(|error| {
-        format!(
-            "cannot move staged update into {}: {error}",
-            target.display()
-        )
-    })?;
-    write_pending(&root, &version, "staged")?;
-    let _ = fs::remove_file(&complete);
-    let _ = tx.send(UpdateEvent::Ready { version });
-    Ok(())
+    let _ = fs::remove_dir_all(target);
+    move_staging(staging, target)?;
+    write_pending(root, version, "staged")
+}
+
+/// Windows can keep a handle on a just-executed image for a moment. Retry the
+/// directory rename with backoff so a Defender scan does not fail an update
+/// that is otherwise complete and verified.
+#[cfg(not(target_arch = "wasm32"))]
+fn move_staging(staging: &Path, target: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..12 {
+        match fs::rename(staging, target) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = error.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+            }
+        }
+    }
+    Err(format!(
+        "cannot move staged update into {}: {last}",
+        target.display()
+    ))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -490,18 +523,12 @@ fn validate_staged(staging: &Path, version: &str) -> Result<(), String> {
             text.trim()
         ));
     }
-    let server_output = std::process::Command::new(&server)
-        .arg("--version")
-        .output();
-    if let Ok(server_output) = server_output {
-        if server_output.status.success() {
-            let text = String::from_utf8_lossy(&server_output.stdout);
-            if !text.trim().is_empty() {
-                return Ok(());
-            }
-        }
+    // `stark-server` has no --version flag; running it would start a second
+    // server and block the updater. Check the staged file instead.
+    let server_size = fs::metadata(&server).map(|meta| meta.len()).unwrap_or(0);
+    if server_size < 1_000_000 {
+        return Err("Update zip has a truncated stark-server.exe.".to_string());
     }
-    // Older servers may not have --version; the binary presence is enough.
     Ok(())
 }
 
@@ -804,6 +831,22 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         fs::write(&file, b"Test").unwrap();
         assert!(verify_signature(&file, signature, &root).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn move_staging_moves_a_directory() {
+        let dir = std::env::temp_dir().join(format!("stark-updater-move-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("marker"), b"ok").unwrap();
+        let target = dir.join("app").join("2.7.1-master.7.1");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        move_staging(&staging, &target).unwrap();
+        assert!(target.join("marker").is_file());
+        assert!(!staging.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

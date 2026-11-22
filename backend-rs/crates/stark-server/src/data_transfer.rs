@@ -31,6 +31,8 @@ const DURABLE: &[&str] = &[
     ".deep_agents/groups",
     ".deep_agents/rollouts",
     ".deep_agents/mcp_servers.json",
+    ".deep_agents/execpolicy.star",
+    ".deep_agents/permissions.json",
     ".deep_agents/ui_state.json",
     ".deep_agents/agent_notes.json",
     ".deep_agents/workspaces.json",
@@ -299,21 +301,22 @@ pub async fn snapshot_once(
     };
     let encrypted = zip.with_extension("zip.enc");
     let _ = std::fs::remove_file(&encrypted);
-    let status = std::process::Command::new("openssl")
-        .args([
-            "enc",
-            "-aes-256-cbc",
-            "-pbkdf2",
-            "-salt",
-            "-in",
-            &zip.to_string_lossy(),
-            "-out",
-            &encrypted.to_string_lossy(),
-            "-pass",
-            "env:STARK_SNAPSHOT_PASSPHRASE",
-        ])
-        .env("STARK_SNAPSHOT_PASSPHRASE", &passphrase)
-        .status();
+    let mut command = std::process::Command::new("openssl");
+    command.args([
+        "enc",
+        "-aes-256-cbc",
+        "-pbkdf2",
+        "-salt",
+        "-in",
+        &zip.to_string_lossy(),
+        "-out",
+        &encrypted.to_string_lossy(),
+        "-pass",
+        "env:STARK_SNAPSHOT_PASSPHRASE",
+    ]);
+    stark_sandbox::secrets::scrub_command(&mut command);
+    command.env("STARK_SNAPSHOT_PASSPHRASE", &passphrase);
+    let status = command.status();
     match status {
         Ok(status) if status.success() => {
             let _ = std::fs::remove_file(&zip);

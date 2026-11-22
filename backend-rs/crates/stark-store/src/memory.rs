@@ -279,9 +279,8 @@ impl MemoryStore {
         )
         .execute(&self.pool)
         .await?;
-        let _ = sqlx::query("ALTER TABLE memory_stage1 ADD COLUMN source TEXT DEFAULT 'turn'")
-            .execute(&self.pool)
-            .await;
+        crate::migrate::ensure_column(&self.pool, "memory_stage1", "source", "TEXT DEFAULT 'turn'")
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS ix_memory_stage1_workspace ON memory_stage1(workspace_id, created_at DESC)",
         )
@@ -335,17 +334,23 @@ impl MemoryStore {
         )
         .execute(&self.pool)
         .await?;
-        let _ = sqlx::query(
-            "ALTER TABLE memory_summary ADD COLUMN source TEXT DEFAULT 'deterministic'",
+        crate::migrate::ensure_column(
+            &self.pool,
+            "memory_summary",
+            "source",
+            "TEXT DEFAULT 'deterministic'",
         )
-        .execute(&self.pool)
-        .await;
-        let _ = sqlx::query("ALTER TABLE memory_summary ADD COLUMN model TEXT DEFAULT ''")
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::query("ALTER TABLE memory_summary ADD COLUMN usage_json TEXT DEFAULT '{}'")
-            .execute(&self.pool)
-            .await;
+        .await?;
+        crate::migrate::ensure_column(&self.pool, "memory_summary", "model", "TEXT DEFAULT ''")
+            .await?;
+        crate::migrate::ensure_column(
+            &self.pool,
+            "memory_summary",
+            "usage_json",
+            "TEXT DEFAULT '{}'",
+        )
+        .await?;
+        crate::migrate::baseline(&self.pool, "memory").await?;
         Ok(())
     }
 
@@ -451,7 +456,7 @@ impl MemoryStore {
     ) -> Result<(), StoreError> {
         let moment = now();
         let summary = truncate_chars(&redact_secrets(summary), max_chars());
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin_immediate(&self.pool).await?;
         for entry in entries {
             let topic = normalize_topic(&entry.topic);
             let kind = normalize_kind(&entry.kind);

@@ -1,13 +1,18 @@
-//! Backend run wiring — `POST /api/run` + SSE stream into transcript rows.
+//! Chat run event contract — command, live feed, and durable log.
 //!
-//! Mirrors `frontend/src/services/api/stream.ts` (`streamPipeline`):
-//! - request body keys: `prompt/model/temperature/workspace_path/workspace_id/
-//!   chat_id/attachments/workspace_kind`.
-//! - SSE framing: `event:` + `data:` lines, blank-line dispatch, trailing
-//!   buffer flush, `delta/state/done/error/warning/turn_aborted` events.
+//! Mirrors `docs/chat-event-contract.md`:
+//! - `POST /api/chats/{chat_id}/run` returns `{accepted, chat_id, run_id,
+//!   after_seq}` (202) or `already_running` (409).
+//! - `GET /api/chats/{chat_id}/events` is the live-only feed; its first frame
+//!   is `server.connected`.
+//! - `GET /api/chats/{chat_id}/log?after=&follow=1` replays durable snapshots
+//!   and ends its replay with `log.synced`.
 //!
-//! The delta fold lives in [`crate::stream_accum`]; this module only routes
-//! frames and owns the live row's lifecycle.
+//! Envelopes are data-only: `{"type":"delta","data":{...}}`. Recorded legacy
+//! streams (`event:` + `data:`) still replay through the same parser.
+//!
+//! The delta fold lives in [`crate::stream_accum`]; this module routes frames
+//! and owns the live row's lifecycle.
 
 use serde_json::Value;
 
@@ -15,7 +20,8 @@ use crate::chats::ChatAttachment;
 use crate::rune_transcript::{RowData, RuneTranscriptState};
 use crate::stream_accum::{Delta, StreamAccum};
 
-/// POST /api/run body. Field names must match `streamPipeline` exactly.
+/// Command body for `POST /api/chats/{chat_id}/run`. The chat id lives in the
+/// path, never in the body.
 #[derive(Debug, Clone)]
 pub struct RunRequest {
     pub prompt: String,
@@ -23,9 +29,8 @@ pub struct RunRequest {
     pub temperature: f64,
     pub workspace_path: String,
     pub workspace_id: String,
-    pub chat_id: String,
     pub workspace_kind: String,
-    /// Uploaded/restored files (`attachments` in `streamPipeline`).
+    /// Uploaded/restored files (`attachments` in the command body).
     pub attachments: Vec<ChatAttachment>,
 }
 
@@ -37,7 +42,6 @@ impl RunRequest {
             "temperature": self.temperature,
             "workspace_path": self.workspace_path,
             "workspace_id": self.workspace_id,
-            "chat_id": self.chat_id,
             "attachments": self.attachments.iter().map(ChatAttachment::to_json).collect::<Vec<_>>(),
             "workspace_kind": self.workspace_kind,
         })
@@ -45,16 +49,65 @@ impl RunRequest {
 }
 
 /// One dispatched SSE frame.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SseFrame {
     pub event: String,
     pub data: Value,
+    /// Durable rollout ordinal or control watermark. Never a live `evt_` id.
+    pub seq: Option<u64>,
+}
+
+impl SseFrame {
+    pub fn new(event: impl Into<String>, data: Value) -> Self {
+        Self {
+            event: event.into(),
+            data,
+            seq: None,
+        }
+    }
+
+    pub fn with_seq(mut self, seq: Option<u64>) -> Self {
+        self.seq = seq;
+        self
+    }
+}
+
+/// Map one durable log event to the UI's snapshot form.
+///
+/// Durable `delta` frames are completed item snapshots, not token deltas.
+/// User/system rows are part of the transcript, not assistant text. Usage is
+/// skipped because `/api/state` already carries the run totals; replaying the
+/// usage deltas would double-count Rune's dock totals.
+pub(crate) fn durable_ui_frame(frame: SseFrame) -> Option<SseFrame> {
+    if frame.event != "delta" {
+        return None;
+    }
+    let role = frame.data.get("role").and_then(Value::as_str).unwrap_or("");
+    if !role.is_empty() && role != "assistant" {
+        return None;
+    }
+    let kind = frame.data.get("kind").and_then(Value::as_str)?.to_string();
+    if kind == "usage" {
+        return None;
+    }
+    let mut data = frame.data;
+    match kind.as_str() {
+        "text" => data["kind"] = Value::String("text_snapshot".to_string()),
+        "reasoning" => data["kind"] = Value::String("reasoning_snapshot".to_string()),
+        "tool_finished" if data.get("text").is_none() => {
+            if let Some(preview) = data.get("preview").and_then(Value::as_str) {
+                data["text"] = Value::String(preview.to_string());
+            }
+        }
+        _ => {}
+    }
+    Some(SseFrame::new("delta", data).with_seq(frame.seq))
 }
 
 /// Parse an SSE byte stream into frames. Tolerates a missing trailing blank
-/// line (flushes the buffer, like `streamPipeline`'s `done` path) and skips
-/// undecodable `data:` lines. Implemented over [`crate::transport::SseDecoder`]
-/// so streaming and one-shot parsing share framing rules.
+/// line and skips undecodable `data:` lines. Implemented over
+/// [`crate::transport::SseDecoder`] so streaming and recorded replay share
+/// framing rules.
 pub fn parse_sse_stream(text: &str) -> Vec<SseFrame> {
     let mut decoder = crate::transport::SseDecoder::new();
     let mut out = Vec::new();
@@ -126,7 +179,7 @@ fn sync_live(row: &mut RowData) {
 pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'static str {
     match frame.event.as_str() {
         // Internal frame from the chat-create step. The real id replaces the
-        // locally minted one before `/api/run` starts.
+        // locally minted one before the run command starts.
         "chat" => {
             let id = frame
                 .data
@@ -158,6 +211,10 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
             }
             "chat"
         }
+        // Control frames belong to the transport/recovery loop. They are not
+        // transcript rows; ignoring them keeps recorded replays harmless.
+        "server.connected" => "connected",
+        "log.synced" => "synced",
         "delta" => {
             // Late frames after the terminal event must not resurrect a
             // finished live row (React's `settled` runs no further UI work).
@@ -165,6 +222,25 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
                 return "ignored";
             }
             let kind = frame.data.get("kind").and_then(Value::as_str).unwrap_or("");
+            if kind == "reset" {
+                if let Some(row) = state.rows.last_mut() {
+                    if let Some(acc) = row.accum.as_mut() {
+                        acc.reset();
+                    }
+                    sync_live(row);
+                }
+                return "reset";
+            }
+            if kind == "text_snapshot" || kind == "reasoning_snapshot" {
+                let delta = Delta::from_value(&frame.data);
+                if let Some(acc) = state.rows.last_mut().and_then(|row| row.accum.as_mut()) {
+                    acc.apply_snapshot(&delta);
+                }
+                if let Some(row) = state.rows.last_mut() {
+                    sync_live(row);
+                }
+                return "snapshot";
+            }
             if kind == "usage" {
                 let u64_of = |key: &str| frame.data.get(key).and_then(Value::as_u64).unwrap_or(0);
                 let input = u64_of("input");
@@ -307,7 +383,8 @@ pub fn apply_frame(state: &mut RuneTranscriptState, frame: &SseFrame) -> &'stati
             crate::rune_transcript::finalize_run(state, Some(msg.to_string()), false);
             "failed"
         }
-        "warning" | "turn_aborted" => "noted",
+        "warning" | "turn_started" | "turn_complete" | "turn_aborted" | "item_started"
+        | "item_completed" => "noted",
         _ => "ignored",
     }
 }
@@ -329,14 +406,13 @@ mod tests {
     }
 
     #[test]
-    fn request_body_matches_stream_pipeline() {
+    fn request_body_matches_the_run_command() {
         let req = RunRequest {
             prompt: "hi".to_string(),
             model: "Automatic Fallback".to_string(),
             temperature: 0.7,
             workspace_path: "D:/x".to_string(),
             workspace_id: "_general".to_string(),
-            chat_id: "c1".to_string(),
             workspace_kind: "general".to_string(),
             attachments: Vec::new(),
         };
@@ -347,12 +423,15 @@ mod tests {
             "temperature",
             "workspace_path",
             "workspace_id",
-            "chat_id",
             "attachments",
             "workspace_kind",
         ] {
             assert!(body.get(key).is_some(), "missing {key}");
         }
+        assert!(
+            body.get("chat_id").is_none(),
+            "chat id belongs in the path, not the body"
+        );
         assert_eq!(body["temperature"], serde_json::json!(0.7));
     }
 
@@ -511,6 +590,79 @@ mod tests {
             body.contains("locked") && body.contains("401"),
             "unexpected body: {body}"
         );
+    }
+
+    #[test]
+    fn durable_rebuild_resets_then_appends_snapshots() {
+        let mut s = state();
+        s.live = true;
+        let statuses = replay(
+            &mut s,
+            "event: delta\ndata: {\"kind\":\"text\",\"text\":\"stale\"}\n\n\
+             event: delta\ndata: {\"kind\":\"reset\"}\n\n\
+             event: delta\ndata: {\"kind\":\"text_snapshot\",\"text\":\"first\"}\n\n\
+             event: delta\ndata: {\"kind\":\"reasoning_snapshot\",\"text\":\"think\"}\n\n\
+             event: delta\ndata: {\"kind\":\"text_snapshot\",\"text\":\" second\"}\n\n",
+        );
+        assert_eq!(
+            statuses,
+            vec!["streaming", "reset", "snapshot", "snapshot", "snapshot"]
+        );
+        let acc = s.rows.last().unwrap().accum.as_ref().unwrap();
+        assert_eq!(acc.text, "first second");
+        assert_eq!(acc.reasoning, "think");
+        // text, reasoning, then text again: order is preserved.
+        assert_eq!(acc.segments.len(), 3);
+    }
+
+    #[test]
+    fn durable_rebuild_skips_user_rows_and_usage() {
+        let user = SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"text","role":"user","text":"hello"}),
+        );
+        assert!(durable_ui_frame(user).is_none());
+
+        let usage = SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"usage","role":"assistant","input":10}),
+        );
+        assert!(durable_ui_frame(usage).is_none());
+
+        let text = SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"text","role":"assistant","text":"answer"}),
+        )
+        .with_seq(Some(7));
+        let mapped = durable_ui_frame(text).unwrap();
+        assert_eq!(mapped.data["kind"], serde_json::json!("text_snapshot"));
+        assert_eq!(mapped.data["text"], serde_json::json!("answer"));
+        assert_eq!(mapped.seq, Some(7));
+
+        let tool = SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"tool_finished","tool":"grep","preview":"found"}),
+        );
+        let mapped = durable_ui_frame(tool).unwrap();
+        assert_eq!(mapped.data["text"], serde_json::json!("found"));
+    }
+
+    #[test]
+    fn control_frames_do_not_touch_the_transcript() {
+        let mut s = state();
+        let before = s.rows.len();
+        assert_eq!(
+            apply_frame(
+                &mut s,
+                &SseFrame::new("server.connected", serde_json::json!({"running":true}))
+            ),
+            "connected"
+        );
+        assert_eq!(
+            apply_frame(&mut s, &SseFrame::new("log.synced", serde_json::json!({}))),
+            "synced"
+        );
+        assert_eq!(s.rows.len(), before);
     }
 
     #[test]

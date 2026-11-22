@@ -153,6 +153,22 @@ pub fn cancel_child_run(chat_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Cancels every delegated child run. Called during server shutdown so child
+/// agents do not keep writing rollouts after the parent has stopped.
+pub fn cancel_all_child_runs() -> usize {
+    let Ok(runs) = child_runs().lock() else {
+        return 0;
+    };
+    for handle in runs.values() {
+        handle.cancel.cancel();
+    }
+    runs.len()
+}
+
+pub fn child_run_count() -> usize {
+    child_runs().lock().map(|runs| runs.len()).unwrap_or(0)
+}
+
 struct ChildRunGuard(String);
 
 impl Drop for ChildRunGuard {
@@ -183,6 +199,17 @@ pub fn cancel_agent_run(agent_id: &str) -> bool {
             true
         })
         .unwrap_or(false)
+}
+
+/// Cancels every durable agent run registered by the scheduler.
+pub fn cancel_all_agent_runs() -> usize {
+    let Ok(cancels) = agent_cancels().lock() else {
+        return 0;
+    };
+    for token in cancels.values() {
+        token.cancel();
+    }
+    cancels.len()
 }
 
 #[derive(Debug, Error)]
@@ -449,7 +476,7 @@ async fn run_agent_inner(
 
     // Canonical trace: one rollout file per chat. Open (or resume) first so
     // every subsequent event is recorded, even when the provider fails.
-    let mut rollout = stark_store::rollout::RolloutWriter::open(
+    let mut rollout = match stark_store::rollout::RolloutWriter::open(
         ctx.store.harness_root(),
         &ctx.chat_id,
         &ctx.workspace_id,
@@ -457,7 +484,19 @@ async fn run_agent_inner(
         &ctx.model,
     )
     .await
-    .ok();
+    {
+        Ok(writer) => Some(writer),
+        // Another writer means the canonical trace would fork or lose
+        // ordinals. Fail the run instead of silently continuing untraced.
+        Err(error @ StoreError::Locked(_)) => return Err(error.into()),
+        Err(error) => {
+            tracing::warn!(
+                "rollout writer unavailable for chat {}: {error}",
+                ctx.chat_id
+            );
+            None
+        }
+    };
     if let Some(writer) = rollout.as_mut() {
         let relative = writer.relative_path(ctx.store.harness_root());
         let _ = ctx

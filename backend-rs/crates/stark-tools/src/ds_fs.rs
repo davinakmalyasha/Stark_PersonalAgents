@@ -565,6 +565,7 @@ async fn try_rg_grep(
         (root, ".".to_string())
     };
     let mut cmd = tokio::process::Command::new("rg");
+    stark_sandbox::secrets::scrub_tokio_command(&mut cmd);
     cmd.arg("--line-number")
         .arg("--no-heading")
         .arg("--hidden")

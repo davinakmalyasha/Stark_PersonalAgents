@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::settings::{UpdatePhase, UpdateState};
 
-/// Default feed. The Rune releases live apart from the Tauri app so
+/// Default feed. The Rune releases have their own repo so
 /// `releases/latest` can never resolve to an NSIS installer for the wrong app.
 pub const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/davinakmalyasha/Stark_Rune_Releases/releases/latest/download/latest-rune.json";

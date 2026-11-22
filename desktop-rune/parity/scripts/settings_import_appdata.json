@@ -1,4 +1,0 @@
-[
-  {"t": 0.6, "type": "tap", "key": "rail-settings", "hold": 0.05},
-  {"t": 1.1, "type": "tap", "key": "settings-import-appdata", "hold": 0.05}
-]

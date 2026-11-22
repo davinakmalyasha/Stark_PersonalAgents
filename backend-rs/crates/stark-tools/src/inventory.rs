@@ -6,11 +6,10 @@
 //! - `IMPLEMENTED` membership -> [`is_implemented`]
 //! - plan-mode write guard -> [`is_plan_write`]
 //! - read-only access guard -> [`is_read_blocked`]
-//! - frontend verb/summary labels -> `tool-labels.json` (generated, see test)
 //!
 //! Adding a tool = add one `ToolMeta` entry here, add the contract JSON
-//! entry, add the `dispatch` arm, regenerate labels. Tests fail loudly if
-//! any of those steps is missed.
+//! entry, and add the `dispatch` arm. Tests fail loudly if any of those steps
+//! is missed.
 
 pub struct ToolMeta {
     pub name: &'static str,
@@ -516,28 +515,6 @@ mod tests {
                 is_program(tool.name),
                 !direct_only.contains(&tool.name),
                 "program flag drift for {}",
-                tool.name
-            );
-        }
-    }
-
-    #[test]
-    fn generated_frontend_labels_match() {
-        let path = format!(
-            "{}/../../../frontend/src/utils/toolLabels.generated.ts",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let text =
-            std::fs::read_to_string(&path).expect("run node backend-rs/specs/generate-labels.mjs");
-        for tool in INVENTORY {
-            assert!(
-                text.contains(&format!("{}: '{}'", tool.name, tool.verb)),
-                "verb drift for {} (regenerate labels)",
-                tool.name
-            );
-            assert!(
-                text.contains(&format!("{}: '{}'", tool.name, tool.summary)),
-                "summary drift for {} (regenerate labels)",
                 tool.name
             );
         }

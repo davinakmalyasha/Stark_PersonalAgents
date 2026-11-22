@@ -1,8 +1,8 @@
 # Stark — Rune UI
 
-Stark's native interface, built with [Rune](https://github.com/anomalyco/rune).
-The React frontend in `../frontend` is the visual and interaction reference;
-it is not a runtime dependency.
+Stark's native and browser interface, built with
+[Rune](https://github.com/anomalyco/rune). This is the only UI; the former
+React/Tauri client has been removed.
 
 This README is context only. It explains the project, the Rune concepts the
 port relies on, and the architecture. The code is the source of truth.
@@ -39,8 +39,6 @@ tree. Layout, paint, animation and input stay inside Rune.
   lifecycle, pending-update application and rollback.
 - `vendor/rune` — pinned Rune fork, excluded from the app workspace.
 - `packaging/` — portable/versioned tree, updater payload and NSIS bootstrap.
-- `parity/` — capture fixtures and scripts used to compare against React.
-  There is intentionally no parity write-up or historical log here.
 
 ## Rune capability map
 
@@ -137,8 +135,8 @@ bundled `stark-server`, starts the UI from `app/<version>`, and applies a
 staged update only after the UI exits. `current.json` is the atomic switch;
 `pending.json` is the handoff; `blocked.json` records a version that failed to
 start. A failed new build rolls back to the previous version automatically.
-The updater feed is a dedicated public Rune release repo, separate from the
-Tauri/NSIS feed. Rune keeps its data in `%LOCALAPPDATA%\StarkRune\data`
+The updater feed is a dedicated public Rune release repo. Rune keeps its data
+in `%LOCALAPPDATA%\StarkRune\data`
 (override with `STARK_HARNESS_ROOT`); use Settings' backup import to adopt an
 existing `D:\StarkData` tree instead of running two servers on one database.
 
@@ -147,8 +145,8 @@ State is plain Rust. `TranscriptHost`, `CanvasHost`, `ProjectsHost`,
 or panel without borrowing the whole app. Handlers capture stable IDs or
 keys, never row indices, because virtual rows and memo reuse can move a row.
 
-React CSS values remain the reference for colors, spacing, radii, type and
-timing. Where CSS names a property Rune does not expose directly, look for a
-behavior primitive in Rune's source first. When the behavior genuinely does
-not exist, keep the closest honest implementation and record the boundary
-here rather than approximating silently.
+The former React CSS values remain the reference for colors, spacing, radii,
+type and timing. Where CSS names a property Rune does not expose directly,
+look for a behavior primitive in Rune's source first. When the behavior
+genuinely does not exist, keep the closest honest implementation and record
+the boundary here rather than approximating silently.

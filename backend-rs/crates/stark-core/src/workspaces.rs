@@ -114,22 +114,22 @@ fn normalize_repo(repo: &str) -> String {
 }
 
 async fn git_clone(repo: &str, branch: Option<&str>, path: &Path) -> Result<(), String> {
+    stark_store::validate_repo_url(repo)?;
     if let Some(parent) = path.parent()
         && let Err(error) = tokio::fs::create_dir_all(parent).await
     {
         return Err(format!("cannot create {}: {error}", parent.display()));
     }
     let mut command = tokio::process::Command::new("git");
-    command
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .env("GIT_TERMINAL_PROMPT", "0");
+    command.arg("clone").arg("--depth").arg("1");
     if let Some(branch) = branch.map(str::trim).filter(|branch| !branch.is_empty()) {
+        stark_store::validate_branch_name(branch)?;
         command.arg("--branch").arg(branch);
     }
     stark_sandbox::secrets::scrub_tokio_command(&mut command);
+    command.env("GIT_TERMINAL_PROMPT", "0");
     let output = command
+        .arg("--")
         .arg(repo)
         .arg(path)
         .output()

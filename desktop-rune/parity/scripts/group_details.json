@@ -1,4 +1,0 @@
-[
-  {"t": 1.2, "type": "tap", "key": "gp-tab-details", "hold": 0.05},
-  {"t": 1.5, "type": "tap", "key": "gp-activity-toggle", "hold": 0.05}
-]

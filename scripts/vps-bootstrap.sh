@@ -10,7 +10,7 @@ echo "==> packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get upgrade -y
-apt-get install -y libasound2t64 fail2ban ufw git curl ca-certificates
+apt-get install -y libasound2t64 fail2ban ufw git curl ca-certificates jq unzip sqlite3
 
 echo "==> timezone"
 timedatectl set-timezone Asia/Jakarta || true

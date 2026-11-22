@@ -1,9 +1,9 @@
-//! Stark byte-identical design tokens, extracted from the frozen React frontend.
+//! Stark byte-identical design tokens, extracted from the former React frontend.
 //!
-//! Sources (do not drift — Rune theme must match these exactly):
-//! - `frontend/src/index.css`      (`:root`, `.premium-surface`, `.send-button`, …)
-//! - `frontend/src/house/house.css` (`.house-root #0a0a0a`, hairlines, dock, cards)
-//! - `frontend/src/canvas/canvas.css` (stage, grid, cards `468x420` / compact `384x392`)
+//! Sources (`:root`, premium surfaces, send button, house and canvas layout):
+//! - index tokens and `.premium-surface` / `.send-button`
+//! - `.house-root`, hairlines, dock and cards
+//! - canvas stage, grid, cards `468x420` / compact `384x392`
 //!
 //! Rune mapping: these become `rune::Theme::from_json` + `rune-kit Kit`
 //! (`Palette/Elevation/Type/Radius/Motion/Glyphs`). No raw literals in app code.

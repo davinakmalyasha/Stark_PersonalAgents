@@ -10,8 +10,8 @@ models/                       shared voice models, not duplicated per version
 updates/                      staged payloads
 ```
 
-Never point Rune at the Tauri `latest.json`. The Tauri workflow publishes an
-NSIS app for `frontend/`; Rune has its own feed and its own release repo.
+Rune has its own feed and its own release repo. There is no legacy desktop
+feed to point at.
 
 ## One-time setup
 

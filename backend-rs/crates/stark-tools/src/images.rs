@@ -1,7 +1,7 @@
 //! Inline image collection for vision-capable runs.
 //!
-//! Chat attachments (uploaded files, voice screen frames) arrive at `/api/run`
-//! as JSON descriptors with a server-side path. This module resolves the image
+//! Chat attachments (uploaded files, voice screen frames) arrive with the run
+//! command as JSON descriptors with a server-side path. This module resolves the image
 //! ones to bytes so the run can send real `image_url` parts instead of path
 //! notes. Reads are containment-checked against caller-supplied roots and
 //! size-capped so a hostile descriptor cannot exfiltrate files or blow up the

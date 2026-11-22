@@ -1,4 +1,4 @@
-//! Port of `frontend/src/utils/streamPresentation.ts`.
+//! Port of the former React stream presentation.
 //!
 //! Splits one stream into the two visual lanes the chat renders: the ordered
 //! activity feed (reasoning, tools, intermediate updates) and the final

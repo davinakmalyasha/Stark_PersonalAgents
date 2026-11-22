@@ -302,7 +302,9 @@ impl GroupStore {
     pub async fn claim_next_ready(&self, project_id: &str) -> Result<Option<Value>, String> {
         let path = self.root.join(project_id);
         let pool = open_pool(&path, false).await?;
-        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut tx = crate::begin_immediate(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
         let active = sqlx::query(
             "UPDATE projects SET updated_at = updated_at WHERE id = ? AND status = 'running'",
         )
@@ -1081,6 +1083,9 @@ async fn init(pool: &SqlitePool) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?;
     }
+    crate::migrate::baseline(pool, "groups")
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 

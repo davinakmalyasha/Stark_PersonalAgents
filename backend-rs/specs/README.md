@@ -58,8 +58,7 @@ PTC/code mode in a separate preset.
 `stark-tools::tool_specs_for_scope_with_access`. Do not add a tool to
 `scope_map.developer` without also adding one `ToolMeta` entry to the
 unified inventory in `stark-tools/src/inventory.rs` and implementing a
-dispatch arm, then regenerating labels with
-`node backend-rs/specs/generate-labels.mjs`.
+dispatch arm.
 
 The Developer surface is documented by the contract itself and the
 `stark-tools` inventory. The old per-tool pages and design docs were deleted;

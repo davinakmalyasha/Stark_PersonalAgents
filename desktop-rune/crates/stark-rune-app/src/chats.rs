@@ -198,7 +198,7 @@ impl ChatAttachment {
         }
     }
 
-    /// Wire shape sent inside the user message metadata and `/api/run`
+    /// Wire shape sent inside the user message metadata and the chat run
     /// (`RunRequest.attachments`). Field order follows the React object.
     pub fn to_json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({

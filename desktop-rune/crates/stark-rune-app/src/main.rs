@@ -1,10 +1,8 @@
-//! `stark-rune`: Stark desktop on Rune (byte-identical rewrite).
+//! `stark-rune`: Stark's native and browser UI on Rune.
 //!
-//! Branch strategy: this crate lives on `rune-rewrite` only. `main` keeps the
-//! frozen Tauri+React `frontend/` until pixel parity is proven via headless
-//! goldens. Nothing here imports `frontend/` — the contract is the backend
-//! HTTP API (`stark-server` on `127.0.0.1:8124`) plus in-process `stark-*`
-//! crates for the future no-bridge build.
+//! The UI talks to the Rust backend over the HTTP API (`stark-server` on
+//! `127.0.0.1:8124`) and uses in-process `stark-*` crates for shared models.
+//! The former React/Tauri client has been removed; this crate is the UI.
 //!
 //! Rune mapping (1:1 when the real `rune` dep is enabled):
 //! - `El` below mirrors `rune`'s element (`key/role/label/checked/focusable`).
@@ -86,7 +84,7 @@ mod voice;
 mod voice_ws;
 
 // ---------------------------------------------------------------------------
-// Backend contract (mirrors `frontend/src/services/api/*` + `types/index.ts`)
+// Backend contract (chat command/events/log and the JSON endpoints below).
 // ---------------------------------------------------------------------------
 
 /// Lucide draws its 2-unit stroke at a 24-unit viewBox and scales it with the
@@ -263,8 +261,9 @@ pub const DEV_API_ORIGIN: &str = "http://127.0.0.1:8124";
 
 /// Frozen route table (subset the Rune UI needs first: transcript/canvas).
 pub const ROUTES: &[(&str, &str)] = &[
-    ("POST", "/api/run"),
-    ("GET", "/api/stream/{chat_id}"),
+    ("POST", "/api/chats/{chat_id}/run"),
+    ("GET", "/api/chats/{chat_id}/events"),
+    ("GET", "/api/chats/{chat_id}/log"),
     ("POST", "/api/abort"),
     ("GET", "/api/runs/active"),
     ("POST", "/api/steer"),
@@ -277,8 +276,21 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("PUT", "/api/ui/state"),
 ];
 
-/// SSE event names (`streamPipeline` in `api/stream.ts`).
-pub const SSE_EVENTS: &[&str] = &["state", "delta", "done", "error", "warning", "turn_aborted"];
+/// SSE event names in the command/live/durable contract.
+pub const SSE_EVENTS: &[&str] = &[
+    "server.connected",
+    "log.synced",
+    "state",
+    "delta",
+    "done",
+    "error",
+    "warning",
+    "item_started",
+    "item_completed",
+    "turn_started",
+    "turn_complete",
+    "turn_aborted",
+];
 
 // ---------------------------------------------------------------------------
 // Minimal Rune-like element tree (swap for `rune::El` when online)
@@ -740,7 +752,6 @@ fn run_cli() {
                 temperature: 0.7,
                 workspace_path: String::new(),
                 workspace_id: "_general".to_string(),
-                chat_id: String::new(),
                 workspace_kind: "general".to_string(),
                 attachments: Vec::new(),
             };
@@ -889,7 +900,7 @@ fn run_cli() {
         }
     }
     if !args.iter().any(|a| a == "--headless") {
-        eprintln!("Stark Rune rewrite (branch `rune-rewrite`). Byte-identical UI lives here; `main` keeps Tauri+React.");
+        eprintln!("Stark Rune UI. Run with --headless or launch the app.");
         print_usage();
         std::process::exit(2);
     }
@@ -1005,14 +1016,16 @@ mod tests {
     fn routes_cover_transcript_contract() {
         let routes: Vec<String> = ROUTES.iter().map(|(m, p)| format!("{m} {p}")).collect();
         for need in [
-            "POST /api/run",
-            "GET /api/stream/{chat_id}",
+            "POST /api/chats/{chat_id}/run",
+            "GET /api/chats/{chat_id}/events",
+            "GET /api/chats/{chat_id}/log",
             "POST /api/steer",
             "GET /api/runs/active",
         ] {
             assert!(routes.iter().any(|r| r == need), "missing {need}");
         }
-        for ev in ["state", "delta", "done"] {
+        assert_eq!(ROUTES.len(), 13, "route table drifted");
+        for ev in ["server.connected", "log.synced", "state", "delta", "done"] {
             assert!(SSE_EVENTS.contains(&ev));
         }
     }

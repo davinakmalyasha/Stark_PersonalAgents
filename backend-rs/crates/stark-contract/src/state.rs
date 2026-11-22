@@ -46,8 +46,6 @@ pub struct AppState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<BTreeMap<String, Vec<PlanItem>>>,
     #[serde(default)]
-    pub antigravity_log: Vec<Value>,
-    #[serde(default)]
     pub live_terminal_log: String,
     #[serde(default)]
     pub selected_model: String,
@@ -85,7 +83,6 @@ impl Default for AppState {
             project_path: String::new(),
             agents_plan: String::new(),
             plan: None,
-            antigravity_log: Vec::new(),
             live_terminal_log: String::new(),
             selected_model: String::new(),
             selected_temp: 0.7,

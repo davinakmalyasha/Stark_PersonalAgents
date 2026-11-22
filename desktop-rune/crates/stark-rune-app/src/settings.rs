@@ -1,4 +1,4 @@
-//! Settings — port of `frontend/src/components/Layout/SettingsModal.tsx`.
+//! Settings — port of the former React Settings modal.
 //!
 //! Contract:
 //! - `GET /api/migration/status` → `{active, candidates:[{id,path,active,
@@ -20,7 +20,7 @@ use std::sync::mpsc;
 
 use rune::{col, row, text, El, TextEdit};
 
-/// Product version shown by Settings (`frontend/src/version.ts`), distinct
+/// Product version shown by Settings, distinct
 /// from the Rune crate version stamped into the binary.
 pub const STARK_VERSION: &str = env!("CARGO_PKG_VERSION");
 

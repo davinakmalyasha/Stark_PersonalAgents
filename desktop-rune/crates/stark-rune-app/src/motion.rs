@@ -1,4 +1,4 @@
-//! Shared CSS timing tokens from `frontend/src/index.css`.
+//! Shared CSS timing tokens from the former React reference.
 //!
 //! Two families live here, because Rune splits what CSS calls a "transition":
 //!

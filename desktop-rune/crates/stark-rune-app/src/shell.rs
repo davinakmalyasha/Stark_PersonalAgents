@@ -51,6 +51,22 @@ fn icon_shape(path: Path, size: f32, color: rune::Color) -> Shape {
         .view_box(24.0, 24.0)
 }
 
+/// Chevron up/down (Lucide 24-box) for the home chat collapse control.
+fn chevron(size: f32, up: bool, color: rune::Color) -> Shape {
+    let path = if up {
+        Path::new()
+            .move_to([18.0, 15.0])
+            .line_to([12.0, 9.0])
+            .line_to([6.0, 15.0])
+    } else {
+        Path::new()
+            .move_to([6.0, 9.0])
+            .line_to([12.0, 15.0])
+            .line_to([18.0, 9.0])
+    };
+    icon_shape(path, size, color)
+}
+
 fn icon_new_chat(size: f32, color: rune::Color) -> Shape {
     // SquarePen: rectangle with an open top-right corner + pen.
     let mut p = Path::new()
@@ -247,6 +263,17 @@ impl Clone for PairingState {
     }
 }
 
+/// Hover-revealed home-card controls. `Live` has no `Debug`, so the shell
+/// keeps it behind a tiny newtype to preserve `ShellState`'s derives.
+#[derive(Clone)]
+pub struct HomeControls(pub rune::Live<f32>);
+
+impl std::fmt::Debug for HomeControls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HomeControls")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellState {
     pub transcript: RuneTranscriptState,
@@ -257,12 +284,19 @@ pub struct ShellState {
     pub memory: MemoryState,
     /// Live chat list + open-tab snapshot (sidebar, cards, history).
     pub chats: crate::chats::ChatsState,
-    /// Global Settings modal (Tauri's modal lives above every chat).
+    /// Global Settings modal; it lives above every chat.
     pub settings: crate::settings::SettingsState,
     pub pairing: PairingState,
     /// Phone drawer. Desktop ignores it; below `md` it is closed until the
     /// bottom nav asks for a panel.
     pub mobile_panel_open: bool,
+    /// Home chat card folded to its prompt dock (`HouseChat` minimize). The
+    /// card is not keyed by chat, so this persists across chat switches like
+    /// React's local `minimized` state.
+    pub home_minimized: bool,
+    /// Hover-revealed collapse control (`HouseChat`'s floating chevron).
+    /// Desktop rests at 0 and fades in with the card; phones keep it visible.
+    pub home_controls: HomeControls,
     /// Transcript whose audio is allowed to keep playing. Virtual rows unmount
     /// freely; switching chats stops the previous thread's clips.
     pub audio_owner: String,
@@ -291,6 +325,8 @@ impl Default for ShellState {
             settings: crate::settings::SettingsState::default(),
             pairing: PairingState::default(),
             mobile_panel_open: false,
+            home_minimized: false,
+            home_controls: HomeControls(rune::Live::new(0.0)),
             audio_owner: "main".to_string(),
             audio_rev: 0,
         }
@@ -891,16 +927,72 @@ fn home_chat_overlay(s: &ShellState, stage_w: f32, stage_h: f32, window_h: f32) 
         .clip_rounded(16.0)
         // CSS borders take layout room; matching that keeps the inner
         // transcript/dock exactly React's 469pt (487 - 2 - 16).
-        .border_layout();
+        .border_layout()
+        .on_hover_change({
+            let controls = s.home_controls.0.clone();
+            move |_: &mut ShellState, inside, tx| {
+                controls.set(if inside { 1.0 } else { 0.0 });
+                tx.live_only();
+            }
+        });
     // `max-h-[74vh]` on the home variant. Empty and message threads both
     // saturate it at this window size; an explicit height (rather than a
     // `max_h` flex guess) is what keeps the scroll viewport from collapsing
-    // inside Rune's auto-height column.
-    let h = (window_h * 0.74).clamp(220.0, (stage_h - 8.0).max(220.0));
-    card = card.h(h);
+    // inside Rune's auto-height column. Folded, the card hugs the dock.
+    let minimized = s.home_minimized;
+    if !minimized {
+        let h = (window_h * 0.74).clamp(220.0, (stage_h - 8.0).max(220.0));
+        card = card.h(h);
+    }
     card = card.child(home_transcript_body::<ShellState>(
-        thread, which, card_w, window_h,
+        thread, which, card_w, window_h, minimized,
     ));
+    // React `HouseChat` home: a floating 28pt chevron at the card's top-right.
+    // It rests hidden on desktop and fades in with the card; phones keep it
+    // visible. The button folds the message area and leaves the prompt dock.
+    let icon_color = if (unsafe { WINDOW_W }) < PANEL_FOLD_W {
+        ink("#71717a")
+    } else {
+        ink("#52525b")
+    };
+    let mut collapse = rune::el()
+        .key("home-chat-collapse")
+        .size(28.0, 28.0)
+        .radius(8.0)
+        .center()
+        .pin(None, Some(6.0), Some(6.0), None)
+        .role("button")
+        .focusable(true)
+        .label(if minimized {
+            "Expand conversation"
+        } else {
+            "Collapse conversation"
+        })
+        .help(if minimized {
+            "Expand conversation"
+        } else {
+            "Collapse conversation"
+        })
+        .hover(rgba(255.0, 255.0, 255.0, 0.08))
+        .focus_ring(1.0, 1.0, rgba(255.0, 255.0, 255.0, 0.5))
+        .on_press_enter(|s: &mut ShellState| {
+            s.home_minimized = !s.home_minimized;
+        })
+        .child(
+            rune::el()
+                .key("home-chat-collapse-icon")
+                .size(14.0, 14.0)
+                .inert()
+                .shape(chevron(14.0, !minimized, icon_color)),
+        );
+    // React's `md:` is the viewport, not the canvas stage; a narrow stage
+    // behind a wide sidebar must not pin the control visible.
+    collapse = if (unsafe { WINDOW_W }) < PANEL_FOLD_W {
+        collapse.opacity(1.0)
+    } else {
+        collapse.live_opacity(s.home_controls.0.smooth(crate::motion::HOVER_SPRING))
+    };
+    card = card.child(collapse);
     Some(
         col()
             .key("home-chat-overlay")
@@ -2724,6 +2816,60 @@ mod tests {
     }
 
     #[test]
+    fn home_chat_collapse_folds_messages_but_keeps_the_dock() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(ShellState::default(), shell_view, (1280.0, 900.0), env);
+        rt.frame(0.0);
+        let open = rt.presented("home-chat-card").expect("home card mounted").0[3];
+        assert!(
+            rt.find("home-chat-collapse").is_some(),
+            "collapse control mounts"
+        );
+        assert!(rt.find("composer-dock").is_some(), "dock starts mounted");
+
+        let (x, y) = rt.find("home-chat-collapse").expect("collapse control");
+        // The control rests at 0 opacity on desktop, like React's hover-only
+        // chevron; hover the card before pressing it.
+        rt.pointer_move(x, y);
+        for _ in 0..8 {
+            rt.frame(1.0 / 60.0);
+        }
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.home_minimized, "control folds the card");
+        let folded = rt.presented("home-chat-card").expect("home card mounted").0[3];
+        assert!(
+            folded < open - 40.0,
+            "folded card hugs the dock: {folded} !< {open}"
+        );
+        assert!(
+            rt.find("composer-dock").is_some(),
+            "prompt dock stays mounted"
+        );
+        assert!(
+            rt.find("transcript-body").is_none(),
+            "message area folds away"
+        );
+
+        let (x, y) = rt.find("home-chat-collapse").expect("collapse control");
+        rt.pointer_move(x, y);
+        for _ in 0..8 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (x, y) = rt.find("home-chat-collapse").expect("collapse control");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(!rt.state.home_minimized, "control expands the card");
+        assert!(rt.find("transcript-body").is_some(), "message area returns");
+    }
+
+    #[test]
     fn phone_layout_hides_the_rail_and_opens_the_drawer_from_bottom_nav() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(ShellState::default(), shell_view, (390.0, 844.0), env);
@@ -3492,10 +3638,10 @@ mod tests {
         let tx = rt.state.transcript.inbox.take();
         let (f_tx, f_rx) = std::sync::mpsc::channel();
         rt.state.transcript.inbox = Some(f_rx);
-        f_tx.send(SseFrame {
-            event: "delta".to_string(),
-            data: serde_json::json!({"kind":"text","text":"42"}),
-        })
+        f_tx.send(SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"text","text":"42"}),
+        ))
         .unwrap();
         drop(f_tx);
         drop(tx);

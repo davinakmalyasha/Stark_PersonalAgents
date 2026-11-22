@@ -1,12 +1,13 @@
-//! Blocking HTTP transport for `POST /api/run` with incremental SSE decode.
+//! Blocking HTTP transport for the chat run event contract.
 //!
 //! `std` only (no async runtime): the Rune UI thread never blocks — the send
-//! handler spawns one thread running [`post_run`], which streams frames into
-//! an `mpsc` channel drained by the `poll` hook before every frame.
+//! handler spawns one thread that posts the command, streams `/events`, and
+//! recovers from `/log`, all into an `mpsc` channel drained by the `poll` hook
+//! before every frame.
 //!
-//! Framing mirrors `frontend/src/services/api/stream.ts`: `event:` + `data:`
-//! lines, blank-line dispatch, trailing-buffer flush. Bodies may be
-//! `Transfer-Encoding: chunked` (axum SSE) or close-delimited.
+//! Envelopes are data-only: `{"type":"delta","data":{...}}`. Legacy recorded
+//! streams (`event:` + `data:`) still parse through the same decoder for
+//! replay tests and the headless inspector.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufRead, BufReader, Read, Write};
@@ -16,11 +17,22 @@ use std::net::TcpStream;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use crate::stream::{infer_event, RunRequest, SseFrame};
+use crate::stream::{infer_event, SseFrame};
+
+/// HTTP status plus parsed JSON body. Command errors keep their body so the
+/// caller can turn a 409 into steering and surface 400/429/503 messages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
 
 /// Incremental SSE decoder over raw bytes. Handles UTF-8 split across chunks
 /// (only complete lines up to the last valid `\n` are processed) and keeps
 /// `event:`/`data:` state across pushes.
+///
+/// Data-only contract envelopes are unwrapped into `event/data/seq`; legacy
+/// `event:`-named frames keep their payload as-is.
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     raw: Vec<u8>,
@@ -62,7 +74,7 @@ impl SseDecoder {
         }
     }
 
-    /// End of stream: flush the trailing buffer like `streamPipeline` does.
+    /// End of stream: flush the trailing buffer.
     pub fn finish(&mut self, out: &mut Vec<SseFrame>) {
         if !self.raw.is_empty() {
             let tail = String::from_utf8_lossy(&self.raw).into_owned();
@@ -85,61 +97,54 @@ impl SseDecoder {
             return;
         }
         let joined = self.data.join("\n");
-        if let Ok(data) = serde_json::from_str(&joined) {
-            let event = if self.event.is_empty() {
-                infer_event(&data)
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&joined) {
+            let is_envelope = payload.get("type").and_then(|v| v.as_str()).is_some()
+                && (payload.get("data").is_some()
+                    || payload.get("durable").is_some()
+                    || payload.get("aggregateID").is_some());
+            let frame = if is_envelope {
+                let event = payload
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let seq = payload
+                    .get("durable")
+                    .and_then(|v| v.get("seq"))
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| {
+                        payload
+                            .get("data")
+                            .and_then(|v| v.get("seq"))
+                            .and_then(|v| v.as_u64())
+                    })
+                    .or_else(|| payload.get("seq").and_then(|v| v.as_u64()));
+                let data = payload
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                SseFrame { event, data, seq }
             } else {
-                std::mem::take(&mut self.event)
+                let event = if self.event.is_empty() {
+                    infer_event(&payload)
+                } else {
+                    std::mem::take(&mut self.event)
+                };
+                SseFrame {
+                    event,
+                    data: payload,
+                    seq: None,
+                }
             };
-            out.push(SseFrame { event, data });
+            out.push(frame);
         }
         self.event.clear();
         self.data.clear();
     }
 }
 
-/// Outcome of [`post_run`]: the terminal `done` status, if the server sent one.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunOutcome {
-    pub status: String,
-}
-
-/// Blocking `POST /api/run`, streaming frames to `on_frame` as they arrive.
-/// Chunked and close-delimited bodies both supported. Errors are strings so
-/// the UI thread can surface them as an `error` frame.
-///
-/// Native only: browsers have no TCP sockets — the web build uses
-/// [`post_run_stream`] over `fetch`.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn post_run(
-    host: &str,
-    port: u16,
-    req: &RunRequest,
-    on_frame: &mut dyn FnMut(SseFrame),
-) -> Result<RunOutcome, String> {
-    let body = req.to_json().to_string();
-    let head = format!(
-        "Content-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\n",
-        body.len()
-    );
-    let (mut reader, chunked) = request(host, port, "POST", "/api/run", &head, body.as_bytes())?;
-    let mut decoder = SseDecoder::new();
-    let mut frames: Vec<SseFrame> = Vec::new();
-    let mut outcome = RunOutcome {
-        status: "unknown".to_string(),
-    };
-    for bytes in read_body(&mut reader, chunked)? {
-        decoder.push(&bytes, &mut frames);
-        drain(&mut frames, &mut outcome, on_frame);
-    }
-    decoder.finish(&mut frames);
-    drain(&mut frames, &mut outcome, on_frame);
-    Ok(outcome)
-}
-
 /// Blocking `GET` returning a JSON body. Used for status endpoints
-/// (`/api/runs/active`, `/api/cloud/status`). Native only (see `post_run`).
+/// (`/api/runs/active`, `/api/cloud/status`). Native only.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, String> {
     let (mut reader, chunked) =
@@ -149,6 +154,57 @@ pub fn get_json(host: &str, port: u16, path: &str) -> Result<serde_json::Value, 
         raw.extend_from_slice(&bytes);
     }
     serde_json::from_slice(&raw).map_err(|e| format!("json: {e}"))
+}
+
+/// Blocking JSON write preserving the HTTP status and error body. The chat
+/// command returns 202 and a 409 body the caller needs for steering.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn post_json_status(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<JsonResponse, String> {
+    let raw_body = body.to_string();
+    let head = format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\nAccept: application/json\r\n",
+        raw_body.len()
+    );
+    let mut raw = open_response(host, port, "POST", path, &head, raw_body.as_bytes())?;
+    if raw.status == 401 {
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    let mut bytes = Vec::new();
+    for piece in read_body(&mut raw.reader, raw.chunked)? {
+        bytes.extend_from_slice(&piece);
+    }
+    let body = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        })
+    };
+    Ok(JsonResponse {
+        status: raw.status,
+        body,
+    })
+}
+
+/// Blocking `POST /api/steer {chat_id, message}`. Used only when the command
+/// reports the chat is already running, so a stale client never drops a
+/// prompt or starts a second run.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn post_steer(host: &str, port: u16, chat_id: &str, message: &str) -> bool {
+    let body = serde_json::json!({"chat_id": chat_id, "message": message});
+    match post_json_status(host, port, "/api/steer", &body) {
+        Ok(response) if response.status == 200 => response
+            .body
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Blocking JSON write (`POST`/`PATCH`/`PUT`/`DELETE`) returning the parsed
@@ -262,11 +318,9 @@ pub async fn create_chat_wasm(workspace_id: &str, title: &str) -> Result<String,
         .ok_or_else(|| "create chat: missing id".to_string())
 }
 
-/// Blocking `POST /api/abort {chat_id}` — mirrors `abortRun`
-/// (`stream.ts`): tells the backend to actually cancel the run (inbox abort +
-/// pydantic-ai token), not just detach this client. Fire-and-forget from Stop
-/// handlers; the response body is a bare `{ok}`. Empty `chat_id` is a no-op
-/// (`false`), like the React guard. Native only.
+/// Blocking `POST /api/abort {chat_id}`: tells the backend to actually cancel
+/// the run, not just detach this client. Fire-and-forget from Stop handlers;
+/// the response body is a bare `{ok}`. Empty `chat_id` is a no-op. Native only.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn post_abort(host: &str, port: u16, chat_id: &str) -> bool {
     if chat_id.trim().is_empty() {
@@ -1008,40 +1062,81 @@ pub fn spawn_web_upload(pick: WebPick, workspace_id: String, chat_id: String, ti
     });
 }
 
-/// Web `POST /api/run` with ReadableStream SSE decode — the browser twin of
-/// native [`post_run`]. Frames stream into `emit` as they arrive; the shared
-/// `SseDecoder` keeps framing rules identical on both targets.
+/// Web JSON write preserving the HTTP status and error body.
 #[cfg(target_arch = "wasm32")]
-pub async fn post_run_stream(req: &RunRequest, emit: &mut dyn FnMut(SseFrame)) {
-    let outcome = post_run_stream_inner(req, emit).await;
-    if let Err(message) = outcome {
-        emit(SseFrame {
-            event: "error".to_string(),
-            data: serde_json::json!({"message": message}),
-        });
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn post_run_stream_inner(
-    req: &RunRequest,
-    emit: &mut dyn FnMut(SseFrame),
-) -> Result<String, String> {
+pub async fn fetch_send_status(
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<JsonResponse, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-    let url = api_url("/api/run");
-    let body = req.to_json().to_string();
+    let url = api_url(path);
     let window = web_sys::window().ok_or("no window")?;
     let init = web_sys::RequestInit::new();
-    init.set_method("POST");
+    init.set_method(method);
     init.set_mode(web_sys::RequestMode::Cors);
-    init.set_body(&wasm_bindgen::JsValue::from_str(&body));
+    if let Some(body) = body {
+        init.set_body(&wasm_bindgen::JsValue::from_str(&body.to_string()));
+    }
     init.set_headers(&auth_headers(true)?.into());
     let request = web_sys::Request::new_with_str_and_init(&url, &init)
         .map_err(|e| format!("request: {e:?}"))?;
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await
-        .map_err(|e| format!("fetch: {e:?}"))?;
+        .map_err(|e| format!("fetch {path}: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("response: {e:?}"))?;
+    let status = resp.status();
+    if status == 401 {
+        mark_auth_rejected();
+        return Err("HTTP 401 Unauthorized".to_string());
+    }
+    let text = JsFuture::from(resp.text().map_err(|e| format!("body: {e:?}"))?)
+        .await
+        .map_err(|e| format!("body: {e:?}"))?
+        .as_string()
+        .unwrap_or_default();
+    let body = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::Value::String(text.clone()))
+    };
+    Ok(JsonResponse { status, body })
+}
+
+/// Web `POST /api/steer {chat_id, message}`.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_steer(chat_id: &str, message: &str) -> bool {
+    let body = serde_json::json!({"chat_id": chat_id, "message": message});
+    match fetch_send_status("POST", "/api/steer", Some(&body)).await {
+        Ok(response) if response.status == 200 => response
+            .body
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Open a browser SSE response. Non-2xx failures are errors; 401 marks the
+/// pairing gate.
+#[cfg(target_arch = "wasm32")]
+pub async fn open_sse(path: &str) -> Result<web_sys::Response, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let url = api_url(path);
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+    init.set_mode(web_sys::RequestMode::Cors);
+    init.set_headers(&auth_headers(false)?.into());
+    let request = web_sys::Request::new_with_str_and_init(&url, &init)
+        .map_err(|e| format!("request: {e:?}"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch {path}: {e:?}"))?;
     let resp: web_sys::Response = resp_value
         .dyn_into()
         .map_err(|e| format!("response: {e:?}"))?;
@@ -1052,6 +1147,18 @@ async fn post_run_stream_inner(
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
     }
+    Ok(resp)
+}
+
+/// Decode an open SSE response. `on_frame` returning false stops the read and
+/// cancels the stream.
+#[cfg(target_arch = "wasm32")]
+pub async fn read_sse(
+    resp: web_sys::Response,
+    on_frame: &mut dyn FnMut(SseFrame) -> bool,
+) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
     let stream = resp.body().ok_or("no body")?;
     let reader = stream
         .get_reader()
@@ -1059,7 +1166,6 @@ async fn post_run_stream_inner(
         .map_err(|e| format!("reader: {e:?}"))?;
     let mut decoder = SseDecoder::new();
     let mut frames = Vec::new();
-    let mut status = "unknown".to_string();
     loop {
         let chunk = JsFuture::from(reader.read())
             .await
@@ -1076,19 +1182,19 @@ async fn post_run_stream_inner(
         let bytes = js_sys::Uint8Array::from(value).to_vec();
         decoder.push(&bytes, &mut frames);
         for frame in frames.drain(..) {
-            if frame.event == "done" {
-                if let Some(s) = frame.data.get("status").and_then(|v| v.as_str()) {
-                    status = s.to_string();
-                }
+            if !on_frame(frame) {
+                let _ = JsFuture::from(reader.cancel()).await;
+                return Ok(());
             }
-            emit(frame);
         }
     }
     decoder.finish(&mut frames);
     for frame in frames.drain(..) {
-        emit(frame);
+        if !on_frame(frame) {
+            break;
+        }
     }
-    Ok(status)
+    Ok(())
 }
 
 /// A downloaded file: body bytes plus the server's `Content-Disposition`
@@ -1101,7 +1207,7 @@ pub struct Download {
 }
 
 /// Blocking `GET` returning raw bytes and the attachment filename. Used by
-/// Settings' backup export; native only (see `post_run`).
+/// Settings' backup export; native only.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn download_file(host: &str, port: u16, path: &str) -> Result<Download, String> {
     let (mut reader, chunked, headers) =
@@ -1198,7 +1304,16 @@ fn request(
 #[cfg(not(target_arch = "wasm32"))]
 type ResponseHeaders = Vec<(String, String)>;
 
-/// [`request`] plus the response headers.
+#[cfg(not(target_arch = "wasm32"))]
+struct RawResponse {
+    reader: BufReader<TcpStream>,
+    chunked: bool,
+    headers: ResponseHeaders,
+    status: u16,
+}
+
+/// [`request`] plus the response headers. Existing callers keep the 200-only
+/// contract; command/steer paths use [`open_response`] directly.
 #[cfg(not(target_arch = "wasm32"))]
 fn request_with_headers(
     host: &str,
@@ -1208,6 +1323,24 @@ fn request_with_headers(
     headers: &str,
     body: &[u8],
 ) -> Result<(BufReader<TcpStream>, bool, ResponseHeaders), String> {
+    let raw = open_response(host, port, method, path, headers, body)?;
+    if raw.status != 200 {
+        return Err(format!("HTTP {}", raw.status));
+    }
+    Ok((raw.reader, raw.chunked, raw.headers))
+}
+
+/// Open a connection and parse the status line and headers, without rejecting
+/// a non-200 status.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_response(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> Result<RawResponse, String> {
     let addr = format!("{host}:{port}");
     let mut sock = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_secs(120)))
@@ -1220,13 +1353,15 @@ fn request_with_headers(
         .map_err(|e| format!("write: {e}"))?;
     sock.write_all(body).map_err(|e| format!("write: {e}"))?;
     let mut reader = BufReader::new(sock);
-    let mut status = String::new();
+    let mut status_line = String::new();
     reader
-        .read_line(&mut status)
+        .read_line(&mut status_line)
         .map_err(|e| format!("status: {e}"))?;
-    if !status.contains("200") {
-        return Err(format!("HTTP {}", status.trim()));
-    }
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| format!("bad status line {status_line:?}"))?;
     let mut chunked = false;
     let mut headers_out = Vec::new();
     loop {
@@ -1247,7 +1382,12 @@ fn request_with_headers(
             headers_out.push((name, value));
         }
     }
-    Ok((reader, chunked, headers_out))
+    Ok(RawResponse {
+        reader,
+        chunked,
+        headers: headers_out,
+        status,
+    })
 }
 
 /// Read one body as pieces (streaming-friendly): chunk frames when chunked,
@@ -1289,16 +1429,84 @@ fn read_body(reader: &mut BufReader<TcpStream>, chunked: bool) -> Result<Vec<Vec
     Ok(pieces)
 }
 
+/// Blocking `GET` SSE reader. Frames are delivered as soon as their chunk
+/// arrives; `on_frame` returning false stops reading and drops the socket.
 #[cfg(not(target_arch = "wasm32"))]
-fn drain(frames: &mut Vec<SseFrame>, outcome: &mut RunOutcome, on_frame: &mut dyn FnMut(SseFrame)) {
-    for frame in frames.drain(..) {
-        if frame.event == "done" {
-            if let Some(status) = frame.data.get("status").and_then(|v| v.as_str()) {
-                outcome.status = status.to_string();
+pub fn get_sse(
+    host: &str,
+    port: u16,
+    path: &str,
+    on_frame: &mut dyn FnMut(SseFrame) -> bool,
+) -> Result<(), String> {
+    let (mut reader, chunked) = request(
+        host,
+        port,
+        "GET",
+        path,
+        "Accept: text/event-stream\r\n",
+        &[],
+    )?;
+    read_sse(&mut reader, chunked, on_frame)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_sse(
+    reader: &mut BufReader<TcpStream>,
+    chunked: bool,
+    on_frame: &mut dyn FnMut(SseFrame) -> bool,
+) -> Result<(), String> {
+    let mut decoder = SseDecoder::new();
+    let mut frames = Vec::new();
+    if chunked {
+        loop {
+            let mut size_line = String::new();
+            reader
+                .read_line(&mut size_line)
+                .map_err(|e| format!("chunk size: {e}"))?;
+            let size = u64::from_str_radix(size_line.trim(), 16)
+                .map_err(|_| format!("bad chunk size {size_line:?}"))?;
+            if size == 0 {
+                break;
+            }
+            let mut chunk = vec![0u8; size as usize];
+            reader
+                .read_exact(&mut chunk)
+                .map_err(|e| format!("chunk: {e}"))?;
+            let mut crlf = [0u8; 2];
+            reader
+                .read_exact(&mut crlf)
+                .map_err(|e| format!("chunk end: {e}"))?;
+            decoder.push(&chunk, &mut frames);
+            if !deliver_frames(&mut frames, on_frame) {
+                return Ok(());
             }
         }
-        on_frame(frame);
+    } else {
+        loop {
+            let mut buf = [0u8; 8192];
+            let n = reader.read(&mut buf).map_err(|e| format!("body: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            decoder.push(&buf[..n], &mut frames);
+            if !deliver_frames(&mut frames, on_frame) {
+                return Ok(());
+            }
+        }
     }
+    decoder.finish(&mut frames);
+    let _ = deliver_frames(&mut frames, on_frame);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn deliver_frames(frames: &mut Vec<SseFrame>, on_frame: &mut dyn FnMut(SseFrame) -> bool) -> bool {
+    for frame in frames.drain(..) {
+        if !on_frame(frame) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1494,48 +1702,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Full client↔server round trip over a real socket with chunked SSE.
     #[test]
-    fn post_run_streams_chunked_sse() {
+    fn decoder_unwraps_contract_envelopes_and_durable_seq() {
+        let stream = concat!(
+            "data: {\"id\":\"evt_1\",\"type\":\"server.connected\",\"data\":{\"chat_id\":\"c1\",\"running\":true,\"seq\":4}}\n\n",
+            "data: {\"id\":\"evt_c_6\",\"type\":\"delta\",\"durable\":{\"aggregateID\":\"c1\",\"seq\":6,\"version\":1},\"data\":{\"kind\":\"text\",\"role\":\"assistant\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"log.synced\",\"aggregateID\":\"c1\",\"seq\":6}\n\n"
+        );
+        let frames = crate::stream::parse_sse_stream(stream);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].event, "server.connected");
+        assert_eq!(frames[0].seq, Some(4));
+        assert_eq!(frames[0].data["running"], serde_json::json!(true));
+        assert_eq!(frames[1].event, "delta");
+        assert_eq!(frames[1].seq, Some(6));
+        assert_eq!(frames[1].data["text"], serde_json::json!("hi"));
+        assert_eq!(frames[2].event, "log.synced");
+        assert_eq!(frames[2].seq, Some(6));
+    }
+
+    fn read_json_request(reader: &mut BufReader<TcpStream>) -> (String, String) {
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut content_len = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("Content-Length:") {
+                content_len = v.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0u8; content_len];
+        reader.read_exact(&mut body).unwrap();
+        (request_line, String::from_utf8(body).unwrap())
+    }
+
+    /// Command 202, then a live `/events` feed over one real socket each.
+    #[test]
+    fn command_then_events_streams_chunked_sse() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            // Read headers + exact body.
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let (request_line, body) = read_json_request(&mut reader);
+            assert!(
+                request_line.starts_with("POST /api/chats/c1/run "),
+                "{request_line}"
+            );
+            assert!(body.contains("\"workspace_kind\":\"general\""), "{body}");
+            assert!(!body.contains("\"chat_id\""), "{body}");
+            let json = r#"{"accepted":true,"chat_id":"c1","run_id":"run-1","after_seq":5}"#;
+            let reply = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+            drop(reader);
+            drop(sock);
+
+            let (mut sock, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(sock.try_clone().unwrap());
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
-            let mut content_len = 0usize;
+            assert!(
+                request_line.starts_with("GET /api/chats/c1/events "),
+                "{request_line}"
+            );
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if line.trim().is_empty() {
                     break;
                 }
-                if let Some(v) = line.strip_prefix("Content-Length:") {
-                    content_len = v.trim().parse().unwrap();
-                }
             }
-            let mut body = vec![0u8; content_len];
-            reader.read_exact(&mut body).unwrap();
-            let sent = String::from_utf8(body).unwrap();
-            assert!(request_line.starts_with("POST /api/run "), "{request_line}");
-            assert!(sent.contains("\"workspace_kind\":\"general\""), "{sent}");
             // Chunked SSE, deliberately fragmented: one logical line split
             // across two chunks to prove incremental decode.
             let parts: &[&[u8]] = &[
-                b"event: delta\r\ndata: {\"kind\":\"text\",\"text\":\"hel",
-                b"lo\"}\r\n\r\nevent: done\r\ndata: {\"status\":\"ok\"}\r\n\r\n",
+                b"data: {\"type\":\"server.connected\",\"data\":{\"chat_id\":\"c1\",\"running\":true,\"seq\":5}}\n\n",
+                b"data: {\"type\":\"delta\",\"data\":{\"kind\":\"text\",\"text\":\"hel",
+                b"lo\"}}\n\ndata: {\"type\":\"done\",\"data\":{\"status\":\"ok\"}}\n\n",
             ];
-            let mut head =
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
-                    .to_vec();
-            sock.write_all(&head).unwrap();
-            head.clear();
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
             for part in parts {
                 sock.write_all(format!("{:x}\r\n", part.len()).as_bytes())
                     .unwrap();
-                // Split the write itself to fragment TCP segments.
                 let mid = part.len() / 2;
                 sock.write_all(&part[..mid]).unwrap();
                 sock.write_all(&part[mid..]).unwrap();
@@ -1544,22 +1802,80 @@ mod tests {
             sock.write_all(b"0\r\n\r\n").unwrap();
         });
 
-        let req = RunRequest {
+        let req = crate::stream::RunRequest {
             prompt: "hi".to_string(),
             model: "m".to_string(),
             temperature: 0.7,
             workspace_path: String::new(),
             workspace_id: "_general".to_string(),
-            chat_id: "c1".to_string(),
             workspace_kind: "general".to_string(),
             attachments: Vec::new(),
         };
-        let mut got: Vec<SseFrame> = Vec::new();
-        let outcome = post_run("127.0.0.1", port, &req, &mut |f| got.push(f)).unwrap();
+        let command =
+            post_json_status("127.0.0.1", port, "/api/chats/c1/run", &req.to_json()).unwrap();
+        assert_eq!(command.status, 202);
+        assert_eq!(command.body["after_seq"], serde_json::json!(5));
+
+        let mut got = Vec::new();
+        get_sse("127.0.0.1", port, "/api/chats/c1/events", &mut |frame| {
+            let terminal = frame.event == "done";
+            got.push(frame);
+            !terminal
+        })
+        .unwrap();
         server.join().unwrap();
-        assert_eq!(outcome.status, "ok");
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].data["text"], serde_json::json!("hello"));
-        assert_eq!(got[1].event, "done");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].event, "server.connected");
+        assert_eq!(got[1].data["text"], serde_json::json!("hello"));
+        assert_eq!(got[2].event, "done");
+    }
+
+    /// A 409 keeps its body so the caller can steer instead of dropping the
+    /// prompt or starting a second run.
+    #[test]
+    fn conflict_body_reaches_steering() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let (request_line, _) = read_json_request(&mut reader);
+            assert!(
+                request_line.starts_with("POST /api/chats/c1/run "),
+                "{request_line}"
+            );
+            let json = r#"{"error":"This chat already has a running agent.","code":"already_running","chat_id":"c1","run_id":"run-1","current_seq":9}"#;
+            let reply = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+            drop(reader);
+            drop(sock);
+
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let (request_line, body) = read_json_request(&mut reader);
+            assert!(
+                request_line.starts_with("POST /api/steer "),
+                "{request_line}"
+            );
+            assert!(body.contains("\"message\":\"hello\""), "{body}");
+            let json = r#"{"ok":true}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+
+        let body = serde_json::json!({"prompt":"hello"});
+        let response = post_json_status("127.0.0.1", port, "/api/chats/c1/run", &body).unwrap();
+        assert_eq!(response.status, 409);
+        assert_eq!(response.body["current_seq"], serde_json::json!(9));
+        assert!(post_steer("127.0.0.1", port, "c1", "hello"));
+        server.join().unwrap();
     }
 }

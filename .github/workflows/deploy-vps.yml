@@ -1,9 +1,9 @@
 # Push to master -> build-linux succeeds -> deploy the same artifact to the VPS.
 #
 # The VPS never compiles. This workflow only ships the artifact `build-linux`
-# produced for that exact commit, waits for the validation workflows on the
+# produced for that exact commit, waits for the Rust validation workflow on the
 # same commit, then runs the drain-safe deploy script (health check + automatic
-# rollback). App access stays tailnet-only; this uses key-only public SSH.
+# rollback). API access stays tailnet-only; this uses key-only public SSH.
 #
 # Required repository secrets:
 #   VPS_SSH_KEY        private key whose public half is in /root/.ssh/authorized_keys
@@ -72,16 +72,14 @@ jobs:
           SHA: ${{ steps.build.outputs.sha }}
         run: |
           set -euo pipefail
-          # deploy-vps and release are not validation gates.
-          filter='[.[] | select(.name != "deploy-vps" and .name != "release")]'
+          # deploy-vps is not a validation gate.
+          filter='[.[] | select(.name != "deploy-vps")]'
 
           # Path-filtered workflows only exist when their paths changed.
           files="$(gh api "repos/$REPO/commits/$SHA" --jq '.files[].filename')"
           need_rust=false
-          need_front=false
           grep -q '^backend-rs/' <<<"$files" && need_rust=true || true
-          grep -q '^frontend/' <<<"$files" && need_front=true || true
-          echo "required validation: rust=$need_rust frontend=$need_front"
+          echo "required validation: rust=$need_rust"
 
           for attempt in $(seq 1 60); do
             runs="$(gh run list --repo "$REPO" --commit "$SHA" --limit 50 \
@@ -97,15 +95,13 @@ jobs:
             fi
 
             rust_ok="$(jq '[.[] | select(.name == "rust-validate" and .conclusion == "success")] | length' <<<"$runs")"
-            front_ok="$(jq '[.[] | select(.name == "frontend" and .conclusion == "success")] | length' <<<"$runs")"
             ok=true
             [ "$need_rust" = "true" ] && [ "$rust_ok" = "0" ] && ok=false
-            [ "$need_front" = "true" ] && [ "$front_ok" = "0" ] && ok=false
             if [ "$ok" = "true" ]; then
               echo "validation green for $SHA"
               exit 0
             fi
-            echo "waiting for validation ($attempt/60, rust=$rust_ok frontend=$front_ok)"
+            echo "waiting for validation ($attempt/60, rust=$rust_ok)"
             sleep 15
           done
           echo "::error::timed out waiting for validation of $SHA"

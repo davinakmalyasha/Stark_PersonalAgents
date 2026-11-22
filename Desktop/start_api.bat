@@ -38,4 +38,3 @@ echo   Starting stark-server (logs in .deep_agents\api_out.log) ...
 start "Stark-API" /D "%ROOT%" cmd /c "set STARK_PORT=%STARK_PORT% && ""%SERVER_BIN%"" >> ""%ROOT%\.deep_agents\api_out.log"" 2>> ""%ROOT%\.deep_agents\api_err.log"""
 
 echo   Done. Check http://127.0.0.1:%STARK_PORT%/api/health for engine status.
-echo   (Frontend changes: just refresh the browser / reopen the voice overlay)

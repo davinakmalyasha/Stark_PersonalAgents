@@ -1,10 +1,10 @@
 # Fast-forward the laptop checkout to master.
 #
 #   pwsh scripts/sync-local.ps1              # pull only
-#   pwsh scripts/sync-local.ps1 -Build       # pull + build server and frontend
+#   pwsh scripts/sync-local.ps1 -Build       # pull + build the Rust server
 #
-# The installed desktop app updates itself from signed releases; this is for
-# the development checkout. It never merges or stashes: a dirty tree stops it.
+# Rune updates itself from its signed release feed; this is for the
+# development checkout. It never merges or stashes: a dirty tree stops it.
 param(
   [string] $Remote = "origin",
   [string] $Branch = "master",
@@ -28,13 +28,6 @@ try {
       if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     } finally { Pop-Location }
 
-    Push-Location (Join-Path $root "frontend")
-    try {
-      if (Test-Path "package-lock.json") { npm ci } else { npm install }
-      if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
-      npm run build
-      if ($LASTEXITCODE -ne 0) { throw "frontend build failed" }
-    } finally { Pop-Location }
   }
   Write-Host "==> synced to $(git rev-parse --short HEAD)"
 } finally {

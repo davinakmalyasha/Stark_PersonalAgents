@@ -3,7 +3,7 @@
 #
 #   bash deploy-vps.sh /root/stark-linux-x86_64.tar.gz [git-sha]
 #
-# Layout: /opt/stark/releases/<stamp>/{stark-server,frontend,REVISION}
+# Layout: /opt/stark/releases/<stamp>/{stark-server,REVISION}
 #         /opt/stark/current -> releases/<stamp>
 # Rollback keeps /opt/stark/previous pointing at the last healthy release.
 #
@@ -50,13 +50,9 @@ flock -w 600 9 || { echo "!! another deploy holds $LOCK"; exit 1; }
 echo "==> extract ($REVISION)"
 tar -xzf "$ARCHIVE" -C "$WORK"
 test -f "$WORK/opt/stark/stark-server"
-test -f "$WORK/opt/stark-frontend/index.html" \
-  || test -f "$WORK/opt/stark-frontend/index.htm" \
-  || { echo "!! archive has no frontend"; exit 1; }
 
 mkdir -p "$RELEASES/$STAMP"
 mv "$WORK/opt/stark/stark-server" "$RELEASES/$STAMP/stark-server"
-mv "$WORK/opt/stark-frontend" "$RELEASES/$STAMP/frontend"
 printf '%s\n' "$REVISION" > "$RELEASES/$STAMP/REVISION"
 chmod +x "$RELEASES/$STAMP/stark-server"
 chown -R stark:stark "$RELEASES/$STAMP"
@@ -88,7 +84,6 @@ if [ ! -f /etc/stark/stark.env ]; then
   mkdir -p /etc/stark
   cat > /etc/stark/stark.env <<'EOF'
 STARK_HARNESS_ROOT=/var/lib/stark-data
-STARK_FRONTEND_DIST=/opt/stark/current/frontend
 STARK_HOST=0.0.0.0
 STARK_PORT=8123
 STARK_MAX_CONCURRENT_RUNS=10
@@ -96,8 +91,7 @@ RUST_LOG=stark_server=info,tower_http=info
 EOF
   chown stark:stark /etc/stark/stark.env
 fi
-sed -i "s#^STARK_FRONTEND_DIST=.*#STARK_FRONTEND_DIST=/opt/stark/current/frontend#" /etc/stark/stark.env || true
-grep -q '^STARK_FRONTEND_DIST=' /etc/stark/stark.env || echo 'STARK_FRONTEND_DIST=/opt/stark/current/frontend' >> /etc/stark/stark.env
+sed -i '/^STARK_FRONTEND_DIST=/d' /etc/stark/stark.env || true
 systemctl daemon-reload
 
 echo "==> drain (refuse new runs, wait for active ones)"

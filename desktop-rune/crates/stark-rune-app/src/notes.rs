@@ -23,7 +23,7 @@ fn ink(hex: &'static str) -> rune::Color {
 
 /// Wall-clock millis. `SystemTime` panics on wasm32-unknown-unknown (no OS
 /// clock), so `clock` reads `Date.now()` there instead. `STARK_PARITY_NOW`
-/// freezes it for the parity rig.
+/// freezes it for deterministic tests.
 pub fn now_millis() -> u64 {
     crate::clock::now_millis()
 }

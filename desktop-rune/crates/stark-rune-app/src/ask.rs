@@ -1,7 +1,7 @@
 //! Inline `ask_user_question` panel — port of `AskQuestionPanel.tsx` +
 //! `usePendingAsk.ts` (via `askDock.css`).
 //!
-//! Contract (verified against `frontend/src/services/api/stream.ts` and
+//! Contract (verified against the backend ask endpoints and
 //! `backend-rs/crates/stark-tools/src/questions.rs`):
 //! - `GET /api/ask/pending` → `{batches:[{batch_id,chat_id,questions,created}]}`,
 //!   polled every 1.5s while the chat is on screen.

@@ -4,7 +4,7 @@
 //!
 //! The browser keeps its mic only for VAD/barge-in; the actual audio is captured here with
 //! `cpal` and fed to Moonshine's native streaming API. This mirrors the Python `MicTranscriber`
-//! lifecycle used by `voice.html`: start, mute, peek, flush, stop.
+//! lifecycle used by the voice overlay: start, mute, peek, flush, stop.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};

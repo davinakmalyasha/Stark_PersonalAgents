@@ -16,30 +16,20 @@ if [[ "$SRC" == *.enc ]]; then
   SRC="$PLAIN"
 fi
 
-python3 - "$SRC" "$WORK" <<'PY'
-import json, sqlite3, sys, zipfile, pathlib
-archive, out = sys.argv[1], pathlib.Path(sys.argv[2])
-with zipfile.ZipFile(archive) as z:
-    names = z.namelist()
-    assert "manifest.json" in names, "missing manifest.json"
-    manifest = json.loads(z.read("manifest.json"))
-    assert manifest.get("app") == "stark", f"not a Stark backup: {manifest}"
-    assert ".deep_agents/chats.db" in names, "missing chats.db"
-    db_dir = out / "db"
-    db_dir.mkdir()
-    for name in names:
-        if name.endswith("chats.db"):
-            (db_dir / "chats.db").write_bytes(z.read(name))
-    chats = sqlite3.connect(db_dir / "chats.db")
-    total = chats.execute("select count(*) from chats").fetchone()[0]
-    tables = chats.execute(
-        "select count(*) from sqlite_master where type='table'"
-    ).fetchone()[0]
-    print(f"manifest: app={manifest['app']} format={manifest.get('format')} "
-          f"exported={manifest.get('exported_at')}")
-    print(f"projects root at export: {manifest.get('projects_root')}")
-    print(f"database: {total} chat(s), {tables} table(s) — integrity:", end=" ")
-    print(chats.execute("pragma integrity_check").fetchone()[0])
-PY
+unzip -Z1 "$SRC" | grep -qx 'manifest.json' || { echo "missing manifest.json"; exit 1; }
+manifest="$(unzip -p "$SRC" manifest.json)"
+app="$(jq -r '.app // empty' <<<"$manifest")"
+[ "$app" = "stark" ] || { echo "not a Stark backup: $manifest"; exit 1; }
+unzip -Z1 "$SRC" | grep -qx '.deep_agents/chats.db' || { echo "missing chats.db"; exit 1; }
+
+mkdir -p "$WORK/db"
+unzip -p "$SRC" .deep_agents/chats.db > "$WORK/db/chats.db"
+total="$(sqlite3 "$WORK/db/chats.db" 'select count(*) from chats;')"
+tables="$(sqlite3 "$WORK/db/chats.db" "select count(*) from sqlite_master where type='table';")"
+integrity="$(sqlite3 "$WORK/db/chats.db" 'pragma integrity_check;')"
+
+echo "manifest: app=$app format=$(jq -r '.format // empty' <<<"$manifest") exported=$(jq -r '.exported_at // empty' <<<"$manifest")"
+echo "projects root at export: $(jq -r '.projects_root // empty' <<<"$manifest")"
+echo "database: $total chat(s), $tables table(s) — integrity: $integrity"
 
 echo "restore drill OK"

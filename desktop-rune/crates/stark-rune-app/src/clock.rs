@@ -1,7 +1,7 @@
-//! Wall clock with an optional frozen override for the parity rig.
+//! Wall clock with an optional frozen override for deterministic tests.
 //!
-//! `STARK_PARITY_NOW` pins both the native and React captures to one instant
-//! so relative labels (`20d`, `Today`) stay byte-stable across days. It
+//! `STARK_PARITY_NOW` pins deterministic screenshots to one instant so
+//! relative labels (`20d`, `Today`) stay byte-stable across days. It
 //! accepts Unix seconds, Unix milliseconds, or RFC 3339. Unset means the live
 //! system clock. The value is read once per process.
 
@@ -134,7 +134,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Monotonic millis for run durations. Unlike [`now_millis`] this is never
-/// frozen by the parity clock, so a staged run still measures real elapsed
+/// frozen by the test clock, so a staged run still measures real elapsed
 /// time in headless tests.
 pub fn monotonic_millis() -> f64 {
     #[cfg(target_arch = "wasm32")]

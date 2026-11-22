@@ -16,6 +16,7 @@
 //!   runs `rune::App` headless (`--snap`); tree via `--tree`.
 
 use crate::keys::EnterPress;
+use serde_json::Value;
 use std::borrow::Cow;
 
 use rune::{col, row, text, AppSpec, Cx, El, GrowthSpec, ScrollSpec, TextEdit};
@@ -703,8 +704,8 @@ pub struct RuneTranscriptState {
     pub live: bool,
     pub api_host: String,
     pub api_port: u16,
-    /// Chat id sent with `POST /api/run` and used by `POST /api/abort` —
-    /// mirrors the React `chat.id` both `streamPipeline` and `abortRun`
+    /// Chat id used by `POST /api/chats/{id}/run` and `POST /api/abort` —
+    /// mirrors the React `chat.id` the run command and `abortRun` both use
     /// carry. Empty until the first send stages one.
     pub chat_id: String,
     /// Real workspace id (`_general`, `_personal`, or a project id).
@@ -943,8 +944,8 @@ impl Clone for RuneTranscriptState {
 pub const DEFAULT_API_HOST: &str = "127.0.0.1";
 pub const DEFAULT_API_PORT: u16 = 8124;
 
-/// The port every client uses. `STARK_API_PORT` lets the parity rig point
-/// both frontends at a frozen fixture server without stopping the live one.
+/// The port every client uses. `STARK_API_PORT` lets a dev build point at a
+/// fixture server without stopping the live one.
 pub fn api_port() -> u16 {
     std::env::var("STARK_API_PORT")
         .ok()
@@ -1324,7 +1325,7 @@ pub const MAX_ATTACHMENTS: usize = 8;
 pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Shared send path (button + Enter): stage the field as a user row, mark the
-/// run live, and spawn the blocking `POST /api/run` thread into `inbox`.
+/// run live, and spawn the blocking chat-run thread into `inbox`.
 /// Attachments count as content, so an attachment-only send is allowed; the
 /// text is only cleared once staging succeeded (React's guard keeps a live
 /// run's draft in place).
@@ -1497,13 +1498,431 @@ fn chat_title(prompt: &str) -> String {
 }
 
 impl RuneTranscriptState {
-    /// `workspaceKind` sent with `/api/run` (deterministic routing).
+    /// `workspaceKind` sent with the chat run command (deterministic routing).
     pub fn workspace_kind(&self) -> String {
         match self.workspace_id.as_str() {
             "_house" => "house".to_string(),
             "_personal" => "personal".to_string(),
             _ => "general".to_string(),
         }
+    }
+}
+
+const RUN_RECOVERY_ATTEMPTS: u32 = 8;
+const RUN_RECOVERY_BASE_MS: u64 = 250;
+
+fn run_error_frame(message: impl Into<String>) -> crate::stream::SseFrame {
+    crate::stream::SseFrame::new("error", serde_json::json!({"message": message.into()}))
+}
+
+fn run_done_frame(status: &str) -> crate::stream::SseFrame {
+    crate::stream::SseFrame::new("done", serde_json::json!({"status": status}))
+}
+
+fn command_error(body: &Value, status: u16) -> String {
+    body.get("error")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| body.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("HTTP {status}"))
+}
+
+/// Recovery floor from the command: `after_seq` for a new run, `current_seq`
+/// for a 409. The live `server.connected.seq` is not a cursor: advancing to it
+/// would skip events emitted before `/events` subscribed.
+fn command_cursor(body: &Value) -> Option<u64> {
+    body.get("after_seq")
+        .or_else(|| body.get("current_seq"))
+        .and_then(Value::as_u64)
+}
+
+fn state_error_message(state: &Value) -> Option<String> {
+    state
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn state_was_aborted(state: &Value) -> bool {
+    state.get("active_node").and_then(Value::as_str) == Some("aborted")
+}
+
+/// Drive one run from a blocking thread: command, live feed, and durable
+/// recovery. Every frame lands in the same `mpsc` channel the poll hook drains.
+#[cfg(not(target_arch = "wasm32"))]
+fn drive_chat_run_native(
+    host: &str,
+    port: u16,
+    chat_id: &str,
+    req: crate::stream::RunRequest,
+    tx: std::sync::mpsc::Sender<crate::stream::SseFrame>,
+) {
+    use crate::stream::SseFrame;
+
+    let command_path = format!("/api/chats/{chat_id}/run");
+    let response =
+        match crate::transport::post_json_status(host, port, &command_path, &req.to_json()) {
+            Ok(response) => response,
+            Err(message) => {
+                let _ = tx.send(run_error_frame(message));
+                return;
+            }
+        };
+    let mut cursor = match response.status {
+        202 => match command_cursor(&response.body) {
+            Some(seq) => seq,
+            None => {
+                let _ = tx.send(run_error_frame(
+                    "The run command did not return a durable cursor.",
+                ));
+                return;
+            }
+        },
+        409 => {
+            if !crate::transport::post_steer(host, port, chat_id, &req.prompt) {
+                let _ = tx.send(run_error_frame(command_error(
+                    &response.body,
+                    response.status,
+                )));
+                return;
+            }
+            command_cursor(&response.body).unwrap_or(0)
+        }
+        status => {
+            let _ = tx.send(run_error_frame(command_error(&response.body, status)));
+            return;
+        }
+    };
+
+    let events_path = format!("/api/chats/{chat_id}/events");
+    let state_path = format!("/api/state?chat_id={chat_id}");
+    let active_path = format!("/api/runs/active?chat_id={chat_id}");
+    let mut attempts = 0u32;
+
+    loop {
+        let mut done = false;
+        let mut dead = false;
+        let mut on_event = |frame: SseFrame| -> bool {
+            if frame.event == "server.connected" {
+                let running = frame
+                    .data
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if running {
+                    if let Ok(state) = crate::transport::get_json(host, port, &state_path) {
+                        if tx.send(SseFrame::new("state", state)).is_err() {
+                            dead = true;
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+            let terminal = frame.event == "done" || frame.event == "error";
+            let sent = tx.send(frame).is_ok();
+            done = terminal;
+            if !sent {
+                dead = true;
+            }
+            sent && !terminal
+        };
+        let result = crate::transport::get_sse(host, port, &events_path, &mut on_event);
+        if dead || done {
+            return;
+        }
+        if let Err(message) = result {
+            if crate::transport::is_locked_error(&message) {
+                let _ = tx.send(run_error_frame(message));
+                return;
+            }
+        }
+
+        // EOF is not success. Confirm against the active-run source of truth.
+        let active = match crate::transport::get_json(host, port, &active_path) {
+            Ok(value) => Some(value),
+            Err(message) if crate::transport::is_locked_error(&message) => {
+                let _ = tx.send(run_error_frame(message));
+                return;
+            }
+            Err(_) => None,
+        };
+        if active
+            .as_ref()
+            .and_then(|value| value.get("running").and_then(Value::as_bool))
+            == Some(false)
+        {
+            if let Ok(state) = crate::transport::get_json(host, port, &state_path) {
+                let had_error = state_error_message(&state).is_some();
+                let aborted = state_was_aborted(&state);
+                if tx.send(SseFrame::new("state", state)).is_err() {
+                    return;
+                }
+                if had_error {
+                    return;
+                }
+                let _ = tx.send(run_done_frame(if aborted { "aborted" } else { "complete" }));
+            } else {
+                let _ = tx.send(run_done_frame("complete"));
+            }
+            return;
+        }
+
+        attempts += 1;
+        if attempts > RUN_RECOVERY_ATTEMPTS {
+            let _ = tx.send(run_error_frame(
+                "Lost the run feed and could not confirm whether the run finished. Reopen the chat to refresh.",
+            ));
+            return;
+        }
+        if let Ok(state) = crate::transport::get_json(host, port, &state_path) {
+            if tx.send(SseFrame::new("state", state)).is_err() {
+                return;
+            }
+        }
+
+        // Buffer the durable rebuild so a failed replay never replaces the
+        // live row with half a turn.
+        let log_path = format!("/api/chats/{chat_id}/log?after={cursor}&follow=1");
+        let mut replay = Vec::new();
+        let mut synced = false;
+        let mut replay_cursor = cursor;
+        let mut on_log = |frame: SseFrame| -> bool {
+            if frame.event == "log.synced" {
+                if let Some(seq) = frame.seq {
+                    replay_cursor = replay_cursor.max(seq);
+                }
+                synced = true;
+                return false;
+            }
+            if let Some(seq) = frame.seq {
+                replay_cursor = replay_cursor.max(seq);
+            }
+            if let Some(frame) = crate::stream::durable_ui_frame(frame) {
+                replay.push(frame);
+            }
+            true
+        };
+        let _ = crate::transport::get_sse(host, port, &log_path, &mut on_log);
+        if !synced {
+            std::thread::sleep(std::time::Duration::from_millis(
+                RUN_RECOVERY_BASE_MS * u64::from(attempts.min(8)),
+            ));
+            continue;
+        }
+
+        cursor = replay_cursor;
+        if tx
+            .send(SseFrame::new("delta", serde_json::json!({"kind": "reset"})))
+            .is_err()
+        {
+            return;
+        }
+        for frame in replay {
+            if tx.send(frame).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(RUN_RECOVERY_BASE_MS));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Browser twin of [`drive_chat_run_native`].
+#[cfg(target_arch = "wasm32")]
+async fn drive_chat_run_wasm(
+    req: crate::stream::RunRequest,
+    chat_id: String,
+    tx: std::sync::mpsc::Sender<crate::stream::SseFrame>,
+) {
+    use crate::stream::SseFrame;
+
+    let command_path = format!("/api/chats/{chat_id}/run");
+    let response = match crate::transport::fetch_send_status(
+        "POST",
+        &command_path,
+        Some(&req.to_json()),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(message) => {
+            let _ = tx.send(run_error_frame(message));
+            return;
+        }
+    };
+    let mut cursor = match response.status {
+        202 => match command_cursor(&response.body) {
+            Some(seq) => seq,
+            None => {
+                let _ = tx.send(run_error_frame(
+                    "The run command did not return a durable cursor.",
+                ));
+                return;
+            }
+        },
+        409 => {
+            if !crate::transport::fetch_steer(&chat_id, &req.prompt).await {
+                let _ = tx.send(run_error_frame(command_error(
+                    &response.body,
+                    response.status,
+                )));
+                return;
+            }
+            command_cursor(&response.body).unwrap_or(0)
+        }
+        status => {
+            let _ = tx.send(run_error_frame(command_error(&response.body, status)));
+            return;
+        }
+    };
+
+    let events_path = format!("/api/chats/{chat_id}/events");
+    let state_path = format!("/api/state?chat_id={chat_id}");
+    let active_path = format!("/api/runs/active?chat_id={chat_id}");
+    let mut attempts = 0u32;
+
+    loop {
+        let mut done = false;
+        let mut dead = false;
+        let mut on_event = |frame: SseFrame| -> bool {
+            if frame.event == "server.connected" {
+                let running = frame
+                    .data
+                    .get("running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if running {
+                    let tx = tx.clone();
+                    let state_path = state_path.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Ok(state) = crate::transport::fetch_json(&state_path).await {
+                            let _ = tx.send(SseFrame::new("state", state));
+                        }
+                    });
+                }
+                return true;
+            }
+            let terminal = frame.event == "done" || frame.event == "error";
+            let sent = tx.send(frame).is_ok();
+            done = terminal;
+            if !sent {
+                dead = true;
+            }
+            sent && !terminal
+        };
+        let result = match crate::transport::open_sse(&events_path).await {
+            Ok(response) => crate::transport::read_sse(response, &mut on_event).await,
+            Err(message) => Err(message),
+        };
+        if dead || done {
+            return;
+        }
+        if let Err(message) = result {
+            if crate::transport::is_locked_error(&message) {
+                let _ = tx.send(run_error_frame(message));
+                return;
+            }
+        }
+
+        let active = match crate::transport::fetch_json(&active_path).await {
+            Ok(value) => Some(value),
+            Err(message) if crate::transport::is_locked_error(&message) => {
+                let _ = tx.send(run_error_frame(message));
+                return;
+            }
+            Err(_) => None,
+        };
+        if active
+            .as_ref()
+            .and_then(|value| value.get("running").and_then(Value::as_bool))
+            == Some(false)
+        {
+            if let Ok(state) = crate::transport::fetch_json(&state_path).await {
+                let had_error = state_error_message(&state).is_some();
+                let aborted = state_was_aborted(&state);
+                if tx.send(SseFrame::new("state", state)).is_err() {
+                    return;
+                }
+                if had_error {
+                    return;
+                }
+                let _ = tx.send(run_done_frame(if aborted { "aborted" } else { "complete" }));
+            } else {
+                let _ = tx.send(run_done_frame("complete"));
+            }
+            return;
+        }
+
+        attempts += 1;
+        if attempts > RUN_RECOVERY_ATTEMPTS {
+            let _ = tx.send(run_error_frame(
+                "Lost the run feed and could not confirm whether the run finished. Reopen the chat to refresh.",
+            ));
+            return;
+        }
+        if let Ok(state) = crate::transport::fetch_json(&state_path).await {
+            if tx.send(SseFrame::new("state", state)).is_err() {
+                return;
+            }
+        }
+
+        let log_path = format!("/api/chats/{chat_id}/log?after={cursor}&follow=1");
+        let mut replay = Vec::new();
+        let mut synced = false;
+        let mut replay_cursor = cursor;
+        let mut on_log = |frame: SseFrame| -> bool {
+            if frame.event == "log.synced" {
+                if let Some(seq) = frame.seq {
+                    replay_cursor = replay_cursor.max(seq);
+                }
+                synced = true;
+                return false;
+            }
+            if let Some(seq) = frame.seq {
+                replay_cursor = replay_cursor.max(seq);
+            }
+            if let Some(frame) = crate::stream::durable_ui_frame(frame) {
+                replay.push(frame);
+            }
+            true
+        };
+        match crate::transport::open_sse(&log_path).await {
+            Ok(response) => {
+                let _ = crate::transport::read_sse(response, &mut on_log).await;
+            }
+            Err(_) => {}
+        }
+        if !synced {
+            sleep_ms((RUN_RECOVERY_BASE_MS * u64::from(attempts.min(8))) as i32).await;
+            continue;
+        }
+
+        cursor = replay_cursor;
+        if tx
+            .send(SseFrame::new("delta", serde_json::json!({"kind": "reset"})))
+            .is_err()
+        {
+            return;
+        }
+        for frame in replay {
+            if tx.send(frame).is_err() {
+                return;
+            }
+        }
+        sleep_ms(RUN_RECOVERY_BASE_MS as i32).await;
     }
 }
 
@@ -1638,7 +2057,6 @@ pub fn stage_send_prompt_with_attachments(
         temperature: 0.7,
         workspace_path: String::new(),
         workspace_id: s.workspace_id.clone(),
-        chat_id: s.chat_id.clone(),
         workspace_kind: s.workspace_kind(),
         attachments: send_attachments,
     };
@@ -1649,44 +2067,30 @@ pub fn stage_send_prompt_with_attachments(
     let (tx, rx) = std::sync::mpsc::channel();
     s.inbox = Some(rx);
     let (host, port) = (s.api_host.clone(), s.api_port);
-    // Browsers have no TCP sockets: drive the run over fetch + ReadableStream
-    // into the same inbox the poll hook drains. Same rows, same framing.
+    // Browsers have no TCP sockets: drive the command, live feed, and durable
+    // recovery over fetch into the same inbox the poll hook drains.
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(async move {
-        let mut done = false;
-        let mut emit = |frame: crate::stream::SseFrame| {
-            if frame.event == "done" {
-                done = true;
-            }
-            let _ = tx.send(frame);
-        };
         let mut chat_id = chat_id;
         if !ready {
             match crate::transport::create_chat_wasm(&workspace_id, &title).await {
                 Ok(id) => {
-                    let _ = tx.send(crate::stream::SseFrame {
-                        event: "chat".to_string(),
-                        data: serde_json::json!({"id": id, "workspace_id": workspace_id}),
-                    });
+                    let _ = tx.send(crate::stream::SseFrame::new(
+                        "chat",
+                        serde_json::json!({"id": id, "workspace_id": workspace_id}),
+                    ));
                     chat_id = id;
                 }
                 Err(message) => {
-                    let _ = tx.send(crate::stream::SseFrame {
-                        event: "error".to_string(),
-                        data: serde_json::json!({"message": message}),
-                    });
+                    let _ = tx.send(crate::stream::SseFrame::new(
+                        "error",
+                        serde_json::json!({"message": message}),
+                    ));
                     return;
                 }
             }
         }
-        let req = crate::stream::RunRequest { chat_id, ..req };
-        crate::transport::post_run_stream(&req, &mut emit).await;
-        if !done {
-            let _ = tx.send(crate::stream::SseFrame {
-                event: "done".to_string(),
-                data: serde_json::json!({"status": "complete"}),
-            });
-        }
+        drive_chat_run_wasm(req, chat_id, tx).await;
         let _ = (host, port);
     });
     #[cfg(not(target_arch = "wasm32"))]
@@ -1695,44 +2099,22 @@ pub fn stage_send_prompt_with_attachments(
         if !ready {
             match crate::transport::create_chat(&host, port, &workspace_id, &title) {
                 Ok(id) => {
-                    let _ = tx.send(crate::stream::SseFrame {
-                        event: "chat".to_string(),
-                        data: serde_json::json!({"id": id, "workspace_id": workspace_id}),
-                    });
+                    let _ = tx.send(crate::stream::SseFrame::new(
+                        "chat",
+                        serde_json::json!({"id": id, "workspace_id": workspace_id}),
+                    ));
                     chat_id = id;
                 }
                 Err(message) => {
-                    let _ = tx.send(crate::stream::SseFrame {
-                        event: "error".to_string(),
-                        data: serde_json::json!({"message": message}),
-                    });
+                    let _ = tx.send(crate::stream::SseFrame::new(
+                        "error",
+                        serde_json::json!({"message": message}),
+                    ));
                     return;
                 }
             }
         }
-        let req = crate::stream::RunRequest { chat_id, ..req };
-        let mut done = false;
-        let mut emit = |frame: crate::stream::SseFrame| {
-            if frame.event == "done" {
-                done = true;
-            }
-            let _ = tx.send(frame);
-        };
-        match crate::transport::post_run(&host, port, &req, &mut emit) {
-            Ok(_) if !done => {
-                let _ = tx.send(crate::stream::SseFrame {
-                    event: "done".to_string(),
-                    data: serde_json::json!({"status": "complete"}),
-                });
-            }
-            Err(message) => {
-                let _ = tx.send(crate::stream::SseFrame {
-                    event: "error".to_string(),
-                    data: serde_json::json!({"message": message}),
-                });
-            }
-            _ => {}
-        }
+        drive_chat_run_native(&host, port, &chat_id, req, tx);
     });
     true
 }
@@ -1994,7 +2376,7 @@ pub fn transcript_view_body<S: TranscriptHost + crate::settings::SettingsHost + 
     s: &RuneTranscriptState,
     which: Thread,
 ) -> El {
-    transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0)
+    transcript_body_with::<S>(s, which, true, false, true, 0.0, 0.0, false)
 }
 
 /// Deduped home transcript state (`MessageStream`): agent rows that merely
@@ -4778,11 +5160,12 @@ pub fn home_transcript_body<S: TranscriptHost + crate::settings::SettingsHost + 
     which: Thread,
     card_w: f32,
     window_h: f32,
+    minimized: bool,
 ) -> El {
     // React caps the user bubble at 85% of the message column: card width
     // minus its 8pt side gutters, hairlines, and the scroll area's pl-8/pr-4.
     let max_w = ((card_w - 18.0 - 48.0) * 0.85).max(120.0);
-    transcript_body_with::<S>(s, which, false, true, false, max_w, window_h)
+    transcript_body_with::<S>(s, which, false, true, false, max_w, window_h, minimized)
 }
 
 /// Lucide `ArrowLeft` (15pt) for the drill back button.
@@ -5071,6 +5454,8 @@ fn subagent_drill_view<S: TranscriptHost + 'static>(
         .child(dock)
 }
 
+// Layout flags stay explicit: head, dock, sheets, home width, window height, fold.
+#[allow(clippy::too_many_arguments)]
 fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'static>(
     s: &RuneTranscriptState,
     which: Thread,
@@ -5079,10 +5464,12 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     show_sheets: bool,
     home_max_w: f32,
     window_h: f32,
+    folded: bool,
 ) -> El {
     // Session-keyed drill (`SubagentSessionView`): conditional content replaces
     // the body, Rune `collapsible` style — no height animation, just open content.
-    if s.active_subagent.is_some() {
+    // A folded home card skips the drill with the rest of the message area.
+    if s.active_subagent.is_some() && !folded {
         return subagent_drill_view::<S>(s, which, home_max_w);
     }
     // Index-built rows: layout builds only the mounted window (viewport + up to
@@ -5463,10 +5850,13 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
                     ),
             ),
     );
-    root = root.child(view);
+    if !folded {
+        root = root.child(view);
+    }
     // Thread-local running banner: the standalone view carries it here; the
-    // shell's sheet drops it (sheet keeps its own).
-    if s.live {
+    // shell's sheet drops it (sheet keeps its own). The folded home card hides
+    // the whole message area and keeps only the prompt dock.
+    if s.live && !folded {
         root = root.child(
             text("Running".to_string())
                 .key("transcript-live")
@@ -5480,7 +5870,7 @@ fn transcript_body_with<S: TranscriptHost + crate::settings::SettingsHost + 'sta
     let ask_batch = s.ask.visible_batch(&s.chat_id).cloned();
     // Composer card: shared `.premium-surface` dock (see `composer.rs`).
     // Send (button or Enter) stages the field as a user row, marks the run
-    // live, and spawns the blocking `POST /api/run` thread; frames land in
+    // live, and spawns the blocking chat-run thread; frames land in
     // `inbox`, drained by the `poll` hook before every frame.
     let composer_card = if ask_batch.is_some() {
         None
@@ -6090,15 +6480,22 @@ pub fn drain_run_inbox(s: &mut RuneTranscriptState, clock: f64, tx: &mut rune::T
         });
         if dead {
             s.inbox = None;
-            // React calls `finish()` when the stream closes without a
-            // terminal event, so a dropped connection still lands the
-            // partial answer instead of leaving a live row forever.
+            // A closed channel without a terminal frame is a transport
+            // failure, never success. The driver confirms against
+            // `/api/runs/active` and replays `/log` before it ends cleanly.
             if s.aborting {
                 s.aborting = false;
                 s.refresh_chat = Some((s.workspace_id.clone(), s.chat_id.clone()));
                 changed = true;
             } else if s.live {
-                finalize_run(s, None, false);
+                finalize_run(
+                    s,
+                    Some(
+                        "Lost the run feed and could not confirm whether the run finished. Reopen the chat to refresh."
+                            .to_string(),
+                    ),
+                    false,
+                );
                 changed = true;
             }
         }
@@ -6503,16 +6900,13 @@ mod tests {
         let n = s.rows.len();
         let (tx, rx) = std::sync::mpsc::channel();
         s.inbox = Some(rx);
-        tx.send(SseFrame {
-            event: "delta".to_string(),
-            data: serde_json::json!({"kind":"text","text":"hi"}),
-        })
+        tx.send(SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"text","text":"hi"}),
+        ))
         .unwrap();
-        tx.send(SseFrame {
-            event: "done".to_string(),
-            data: serde_json::json!({"status":"ok"}),
-        })
-        .unwrap();
+        tx.send(SseFrame::new("done", serde_json::json!({"status":"ok"})))
+            .unwrap();
         drop(tx);
         let mut run_tx = rune::Tx::default();
         assert!(drain_run_inbox(&mut s, 0.0, &mut run_tx));
@@ -6724,6 +7118,7 @@ mod tests {
             Thread::Main,
             468.0,
             720.0,
+            false,
         ));
         if let Some(file) = s.attachment_preview.clone() {
             root = root.child(attachment_lightbox::<RuneTranscriptState>(
@@ -7121,7 +7516,7 @@ mod tests {
     fn tapping_delegation_card_opens_drill() {
         use crate::stream_accum::{ChildRef, LiveToolEvent, StreamSegment, ToolStatus};
         fn home_view(s: &RuneTranscriptState, _cx: &mut Cx<RuneTranscriptState>) -> El {
-            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0)
+            home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
         }
         let mut s = RuneTranscriptState::screenshot();
         s.workspace_id = "_general".to_string();
@@ -7287,7 +7682,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_matches_tauri_sections() {
+    fn settings_matches_reference_sections() {
         let mut s = RuneTranscriptState::screenshot();
         s.settings.open = true;
         let env = Env::new(true, 2.0);
@@ -7603,7 +7998,7 @@ mod tests {
     }
 
     fn home_test_view(s: &RuneTranscriptState, _: &mut rune::Cx<RuneTranscriptState>) -> El {
-        home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0)
+        home_transcript_body::<RuneTranscriptState>(s, Thread::Main, 468.0, 720.0, false)
     }
 
     #[test]
@@ -7737,6 +8132,341 @@ mod tests {
             "inner at pad, got row {:?} inner {:?}",
             row,
             inner
+        );
+    }
+
+    /// Minimal one-request-at-a-time HTTP server for run-client tests. Not
+    /// chunked: the SSE reader supports close-delimited bodies too.
+    struct MockServer {
+        port: u16,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockServer {
+        fn start(
+            handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::sync::atomic::Ordering;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handler = std::sync::Arc::new(handler);
+            let thread_stop = stop.clone();
+            let thread_requests = requests.clone();
+            let handle = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let (mut sock, _) = match listener.accept() {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    let mut reader = BufReader::new(sock.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let method = request_line
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut content_len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        let line = line.trim();
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some(value) = line.strip_prefix("Content-Length:") {
+                            content_len = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut body);
+                    thread_requests
+                        .lock()
+                        .unwrap()
+                        .push(format!("{method} {path}"));
+                    let (status, response_body) =
+                        handler(&method, &path, &String::from_utf8_lossy(&body));
+                    let reason = match status {
+                        200 => "OK",
+                        202 => "Accepted",
+                        409 => "Conflict",
+                        _ => "Error",
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(response_body.as_bytes());
+                }
+            });
+            Self {
+                port,
+                stop,
+                requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn run_request(prompt: &str) -> crate::stream::RunRequest {
+        crate::stream::RunRequest {
+            prompt: prompt.to_string(),
+            model: "m".to_string(),
+            temperature: 0.7,
+            workspace_path: String::new(),
+            workspace_id: "_general".to_string(),
+            workspace_kind: "general".to_string(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropped_feed_recovers_from_log_then_resumes_live() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let events = std::sync::Arc::new(AtomicUsize::new(0));
+        let handler_events = events.clone();
+        let server = MockServer::start(move |method, path, _body| {
+            match (method, path) {
+            ("POST", "/api/chats/c1/run") => (
+                202,
+                r#"{"accepted":true,"chat_id":"c1","run_id":"run-1","after_seq":5}"#
+                    .to_string(),
+            ),
+            ("GET", "/api/chats/c1/events") => {
+                let count = handler_events.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    (
+                        200,
+                        "data: {\"type\":\"server.connected\",\"data\":{\"chat_id\":\"c1\",\"running\":false,\"seq\":5}}\n\n".to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        concat!(
+                            "data: {\"type\":\"server.connected\",\"data\":{\"chat_id\":\"c1\",\"running\":true,\"seq\":6}}\n\n",
+                            "data: {\"type\":\"done\",\"data\":{\"status\":\"complete\"}}\n\n"
+                        )
+                        .to_string(),
+                    )
+                }
+            }
+            ("GET", p) if p.starts_with("/api/runs/active") => {
+                (200, r#"{"running":true,"chat_id":"c1"}"#.to_string())
+            }
+            ("GET", p) if p.starts_with("/api/state") => (
+                200,
+                r#"{"active_node":"agent","outputs":{},"token_usage":{}}"#.to_string(),
+            ),
+            ("GET", p) if p.starts_with("/api/chats/c1/log") => (
+                200,
+                concat!(
+                    "data: {\"type\":\"delta\",\"durable\":{\"aggregateID\":\"c1\",\"seq\":6,\"version\":1},\"data\":{\"kind\":\"text\",\"role\":\"assistant\",\"text\":\"recovered\"}}\n\n",
+                    "data: {\"type\":\"log.synced\",\"aggregateID\":\"c1\",\"seq\":6}\n\n"
+                )
+                .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        drive_chat_run_native("127.0.0.1", server.port, "c1", run_request("hello"), tx);
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.event == "delta"
+                    && frame.data["kind"] == serde_json::json!("reset")),
+            "{frames:?}"
+        );
+        assert!(
+            frames.iter().any(|frame| frame.event == "delta"
+                && frame.data["kind"] == serde_json::json!("text_snapshot")
+                && frame.data["text"] == serde_json::json!("recovered")),
+            "{frames:?}"
+        );
+        assert_eq!(frames.last().unwrap().event, "done");
+        assert!(!frames.iter().any(|frame| frame.event == "error"));
+        let requests = server.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line == "GET /api/chats/c1/log?after=5&follow=1"),
+            "{requests:?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| *line == "GET /api/chats/c1/events")
+                .count(),
+            2,
+            "{requests:?}"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropped_feed_finishes_only_after_active_and_state_confirm_it() {
+        let server = MockServer::start(move |method, path, _body| {
+            match (method, path) {
+            ("POST", "/api/chats/c1/run") => (
+                202,
+                r#"{"accepted":true,"chat_id":"c1","run_id":"run-1","after_seq":3}"#
+                    .to_string(),
+            ),
+            ("GET", "/api/chats/c1/events") => (
+                200,
+                "data: {\"type\":\"server.connected\",\"data\":{\"chat_id\":\"c1\",\"running\":false,\"seq\":3}}\n\n"
+                    .to_string(),
+            ),
+            ("GET", p) if p.starts_with("/api/runs/active") => {
+                (200, r#"{"running":false,"chat_id":"c1"}"#.to_string())
+            }
+            ("GET", p) if p.starts_with("/api/state") => {
+                (200, r#"{"active_node":"done","outputs":{}}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        drive_chat_run_native("127.0.0.1", server.port, "c1", run_request("hello"), tx);
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            frames.iter().any(|frame| frame.event == "state"
+                && frame.data["active_node"] == serde_json::json!("done")),
+            "{frames:?}"
+        );
+        assert_eq!(frames.last().unwrap().event, "done");
+        assert_eq!(
+            frames.last().unwrap().data["status"],
+            serde_json::json!("complete")
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.event == "delta"
+                    && frame.data["kind"] == serde_json::json!("reset")),
+            "no replay when the server confirms the run is inactive: {frames:?}"
+        );
+        assert!(!server
+            .requests()
+            .iter()
+            .any(|line| line.starts_with("GET /api/chats/c1/log")));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn run_command_conflict_steers_instead_of_dropping_the_prompt() {
+        let server = MockServer::start(move |method, path, body| {
+            match (method, path) {
+            ("POST", "/api/chats/c1/run") => (
+                409,
+                r#"{"error":"This chat already has a running agent.","code":"already_running","chat_id":"c1","run_id":"run-live","current_seq":9}"#
+                    .to_string(),
+            ),
+            ("POST", "/api/steer") => {
+                assert!(body.contains("\"message\":\"hello\""), "{body}");
+                (200, r#"{"ok":true}"#.to_string())
+            }
+            ("GET", "/api/chats/c1/events") => (
+                200,
+                concat!(
+                    "data: {\"type\":\"server.connected\",\"data\":{\"chat_id\":\"c1\",\"running\":true,\"seq\":9}}\n\n",
+                    "data: {\"type\":\"done\",\"data\":{\"status\":\"complete\"}}\n\n"
+                )
+                .to_string(),
+            ),
+            ("GET", p) if p.starts_with("/api/state") => {
+                (200, r#"{"active_node":"agent","outputs":{}}"#.to_string())
+            }
+            _ => (404, "{}".to_string()),
+        }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        drive_chat_run_native("127.0.0.1", server.port, "c1", run_request("hello"), tx);
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.last().unwrap().event, "done");
+        assert!(!frames.iter().any(|frame| frame.event == "error"));
+        let requests = server.requests();
+        assert!(
+            requests.iter().any(|line| line == "POST /api/steer"),
+            "{requests:?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| *line == "POST /api/chats/c1/run")
+                .count(),
+            1,
+            "a conflict must never start a second run: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn a_dead_run_channel_never_finalizes_as_success() {
+        let mut s = RuneTranscriptState::screenshot();
+        s.rows.push(RowData {
+            key: crate::stream::LIVE_ROW_KEY.to_string(),
+            role: "agent",
+            is_streaming: true,
+            accum: Some(StreamAccum::default()),
+            ..RowData::default()
+        });
+        s.live = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.inbox = Some(rx);
+        tx.send(crate::stream::SseFrame::new(
+            "delta",
+            serde_json::json!({"kind":"text","text":"partial"}),
+        ))
+        .unwrap();
+        drop(tx);
+        let mut run_tx = rune::Tx::default();
+        assert!(drain_run_inbox(&mut s, 0.0, &mut run_tx));
+        assert!(!s.live);
+        assert!(
+            s.rows
+                .iter()
+                .any(|row| row.role == "error" && row.body.contains("Lost the run feed")),
+            "a dropped feed must surface an error, not a completed answer"
         );
     }
 }

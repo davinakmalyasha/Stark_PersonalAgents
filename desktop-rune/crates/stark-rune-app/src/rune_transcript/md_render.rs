@@ -1,5 +1,5 @@
 //! Markdown rendering for transcript rows — a direct port of
-//! `frontend/src/components/Workspace/Markdown.tsx` and `DiffView.tsx`.
+//! the former React `Markdown` and `DiffView` components.
 //!
 //! `stark-kit::markdown` parses GFM; this module owns every visual value:
 //! Tailwind margins, line boxes, one-dark code colours, the code header and
@@ -80,7 +80,7 @@ fn prepend_space(blocks: &[stark_kit::markdown::Block]) -> Vec<stark_kit::markdo
 }
 /// Inline code: 13.5pt mono indigo-300 on a zinc-800/80 well with the
 /// `border-zinc-700/50` 1px ring (React `code` component:
-/// `frontend/src/components/Workspace/Markdown.tsx:99`
+/// the former React `Markdown` component
 /// `bg-zinc-800/80 px-1.5 py-0.5 ... border border-zinc-700/50`).
 /// Horizontal chrome is exact: `pad(6.0)` == `px-1.5`, plus the 1px ring
 /// (table width fudge `+14.0` per code span). Vertical chrome is

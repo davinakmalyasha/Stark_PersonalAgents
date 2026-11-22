@@ -84,9 +84,6 @@ scratch/eval_tmp/
 _house/
 .playwright-mcp/
 
-# Large local documentation binaries
-docs/paper_stark_v2.docx
-
 # Local agent plans
 .opencode/plans/
 
@@ -94,10 +91,6 @@ docs/paper_stark_v2.docx
 # directories, so nested run output leaked through. Never commit eval output.
 scratch/gen10_runs*/
 scratch/gen10_crashed_smoke/
-
-# Machine-specific electron root hint — generated per install, holds an
-# absolute local path. main.cjs:21 already has a default fallback.
-frontend/electron/stark-root.txt
 
 # Rust build output
 backend-rs/target/

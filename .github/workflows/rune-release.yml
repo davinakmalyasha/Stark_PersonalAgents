@@ -1,8 +1,8 @@
 name: rune-release
 
 # Signed Rune release. Tag with `rune-v2.6.4`; the tag must match
-# desktop-rune/Cargo.toml. Publishes to the dedicated public Rune feed repo so
-# `releases/latest/download/latest-rune.json` is never the Tauri installer.
+# desktop-rune/Cargo.toml. Publishes to the dedicated public Rune feed repo;
+# the legacy desktop installer feed has been retired.
 #
 # Required secrets:
 #   MINISIGN_SECRET_KEY       minisign secret key text

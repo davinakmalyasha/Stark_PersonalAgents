@@ -1,5 +1,0 @@
-[
-  {"t": 1.0, "type": "tap", "key": "map-kind", "hold": 0.05},
-  {"t": 1.25, "type": "tap", "key": "map-kind-Coding", "hold": 0.05},
-  {"t": 1.6, "type": "move", "x": 150, "y": 282}
-]

@@ -1,5 +1,5 @@
-//! Agents & providers config — port of `AgentConfigModal.tsx` +
-//! `services/api/stream.ts` agent-config contracts.
+//! Agents & providers config — port of `AgentConfigModal.tsx` against the
+//! backend agent-config endpoints.
 //!
 //! Contract:
 //! - `GET /api/config/agents` → `{agents:[{key,display,tier,override,

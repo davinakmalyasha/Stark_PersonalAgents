@@ -1,5 +1,5 @@
-//! Tool labels — port of `frontend/src/utils/toolLabels.generated.ts`
-//! plus the historical names `ActivityTimeline.tsx` keeps for old transcripts.
+//! Tool labels — port of the former React labels plus the historical names
+//! kept for old transcripts.
 
 /// `TOOL_VERBS` + `LEGACY_VERBS`.
 pub fn verb(name: &str) -> &str {

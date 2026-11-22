@@ -77,7 +77,7 @@ async fn approve_command(ctx: &ToolContext, command: &str, reason: &str) -> bool
         "question": format!("Allow this command?\n\n{command}"),
         "header": "Approval",
         "detail": reason,
-        "options": ["Approve", "Allow for session", "Deny"],
+        "options": ["Approve", "Allow for session", "Always allow", "Deny"],
     });
     let Ok(answers) = ctx.questions.ask(&ctx.chat_id, vec![question], 300).await else {
         return false;
@@ -94,6 +94,15 @@ async fn approve_command(ctx: &ToolContext, command: &str, reason: &str) -> bool
         Some("Allow for session") => {
             if let Some(tokens) = shlex::split(command) {
                 ctx.approvals.approve(&tokens);
+            }
+            true
+        }
+        Some("Always allow") => {
+            if let Some(tokens) = shlex::split(command) {
+                ctx.approvals.approve(&tokens);
+                if let Err(error) = stark_policy::append_allow_prefix(&tokens) {
+                    tracing::warn!("could not persist approved command prefix: {error}");
+                }
             }
             true
         }

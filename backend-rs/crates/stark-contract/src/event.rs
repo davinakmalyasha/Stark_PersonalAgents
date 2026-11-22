@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -117,6 +120,11 @@ impl Delta {
 
 #[derive(Debug, Clone)]
 pub struct ServerEvent {
+    /// Stable event identifier (`evt_...`) carried inside the OpenCode-style
+    /// event envelope. The legacy SSE endpoints do not emit this field.
+    pub id: String,
+    /// Unix timestamp in milliseconds when the server created the event.
+    pub created: i64,
     pub event: String,
     pub data: Value,
 }
@@ -124,8 +132,39 @@ pub struct ServerEvent {
 impl ServerEvent {
     pub fn new(event: impl Into<String>, data: impl Serialize) -> Self {
         Self {
+            id: next_event_id(),
+            created: now_ms(),
             event: event.into(),
             data: serde_json::to_value(data).unwrap_or(Value::Null),
         }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn next_event_id() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("evt_{:x}{:x}{:x}", now_ms(), std::process::id(), sequence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_events_have_unique_ids_and_creation_times() {
+        let first = ServerEvent::new("delta", serde_json::json!({"kind": "text"}));
+        let second = ServerEvent::new("state", serde_json::json!({}));
+        assert!(first.id.starts_with("evt_"));
+        assert!(second.id.starts_with("evt_"));
+        assert_ne!(first.id, second.id);
+        assert!(first.created > 0);
+        assert!(second.created >= first.created);
     }
 }

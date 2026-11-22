@@ -14,6 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod netproxy;
+pub mod process_tree;
 pub mod secrets;
 
 #[cfg(target_os = "linux")]
@@ -178,26 +180,40 @@ impl SandboxProfile {
     /// Environment pairs for spawn paths that build their own command
     /// (portable-pty's CommandBuilder).
     pub fn env(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut env = vec![
             ("STARK_SANDBOX_MODE", self.mode.as_str().to_string()),
             ("STARK_APPROVAL", self.approval.as_str().to_string()),
             (
                 "STARK_SANDBOX_NETWORK",
                 if self.network { "on" } else { "off" }.to_string(),
             ),
-        ]
+        ];
+        // Standard proxy variables are honored by curl, git, npm, pip, cargo,
+        // and most language HTTP clients. The proxy denies all destinations
+        // when network is off, so an accidental direct request fails closed.
+        if let Some(proxy) = netproxy::url() {
+            for (key, value) in proxy_env(proxy) {
+                env.push((key, value));
+            }
+        }
+        env
     }
 
     /// One prompt line that states the truth: requested mode, real backend,
-    /// and whether enforcement is active.
+    /// network gate, and whether filesystem enforcement is active.
     pub fn prompt_line(&self) -> String {
         let enforcement = if enforced() {
-            "enforced"
+            "filesystem enforced"
         } else {
-            "not enforced (no OS backend in this build)"
+            "filesystem not enforced (no OS backend in this build)"
+        };
+        let egress = if netproxy::url().is_some() {
+            "egress through policy proxy"
+        } else {
+            "no egress proxy"
         };
         format!(
-            "Sandbox: {mode} requested, network {network}, backend {backend} — {enforcement}.",
+            "Sandbox: {mode} requested, network {network}, backend {backend} — {enforcement}; process tree contained; {egress}.",
             mode = self.mode.as_str(),
             network = if self.network { "on" } else { "off" },
             backend = backend_name(),
@@ -258,6 +274,55 @@ mod backend {
 /// Convenience for callers that only have a workspace path.
 pub fn for_workspace(workspace: &Path) -> SandboxProfile {
     SandboxProfile::from_env(workspace)
+}
+
+/// Opt-in fail-closed mode. When `STARK_SANDBOX_STRICT=1`, shell spawns are
+/// refused unless a real OS filesystem backend is active. Default is off so a
+/// machine without AppContainer/Seatbelt/Landlock can still run; the prompt
+/// continues to say filesystem enforcement is unavailable.
+pub fn strict() -> bool {
+    std::env::var("STARK_SANDBOX_STRICT")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Returns an error when strict mode is on and the requested mode cannot be
+/// enforced by this build. `danger-full-access` is always allowed.
+pub fn ensure_enforced(workspace: &Path) -> Result<(), String> {
+    let profile = SandboxProfile::from_env(workspace);
+    if strict() && profile.mode != SandboxMode::DangerFullAccess && !enforced() {
+        return Err(format!(
+            "STARK_SANDBOX_STRICT is set but the {0} filesystem backend is not enforcing. \
+             Use danger-full-access explicitly or run on a platform with a real sandbox.",
+            backend_name()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether model-spawned processes may reach the network.
+pub fn network_enabled() -> bool {
+    netproxy::network_enabled()
+}
+
+fn proxy_env(proxy: &str) -> Vec<(&'static str, String)> {
+    // Clear inherited NO_PROXY so a provider cannot exempt itself from policy.
+    vec![
+        ("HTTP_PROXY", proxy.to_string()),
+        ("HTTPS_PROXY", proxy.to_string()),
+        ("ALL_PROXY", proxy.to_string()),
+        ("http_proxy", proxy.to_string()),
+        ("https_proxy", proxy.to_string()),
+        ("all_proxy", proxy.to_string()),
+        ("NO_PROXY", String::new()),
+        ("no_proxy", String::new()),
+    ]
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 // Stark Rune app-shell service worker: the PWA opens offline with the last
-// shell available. Mirrors frontend/public/sw.js policy: API responses are
+// shell available. API responses are
 // never cached (chats must be live; the API is cross-origin anyway, so the
 // worker never even sees those requests).
 //

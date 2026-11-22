@@ -30,6 +30,15 @@ pub struct JobStore {
 }
 
 impl JobStore {
+    /// Checkpoints WAL and closes pooled connections after the caller has
+    /// stopped active runs.
+    pub async fn close(&self) {
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
+        self.pool.close().await;
+    }
+
     pub async fn open(harness_root: &Path) -> Result<Self, StoreError> {
         let db_path = harness_root.join(".deep_agents").join("jobs.db");
         if let Some(parent) = db_path.parent() {
@@ -77,6 +86,7 @@ impl JobStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS ix_jobs_parent ON jobs(parent_chat_id, status)")
             .execute(&self.pool)
             .await?;
+        crate::migrate::baseline(&self.pool, "jobs").await?;
         Ok(())
     }
 

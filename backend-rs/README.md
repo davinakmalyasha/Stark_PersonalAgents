@@ -35,13 +35,8 @@ cargo test --workspace
 49 tools, nine scopes (`developer`, `coder`, `general`, `house`, `dfd`,
 `orchestrator`, `devops`, `explore`, `ui`). It is validated by
 `stark-contract`; implementations are registered in
-`stark-tools/src/inventory.rs`. Regenerate frontend labels with:
-
-```bash
-node specs/generate-labels.mjs
-```
-
-Do not hand-edit the generated labels.
+`stark-tools/src/inventory.rs`. The Rust inventory is the source of truth for
+tool names and labels.
 
 ## Run the server
 
@@ -57,16 +52,11 @@ cargo run -p stark-server
 ```
 
 The server binds `127.0.0.1:8124` by default. Set `STARK_HOST=0.0.0.0` to
-expose it to a phone (pairing token required). Point the Vite dev UI at it with:
-
-```bash
-cd ../frontend
-STARK_PORT=8124 npm run dev
-```
-
-Routes live in `stark-server/src/main.rs`; the UI consumes `/api/run`,
-`/api/stream/{chat_id}`, the workspace/chat/session routes, and the notes,
-groups, snapshot, and pairing routes.
+expose the API to a phone's Rune client (pairing token required). The Rune client starts a run
+with `POST /api/chats/{chat_id}/run`, subscribes to
+`GET /api/chats/{chat_id}/events`, and recovers from
+`GET /api/chats/{chat_id}/log`. Other routes cover workspaces, chats,
+sessions, notes, groups, snapshots, pairing, and voice.
 
 ## Crates
 

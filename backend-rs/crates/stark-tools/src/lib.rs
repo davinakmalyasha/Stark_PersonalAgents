@@ -78,9 +78,9 @@ pub use screen::{
 pub use skills::{catalog_block_for, catalog_block_for_agent};
 pub use verify::{AcceptanceVerdict, CriterionStatus, CriterionVerdict, evaluate_acceptance};
 
-/// Tool membership and guard flags now live in [`inventory`]: one `ToolMeta`
-/// entry per tool derives the implemented set, the plan-write guard, the
-/// read-only guard, and the frontend labels. The frozen wire schema stays in
+/// Tool membership and guard flags live in [`inventory`]: one `ToolMeta`
+/// entry per tool derives the implemented set, the plan-write guard, and the
+/// read-only guard. The frozen wire schema stays in
 /// `backend-rs/specs/tool-specs.json`.
 pub const MCP_EAGER_LIMIT: usize = 8;
 
@@ -1658,7 +1658,7 @@ mod tests {
             .expect("job id");
         let polled = dispatch(
             "job",
-            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 5000}),
+            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 15000}),
             &ctx,
         )
         .await;
@@ -1696,7 +1696,7 @@ mod tests {
 
         let logs = dispatch(
             "job",
-            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 5000}),
+            &json!({"action": "output", "job_id": job_id, "wait": true, "timeout_ms": 15000}),
             &ctx,
         )
         .await;

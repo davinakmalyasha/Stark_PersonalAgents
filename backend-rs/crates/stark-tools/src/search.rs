@@ -375,22 +375,26 @@ pub async fn run_main<T: Reporter>(
         None => {
             reporter.warn_no_search_pattern(&search_directory);
             #[cfg(unix)]
-            Command::new("ls")
-                .arg("-al")
-                .current_dir(search_directory)
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status()
-                .await?;
+            {
+                let mut command = Command::new("ls");
+                command
+                    .arg("-al")
+                    .current_dir(search_directory)
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                stark_sandbox::secrets::scrub_tokio_command(&mut command);
+                command.status().await?;
+            }
             #[cfg(windows)]
             {
-                Command::new("cmd")
+                let mut command = Command::new("cmd");
+                command
                     .arg("/c")
                     .arg(search_directory)
                     .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .status()
-                    .await?;
+                    .stderr(std::process::Stdio::inherit());
+                stark_sandbox::secrets::scrub_tokio_command(&mut command);
+                command.status().await?;
             }
             return Ok(());
         }

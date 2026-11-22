@@ -779,7 +779,7 @@ fn pick_project_folder<S: ProjectsHost + 'static>(_s: &mut S, tx: &mut rune::Tx)
     }
 }
 
-/// The live `NewProjectDialog` (`frontend/src/house/NewProjectDialog.tsx`):
+/// The live New Project dialog from the former React reference:
 /// a 390 pt two-step card over a 60% blurred backdrop. Step 1 creates
 /// nothing; step 2 registers the workspace, creates its first chat, and (in
 /// group mode) the durable team board.

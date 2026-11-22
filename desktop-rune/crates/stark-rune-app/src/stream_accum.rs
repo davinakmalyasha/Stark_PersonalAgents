@@ -1,5 +1,5 @@
 //! Shared SSE stream accumulator — direct port of
-//! `frontend/src/utils/streamAccum.ts`.
+//! the former React stream accumulator.
 //!
 //! Every surface (chat, pipeline, subagents) folds deltas through this one
 //! implementation so live reasoning, tool pills, retries and the final
@@ -230,7 +230,8 @@ impl Delta {
         let status = v.get("status").and_then(parse_status);
         Self {
             kind: s("kind").unwrap_or_default(),
-            text: s("text").unwrap_or_default(),
+            // Durable `tool_finished` rollouts carry `preview`, not `text`.
+            text: s("text").or_else(|| s("preview")).unwrap_or_default(),
             agent: s("agent"),
             tool: s("tool"),
             args: s("args"),
@@ -342,6 +343,49 @@ impl StreamAccum {
                     return;
                 }
             }
+        }
+    }
+
+    /// Clear the live turn before a durable replay rebuilds it.
+    ///
+    /// Mirrors the TS `reset` delta: transcript content, retry/status, and the
+    /// rate history clear; usage/report/artifacts stay because `/api/state`
+    /// owns those and replay skips durable usage events.
+    pub fn reset(&mut self) {
+        self.text.clear();
+        self.reasoning.clear();
+        self.agent.clear();
+        self.segments.clear();
+        self.tool_events.clear();
+        self.retry = None;
+        self.status = None;
+        self.rate = RateAccum::default();
+    }
+
+    /// Append a completed durable item. Unlike a live delta it is neither a
+    /// token fragment nor a retry notice, so it appends verbatim and leaves
+    /// the token-rate meter alone.
+    pub fn apply_snapshot(&mut self, delta: &Delta) -> bool {
+        match delta.kind.as_str() {
+            "text_snapshot" => {
+                self.retry = None;
+                if let Some(agent) = &delta.agent {
+                    self.agent = agent.clone();
+                }
+                self.text.push_str(&delta.text);
+                self.append_segment(SegmentKind::Text, &delta.text, delta.agent.as_deref());
+                true
+            }
+            "reasoning_snapshot" => {
+                self.retry = None;
+                if let Some(agent) = &delta.agent {
+                    self.agent = agent.clone();
+                }
+                self.reasoning.push_str(&delta.text);
+                self.append_segment(SegmentKind::Reasoning, &delta.text, delta.agent.as_deref());
+                true
+            }
+            _ => false,
         }
     }
 

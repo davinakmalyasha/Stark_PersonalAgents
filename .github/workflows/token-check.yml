@@ -1,0 +1,30 @@
+name: token-check
+
+# Temporary: prove RELEASES_TOKEN can create and delete a draft in the feed
+# repo before the first master release. Removed before merge.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read feed
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: gh api repos/davinakmalyasha/Stark_Rune_Releases --jq '.full_name'
+      - name: Write feed
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          TAG: token-check-${{ github.run_number }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            -R davinakmalyasha/Stark_Rune_Releases \
+            --draft --title "token check" --notes "temporary"
+          gh release delete "$TAG" \
+            -R davinakmalyasha/Stark_Rune_Releases \
+            --yes --cleanup-tag
